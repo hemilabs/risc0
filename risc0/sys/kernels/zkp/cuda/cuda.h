@@ -14,6 +14,11 @@
 
 #pragma once
 
+// CUDA 13.1's CCCL v2 headers (thrust, cub) need driver API types (CUcontext,
+// CUdevice, etc.) from the system <cuda.h>. Forward to it first so those types
+// are defined before any CCCL header is processed.
+#include_next <cuda.h>
+
 #include <cstdint>
 #include <cstring>
 #include <cuda_runtime.h>
@@ -62,16 +67,30 @@ struct LaunchConfig {
   LaunchConfig(int grid, int block, size_t shared = 0) : grid(grid), block(block), shared(shared) {}
 };
 
-inline LaunchConfig getSimpleConfig(uint32_t count) {
-  int device;
-  CUDA_OK(cudaGetDevice(&device));
+inline cudaStream_t getPersistentStream() {
+  static cudaStream_t stream = nullptr;
+  if (!stream) {
+    CUDA_OK(cudaStreamCreate(&stream));
+  }
+  return stream;
+}
 
-  int maxThreads;
-  CUDA_OK(cudaDeviceGetAttribute(&maxThreads, cudaDevAttrMaxThreadsPerBlock, device));
-
-  int block = maxThreads / 4;
+inline LaunchConfig getCachedSimpleConfig(uint32_t count) {
+  static int block = 0;
+  if (block == 0) {
+    int device;
+    CUDA_OK(cudaGetDevice(&device));
+    int maxThreads;
+    CUDA_OK(cudaDeviceGetAttribute(&maxThreads, cudaDevAttrMaxThreadsPerBlock, device));
+    block = maxThreads / 4;
+  }
   int grid = (count + block - 1) / block;
   return LaunchConfig{grid, block, 0};
+}
+
+// Backward-compat alias used by circuit ffi files
+inline LaunchConfig getSimpleConfig(uint32_t count) {
+  return getCachedSimpleConfig(count);
 }
 
 template <typename... ExpTypes, typename... ActTypes>
@@ -80,8 +99,8 @@ const char* launchKernel(void (*kernel)(ExpTypes...),
                          uint32_t shared_size,
                          ActTypes&&... args) {
   try {
-    CudaStream stream;
-    LaunchConfig cfg = getSimpleConfig(count);
+    cudaStream_t stream = getPersistentStream();
+    LaunchConfig cfg = getCachedSimpleConfig(count);
     cudaLaunchConfig_t config;
     config.attrs = nullptr;
     config.numAttrs = 0;
@@ -90,7 +109,6 @@ const char* launchKernel(void (*kernel)(ExpTypes...),
     config.dynamicSmemBytes = shared_size;
     config.stream = stream;
     CUDA_OK(cudaLaunchKernelEx(&config, kernel, std::forward<ActTypes>(args)...));
-    CUDA_OK(cudaStreamSynchronize(stream));
   } catch (const std::exception& err) {
     return strdup(err.what());
   } catch (...) {

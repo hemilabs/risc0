@@ -18,7 +18,7 @@ use risc0_core::{field::ExtElem, scope};
 use tracing::debug;
 
 use crate::{
-    core::log2_ceil,
+    core::{digest::Digest, log2_ceil},
     hal::{Buffer, Hal},
     prove::{merkle::MerkleTreeProver, write_iop::WriteIOP},
     FRI_FOLD, FRI_MIN_DEGREE, INV_RATE, QUERIES,
@@ -73,14 +73,6 @@ impl<H: Hal> ProveRoundInfo<H> {
         }
     }
 
-    pub fn prove_query(&mut self, hal: &H, iop: &mut WriteIOP<H::Field>, pos: &mut usize) {
-        // Compute which group we are in
-        let group = *pos % (self.domain / FRI_FOLD);
-        // Generate the proof
-        self.merkle.prove(hal, iop, group);
-        // Update pos
-        *pos = group;
-    }
 }
 
 pub fn fri_prove<H: Hal, F>(
@@ -89,7 +81,7 @@ pub fn fri_prove<H: Hal, F>(
     coeffs: &H::Buffer<H::Elem>,
     inner: F,
 ) where
-    F: Fn(&mut WriteIOP<H::Field>, usize),
+    F: Fn(&[usize]) -> Vec<Vec<(Vec<H::Elem>, Vec<Digest>)>>,
 {
     scope!("fri_prove");
     let ext_size = H::ExtElem::EXT_SIZE;
@@ -111,16 +103,44 @@ pub fn fri_prove<H: Hal, F>(
         let digest = hal.get_hash_suite().hashfn.hash_elem_slice(view);
         iop.commit(&digest);
     });
-    // Do queries
+    // Do queries (batched: pre-compute all positions, batch GPU work per tree)
     debug!("Doing Queries");
-    for _ in 0..QUERIES {
-        // Get a 'random' index.
-        let mut pos = iop.random_bits(log2_ceil(orig_domain)) as usize;
-        // Do the 'inner' proof for this index
-        inner(iop, pos);
-        // Write the per-round proofs
-        for round in rounds.iter_mut() {
-            round.prove_query(hal, iop, &mut pos);
+
+    // Pre-compute all query positions upfront. This is safe because random_bits
+    // depends only on RNG state (advanced by commit()), not on proof writes.
+    let positions: Vec<usize> = (0..QUERIES)
+        .map(|_| iop.random_bits(log2_ceil(orig_domain)) as usize)
+        .collect();
+
+    // Batch-collect inner tree proofs for all queries at once
+    let inner_results = inner(&positions);
+
+    // Batch-collect FRI round proofs for all queries
+    let mut round_results: Vec<Vec<(Vec<H::Elem>, Vec<Digest>)>> = Vec::new();
+    let mut cur_positions = positions;
+    for round in rounds.iter() {
+        let groups: Vec<usize> = cur_positions
+            .iter()
+            .map(|&pos| pos % (round.domain / FRI_FOLD))
+            .collect();
+        round_results.push(round.merkle.batch_prove(hal, &groups));
+        cur_positions = groups;
+    }
+
+    // Write to IOP in correct query-major order (matching verifier's read order)
+    for q in 0..QUERIES {
+        for (col_data, siblings) in &inner_results[q] {
+            iop.write_field_elem_slice::<H::Elem>(col_data);
+            for digest in siblings {
+                iop.write_pod_slice(&[*digest]);
+            }
+        }
+        for round_data in &round_results {
+            let (col_data, siblings) = &round_data[q];
+            iop.write_field_elem_slice::<H::Elem>(col_data);
+            for digest in siblings {
+                iop.write_pod_slice(&[*digest]);
+            }
         }
     }
 }

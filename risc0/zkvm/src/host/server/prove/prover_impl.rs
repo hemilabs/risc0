@@ -12,11 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
+use std::{cell::RefCell, collections::HashMap};
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 
 use super::{keccak::prove_keccak, ProverServer};
+use risc0_circuit_rv32im::prove::SegmentProver;
+
+thread_local! {
+    static CACHED_SEGMENT_PROVER: RefCell<Option<Box<dyn SegmentProver>>> = const { RefCell::new(None) };
+}
+
+fn with_segment_prover<R>(f: impl FnOnce(&dyn SegmentProver) -> Result<R>) -> Result<R> {
+    CACHED_SEGMENT_PROVER.with(|cell| {
+        {
+            let mut borrow = cell.borrow_mut();
+            if borrow.is_none() {
+                *borrow = Some(risc0_circuit_rv32im::prove::segment_prover()?);
+            }
+        }
+        let borrow = cell.borrow();
+        f(borrow.as_ref().unwrap().as_ref())
+    })
+}
 use crate::{
     claim::merge::Merge,
     host::{
@@ -80,13 +98,36 @@ impl ProverServer for ProverImpl {
             &self.opts.hashfn
         );
 
+        // Trigger CUDA module loading in background while first segment is prepared.
+        // With primary context, this is a one-time cost amortized across all segments.
+        #[cfg(feature = "cuda")]
+        let mut warmup_handle = Some(std::thread::spawn(|| {
+            risc0_circuit_rv32im::prove::cuda_warmup();
+        }));
+        #[cfg(not(feature = "cuda"))]
+        let mut warmup_handle: Option<std::thread::JoinHandle<()>> = None;
+
         let mut segments = Vec::new();
-        for segment_ref in session.segments.iter() {
+        for (seg_idx, segment_ref) in session.segments.iter().enumerate() {
             let segment = segment_ref.resolve()?;
             for hook in &session.hooks {
                 hook.on_pre_prove_segment(&segment);
             }
-            segments.push(self.prove_segment(ctx, &segment)?);
+            // Join warmup thread before first segment's prove_core.
+            // preflight is CPU-only, so it overlaps with the background warmup.
+            let results = self.segment_preflight(&segment)?;
+            if seg_idx == 0 {
+                if let Some(handle) = warmup_handle.take() {
+                    let _ = handle.join();
+                }
+            }
+            let receipt = self.prove_segment_core(ctx, results)?;
+            if std::env::var("RISC0_SKIP_VERIFY").is_err() {
+                receipt
+                    .verify_integrity_with_context(ctx)
+                    .context("verify segment")?;
+            }
+            segments.push(receipt);
             for hook in &session.hooks {
                 hook.on_post_prove_segment(&segment);
             }
@@ -162,12 +203,14 @@ impl ProverServer for ProverImpl {
 
         // Verify the receipt to catch if something is broken in the proving process.
         // NOTE: If the proof is very large, this could take > 1s, e.g. with 1000 segments.
-        composite_receipt.verify_integrity_with_context(ctx)?;
-        check_claims(
-            &session_claim,
-            "composite",
-            MaybePruned::Value(composite_receipt.claim()?),
-        )?;
+        if std::env::var("RISC0_SKIP_VERIFY").is_err() {
+            composite_receipt.verify_integrity_with_context(ctx)?;
+            check_claims(
+                &session_claim,
+                "composite",
+                MaybePruned::Value(composite_receipt.claim()?),
+            )?;
+        }
 
         if self.opts.receipt_kind == ReceiptKind::Composite {
             let receipt = Receipt::new(
@@ -233,7 +276,7 @@ impl ProverServer for ProverImpl {
             segment.po2(),
             self.opts.max_segment_po2
         );
-        let inner = risc0_circuit_rv32im::prove::segment_prover()?.preflight(&segment.inner)?;
+        let inner = with_segment_prover(|sp| sp.preflight(&segment.inner))?;
 
         Ok(PreflightResults {
             inner,
@@ -258,9 +301,13 @@ impl ProverServer for ProverImpl {
         );
 
         let po2 = preflight_results.inner.po2();
+        let t_psc = std::time::Instant::now();
         let seal =
-            risc0_circuit_rv32im::prove::segment_prover()?.prove_core(preflight_results.inner)?;
+            with_segment_prover(|sp| sp.prove_core(preflight_results.inner))?;
+        eprintln!("[prove_segment_core] prove_core: {:.1}ms", t_psc.elapsed().as_secs_f64() * 1000.0);
+        let t_dec = std::time::Instant::now();
         let mut claim = ReceiptClaim::decode_from_seal_v2(&seal, Some(po2))?;
+        eprintln!("[prove_segment_core] decode: {:.1}ms (seal len: {})", t_dec.elapsed().as_secs_f64() * 1000.0, seal.len());
         claim.output = preflight_results.output.into();
 
         let verifier_parameters = ctx
@@ -275,9 +322,6 @@ impl ProverServer for ProverImpl {
             claim,
             verifier_parameters,
         };
-        receipt
-            .verify_integrity_with_context(ctx)
-            .context("verify segment")?;
 
         Ok(receipt)
     }

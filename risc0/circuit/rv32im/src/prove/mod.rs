@@ -53,3 +53,30 @@ pub fn segment_prover() -> Result<Box<dyn SegmentProver>> {
         }
     }
 }
+
+/// Trigger CUDA module loading so the first kernel launch doesn't stall.
+/// This is a no-op on non-CUDA builds.
+#[cfg(feature = "cuda")]
+pub fn cuda_warmup() {
+    use risc0_sys::ffi_wrap;
+    // Warmup rv32im circuit kernels (par_stepExec, stepAccum, finalizeAccum, eval_check)
+    let _ = ffi_wrap(|| unsafe { risc0_circuit_rv32im_sys::risc0_circuit_rv32im_cuda_warmup() });
+    let _ = ffi_wrap(|| unsafe {
+        risc0_circuit_rv32im_sys::risc0_circuit_rv32im_cuda_warmup_eval_check()
+    });
+    // Warmup sppark NTT kernels (normally loaded during CudaHal::new → sppark_init)
+    let err = unsafe { risc0_sys::cuda::sppark_init() };
+    if err.code != 0 {
+        tracing::warn!("sppark_init warmup failed: {err}");
+    }
+    // Warmup poseidon2 kernels
+    let err = unsafe { risc0_sys::cuda::sppark_poseidon2_init() };
+    if err.code != 0 {
+        tracing::warn!("sppark_poseidon2_init warmup failed: {err}");
+    }
+    // Warmup risc0-zkp kernels (eltwise, sha, bit_reverse, etc.)
+    extern "C" {
+        fn risc0_zkp_cuda_warmup() -> *const std::os::raw::c_char;
+    }
+    let _ = ffi_wrap(|| unsafe { risc0_zkp_cuda_warmup() });
+}

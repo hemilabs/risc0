@@ -18,6 +18,7 @@ pub use sppark::Error as SpparkError;
 
 extern "C" {
     pub fn sppark_init() -> sppark::Error;
+    pub fn sppark_poseidon2_init() -> sppark::Error;
 
     pub fn sppark_batch_expand(
         d_out: DevicePointer<u8>,
@@ -45,10 +46,29 @@ extern "C" {
         poly_count: u32,
     ) -> sppark::Error;
 
+    pub fn sppark_batch_iNTT_zk_shift(
+        d_inout: DevicePointer<u8>,
+        lg_domain_size: u32,
+        poly_count: u32,
+    ) -> sppark::Error;
+
+    pub fn sppark_batch_expand_NTT(
+        d_out: DevicePointer<u8>,
+        d_in: DevicePointer<u8>,
+        lg_domain_size: u32,
+        lg_blowup: u32,
+        poly_count: u32,
+    ) -> sppark::Error;
+
     pub fn sppark_poseidon2_fold(
         d_out: DevicePointer<u8>,
         d_in: DevicePointer<u8>,
         num_hashes: usize,
+    ) -> sppark::Error;
+
+    pub fn sppark_poseidon2_fold_tree(
+        nodes: DevicePointer<u8>,
+        layers: u32,
     ) -> sppark::Error;
 
     pub fn sppark_poseidon2_rows(
@@ -64,6 +84,11 @@ extern "C" {
         num_hashes: usize,
     ) -> sppark::Error;
 
+    pub fn sppark_poseidon254_fold_tree(
+        nodes: DevicePointer<u8>,
+        layers: u32,
+    ) -> sppark::Error;
+
     pub fn sppark_poseidon254_rows(
         d_out: DevicePointer<u8>,
         d_in: DevicePointer<u8>,
@@ -76,5 +101,13 @@ extern "C" {
         poly_size: usize,
         remainder: *mut u32,
         pow: *const u32,
+    ) -> sppark::Error;
+
+    pub fn supra_poly_divide_batch(
+        polynomial: DevicePointer<u8>,
+        poly_size: usize,
+        remainders: *mut u32,
+        pows: *const u32,
+        num_divides: u32,
     ) -> sppark::Error;
 }

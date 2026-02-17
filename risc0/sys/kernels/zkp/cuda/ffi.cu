@@ -24,6 +24,34 @@
 
 extern "C" {
 
+// Trigger CUDA module loading for risc0-zkp kernels (eltwise, sha, etc.)
+// by launching a dummy kernel. All kernels in this compilation unit share
+// the same CUDA module, so loading one loads all.
+const char* risc0_zkp_cuda_warmup() {
+  try {
+    cudaStream_t stream = getPersistentStream();
+    // batch_bit_reverse with count=0 exits immediately (bounds check).
+    batch_bit_reverse<<<1, 1, 0, stream>>>(nullptr, 0, 0);
+    CUDA_OK(cudaStreamSynchronize(stream));
+  } catch (const std::exception& err) {
+    return strdup(err.what());
+  } catch (...) {
+    return strdup("warmup failed");
+  }
+  return nullptr;
+}
+
+// Sync the persistent risc0 stream. Must be called before sppark operations
+// that read from buffers written by risc0 kernels (different CUDA stream).
+const char* risc0_zkp_cuda_sync_stream() {
+  try {
+    CUDA_OK(cudaStreamSynchronize(getPersistentStream()));
+  } catch (const std::exception& err) {
+    return strdup(err.what());
+  }
+  return nullptr;
+}
+
 const char* risc0_zkp_cuda_eltwise_add_fp(Fp* out, const Fp* x, const Fp* y, uint32_t count) {
   return launchKernel(eltwise_add_fp, count, 0, out, x, y, count);
 }
@@ -122,6 +150,11 @@ const char* risc0_zkp_cuda_sha_fold(ShaDigest* output, const ShaDigest* input, u
   return launchKernel(sha_fold, count, 0, output, input, count);
 }
 
+const char* risc0_zkp_cuda_gather_digests(
+    uint32_t* dst, const uint32_t* src, const uint32_t* indices, uint32_t count) {
+  return launchKernel(gather_digests, count, 0, dst, src, indices, count);
+}
+
 const char* risc0_zkp_cuda_combos_prepare(FpExt* combos,
                                           const FpExt* coeffU,
                                           const uint32_t comboCount,
@@ -133,11 +166,13 @@ const char* risc0_zkp_cuda_combos_prepare(FpExt* combos,
                                           const FpExt* mix) {
 
   try {
-    CudaStream stream;
+    cudaStream_t stream = getPersistentStream();
     combos_prepare<<<1, 1, 0, stream>>>(
         combos, coeffU, regsCount, regSizes, regComboIds, cycles, mix, checkSize, comboCount);
   } catch (const std::exception& err) {
     return strdup(err.what());
+  } catch (...) {
+    return strdup("Generic exception");
   }
   return nullptr;
 }

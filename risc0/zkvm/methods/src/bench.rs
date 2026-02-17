@@ -32,6 +32,10 @@ pub enum BenchmarkSpec {
     HashBytes {
         buf: Vec<u8>,
     },
+    HashBytesIter {
+        buf: Vec<u8>,
+        iters: u32,
+    },
     Memcpy {
         src: Vec<u8>,
         src_align: u32,
@@ -66,6 +70,13 @@ impl BenchmarkSpec {
             }
             BenchmarkSpec::HashBytes { buf } => {
                 memory_barrier(&sha::Impl::hash_bytes(&buf));
+            }
+            BenchmarkSpec::HashBytesIter { buf, iters } => {
+                let mut hash = sha::Impl::hash_bytes(&buf);
+                for _ in 1..iters {
+                    hash = sha::Impl::hash_bytes(hash.as_bytes());
+                }
+                memory_barrier(&hash);
             }
             BenchmarkSpec::Memcpy {
                 src,

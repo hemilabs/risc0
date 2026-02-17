@@ -122,6 +122,11 @@ pub trait Hal {
 
     fn zk_shift(&self, io: &Self::Buffer<Self::Elem>, count: usize);
 
+    fn batch_interpolate_ntt_zk_shift(&self, io: &Self::Buffer<Self::Elem>, count: usize) {
+        self.batch_interpolate_ntt(io, count);
+        self.zk_shift(io, count);
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn mix_poly_coeffs(
         &self,
@@ -179,6 +184,13 @@ pub trait Hal {
 
     fn hash_fold(&self, io: &Self::Buffer<Digest>, input_size: usize, output_size: usize);
 
+    fn hash_fold_tree(&self, io: &Self::Buffer<Digest>, layers: usize) {
+        for i in (0..layers).rev() {
+            let layer_size = 1 << i;
+            self.hash_fold(io, layer_size * 2, layer_size);
+        }
+    }
+
     fn gather_sample(
         &self,
         dst: &Self::Buffer<Self::Elem>,
@@ -187,6 +199,12 @@ pub trait Hal {
         size: usize,
         stride: usize,
     );
+
+    /// Batch-read digests at scattered indices. Default impl uses individual get_at() calls.
+    /// CUDA overrides this with a gather kernel + single D2H transfer.
+    fn batch_get_digest_at(&self, buf: &Self::Buffer<Digest>, indices: &[usize]) -> Vec<Digest> {
+        indices.iter().map(|&idx| buf.get_at(idx)).collect()
+    }
 
     fn scatter(
         &self,

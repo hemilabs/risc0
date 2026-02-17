@@ -16,7 +16,7 @@ pub(crate) mod cpu;
 #[cfg(feature = "cuda")]
 pub(crate) mod cuda;
 
-use std::rc::Rc;
+use std::{cell::RefCell, rc::Rc};
 
 use anyhow::Result;
 use risc0_core::scope;
@@ -107,6 +107,7 @@ where
     F: Fn() -> (Rc<H>, Rc<C>),
 {
     hal_factory: F,
+    cached_hal: RefCell<Option<(Rc<H>, Rc<C>)>>,
 }
 
 impl<H, C, F> SegmentProverImpl<H, C, F>
@@ -116,7 +117,20 @@ where
     F: Fn() -> (Rc<H>, Rc<C>),
 {
     pub fn new(hal_factory: F) -> Self {
-        Self { hal_factory }
+        Self {
+            hal_factory,
+            cached_hal: RefCell::new(None),
+        }
+    }
+
+    fn get_hal(&self) -> (Rc<H>, Rc<C>) {
+        let mut cached = self.cached_hal.borrow_mut();
+        if let Some(ref hal) = *cached {
+            return (hal.0.clone(), hal.1.clone());
+        }
+        let hal = (self.hal_factory)();
+        *cached = Some((hal.0.clone(), hal.1.clone()));
+        (hal.0, hal.1)
     }
 }
 
@@ -142,6 +156,7 @@ where
 
     fn prove_core(&self, preflight_results: PreflightResults) -> Result<Seal> {
         scope!("prove_core");
+        let t0 = std::time::Instant::now();
 
         cfg_if::cfg_if! {
             if #[cfg(feature = "witgen_debug")] {
@@ -155,17 +170,20 @@ where
             }
         }
 
-        let (hal, circuit_hal) = (self.hal_factory)();
+        let (hal, circuit_hal) = self.get_hal();
+        eprintln!("[prove_core] hal_factory: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
 
         let po2 = preflight_results.po2();
+        let t1 = std::time::Instant::now();
         let witgen =
             WitnessGenerator::new(hal.as_ref(), circuit_hal.as_ref(), preflight_results, mode)?;
+        eprintln!("[prove_core] witgen: {:.1}ms", t1.elapsed().as_secs_f64() * 1000.0);
 
         let code = &witgen.code.buf;
         let data = &witgen.data.buf;
-        let global = &witgen.global.buf;
 
-        Ok(scope!("prove_inner", {
+        let t2 = std::time::Instant::now();
+        let seal = scope!("prove_inner", {
             tracing::debug!("prove_inner");
 
             let mut prover = Prover::new(hal.as_ref(), TAPSET);
@@ -180,7 +198,8 @@ where
             // already allocated vector.
             prover.iop().write_u32_slice(&[RV32IM_SEAL_VERSION]);
 
-            let mix = scope!("main", {
+            let mt0 = std::time::Instant::now();
+            let (mix, global_clone) = scope!("main", {
                 // At the start of the protocol, seed the Fiat-Shamir transcript with context information
                 // about the proof system and circuit.
                 prover
@@ -190,36 +209,68 @@ where
                     .iop()
                     .commit(&hashfn.hash_elem_slice(&CircuitImpl::CIRCUIT_INFO.encode()));
 
-                // Concat globals and po2 into a vector.
-                let global_len = global.size();
+                // Build header from GPU global buffer (after witgen + zeroize).
+                // The witgen writes state_out, output, term_* to global, so we must
+                // read from the GPU buffer, not the pre-upload CPU vec.
+                // Use view() (read-only D2H) instead of view_mut() to avoid H2D.
+                let global_len = witgen.global.cols;
                 let mut header = vec![Val::ZERO; global_len + 1];
-                global.view_mut(|view| {
-                    for (i, elem) in view.iter_mut().enumerate() {
-                        *elem = elem.valid_or_zero();
+                witgen.global.buf.view(|view| {
+                    for (i, elem) in view.iter().enumerate() {
                         header[i] = *elem;
                     }
-                    header[global_len] = Val::new_raw(po2);
                 });
-
+                header[global_len] = Val::new_raw(po2);
                 let header_digest = hashfn.hash_elem_slice(&header);
                 prover.iop().commit(&header_digest);
                 prover.iop().write_field_elem_slice(header.as_slice());
                 prover.set_po2(po2 as usize);
+                eprintln!("  [main] setup: {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0);
 
                 prover.commit_group(REGISTER_GROUP_CODE, code);
+                eprintln!("  [main] commit(code): {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0);
                 prover.commit_group(REGISTER_GROUP_DATA, data);
+                eprintln!("  [main] commit(data): {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0);
 
                 // Make the mixing values
                 let mix: [Val; REGCOUNT_MIX] = std::array::from_fn(|_| prover.iop().random_elem());
 
                 let mix = witgen.accum(hal.as_ref(), circuit_hal.as_ref(), &mix)?;
+                eprintln!("  [main] accum: {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0);
 
                 prover.commit_group(REGISTER_GROUP_ACCUM, &witgen.accum.buf);
+                eprintln!("  [main] commit(accum): {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0);
 
-                mix
+                // Clone tiny global buffer (90 elements = 360 bytes) so witgen can
+                // be dropped during async GPU eval_check.
+                let global_clone = hal.alloc_elem("global_clone", witgen.global.buf.size());
+                hal.eltwise_copy_elem(&global_clone, &witgen.global.buf);
+
+                (mix, global_clone)
             });
 
-            prover.finalize(&[&mix.buf, global], circuit_hal.as_ref())
-        }))
+            // All borrows on witgen (through code, data, global, accum) are now
+            // released by NLL. Move witgen into a closure that runs during GPU
+            // eval_check to overlap CPU drop with GPU compute.
+            let t3 = std::time::Instant::now();
+            let result = prover.finalize_with_hook(
+                &[&mix.buf, &global_clone],
+                circuit_hal.as_ref(),
+                move || {
+                    let td = std::time::Instant::now();
+                    drop(witgen);
+                    eprintln!("[prove_core] witgen_drop (overlapped with eval_check): {:.1}ms",
+                        td.elapsed().as_secs_f64() * 1000.0);
+                },
+            );
+            eprintln!("[prove_core] prove_inner: {:.1}ms (main: {:.1}ms, finalize: {:.1}ms)",
+                t2.elapsed().as_secs_f64() * 1000.0,
+                (t3 - t2).as_secs_f64() * 1000.0,
+                t3.elapsed().as_secs_f64() * 1000.0);
+            eprintln!("[prove_core] TOTAL: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+            result
+        });
+
+        Ok(seal)
     }
 }

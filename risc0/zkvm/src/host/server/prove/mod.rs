@@ -23,7 +23,7 @@ pub(crate) mod union_peak;
 
 use std::rc::Rc;
 
-use anyhow::{anyhow, bail, ensure, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use risc0_core::field::baby_bear::{BabyBear, Elem, ExtElem};
 use risc0_groth16::prove::shrink_wrap;
 use risc0_zkp::hal::{CircuitHal, Hal};
@@ -72,7 +72,13 @@ pub trait ProverServer: private::Sealed {
     fn prove_segment(&self, ctx: &VerifierContext, segment: &Segment) -> Result<SegmentReceipt> {
         tracing::debug!("prove_segment");
         let results = self.segment_preflight(segment)?;
-        self.prove_segment_core(ctx, results)
+        let receipt = self.prove_segment_core(ctx, results)?;
+        if std::env::var("RISC0_SKIP_VERIFY").is_err() {
+            receipt
+                .verify_integrity_with_context(ctx)
+                .context("verify segment")?;
+        }
+        Ok(receipt)
     }
 
     /// Run preflight on the specified [Segment].

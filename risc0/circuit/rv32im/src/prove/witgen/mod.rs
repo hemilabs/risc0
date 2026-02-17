@@ -25,8 +25,8 @@ use std::iter::zip;
 
 use anyhow::{Context, Result};
 use preflight::PreflightTrace;
+use rayon::prelude::*;
 use risc0_binfmt::{PovwNonce, WordAddr};
-use risc0_circuit_rv32im_sys::RawPreflightCycle;
 use risc0_core::scope;
 use risc0_zkp::{
     core::digest::DIGEST_WORDS,
@@ -87,6 +87,17 @@ impl PreflightResults {
 
     pub fn po2(&self) -> u32 {
         self.po2
+    }
+
+    /// Build the Fiat-Shamir header from the CPU-side global vector.
+    /// This avoids a GPU DtoH+HtoD round-trip via view_mut() after upload.
+    pub fn build_header(&self) -> Vec<Val> {
+        let mut header = vec![Val::ZERO; self.global.len() + 1];
+        for (i, elem) in self.global.iter().enumerate() {
+            header[i] = elem.valid_or_zero();
+        }
+        header[self.global.len()] = Val::new_raw(self.po2);
+        header
     }
 }
 
@@ -154,6 +165,12 @@ where
             "alloc(data)",
             MetaBuffer::new("data", hal, cycles, REGCOUNT_DATA, true)
         );
+        // Allocate accum before generate_witness so its set_32 init (default stream)
+        // runs while the persistent stream is idle, avoiding implicit blocking-stream sync.
+        let accum = scope!(
+            "alloc(accum)",
+            MetaBuffer::new("accum", hal, cycles, REGCOUNT_ACCUM, true)
+        );
         hal.scatter(
             &data.buf,
             &injector.index,
@@ -168,10 +185,6 @@ where
             hal.eltwise_zeroize_elem(&code.buf);
             hal.eltwise_zeroize_elem(&data.buf);
         });
-        let accum = scope!(
-            "alloc(accum)",
-            MetaBuffer::new("accum", hal, cycles, REGCOUNT_ACCUM, true)
-        );
         Ok((global, code, data, accum))
     }
 
@@ -181,6 +194,7 @@ where
         circuit_hal: &C,
         mix: &[Val],
     ) -> Result<MetaBuffer<H>> {
+        let ta0 = std::time::Instant::now();
         // use final mix to compute BigIntAccumPowers
         let last_mix = ExtVal::from_subelems(mix[mix.len() - 4..].iter().cloned());
 
@@ -198,6 +212,7 @@ where
                 injector.push();
             }
         }
+        eprintln!("    [accum] bigint_inject: {:.1}ms", ta0.elapsed().as_secs_f64() * 1000.0);
 
         hal.scatter(
             &self.accum.buf,
@@ -205,6 +220,7 @@ where
             &injector.offsets,
             &injector.values,
         );
+        eprintln!("    [accum] scatter: {:.1}ms", ta0.elapsed().as_secs_f64() * 1000.0);
 
         let mix = MetaBuffer {
             buf: hal.copy_from_elem("mix", mix),
@@ -212,12 +228,15 @@ where
             cols: REGCOUNT_MIX,
             checked: true,
         };
+        eprintln!("    [accum] mix_upload: {:.1}ms", ta0.elapsed().as_secs_f64() * 1000.0);
 
         circuit_hal.step_accum(&self.trace, &self.data, &self.accum, &self.global, &mix)?;
+        eprintln!("    [accum] step_accum: {:.1}ms", ta0.elapsed().as_secs_f64() * 1000.0);
 
         scope!("zeroize(accum)", {
             hal.eltwise_zeroize_elem(&self.accum.buf);
         });
+        eprintln!("    [accum] zeroize: {:.1}ms", ta0.elapsed().as_secs_f64() * 1000.0);
 
         Ok(mix)
     }
@@ -226,47 +245,118 @@ where
 fn build_injector(trace: &PreflightTrace, cycles: usize) -> Injector {
     scope!("build_injector");
 
-    // Set stateful columns from 'top'
-    let mut injector = Injector::new(cycles);
-    for (row, back) in trace.backs.iter().enumerate() {
-        let cycle = &trace.cycles[row];
-        // tracing::trace!(
-        //     "[{row}] pc: {:#010x}, state: {:?}",
-        //     cycle.pc,
-        //     crate::execute::CycleState::from_u32(cycle.state).unwrap()
-        // );
-        match back {
-            Back::None => {}
-            Back::Ecall(s0, s1, s2) => {
-                const ECALL_S0: usize = LAYOUT_TOP.inst_result.arm8.s0._super.offset;
-                const ECALL_S1: usize = LAYOUT_TOP.inst_result.arm8.s1._super.offset;
-                const ECALL_S2: usize = LAYOUT_TOP.inst_result.arm8.s2._super.offset;
-                injector.set(row, ECALL_S0, *s0);
-                injector.set(row, ECALL_S1, *s1);
-                injector.set(row, ECALL_S2, *s2);
-            }
-            Back::Poseidon2(p2_state) => {
-                for (col, value) in zip(Poseidon2State::offsets(), p2_state.as_array()) {
-                    injector.set(row, col, value);
+    const CYCLE_COL: usize = LAYOUT_TOP.cycle._super.offset;
+    const NEXT_PC_LOW: usize = LAYOUT_TOP.next_pc_low._super.offset;
+    const NEXT_PC_HIGH: usize = LAYOUT_TOP.next_pc_high._super.offset;
+    const NEXT_STATE: usize = LAYOUT_TOP.next_state_0._super.offset;
+    const NEXT_MACHINE_MODE: usize = LAYOUT_TOP.next_machine_mode._super.offset;
+    const ECALL_S0: usize = LAYOUT_TOP.inst_result.arm8.s0._super.offset;
+    const ECALL_S1: usize = LAYOUT_TOP.inst_result.arm8.s1._super.offset;
+    const ECALL_S2: usize = LAYOUT_TOP.inst_result.arm8.s2._super.offset;
+    const SET_CYCLE_COUNT: u32 = 5;
+
+    let n = trace.backs.len();
+
+    // Steps 1+2: Compute exclusive prefix sum in a single pass (avoid intermediate counts vec)
+    let mut index = Vec::with_capacity(n + 1);
+    index.push(0u32);
+    let mut total = 0u32;
+    for back in &trace.backs {
+        total += SET_CYCLE_COUNT
+            + match back {
+                Back::None => 0,
+                Back::Ecall(..) => 3,
+                Back::Poseidon2(_) => Poseidon2State::offsets().len() as u32,
+                Back::Sha2(_) => {
+                    Sha2State::fp_offsets().len() as u32
+                        + 32 * Sha2State::u32_offsets().len() as u32
                 }
-            }
-            Back::Sha2(sha2_state) => {
-                for (col, value) in zip(Sha2State::fp_offsets(), sha2_state.fp_array()) {
-                    injector.set(row, col, value);
-                }
-                for (col, value) in zip(Sha2State::u32_offsets(), sha2_state.u32_array()) {
-                    injector.set_u32_bits(row, col, value);
-                }
-            }
-            Back::BigInt(state) => {
-                for (col, value) in zip(BigIntState::offsets(), state.as_array()) {
-                    injector.set(row, col, value);
-                }
-            }
-        }
-        injector.set_cycle(row, cycle);
+                Back::BigInt(_) => BigIntState::offsets().len() as u32,
+            };
+        index.push(total);
     }
-    injector
+    let total = total as usize;
+
+    // Step 3: Pre-allocate output arrays (skip zero-fill since every element is overwritten)
+    let mut offsets = Vec::<u32>::with_capacity(total);
+    let mut values = Vec::<Val>::with_capacity(total);
+    // SAFETY: All elements [0..total) will be written by the parallel fill below.
+    unsafe {
+        offsets.set_len(total);
+        values.set_len(total);
+    }
+
+    // Step 4: Fill in parallel (each row writes to non-overlapping region)
+    let offsets_ptr = offsets.as_mut_ptr();
+    let values_ptr = values.as_mut_ptr();
+
+    // SAFETY: Each thread writes to [index[row]..index[row+1]), which are
+    // non-overlapping ranges determined by the prefix sum above.
+    let offsets_send = offsets_ptr as usize;
+    let values_send = values_ptr as usize;
+
+    trace
+        .backs
+        .par_iter()
+        .enumerate()
+        .for_each(|(row, back)| {
+            let cycle = &trace.cycles[row];
+            let mut pos = index[row] as usize;
+
+            let offsets_p = offsets_send as *mut u32;
+            let values_p = values_send as *mut Val;
+
+            let mut set = |col: usize, value: u32| {
+                let idx = col * cycles + row;
+                unsafe {
+                    *offsets_p.add(pos) = idx as u32;
+                    *values_p.add(pos) = Val::new(value);
+                }
+                pos += 1;
+            };
+
+            match back {
+                Back::None => {}
+                Back::Ecall(s0, s1, s2) => {
+                    set(ECALL_S0, *s0);
+                    set(ECALL_S1, *s1);
+                    set(ECALL_S2, *s2);
+                }
+                Back::Poseidon2(p2_state) => {
+                    for (col, value) in zip(Poseidon2State::offsets(), p2_state.as_array()) {
+                        set(col, value);
+                    }
+                }
+                Back::Sha2(sha2_state) => {
+                    for (col, value) in zip(Sha2State::fp_offsets(), sha2_state.fp_array()) {
+                        set(col, value);
+                    }
+                    for (col, value) in zip(Sha2State::u32_offsets(), sha2_state.u32_array()) {
+                        for i in 0..32 {
+                            set(col + i, (value >> i) & 1);
+                        }
+                    }
+                }
+                Back::BigInt(state) => {
+                    for (col, value) in zip(BigIntState::offsets(), state.as_array()) {
+                        set(col, value);
+                    }
+                }
+            }
+
+            set(CYCLE_COL, row as u32);
+            set(NEXT_PC_LOW, cycle.pc & 0xffff);
+            set(NEXT_PC_HIGH, cycle.pc >> 16);
+            set(NEXT_STATE, cycle.state);
+            set(NEXT_MACHINE_MODE, cycle.machine_mode as u32);
+        });
+
+    Injector {
+        rows: cycles,
+        offsets,
+        values,
+        index,
+    }
 }
 
 fn build_global_vec(segment: &Segment, trace: &PreflightTrace) -> Vec<Val> {
@@ -350,30 +440,10 @@ impl Injector {
         self.index.push(self.offsets.len() as u32);
     }
 
-    fn set_cycle(&mut self, row: usize, cycle: &RawPreflightCycle) {
-        const CYCLE_COL: usize = LAYOUT_TOP.cycle._super.offset;
-        const NEXT_PC_LOW: usize = LAYOUT_TOP.next_pc_low._super.offset;
-        const NEXT_PC_HIGH: usize = LAYOUT_TOP.next_pc_high._super.offset;
-        const NEXT_STATE: usize = LAYOUT_TOP.next_state_0._super.offset;
-        const NEXT_MACHINE_MODE: usize = LAYOUT_TOP.next_machine_mode._super.offset;
-        self.set(row, CYCLE_COL, row as u32);
-        self.set(row, NEXT_PC_LOW, cycle.pc & 0xffff);
-        self.set(row, NEXT_PC_HIGH, cycle.pc >> 16);
-        self.set(row, NEXT_STATE, cycle.state);
-        self.set(row, NEXT_MACHINE_MODE, cycle.machine_mode as u32);
-        self.push();
-    }
-
     fn set(&mut self, row: usize, col: usize, value: u32) {
         let idx = col * self.rows + row;
         self.offsets.push(idx as u32);
         self.values.push(value.into());
-    }
-
-    fn set_u32_bits(&mut self, row: usize, col: usize, value: u32) {
-        for i in 0..32 {
-            self.set(row, col + i, (value >> i) & 1);
-        }
     }
 }
 

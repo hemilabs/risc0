@@ -95,21 +95,31 @@ __device__ __forceinline__ void poseidon2_mix(fr_t cells[CELLS]) {
   // First linear layer.
   multiply_by_m_ext(cells);
 
+  // First half full rounds
 #pragma unroll 1
-  for (uint32_t i = 0; i < ROUNDS_HALF_FULL * 2 + ROUNDS_PARTIAL; i++) {
-    if (i < ROUNDS_HALF_FULL || i >= ROUNDS_HALF_FULL + ROUNDS_PARTIAL) {
-      full_round(cells, round_constants_off);
-      round_constants_off += CELLS;
-    } else {
-      partial_round(cells, round_constants_off);
-      round_constants_off++;
-    }
+  for (uint32_t i = 0; i < ROUNDS_HALF_FULL; i++) {
+    full_round(cells, round_constants_off);
+    round_constants_off += CELLS;
+  }
+
+  // Partial rounds
+#pragma unroll 1
+  for (uint32_t i = 0; i < ROUNDS_PARTIAL; i++) {
+    partial_round(cells, round_constants_off);
+    round_constants_off++;
+  }
+
+  // Second half full rounds
+#pragma unroll 1
+  for (uint32_t i = 0; i < ROUNDS_HALF_FULL; i++) {
+    full_round(cells, round_constants_off);
+    round_constants_off += CELLS;
   }
 }
 
 } // namespace poseidon2
 
-__launch_bounds__(256, 4) __global__
+__launch_bounds__(256, 2) __global__
     void _poseidon2_fold(poseidon_out_t* output, const poseidon_in_t* input, uint32_t output_size) {
   uint32_t gid = blockDim.x * blockIdx.x + threadIdx.x;
   fr_t cells[CELLS];
@@ -134,7 +144,7 @@ __launch_bounds__(256, 4) __global__
   output[gid] = tmp;
 }
 
-__launch_bounds__(256, 4) __global__
+__launch_bounds__(256, 2) __global__
     void _poseidon2_rows(poseidon_out_t* out, const fr_t* matrix, uint32_t dim_x, uint32_t dim_y) {
   uint32_t gid = blockDim.x * blockIdx.x + threadIdx.x;
   if (gid >= dim_x)

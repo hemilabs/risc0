@@ -1,7 +1,7 @@
 #pragma once
 
 // This code is automatically generated
-// Modified: all rv32im_v2_* functions marked to reduce register
+// Modified: all rv32im_v2_* functions marked __noinline__ to reduce register
 // pressure within each function. Same-TU compilation still allows NVCC to
 // see all function bodies for optimal parameter passing and scheduling.
 

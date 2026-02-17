@@ -14,13 +14,15 @@
 
 use hotbench::{benchmark_group, benchmark_main, BenchGroup};
 use risc0_zkvm::{
-    get_prover_server, ExecutorEnv, ExecutorImpl, ProverOpts, VerifierContext, RECURSION_PO2,
+    get_prover_server, ExecutorEnv, ExecutorImpl, PreflightResults, ProverOpts, VerifierContext,
+    RECURSION_PO2,
 };
 use risc0_zkvm_methods::FIB_ELF;
 
 fn setup_exec(iterations: u32) -> ExecutorImpl<'static> {
     let env = ExecutorEnv::builder()
         .write_slice(&[iterations])
+        .segment_limit_po2(20)
         .build()
         .unwrap();
     ExecutorImpl::from_elf(env, FIB_ELF).unwrap()
@@ -58,7 +60,7 @@ fn warmup(_group: &mut BenchGroup) {
 fn prove_segment(group: &mut BenchGroup, hashfn: &str) {
     let name = format!("prove/{hashfn}");
     group.bench(name, |b| {
-        let iterations = 100_000;
+        let iterations = 300_000;
 
         let opts = ProverOpts::composite().with_hashfn(hashfn.to_string());
 
@@ -66,12 +68,17 @@ fn prove_segment(group: &mut BenchGroup, hashfn: &str) {
         let ctx = VerifierContext::default();
 
         let session = setup_exec(iterations).run().unwrap();
-        let segment = session.segments[0].resolve().unwrap();
+        // Pick the largest segment (usually index 1+, since index 0 is just init)
+        eprintln!("  session: {} segments, total_cycles: {}", session.segments.len(), session.total_cycles);
+        let seg_idx = if session.segments.len() > 1 { 1 } else { 0 };
+        let segment = session.segments[seg_idx].resolve().unwrap();
 
         b.iter(
             session.total_cycles as usize,
-            || {},
-            |()| prover.prove_segment(&ctx, &segment),
+            || Some(prover.segment_preflight(&segment).unwrap()),
+            |preflight: &mut Option<PreflightResults>| {
+                prover.prove_segment_core(&ctx, preflight.take().unwrap())
+            },
         );
     })
 }

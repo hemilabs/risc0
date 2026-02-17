@@ -18,7 +18,7 @@ use risc0_core::{
 };
 
 use crate::{
-    core::poly::poly_interpolate,
+    core::{digest::Digest, poly::poly_interpolate},
     hal::{Buffer, CircuitHal, Hal},
     prove::{fri::fri_prove, poly_group::PolyGroup, write_iop::WriteIOP},
     taps::TapSet,
@@ -39,11 +39,11 @@ fn make_coeffs<H: Hal>(hal: &H, witness: &H::Buffer<H::Elem>, count: usize) -> H
     scope!("make_coeffs");
     let coeffs = hal.alloc_elem("coeffs", witness.size());
     hal.eltwise_copy_elem(&coeffs, witness);
-    // Do interpolate
-    hal.batch_interpolate_ntt(&coeffs, count);
-    // Convert f(x) -> f(3x), which effective multiplies coefficients c_i by 3^i.
+    // Do interpolate + zk_shift (f(x) -> f(3x), multiplying coefficients c_i by 3^i)
     #[cfg(not(feature = "circuit_debug"))]
-    hal.zk_shift(&coeffs, count);
+    hal.batch_interpolate_ntt_zk_shift(&coeffs, count);
+    #[cfg(feature = "circuit_debug")]
+    hal.batch_interpolate_ntt(&coeffs, count);
     coeffs
 }
 
@@ -112,7 +112,24 @@ impl<'a, H: Hal> Prover<'a, H> {
     where
         C: CircuitHal<H>,
     {
+        self.finalize_with_hook(globals, circuit_hal, || {})
+    }
+
+    /// Generates the proof and returns the seal, calling `post_eval_check` after
+    /// launching eval_check but before needing its results. This allows CPU work
+    /// (e.g., freeing buffers) to overlap with GPU eval_check computation.
+    pub fn finalize_with_hook<C, F>(
+        mut self,
+        globals: &[&H::Buffer<H::Elem>],
+        circuit_hal: &C,
+        post_eval_check: F,
+    ) -> Vec<u32>
+    where
+        C: CircuitHal<H>,
+        F: FnOnce(),
+    {
         scope!("finalize");
+        let ft0 = std::time::Instant::now();
 
         // Set the poly mix value, which is used for constraint compression in the
         // DEEP-ALI protocol.
@@ -131,6 +148,7 @@ impl<'a, H: Hal> Prover<'a, H> {
             .iter()
             .map(|pg| &pg.as_ref().unwrap().evaluated)
             .collect();
+        let ft1 = std::time::Instant::now();
         circuit_hal.eval_check(
             &check_poly,
             groups.as_slice(),
@@ -139,6 +157,10 @@ impl<'a, H: Hal> Prover<'a, H> {
             self.po2,
             self.cycles,
         );
+        // eval_check is async on GPU — run CPU work while GPU computes
+        post_eval_check();
+        eprintln!("  [finalize] alloc+eval_check: {:.2}ms (eval_check alone: {:.2}ms)",
+            ft0.elapsed().as_secs_f64() * 1000.0, ft1.elapsed().as_secs_f64() * 1000.0);
 
         #[cfg(feature = "circuit_debug")]
         let mut bad_z = None;
@@ -174,10 +196,13 @@ impl<'a, H: Hal> Prover<'a, H> {
         // the coefficients of g1, etc. So really, we can just reinterpret 4 polys of
         // invRate*size to 16 polys of size, without actually doing anything.
 
+        eprintln!("  [finalize] iNTT(check): {:.2}ms", ft0.elapsed().as_secs_f64() * 1000.0);
         // Make the PolyGroup + add it to the IOP;
         let check_group = PolyGroup::new(self.hal, check_poly, H::CHECK_SIZE, self.cycles, "check");
+        eprintln!("  [finalize] check_poly_group: {:.2}ms", ft0.elapsed().as_secs_f64() * 1000.0);
         check_group.merkle.commit(&mut self.iop);
         tracing::debug!("checkGroup: {}", check_group.merkle.root());
+        eprintln!("  [finalize] check_group+commit: {:.2}ms", ft0.elapsed().as_secs_f64() * 1000.0);
 
         // Now pick a value for Z, which is used as the DEEP-ALI query point.
         cfg_if::cfg_if! {
@@ -206,28 +231,50 @@ impl<'a, H: Hal> Prover<'a, H> {
 
         let mut eval_u: Vec<H::ExtElem> = Vec::new();
         scope!("eval_u", {
-            for (id, pg) in self.groups.iter().enumerate() {
-                let pg = pg.as_ref().unwrap();
+            // Calculate total taps to allocate a single combined output buffer.
+            let total_taps: usize = self
+                .groups
+                .iter()
+                .enumerate()
+                .map(|(id, _)| self.taps.group_taps(id).count())
+                .sum();
+            let combined_out = self.hal.alloc_extelem("eval_u_combined", total_taps);
 
-                let mut which = Vec::new();
-                let mut xs = Vec::new();
+            // Pre-compute all which/xs values and upload as single combined buffers.
+            let mut all_which_flat = Vec::with_capacity(total_taps);
+            let mut all_xs_flat = Vec::with_capacity(total_taps);
+            for (id, _) in self.groups.iter().enumerate() {
                 for tap in self.taps.group_taps(id) {
-                    which.push(tap.offset() as u32);
+                    all_which_flat.push(tap.offset() as u32);
                     let x = back_one.pow(tap.back()) * z;
-                    xs.push(x);
+                    all_xs_flat.push(x);
                     all_xs.push(x);
                 }
-                let which = self.hal.copy_from_u32("which", which.as_slice());
-                let xs = self.hal.copy_from_extelem("xs", xs.as_slice());
-                let out = self.hal.alloc_extelem("out", which.size());
-                self.hal
-                    .batch_evaluate_any(&pg.coeffs, pg.count, &which, &xs, &out);
-                out.view(|view| {
-                    eval_u.extend(view);
-                });
             }
+            let which_buf = self.hal.copy_from_u32("which", &all_which_flat);
+            let xs_buf = self.hal.copy_from_extelem("xs", &all_xs_flat);
+
+            let mut offset = 0;
+            for (id, pg) in self.groups.iter().enumerate() {
+                let pg = pg.as_ref().unwrap();
+                let group_size = self.taps.group_taps(id).count();
+                self.hal.batch_evaluate_any(
+                    &pg.coeffs,
+                    pg.count,
+                    &which_buf.slice(offset, group_size),
+                    &xs_buf.slice(offset, group_size),
+                    &combined_out.slice(offset, group_size),
+                );
+                offset += group_size;
+            }
+
+            // Single D2H transfer instead of one per group.
+            combined_out.view(|view| {
+                eval_u.extend_from_slice(view);
+            });
         });
 
+        eprintln!("  [finalize] eval_u: {:.1}ms", ft0.elapsed().as_secs_f64() * 1000.0);
         // Now, convert the values to coefficients via interpolation
         let mut coeff_u = vec![H::ExtElem::ZERO; eval_u.len()];
         scope!("poly_interpolate", {
@@ -243,6 +290,7 @@ impl<'a, H: Hal> Prover<'a, H> {
             }
         });
 
+        eprintln!("  [finalize] poly_interp: {:.1}ms", ft0.elapsed().as_secs_f64() * 1000.0);
         // Add in the coeffs of the check polynomials.
         let z_pow = z.pow(ext_size);
         scope!("misc", {
@@ -284,40 +332,54 @@ impl<'a, H: Hal> Prover<'a, H> {
         scope!("mix_poly_coeffs", {
             let mut cur_mix = H::ExtElem::ONE;
 
+            // Pre-compute all which arrays (combo_ids) for groups + check, upload once.
+            let total_group_regs: usize = self
+                .groups
+                .iter()
+                .enumerate()
+                .map(|(id, _)| self.taps.group_size(id))
+                .sum();
+            let mut all_mix_which = Vec::with_capacity(total_group_regs + H::CHECK_SIZE);
+            for (id, _) in self.groups.iter().enumerate() {
+                for reg in self.taps.group_regs(id) {
+                    all_mix_which.push(reg.combo_id() as u32);
+                }
+            }
+            let check_which_offset = all_mix_which.len();
+            for _ in 0..H::CHECK_SIZE {
+                all_mix_which.push(combo_count as u32);
+            }
+            let mix_which_buf = self.hal.copy_from_u32("which", &all_mix_which);
+
+            let mut which_offset = 0;
             for (id, pg) in self.groups.iter().enumerate() {
                 let pg = pg.as_ref().unwrap();
-
                 let group_size = self.taps.group_size(id);
-                let mut which = Vec::with_capacity(group_size);
-                for reg in self.taps.group_regs(id) {
-                    which.push(reg.combo_id() as u32);
-                }
-                let which = self.hal.copy_from_u32("which", which.as_slice());
                 self.hal.mix_poly_coeffs(
                     &combos,
                     &cur_mix,
                     &mix,
                     &pg.coeffs,
-                    &which,
+                    &mix_which_buf.slice(which_offset, group_size),
                     group_size,
                     self.cycles,
                 );
                 cur_mix *= mix.pow(group_size);
+                which_offset += group_size;
             }
 
-            let which = vec![combo_count as u32; H::CHECK_SIZE];
-            let which_buf = self.hal.copy_from_u32("which", which.as_slice());
             self.hal.mix_poly_coeffs(
                 &combos,
                 &cur_mix,
                 &mix,
                 &check_group.coeffs,
-                &which_buf,
+                &mix_which_buf.slice(check_which_offset, H::CHECK_SIZE),
                 H::CHECK_SIZE,
                 self.cycles,
             );
         });
 
+        eprintln!("  [finalize] mix_poly: {:.1}ms", ft0.elapsed().as_secs_f64() * 1000.0);
         scope!("load_combos", {
             let reg_sizes: Vec<_> = self.taps.regs().map(|x| x.size() as u32).collect();
             let reg_combo_ids: Vec<_> = self.taps.regs().map(|x| x.combo_id() as u32).collect();
@@ -353,6 +415,7 @@ impl<'a, H: Hal> Prover<'a, H> {
             });
         });
 
+        eprintln!("  [finalize] combos: {:.1}ms", ft0.elapsed().as_secs_f64() * 1000.0);
         // Sum the combos up into one final polynomial + make it into 4 Fp polys.
         // Additionally, it needs to be bit reversed to make everyone happy
         let final_poly_coeffs = scope!("sum", {
@@ -363,6 +426,7 @@ impl<'a, H: Hal> Prover<'a, H> {
             final_poly_coeffs
         });
 
+        eprintln!("  [finalize] sum+bitrev: {:.1}ms", ft0.elapsed().as_secs_f64() * 1000.0);
         // Finally do the FRI protocol to prove the degree of the polynomial
         scope!(
             "bit_rev",
@@ -370,14 +434,35 @@ impl<'a, H: Hal> Prover<'a, H> {
         );
         tracing::debug!("FRI-proof, size = {}", final_poly_coeffs.size() / ext_size);
 
-        fri_prove(self.hal, &mut self.iop, &final_poly_coeffs, |iop, idx| {
-            for pg in self.groups.iter() {
-                let pg = pg.as_ref().unwrap();
-                pg.merkle.prove(self.hal, iop, idx);
-            }
-            check_group.merkle.prove(self.hal, iop, idx);
-        });
+        fri_prove(
+            self.hal,
+            &mut self.iop,
+            &final_poly_coeffs,
+            |indices: &[usize]| -> Vec<Vec<(Vec<H::Elem>, Vec<Digest>)>> {
+                // Batch-prove each tree across all query indices
+                let mut trees: Vec<Vec<(Vec<H::Elem>, Vec<Digest>)>> = Vec::new();
+                for pg in self.groups.iter() {
+                    trees.push(pg.as_ref().unwrap().merkle.batch_prove(self.hal, indices));
+                }
+                trees.push(check_group.merkle.batch_prove(self.hal, indices));
 
+                // Transpose: trees[tree_idx][query_idx] -> result[query_idx][tree_idx]
+                let n = indices.len();
+                let num_trees = trees.len();
+                let mut result: Vec<Vec<(Vec<H::Elem>, Vec<Digest>)>> =
+                    Vec::with_capacity(n);
+                for q in 0..n {
+                    let mut query_data = Vec::with_capacity(num_trees);
+                    for tree in trees.iter_mut() {
+                        query_data.push(std::mem::take(&mut tree[q]));
+                    }
+                    result.push(query_data);
+                }
+                result
+            },
+        );
+
+        eprintln!("  [finalize] fri_prove: {:.1}ms", ft0.elapsed().as_secs_f64() * 1000.0);
         let proven_soundness_error =
             super::soundness::proven::<H>(self.taps, final_poly_coeffs.size());
         tracing::debug!("proven_soundness_error: {proven_soundness_error:?}");

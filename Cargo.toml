@@ -78,3 +78,6 @@ opt-level = 3
 
 [profile.release]
 lto = true
+
+[patch.crates-io]
+sppark = { git = "https://github.com/hemilabs/risc0-sppark", branch = "max/optimizations" }

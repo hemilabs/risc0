@@ -113,6 +113,18 @@ __global__ void scatter(Fp* into,
   }
 }
 
+__global__ void gather_digests(
+    uint32_t* dst, const uint32_t* src, const uint32_t* indices, uint32_t count) {
+  uint gid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (gid < count) {
+    uint32_t src_idx = indices[gid];
+    // Copy 8 uint32_t words (32 bytes = 1 Digest)
+    for (int w = 0; w < 8; w++) {
+      dst[gid * 8 + w] = src[src_idx * 8 + w];
+    }
+  }
+}
+
 __global__ void mix_poly_coeffs(FpExt* out,
                                 const Fp* in,
                                 const uint32_t* combos,

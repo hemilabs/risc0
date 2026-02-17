@@ -63,13 +63,11 @@ extern "C" const char* risc0_circuit_recursion_cuda_eval_check(Fp* check,
                                                                const FpExt* poly_mix_pows) {
 
   try {
-    CUDA_OK(cudaDeviceSynchronize());
-    CudaStream stream;
+    cudaStream_t stream = getPersistentStream();
     LaunchConfig cfg = getSimpleConfig(domain);
     cudaMemcpyToSymbol(poly_mix, poly_mix_pows, sizeof(poly_mix));
     risc0::circuit::recursion::cuda::eval_check<<<cfg.grid, cfg.block, 0, stream>>>(
         check, ctrl, data, accum, mix, out, rou, po2, domain);
-    CUDA_OK(cudaStreamSynchronize(stream));
   } catch (const std::exception& err) {
     return strdup(err.what());
   }
