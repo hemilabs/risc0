@@ -64,6 +64,12 @@ static inline void launch_batch_expand(const gpu_t& gpu,
 }
 
 extern "C" RustError::by_value sppark_init() {
+  // Always call select_gpu() to ensure the primary CUDA context is retained
+  // on the calling thread. This is critical when cuda_warmup() runs on a
+  // background thread first (setting initialized=true), then the main thread
+  // calls sppark_init() and needs the context to be current for cust/DeviceBuffer.
+  (void)select_gpu();
+
   static bool initialized = false;
   if (initialized)
     return RustError{cudaSuccess};

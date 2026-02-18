@@ -1053,27 +1053,60 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
             return;
         }
 
-        let index = self.copy_from_u32("index", index);
-        let offsets = self.copy_from_u32("offsets", offsets);
-        let values = self.copy_from_elem("values", values);
-
         extern "C" {
-            fn risc0_zkp_cuda_scatter(
+            fn risc0_zkp_cuda_scatter_from_host(
                 into: DevicePointer<u8>,
-                index: DevicePointer<u8>,
-                offsets: DevicePointer<u8>,
-                values: DevicePointer<u8>,
+                h_index: *const u32,
+                index_count: u32,
+                h_offsets: *const u32,
+                offsets_count: u32,
+                h_values: *const u8,
+                values_count: u32,
                 count: u32,
             ) -> *const std::os::raw::c_char;
         }
 
         ffi_wrap(|| unsafe {
-            risc0_zkp_cuda_scatter(
+            risc0_zkp_cuda_scatter_from_host(
                 into.as_device_ptr(),
-                index.as_device_ptr(),
-                offsets.as_device_ptr(),
-                values.as_device_ptr(),
+                index.as_ptr(),
+                index.len() as u32,
+                offsets.as_ptr(),
+                offsets.len() as u32,
+                values.as_ptr() as *const u8,
+                values.len() as u32,
                 count as u32,
+            )
+        })
+        .unwrap();
+    }
+
+    fn scatter_bits(
+        &self,
+        into: &Self::Buffer<Self::Elem>,
+        bit_data: &[u32],
+        cycles: u32,
+    ) {
+        let count = bit_data.len() / 3;
+        if count == 0 {
+            return;
+        }
+
+        extern "C" {
+            fn risc0_zkp_cuda_scatter_bits_from_host(
+                into: DevicePointer<u8>,
+                h_data: *const u32,
+                triplet_count: u32,
+                cycles: u32,
+            ) -> *const std::os::raw::c_char;
+        }
+
+        ffi_wrap(|| unsafe {
+            risc0_zkp_cuda_scatter_bits_from_host(
+                into.as_device_ptr(),
+                bit_data.as_ptr(),
+                count as u32,
+                cycles,
             )
         })
         .unwrap();

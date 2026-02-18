@@ -1,6 +1,8 @@
 use std::time::Instant;
 
 use risc0_zkvm::{get_prover_server, ExecutorEnv, ExecutorImpl, ProverOpts, VerifierContext};
+#[cfg(feature = "cuda")]
+use risc0_circuit_rv32im;
 use risc0_zkvm_methods::{bench::BenchmarkSpec, BENCH_ELF, BENCH_ID};
 
 fn main() {
@@ -31,6 +33,10 @@ fn main() {
     let opts = ProverOpts::composite().with_hashfn("poseidon2".to_string());
     let prover = get_prover_server(&opts).unwrap();
     let ctx = VerifierContext::default();
+
+    // Pre-load CUDA modules so the first kernel launch doesn't stall ~100ms.
+    #[cfg(feature = "cuda")]
+    risc0_circuit_rv32im::prove::cuda_warmup();
 
     eprintln!("Proving {} segments...", session.segments.len());
     let t0 = Instant::now();

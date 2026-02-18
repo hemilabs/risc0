@@ -107,8 +107,26 @@ impl<'a, H: Hal> Prover<'a, H> {
         );
     }
 
+    /// Returns a reference to the PolyGroup for the given tap group, if committed.
+    pub fn get_group(&self, tap_group_index: usize) -> Option<&PolyGroup<H>> {
+        self.groups[tap_group_index].as_ref()
+    }
+
+    /// Injects a pre-built PolyGroup (e.g., cached from a previous segment) and
+    /// commits its merkle root to the IOP. Skips iNTT/expand/hash recomputation.
+    pub fn commit_cached_group(&mut self, tap_group_index: usize, group: PolyGroup<H>) {
+        assert!(
+            self.groups[tap_group_index].is_none(),
+            "Attempted to commit group {} more than once",
+            self.taps.group_name(tap_group_index)
+        );
+
+        let group_ref = self.groups[tap_group_index].insert(group);
+        group_ref.merkle.commit(&mut self.iop);
+    }
+
     /// Generates the proof and returns the seal.
-    pub fn finalize<C>(mut self, globals: &[&H::Buffer<H::Elem>], circuit_hal: &C) -> Vec<u32>
+    pub fn finalize<C>(self, globals: &[&H::Buffer<H::Elem>], circuit_hal: &C) -> Vec<u32>
     where
         C: CircuitHal<H>,
     {

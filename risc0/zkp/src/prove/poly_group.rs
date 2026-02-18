@@ -59,6 +59,17 @@ pub struct PolyGroup<H: Hal> {
     pub merkle: MerkleTreeProver<H>,
 }
 
+impl<H: Hal> Clone for PolyGroup<H> {
+    fn clone(&self) -> Self {
+        Self {
+            coeffs: self.coeffs.clone(),
+            count: self.count,
+            evaluated: self.evaluated.clone(),
+            merkle: self.merkle.clone(),
+        }
+    }
+}
+
 impl<H: Hal> PolyGroup<H> {
     pub fn new(
         hal: &H,

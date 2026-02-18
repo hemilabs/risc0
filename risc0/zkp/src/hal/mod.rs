@@ -214,6 +214,36 @@ pub trait Hal {
         values: &[Self::Elem],
     );
 
+    /// Scatter u32 values as 32-bit decompositions into the data buffer.
+    /// `bit_data` contains packed (row, base_col, value) triples. Each triple
+    /// writes 32 field elements: data[(base_col+i)*cycles + row] = (value>>i)&1.
+    fn scatter_bits(
+        &self,
+        into: &Self::Buffer<Self::Elem>,
+        bit_data: &[u32],
+        cycles: u32,
+    ) {
+        let n = bit_data.len() / 3;
+        if n == 0 {
+            return;
+        }
+        let mut index = Vec::with_capacity(n + 1);
+        let mut offsets = Vec::with_capacity(n * 32);
+        let mut vals: Vec<Self::Elem> = Vec::with_capacity(n * 32);
+        for i in 0..n {
+            index.push((i * 32) as u32);
+            let row = bit_data[i * 3];
+            let base = bit_data[i * 3 + 1];
+            let value = bit_data[i * 3 + 2];
+            for bit in 0..32u32 {
+                offsets.push((base + bit) * cycles + row);
+                vals.push(Self::Elem::from_u64(((value >> bit) & 1) as u64));
+            }
+        }
+        index.push((n * 32) as u32);
+        self.scatter(into, &index, &offsets, &vals);
+    }
+
     fn prefix_products(&self, io: &Self::Buffer<Self::ExtElem>);
 
     #[allow(clippy::too_many_arguments)]

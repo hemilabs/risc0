@@ -58,6 +58,8 @@ pub struct PreflightResults {
     cycles: usize,
     trace: PreflightTrace,
     po2: u32,
+    /// Row indices where Back::BigInt entries occur (pre-extracted for accum).
+    bigint_rows: Vec<usize>,
 }
 
 impl PreflightResults {
@@ -74,7 +76,7 @@ impl PreflightResults {
         let cycles = 1 << segment.po2;
 
         let global = build_global_vec(segment, &trace);
-        let injector = build_injector(&trace, cycles);
+        let (injector, bigint_rows) = build_injector(&trace, cycles);
 
         Ok(Self {
             global,
@@ -82,6 +84,7 @@ impl PreflightResults {
             cycles,
             trace,
             po2: segment.po2,
+            bigint_rows,
         })
     }
 
@@ -90,8 +93,10 @@ impl PreflightResults {
     }
 
     /// Build the Fiat-Shamir header from the CPU-side global vector.
-    /// This avoids a GPU DtoH+HtoD round-trip via view_mut() after upload.
+    /// Applies valid_or_zero() to match the GPU buffer state after eltwise_zeroize_elem,
+    /// which converts INVALID sentinels (unfilled global positions) to ZERO.
     pub fn build_header(&self) -> Vec<Val> {
+        use risc0_core::field::Elem as _;
         let mut header = vec![Val::ZERO; self.global.len() + 1];
         for (i, elem) in self.global.iter().enumerate() {
             header[i] = elem.valid_or_zero();
@@ -108,6 +113,7 @@ pub(crate) struct WitnessGenerator<H: Hal> {
     pub data: MetaBuffer<H>,
     pub accum: MetaBuffer<H>,
     pub trace: PreflightTrace,
+    bigint_rows: Vec<usize>,
 }
 
 impl<H> WitnessGenerator<H>
@@ -122,6 +128,7 @@ where
     ) -> Result<Self> {
         scope!("witness_generator_new");
 
+        let tn0 = std::time::Instant::now();
         let (global, code, data, accum) = Self::hal_generate_witness(
             hal,
             circuit_hal,
@@ -131,15 +138,20 @@ where
             preflight_results.cycles,
             preflight_results.injector,
         )?;
+        let tn1 = std::time::Instant::now();
 
-        Ok(Self {
+        let result = Self {
             cycles: preflight_results.cycles,
             global,
             code,
             data,
             accum,
             trace: preflight_results.trace,
-        })
+            bigint_rows: preflight_results.bigint_rows,
+        };
+        eprintln!("      [witgen_new] hal_gen={:.1}ms struct_build={:.1}ms",
+            (tn1-tn0).as_secs_f64()*1000.0, tn1.elapsed().as_secs_f64()*1000.0);
+        Ok(result)
     }
 
     #[allow(clippy::type_complexity)]
@@ -154,6 +166,7 @@ where
     ) -> Result<(MetaBuffer<H>, MetaBuffer<H>, MetaBuffer<H>, MetaBuffer<H>), anyhow::Error> {
         scope!("hal_generate_witness");
 
+        let tw0 = std::time::Instant::now();
         let global = MetaBuffer {
             buf: hal.copy_from_elem("global", &global),
             rows: 1,
@@ -161,30 +174,53 @@ where
             checked: true,
         };
         let code = MetaBuffer::new("code", hal, cycles, REGCOUNT_CODE, false);
+        let tw1 = std::time::Instant::now();
         let data = scope!(
             "alloc(data)",
             MetaBuffer::new("data", hal, cycles, REGCOUNT_DATA, true)
         );
+        let tw2 = std::time::Instant::now();
         // Allocate accum before generate_witness so its set_32 init (default stream)
         // runs while the persistent stream is idle, avoiding implicit blocking-stream sync.
         let accum = scope!(
             "alloc(accum)",
             MetaBuffer::new("accum", hal, cycles, REGCOUNT_ACCUM, true)
         );
+        let tw3 = std::time::Instant::now();
         hal.scatter(
             &data.buf,
             &injector.index,
             &injector.offsets,
             &injector.values,
         );
+        hal.scatter_bits(&data.buf, &injector.bit_data, cycles as u32);
+        let tw4 = std::time::Instant::now();
+        // Drop 126MB of injector Vecs in background while GPU runs generate_witness.
+        // After scatter + scatter_bits, all host data has been copied to GPU (sync memcpy).
+        let inj_idx = injector.index.len();
+        let inj_off = injector.offsets.len();
+        let inj_val = injector.values.len();
+        let inj_bits = injector.bit_data.len() / 3;
+        let _drop_handle = std::thread::spawn(move || drop(injector));
         circuit_hal
             .generate_witness(mode, trace, &global, &data)
             .context("witness generation failure")?;
+        let tw5 = std::time::Instant::now();
         scope!("zeroize", {
             hal.eltwise_zeroize_elem(&global.buf);
             hal.eltwise_zeroize_elem(&code.buf);
             hal.eltwise_zeroize_elem(&data.buf);
         });
+        let tw6 = std::time::Instant::now();
+        eprintln!("      [hal_witgen] global+code={:.1}ms data={:.1}ms accum={:.1}ms scatter={:.1}ms ffi={:.1}ms zeroize={:.1}ms (inj: idx={} off={} val={} bits={})",
+            (tw1-tw0).as_secs_f64()*1000.0,
+            (tw2-tw1).as_secs_f64()*1000.0,
+            (tw3-tw2).as_secs_f64()*1000.0,
+            (tw4-tw3).as_secs_f64()*1000.0,
+            (tw5-tw4).as_secs_f64()*1000.0,
+            (tw6-tw5).as_secs_f64()*1000.0,
+            inj_idx, inj_off, inj_val, inj_bits,
+        );
         Ok((global, code, data, accum))
     }
 
@@ -202,8 +238,8 @@ where
         let mut injector = Injector::new(self.cycles);
         let mut bigint_accum = BigIntAccum::new(last_mix);
 
-        for (row, back) in self.trace.backs.iter().enumerate() {
-            if let Back::BigInt(state) = back {
+        for &row in &self.bigint_rows {
+            if let Back::BigInt(state) = &self.trace.backs[row] {
                 bigint_accum.step(state)?;
                 for (col, value) in zip(BigIntAccumState::offsets(), bigint_accum.state.as_array())
                 {
@@ -242,7 +278,7 @@ where
     }
 }
 
-fn build_injector(trace: &PreflightTrace, cycles: usize) -> Injector {
+fn build_injector(trace: &PreflightTrace, cycles: usize) -> (Injector, Vec<usize>) {
     scope!("build_injector");
 
     const CYCLE_COL: usize = LAYOUT_TOP.cycle._super.offset;
@@ -257,25 +293,38 @@ fn build_injector(trace: &PreflightTrace, cycles: usize) -> Injector {
 
     let n = trace.backs.len();
 
-    // Steps 1+2: Compute exclusive prefix sum in a single pass (avoid intermediate counts vec)
+    // Steps 1+2: Compute exclusive prefix sums in a single pass.
+    // scatter entries (without SHA2 u32 bit decomposition — those go to bit_data)
     let mut index = Vec::with_capacity(n + 1);
     index.push(0u32);
     let mut total = 0u32;
-    for back in &trace.backs {
+    // bit entries: each SHA2 u32 becomes one packed (row, base_col, value) triple
+    let mut bit_index = Vec::with_capacity(n + 1);
+    bit_index.push(0u32);
+    let mut bit_total = 0u32;
+    // Pre-extract BigInt row indices for accum phase (avoids 1M-entry scan later)
+    let mut bigint_rows = Vec::new();
+    for (row, back) in trace.backs.iter().enumerate() {
         total += SET_CYCLE_COUNT
             + match back {
                 Back::None => 0,
                 Back::Ecall(..) => 3,
                 Back::Poseidon2(_) => Poseidon2State::offsets().len() as u32,
-                Back::Sha2(_) => {
-                    Sha2State::fp_offsets().len() as u32
-                        + 32 * Sha2State::u32_offsets().len() as u32
-                }
+                Back::Sha2(_) => Sha2State::fp_offsets().len() as u32, // u32s moved to bit_data
                 Back::BigInt(_) => BigIntState::offsets().len() as u32,
             };
         index.push(total);
+        bit_total += match back {
+            Back::Sha2(_) => Sha2State::u32_offsets().len() as u32, // 3 u32s per SHA2 cycle
+            _ => 0,
+        };
+        bit_index.push(bit_total);
+        if matches!(back, Back::BigInt(_)) {
+            bigint_rows.push(row);
+        }
     }
     let total = total as usize;
+    let bit_total = bit_total as usize;
 
     // Step 3: Pre-allocate output arrays (skip zero-fill since every element is overwritten)
     let mut offsets = Vec::<u32>::with_capacity(total);
@@ -285,15 +334,22 @@ fn build_injector(trace: &PreflightTrace, cycles: usize) -> Injector {
         offsets.set_len(total);
         values.set_len(total);
     }
+    // Packed (row, base_col, value) triples for GPU-side bit decomposition
+    let mut bit_data = Vec::<u32>::with_capacity(bit_total * 3);
+    unsafe {
+        bit_data.set_len(bit_total * 3);
+    }
 
     // Step 4: Fill in parallel (each row writes to non-overlapping region)
     let offsets_ptr = offsets.as_mut_ptr();
     let values_ptr = values.as_mut_ptr();
+    let bit_data_ptr = bit_data.as_mut_ptr();
 
     // SAFETY: Each thread writes to [index[row]..index[row+1]), which are
     // non-overlapping ranges determined by the prefix sum above.
     let offsets_send = offsets_ptr as usize;
     let values_send = values_ptr as usize;
+    let bit_data_send = bit_data_ptr as usize;
 
     trace
         .backs
@@ -302,9 +358,11 @@ fn build_injector(trace: &PreflightTrace, cycles: usize) -> Injector {
         .for_each(|(row, back)| {
             let cycle = &trace.cycles[row];
             let mut pos = index[row] as usize;
+            let mut bit_pos = bit_index[row] as usize;
 
             let offsets_p = offsets_send as *mut u32;
             let values_p = values_send as *mut Val;
+            let bit_data_p = bit_data_send as *mut u32;
 
             let mut set = |col: usize, value: u32| {
                 let idx = col * cycles + row;
@@ -313,6 +371,15 @@ fn build_injector(trace: &PreflightTrace, cycles: usize) -> Injector {
                     *values_p.add(pos) = Val::new(value);
                 }
                 pos += 1;
+            };
+
+            let mut set_bits = |col: usize, value: u32| {
+                unsafe {
+                    *bit_data_p.add(bit_pos * 3) = row as u32;
+                    *bit_data_p.add(bit_pos * 3 + 1) = col as u32;
+                    *bit_data_p.add(bit_pos * 3 + 2) = value;
+                }
+                bit_pos += 1;
             };
 
             match back {
@@ -332,9 +399,7 @@ fn build_injector(trace: &PreflightTrace, cycles: usize) -> Injector {
                         set(col, value);
                     }
                     for (col, value) in zip(Sha2State::u32_offsets(), sha2_state.u32_array()) {
-                        for i in 0..32 {
-                            set(col + i, (value >> i) & 1);
-                        }
+                        set_bits(col, value);
                     }
                 }
                 Back::BigInt(state) => {
@@ -351,12 +416,13 @@ fn build_injector(trace: &PreflightTrace, cycles: usize) -> Injector {
             set(NEXT_MACHINE_MODE, cycle.machine_mode as u32);
         });
 
-    Injector {
+    (Injector {
         rows: cycles,
         offsets,
         values,
         index,
-    }
+        bit_data,
+    }, bigint_rows)
 }
 
 fn build_global_vec(segment: &Segment, trace: &PreflightTrace) -> Vec<Val> {
@@ -396,6 +462,34 @@ fn build_global_vec(segment: &Segment, trace: &PreflightTrace) -> Vec<Val> {
     // shutdown_cycle
     global[LAYOUT_GLOBAL.shutdown_cycle._super.offset] = segment.segment_threshold.into();
 
+    // state out (written by GPU witgen in exec_ControlStoreRoot)
+    for (i, word) in segment.claim.post_state.as_words().iter().enumerate() {
+        let low = word & 0xffff;
+        let high = word >> 16;
+        global[LAYOUT_GLOBAL.state_out.values[i].low._super.offset] = low.into();
+        global[LAYOUT_GLOBAL.state_out.values[i].high._super.offset] = high.into();
+    }
+
+    // output digest (written by GPU witgen in exec_ControlSuspend)
+    if let Some(output) = &segment.claim.output {
+        for (i, word) in output.as_words().iter().enumerate() {
+            let low = word & 0xffff;
+            let high = word >> 16;
+            global[LAYOUT_GLOBAL.output.values[i].low._super.offset] = low.into();
+            global[LAYOUT_GLOBAL.output.values[i].high._super.offset] = high.into();
+        }
+    }
+
+    // terminate state (written by GPU witgen in exec_ECallTerminate/exec_ControlSuspend)
+    if let Some(ts) = &segment.claim.terminate_state {
+        let a0: u32 = ts.a0.into();
+        let a1: u32 = ts.a1.into();
+        global[LAYOUT_GLOBAL.term_a0low._super.offset] = (a0 & 0xffff).into();
+        global[LAYOUT_GLOBAL.term_a0high._super.offset] = (a0 >> 16).into();
+        global[LAYOUT_GLOBAL.term_a1low._super.offset] = (a1 & 0xffff).into();
+        global[LAYOUT_GLOBAL.term_a1high._super.offset] = (a1 >> 16).into();
+    }
+
     // povw nonce
     // Split the U256 nonce into LE shorts and assign to the globals.
     let nonce = segment.povw_nonce.unwrap_or(PovwNonce::ZERO);
@@ -422,6 +516,8 @@ struct Injector {
     offsets: Vec<u32>,
     values: Vec<Val>,
     index: Vec<u32>,
+    /// Packed (row, base_col, value) triples for GPU-side u32→bits decomposition.
+    bit_data: Vec<u32>,
 }
 
 impl Injector {
@@ -433,6 +529,7 @@ impl Injector {
             offsets: vec![],
             values: vec![],
             index,
+            bit_data: vec![],
         }
     }
 

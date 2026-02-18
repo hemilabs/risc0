@@ -111,7 +111,8 @@ const char* risc0_zkp_cuda_mix_poly_coeffs(FpExt* out,
                                            const FpExt* mix,
                                            const uint32_t inputSize,
                                            const uint32_t count) {
-  return launchKernel(mix_poly_coeffs, count, 0, out, in, combos, mixStart, mix, inputSize, count);
+  return launchKernel(mix_poly_coeffs, count, inputSize * sizeof(FpExt),
+                      out, in, combos, mixStart, mix, inputSize, count);
 }
 
 const char* risc0_zkp_cuda_batch_bit_reverse(Fp* io, const uint32_t nBits, const uint32_t count) {
@@ -139,6 +140,111 @@ const char* risc0_zkp_cuda_scatter(Fp* into,
                                    const Fp* values,
                                    const uint32_t count) {
   return launchKernel(scatter, count, 0, into, index, offsets, values, count);
+}
+
+const char* risc0_zkp_cuda_scatter_bits(Fp* into,
+                                        const uint32_t* data,
+                                        const uint32_t cycles,
+                                        const uint32_t count) {
+  return launchKernel(scatter_bits, count, 0, into, data, cycles, count);
+}
+
+// Scatter from host memory using persistent device buffers.
+// Reuses grow-only device buffers across segments to avoid per-call allocation.
+const char* risc0_zkp_cuda_scatter_from_host(Fp* into,
+                                             const uint32_t* h_index,
+                                             uint32_t index_count,
+                                             const uint32_t* h_offsets,
+                                             uint32_t offsets_count,
+                                             const Fp* h_values,
+                                             uint32_t values_count,
+                                             uint32_t count) {
+  try {
+    cudaStream_t stream = getPersistentStream();
+
+    // Persistent device buffers (grow-only, reused across segments).
+    static uint32_t* d_index = nullptr;
+    static uint32_t* d_offsets = nullptr;
+    static Fp* d_values = nullptr;
+    static size_t cap_d_index = 0, cap_d_offsets = 0, cap_d_values = 0;
+
+    size_t index_bytes = index_count * sizeof(uint32_t);
+    size_t offsets_bytes = offsets_count * sizeof(uint32_t);
+    size_t values_bytes = values_count * sizeof(Fp);
+
+    // Grow device buffers if needed.
+    if (index_bytes > cap_d_index) {
+      if (d_index) CUDA_OK(cudaFree(d_index));
+      CUDA_OK(cudaMalloc(&d_index, index_bytes));
+      cap_d_index = index_bytes;
+    }
+    if (offsets_bytes > cap_d_offsets) {
+      if (d_offsets) CUDA_OK(cudaFree(d_offsets));
+      CUDA_OK(cudaMalloc(&d_offsets, offsets_bytes));
+      cap_d_offsets = offsets_bytes;
+    }
+    if (values_bytes > cap_d_values) {
+      if (d_values) CUDA_OK(cudaFree(d_values));
+      CUDA_OK(cudaMalloc(&d_values, values_bytes));
+      cap_d_values = values_bytes;
+    }
+
+    // Async H2D transfers (CUDA driver stages pageable memory internally).
+    CUDA_OK(cudaMemcpyAsync(d_index, h_index, index_bytes,
+                            cudaMemcpyHostToDevice, stream));
+    CUDA_OK(cudaMemcpyAsync(d_offsets, h_offsets, offsets_bytes,
+                            cudaMemcpyHostToDevice, stream));
+    CUDA_OK(cudaMemcpyAsync(d_values, h_values, values_bytes,
+                            cudaMemcpyHostToDevice, stream));
+
+    // Launch scatter kernel on same stream (waits for DMA implicitly).
+    LaunchConfig cfg = getCachedSimpleConfig(count);
+    scatter<<<cfg.grid, cfg.block, 0, stream>>>(
+        into, d_index, d_offsets, d_values, count);
+
+  } catch (const std::exception& err) {
+    return strdup(err.what());
+  } catch (...) {
+    return strdup("Generic exception");
+  }
+  return nullptr;
+}
+
+// Scatter bits from host memory using persistent device buffer.
+const char* risc0_zkp_cuda_scatter_bits_from_host(Fp* into,
+                                                  const uint32_t* h_data,
+                                                  uint32_t triplet_count,
+                                                  uint32_t cycles) {
+  try {
+    cudaStream_t stream = getPersistentStream();
+
+    // Persistent device buffer (grow-only, reused across segments).
+    static uint32_t* d_bitdata = nullptr;
+    static size_t cap_d_bitdata = 0;
+
+    size_t data_bytes = (size_t)triplet_count * 3 * sizeof(uint32_t);
+
+    if (data_bytes > cap_d_bitdata) {
+      if (d_bitdata) CUDA_OK(cudaFree(d_bitdata));
+      CUDA_OK(cudaMalloc(&d_bitdata, data_bytes));
+      cap_d_bitdata = data_bytes;
+    }
+
+    // Async H2D transfer (CUDA driver stages pageable memory internally).
+    CUDA_OK(cudaMemcpyAsync(d_bitdata, h_data, data_bytes,
+                            cudaMemcpyHostToDevice, stream));
+
+    // Launch scatter_bits kernel on same stream.
+    LaunchConfig cfg = getCachedSimpleConfig(triplet_count);
+    scatter_bits<<<cfg.grid, cfg.block, 0, stream>>>(
+        into, d_bitdata, cycles, triplet_count);
+
+  } catch (const std::exception& err) {
+    return strdup(err.what());
+  } catch (...) {
+    return strdup("Generic exception");
+  }
+  return nullptr;
 }
 
 const char*

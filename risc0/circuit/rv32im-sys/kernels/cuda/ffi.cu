@@ -56,83 +56,6 @@ struct DeviceExecContext {
   LookupTables* tables;
 };
 
-struct HostExecContext {
-  DeviceExecContext* ctx;
-  DeviceExecContext h_ctx;  // host-side copy for filling in pointers
-  PreflightTrace d_preflight;
-  LookupTables d_tables;
-  void* alloc_ptrs[10];
-  size_t alloc_count = 0;
-
-  HostExecContext(ExecBuffers* buffers, PreflightTrace* preflight, size_t cycles) {
-    cudaStream_t stream = getPersistentStream();
-
-    CUDA_OK(cudaMallocAsync(&ctx, sizeof(DeviceExecContext), stream));
-    alloc_ptrs[alloc_count++] = ctx;
-
-    CUDA_OK(cudaMallocAsync(&h_ctx.data, sizeof(Buffer), stream));
-    CUDA_OK(cudaMemcpyAsync(h_ctx.data, &buffers->data, sizeof(Buffer), cudaMemcpyHostToDevice, stream));
-    alloc_ptrs[alloc_count++] = h_ctx.data;
-
-    CUDA_OK(cudaMallocAsync(&h_ctx.global, sizeof(Buffer), stream));
-    CUDA_OK(cudaMemcpyAsync(h_ctx.global, &buffers->global, sizeof(Buffer), cudaMemcpyHostToDevice, stream));
-    alloc_ptrs[alloc_count++] = h_ctx.global;
-
-    CUDA_OK(cudaMallocAsync(&d_preflight.cycles, cycles * sizeof(PreflightCycle), stream));
-    CUDA_OK(cudaMemcpyAsync(d_preflight.cycles,
-                       preflight->cycles,
-                       cycles * sizeof(PreflightCycle),
-                       cudaMemcpyHostToDevice, stream));
-    alloc_ptrs[alloc_count++] = d_preflight.cycles;
-
-    CUDA_OK(cudaMallocAsync(&d_preflight.txns, preflight->txnsLen * sizeof(MemoryTransaction), stream));
-    CUDA_OK(cudaMemcpyAsync(d_preflight.txns,
-                       preflight->txns,
-                       preflight->txnsLen * sizeof(MemoryTransaction),
-                       cudaMemcpyHostToDevice, stream));
-    alloc_ptrs[alloc_count++] = d_preflight.txns;
-
-    CUDA_OK(cudaMallocAsync(&d_preflight.bigintBytes, preflight->bigintBytesLen, stream));
-    CUDA_OK(cudaMemcpyAsync(d_preflight.bigintBytes,
-                       preflight->bigintBytes,
-                       preflight->bigintBytesLen,
-                       cudaMemcpyHostToDevice, stream));
-    alloc_ptrs[alloc_count++] = d_preflight.bigintBytes;
-
-    d_preflight.txnsLen = preflight->txnsLen;
-    d_preflight.bigintBytesLen = preflight->bigintBytesLen;
-    d_preflight.tableSplitCycle = preflight->tableSplitCycle;
-
-    CUDA_OK(cudaMallocAsync(&h_ctx.preflight, sizeof(PreflightTrace), stream));
-    CUDA_OK(
-        cudaMemcpyAsync(h_ctx.preflight, &d_preflight, sizeof(PreflightTrace), cudaMemcpyHostToDevice, stream));
-    alloc_ptrs[alloc_count++] = h_ctx.preflight;
-
-    CUDA_OK(cudaMallocAsync(&d_tables.tableU8, (1 << 8) * sizeof(uint32_t), stream));
-    CUDA_OK(cudaMemsetAsync(d_tables.tableU8, 0, (1 << 8) * sizeof(uint32_t), stream));
-    alloc_ptrs[alloc_count++] = d_tables.tableU8;
-
-    CUDA_OK(cudaMallocAsync(&d_tables.tableU16, (1 << 16) * sizeof(uint32_t), stream));
-    CUDA_OK(cudaMemsetAsync(d_tables.tableU16, 0, (1 << 16) * sizeof(uint32_t), stream));
-    alloc_ptrs[alloc_count++] = d_tables.tableU16;
-
-    CUDA_OK(cudaMallocAsync(&h_ctx.tables, sizeof(LookupTables), stream));
-    CUDA_OK(cudaMemcpyAsync(h_ctx.tables, &d_tables, sizeof(LookupTables), cudaMemcpyHostToDevice, stream));
-    alloc_ptrs[alloc_count++] = h_ctx.tables;
-
-    CUDA_OK(cudaMemcpyAsync(ctx, &h_ctx, sizeof(DeviceExecContext), cudaMemcpyHostToDevice, stream));
-  }
-
-  DeviceExecContext* get_ctx() const { return ctx; }
-
-  ~HostExecContext() {
-    cudaStream_t stream = getPersistentStream();
-    for (size_t i = 0; i < alloc_count; i++) {
-      cudaFreeAsync(alloc_ptrs[i], stream);
-    }
-  }
-};
-
 struct AccumBuffers {
   Buffer data;
   Buffer accum;
@@ -149,82 +72,173 @@ struct DeviceAccumContext {
   LookupTables* tables;
 };
 
-struct HostAccumContext {
-  DeviceAccumContext* ctx;
-  DeviceAccumContext h_ctx;  // host-side copy for filling in pointers
-  PreflightTrace d_preflight;
-  LookupTables d_tables;
-  void* alloc_ptrs[11];
-  size_t alloc_count = 0;
+// Static cache for device-side allocations that persist across segments.
+// Eliminates ~42 cudaMallocAsync/cudaFreeAsync pairs per segment and avoids
+// re-uploading ~18MB of preflight data in the accum phase (which doesn't use it).
+struct DeviceCache {
+  // Exec context (device pointers, reused across segments)
+  DeviceExecContext* exec_ctx = nullptr;
+  Buffer* d_exec_data = nullptr;
+  Buffer* d_exec_global = nullptr;
+  PreflightTrace* d_exec_preflight = nullptr;
+  LookupTables* d_exec_tables = nullptr;
 
-  HostAccumContext(AccumBuffers* buffers, PreflightTrace* preflight, size_t cycles) {
-    cudaStream_t stream = getPersistentStream();
+  // Accum context (device pointers, reused across segments)
+  DeviceAccumContext* accum_ctx = nullptr;
+  Buffer* d_accum_data = nullptr;
+  Buffer* d_accum_accum = nullptr;
+  Buffer* d_accum_global = nullptr;
+  Buffer* d_accum_mix = nullptr;
+  PreflightTrace* d_accum_preflight = nullptr;
+  LookupTables* d_accum_tables = nullptr;
 
-    CUDA_OK(cudaMallocAsync(&ctx, sizeof(DeviceAccumContext), stream));
-    alloc_ptrs[alloc_count++] = ctx;
+  // Shared lookup table memory (reused, zeroed between phases)
+  ::cuda::atomic<uint32_t>* d_tableU8 = nullptr;
+  ::cuda::atomic<uint32_t>* d_tableU16 = nullptr;
 
-    CUDA_OK(cudaMallocAsync(&h_ctx.data, sizeof(Buffer), stream));
-    CUDA_OK(cudaMemcpyAsync(h_ctx.data, &buffers->data, sizeof(Buffer), cudaMemcpyHostToDevice, stream));
-    alloc_ptrs[alloc_count++] = h_ctx.data;
+  // Variable-size preflight data (grow-only, shared between exec and accum)
+  PreflightCycle* d_cycles = nullptr;
+  size_t cycles_capacity = 0;
+  MemoryTransaction* d_txns = nullptr;
+  size_t txns_capacity = 0;
+  uint8_t* d_bigintBytes = nullptr;
+  size_t bigintBytes_capacity = 0;
 
-    CUDA_OK(cudaMallocAsync(&h_ctx.accum, sizeof(Buffer), stream));
-    CUDA_OK(cudaMemcpyAsync(h_ctx.accum, &buffers->accum, sizeof(Buffer), cudaMemcpyHostToDevice, stream));
-    alloc_ptrs[alloc_count++] = h_ctx.accum;
 
-    CUDA_OK(cudaMallocAsync(&h_ctx.global, sizeof(Buffer), stream));
-    CUDA_OK(cudaMemcpyAsync(h_ctx.global, &buffers->global, sizeof(Buffer), cudaMemcpyHostToDevice, stream));
-    alloc_ptrs[alloc_count++] = h_ctx.global;
-
-    CUDA_OK(cudaMallocAsync(&h_ctx.mix, sizeof(Buffer), stream));
-    CUDA_OK(cudaMemcpyAsync(h_ctx.mix, &buffers->mix, sizeof(Buffer), cudaMemcpyHostToDevice, stream));
-    alloc_ptrs[alloc_count++] = h_ctx.mix;
-
-    CUDA_OK(cudaMallocAsync(&d_preflight.cycles, cycles * sizeof(PreflightCycle), stream));
-    CUDA_OK(cudaMemcpyAsync(d_preflight.cycles,
-                       preflight->cycles,
-                       cycles * sizeof(PreflightCycle),
-                       cudaMemcpyHostToDevice, stream));
-    alloc_ptrs[alloc_count++] = d_preflight.cycles;
-
-    CUDA_OK(cudaMallocAsync(&d_preflight.txns, preflight->txnsLen * sizeof(MemoryTransaction), stream));
-    CUDA_OK(cudaMemcpyAsync(d_preflight.txns,
-                       preflight->txns,
-                       preflight->txnsLen * sizeof(MemoryTransaction),
-                       cudaMemcpyHostToDevice, stream));
-    alloc_ptrs[alloc_count++] = d_preflight.txns;
-
-    d_preflight.txnsLen = preflight->txnsLen;
-    d_preflight.tableSplitCycle = preflight->tableSplitCycle;
-
-    CUDA_OK(cudaMallocAsync(&h_ctx.preflight, sizeof(PreflightTrace), stream));
-    CUDA_OK(
-        cudaMemcpyAsync(h_ctx.preflight, &d_preflight, sizeof(PreflightTrace), cudaMemcpyHostToDevice, stream));
-    alloc_ptrs[alloc_count++] = h_ctx.preflight;
-
-    CUDA_OK(cudaMallocAsync(&d_tables.tableU8, (1 << 8) * sizeof(uint32_t), stream));
-    CUDA_OK(cudaMemsetAsync(d_tables.tableU8, 0, (1 << 8) * sizeof(uint32_t), stream));
-    alloc_ptrs[alloc_count++] = d_tables.tableU8;
-
-    CUDA_OK(cudaMallocAsync(&d_tables.tableU16, (1 << 16) * sizeof(uint32_t), stream));
-    CUDA_OK(cudaMemsetAsync(d_tables.tableU16, 0, (1 << 16) * sizeof(uint32_t), stream));
-    alloc_ptrs[alloc_count++] = d_tables.tableU16;
-
-    CUDA_OK(cudaMallocAsync(&h_ctx.tables, sizeof(LookupTables), stream));
-    CUDA_OK(cudaMemcpyAsync(h_ctx.tables, &d_tables, sizeof(LookupTables), cudaMemcpyHostToDevice, stream));
-    alloc_ptrs[alloc_count++] = h_ctx.tables;
-
-    CUDA_OK(cudaMemcpyAsync(ctx, &h_ctx, sizeof(DeviceAccumContext), cudaMemcpyHostToDevice, stream));
+  void init(cudaStream_t stream) {
+    if (exec_ctx) return;  // already initialized
+    // Fixed-size allocations for exec context
+    CUDA_OK(cudaMallocAsync(&exec_ctx, sizeof(DeviceExecContext), stream));
+    CUDA_OK(cudaMallocAsync(&d_exec_data, sizeof(Buffer), stream));
+    CUDA_OK(cudaMallocAsync(&d_exec_global, sizeof(Buffer), stream));
+    CUDA_OK(cudaMallocAsync(&d_exec_preflight, sizeof(PreflightTrace), stream));
+    CUDA_OK(cudaMallocAsync(&d_exec_tables, sizeof(LookupTables), stream));
+    // Fixed-size allocations for accum context
+    CUDA_OK(cudaMallocAsync(&accum_ctx, sizeof(DeviceAccumContext), stream));
+    CUDA_OK(cudaMallocAsync(&d_accum_data, sizeof(Buffer), stream));
+    CUDA_OK(cudaMallocAsync(&d_accum_accum, sizeof(Buffer), stream));
+    CUDA_OK(cudaMallocAsync(&d_accum_global, sizeof(Buffer), stream));
+    CUDA_OK(cudaMallocAsync(&d_accum_mix, sizeof(Buffer), stream));
+    CUDA_OK(cudaMallocAsync(&d_accum_preflight, sizeof(PreflightTrace), stream));
+    CUDA_OK(cudaMallocAsync(&d_accum_tables, sizeof(LookupTables), stream));
+    // Shared lookup tables
+    CUDA_OK(cudaMallocAsync(&d_tableU8, (1 << 8) * sizeof(uint32_t), stream));
+    CUDA_OK(cudaMallocAsync(&d_tableU16, (1 << 16) * sizeof(uint32_t), stream));
   }
 
-  DeviceAccumContext* get_ctx() const { return ctx; }
-
-  ~HostAccumContext() {
-    cudaStream_t stream = getPersistentStream();
-    for (size_t i = 0; i < alloc_count; i++) {
-      cudaFreeAsync(alloc_ptrs[i], stream);
+  // Grow-only reallocation for variable-size preflight buffers
+  void ensure_preflight(cudaStream_t stream, size_t nCycles, size_t txnsLen, size_t bigintBytesLen) {
+    if (nCycles > cycles_capacity) {
+      if (d_cycles) CUDA_OK(cudaFreeAsync(d_cycles, stream));
+      CUDA_OK(cudaMallocAsync(&d_cycles, nCycles * sizeof(PreflightCycle), stream));
+      cycles_capacity = nCycles;
+    }
+    if (txnsLen > txns_capacity) {
+      if (d_txns) CUDA_OK(cudaFreeAsync(d_txns, stream));
+      CUDA_OK(cudaMallocAsync(&d_txns, txnsLen * sizeof(MemoryTransaction), stream));
+      txns_capacity = txnsLen;
+    }
+    if (bigintBytesLen > bigintBytes_capacity) {
+      if (d_bigintBytes) CUDA_OK(cudaFreeAsync(d_bigintBytes, stream));
+      CUDA_OK(cudaMallocAsync(&d_bigintBytes, bigintBytesLen, stream));
+      bigintBytes_capacity = bigintBytesLen;
     }
   }
+
+  // Setup exec context: upload buffers + preflight data + zero tables
+  DeviceExecContext* setup_exec(ExecBuffers* buffers, PreflightTrace* preflight,
+                                size_t lastCycle, cudaStream_t stream) {
+    init(stream);
+    ensure_preflight(stream, lastCycle, preflight->txnsLen, preflight->bigintBytesLen);
+
+    // Upload buffer descriptors
+    CUDA_OK(cudaMemcpyAsync(d_exec_data, &buffers->data, sizeof(Buffer), cudaMemcpyHostToDevice, stream));
+    CUDA_OK(cudaMemcpyAsync(d_exec_global, &buffers->global, sizeof(Buffer), cudaMemcpyHostToDevice, stream));
+
+    // Upload preflight data (async H2D, CUDA driver stages pageable memory).
+    CUDA_OK(cudaMemcpyAsync(d_cycles, preflight->cycles,
+                            lastCycle * sizeof(PreflightCycle), cudaMemcpyHostToDevice, stream));
+    CUDA_OK(cudaMemcpyAsync(d_txns, preflight->txns,
+                            preflight->txnsLen * sizeof(MemoryTransaction), cudaMemcpyHostToDevice, stream));
+    if (preflight->bigintBytesLen > 0) {
+      CUDA_OK(cudaMemcpyAsync(d_bigintBytes, preflight->bigintBytes,
+                              preflight->bigintBytesLen, cudaMemcpyHostToDevice, stream));
+    }
+
+    // Build and upload PreflightTrace descriptor
+    PreflightTrace h_pf;
+    h_pf.cycles = d_cycles;
+    h_pf.txns = d_txns;
+    h_pf.bigintBytes = d_bigintBytes;
+    h_pf.txnsLen = preflight->txnsLen;
+    h_pf.bigintBytesLen = preflight->bigintBytesLen;
+    h_pf.tableSplitCycle = preflight->tableSplitCycle;
+    CUDA_OK(cudaMemcpyAsync(d_exec_preflight, &h_pf, sizeof(PreflightTrace), cudaMemcpyHostToDevice, stream));
+
+    // Zero and upload lookup tables
+    CUDA_OK(cudaMemsetAsync(d_tableU8, 0, (1 << 8) * sizeof(uint32_t), stream));
+    CUDA_OK(cudaMemsetAsync(d_tableU16, 0, (1 << 16) * sizeof(uint32_t), stream));
+    LookupTables h_tables;
+    h_tables.tableU8 = d_tableU8;
+    h_tables.tableU16 = d_tableU16;
+    CUDA_OK(cudaMemcpyAsync(d_exec_tables, &h_tables, sizeof(LookupTables), cudaMemcpyHostToDevice, stream));
+
+    // Build and upload DeviceExecContext
+    DeviceExecContext h_ctx;
+    h_ctx.data = d_exec_data;
+    h_ctx.global = d_exec_global;
+    h_ctx.preflight = d_exec_preflight;
+    h_ctx.tables = d_exec_tables;
+    CUDA_OK(cudaMemcpyAsync(exec_ctx, &h_ctx, sizeof(DeviceExecContext), cudaMemcpyHostToDevice, stream));
+
+    return exec_ctx;
+  }
+
+  // Setup accum context: upload buffers only, reuse preflight from exec phase.
+  // The accum circuit (step_TopAccum) only uses lookupDelta/lookupCurrent - it never
+  // accesses preflight cycles/txns/bigintBytes, so we skip the ~18MB re-upload.
+  DeviceAccumContext* setup_accum(AccumBuffers* buffers, PreflightTrace* preflight,
+                                  size_t lastCycle, cudaStream_t stream) {
+    // Upload buffer descriptors
+    CUDA_OK(cudaMemcpyAsync(d_accum_data, &buffers->data, sizeof(Buffer), cudaMemcpyHostToDevice, stream));
+    CUDA_OK(cudaMemcpyAsync(d_accum_accum, &buffers->accum, sizeof(Buffer), cudaMemcpyHostToDevice, stream));
+    CUDA_OK(cudaMemcpyAsync(d_accum_global, &buffers->global, sizeof(Buffer), cudaMemcpyHostToDevice, stream));
+    CUDA_OK(cudaMemcpyAsync(d_accum_mix, &buffers->mix, sizeof(Buffer), cudaMemcpyHostToDevice, stream));
+
+    // Reuse preflight descriptor from exec phase (already on device)
+    // Just update tableSplitCycle in case it changed (it shouldn't, but be safe)
+    PreflightTrace h_pf;
+    h_pf.cycles = d_cycles;
+    h_pf.txns = d_txns;
+    h_pf.bigintBytes = d_bigintBytes;
+    h_pf.txnsLen = preflight->txnsLen;
+    h_pf.bigintBytesLen = preflight->bigintBytesLen;
+    h_pf.tableSplitCycle = preflight->tableSplitCycle;
+    CUDA_OK(cudaMemcpyAsync(d_accum_preflight, &h_pf, sizeof(PreflightTrace), cudaMemcpyHostToDevice, stream));
+
+    // Zero and upload lookup tables (must be fresh for accum phase)
+    CUDA_OK(cudaMemsetAsync(d_tableU8, 0, (1 << 8) * sizeof(uint32_t), stream));
+    CUDA_OK(cudaMemsetAsync(d_tableU16, 0, (1 << 16) * sizeof(uint32_t), stream));
+    LookupTables h_tables;
+    h_tables.tableU8 = d_tableU8;
+    h_tables.tableU16 = d_tableU16;
+    CUDA_OK(cudaMemcpyAsync(d_accum_tables, &h_tables, sizeof(LookupTables), cudaMemcpyHostToDevice, stream));
+
+    // Build and upload DeviceAccumContext
+    DeviceAccumContext h_ctx;
+    h_ctx.data = d_accum_data;
+    h_ctx.accum = d_accum_accum;
+    h_ctx.global = d_accum_global;
+    h_ctx.mix = d_accum_mix;
+    h_ctx.preflight = d_accum_preflight;
+    h_ctx.tables = d_accum_tables;
+    CUDA_OK(cudaMemcpyAsync(accum_ctx, &h_ctx, sizeof(DeviceAccumContext), cudaMemcpyHostToDevice, stream));
+
+    return accum_ctx;
+  }
 };
+
+static DeviceCache g_cache;
 
 __device__ ::cuda::std::array<uint32_t, 2>
 divide_rv32im(uint32_t numer, uint32_t denom, uint32_t signType) {
@@ -462,10 +476,7 @@ const char* risc0_circuit_rv32im_cuda_witgen(uint32_t mode,
   try {
     cudaStream_t stream = getPersistentStream();
     auto t0 = std::chrono::steady_clock::now();
-    // No explicit event sync needed: the persistent stream is a blocking stream
-    // (created with cudaStreamCreate, no NonBlocking flag), so it automatically
-    // synchronizes with default stream operations (buffer allocs, memsets).
-    HostExecContext ctx(buffers, preflight, lastCycle);
+    DeviceExecContext* d_ctx = g_cache.setup_exec(buffers, preflight, lastCycle, stream);
     auto t1 = std::chrono::steady_clock::now();
     size_t split = preflight->tableSplitCycle;
 
@@ -474,26 +485,26 @@ const char* risc0_circuit_rv32im_cuda_witgen(uint32_t mode,
       auto cfg1 = getSimpleConfig(split);
       size_t phase2Count = lastCycle - split;
       auto cfg2 = getSimpleConfig(phase2Count);
-      // Launch both phases back-to-back on the same stream (GPU serializes automatically).
-      // Single sync at the end catches errors from both.
       {
         nvtx3::scoped_range range("par_stepExec");
-        par_stepExec<<<cfg1.grid, cfg1.block, 0, stream>>>(ctx.get_ctx(), 0, split);
-        par_stepExec<<<cfg2.grid, cfg2.block, 0, stream>>>(ctx.get_ctx(), split, phase2Count);
-        CUDA_OK(cudaStreamSynchronize(stream));
+        par_stepExec<<<cfg1.grid, cfg1.block, 0, stream>>>(d_ctx, 0, split);
+        par_stepExec<<<cfg2.grid, cfg2.block, 0, stream>>>(d_ctx, split, phase2Count);
+        // No sync needed: subsequent operations on same stream (zeroize, iNTT)
+        // are ordered by CUDA stream semantics. The ~2ms of CPU work (Fiat-Shamir
+        // setup + commit(code)) that follows overlaps with GPU step_exec.
       }
     } break;
     case kStepModeSeqForward:
-      fwd_stepExec<<<1, 1, 0, stream>>>(ctx.get_ctx(), lastCycle);
+      fwd_stepExec<<<1, 1, 0, stream>>>(d_ctx, lastCycle);
       CUDA_OK(cudaStreamSynchronize(stream));
       break;
     case kStepModeSeqReverse:
-      rev_stepExec<<<1, 1, 0, stream>>>(ctx.get_ctx(), split, lastCycle);
+      rev_stepExec<<<1, 1, 0, stream>>>(d_ctx, split, lastCycle);
       CUDA_OK(cudaStreamSynchronize(stream));
       break;
     }
     auto t2 = std::chrono::steady_clock::now();
-    fprintf(stderr, "      [ffi_witgen] ctx_setup: %.1fms, kernels+sync: %.1fms\n",
+    fprintf(stderr, "      [ffi_witgen] ctx_setup: %.1fms, kernels(async): %.1fms\n",
             std::chrono::duration<double, std::milli>(t1 - t0).count(),
             std::chrono::duration<double, std::milli>(t2 - t1).count());
   } catch (const std::exception& err) {
@@ -511,20 +522,17 @@ const char* risc0_circuit_rv32im_cuda_accum(AccumBuffers* buffers,
     cudaStream_t stream = getPersistentStream();
 
     auto t0 = std::chrono::steady_clock::now();
-    // No explicit event sync needed: the persistent stream is a blocking stream
-    // (created with cudaStreamCreate, no NonBlocking flag), so it automatically
-    // synchronizes with default stream operations (scatter H2D, mix upload).
-    HostAccumContext ctx(buffers, preflight, lastCycle);
+    DeviceAccumContext* d_ctx = g_cache.setup_accum(buffers, preflight, lastCycle, stream);
     auto t1 = std::chrono::steady_clock::now();
     auto cfg = getSimpleConfig(lastCycle);
 
     {
       nvtx3::scoped_range range("stepAccum");
-      stepAccum<<<cfg.grid, cfg.block, 0, stream>>>(ctx.get_ctx(), lastCycle);
+      stepAccum<<<cfg.grid, cfg.block, 0, stream>>>(d_ctx, lastCycle);
 
-      // Run thrust scans on the same persistent stream as stepAccum to avoid
-      // cross-stream synchronization overhead (thrust::device uses default stream).
-      auto policy = thrust::cuda::par.on(stream);
+      // par_nosync (CUDA 12.2+) uses cudaMallocAsync for temp storage instead
+      // of cudaMalloc, avoiding implicit device-wide synchronization per scan call.
+      auto policy = thrust::cuda::par_nosync.on(stream);
       size_t rows = buffers->accum.rows;
       for (size_t j = 0; j < 4; j++) {
         size_t col = buffers->accum.cols - 4 + j;
@@ -533,10 +541,7 @@ const char* risc0_circuit_rv32im_cuda_accum(AccumBuffers* buffers,
         thrust::inclusive_scan(policy, itBegin, itEnd, itBegin);
       }
 
-      finalizeAccum<<<cfg.grid, cfg.block, 0, stream>>>(ctx.get_ctx(), lastCycle);
-      // No sync needed: all GPU work is ordered on the persistent stream,
-      // HostAccumContext destructor uses only cudaFreeAsync (non-blocking),
-      // and the next sync happens at sync_stream() in commit_group.
+      finalizeAccum<<<cfg.grid, cfg.block, 0, stream>>>(d_ctx, lastCycle);
     }
     auto t2 = std::chrono::steady_clock::now();
     fprintf(stderr, "      [ffi_accum] ctx_setup: %.1fms, kernels: %.1fms\n",

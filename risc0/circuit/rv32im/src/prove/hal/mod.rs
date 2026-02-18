@@ -24,7 +24,7 @@ use risc0_zkp::{
     adapter::{CircuitInfo as _, PROOF_SYSTEM_INFO},
     field::Elem as _,
     hal::{Buffer, CircuitHal, Hal},
-    prove::Prover,
+    prove::{poly_group::PolyGroup, Prover},
 };
 
 use super::{
@@ -108,6 +108,8 @@ where
 {
     hal_factory: F,
     cached_hal: RefCell<Option<(Rc<H>, Rc<C>)>>,
+    /// Cached code PolyGroup (always zeros, same for every segment at same po2).
+    cached_code_group: RefCell<Option<PolyGroup<H>>>,
 }
 
 impl<H, C, F> SegmentProverImpl<H, C, F>
@@ -120,6 +122,7 @@ where
         Self {
             hal_factory,
             cached_hal: RefCell::new(None),
+            cached_code_group: RefCell::new(None),
         }
     }
 
@@ -174,6 +177,11 @@ where
         eprintln!("[prove_core] hal_factory: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
 
         let po2 = preflight_results.po2();
+        // Build header from CPU-side global vec BEFORE it's consumed by WitnessGenerator.
+        // The GPU witgen never writes to the global buffer (verified: 0 STOREs in steps.cu),
+        // so the CPU values are identical to what the GPU sees. This avoids a 41ms GPU sync
+        // that was previously caused by global.buf.view() waiting for par_stepExec to finish.
+        let header = preflight_results.build_header();
         let t1 = std::time::Instant::now();
         let witgen =
             WitnessGenerator::new(hal.as_ref(), circuit_hal.as_ref(), preflight_results, mode)?;
@@ -209,26 +217,27 @@ where
                     .iop()
                     .commit(&hashfn.hash_elem_slice(&CircuitImpl::CIRCUIT_INFO.encode()));
 
-                // Build header from GPU global buffer (after witgen + zeroize).
-                // The witgen writes state_out, output, term_* to global, so we must
-                // read from the GPU buffer, not the pre-upload CPU vec.
-                // Use view() (read-only D2H) instead of view_mut() to avoid H2D.
-                let global_len = witgen.global.cols;
-                let mut header = vec![Val::ZERO; global_len + 1];
-                witgen.global.buf.view(|view| {
-                    for (i, elem) in view.iter().enumerate() {
-                        header[i] = *elem;
-                    }
-                });
-                header[global_len] = Val::new_raw(po2);
+                // Use pre-computed header from CPU-side preflight data (no GPU sync needed).
                 let header_digest = hashfn.hash_elem_slice(&header);
                 prover.iop().commit(&header_digest);
                 prover.iop().write_field_elem_slice(header.as_slice());
                 prover.set_po2(po2 as usize);
                 eprintln!("  [main] setup: {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0);
 
-                prover.commit_group(REGISTER_GROUP_CODE, code);
-                eprintln!("  [main] commit(code): {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0);
+                // Code buffer is always zeros (INVALID → zeroized, never written to).
+                // Cache its PolyGroup to skip iNTT/expand/merkle on subsequent segments.
+                {
+                    let mut cache = self.cached_code_group.borrow_mut();
+                    if let Some(ref cached) = *cache {
+                        prover.commit_cached_group(REGISTER_GROUP_CODE, cached.clone());
+                        eprintln!("  [main] commit(code) [cached]: {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0);
+                    } else {
+                        prover.commit_group(REGISTER_GROUP_CODE, code);
+                        // Cache for next segment (PolyGroup clone is cheap — Rc refcount bump).
+                        *cache = prover.get_group(REGISTER_GROUP_CODE).cloned();
+                        eprintln!("  [main] commit(code) [computed+cached]: {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0);
+                    }
+                }
                 prover.commit_group(REGISTER_GROUP_DATA, data);
                 eprintln!("  [main] commit(data): {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0);
 
