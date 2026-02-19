@@ -73,6 +73,7 @@ const char* risc0_circuit_rv32im_cuda_eval_check(Fp* check,
     // Use async copy on our stream to avoid implicit device-wide sync
     CUDA_OK(cudaMemcpyToSymbolAsync(poly_mix, poly_mix_pows, sizeof(poly_mix),
                                      0, cudaMemcpyHostToDevice, stream));
+    (void)cudaGetLastError(); // consume any stale async errors
     eval_check<<<grid, block, 0, stream>>>(
         check, ctrl, data, accum, mix, out, rou, po2, domain);
     CUDA_OK(cudaGetLastError());

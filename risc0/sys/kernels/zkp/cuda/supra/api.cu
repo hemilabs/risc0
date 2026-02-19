@@ -58,6 +58,7 @@ sppark_poseidon2_fold(poseidon_out_t* d_out, const poseidon_in_t* d_in, size_t n
   size_t num_blocks = num_hashes < 256 ? 1 : num_hashes / 256;
 
   try {
+    (void)cudaGetLastError(); // consume any stale async errors
     _poseidon2_fold<<<num_blocks, block_size, 0, gpu>>>(d_out, d_in, num_hashes);
 
     CUDA_OK(cudaGetLastError());
@@ -76,6 +77,7 @@ sppark_poseidon2_fold_tree(poseidon_out_t* nodes, uint32_t layers) {
   const gpu_t& gpu = select_gpu();
 
   try {
+    (void)cudaGetLastError(); // consume any stale async errors
     for (int i = layers - 1; i >= 0; i--) {
       uint32_t layer_size = 1u << i;
       size_t block_size = layer_size < 256 ? layer_size : 256;
@@ -104,6 +106,7 @@ sppark_poseidon2_rows(poseidon_out_t* d_out, const fr_t* d_in, uint32_t count, u
   size_t num_blocks = (count + block_size - 1) / block_size;
 
   try {
+    (void)cudaGetLastError(); // consume any stale async errors
     _poseidon2_rows<<<num_blocks, block_size, 0, gpu>>>(d_out, d_in, count, col_size);
 
     CUDA_OK(cudaGetLastError());
@@ -158,6 +161,7 @@ sppark_poseidon254_fold(alt_bn128::fr_t* d_out, const alt_bn128::fr_t* d_in, siz
   compute_grid_block_size(num_hashes, block_size, num_blocks);
 
   try {
+    (void)cudaGetLastError(); // consume any stale async errors
     _poseidon254_fold<<<num_blocks, block_size, 0, gpu>>>(d_out, d_in, num_hashes);
 
     CUDA_OK(cudaGetLastError());
@@ -179,6 +183,7 @@ sppark_poseidon254_fold_tree(alt_bn128::fr_t* nodes, uint32_t layers) {
   size_t num_blocks = gpu.sm_count();
 
   try {
+    (void)cudaGetLastError(); // consume any stale async errors
     for (int i = layers - 1; i >= 0; i--) {
       uint32_t layer_size = 1u << i;
       size_t bs = block_size;
@@ -210,6 +215,7 @@ sppark_poseidon254_rows(alt_bn128::fr_t* d_out, const fr_t* d_in, size_t count, 
   compute_grid_block_size(count, block_size, num_blocks);
 
   try {
+    (void)cudaGetLastError(); // consume any stale async errors
     _poseidon254_rows<<<num_blocks, block_size, 0, gpu>>>(d_out, d_in, count, col_size);
 
     CUDA_OK(cudaGetLastError());

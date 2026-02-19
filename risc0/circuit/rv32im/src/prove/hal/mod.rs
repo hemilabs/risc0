@@ -109,7 +109,7 @@ where
     hal_factory: F,
     cached_hal: RefCell<Option<(Rc<H>, Rc<C>)>>,
     /// Cached code PolyGroup (always zeros, same for every segment at same po2).
-    cached_code_group: RefCell<Option<PolyGroup<H>>>,
+    cached_code_group: RefCell<Option<(PolyGroup<H>, usize)>>,
 }
 
 impl<H, C, F> SegmentProverImpl<H, C, F>
@@ -225,16 +225,24 @@ where
                 eprintln!("  [main] setup: {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0);
 
                 // Code buffer is always zeros (INVALID → zeroized, never written to).
-                // Cache its PolyGroup to skip iNTT/expand/merkle on subsequent segments.
+                // Cache its PolyGroup to skip iNTT/expand/merkle on subsequent segments
+                // with the same po2. Different po2 = different domain size = must recompute.
                 {
                     let mut cache = self.cached_code_group.borrow_mut();
-                    if let Some(ref cached) = *cache {
-                        prover.commit_cached_group(REGISTER_GROUP_CODE, cached.clone());
-                        eprintln!("  [main] commit(code) [cached]: {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0);
+                    if let Some((ref cached, cached_po2)) = *cache {
+                        if cached_po2 == po2 as usize {
+                            prover.commit_cached_group(REGISTER_GROUP_CODE, cached.clone());
+                            eprintln!("  [main] commit(code) [cached]: {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0);
+                        } else {
+                            prover.commit_group(REGISTER_GROUP_CODE, code);
+                            *cache = prover.get_group(REGISTER_GROUP_CODE).cloned()
+                                .map(|g| (g, po2 as usize));
+                            eprintln!("  [main] commit(code) [recomputed, po2 changed {cached_po2}->{po2}]: {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0);
+                        }
                     } else {
                         prover.commit_group(REGISTER_GROUP_CODE, code);
-                        // Cache for next segment (PolyGroup clone is cheap — Rc refcount bump).
-                        *cache = prover.get_group(REGISTER_GROUP_CODE).cloned();
+                        *cache = prover.get_group(REGISTER_GROUP_CODE).cloned()
+                            .map(|g| (g, po2 as usize));
                         eprintln!("  [main] commit(code) [computed+cached]: {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0);
                     }
                 }
