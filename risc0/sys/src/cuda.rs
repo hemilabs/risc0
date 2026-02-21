@@ -110,4 +110,13 @@ extern "C" {
         pows: *const u32,
         num_divides: u32,
     ) -> sppark::Error;
+
+    pub fn supra_poly_divide_multi(
+        combos_base: DevicePointer<u8>,
+        stride: usize,
+        combo_indices: *const u32,
+        pows_per_combo: *const u32,
+        all_pows: *const u32,
+        num_combos: u32,
+    ) -> sppark::Error;
 }

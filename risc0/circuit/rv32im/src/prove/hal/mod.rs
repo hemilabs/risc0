@@ -176,13 +176,9 @@ where
         let (hal, circuit_hal) = self.get_hal();
         eprintln!("[prove_core] hal_factory: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
 
-        let po2 = preflight_results.po2();
-        // Build header from CPU-side global vec BEFORE it's consumed by WitnessGenerator.
-        // The GPU witgen never writes to the global buffer (verified: 0 STOREs in steps.cu),
-        // so the CPU values are identical to what the GPU sees. This avoids a 41ms GPU sync
-        // that was previously caused by global.buf.view() waiting for par_stepExec to finish.
-        let header = preflight_results.build_header();
         let t1 = std::time::Instant::now();
+        let po2 = preflight_results.po2();
+        let header = preflight_results.build_header();
         let witgen =
             WitnessGenerator::new(hal.as_ref(), circuit_hal.as_ref(), preflight_results, mode)?;
         eprintln!("[prove_core] witgen: {:.1}ms", t1.elapsed().as_secs_f64() * 1000.0);
@@ -280,6 +276,7 @@ where
                         td.elapsed().as_secs_f64() * 1000.0);
                 },
             );
+
             eprintln!("[prove_core] prove_inner: {:.1}ms (main: {:.1}ms, finalize: {:.1}ms)",
                 t2.elapsed().as_secs_f64() * 1000.0,
                 (t3 - t2).as_secs_f64() * 1000.0,

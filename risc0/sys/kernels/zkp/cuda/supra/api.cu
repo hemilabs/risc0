@@ -279,3 +279,35 @@ supra_poly_divide_batch(fr4_t d_inout[/*len*/], size_t len,
 
   return RustError{cudaSuccess};
 }
+
+// Batch polynomial division across multiple combo slices.
+// Each combo slice (at combos_base + combo_indices[c] * stride) is divided
+// by its respective roots in-place. No remainder check — all kernels are
+// pipelined with a single gpu.sync() at the end for better GPU utilization.
+extern "C" RustError::by_value
+supra_poly_divide_multi(fr4_t* combos_base, size_t stride,
+                        const uint32_t combo_indices[],
+                        const uint32_t pows_per_combo[],
+                        const uint32_t all_pows_raw[],
+                        uint32_t num_combos) {
+  const gpu_t& gpu = select_gpu();
+  int sm_count = get_real_sm_count();
+  const fr4_t* all_pows = reinterpret_cast<const fr4_t*>(all_pows_raw);
+
+  try {
+    size_t pows_offset = 0;
+    for (uint32_t c = 0; c < num_combos; c++) {
+      fr4_t* slice = combos_base + combo_indices[c] * stride;
+      for (uint32_t d = 0; d < pows_per_combo[c]; d++) {
+        div_by_x_minus_z<true>(slice, stride, all_pows[pows_offset + d], gpu, sm_count);
+      }
+      pows_offset += pows_per_combo[c];
+    }
+    gpu.sync();
+  } catch (const cuda_error& e) {
+    gpu.sync();
+    return RustError{e.code(), e.what()};
+  }
+
+  return RustError{cudaSuccess};
+}

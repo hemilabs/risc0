@@ -335,6 +335,7 @@ impl<'a, H: Hal> Prover<'a, H> {
             // Set the mix value, which is used for FRI batching.
         });
 
+        eprintln!("  [finalize] misc: {:.1}ms", ft0.elapsed().as_secs_f64() * 1000.0);
         let mix = self.iop.random_ext_elem();
         tracing::debug!("Mix = {mix:?}");
 
@@ -346,6 +347,7 @@ impl<'a, H: Hal> Prover<'a, H> {
             self.hal
                 .alloc_extelem_zeroed("combos", self.cycles * (combo_count + 1))
         );
+        eprintln!("  [finalize] alloc_combos: {:.1}ms", ft0.elapsed().as_secs_f64() * 1000.0);
 
         scope!("mix_poly_coeffs", {
             let mut cur_mix = H::ExtElem::ONE;

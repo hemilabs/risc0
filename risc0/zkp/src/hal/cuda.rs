@@ -553,6 +553,7 @@ impl<CH: CudaHash + ?Sized> CudaHal<CH> {
         remainder
     }
 
+    #[allow(dead_code)]
     fn poly_divide_batch(
         &self,
         polynomial: &BufferImpl<BabyBearExtElem>,
@@ -1264,12 +1265,26 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
         cycles: usize,
     ) {
         scope!("combos_divide");
-        for (i, pows) in chunks {
-            let combo_slice = combos.slice(i * cycles, cycles);
-            let remainders = self.poly_divide_batch(&combo_slice, &pows);
-            for (j, r) in remainders.iter().enumerate() {
-                assert_eq!(*r, Self::ExtElem::ZERO, "i: {i}, pow_idx: {j}");
-            }
+        let combo_indices: Vec<u32> = chunks.iter().map(|(i, _)| *i as u32).collect();
+        let pows_per_combo: Vec<u32> = chunks.iter().map(|(_, pows)| pows.len() as u32).collect();
+        let all_pows_flat: Vec<u32> = chunks
+            .iter()
+            .flat_map(|(_, pows)| pows.iter().flat_map(|p| p.to_u32_words()))
+            .collect();
+
+        Self::sync_stream();
+        let err = unsafe {
+            supra_poly_divide_multi(
+                combos.as_device_ptr(),
+                cycles,
+                combo_indices.as_ptr(),
+                pows_per_combo.as_ptr(),
+                all_pows_flat.as_ptr(),
+                chunks.len() as u32,
+            )
+        };
+        if err.code != 0 {
+            panic!("Failure during supra_poly_divide_multi: {err}");
         }
     }
 }

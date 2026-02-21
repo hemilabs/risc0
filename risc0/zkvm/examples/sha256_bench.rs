@@ -11,17 +11,22 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(10_000);
 
+    let po2: Option<u32> = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok());
+
     let spec = BenchmarkSpec::HashBytesIter {
         buf: vec![0u8; 64],
         iters,
     };
 
-    eprintln!("Executing guest ({iters} SHA256 iterations)...");
-    let env = ExecutorEnv::builder()
-        .write(&spec)
-        .unwrap()
-        .build()
-        .unwrap();
+    eprintln!("Executing guest ({iters} SHA256 iterations, po2={})...", po2.map_or("default(20)".to_string(), |p| p.to_string()));
+    let mut builder = ExecutorEnv::builder();
+    builder.write(&spec).unwrap();
+    if let Some(po2) = po2 {
+        builder.segment_limit_po2(po2);
+    }
+    let env = builder.build().unwrap();
     let session = ExecutorImpl::from_elf(env, BENCH_ELF).unwrap().run().unwrap();
     eprintln!(
         "  segments: {}, total_cycles: {}, user_cycles: {}",
