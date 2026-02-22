@@ -151,6 +151,7 @@ fn build_cuda_kernels() {
         .flag("-O3")
         .flag("-Xptxas")
         .flag("-O3")
+        .flag("-maxrregcount=96")
         .include(&cuda_root)
         .include(&cxx_root)
         .include(&sppark_root);
