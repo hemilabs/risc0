@@ -10,14 +10,19 @@ fn main() {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(10_000);
+    let po2: u32 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
 
     let spec = BenchmarkSpec::HashBytesIter {
         buf: vec![0u8; 64],
         iters,
     };
 
-    eprintln!("Executing guest ({iters} SHA256 iterations)...");
+    eprintln!("Executing guest ({iters} SHA256 iterations, segment_limit_po2={po2})...");
     let env = ExecutorEnv::builder()
+        .segment_limit_po2(po2)
         .write(&spec)
         .unwrap()
         .build()

@@ -80,4 +80,4 @@ opt-level = 3
 lto = true
 
 [patch.crates-io]
-sppark = { git = "https://github.com/hemilabs/risc0-sppark", branch = "max/optimizations" }
+sppark = { path = "../risc0-sppark/rust" }

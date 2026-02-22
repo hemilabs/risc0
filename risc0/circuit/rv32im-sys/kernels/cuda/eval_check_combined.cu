@@ -68,6 +68,9 @@ const char* risc0_circuit_rv32im_cuda_eval_check(Fp* check,
     static bool cacheConfigSet = false;
     if (!cacheConfigSet) {
       cudaFuncSetCacheConfig((const void*)eval_check, cudaFuncCachePreferL1);
+      // Modern carveout API: give 0% to shared memory = 100% to L1 cache
+      cudaFuncSetAttribute((const void*)eval_check,
+                           cudaFuncAttributePreferredSharedMemoryCarveout, 0);
       cacheConfigSet = true;
     }
     // Use async copy on our stream to avoid implicit device-wide sync
