@@ -31,6 +31,7 @@ __global__ void eval_check(Fp* check,
                            const Fp rou,
                            uint32_t po2,
                            uint32_t domain) {
+  asm volatile (".pragma \"enable_smem_spilling\";");
   uint32_t cycle = blockDim.x * blockIdx.x + threadIdx.x;
   if (cycle < domain) {
     FpExt tot = poly_fp(cycle, domain, ctrl, out, data, mix, accum);

@@ -8329,6 +8329,7 @@ dependencies = [
 [[package]]
 name = "sppark"
 version = "0.1.12"
+source = "git+https://github.com/hemilabs/risc0-sppark?branch=max%2Foptimizations#2093a7b67da39f06555e2bf07321a0bed1cad5d9"
 dependencies = [
  "cc",
  "which 4.4.2",

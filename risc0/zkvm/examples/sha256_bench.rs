@@ -1,6 +1,8 @@
 use std::time::Instant;
 
-use risc0_zkvm::{get_prover_server, ExecutorEnv, ExecutorImpl, ProverOpts, VerifierContext};
+use risc0_zkvm::{
+    get_prover_server, ExecutorEnv, ExecutorImpl, ProverOpts, SimpleSegmentRef, VerifierContext,
+};
 #[cfg(feature = "cuda")]
 use risc0_circuit_rv32im;
 use risc0_zkvm_methods::{bench::BenchmarkSpec, BENCH_ELF, BENCH_ID};
@@ -27,7 +29,10 @@ fn main() {
         builder.segment_limit_po2(po2);
     }
     let env = builder.build().unwrap();
-    let session = ExecutorImpl::from_elf(env, BENCH_ELF).unwrap().run().unwrap();
+    let session = ExecutorImpl::from_elf(env, BENCH_ELF)
+        .unwrap()
+        .run_with_callback(|segment| Ok(Box::new(SimpleSegmentRef::new(segment))))
+        .unwrap();
     eprintln!(
         "  segments: {}, total_cycles: {}, user_cycles: {}",
         session.segments.len(),
