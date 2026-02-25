@@ -27,6 +27,16 @@ use crate::Seal;
 
 pub use self::seal_to_json::to_json;
 
+/// Pre-load resources needed for Groth16 proving (circom graph file).
+/// Call before identity_p254 to overlap I/O with GPU work.
+pub fn prepare() {
+    cfg_if::cfg_if! {
+        if #[cfg(feature = "cuda")] {
+            self::cuda::prepare();
+        }
+    }
+}
+
 /// Produce a Groth16 proof from an `identity_p254` seal.
 pub fn shrink_wrap(identity_p254_seal_bytes: &[u8]) -> Result<Seal> {
     cfg_if::cfg_if! {

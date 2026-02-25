@@ -50,14 +50,70 @@ struct ProveParams {
   const fr_t* witness;
 };
 
+static SRS* g_cached_srs = nullptr;
+static groth16_prover* g_cached_prover = nullptr;
+static std::string g_cached_srs_path;
+
+static void ensure_initialized(SetupParams* setup_params) {
+  std::string path(setup_params->srs_path);
+  if (g_cached_srs && g_cached_srs_path == path) return;
+  delete g_cached_prover; g_cached_prover = nullptr;
+  delete g_cached_srs; g_cached_srs = nullptr;
+  g_cached_srs = new SRS(0, setup_params->srs_path);
+  g_cached_srs_path = std::move(path);
+  g_cached_prover = new groth16_prover(*g_cached_srs,
+      setup_params->pcoeffs_path, setup_params->fres_path);
+}
+
+extern "C" const char* risc0_groth16_cuda_init(SetupParams* setup_params) {
+  try {
+    ensure_initialized(setup_params);
+  } catch (const std::exception& err) {
+    return strdup(err.what());
+  }
+  return nullptr;
+}
+
+// Raw proof output: 8 field elements (a.x, a.y, c.x, c.y, b[0..3]) in
+// non-Montgomery little-endian form. Layout matches groth16_proof struct.
+struct RawProofOutput {
+  uint8_t data[256]; // 8 × 32 bytes
+};
+
 extern "C" const char* risc0_groth16_cuda_prove(SetupParams* setup_params,
                                                 ProveParams* prover_params) {
 
   try {
-    SRS srs(0, setup_params->srs_path);
-    groth16_prover prover(srs, setup_params->pcoeffs_path, setup_params->fres_path);
-    groth16_proof proof = prover.prove(prover_params->public_path, prover_params->witness);
+    ensure_initialized(setup_params);
+    groth16_proof proof = g_cached_prover->prove(prover_params->public_path, prover_params->witness);
     write_proof_file(prover_params->proof_path, proof);
+  } catch (const std::exception& err) {
+    return strdup(err.what());
+  }
+  return nullptr;
+}
+
+extern "C" const char* risc0_groth16_cuda_prove_raw(SetupParams* setup_params,
+                                                    ProveParams* prover_params,
+                                                    RawProofOutput* raw_out) {
+  try {
+    ensure_initialized(setup_params);
+    groth16_proof proof = g_cached_prover->prove(prover_params->public_path, prover_params->witness);
+
+    // Convert from Montgomery form to standard and copy raw bytes.
+    // Use the same named union as write_proof_file to access individual fp_t values.
+    union proof_and_fp_t {
+      groth16_proof proof;
+      struct { fp_t a[2], c[2], b[4]; };
+    };
+    proof_and_fp_t u = proof_and_fp_t{proof};
+
+    // Convert all 8 field elements from Montgomery to standard form
+    for (int i = 0; i < 2; i++) { u.a[i].to(); }
+    for (int i = 0; i < 2; i++) { u.c[i].to(); }
+    for (int i = 0; i < 4; i++) { u.b[i].to(); }
+
+    memcpy(raw_out->data, &u, 256);
   } catch (const std::exception& err) {
     return strdup(err.what());
   }

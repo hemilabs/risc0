@@ -15,7 +15,8 @@
 pub mod zkr;
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    cell::RefCell,
+    collections::{BTreeMap, HashMap, VecDeque},
     fmt::Debug,
     sync::Mutex,
 };
@@ -81,6 +82,53 @@ pub fn lift(segment_receipt: &SegmentReceipt) -> Result<SuccinctReceipt<ReceiptC
     let claim = claim_decoded.merge(&segment_receipt.claim)?;
 
     make_succinct_receipt(prover, receipt, claim)
+}
+
+/// Pre-compute lift preflights for all segments in parallel.
+///
+/// Must be called from the same thread that will later call `lift()`.
+/// The preflights are stored in a thread-local cache and automatically consumed
+/// by the corresponding `lift()` calls, saving ~17ms of CPU work per segment.
+#[cfg(feature = "prove")]
+pub fn batch_preflight_lifts(segments: &[SegmentReceipt]) -> Result<()> {
+    use rayon::prelude::*;
+    use risc0_circuit_recursion::prove::{push_preflight_handles, PreflightHandle};
+
+    let handles: Vec<PreflightHandle> = segments
+        .par_iter()
+        .map(|seg| -> Result<PreflightHandle> {
+            let mut prover = Prover::new_lift(seg, ProverOpts::succinct())?;
+            prover.prover.compute_preflight()
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    push_preflight_handles(handles);
+    Ok(())
+}
+
+/// Pre-compute join preflights for pairs of succinct receipts in parallel.
+///
+/// Must be called from the same thread that will later call `join()`.
+/// The preflights are stored in a thread-local cache and automatically consumed
+/// by the corresponding `join()` calls, saving ~27ms of CPU work per join.
+/// Pairs must be in the same order as the subsequent `join()` calls.
+#[cfg(feature = "prove")]
+pub fn batch_preflight_joins(
+    pairs: &[(&SuccinctReceipt<ReceiptClaim>, &SuccinctReceipt<ReceiptClaim>)],
+) -> Result<()> {
+    use rayon::prelude::*;
+    use risc0_circuit_recursion::prove::{push_preflight_handles, PreflightHandle};
+
+    let handles: Vec<PreflightHandle> = pairs
+        .par_iter()
+        .map(|(a, b)| -> Result<PreflightHandle> {
+            let mut prover = Prover::new_join(a, b, ProverOpts::succinct())?;
+            prover.prover.compute_preflight()
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    push_preflight_handles(handles);
+    Ok(())
 }
 
 /// Run the lift program to create a succinct work claim receipt from a segment receipt.
@@ -397,7 +445,7 @@ pub fn prove_zkr(
     input: &[u8],
 ) -> Result<SuccinctReceipt<Unknown>> {
     let opts = ProverOpts::succinct().with_control_ids(allowed_control_ids);
-    let mut prover = Prover::new(program, *control_id, opts.clone());
+    let mut prover = Prover::new(program, *control_id, opts.clone())?;
     prover.add_input(bytemuck::cast_slice(input));
 
     tracing::debug!("Running prover");
@@ -416,9 +464,8 @@ pub fn prove_zkr(
     ))?;
 
     let hashfn = opts.hash_suite()?.hashfn;
-    let control_group = MerkleGroup::new(opts.control_ids.clone())?;
-    let control_root = control_group.calc_root(hashfn.as_ref());
-    let control_inclusion_proof = control_group.get_proof(control_id, hashfn.as_ref())?;
+    let control_root = prover.merkle_group.calc_root(hashfn.as_ref());
+    let control_inclusion_proof = prover.merkle_group.get_proof(control_id, hashfn.as_ref())?;
 
     let verifier_parameters = SuccinctReceiptVerifierParameters {
         control_root,
@@ -501,7 +548,7 @@ pub fn test_zkr(
     let control_id = program.compute_control_id(suite.clone()).unwrap();
     let opts = ProverOpts::succinct().with_control_ids(vec![control_id]);
 
-    let mut prover = Prover::new(program, control_id, opts.clone());
+    let mut prover = Prover::new(program, control_id, opts.clone())?;
     prover.add_input_digest(digest1, DigestKind::Poseidon2);
     prover.add_input_digest(digest2, DigestKind::Poseidon2);
 
@@ -519,7 +566,7 @@ pub fn test_zkr(
 
     // Include an inclusion proof for control_id to allow verification against a root.
     let hashfn = opts.hash_suite()?.hashfn;
-    let control_inclusion_proof = MerkleGroup::new(opts.control_ids.clone())?
+    let control_inclusion_proof = prover.merkle_group
         .get_proof(&prover.control_id, hashfn.as_ref())?;
     let control_root = control_inclusion_proof.root(&prover.control_id, hashfn.as_ref());
     let params = SuccinctReceiptVerifierParameters {
@@ -538,11 +585,26 @@ pub fn test_zkr(
     })
 }
 
+thread_local! {
+    /// Cache of Merkle root and inclusion proofs for control IDs.
+    /// The control_ids list is the same for all proofs in a session, so the root
+    /// and per-control-id proofs never change. Caching saves ~255 Poseidon2 hashes
+    /// per proof × 43 proofs = ~40ms of redundant CPU hashing.
+    static MERKLE_PROOF_CACHE: RefCell<Option<MerkleProofCache>> = RefCell::new(None);
+}
+
+struct MerkleProofCache {
+    leaves: Vec<Digest>,
+    root: Digest,
+    proofs: HashMap<Digest, MerkleProof>,
+}
+
 /// Prover for zkVM use of the recursion circuit.
 pub struct Prover {
     prover: risc0_circuit_recursion::prove::Prover,
     control_id: Digest,
     opts: ProverOpts,
+    merkle_group: MerkleGroup,
 }
 
 /// Utility macro to compress repeated checks that a receipt uses the poseidon2 hash.
@@ -557,12 +619,14 @@ macro_rules! ensure_poseidon2 {
 }
 
 impl Prover {
-    pub(crate) fn new(program: Program, control_id: Digest, opts: ProverOpts) -> Self {
-        Self {
+    pub(crate) fn new(program: Program, control_id: Digest, opts: ProverOpts) -> Result<Self> {
+        let merkle_group = MerkleGroup::new(opts.control_ids.clone())?;
+        Ok(Self {
             prover: risc0_circuit_recursion::prove::Prover::new(program, &opts.hashfn),
             control_id,
             opts,
-        }
+            merkle_group,
+        })
     }
 
     /// Returns the control id of the recursion VM program being proven.
@@ -570,22 +634,61 @@ impl Prover {
         &self.control_id
     }
 
+    /// Returns the Merkle root, using the thread-local cache to avoid recomputation.
+    fn cached_merkle_root(&self, hashfn: &dyn risc0_zkp::core::hash::HashFn<risc0_core::field::baby_bear::BabyBear>) -> Digest {
+        MERKLE_PROOF_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if cache.as_ref().is_some_and(|c| c.leaves != self.opts.control_ids) {
+                *cache = None;
+            }
+            let c = cache.get_or_insert_with(|| {
+                let root = self.merkle_group.calc_root(hashfn);
+                MerkleProofCache {
+                    leaves: self.opts.control_ids.clone(),
+                    root,
+                    proofs: HashMap::new(),
+                }
+            });
+            c.root
+        })
+    }
+
     /// Returns a Merkle inclusion proof of this prover's control ID in the set of allowed IDs.
+    /// Uses a thread-local cache to avoid recomputing ~255 Poseidon2 hashes per call.
     pub fn control_inclusion_proof(&self) -> Result<MerkleProof> {
-        let hashfn = self
-            .opts
-            .hash_suite()
-            .context("ProverOpts contains invalid hashfn")?
-            .hashfn;
-        MerkleGroup::new(self.opts.control_ids.clone())?
-            .get_proof(&self.control_id, hashfn.as_ref())
+        let control_id = self.control_id;
+        MERKLE_PROOF_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            // Invalidate cache if control_ids changed.
+            if cache.as_ref().is_some_and(|c| c.leaves != self.opts.control_ids) {
+                *cache = None;
+            }
+            let c = cache.get_or_insert_with(|| {
+                let hashfn = self.opts.hash_suite().unwrap().hashfn;
+                let root = self.merkle_group.calc_root(hashfn.as_ref());
+                MerkleProofCache {
+                    leaves: self.opts.control_ids.clone(),
+                    root,
+                    proofs: HashMap::new(),
+                }
+            });
+            if let Some(proof) = c.proofs.get(&control_id) {
+                return Ok(proof.clone());
+            }
+            let hashfn = self.opts.hash_suite()
+                .context("ProverOpts contains invalid hashfn")?
+                .hashfn;
+            let proof = self.merkle_group.get_proof(&control_id, hashfn.as_ref())?;
+            c.proofs.insert(control_id, proof.clone());
+            Ok(proof)
+        })
     }
 
     /// Initialize a recursion prover with the test recursion program. This program is used in
     /// testing the basic correctness of the recursion circuit.
     pub fn new_test_recursion_circuit(digests: [&Digest; 2], opts: ProverOpts) -> Result<Self> {
         let (program, control_id) = zkr::test_recursion_circuit(&opts.hashfn)?;
-        let mut prover = Prover::new(program, control_id, opts);
+        let mut prover = Prover::new(program, control_id, opts)?;
 
         for digest in digests {
             prover.add_input_digest(digest, DigestKind::Poseidon2);
@@ -621,8 +724,6 @@ impl Prover {
 
         let inner_hash_suite = hash_suite_from_name(&segment.hashfn)
             .ok_or_else(|| anyhow!("unsupported hash function: {}", segment.hashfn))?;
-        let allowed_ids = MerkleGroup::new(opts.control_ids.clone())?;
-        let merkle_root = allowed_ids.calc_root(inner_hash_suite.hashfn.as_ref());
 
         let out_size = risc0_circuit_rv32im::CircuitImpl::OUTPUT_SIZE;
 
@@ -644,8 +745,9 @@ impl Prover {
             false => zkr::lift(po2, &opts.hashfn)?,
             true => zkr::lift_povw(po2, &opts.hashfn)?,
         };
-        let mut prover = Prover::new(program, control_id, opts);
+        let mut prover = Prover::new(program, control_id, opts)?;
 
+        let merkle_root = prover.cached_merkle_root(inner_hash_suite.hashfn.as_ref());
         prover.add_input_digest(&merkle_root, DigestKind::Poseidon2);
         prover.add_input(seal);
 
@@ -666,12 +768,11 @@ impl Prover {
         ensure_poseidon2!(b);
 
         let hash_suite = Poseidon2HashSuite::new_suite();
-        let allowed_ids = MerkleGroup::new(opts.control_ids.clone())?;
-        let merkle_root = allowed_ids.calc_root(hash_suite.hashfn.as_ref());
 
         let (program, control_id) = zkr::union(&opts.hashfn)?;
-        let mut prover = Prover::new(program, control_id, opts);
+        let mut prover = Prover::new(program, control_id, opts)?;
 
+        let merkle_root = prover.cached_merkle_root(hash_suite.hashfn.as_ref());
         prover.add_input_digest(&merkle_root, DigestKind::Poseidon2);
         prover.add_succinct_generic_receipt(a)?;
         prover.add_succinct_generic_receipt(b)?;
@@ -692,7 +793,7 @@ impl Prover {
         ensure_poseidon2!(b);
 
         let (program, control_id) = zkr::join(&opts.hashfn)?;
-        let mut prover = Prover::new(program, control_id, opts);
+        let mut prover = Prover::new(program, control_id, opts)?;
 
         // Determine the control root from the receipts themselves, and ensure they are equal. If
         // the determined control root does not match what the downstream verifier expects, they
@@ -729,7 +830,7 @@ impl Prover {
             false => zkr::join_povw(&opts.hashfn)?,
             true => zkr::join_unwrap_povw(&opts.hashfn)?,
         };
-        let mut prover = Prover::new(program, control_id, opts);
+        let mut prover = Prover::new(program, control_id, opts)?;
 
         // Determine the control root from the receipts themselves, and ensure they are equal. If
         // the determined control root does not match what the downstream verifier expects, they
@@ -767,7 +868,7 @@ impl Prover {
 
         // Load the resolve predicate as a Program and construct the prover.
         let (program, control_id) = zkr::resolve(&opts.hashfn)?;
-        let mut prover = Prover::new(program, control_id, opts);
+        let mut prover = Prover::new(program, control_id, opts)?;
 
         // Load the input values needed by the predicate.
         // Resolve predicate needs both seals as input, and the journal and assumptions tail digest
@@ -815,7 +916,7 @@ impl Prover {
             false => zkr::resolve_povw(&opts.hashfn)?,
             true => zkr::resolve_unwrap_povw(&opts.hashfn)?,
         };
-        let mut prover = Prover::new(program, control_id, opts);
+        let mut prover = Prover::new(program, control_id, opts)?;
 
         // Load the input values needed by the predicate.
         // Resolve predicate needs both seals as input, and the journal and assumptions tail digest
@@ -854,7 +955,7 @@ impl Prover {
         ensure_poseidon2!(a);
 
         let (program, control_id) = zkr::identity(&opts.hashfn)?;
-        let mut prover = Prover::new(program, control_id, opts);
+        let mut prover = Prover::new(program, control_id, opts)?;
 
         prover.add_input_digest(&a.control_root()?, DigestKind::Poseidon2);
         prover.add_succinct_rv32im_receipt(a)?;
@@ -873,7 +974,7 @@ impl Prover {
         ensure_poseidon2!(a);
 
         let (program, control_id) = zkr::unwrap_povw(&opts.hashfn)?;
-        let mut prover = Prover::new(program, control_id, opts);
+        let mut prover = Prover::new(program, control_id, opts)?;
 
         prover.add_input_digest(&a.control_root()?, DigestKind::Poseidon2);
         prover.add_succinct_work_claim_rv32im_receipt(a)?;

@@ -21,7 +21,7 @@ use risc0_zkp::{
         baby_bear::{BabyBear, BabyBearElem, BabyBearExtElem},
         Elem as _,
     },
-    hal::Hal,
+    hal::{Buffer, Hal},
 };
 
 use crate::{CircuitImpl, CIRCUIT};
@@ -46,6 +46,8 @@ where
         circuit_hal: &C,
         zkr: &Program,
         preflight: &Preflight,
+        ctrl_transposed: &[BabyBearElem],
+        cached_ctrl_gpu: Option<&H::Buffer<H::Elem>>,
     ) -> Result<Self> {
         scope!("witgen");
 
@@ -54,17 +56,15 @@ where
         let global = vec![BabyBearElem::INVALID; CircuitImpl::OUTPUT_SIZE];
         let global = hal.copy_from_elem("global", &global);
 
-        let mut ctrl = vec![BabyBearElem::ZERO; total_cycles * CIRCUIT.ctrl_size()];
-
-        // populate the ctrl buffer
-        let ctrl_size = CIRCUIT.ctrl_size();
-        assert_eq!(ctrl_size, zkr.code_size);
-        for i in 0..zkr.code_rows() {
-            for j in 0..ctrl_size {
-                ctrl[j * total_cycles + i] = zkr.code[i * ctrl_size + j];
-            }
-        }
-        let ctrl = hal.copy_from_elem("ctrl", &ctrl);
+        // Use cached GPU ctrl buffer (GPU→GPU copy, ~0.01ms) instead of
+        // CPU→GPU upload (~2ms pageable memcpy) when available.
+        let ctrl = if let Some(cached) = cached_ctrl_gpu {
+            let buf = hal.alloc_elem("ctrl", cached.size());
+            hal.eltwise_copy_elem(&buf, cached);
+            buf
+        } else {
+            hal.copy_from_elem("ctrl", ctrl_transposed)
+        };
 
         let data = hal.alloc_elem_init(
             "data",

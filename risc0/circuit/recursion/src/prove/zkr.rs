@@ -12,7 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::io::{Cursor, Read as _};
+use std::{
+    collections::HashMap,
+    io::{Cursor, Read as _},
+    sync::Mutex,
+};
 
 use anyhow::{bail, Context as _, Result};
 
@@ -20,10 +24,22 @@ use super::Program;
 
 const ZKR_ZIP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/recursion_zkr.zip"));
 
+/// Cache for fully-constructed Programs to avoid re-reading from ZIP and
+/// re-running Montgomery encoding on every call.
+static ZKR_CACHE: Mutex<Option<HashMap<(String, usize), Program>>> = Mutex::new(None);
+
 pub fn get_zkr(name: &str, po2: usize) -> Result<Program> {
+    let mut cache = ZKR_CACHE.lock().unwrap();
+    let cache = cache.get_or_insert_with(HashMap::new);
+    let key = (name.to_string(), po2);
+    if let Some(program) = cache.get(&key) {
+        return Ok(program.clone());
+    }
     let mut zip = zip::ZipArchive::new(Cursor::new(ZKR_ZIP))?;
     let encoded = extract_zkr(&mut zip, name)?;
-    Ok(Program::from_encoded(&encoded, po2))
+    let program = Program::from_encoded(&encoded, po2);
+    cache.insert(key, program.clone());
+    Ok(program)
 }
 
 /// Iterate over all provided zkr programs.

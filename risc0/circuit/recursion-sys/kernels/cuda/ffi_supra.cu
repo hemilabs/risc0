@@ -65,9 +65,13 @@ extern "C" const char* risc0_circuit_recursion_cuda_eval_check(Fp* check,
   try {
     cudaStream_t stream = getPersistentStream();
     LaunchConfig cfg = getSimpleConfig(domain);
-    cudaMemcpyToSymbol(poly_mix, poly_mix_pows, sizeof(poly_mix));
+    // Use async copy on our stream to avoid implicit device-wide sync
+    CUDA_OK(cudaMemcpyToSymbolAsync(poly_mix, poly_mix_pows, sizeof(poly_mix),
+                                     0, cudaMemcpyHostToDevice, stream));
+    (void)cudaGetLastError(); // consume any stale async errors
     risc0::circuit::recursion::cuda::eval_check<<<cfg.grid, cfg.block, 0, stream>>>(
         check, ctrl, data, accum, mix, out, rou, po2, domain);
+    CUDA_OK(cudaGetLastError());
   } catch (const std::exception& err) {
     return strdup(err.what());
   }

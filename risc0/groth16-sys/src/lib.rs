@@ -67,6 +67,16 @@ impl ProverParams {
 }
 
 #[cfg(feature = "cuda")]
+pub fn init(setup_params: &SetupParams) -> anyhow::Result<()> {
+    let setup_params = RawSetupParams {
+        pcoeffs_path: setup_params.pcoeffs_path.c_str.as_ptr(),
+        fres_path: setup_params.fres_path.c_str.as_ptr(),
+        srs_path: setup_params.srs_path.c_str.as_ptr(),
+    };
+    ffi_wrap(|| unsafe { risc0_groth16_cuda_init(&setup_params) })
+}
+
+#[cfg(feature = "cuda")]
 pub fn prove(prover_params: &ProverParams, setup_params: &SetupParams) -> anyhow::Result<()> {
     let setup_params = RawSetupParams {
         pcoeffs_path: setup_params.pcoeffs_path.c_str.as_ptr(),
@@ -80,6 +90,38 @@ pub fn prove(prover_params: &ProverParams, setup_params: &SetupParams) -> anyhow
     };
 
     ffi_wrap(|| unsafe { risc0_groth16_cuda_prove(&setup_params, &prover_params) })
+}
+
+/// Raw proof output: 8 BN254 field elements in non-Montgomery LE form.
+/// Layout: [a.x(32), a.y(32), c.x(32), c.y(32), b[0](32), b[1](32), b[2](32), b[3](32)]
+#[cfg(feature = "cuda")]
+#[repr(C)]
+pub struct RawProofOutput {
+    pub data: [u8; 256],
+}
+
+/// Prove and return raw proof bytes directly, avoiding file I/O round-trip.
+#[cfg(feature = "cuda")]
+pub fn prove_raw(
+    prover_params: &ProverParams,
+    setup_params: &SetupParams,
+) -> anyhow::Result<RawProofOutput> {
+    let setup_params = RawSetupParams {
+        pcoeffs_path: setup_params.pcoeffs_path.c_str.as_ptr(),
+        fres_path: setup_params.fres_path.c_str.as_ptr(),
+        srs_path: setup_params.srs_path.c_str.as_ptr(),
+    };
+    let prover_params = RawProverParams {
+        public_path: prover_params.public_path.c_str.as_ptr(),
+        proof_path: prover_params.proof_path.c_str.as_ptr(),
+        witness: prover_params.witness,
+    };
+
+    let mut raw_out = RawProofOutput { data: [0u8; 256] };
+    ffi_wrap(|| unsafe {
+        risc0_groth16_cuda_prove_raw(&setup_params, &prover_params, &mut raw_out)
+    })?;
+    Ok(raw_out)
 }
 
 #[cfg(all(feature = "cuda", feature = "setup"))]
@@ -110,9 +152,19 @@ struct RawSetupParams {
 
 extern "C" {
     #[cfg(feature = "cuda")]
+    fn risc0_groth16_cuda_init(setup: *const RawSetupParams) -> *const c_char;
+
+    #[cfg(feature = "cuda")]
     fn risc0_groth16_cuda_prove(
         setup: *const RawSetupParams,
         params: *const RawProverParams,
+    ) -> *const c_char;
+
+    #[cfg(feature = "cuda")]
+    fn risc0_groth16_cuda_prove_raw(
+        setup: *const RawSetupParams,
+        params: *const RawProverParams,
+        raw_out: *mut RawProofOutput,
     ) -> *const c_char;
 
     #[cfg(all(feature = "cuda", feature = "setup"))]

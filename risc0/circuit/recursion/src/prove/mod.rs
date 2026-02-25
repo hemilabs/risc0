@@ -22,7 +22,7 @@ mod program;
 mod witgen;
 pub mod zkr;
 
-use std::{collections::VecDeque, fmt::Debug, rc::Rc};
+use std::{cell::RefCell, collections::VecDeque, fmt::Debug, mem, rc::Rc};
 
 use anyhow::Result;
 use cfg_if::cfg_if;
@@ -35,6 +35,7 @@ use risc0_zkp::{
         Elem as _,
     },
     hal::{Buffer, CircuitHal, Hal},
+    prove::poly_group::PolyGroup,
 };
 use serde::{Deserialize, Serialize};
 
@@ -91,6 +92,39 @@ pub fn recursion_prover(hashfn: &str) -> Result<Box<dyn RecursionProver>> {
     }
 }
 
+thread_local! {
+    /// Cache of pre-computed preflights, keyed by (po2, code_len).
+    /// Populated by `push_preflight_handles()` and consumed by `RecursionProverImpl::prove()`.
+    static PREFLIGHT_CACHE: RefCell<Vec<(Preflight, usize, usize)>> = RefCell::new(Vec::new());
+}
+
+/// Opaque handle for a pre-computed preflight result.
+/// Created by `Prover::compute_preflight()` and consumed by `push_preflight_handles()`.
+pub struct PreflightHandle {
+    preflight: Preflight,
+    po2: usize,
+    code_len: usize,
+}
+
+// Safety: Preflight contains only owned data (Vecs, BTreeMaps, scalars).
+unsafe impl Send for PreflightHandle {}
+
+/// Push pre-computed preflight handles into the thread-local cache.
+/// Must be called from the same thread that will later call `Prover::run()`.
+pub fn push_preflight_handles(handles: Vec<PreflightHandle>) {
+    PREFLIGHT_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        for h in handles {
+            cache.push((h.preflight, h.po2, h.code_len));
+        }
+    });
+}
+
+/// Clear any remaining pre-computed preflights from the cache.
+pub fn clear_preflight_cache() {
+    PREFLIGHT_CACHE.with(|cache| cache.borrow_mut().clear());
+}
+
 /// Prover for the recursion circuit.
 pub struct Prover {
     program: Program,
@@ -140,11 +174,41 @@ impl Prover {
         }
     }
 
+    /// Pre-compute the preflight for this prover.
+    /// Returns a handle that can be passed to `push_preflight_handles()`.
+    /// The input is consumed; `run()` will use the cached preflight.
+    pub fn compute_preflight(&mut self) -> Result<PreflightHandle> {
+        scope!("compute_preflight");
+        let mut preflight = Preflight::new(mem::take(&mut self.input));
+        for (cycle, row) in self.program.code_by_row().enumerate() {
+            preflight.step(cycle, row)?
+        }
+        Ok(PreflightHandle {
+            po2: self.program.po2,
+            code_len: self.program.code.len(),
+            preflight,
+        })
+    }
+
     /// Run the prover, producing a receipt of execution for the recursion circuit over the loaded
     /// program and input.
     pub fn run(&mut self) -> Result<RecursionReceipt> {
-        let prover = recursion_prover(&self.hashfn)?;
-        prover.prove(self.program.clone(), self.input.clone())
+        thread_local! {
+            static CACHED: RefCell<Option<(String, Box<dyn RecursionProver>)>> =
+                RefCell::new(None);
+        }
+        CACHED.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let need_new = match cache.as_ref() {
+                Some((hashfn, _)) => hashfn != &self.hashfn,
+                None => true,
+            };
+            if need_new {
+                *cache = Some((self.hashfn.clone(), recursion_prover(&self.hashfn)?));
+            }
+            let (_, prover) = cache.as_ref().unwrap();
+            prover.prove(mem::take(&mut self.program), mem::take(&mut self.input))
+        })
     }
 }
 
@@ -155,6 +219,17 @@ where
 {
     hal: Rc<H>,
     circuit_hal: Rc<C>,
+    /// Cached ctrl PolyGroups keyed by (po2, code_len). The ctrl group is deterministic
+    /// for a given recursion program, so repeat calls with the same program
+    /// skip iNTT/expand/merkle recomputation. Stored as a Vec since there are
+    /// only a few distinct programs (lift, join, identity_p254, shrink_wrap).
+    cached_ctrl_groups: RefCell<Vec<(PolyGroup<H>, usize, usize)>>,
+    /// Cached transposed ctrl CPU buffers keyed by (po2, code_len).
+    /// Avoids re-transposing program code into column-major layout on repeat calls.
+    cached_ctrl_cpu: RefCell<Vec<(Vec<BabyBearElem>, usize, usize)>>,
+    /// Cached ctrl GPU buffers keyed by (po2, code_len).
+    /// Avoids re-uploading ~24MB from CPU→GPU (pageable memcpy) every proof.
+    cached_ctrl_gpu: RefCell<Vec<(H::Buffer<H::Elem>, usize, usize)>>,
 }
 
 impl<H, C> RecursionProver for RecursionProverImpl<H, C>
@@ -165,14 +240,88 @@ where
     fn prove(&self, program: Program, input: VecDeque<u32>) -> Result<RecursionReceipt> {
         scope!("prove");
 
-        let preflight = self.preflight(&program, input)?;
+        // Use pre-computed preflight from cache if available (from batch_preflight_lifts).
+        let preflight = {
+            let cached = PREFLIGHT_CACHE.with(|cache| {
+                let mut cache = cache.borrow_mut();
+                if let Some(idx) = cache.iter().position(|(_, po2, code_len)| {
+                    *po2 == program.po2 && *code_len == program.code.len()
+                }) {
+                    Some(cache.remove(idx).0)
+                } else {
+                    None
+                }
+            });
+            match cached {
+                Some(pf) => pf,
+                None => self.preflight(&program, input)?,
+            }
+        };
+
+        // Ensure the transposed ctrl CPU buffer is cached, then borrow it.
+        {
+            let needs_compute = !self
+                .cached_ctrl_cpu
+                .borrow()
+                .iter()
+                .any(|(_, po2, code_len)| {
+                    *po2 == program.po2 && *code_len == program.code.len()
+                });
+            if needs_compute {
+                let total_cycles = 1usize << program.po2;
+                let ctrl_size = program.code_size;
+                let mut ctrl = vec![BabyBearElem::ZERO; total_cycles * ctrl_size];
+                for i in 0..program.code_rows() {
+                    for j in 0..ctrl_size {
+                        ctrl[j * total_cycles + i] = program.code[i * ctrl_size + j];
+                    }
+                }
+                self.cached_ctrl_cpu.borrow_mut().push((
+                    ctrl,
+                    program.po2,
+                    program.code.len(),
+                ));
+            }
+        }
+        let ctrl_cache = self.cached_ctrl_cpu.borrow();
+        let ctrl_transposed = &ctrl_cache
+            .iter()
+            .find(|(_, po2, code_len)| {
+                *po2 == program.po2 && *code_len == program.code.len()
+            })
+            .unwrap()
+            .0;
+
+        // Use cached GPU ctrl buffer if available (avoids ~2ms CPU→GPU pageable memcpy).
+        let cached_ctrl_gpu = {
+            let cache = self.cached_ctrl_gpu.borrow();
+            cache
+                .iter()
+                .find(|(_, po2, code_len)| {
+                    *po2 == program.po2 && *code_len == program.code.len()
+                })
+                .map(|(buf, _, _)| buf.clone())
+        };
 
         let witgen = WitnessGenerator::new(
             self.hal.as_ref(),
             self.circuit_hal.as_ref(),
             &program,
             &preflight,
+            ctrl_transposed,
+            cached_ctrl_gpu.as_ref(),
         )?;
+
+        // Cache the GPU ctrl buffer after first upload.
+        if cached_ctrl_gpu.is_none() {
+            let ctrl_clone = self.hal.alloc_elem("ctrl_cache", witgen.ctrl.size());
+            self.hal.eltwise_copy_elem(&ctrl_clone, &witgen.ctrl);
+            self.cached_ctrl_gpu.borrow_mut().push((
+                ctrl_clone,
+                program.po2,
+                program.code.len(),
+            ));
+        }
 
         let global = &witgen.global;
 
@@ -206,7 +355,31 @@ where
                 prover.iop().write_field_elem_slice(header.as_slice());
                 prover.set_po2(program.po2);
 
-                prover.commit_group(REGISTER_GROUP_CTRL, &witgen.ctrl);
+                // Cache the ctrl PolyGroup: ctrl is deterministic per (program, po2),
+                // so repeat calls with the same program skip iNTT/expand/merkle.
+                {
+                    let cached_ctrl = {
+                        let cache = self.cached_ctrl_groups.borrow();
+                        cache
+                            .iter()
+                            .find(|(_, po2, code_len)| {
+                                *po2 == program.po2 && *code_len == program.code.len()
+                            })
+                            .map(|(group, _, _)| group.clone())
+                    };
+                    if let Some(group) = cached_ctrl {
+                        prover.commit_cached_group(REGISTER_GROUP_CTRL, group);
+                    } else {
+                        prover.commit_group(REGISTER_GROUP_CTRL, &witgen.ctrl);
+                        if let Some(group) = prover.get_group(REGISTER_GROUP_CTRL).cloned() {
+                            self.cached_ctrl_groups.borrow_mut().push((
+                                group,
+                                program.po2,
+                                program.code.len(),
+                            ));
+                        }
+                    }
+                }
                 prover.commit_group(REGISTER_GROUP_DATA, &witgen.data);
 
                 // Make the mixing values
@@ -219,7 +392,6 @@ where
 
                 mix
             });
-
             prover.finalize(&[&mix, global], self.circuit_hal.as_ref())
         });
 
@@ -236,7 +408,13 @@ where
     C: CircuitHal<H> + CircuitWitnessGenerator<H>,
 {
     pub fn new(hal: Rc<H>, circuit_hal: Rc<C>) -> Self {
-        Self { hal, circuit_hal }
+        Self {
+            hal,
+            circuit_hal,
+            cached_ctrl_groups: RefCell::new(Vec::new()),
+            cached_ctrl_cpu: RefCell::new(Vec::new()),
+            cached_ctrl_gpu: RefCell::new(Vec::new()),
+        }
     }
 
     fn preflight(&self, program: &Program, input: VecDeque<u32>) -> Result<Preflight> {

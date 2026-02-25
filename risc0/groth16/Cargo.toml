@@ -49,6 +49,7 @@ cuda = [
   "dep:wtns-file",
   "prove",
   "risc0-groth16-sys/cuda",
+  "risc0-zkp/cuda",
 ]
 default = ["std"]
 prove = [

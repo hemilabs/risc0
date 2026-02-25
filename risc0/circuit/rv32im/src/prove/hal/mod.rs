@@ -179,7 +179,7 @@ where
         let t1 = std::time::Instant::now();
         let po2 = preflight_results.po2();
         let header = preflight_results.build_header();
-        let witgen =
+        let mut witgen =
             WitnessGenerator::new(hal.as_ref(), circuit_hal.as_ref(), preflight_results, mode)?;
         eprintln!("[prove_core] witgen: {:.1}ms", t1.elapsed().as_secs_f64() * 1000.0);
 
@@ -251,8 +251,17 @@ where
                 let mix = witgen.accum(hal.as_ref(), circuit_hal.as_ref(), &mix)?;
                 eprintln!("  [main] accum: {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0);
 
+                // Free dead witness buffers to reduce peak GPU memory.
+                // data.buf and code.buf are no longer needed after accum().
+                // At po2=22 this frees ~3.3GB, enabling the accum PolyGroup allocation.
+                witgen.data.buf = hal.alloc_elem("data_freed", 1);
+                witgen.code.buf = hal.alloc_elem("code_freed", 1);
+
                 prover.commit_group(REGISTER_GROUP_ACCUM, &witgen.accum.buf);
                 eprintln!("  [main] commit(accum): {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0);
+
+                // Free accum witness buffer — PolyGroup now owns the data.
+                witgen.accum.buf = hal.alloc_elem("accum_freed", 1);
 
                 // Clone tiny global buffer (90 elements = 360 bytes) so witgen can
                 // be dropped during async GPU eval_check.

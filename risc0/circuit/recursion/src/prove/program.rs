@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
+
 use anyhow::Result;
 
 use risc0_zkp::{
@@ -33,10 +35,12 @@ use super::RECURSION_CODE_SIZE;
 /// Programs for the recursion circuit are loaded into the control columns, which is a set of
 /// public columns in the witness. Programs are therefore identified by their control ID, which is
 /// similar but not the same as the image ID used to identify rv32im programs.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Program {
     /// The code of the program, encoded as Baby Bear field elements.
-    pub code: Vec<BabyBearElem>,
+    /// Wrapped in Arc to avoid expensive 15-23MB clones when the same program
+    /// (e.g. lift, join) is reused across multiple proofs.
+    pub code: Arc<Vec<BabyBearElem>>,
 
     /// The number of code columns.
     pub code_size: usize,
@@ -49,7 +53,7 @@ impl Program {
     /// Create a [Program] from a stream of data encoded by Zirgen.
     pub fn from_encoded(encoded: &[u32], po2: usize) -> Self {
         let prog = Self {
-            code: encoded.iter().copied().map(BabyBearElem::from).collect(),
+            code: Arc::new(encoded.iter().copied().map(BabyBearElem::from).collect()),
             code_size: RECURSION_CODE_SIZE,
             po2,
         };

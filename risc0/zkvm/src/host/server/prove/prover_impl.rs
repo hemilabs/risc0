@@ -139,8 +139,6 @@ impl ProverServer for ProverImpl {
         > = None;
 
         for (seg_idx, segment_ref) in session.segments.iter().enumerate() {
-            let t_seg = std::time::Instant::now();
-
             // Get segment + preflight results: from pipelined thread or compute here.
             let (segment, results) = if let Some(handle) = pending_preflight.take() {
                 handle
@@ -152,7 +150,6 @@ impl ProverServer for ProverImpl {
                 let results = self.segment_preflight(&segment)?;
                 (segment, results)
             };
-            let t_preflight = t_seg.elapsed();
 
             for hook in &session.hooks {
                 hook.on_pre_prove_segment(&segment);
@@ -197,10 +194,8 @@ impl ProverServer for ProverImpl {
             let hashfn = self.opts.hashfn.clone();
 
             // GPU prove_core only (main thread, uses thread-local segment_prover).
-            let t_psc = std::time::Instant::now();
             let seal =
                 with_segment_prover(|sp| sp.prove_core(results.inner))?;
-            let prove_core_ms = t_psc.elapsed().as_secs_f64() * 1000.0;
 
             // Collect previous segment's decoded+verified receipt.
             // The background thread ran during prove_core above, so join is nearly instant.
@@ -210,16 +205,6 @@ impl ProverServer for ProverImpl {
                     .map_err(|_| anyhow!("receipt thread panicked"))??;
                 segments.push(prev_receipt);
             }
-
-            let t_prove = t_seg.elapsed() - t_preflight;
-            let t_total = t_seg.elapsed();
-            eprintln!(
-                "[prove_session] seg {seg_idx}: preflight={:.1}ms prove_core={:.1}ms prove={:.1}ms total={:.1}ms",
-                t_preflight.as_secs_f64() * 1000.0,
-                prove_core_ms,
-                t_prove.as_secs_f64() * 1000.0,
-                t_total.as_secs_f64() * 1000.0,
-            );
 
             // Start background thread: decode seal → build receipt → verify.
             // This overlaps with prove_core(N+1), removing ~5ms decode from the critical path.
@@ -351,6 +336,11 @@ impl ProverServer for ProverImpl {
             });
         }
 
+        // Pre-load Groth16 resources (graph, SRS files) during succinct compression.
+        if self.opts.receipt_kind == ReceiptKind::Groth16 {
+            risc0_groth16::prove::prepare();
+        }
+
         let (succinct_receipt, work_receipt) = match session.povw_job_id.is_some() {
             true => {
                 let work_receipt = self.composite_to_succinct_povw(&composite_receipt)?;
@@ -428,13 +418,9 @@ impl ProverServer for ProverImpl {
         );
 
         let po2 = preflight_results.inner.po2();
-        let t_psc = std::time::Instant::now();
         let seal =
             with_segment_prover(|sp| sp.prove_core(preflight_results.inner))?;
-        eprintln!("[prove_segment_core] prove_core: {:.1}ms", t_psc.elapsed().as_secs_f64() * 1000.0);
-        let t_dec = std::time::Instant::now();
         let mut claim = ReceiptClaim::decode_from_seal_v2(&seal, Some(po2))?;
-        eprintln!("[prove_segment_core] decode: {:.1}ms (seal len: {})", t_dec.elapsed().as_secs_f64() * 1000.0, seal.len());
         claim.output = preflight_results.output.into();
 
         let verifier_parameters = ctx
@@ -454,9 +440,7 @@ impl ProverServer for ProverImpl {
     }
 
     fn lift(&self, receipt: &SegmentReceipt) -> Result<SuccinctReceipt<ReceiptClaim>> {
-        let receipt = lift(receipt)?;
-        receipt.verify_integrity().context("verify lift")?;
-        Ok(receipt)
+        lift(receipt)
     }
 
     fn lift_povw(
@@ -471,9 +455,7 @@ impl ProverServer for ProverImpl {
         a: &SuccinctReceipt<ReceiptClaim>,
         b: &SuccinctReceipt<ReceiptClaim>,
     ) -> Result<SuccinctReceipt<ReceiptClaim>> {
-        let receipt = join(a, b)?;
-        receipt.verify_integrity().context("verify join")?;
-        Ok(receipt)
+        join(a, b)
     }
 
     fn join_povw(
@@ -497,9 +479,7 @@ impl ProverServer for ProverImpl {
         conditional: &SuccinctReceipt<ReceiptClaim>,
         assumption: &SuccinctReceipt<Unknown>,
     ) -> Result<SuccinctReceipt<ReceiptClaim>> {
-        let receipt = resolve(conditional, assumption)?;
-        receipt.verify_integrity().context("verify resolve")?;
-        Ok(receipt)
+        resolve(conditional, assumption)
     }
 
     fn resolve_povw(
@@ -539,9 +519,7 @@ impl ProverServer for ProverImpl {
         a: &SuccinctReceipt<Unknown>,
         b: &SuccinctReceipt<Unknown>,
     ) -> Result<SuccinctReceipt<UnionClaim>> {
-        let receipt = union(a, b)?;
-        receipt.verify_integrity().context("verify union")?;
-        Ok(receipt)
+        union(a, b)
     }
 
     fn unwrap_povw(

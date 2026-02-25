@@ -327,9 +327,27 @@ impl RawBuffer {
         let buf = BUFFER_POOL
             .with(|pool| pool.borrow_mut().pop(size))
             .unwrap_or_else(|| {
-                unsafe { DeviceBuffer::uninitialized(size) }
-                    .context(format!("allocation failed on {name}: {size} bytes"))
-                    .unwrap()
+                match unsafe { DeviceBuffer::uninitialized(size) } {
+                    Ok(buf) => buf,
+                    Err(_) => {
+                        // Flush buffer pool to reclaim GPU memory, then retry.
+                        let flushed = BUFFER_POOL.with(|pool| {
+                            let mut pool = pool.borrow_mut();
+                            let bytes = pool.total_cached;
+                            pool.cache.clear();
+                            pool.total_cached = 0;
+                            bytes
+                        });
+                        tracing::debug!(
+                            "flushed {flushed} bytes from buffer pool for {name}: {size} bytes"
+                        );
+                        unsafe { DeviceBuffer::uninitialized(size) }
+                            .context(format!(
+                                "allocation failed on {name}: {size} bytes (after flushing {flushed} bytes from pool)"
+                            ))
+                            .unwrap()
+                    }
+                }
             });
         Self {
             name,
