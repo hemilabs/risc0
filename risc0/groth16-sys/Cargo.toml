@@ -25,5 +25,6 @@ tracing = "0.1.41"
 [features]
 default = []
 cuda = ["dep:blst", "dep:sppark"]
+rocm = ["dep:blst", "dep:sppark"]
 metal = []
 setup = []

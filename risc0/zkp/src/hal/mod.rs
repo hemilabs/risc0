@@ -18,6 +18,8 @@ pub mod cpu;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 pub mod dual;
+#[cfg(feature = "rocm")]
+pub mod hip;
 #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), target_os = "ios"))]
 pub mod metal;
 

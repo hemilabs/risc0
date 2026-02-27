@@ -21,7 +21,13 @@
 #include "tables.h"
 
 #include <cassert>
+
+#ifdef __HIPCC__
+#include <array>
+namespace cuda { namespace std { using ::std::array; } }
+#else
 #include <cuda/std/array>
+#endif
 
 namespace risc0::circuit::rv32im_v2::cuda {
 

@@ -1,5 +1,4 @@
 #include "poseidon2_constants.cuh"
-#include "stdio.h"
 
 #define CELLS 24
 #define ROUNDS_FULL 8
@@ -55,6 +54,38 @@ __device__ __forceinline__ void multiply_by_4x4_circulant(fr_t x[4]) {
   x[3] = t4;
 }
 
+#ifdef __HIPCC__
+// ROCm 7.2 clang-22 gfx1201 miscompilation workaround:
+// Both the optimizer AND the optnone codegen produce wrong results
+// for the circulant loop. Use a fully-unrolled, copy-based approach
+// with no loop over groups and no optnone attribute.
+__device__ __attribute__((noinline)) void multiply_by_m_ext(fr_t cells[CELLS]) {
+  fr_t s0{0u}, s1{0u}, s2{0u}, s3{0u}; // tmp_sums
+
+  // Macro: apply 4x4 circulant on group G, accumulate sums
+  #define DO_GROUP(G) do { \
+    fr_t a = cells[(G)*4+0], b = cells[(G)*4+1]; \
+    fr_t c = cells[(G)*4+2], d = cells[(G)*4+3]; \
+    fr_t t0 = a + b, t1 = c + d; \
+    fr_t t2 = b + b + t1, t3 = d + d + t0; \
+    fr_t t4 = fr_t(4) * t1 + t3, t5 = fr_t(4) * t0 + t2; \
+    cells[(G)*4+0] = t3 + t5; cells[(G)*4+1] = t5; \
+    cells[(G)*4+2] = t2 + t4; cells[(G)*4+3] = t4; \
+    s0 += cells[(G)*4+0]; s1 += cells[(G)*4+1]; \
+    s2 += cells[(G)*4+2]; s3 += cells[(G)*4+3]; \
+  } while(0)
+
+  DO_GROUP(0); DO_GROUP(1); DO_GROUP(2);
+  DO_GROUP(3); DO_GROUP(4); DO_GROUP(5);
+  #undef DO_GROUP
+
+  // Add accumulated sums
+  for (uint32_t i = 0; i < CELLS; i += 4) {
+    cells[i+0] += s0; cells[i+1] += s1;
+    cells[i+2] += s2; cells[i+3] += s3;
+  }
+}
+#else
 __device__ __forceinline__ void multiply_by_m_ext(fr_t cells[CELLS]) {
   // Optimized method for multiplication by M_EXT.
   // See appendix B of Poseidon2 paper for additional details.
@@ -73,6 +104,7 @@ __device__ __forceinline__ void multiply_by_m_ext(fr_t cells[CELLS]) {
     cells[i] += tmp_sums[i % 4];
   }
 }
+#endif
 
 __device__ __forceinline__ void full_round(fr_t cells[CELLS], uint32_t round_constants_off) {
 #pragma unroll
@@ -89,7 +121,13 @@ __device__ __forceinline__ void partial_round(fr_t cells[CELLS], uint32_t round_
   multiply_by_m_int(cells);
 }
 
+#ifdef __HIPCC__
+// ROCm 7.2 clang-22 gfx1201: noinline prevents optimizer from
+// miscompiling the round loops (full_round/partial_round are forceinline).
+__device__ __attribute__((noinline)) void poseidon2_mix(fr_t cells[CELLS]) {
+#else
 __device__ __forceinline__ void poseidon2_mix(fr_t cells[CELLS]) {
+#endif
   uint32_t round_constants_off = 0;
 
   // First linear layer.
@@ -119,9 +157,10 @@ __device__ __forceinline__ void poseidon2_mix(fr_t cells[CELLS]) {
 
 } // namespace poseidon2
 
-__launch_bounds__(256, 2) __global__
+__launch_bounds__(256, 3) __global__
     void _poseidon2_fold(poseidon_out_t* output, const poseidon_in_t* input, uint32_t output_size) {
   uint32_t gid = blockDim.x * blockIdx.x + threadIdx.x;
+
   fr_t cells[CELLS];
 #pragma unroll
   for (uint32_t i = 0; i < CELLS; i++) {
@@ -144,21 +183,24 @@ __launch_bounds__(256, 2) __global__
   output[gid] = tmp;
 }
 
-__launch_bounds__(256, 2) __global__
+__launch_bounds__(256, 3) __global__
     void _poseidon2_rows(poseidon_out_t* out, const fr_t* matrix, uint32_t dim_x, uint32_t dim_y) {
   uint32_t gid = blockDim.x * blockIdx.x + threadIdx.x;
   if (gid >= dim_x)
     return;
 
-  fr_t cells[CELLS] = {0};
+  fr_t cells[CELLS];
+#pragma unroll
+  for (uint32_t k = 0; k < CELLS; k++)
+    cells[k] = 0;
 
   matrix += gid;
   uint32_t i = 0;
+  fr_t zero(0u);
 
   do {
-#pragma unroll
     for (uint32_t j = 0; j < CELLS_RATE; j++, i++)
-      cells[j] = i < dim_y ? matrix[i * dim_x] : fr_t{0};
+      cells[j] = i < dim_y ? matrix[i * dim_x] : zero;
 
     poseidon2::poseidon2_mix(cells);
   } while (i < dim_y);

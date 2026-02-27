@@ -16,6 +16,7 @@
 #include "steps.cuh"
 #include "witgen.h"
 
+#ifndef __HIPCC__
 #if defined(__clang__)
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wmissing-braces"
@@ -31,16 +32,34 @@
 #elif defined(__GNUC__)
 #pragma GCC diagnostic pop
 #endif
+#else
+namespace nvtx3 { struct scoped_range { scoped_range(const char*) {} }; }
+#endif
 
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
-#include <cuda/std/array>
 #include <string.h>
+
+#ifdef __HIPCC__
+#include <array>
+namespace cuda { namespace std { using ::std::array; } }
+#include <hip/hip_runtime.h>
+#include <hipcub/hipcub.hpp>
+#else
+#include <cuda/std/array>
 #include <thrust/execution_policy.h>
 #include <thrust/scan.h>
+#endif
 
 namespace risc0::circuit::rv32im_v2::cuda {
+
+#ifdef __HIPCC__
+// Addition operator for hipcub::DeviceScan::InclusiveScan on Fp elements
+struct AddOp {
+  __device__ __forceinline__ Fp operator()(const Fp& a, const Fp& b) const { return a + b; }
+};
+#endif
 
 constexpr size_t kUserAccumSplit = kLayout_TopAccum.columns[0].col;
 
@@ -530,15 +549,26 @@ const char* risc0_circuit_rv32im_cuda_accum(AccumBuffers* buffers,
       nvtx3::scoped_range range("stepAccum");
       stepAccum<<<cfg.grid, cfg.block, 0, stream>>>(d_ctx, lastCycle);
 
-      // par_nosync (CUDA 12.2+) uses cudaMallocAsync for temp storage instead
-      // of cudaMalloc, avoiding implicit device-wide synchronization per scan call.
-      auto policy = thrust::cuda::par_nosync.on(stream);
       size_t rows = buffers->accum.rows;
       for (size_t j = 0; j < 4; j++) {
         size_t col = buffers->accum.cols - 4 + j;
         Fp* itBegin = buffers->accum.buf + col * rows;
         Fp* itEnd = buffers->accum.buf + col * rows + lastCycle;
+#ifdef __HIPCC__
+        // Use hipcub::DeviceScan for HIP (no thrust dependency)
+        size_t n = itEnd - itBegin;
+        size_t temp_bytes = 0;
+        hipcub::DeviceScan::InclusiveScan(nullptr, temp_bytes, itBegin, itBegin, AddOp(), n, stream);
+        void* d_temp = nullptr;
+        CUDA_OK(hipMallocAsync(&d_temp, temp_bytes, stream));
+        hipcub::DeviceScan::InclusiveScan(d_temp, temp_bytes, itBegin, itBegin, AddOp(), n, stream);
+        CUDA_OK(hipFreeAsync(d_temp, stream));
+#else
+        // par_nosync (CUDA 12.2+) uses cudaMallocAsync for temp storage instead
+        // of cudaMalloc, avoiding implicit device-wide synchronization per scan call.
+        auto policy = thrust::cuda::par_nosync.on(stream);
         thrust::inclusive_scan(policy, itBegin, itEnd, itBegin);
+#endif
       }
 
       finalizeAccum<<<cfg.grid, cfg.block, 0, stream>>>(d_ctx, lastCycle);

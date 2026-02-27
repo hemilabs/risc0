@@ -317,9 +317,24 @@ impl<'a, H: Hal> Prover<'a, H> {
             let out = self.hal.alloc_extelem("out", H::CHECK_SIZE);
             let which = self.hal.copy_from_u32("which", which.as_slice());
             let xs = self.hal.copy_from_extelem("xs", xs.as_slice());
+            // DIAG: Check coeffs before batch_evaluate_any
+            check_group.coeffs.view(|view| {
+                let total = view.len();
+                let nonzero = view.iter().filter(|v| **v != H::Elem::ZERO).count();
+                eprintln!("  [DIAG] check_group.coeffs: {}/{} nonzero", nonzero, total);
+                // Print first 8 coefficients
+                for i in 0..8.min(total) {
+                    eprintln!("    coeffs[{}] = {:?}", i, view[i]);
+                }
+            });
+
             self.hal
                 .batch_evaluate_any(&check_group.coeffs, H::CHECK_SIZE, &which, &xs, &out);
             out.view(|view| {
+                eprintln!("  [DIAG] check eval_u results ({} entries):", view.len());
+                for (i, v) in view.iter().enumerate() {
+                    eprintln!("    check_eval[{}] = {:?}", i, v);
+                }
                 coeff_u.extend(view);
             });
 

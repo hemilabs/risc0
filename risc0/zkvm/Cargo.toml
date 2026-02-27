@@ -168,6 +168,14 @@ cuda = [
   "risc0-groth16/cuda",
   "risc0-zkp/cuda",
 ]
+rocm = [
+  "prove",
+  "risc0-circuit-keccak/rocm",
+  "risc0-circuit-recursion/rocm",
+  "risc0-circuit-rv32im/rocm",
+  "risc0-groth16/rocm",
+  "risc0-zkp/rocm",
+]
 default = ["client", "bonsai"]
 r0vm-ver-compat = []
 disable-dev-mode = []

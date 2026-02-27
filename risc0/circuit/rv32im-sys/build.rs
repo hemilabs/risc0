@@ -22,9 +22,16 @@ use std::{
 
 use risc0_build_kernel::{KernelBuild, KernelType};
 
+#[cfg(all(feature = "cuda", feature = "rocm"))]
+compile_error!("Features 'cuda' and 'rocm' are mutually exclusive. Enable only one GPU backend.");
+
 fn main() {
     if env::var("CARGO_FEATURE_CUDA").is_ok() {
         build_cuda_kernels();
+    }
+
+    if env::var("CARGO_FEATURE_ROCM").is_ok() {
+        build_rocm_kernels();
     }
 
     build_cpu_kernels();
@@ -183,6 +190,238 @@ fn build_cuda_kernels() {
         .status()
         .expect("failed to run ar");
     assert!(status.success(), "ar failed to add standalone objects");
+}
+
+fn build_rocm_kernels() {
+    let output = "risc0_rv32im_cuda";
+
+    println!("cargo:rerun-if-env-changed=HIPCC");
+    println!("cargo:rerun-if-env-changed=SCCACHE_RECACHE");
+    rerun_if_changed("kernels/cuda");
+
+    env::set_var("SCCACHE_IDLE_TIMEOUT", "0");
+    env::set_var("HIP_PLATFORM", "amd");
+
+    if env::var("RISC0_SKIP_BUILD_KERNELS").is_ok() {
+        let out_dir = env::var("OUT_DIR").map(PathBuf::from).unwrap();
+        let out_path = out_dir.join(format!("lib{output}-skip.a"));
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&out_path)
+            .unwrap();
+        println!("cargo:{}={}", output, out_path.display());
+        return;
+    }
+
+    let cuda_root = env::var("DEP_RISC0_SYS_CUDA_ROOT").unwrap();
+    let cxx_root = env::var("DEP_RISC0_SYS_CXX_ROOT").unwrap();
+    let sppark_root = env::var("DEP_SPPARK_ROOT").unwrap();
+    let hipcc = env::var("HIPCC").unwrap_or_else(|_| "hipcc".to_string());
+
+    // Step 1: Compile eval_check_combined.cu standalone with hipcc.
+    // -mllvm -amdgpu-early-inline-all=false prevents OOM on this large kernel
+    // (21 functions, 2154 column reads).
+    //
+    // CACHING: eval_check compilation is very slow. We hash all eval_check
+    // source files and skip recompilation when only other .cu files changed.
+    let out_dir = env::var("OUT_DIR").map(PathBuf::from).unwrap();
+    let kernel_dir = std::fs::canonicalize("kernels/cuda").unwrap();
+    let cache_dir = out_dir
+        .ancestors()
+        .find(|p| p.ends_with("release") || p.ends_with("debug"))
+        .map(|p| p.join("eval_check_cache_rocm"))
+        .unwrap_or_else(|| out_dir.join("eval_check_cache_rocm"));
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    let eval_check_cached = cache_dir.join("eval_check_combined_standalone.o");
+    let eval_check_stamp = cache_dir.join("eval_check_hash_rocm.stamp");
+    let eval_check_obj = out_dir.join("eval_check_combined_standalone.o");
+    let current_hash = eval_check_source_hash();
+    let cached_hash = std::fs::read_to_string(&eval_check_stamp).unwrap_or_default();
+    let need_rebuild = current_hash != cached_hash || !eval_check_cached.exists();
+    if need_rebuild {
+        eprintln!("eval_check (rocm): source changed (or first build), compiling standalone...");
+        let mut cmd = Command::new(&hipcc);
+        cmd.current_dir("kernels/cuda")
+            .arg("-x")
+            .arg("hip")
+            .arg("-std=c++17")
+            .arg("-O2")
+            .arg("-fPIC")
+            .arg("-Wno-unused-function")
+            .arg("-Wno-unused-parameter")
+            .arg("--offload-arch=native")
+            .arg("-mllvm")
+            .arg("-amdgpu-early-inline-all=false")
+            .arg("-include")
+            .arg(format!("{}/util/cuda2hip.hpp", &sppark_root))
+            .arg("-I")
+            .arg(&cuda_root)
+            .arg("-I")
+            .arg(&cxx_root)
+            .arg("-I")
+            .arg(&sppark_root)
+            .arg("-c")
+            .arg("eval_check_combined.cu")
+            .arg("-o")
+            .arg(&eval_check_cached);
+        let status = cmd
+            .status()
+            .expect("failed to run hipcc for eval_check_combined.cu");
+        assert!(
+            status.success(),
+            "hipcc failed for eval_check_combined.cu (standalone mode)"
+        );
+        std::fs::write(&eval_check_stamp, &current_hash).unwrap();
+    } else {
+        eprintln!("eval_check (rocm): source unchanged, reusing cached object");
+    }
+    // Copy cached object to OUT_DIR for this build.
+    std::fs::copy(&eval_check_cached, &eval_check_obj).unwrap();
+
+    // Step 2: Single-TU amalgamation for remaining .cu files.
+    // This avoids -fgpu-rdc and the problematic HIP device link step entirely.
+    // Exclude eval_check files (compiled standalone above), witgen_combined.cu,
+    // and ffi_supra.cu (uses sppark types that conflict with risc0's fpext.h).
+    let cuda_files: Vec<PathBuf> = glob_paths("kernels/cuda/*.cu")
+        .into_iter()
+        .filter(|p| {
+            let name = p.file_name().unwrap().to_str().unwrap();
+            !matches!(
+                name,
+                "eval_check_0.cu"
+                    | "eval_check_1.cu"
+                    | "eval_check_2.cu"
+                    | "eval_check_3.cu"
+                    | "eval_check_combined.cu"
+                    | "witgen_combined.cu"
+                    | "ffi_supra.cu"
+            )
+        })
+        .collect();
+    let separate_files: Vec<PathBuf> = glob_paths("kernels/cuda/ffi_supra.cu");
+
+    let amalg_path = out_dir.join("remaining_kernels_rocm.cu");
+    let mut amalg = String::new();
+    for cu in &cuda_files {
+        let abs = std::fs::canonicalize(cu).unwrap();
+        amalg.push_str(&format!("#include \"{}\"\n", abs.display()));
+    }
+    std::fs::write(&amalg_path, &amalg).unwrap();
+
+    // Cache remaining_kernels: hash source files, skip recompilation if unchanged
+    let remaining_cached = cache_dir.join("remaining_kernels_rocm.o");
+    let remaining_stamp = cache_dir.join("remaining_kernels_hash_rocm.stamp");
+    let remaining_obj = out_dir.join("remaining_kernels_rocm.o");
+    let remaining_hash = {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        for cu in &cuda_files {
+            let abs = std::fs::canonicalize(cu).unwrap();
+            if let Ok(content) = std::fs::read_to_string(&abs) {
+                content.hash(&mut hasher);
+            }
+        }
+        format!("{:016x}", hasher.finish())
+    };
+    let remaining_prev = std::fs::read_to_string(&remaining_stamp).unwrap_or_default();
+    if remaining_hash != remaining_prev || !remaining_cached.exists() {
+        eprintln!("remaining_kernels (rocm): source changed, compiling...");
+        let status = Command::new(&hipcc)
+            .arg("-x").arg("hip")
+            .arg("-std=c++17")
+            .arg("-O2")
+            .arg("-fPIC")
+            .arg("-Wno-unused-function")
+            .arg("-Wno-unused-parameter")
+            .arg("--offload-arch=native")
+            .arg("-mllvm")
+            .arg("-amdgpu-early-inline-all=false")
+            .arg("-include").arg(format!("{sppark_root}/util/cuda2hip.hpp"))
+            .arg("-I").arg(&cuda_root)
+            .arg("-I").arg(&cxx_root)
+            .arg("-I").arg(&sppark_root)
+            .arg("-I").arg(&kernel_dir)
+            .arg("-c").arg(&amalg_path)
+            .arg("-o").arg(&remaining_cached)
+            .status()
+            .unwrap_or_else(|e| panic!("failed to run hipcc: {e}"));
+        assert!(status.success(), "hipcc failed for amalgamated kernels");
+        std::fs::write(&remaining_stamp, &remaining_hash).unwrap();
+    } else {
+        eprintln!("remaining_kernels (rocm): source unchanged, reusing cached object");
+    }
+    std::fs::copy(&remaining_cached, &remaining_obj).unwrap();
+
+    // Compile ffi_supra.cu separately (uses sppark types, can't be in same TU)
+    // Also cached
+    let mut all_objs = vec![eval_check_obj.clone(), remaining_obj];
+    for cu in &separate_files {
+        let stem = cu.file_stem().unwrap().to_str().unwrap();
+        let obj = out_dir.join(format!("{stem}.o"));
+        let cached_obj = cache_dir.join(format!("{stem}.o"));
+        let cached_stamp = cache_dir.join(format!("{stem}_hash_rocm.stamp"));
+        let src_hash = {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            if let Ok(content) = std::fs::read_to_string(cu) {
+                content.hash(&mut hasher);
+            }
+            format!("{:016x}", hasher.finish())
+        };
+        let prev_hash = std::fs::read_to_string(&cached_stamp).unwrap_or_default();
+        if src_hash != prev_hash || !cached_obj.exists() {
+            eprintln!("{stem} (rocm): source changed, compiling...");
+            let status = Command::new(&hipcc)
+                .arg("-x").arg("hip")
+                .arg("-std=c++17")
+                .arg("-O2")
+                .arg("-fPIC")
+                .arg("-Wno-unused-function")
+                .arg("-Wno-unused-parameter")
+                .arg("--offload-arch=native")
+                .arg("-include").arg(format!("{sppark_root}/util/cuda2hip.hpp"))
+                .arg("-I").arg(&cuda_root)
+                .arg("-I").arg(&cxx_root)
+                .arg("-I").arg(&sppark_root)
+                .arg("-I").arg(&kernel_dir)
+                .arg("-c").arg(cu)
+                .arg("-o").arg(&cached_obj)
+                .status()
+                .unwrap_or_else(|e| panic!("failed to run hipcc for {stem}: {e}"));
+            assert!(status.success(), "hipcc failed for {stem}.cu");
+            std::fs::write(&cached_stamp, &src_hash).unwrap();
+        } else {
+            eprintln!("{stem} (rocm): source unchanged, reusing cached object");
+        }
+        std::fs::copy(&cached_obj, &obj).unwrap();
+        all_objs.push(obj);
+    }
+
+    // Step 3: Archive all objects
+    let archive = out_dir.join(format!("lib{output}.a"));
+    let _ = std::fs::remove_file(&archive);
+    let mut ar_cmd = Command::new("ar");
+    ar_cmd.arg("rcs").arg(&archive);
+    for obj in &all_objs {
+        ar_cmd.arg(obj);
+    }
+    let status = ar_cmd.status().expect("failed to run ar");
+    assert!(status.success(), "ar failed");
+
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=static={output}");
+
+    // Link against HIP runtime
+    if let Ok(hip_path) = env::var("HIP_PATH") {
+        println!("cargo:rustc-link-search=native={}/lib", hip_path);
+    } else if std::path::Path::new("/opt/rocm/lib").exists() {
+        println!("cargo:rustc-link-search=native=/opt/rocm/lib");
+    }
+    println!("cargo:rustc-link-lib=amdhip64");
 }
 
 fn rerun_if_changed<P: AsRef<Path>>(path: P) {

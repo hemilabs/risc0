@@ -168,11 +168,16 @@ impl Receipt {
         if self.inner.verifier_parameters() != self.metadata.verifier_parameters {
             // inner verifier_parameters do not match metadata.verifier_parameters.
             // This is an internal inconsistency in the receipt struct.
+            tracing::error!("ReceiptFormatError: verifier_parameters mismatch (inner != metadata)");
             return Err(VerificationError::ReceiptFormatError);
         }
 
         tracing::debug!("Receipt::verify_with_context");
-        self.inner.verify_integrity_with_context(ctx)?;
+        let integrity_result = self.inner.verify_integrity_with_context(ctx);
+        if let Err(ref e) = integrity_result {
+            tracing::error!("verify_integrity_with_context failed: {:?}", e);
+        }
+        integrity_result?;
 
         // Check that the claim on the verified receipt matches what was expected. Since we have
         // constrained all field in the ReceiptClaim, we can directly construct the expected digest

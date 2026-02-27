@@ -50,6 +50,14 @@ cuda = [
   "prove",
   "risc0-groth16-sys/cuda",
 ]
+rocm = [
+  "dep:circom-witnesscalc",
+  "dep:risc0-groth16-sys",
+  "dep:wtns-file",
+  "prove",
+  "risc0-groth16-sys/rocm",
+  "risc0-zkp/rocm",
+]
 default = ["std"]
 prove = [
   "dep:cfg-if",

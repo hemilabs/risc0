@@ -24,8 +24,40 @@ typedef xyzz_t<fp2_t> bucket_fp2_t;
 
 typedef fr_t scalar_t;
 
+#ifndef __HIPCC__
 #define SPPARK_DONT_INSTANTIATE_TEMPLATES
+#endif
 #include "msm/pippenger.cuh"
+
+#ifdef __HIPCC__
+// G2 MSM kernel explicit instantiations (G1 handled by pippenger.cuh defaults).
+// All four template arguments are specified explicitly so that the mangled names
+// match the call sites in msm_t<bucket_fp2_t, point_fp2_t, affine_fp2_t, fr_t>.
+template __global__
+void accumulate<bucket_fp2_t, affine_fp2_t::mem_t,
+                bucket_fp2_t::mem_t, affine_fp2_t>(
+    bucket_fp2_t::mem_t buckets_[],
+    uint32_t nwins, uint32_t wbits,
+    /*const*/ affine_fp2_t::mem_t points_[],
+    const vec2d_t<uint32_t> digits,
+    const vec2d_t<uint32_t> histogram,
+    uint32_t* counter);
+template __global__
+void batch_addition<bucket_fp2_t, affine_fp2_t::mem_t,
+                    bucket_fp2_t::mem_t, affine_fp2_t>(
+    bucket_fp2_t::mem_t buckets[],
+    const affine_fp2_t::mem_t points[], size_t npoints,
+    const uint32_t digits[], const uint32_t& ndigits);
+template __global__
+void integrate<bucket_fp2_t, bucket_fp2_t::mem_t>(
+    bucket_fp2_t::mem_t buckets_[], uint32_t nwins,
+    uint32_t wbits, uint32_t nbits);
+template __global__
+void reduce_rows<bucket_fp2_t, bucket_fp2_t::mem_t>(
+    bucket_fp2_t::mem_t buckets_[], uint32_t nwins,
+    uint32_t wbits, uint32_t nbits,
+    uint32_t thr_per_sub);
+#endif
 
 namespace sppark::bn254 {
 #include "ntt/ntt.cuh"
@@ -35,9 +67,78 @@ using namespace sppark::bn254;
 #include "util.cuh"
 
 #include "groth16_coeffs.cuh"
-#include "groth16_prover.cuh"
 #include "groth16_srs.cuh"
+#include "groth16_prover.cuh"
 
+#ifdef __HIPCC__
+// Explicit template instantiations for HIP device pass.
+// The groth16_prover host code is hidden from the device pass (it uses
+// blst-specific methods), so template __global__ functions called from it
+// must be explicitly instantiated here.
+
+// NTT kernels (inside the sppark::bn254 namespace where ntt.cuh was included)
+namespace sppark::bn254 {
+template __global__
+void _GS_NTT<0, fr_t>(const unsigned int, const unsigned int,
+    const unsigned int, const unsigned int,
+    fr_t*, const fr_t (*)[WINDOW_SIZE],
+    const fr_t*, const fr_t*, const fr_t*,
+    const unsigned int, const bool, const fr_t,
+    const unsigned int);
+template __global__
+void _GS_NTT<1, fr_t>(const unsigned int, const unsigned int,
+    const unsigned int, const unsigned int,
+    fr_t*, const fr_t (*)[WINDOW_SIZE],
+    const fr_t*, const fr_t*, const fr_t*,
+    const unsigned int, const bool, const fr_t,
+    const unsigned int);
+template __global__
+void _GS_NTT<2, fr_t>(const unsigned int, const unsigned int,
+    const unsigned int, const unsigned int,
+    fr_t*, const fr_t (*)[WINDOW_SIZE],
+    const fr_t*, const fr_t*, const fr_t*,
+    const unsigned int, const bool, const fr_t,
+    const unsigned int);
+template __global__
+void _CT_NTT<0, fr_t>(const unsigned int, const unsigned int,
+    const unsigned int, const unsigned int,
+    fr_t*, const fr_t (*)[WINDOW_SIZE],
+    const fr_t*, const fr_t*, const fr_t*,
+    const unsigned int, const bool, const fr_t,
+    const unsigned int);
+template __global__
+void _CT_NTT<1, fr_t>(const unsigned int, const unsigned int,
+    const unsigned int, const unsigned int,
+    fr_t*, const fr_t (*)[WINDOW_SIZE],
+    const fr_t*, const fr_t*, const fr_t*,
+    const unsigned int, const bool, const fr_t,
+    const unsigned int);
+template __global__
+void _CT_NTT<2, fr_t>(const unsigned int, const unsigned int,
+    const unsigned int, const unsigned int,
+    fr_t*, const fr_t (*)[WINDOW_SIZE],
+    const fr_t*, const fr_t*, const fr_t*,
+    const unsigned int, const bool, const fr_t,
+    const unsigned int);
+template __global__
+void bit_rev_permutation<fr_t>(fr_t*, const fr_t*, uint32_t);
+template __global__
+void LDE_distribute_powers<fr_t>(fr_t*, uint32_t, uint32_t, bool,
+    const fr_t (*)[WINDOW_SIZE], const unsigned int);
+template __global__
+void generate_partial_twiddles<fr_t>(fr_t (*)[WINDOW_SIZE], const fr_t);
+template __global__
+void generate_all_twiddles<fr_t>(fr_t*, const fr_t);
+template __global__
+void generate_radixX_twiddles_X<fr_t>(fr_t*, int, const fr_t);
+} // namespace sppark::bn254
+
+// Utility kernels
+template __global__
+void chacha_generate_random_scalars<8, fr_t>(fr_t*, const chacha_state, size_t);
+#endif // __HIPCC__
+
+#if !defined(__HIP_DEVICE_COMPILE__)
 struct SetupParams {
   const char* pcoeffs_path;
   const char* fres_path;
@@ -54,6 +155,14 @@ extern "C" const char* risc0_groth16_cuda_prove(SetupParams* setup_params,
                                                 ProveParams* prover_params) {
 
   try {
+    // Release cached async memory pool allocations from prior GPU work (e.g.
+    // STARK proving) so that the Groth16 prover has enough VRAM.
+    {
+      cudaMemPool_t pool;
+      if (cudaDeviceGetDefaultMemPool(&pool, 0) == cudaSuccess)
+        cudaMemPoolTrimTo(pool, 0);
+    }
+
     SRS srs(0, setup_params->srs_path);
     groth16_prover prover(srs, setup_params->pcoeffs_path, setup_params->fres_path);
     groth16_proof proof = prover.prove(prover_params->public_path, prover_params->witness);
@@ -78,3 +187,4 @@ extern "C" const char* risc0_groth16_cuda_setup(SetupParams* params) {
 }
 
 #endif // SRS_READ_COEFFS
+#endif // !__HIP_DEVICE_COMPILE__

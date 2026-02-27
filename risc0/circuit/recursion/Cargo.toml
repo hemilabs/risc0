@@ -59,6 +59,13 @@ cuda = [
   "risc0-zkp/cuda",
   "std",
 ]
+rocm = [
+  "prove",
+  "risc0-circuit-recursion-sys/rocm",
+  "risc0-sys?/rocm",
+  "risc0-zkp/rocm",
+  "std",
+]
 default = ["prove", "test"]
 metal = ["prove"]
 prove = [

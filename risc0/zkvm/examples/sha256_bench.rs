@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use risc0_zkvm::{get_prover_server, ExecutorEnv, ExecutorImpl, ProverOpts, VerifierContext};
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 use risc0_circuit_rv32im;
 use risc0_zkvm_methods::{bench::BenchmarkSpec, BENCH_ELF, BENCH_ID};
 
@@ -15,6 +15,13 @@ fn main() {
         .nth(2)
         .and_then(|s| s.parse().ok());
 
+    // Support loading an external guest ELF for apples-to-apples benchmarking
+    let external_elf = std::env::var("BENCH_ELF_PATH").ok().map(|p| {
+        eprintln!("Loading external guest ELF from {p}");
+        std::fs::read(&p).unwrap_or_else(|e| panic!("Failed to read {p}: {e}"))
+    });
+    let elf: &[u8] = external_elf.as_deref().unwrap_or(BENCH_ELF);
+
     let spec = BenchmarkSpec::HashBytesIter {
         buf: vec![0u8; 64],
         iters,
@@ -27,7 +34,7 @@ fn main() {
         builder.segment_limit_po2(po2);
     }
     let env = builder.build().unwrap();
-    let session = ExecutorImpl::from_elf(env, BENCH_ELF).unwrap().run().unwrap();
+    let session = ExecutorImpl::from_elf(env, elf).unwrap().run().unwrap();
     eprintln!(
         "  segments: {}, total_cycles: {}, user_cycles: {}",
         session.segments.len(),
@@ -39,21 +46,27 @@ fn main() {
     let prover = get_prover_server(&opts).unwrap();
     let ctx = VerifierContext::default();
 
-    // Pre-load CUDA modules so the first kernel launch doesn't stall ~100ms.
+    // Pre-load GPU modules so the first kernel launch doesn't stall ~100ms.
     #[cfg(feature = "cuda")]
     risc0_circuit_rv32im::prove::cuda_warmup();
+    #[cfg(feature = "rocm")]
+    risc0_circuit_rv32im::prove::rocm_warmup();
 
     eprintln!("Proving {} segments...", session.segments.len());
     let t0 = Instant::now();
     let prove_info = prover.prove_session(&ctx, &session).unwrap();
     let elapsed = t0.elapsed();
 
-    eprintln!("Verifying receipt...");
-    prove_info
-        .receipt
-        .verify(BENCH_ID)
-        .expect("receipt verification failed");
-    eprintln!("  OK");
+    if external_elf.is_none() {
+        eprintln!("Verifying receipt...");
+        prove_info
+            .receipt
+            .verify(BENCH_ID)
+            .expect("receipt verification failed");
+        eprintln!("  OK");
+    } else {
+        eprintln!("Skipping verification (external ELF, BENCH_ID mismatch)");
+    }
 
     let secs = elapsed.as_secs_f64();
     let per_seg = secs * 1000.0 / session.segments.len() as f64;

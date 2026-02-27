@@ -46,12 +46,48 @@ pub fn segment_prover() -> Result<Box<dyn SegmentProver>> {
     cfg_if! {
         if #[cfg(feature = "cuda")] {
             self::hal::cuda::segment_prover()
+        } else if #[cfg(feature = "rocm")] {
+            self::hal::hip::segment_prover()
         // } else if #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), target_os = "ios"))] {
         // self::hal::metal::segment_prover(hashfn)
         } else {
             self::hal::cpu::segment_prover()
         }
     }
+}
+
+/// Trigger HIP module loading so the first kernel launch doesn't stall.
+/// This is a no-op on non-ROCm builds. Mirrors cuda_warmup() but adds
+/// hipInit/hipSetDevice for HIP runtime initialization.
+#[cfg(feature = "rocm")]
+pub fn rocm_warmup() {
+    use risc0_sys::ffi_wrap;
+    // Initialize HIP runtime and select device 0.
+    unsafe {
+        risc0_sys::hip::hipInit(0);
+        risc0_sys::hip::hipSetDevice(0);
+    }
+    // Warmup rv32im circuit kernels (par_stepExec, stepAccum, finalizeAccum, eval_check).
+    // The C function names are the same regardless of CUDA or HIP compilation.
+    let _ = ffi_wrap(|| unsafe { risc0_circuit_rv32im_sys::risc0_circuit_rv32im_cuda_warmup() });
+    let _ = ffi_wrap(|| unsafe {
+        risc0_circuit_rv32im_sys::risc0_circuit_rv32im_cuda_warmup_eval_check()
+    });
+    // Warmup sppark NTT kernels (normally loaded during HipHal::new -> sppark_init)
+    let err = unsafe { risc0_sys::cuda::sppark_init() };
+    if err.code != 0 {
+        tracing::warn!("sppark_init warmup failed: {err}");
+    }
+    // Warmup poseidon2 kernels
+    let err = unsafe { risc0_sys::cuda::sppark_poseidon2_init() };
+    if err.code != 0 {
+        tracing::warn!("sppark_poseidon2_init warmup failed: {err}");
+    }
+    // Warmup risc0-zkp kernels (eltwise, sha, bit_reverse, etc.)
+    extern "C" {
+        fn risc0_zkp_cuda_warmup() -> *const std::os::raw::c_char;
+    }
+    let _ = ffi_wrap(|| unsafe { risc0_zkp_cuda_warmup() });
 }
 
 /// Trigger CUDA module loading so the first kernel launch doesn't stall.

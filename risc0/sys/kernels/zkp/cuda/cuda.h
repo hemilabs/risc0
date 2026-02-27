@@ -14,15 +14,25 @@
 
 #pragma once
 
-// CUDA 13.1's CCCL v2 headers (thrust, cub) need driver API types (CUcontext,
-// CUdevice, etc.) from the system <cuda.h>. Forward to it first so those types
-// are defined before any CCCL header is processed.
+#ifndef __HIPCC__
+// CUDA 13.1's CCCL v2 headers need driver API types from system <cuda.h>
 #include_next <cuda.h>
+#endif
 
 #include <cstdint>
 #include <cstring>
+#ifndef __HIPCC__
 #include <cuda_runtime.h>
+#endif
 #include <stdexcept>
+
+// When cuda2hip.hpp is force-included (sppark builds), these are already defined.
+// Only provide them for standalone HIP compilation without cuda2hip.hpp.
+#if defined(__HIPCC__) && !defined(WARP_SZ)
+static const auto cudaStreamCreate         = hipStreamCreate;
+static const auto cudaDeviceGetAttribute   = hipDeviceGetAttribute;
+#define           cudaDevAttrMaxThreadsPerBlock hipDeviceAttributeMaxThreadsPerBlock
+#endif
 
 template <typename... Types> inline std::string fmt(const char* fmt, Types... args) {
   size_t len = std::snprintf(nullptr, 0, fmt, args...);
@@ -101,6 +111,9 @@ const char* launchKernel(void (*kernel)(ExpTypes...),
   try {
     cudaStream_t stream = getPersistentStream();
     LaunchConfig cfg = getCachedSimpleConfig(count);
+#ifdef __HIPCC__
+    kernel<<<cfg.grid, cfg.block, shared_size, stream>>>(std::forward<ActTypes>(args)...);
+#else
     cudaLaunchConfig_t config;
     config.attrs = nullptr;
     config.numAttrs = 0;
@@ -109,6 +122,7 @@ const char* launchKernel(void (*kernel)(ExpTypes...),
     config.dynamicSmemBytes = shared_size;
     config.stream = stream;
     CUDA_OK(cudaLaunchKernelEx(&config, kernel, std::forward<ActTypes>(args)...));
+#endif
   } catch (const std::exception& err) {
     return strdup(err.what());
   } catch (...) {

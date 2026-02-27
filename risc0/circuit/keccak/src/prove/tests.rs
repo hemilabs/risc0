@@ -39,7 +39,7 @@ fn basic() {
 #[test]
 fn fwd_rev_ab() {
     cfg_if! {
-        if #[cfg(feature = "cuda")] {
+        if #[cfg(any(feature = "cuda", feature = "rocm"))] {
             use risc0_zkp::hal::cuda::CudaHalPoseidon2;
             use crate::prove::hal::cuda::CudaCircuitHalPoseidon2;
             let hal = Rc::new(CudaHalPoseidon2::new());

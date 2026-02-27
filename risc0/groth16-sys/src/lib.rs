@@ -19,7 +19,7 @@ use std::{
 
 use anyhow::{anyhow, Result};
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 pub use sppark::Error as SpparkError;
 
 pub struct SetupParams {
@@ -66,7 +66,7 @@ impl ProverParams {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 pub fn prove(prover_params: &ProverParams, setup_params: &SetupParams) -> anyhow::Result<()> {
     let setup_params = RawSetupParams {
         pcoeffs_path: setup_params.pcoeffs_path.c_str.as_ptr(),
@@ -82,7 +82,7 @@ pub fn prove(prover_params: &ProverParams, setup_params: &SetupParams) -> anyhow
     ffi_wrap(|| unsafe { risc0_groth16_cuda_prove(&setup_params, &prover_params) })
 }
 
-#[cfg(all(feature = "cuda", feature = "setup"))]
+#[cfg(all(any(feature = "cuda", feature = "rocm"), feature = "setup"))]
 pub fn setup(params: &SetupParams) -> anyhow::Result<()> {
     let raw_params = RawSetupParams {
         pcoeffs_path: params.pcoeffs_path.c_str.as_ptr(),
@@ -92,7 +92,7 @@ pub fn setup(params: &SetupParams) -> anyhow::Result<()> {
     ffi_wrap(|| unsafe { risc0_groth16_cuda_setup(&raw_params) })
 }
 
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+#[cfg_attr(not(any(feature = "cuda", feature = "rocm")), allow(dead_code))]
 #[repr(C)]
 struct RawProverParams {
     pub public_path: *const c_char,
@@ -100,7 +100,7 @@ struct RawProverParams {
     pub witness: *const u8,
 }
 
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+#[cfg_attr(not(any(feature = "cuda", feature = "rocm")), allow(dead_code))]
 #[repr(C)]
 struct RawSetupParams {
     pub pcoeffs_path: *const c_char,
@@ -109,17 +109,17 @@ struct RawSetupParams {
 }
 
 extern "C" {
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     fn risc0_groth16_cuda_prove(
         setup: *const RawSetupParams,
         params: *const RawProverParams,
     ) -> *const c_char;
 
-    #[cfg(all(feature = "cuda", feature = "setup"))]
+    #[cfg(all(any(feature = "cuda", feature = "rocm"), feature = "setup"))]
     fn risc0_groth16_cuda_setup(params: *const RawSetupParams) -> *const c_char;
 }
 
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+#[cfg_attr(not(any(feature = "cuda", feature = "rocm")), allow(dead_code))]
 fn ffi_wrap<F>(mut inner: F) -> Result<()>
 where
     F: FnMut() -> *const c_char,
@@ -144,7 +144,7 @@ where
     }
 }
 
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+#[cfg_attr(not(any(feature = "cuda", feature = "rocm")), allow(dead_code))]
 pub struct RawPath {
     path: PathBuf,
     c_str: CString,

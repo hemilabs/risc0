@@ -1,5 +1,7 @@
 #pragma once
 
+#if !defined(__HIP_DEVICE_COMPILE__)
+
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -359,3 +361,5 @@ public:
     return num_public;
   }
 };
+
+#endif // !__HIP_DEVICE_COMPILE__

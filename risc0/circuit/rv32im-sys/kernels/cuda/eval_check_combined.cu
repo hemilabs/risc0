@@ -21,6 +21,33 @@ namespace risc0::circuit::rv32im_v2::cuda {
 #define EVAL_CHECK_THREADS 256
 #endif
 
+// Diagnostic kernel: write poly_mix[0..3] and data samples to check[0..15]
+// Called with <<<1,1>>> before eval_check to verify constant memory
+__global__ void eval_check_diag(Fp* check,
+                                const Fp* ctrl,
+                                const Fp* data,
+                                const Fp* accum,
+                                const Fp* mix,
+                                const Fp* out,
+                                uint32_t domain) {
+  // Write poly_mix first 4 values (each is FpExt = 4 Fp)
+  // check[0..3] = poly_mix[0] components
+  for (int i = 0; i < 4; i++) check[i] = poly_mix[0][i];
+  // check[4..7] = poly_mix[1] components
+  for (int i = 0; i < 4; i++) check[4+i] = poly_mix[1][i];
+  // check[8] = ctrl[0], check[9] = data[0], check[10] = accum[0]
+  check[8] = ctrl[0];
+  check[9] = data[0];
+  check[10] = accum[0];
+  check[11] = mix[0];
+  check[12] = out[0];
+  // check[13] = domain as Fp
+  check[13] = Fp(domain);
+  // check[14..15] = poly_mix[457] components (last)
+  check[14] = poly_mix[457][0];
+  check[15] = poly_mix[457][1];
+}
+
 __launch_bounds__(EVAL_CHECK_THREADS, 1)
 __global__ void eval_check(Fp* check,
                            const Fp* ctrl,
@@ -34,8 +61,13 @@ __global__ void eval_check(Fp* check,
   uint32_t cycle = blockDim.x * blockIdx.x + threadIdx.x;
   if (cycle < domain) {
     FpExt tot = poly_fp(cycle, domain, ctrl, out, data, mix, accum);
+#ifdef __HIPCC__
+    Fp x = rou ^ (unsigned)cycle;
+    Fp y = (Fp(3) * x) ^ (unsigned)(1 << po2);
+#else
     Fp x = pow(rou, cycle);
     Fp y = pow(Fp(3) * x, 1 << po2);
+#endif
     FpExt ret = tot * inv(y - Fp(1));
     check[domain * 0 + cycle] = ret[0];
     check[domain * 1 + cycle] = ret[1];
@@ -70,10 +102,22 @@ const char* risc0_circuit_rv32im_cuda_eval_check(Fp* check,
       cudaFuncSetCacheConfig((const void*)eval_check, cudaFuncCachePreferL1);
       cacheConfigSet = true;
     }
-    // Use async copy on our stream to avoid implicit device-wide sync
+    // Copy poly_mix_pows to __constant__ memory on our stream
+#ifdef __HIPCC__
+    // HIP: hipMemcpyToSymbol doesn't work reliably without -fgpu-rdc.
+    // Use hipGetSymbolAddress + hipMemcpyAsync instead.
+    {
+      void* dev_ptr = nullptr;
+      CUDA_OK(hipGetSymbolAddress(&dev_ptr, HIP_SYMBOL(poly_mix)));
+      CUDA_OK(hipMemcpyAsync(dev_ptr, poly_mix_pows, sizeof(poly_mix),
+                              hipMemcpyHostToDevice, stream));
+    }
+#else
     CUDA_OK(cudaMemcpyToSymbolAsync(poly_mix, poly_mix_pows, sizeof(poly_mix),
                                      0, cudaMemcpyHostToDevice, stream));
+#endif
     (void)cudaGetLastError(); // consume any stale async errors
+
     eval_check<<<grid, block, 0, stream>>>(
         check, ctrl, data, accum, mix, out, rou, po2, domain);
     CUDA_OK(cudaGetLastError());

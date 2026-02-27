@@ -75,6 +75,8 @@ pub fn keccak_prover() -> Result<Box<dyn KeccakProver>> {
     cfg_if! {
         if #[cfg(feature = "cuda")] {
             self::hal::cuda::keccak_prover()
+        } else if #[cfg(feature = "rocm")] {
+            self::hal::hip::keccak_prover()
         // } else if #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), target_os = "ios"))] {
         //     self::metal::keccak_prover()
         } else {

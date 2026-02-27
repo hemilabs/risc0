@@ -92,16 +92,22 @@ impl<Claim> Groth16Receipt<Claim> {
             });
         }
 
-        Verifier::new(
+        let verifier_result = Verifier::new(
             &self.seal,
             params.control_root,
             self.claim.digest::<sha::Impl>(),
             params.bn254_control_id,
             &params.verifying_key,
-        )
-        .map_err(|_| VerificationError::ReceiptFormatError)?
-        .verify()
-        .map_err(|_| VerificationError::InvalidProof)?;
+        );
+        if let Err(ref e) = verifier_result {
+            tracing::error!("Groth16 Verifier::new failed: {:?}, seal len: {}", e, self.seal.len());
+        }
+        let verifier = verifier_result.map_err(|_| VerificationError::ReceiptFormatError)?;
+        let verify_result = verifier.verify();
+        if let Err(ref e) = verify_result {
+            tracing::error!("Groth16 Verifier::verify failed: {:?}", e);
+        }
+        verify_result.map_err(|_| VerificationError::InvalidProof)?;
 
         // Everything passed
         Ok(())

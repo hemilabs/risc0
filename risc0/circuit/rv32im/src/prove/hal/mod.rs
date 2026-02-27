@@ -15,6 +15,8 @@
 pub(crate) mod cpu;
 #[cfg(feature = "cuda")]
 pub(crate) mod cuda;
+#[cfg(feature = "rocm")]
+pub(crate) mod hip;
 
 use std::{cell::RefCell, rc::Rc};
 

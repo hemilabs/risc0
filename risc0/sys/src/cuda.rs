@@ -12,7 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(feature = "cuda")]
 use cust::memory::DevicePointer;
+
+/// ABI-compatible substitute for cust::memory::DevicePointer when using ROCm.
+/// HIP device pointers are native `*mut T` (vs CUDA's CUdeviceptr which is u64),
+/// but both are 8 bytes on 64-bit and pass identically in FFI.
+#[cfg(feature = "rocm")]
+#[repr(transparent)]
+#[derive(Copy, Clone)]
+pub struct DevicePointer<T>(pub *mut T);
+
+#[cfg(feature = "rocm")]
+impl<T> DevicePointer<T> {
+    /// Get the raw pointer value.
+    pub fn as_ptr(&self) -> *const T {
+        self.0 as *const T
+    }
+
+    /// Offset the pointer by `count` bytes (matching cust's byte-offset semantics).
+    pub unsafe fn offset(&self, count: isize) -> DevicePointer<T> {
+        DevicePointer((self.0 as *mut u8).offset(count) as *mut T)
+    }
+}
 
 pub use sppark::Error as SpparkError;
 

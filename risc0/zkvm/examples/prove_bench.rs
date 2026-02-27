@@ -33,7 +33,7 @@ fn main() {
     let ctx = VerifierContext::default();
 
     // Pre-load CUDA modules so the first kernel launch doesn't stall ~100ms.
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     risc0_circuit_rv32im::prove::cuda_warmup();
 
     eprintln!("Proving {} segments...", session.segments.len());

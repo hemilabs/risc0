@@ -375,7 +375,13 @@ impl<'a, F: Field> Verifier<'a, F> {
         check *= (F::ExtElem::from_subfield(&three) * z).pow(self.tot_cycles) - F::ExtElem::ONE;
         trace_if_enabled!("Check = {check:?}");
         if check != result {
-            tracing::debug!("check != result");
+            #[cfg(feature = "std")]
+            {
+                extern crate std;
+                std::eprintln!("[VERIFY DIAG] check != result");
+                std::eprintln!("[VERIFY DIAG] check  = {check:?}");
+                std::eprintln!("[VERIFY DIAG] result = {result:?}");
+            }
             return Err(VerificationError::InvalidProof);
         }
 

@@ -39,8 +39,13 @@ __global__ void eval_check(Fp* check,
   uint32_t cycle = blockDim.x * blockIdx.x + threadIdx.x;
   if (cycle < domain) {
     FpExt tot = poly_fp(cycle, domain, ctrl, out, data, mix, accum);
+#ifdef __HIPCC__
+    Fp x = rou ^ (unsigned)cycle;
+    Fp y = (Fp(3) * x) ^ (unsigned)(1 << po2);
+#else
     Fp x = pow(rou, cycle);
     Fp y = pow(Fp(3) * x, 1 << po2);
+#endif
     FpExt ret = tot * inv(y - Fp(1));
     check[domain * 0 + cycle] = ret[0];
     check[domain * 1 + cycle] = ret[1];
@@ -65,7 +70,15 @@ extern "C" const char* risc0_circuit_recursion_cuda_eval_check(Fp* check,
   try {
     cudaStream_t stream = getPersistentStream();
     LaunchConfig cfg = getSimpleConfig(domain);
+#ifdef __HIPCC__
+    {
+      void* dev_ptr = nullptr;
+      hipGetSymbolAddress(&dev_ptr, HIP_SYMBOL(poly_mix));
+      hipMemcpy(dev_ptr, poly_mix_pows, sizeof(poly_mix), hipMemcpyHostToDevice);
+    }
+#else
     cudaMemcpyToSymbol(poly_mix, poly_mix_pows, sizeof(poly_mix));
+#endif
     risc0::circuit::recursion::cuda::eval_check<<<cfg.grid, cfg.block, 0, stream>>>(
         check, ctrl, data, accum, mix, out, rou, po2, domain);
   } catch (const std::exception& err) {

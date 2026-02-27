@@ -79,7 +79,7 @@ extern "C" {
     ) -> *const std::os::raw::c_char;
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 extern "C" {
     pub fn risc0_circuit_recursion_cuda_witgen(
         mode: StepMode,

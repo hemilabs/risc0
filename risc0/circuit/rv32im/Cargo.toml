@@ -67,6 +67,12 @@ cuda = [
   "risc0-sys/cuda",
   "risc0-zkp/cuda",
 ]
+rocm = [
+  "prove",
+  "risc0-circuit-rv32im-sys/rocm",
+  "risc0-sys/rocm",
+  "risc0-zkp/rocm",
+]
 default = []
 # entropy_finder = []
 execute = [

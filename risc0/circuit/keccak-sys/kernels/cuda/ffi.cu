@@ -21,7 +21,12 @@
 
 #include <cstdint>
 #include <cstdio>
+#ifdef __HIPCC__
+#include <array>
+namespace cuda { namespace std { using ::std::array; } }
+#else
 #include <cuda/std/array>
+#endif
 #include <string.h>
 
 using namespace risc0;

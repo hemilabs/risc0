@@ -19,6 +19,9 @@ use std::{
 
 use risc0_build_kernel::{KernelBuild, KernelType};
 
+#[cfg(all(feature = "cuda", feature = "rocm"))]
+compile_error!("Features 'cuda' and 'rocm' are mutually exclusive. Enable only one GPU backend.");
+
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let cxx_root = manifest_dir.join("cxx");
@@ -30,6 +33,14 @@ fn main() {
             manifest_dir.join("kernels/zkp/cuda").to_string_lossy()
         );
         build_cuda_kernels(&cxx_root);
+    }
+
+    if env::var("CARGO_FEATURE_ROCM").is_ok() {
+        println!(
+            "cargo:cuda_root={}",
+            manifest_dir.join("kernels/zkp/cuda").to_string_lossy()
+        );
+        build_rocm_kernels(&cxx_root);
     }
 
     if env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "macos" || os == "ios") {
@@ -58,6 +69,52 @@ fn build_cuda_kernels(cxx_root: &Path) {
         .include(env::var("DEP_BLST_C_SRC").unwrap())
         .include(env::var("DEP_SPPARK_ROOT").unwrap())
         .compile("risc0_zkp_cuda");
+}
+
+fn build_rocm_kernels(cxx_root: &Path) {
+    let sppark_root = env::var("DEP_SPPARK_ROOT").unwrap();
+
+    env::set_var("HIP_PLATFORM", "amd");
+
+    let hipcc = env::var("HIPCC").unwrap_or_else(|_| "hipcc".to_string());
+
+    let mut build = cc::Build::new();
+    build
+        .compiler(&hipcc)
+        .cpp(true)
+        .debug(false)
+        .flag("-x")
+        .flag("hip")
+        .flag("-std=c++17")
+        .flag("-O2")
+        .flag("-Wno-unused-function")
+        .flag("-Wno-unused-parameter")
+        .flag("-Wno-missing-braces")
+        .flag("--offload-arch=native")
+        .flag("-include")
+        .flag("util/cuda2hip.hpp")
+        .flag("-DFEATURE_BABY_BEAR")
+        .include(cxx_root)
+        .include(env::var("DEP_BLST_C_SRC").unwrap())
+        .include(&sppark_root)
+        .files([
+            "kernels/zkp/cuda/combos.cu",
+            "kernels/zkp/cuda/eltwise.cu",
+            "kernels/zkp/cuda/ffi.cu",
+            "kernels/zkp/cuda/kernels.cu",
+            "kernels/zkp/cuda/sha.cu",
+            "kernels/zkp/cuda/supra/api.cu",
+            "kernels/zkp/cuda/supra/ntt.cu",
+        ])
+        .compile("risc0_zkp_cuda");
+
+    // Link against HIP runtime
+    if let Ok(hip_path) = env::var("HIP_PATH") {
+        println!("cargo:rustc-link-search=native={}/lib", hip_path);
+    } else if std::path::Path::new("/opt/rocm/lib").exists() {
+        println!("cargo:rustc-link-search=native=/opt/rocm/lib");
+    }
+    println!("cargo:rustc-link-lib=amdhip64");
 }
 
 fn build_metal_kernels() {

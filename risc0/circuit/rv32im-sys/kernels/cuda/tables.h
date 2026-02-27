@@ -19,7 +19,19 @@
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
+
+#ifdef __HIPCC__
+namespace cuda {
+  template<typename T> struct atomic {
+    T val;
+    __device__ void operator++()    { atomicAdd(&val, T(1)); }
+    __device__ void operator++(int) { atomicAdd(&val, T(1)); }
+    __device__ operator T() const   { return val; }
+  };
+}
+#else
 #include <cuda/atomic>
+#endif
 
 namespace risc0::circuit::rv32im_v2::cuda {
 

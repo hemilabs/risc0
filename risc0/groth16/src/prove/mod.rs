@@ -16,7 +16,9 @@
 
 #[cfg(feature = "cuda")]
 mod cuda;
-#[cfg(not(feature = "cuda"))]
+#[cfg(feature = "rocm")]
+mod hip;
+#[cfg(not(any(feature = "cuda", feature = "rocm")))]
 mod docker;
 mod seal_format;
 mod seal_to_json;
@@ -32,6 +34,8 @@ pub fn shrink_wrap(identity_p254_seal_bytes: &[u8]) -> Result<Seal> {
     cfg_if::cfg_if! {
         if #[cfg(feature = "cuda")] {
             self::cuda::shrink_wrap(identity_p254_seal_bytes)
+        } else if #[cfg(feature = "rocm")] {
+            self::hip::shrink_wrap(identity_p254_seal_bytes)
         } else {
             self::docker::shrink_wrap(identity_p254_seal_bytes)
         }

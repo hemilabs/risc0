@@ -109,7 +109,11 @@ impl ProverServer for ProverImpl {
         let mut warmup_handle = Some(std::thread::spawn(|| {
             risc0_circuit_rv32im::prove::cuda_warmup();
         }));
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(feature = "rocm")]
+        let mut warmup_handle = Some(std::thread::spawn(|| {
+            risc0_circuit_rv32im::prove::rocm_warmup();
+        }));
+        #[cfg(not(any(feature = "cuda", feature = "rocm")))]
         let mut warmup_handle: Option<std::thread::JoinHandle<()>> = None;
 
         let skip_verify = std::env::var("RISC0_SKIP_VERIFY").is_ok();

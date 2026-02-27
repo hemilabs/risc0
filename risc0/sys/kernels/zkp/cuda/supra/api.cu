@@ -7,7 +7,21 @@
 #include <polynomial/prefix_op.cuh>
 
 #include "poseidon2.cuh"
+#if defined(__HIPCC__) && !defined(__HIP_DEVICE_COMPILE__)
+// HIP host pass: blst_256_t::operator[] is private, causing errors in
+// poseidon254.cuh's __device__ helpers. Provide empty __global__ kernel
+// bodies so hipcc can generate launch stubs; real implementations come
+// from the device pass which includes poseidon254.cuh with mont_t types.
+#include "poseidon254_constants.cuh"
+template<typename bn254_t>
+__global__ __launch_bounds__(512)
+void _poseidon254_fold(bn254_t*, const bn254_t*, size_t) {}
+template<typename bn254_t>
+__global__ __launch_bounds__(512)
+void _poseidon254_rows(bn254_t*, const fr_t*, size_t, uint32_t) {}
+#else
 #include "poseidon254.cuh"
+#endif
 
 // Workaround: cudaGetDeviceProperties returns multiProcessorCount=1
 // in some VM/passthrough setups, while cudaDeviceGetAttribute returns

@@ -9,6 +9,7 @@ repository = { workspace = true }
 links = "risc0-sys"
 
 [build-dependencies]
+cc = { version = "1.2.2", features = ["parallel"] }
 risc0-build-kernel = { workspace = true }
 
 [dependencies]
@@ -20,4 +21,5 @@ sppark = { workspace = true, optional = true }
 [features]
 default = []
 cuda = ["dep:blst", "dep:cust", "dep:sppark"]
+rocm = ["dep:blst", "dep:sppark"]
 metal = []

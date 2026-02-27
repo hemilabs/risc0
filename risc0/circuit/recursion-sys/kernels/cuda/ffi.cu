@@ -18,11 +18,22 @@
 #include "fpext.h"
 #include "kernels.h"
 
+#ifndef __HIPCC__
 #include "vendor/nvtx3/nvtx3.hpp"
+#else
+namespace nvtx3 { struct scoped_range { scoped_range(const char*) {} }; }
+#endif
 
 #include <cstring>
+#ifdef __HIPCC__
+#include <array>
+namespace cuda { namespace std { using ::std::array; } }
+#else
 #include <cuda/std/array>
+#endif
+#ifndef __HIPCC__
 #include <cuda_runtime.h>
+#endif
 #include <exception>
 #include <thrust/execution_policy.h>
 #include <thrust/host_vector.h>
