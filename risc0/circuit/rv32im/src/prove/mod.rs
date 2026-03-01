@@ -40,6 +40,23 @@ pub trait SegmentProver {
     fn preflight(&self, segment: &Segment) -> Result<PreflightResults>;
 
     fn prove_core(&self, preflight_results: PreflightResults) -> Result<Seal>;
+
+    /// Pipeline-aware proving: performs the main phase for this segment
+    /// (overlapping GPU eval_check from the previous segment), completes the
+    /// previous segment's deferred finalize, then launches eval_check for
+    /// the current segment.
+    ///
+    /// Returns the seal for the PREVIOUS segment (None on first call).
+    fn prove_begin(&self, preflight_results: PreflightResults) -> Result<Option<Seal>> {
+        // Default: sequential, no pipelining.
+        Ok(Some(self.prove_core(preflight_results)?))
+    }
+
+    /// Complete the last segment's deferred finalize and return its seal.
+    /// Only valid after at least one prove_begin call.
+    fn prove_end(&self) -> Result<Seal> {
+        anyhow::bail!("prove_end: no pending work (default impl)")
+    }
 }
 
 pub fn segment_prover() -> Result<Box<dyn SegmentProver>> {

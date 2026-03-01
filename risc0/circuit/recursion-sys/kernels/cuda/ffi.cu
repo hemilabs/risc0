@@ -167,6 +167,59 @@ __global__ void parStepVerifyAccum(AccumContext* ctx) {
   }
 }
 
+// Cached GPU buffers for HostExecContext to avoid repeated alloc/free overhead.
+// Pre-allocated to the max size seen and reused across calls.
+struct CachedExecBuffers {
+  ExecContext* ctx = nullptr;
+  PreflightTrace* trace = nullptr;
+  WomArgumentRow* womRows = nullptr;
+  uint32_t* womIndex = nullptr;
+  FpExt* wom = nullptr;
+  PreflightCycle* cycles = nullptr;
+  FpExt* iops = nullptr;
+  uint32_t maxCycles = 0;
+  uint32_t maxWoms = 0;
+  uint32_t maxIops = 0;
+
+  void ensure(uint32_t numCycles, uint32_t numWoms, uint32_t numIops) {
+    if (!ctx) {
+      CUDA_OK(cudaMallocManaged(&ctx, sizeof(ExecContext)));
+      CUDA_OK(cudaMallocManaged(&trace, sizeof(PreflightTrace)));
+    }
+    if (numCycles > maxCycles) {
+      cudaFree(womRows);
+      cudaFree(womIndex);
+      cudaFree(cycles);
+      CUDA_OK(cudaMalloc(&womRows, numCycles * kMaxWomRowsPerCycle * sizeof(WomArgumentRow)));
+      CUDA_OK(cudaMalloc(&womIndex, numCycles * sizeof(uint32_t)));
+      CUDA_OK(cudaMalloc(&cycles, numCycles * sizeof(PreflightCycle)));
+      maxCycles = numCycles;
+    }
+    if (numWoms > maxWoms) {
+      cudaFree(wom);
+      CUDA_OK(cudaMalloc(&wom, numWoms * sizeof(FpExt)));
+      maxWoms = numWoms;
+    }
+    if (numIops > maxIops) {
+      cudaFree(iops);
+      CUDA_OK(cudaMalloc(&iops, numIops * sizeof(FpExt)));
+      maxIops = numIops;
+    }
+  }
+
+  ~CachedExecBuffers() {
+    cudaFree(iops);
+    cudaFree(cycles);
+    cudaFree(wom);
+    cudaFree(womIndex);
+    cudaFree(womRows);
+    cudaFree(trace);
+    cudaFree(ctx);
+  }
+};
+
+static thread_local CachedExecBuffers g_execCache;
+
 struct HostExecContext {
   ExecContext* ctx;
   CudaStream stream;
@@ -174,49 +227,44 @@ struct HostExecContext {
 
   HostExecContext(ExecBuffers* buffers, PreflightTrace* trace, size_t totalCycles)
       : cfg(getSimpleConfig(trace->numCycles)) {
-    CUDA_OK(cudaMallocManaged(&ctx, sizeof(ExecContext)));
+    g_execCache.ensure(trace->numCycles, trace->numWoms, trace->numIops);
+
+    ctx = g_execCache.ctx;
     ctx->buffers.ctrl = buffers->ctrl;
     ctx->buffers.data = buffers->data;
     ctx->buffers.global = buffers->global;
     ctx->totalCycles = totalCycles;
 
-    CUDA_OK(cudaMallocManaged(&ctx->trace, sizeof(PreflightTrace)));
+    ctx->trace = g_execCache.trace;
     ctx->trace->numWoms = trace->numWoms;
     ctx->trace->numCycles = trace->numCycles;
     ctx->trace->numIops = trace->numIops;
 
-    CUDA_OK(cudaMalloc(&ctx->trace->wom, trace->numWoms * sizeof(FpExt)));
+    ctx->trace->wom = g_execCache.wom;
     CUDA_OK(cudaMemcpy(
         ctx->trace->wom, trace->wom, trace->numWoms * sizeof(FpExt), cudaMemcpyHostToDevice));
 
-    CUDA_OK(cudaMalloc(&ctx->trace->cycles, trace->numCycles * sizeof(PreflightCycle)));
+    ctx->trace->cycles = g_execCache.cycles;
     CUDA_OK(cudaMemcpy(ctx->trace->cycles,
                        trace->cycles,
                        trace->numCycles * sizeof(PreflightCycle),
                        cudaMemcpyHostToDevice));
 
-    CUDA_OK(cudaMalloc(&ctx->trace->iops, trace->numIops * sizeof(FpExt)));
+    ctx->trace->iops = g_execCache.iops;
     CUDA_OK(cudaMemcpy(
         ctx->trace->iops, trace->iops, trace->numIops * sizeof(FpExt), cudaMemcpyHostToDevice));
 
-    CUDA_OK(
-        cudaMalloc(&ctx->womRows, trace->numCycles * kMaxWomRowsPerCycle * sizeof(WomArgumentRow)));
+    ctx->womRows = g_execCache.womRows;
     CUDA_OK(cudaMemset(ctx->womRows,
                        kInvalidPattern,
                        trace->numCycles * kMaxWomRowsPerCycle * sizeof(WomArgumentRow)));
 
-    CUDA_OK(cudaMalloc(&ctx->womIndex, trace->numCycles * sizeof(uint32_t)));
+    ctx->womIndex = g_execCache.womIndex;
     CUDA_OK(cudaMemset(ctx->womIndex, 0, trace->numCycles * sizeof(uint32_t)));
   }
 
   ~HostExecContext() {
-    cudaFree(ctx->womIndex);
-    cudaFree(ctx->womRows);
-    cudaFree(ctx->trace->iops);
-    cudaFree(ctx->trace->cycles);
-    cudaFree(ctx->trace->wom);
-    cudaFree(ctx->trace);
-    cudaFree(ctx);
+    // Buffers are owned by g_execCache, not freed here
   }
 
   void doStepExec(uint32_t mode) {
@@ -264,6 +312,31 @@ struct HostExecContext {
   }
 };
 
+// Cached GPU buffers for HostAccumContext
+struct CachedAccumBuffers {
+  AccumContext* ctx = nullptr;
+  FpExt* accum = nullptr;
+  uint32_t maxWorkCycles = 0;
+
+  void ensure(uint32_t workCycles) {
+    if (!ctx) {
+      CUDA_OK(cudaMallocManaged(&ctx, sizeof(AccumContext)));
+    }
+    if (workCycles > maxWorkCycles) {
+      cudaFree(accum);
+      CUDA_OK(cudaMalloc(&accum, workCycles * sizeof(FpExt)));
+      maxWorkCycles = workCycles;
+    }
+  }
+
+  ~CachedAccumBuffers() {
+    cudaFree(accum);
+    cudaFree(ctx);
+  }
+};
+
+static thread_local CachedAccumBuffers g_accumCache;
+
 struct HostAccumContext {
   AccumContext* ctx;
   CudaStream stream;
@@ -271,7 +344,9 @@ struct HostAccumContext {
 
   HostAccumContext(AccumBuffers* buffers, size_t workCycles, size_t totalCycles)
       : cfg(getSimpleConfig(workCycles)) {
-    CUDA_OK(cudaMallocManaged(&ctx, sizeof(AccumContext)));
+    g_accumCache.ensure(workCycles);
+
+    ctx = g_accumCache.ctx;
     ctx->buffers.ctrl = buffers->ctrl;
     ctx->buffers.global = buffers->global;
     ctx->buffers.data = buffers->data;
@@ -280,15 +355,14 @@ struct HostAccumContext {
     ctx->totalCycles = totalCycles;
     ctx->workCycles = workCycles;
 
+    ctx->accum = g_accumCache.accum;
     std::vector<FpExt> accumInit(workCycles, FpExt(1));
-    CUDA_OK(cudaMalloc(&ctx->accum, workCycles * sizeof(FpExt)));
     CUDA_OK(cudaMemcpy(
         ctx->accum, accumInit.data(), workCycles * sizeof(FpExt), cudaMemcpyHostToDevice));
   }
 
   ~HostAccumContext() {
-    cudaFree(ctx->accum);
-    cudaFree(ctx);
+    // Buffers owned by g_accumCache, not freed here
   }
 
   void computeAccum() {

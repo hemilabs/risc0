@@ -10,21 +10,24 @@ __global__ void batch_lde_expand_kernel(
     fr_t* __restrict__ d_out,
     const fr_t* __restrict__ d_in,
     uint32_t domain_size,
-    uint32_t ext_size,
-    uint32_t blowup,
+    uint32_t lg_ext_size,
+    uint32_t lg_blowup,
     uint32_t poly_count)
 {
+    uint32_t ext_size = 1u << lg_ext_size;
+    uint32_t ext_mask = ext_size - 1;
+    uint32_t blowup_mask = (1u << lg_blowup) - 1;
     uint64_t total = (uint64_t)ext_size * poly_count;
 
     for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
          i < total;
          i += (uint64_t)gridDim.x * blockDim.x)
     {
-        uint32_t pos_in_ext = (uint32_t)(i % ext_size);
-        uint32_t col = (uint32_t)(i / ext_size);
+        uint32_t pos_in_ext = (uint32_t)i & ext_mask;
+        uint32_t col = (uint32_t)(i >> lg_ext_size);
         fr_t val;
-        if ((pos_in_ext % blowup) == 0) {
-            uint32_t src_idx = pos_in_ext / blowup;
+        if ((pos_in_ext & blowup_mask) == 0) {
+            uint32_t src_idx = pos_in_ext >> lg_blowup;
             val = d_in[(uint64_t)col * domain_size + src_idx];
         } else {
             val = fr_t(0);
@@ -50,8 +53,8 @@ static inline void launch_batch_expand(const gpu_t& gpu,
                                        uint32_t lg_blowup,
                                        uint32_t poly_count)
 {
-    uint32_t ext_domain_size = domain_size << lg_blowup;
-    uint32_t blowup = 1u << lg_blowup;
+    uint32_t lg_ext = lg_domain_size + lg_blowup;
+    uint32_t ext_domain_size = 1u << lg_ext;
     uint64_t total = (uint64_t)ext_domain_size * poly_count;
 
     uint32_t block_sz = 256;
@@ -60,7 +63,7 @@ static inline void launch_batch_expand(const gpu_t& gpu,
     uint32_t grid_sz = need_blocks < max_blocks ? need_blocks : max_blocks;
 
     batch_lde_expand_kernel<fr_t><<<grid_sz, block_sz, 0, (cudaStream_t)gpu>>>(
-        d_out, d_in, domain_size, ext_domain_size, blowup, poly_count);
+        d_out, d_in, domain_size, lg_ext, lg_blowup, poly_count);
 }
 
 extern "C" RustError::by_value sppark_init() {
@@ -94,9 +97,9 @@ extern "C" RustError::by_value sppark_init() {
               NTT::InputOutputOrder::NR,
               NTT::Direction::forward,
               NTT::Type::standard);
-    gpu.sync();
+    gpu.sync_zero();
   } catch (const cuda_error& e) {
-    gpu.sync();
+    gpu.sync_zero();
     return RustError{e.code(), e.what()};
   } catch (...) {
     return RustError(cudaErrorUnknown, "Generic exception");
@@ -117,9 +120,9 @@ extern "C" RustError::by_value sppark_batch_expand(
 
   try {
     launch_batch_expand(gpu, d_out, d_in, domain_size, lg_domain_size, lg_blowup, poly_count);
-    gpu.sync();
+    gpu.sync_zero();
   } catch (const cuda_error& e) {
-    gpu.sync();
+    gpu.sync_zero();
     return RustError{e.code(), e.what()};
   } catch (...) {
     return RustError(cudaErrorUnknown, "Generic exception");
@@ -147,9 +150,9 @@ sppark_batch_NTT(fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly_count) {
                             NTT::Type::standard,
                             poly_count, domain_size);
 
-    gpu.sync();
+    gpu.sync_zero();
   } catch (const cuda_error& e) {
-    gpu.sync();
+    gpu.sync_zero();
     return RustError{e.code(), e.what()};
   } catch (...) {
     return RustError(cudaErrorUnknown, "Generic exception");
@@ -177,9 +180,9 @@ sppark_batch_iNTT(fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly_count) {
                             NTT::Type::standard,
                             poly_count, domain_size);
 
-    gpu.sync();
+    gpu.sync_zero();
   } catch (const cuda_error& e) {
-    gpu.sync();
+    gpu.sync_zero();
     return RustError{e.code(), e.what()};
   } catch (...) {
     return RustError(cudaErrorUnknown, "Generic exception");
@@ -201,9 +204,9 @@ sppark_batch_zk_shift(fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly_coun
     // Single batched kernel for all columns instead of per-column launches
     NTT::LDE_powers_batch(gpu, d_inout, lg_domain_size, poly_count, domain_size);
 
-    gpu.sync();
+    gpu.sync_zero();
   } catch (const cuda_error& e) {
-    gpu.sync();
+    gpu.sync_zero();
     return RustError{e.code(), e.what()};
   } catch (...) {
     return RustError(cudaErrorUnknown, "Generic exception");
@@ -233,9 +236,9 @@ sppark_batch_iNTT_zk_shift(fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly
     // Single batched ZK shift for all columns
     NTT::LDE_powers_batch(gpu, d_inout, lg_domain_size, poly_count, domain_size);
 
-    gpu.sync();
+    gpu.sync_zero();
   } catch (const cuda_error& e) {
-    gpu.sync();
+    gpu.sync_zero();
     return RustError{e.code(), e.what()};
   } catch (...) {
     return RustError(cudaErrorUnknown, "Generic exception");
@@ -269,9 +272,9 @@ sppark_batch_expand_NTT(fr_t* d_out, fr_t* d_in,
                             NTT::Type::standard,
                             poly_count, ext_domain_size);
 
-    gpu.sync();
+    gpu.sync_zero();
   } catch (const cuda_error& e) {
-    gpu.sync();
+    gpu.sync_zero();
     return RustError{e.code(), e.what()};
   } catch (...) {
     return RustError(cudaErrorUnknown, "Generic exception");

@@ -47,11 +47,10 @@ pub(crate) fn shrink_wrap(seal_bytes: &[u8]) -> Result<Seal> {
         .context("failed to calculate groth16 witness")?;
 
     {
-        // Use the HIP HAL singleton lock (same pattern as CUDA)
         let _lock = risc0_zkp::hal::hip::singleton().lock();
 
-        // Release cached GPU buffers from the STARK prover so the Groth16
-        // prover (which uses sppark's own allocator) has enough VRAM.
+        // Release cached GPU buffers from the STARK/recursion prover so the
+        // Groth16 prover (which uses sppark's own allocator) has enough VRAM.
         risc0_zkp::hal::hip::clear_buffer_pool();
 
         let prover_params = ProverParams::new(work_dir, witness.as_ptr())

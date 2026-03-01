@@ -22,7 +22,7 @@ mod program;
 mod witgen;
 pub mod zkr;
 
-use std::{collections::VecDeque, fmt::Debug, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, collections::VecDeque, fmt::Debug, rc::Rc};
 
 use anyhow::Result;
 use cfg_if::cfg_if;
@@ -35,6 +35,7 @@ use risc0_zkp::{
         Elem as _,
     },
     hal::{Buffer, CircuitHal, Hal},
+    prove::poly_group::PolyGroup,
 };
 use serde::{Deserialize, Serialize};
 
@@ -145,8 +146,23 @@ impl Prover {
     /// Run the prover, producing a receipt of execution for the recursion circuit over the loaded
     /// program and input.
     pub fn run(&mut self) -> Result<RecursionReceipt> {
-        let prover = recursion_prover(&self.hashfn)?;
-        prover.prove(self.program.clone(), self.input.clone())
+        // Cache the prover per hashfn to avoid recreating HAL + circuit_hal each call.
+        thread_local! {
+            static PROVER_CACHE: RefCell<Option<(String, Box<dyn RecursionProver>)>> =
+                RefCell::new(None);
+        }
+        let hashfn = self.hashfn.clone();
+        let program = self.program.clone();
+        let input = self.input.clone();
+        PROVER_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let need_new = cache.as_ref().map_or(true, |(h, _)| h != &hashfn);
+            if need_new {
+                let p = recursion_prover(&hashfn)?;
+                *cache = Some((hashfn, p));
+            }
+            cache.as_ref().unwrap().1.prove(program, input)
+        })
     }
 }
 
@@ -157,11 +173,14 @@ where
 {
     hal: Rc<H>,
     circuit_hal: Rc<C>,
+    // Cache ctrl PolyGroup by (code_rows, po2) to skip iNTT/expand/merkle on
+    // repeated proofs with the same program (e.g. 43 lifts all use the same ZKR).
+    cached_ctrl_group: RefCell<HashMap<(usize, usize), PolyGroup<H>>>,
 }
 
 impl<H, C> RecursionProver for RecursionProverImpl<H, C>
 where
-    H: Hal<Field = BabyBear, Elem = BabyBearElem, ExtElem = BabyBearExtElem>,
+    H: Hal<Field = BabyBear, Elem = BabyBearElem, ExtElem = BabyBearExtElem> + 'static,
     C: CircuitHal<H> + CircuitWitnessGenerator<H> + CircuitAccumulator<H>,
 {
     fn prove(&self, program: Program, input: VecDeque<u32>) -> Result<RecursionReceipt> {
@@ -208,7 +227,21 @@ where
                 prover.iop().write_field_elem_slice(header.as_slice());
                 prover.set_po2(program.po2);
 
-                prover.commit_group(REGISTER_GROUP_CTRL, &witgen.ctrl);
+                // Cache ctrl PolyGroup to skip iNTT/expand/merkle on repeated proofs
+                // with the same program. Lift and join ZKRs have different code_rows,
+                // so we key by (code_rows, po2) to cache both independently.
+                let ctrl_key = (program.code_rows(), program.po2);
+                {
+                    let mut cache = self.cached_ctrl_group.borrow_mut();
+                    if let Some(cached) = cache.get(&ctrl_key) {
+                        prover.commit_cached_group(REGISTER_GROUP_CTRL, cached.clone());
+                    } else {
+                        prover.commit_group(REGISTER_GROUP_CTRL, &witgen.ctrl);
+                        if let Some(group) = prover.get_group(REGISTER_GROUP_CTRL).cloned() {
+                            cache.insert(ctrl_key, group);
+                        }
+                    }
+                }
                 prover.commit_group(REGISTER_GROUP_DATA, &witgen.data);
 
                 // Make the mixing values
@@ -238,7 +271,11 @@ where
     C: CircuitHal<H> + CircuitWitnessGenerator<H>,
 {
     pub fn new(hal: Rc<H>, circuit_hal: Rc<C>) -> Self {
-        Self { hal, circuit_hal }
+        Self {
+            hal,
+            circuit_hal,
+            cached_ctrl_group: RefCell::new(HashMap::new()),
+        }
     }
 
     fn preflight(&self, program: &Program, input: VecDeque<u32>) -> Result<Preflight> {

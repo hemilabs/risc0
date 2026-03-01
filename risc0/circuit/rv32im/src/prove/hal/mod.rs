@@ -26,7 +26,7 @@ use risc0_zkp::{
     adapter::{CircuitInfo as _, PROOF_SYSTEM_INFO},
     field::Elem as _,
     hal::{Buffer, CircuitHal, Hal},
-    prove::{poly_group::PolyGroup, Prover},
+    prove::{poly_group::PolyGroup, DeferredFinalize, Prover},
 };
 
 use super::{
@@ -112,6 +112,8 @@ where
     cached_hal: RefCell<Option<(Rc<H>, Rc<C>)>>,
     /// Cached code PolyGroup (always zeros, same for every segment at same po2).
     cached_code_group: RefCell<Option<(PolyGroup<H>, usize)>>,
+    /// Deferred finalize from previous prove_begin call (for eval_check pipelining).
+    pending_finalize: RefCell<Option<DeferredFinalize<H>>>,
 }
 
 impl<H, C, F> SegmentProverImpl<H, C, F>
@@ -125,6 +127,7 @@ where
             hal_factory,
             cached_hal: RefCell::new(None),
             cached_code_group: RefCell::new(None),
+            pending_finalize: RefCell::new(None),
         }
     }
 
@@ -141,7 +144,7 @@ where
 
 impl<H, C, F> SegmentProver for SegmentProverImpl<H, C, F>
 where
-    H: Hal<Field = CircuitField, Elem = Val, ExtElem = ExtVal>,
+    H: Hal<Field = CircuitField, Elem = Val, ExtElem = ExtVal> + 'static,
     C: CircuitHal<H> + CircuitWitnessGenerator<H> + CircuitAccumulator<H>,
     F: Fn() -> (Rc<H>, Rc<C>),
 {
@@ -287,6 +290,142 @@ where
             result
         });
 
+        Ok(seal)
+    }
+
+    fn prove_begin(&self, preflight_results: PreflightResults) -> Result<Option<Seal>> {
+        scope!("prove_begin");
+        let t0 = std::time::Instant::now();
+
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "witgen_debug")] {
+                let mode = if std::env::var_os("RISC0_WITGEN_DEBUG").is_some() {
+                    StepMode::SeqForward
+                } else {
+                    StepMode::Parallel
+                };
+            } else {
+                let mode = StepMode::Parallel;
+            }
+        }
+
+        let (hal, circuit_hal) = self.get_hal();
+
+        let po2 = preflight_results.po2();
+        let header = preflight_results.build_header();
+        let witgen =
+            WitnessGenerator::new(hal.as_ref(), circuit_hal.as_ref(), preflight_results, mode)?;
+        let t_witgen = t0.elapsed();
+
+        // Complete previous deferred finalize (if any) BEFORE creating PolyGroups.
+        // Witgen allocates ~1.3GB of raw witness buffers. The prev DeferredFinalize
+        // holds ~6.4GB of PolyGroups. Both must coexist during witgen (they overlap
+        // with eval_check on stream2). But commit_group(data) allocates ~4.2GB more,
+        // which would push total over 16GB VRAM. So we complete + free the prev
+        // deferred here, after witgen provides overlap with eval_check.
+        let prev_seal = if let Some(deferred) = self.pending_finalize.borrow_mut().take() {
+            let tp = std::time::Instant::now();
+            let seal = deferred.complete(hal.as_ref(), circuit_hal.as_ref());
+            eprintln!(
+                "[prove_begin] completed prev finalize: {:.1}ms (after witgen={:.1}ms)",
+                tp.elapsed().as_secs_f64() * 1000.0,
+                t_witgen.as_secs_f64() * 1000.0
+            );
+            Some(seal)
+        } else {
+            None
+        };
+
+        let code = &witgen.code.buf;
+        let data = &witgen.data.buf;
+
+        let mut prover = Prover::new(hal.as_ref(), TAPSET);
+        let hashfn = &hal.get_hash_suite().hashfn;
+
+        prover.iop().write_u32_slice(&[RV32IM_SEAL_VERSION]);
+
+        // Seed Fiat-Shamir transcript
+        prover
+            .iop()
+            .commit(&hashfn.hash_elem_slice(&PROOF_SYSTEM_INFO.encode()));
+        prover
+            .iop()
+            .commit(&hashfn.hash_elem_slice(&CircuitImpl::CIRCUIT_INFO.encode()));
+
+        let header_digest = hashfn.hash_elem_slice(&header);
+        prover.iop().commit(&header_digest);
+        prover.iop().write_field_elem_slice(header.as_slice());
+        prover.set_po2(po2 as usize);
+
+        // Code group caching
+        {
+            let mut cache = self.cached_code_group.borrow_mut();
+            if let Some((ref cached, cached_po2)) = *cache {
+                if cached_po2 == po2 as usize {
+                    prover.commit_cached_group(REGISTER_GROUP_CODE, cached.clone());
+                } else {
+                    prover.commit_group(REGISTER_GROUP_CODE, code);
+                    *cache = prover
+                        .get_group(REGISTER_GROUP_CODE)
+                        .cloned()
+                        .map(|g| (g, po2 as usize));
+                }
+            } else {
+                prover.commit_group(REGISTER_GROUP_CODE, code);
+                *cache = prover
+                    .get_group(REGISTER_GROUP_CODE)
+                    .cloned()
+                    .map(|g| (g, po2 as usize));
+            }
+        }
+        prover.commit_group(REGISTER_GROUP_DATA, data);
+
+        let mix: [Val; REGCOUNT_MIX] = std::array::from_fn(|_| prover.iop().random_elem());
+        let mix = witgen.accum(hal.as_ref(), circuit_hal.as_ref(), &mix)?;
+        prover.commit_group(REGISTER_GROUP_ACCUM, &witgen.accum.buf);
+
+        let global_clone = hal.alloc_elem("global_clone", witgen.global.buf.size());
+        hal.eltwise_copy_elem(&global_clone, &witgen.global.buf);
+
+        let t_main = t0.elapsed();
+
+        // Start finalize: launch eval_check on stream2 (async on GPU).
+        let mut deferred = prover.start_finalize_with_hook(
+            &[&mix.buf, &global_clone],
+            circuit_hal.as_ref(),
+            move || drop(witgen),
+        );
+        // Keep globals alive until eval_check completes — eval_check reads from
+        // these buffers asynchronously on stream2. Without this, hipFree/cudaFree
+        // would either sync all streams (defeating pipelining) or cause use-after-free.
+        deferred.keep_alive_buf(mix.buf);
+        deferred.keep_alive_buf(global_clone);
+        *self.pending_finalize.borrow_mut() = Some(deferred);
+
+        eprintln!(
+            "[prove_begin] witgen={:.1}ms main={:.1}ms total={:.1}ms",
+            t_witgen.as_secs_f64() * 1000.0,
+            t_main.as_secs_f64() * 1000.0,
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
+
+        Ok(prev_seal)
+    }
+
+    fn prove_end(&self) -> Result<Seal> {
+        scope!("prove_end");
+        let (hal, circuit_hal) = self.get_hal();
+        let deferred = self
+            .pending_finalize
+            .borrow_mut()
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("prove_end: no pending finalize"))?;
+        let t0 = std::time::Instant::now();
+        let seal = deferred.complete(hal.as_ref(), circuit_hal.as_ref());
+        eprintln!(
+            "[prove_end] finalize: {:.1}ms",
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
         Ok(seal)
     }
 }

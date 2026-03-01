@@ -441,9 +441,9 @@ impl<T: Clone> Buffer<T> for BufferImpl<T> {
         let item_size = std::mem::size_of::<T>();
         let buf = self.buffer.borrow_mut();
         let offset = (self.offset + idx) * item_size;
-        // Read just the single element from device memory
-        let host_buf = buf.buf.as_host_vec().unwrap();
-        let slice: &[T] = unchecked_cast(&host_buf[offset..offset + item_size]);
+        // Read just the single element from device memory (ranged D2H)
+        let host_buf = buf.buf.as_host_vec_range(offset, item_size).unwrap();
+        let slice: &[T] = unchecked_cast(&host_buf[..]);
         slice[0].clone()
     }
 
@@ -453,8 +453,9 @@ impl<T: Clone> Buffer<T> for BufferImpl<T> {
         let buf = self.buffer.borrow_mut();
         let offset = self.offset * item_size;
         let len = self.size * item_size;
-        let host_buf = buf.buf.as_host_vec().unwrap();
-        let slice = unchecked_cast(&host_buf[offset..offset + len]);
+        // Use ranged D2H copy: only transfer the needed slice, not the full buffer.
+        let host_buf = buf.buf.as_host_vec_range(offset, len).unwrap();
+        let slice: &[T] = unchecked_cast(&host_buf[..]);
         f(slice);
     }
 
@@ -468,9 +469,13 @@ impl<T: Clone> Buffer<T> for BufferImpl<T> {
     }
 
     fn to_vec(&self) -> Vec<T> {
+        let item_size = std::mem::size_of::<T>();
         let buf = self.buffer.borrow_mut();
-        let host_buf = buf.buf.as_host_vec().unwrap();
-        let slice = unchecked_cast(&host_buf);
+        let offset = self.offset * item_size;
+        let len = self.size * item_size;
+        // Use ranged D2H copy: only transfer the needed slice, not the full buffer.
+        let host_buf = buf.buf.as_host_vec_range(offset, len).unwrap();
+        let slice: &[T] = unchecked_cast(&host_buf[..]);
         slice.to_vec()
     }
 }
@@ -679,9 +684,7 @@ impl<HH: HipHash + ?Sized> Hal for HipHal<HH> {
         assert_eq!(row_size, 1 << n_bits);
         assert!(n_bits >= expand_bits);
         assert!(n_bits < Self::Elem::MAX_ROU_PO2);
-        let ts = std::time::Instant::now();
         Self::sync_stream();
-        let sync_ms = ts.elapsed().as_secs_f64() * 1000.0;
 
         let err = unsafe {
             sppark_batch_expand_NTT(
@@ -692,8 +695,6 @@ impl<HH: HipHash + ?Sized> Hal for HipHal<HH> {
                 poly_count.try_into().unwrap(),
             )
         };
-        eprintln!("    [batch_expand_NTT] sync: {:.2}ms, total: {:.2}ms (in_bits={}, expand={}, count={})",
-            sync_ms, ts.elapsed().as_secs_f64() * 1000.0, in_bits, expand_bits, poly_count);
         if err.code != 0 {
             panic!("Failure during batch_expand_NTT: {err}");
         }
@@ -705,24 +706,7 @@ impl<HH: HipHash + ?Sized> Hal for HipHal<HH> {
         let n_bits = log2_ceil(row_size);
         assert_eq!(row_size, 1 << n_bits);
         assert!(n_bits < Self::Elem::MAX_ROU_PO2);
-        let ts = std::time::Instant::now();
         Self::sync_stream();
-        let sync_ms = ts.elapsed().as_secs_f64() * 1000.0;
-
-        // DIAG: Read first 8 elements BEFORE iNTT
-        {
-            unsafe { risc0_sys::hip::hipDeviceSynchronize(); }
-            let mut pre = [0u32; 8];
-            unsafe {
-                risc0_sys::hip::hipMemcpy(
-                    pre.as_mut_ptr() as *mut std::ffi::c_void,
-                    io.as_device_ptr().as_ptr() as *const std::ffi::c_void,
-                    8 * 4,
-                    risc0_sys::hip::HIP_MEMCPY_DEVICE_TO_HOST,
-                );
-            }
-            eprintln!("    [batch_iNTT DIAG] BEFORE iNTT first 8: {:08x?}", pre);
-        }
 
         let err = unsafe {
             sppark_batch_iNTT(
@@ -731,26 +715,10 @@ impl<HH: HipHash + ?Sized> Hal for HipHal<HH> {
                 count.try_into().unwrap(),
             )
         };
-        eprintln!("    [batch_iNTT] sync: {:.2}ms, total: {:.2}ms (n_bits={}, count={})",
-            sync_ms, ts.elapsed().as_secs_f64() * 1000.0, n_bits, count);
         if err.code != 0 {
             panic!("Failure during batch_interpolate_ntt: {err}");
         }
 
-        // DIAG: Read first 8 elements AFTER iNTT
-        {
-            unsafe { risc0_sys::hip::hipDeviceSynchronize(); }
-            let mut post = [0u32; 8];
-            unsafe {
-                risc0_sys::hip::hipMemcpy(
-                    post.as_mut_ptr() as *mut std::ffi::c_void,
-                    io.as_device_ptr().as_ptr() as *const std::ffi::c_void,
-                    8 * 4,
-                    risc0_sys::hip::HIP_MEMCPY_DEVICE_TO_HOST,
-                );
-            }
-            eprintln!("    [batch_iNTT DIAG] AFTER  iNTT first 8: {:08x?}", post);
-        }
     }
 
     fn batch_bit_reverse(&self, io: &Self::Buffer<Self::Elem>, count: usize) {
@@ -912,9 +880,7 @@ impl<HH: HipHash + ?Sized> Hal for HipHal<HH> {
         let n_bits = log2_ceil(row_size);
         assert_eq!(row_size, 1 << n_bits);
         assert!(n_bits < Self::Elem::MAX_ROU_PO2);
-        let ts = std::time::Instant::now();
         Self::sync_stream();
-        let sync_ms = ts.elapsed().as_secs_f64() * 1000.0;
 
         let err = unsafe {
             sppark_batch_iNTT_zk_shift(
@@ -923,8 +889,6 @@ impl<HH: HipHash + ?Sized> Hal for HipHal<HH> {
                 count.try_into().unwrap(),
             )
         };
-        eprintln!("    [batch_iNTT_zk] sync: {:.2}ms, total: {:.2}ms (n_bits={}, count={})",
-            sync_ms, ts.elapsed().as_secs_f64() * 1000.0, n_bits, count);
         if err.code != 0 {
             panic!("Failure during batch_iNTT_zk_shift: {err}");
         }

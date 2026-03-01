@@ -337,6 +337,11 @@ pub trait CircuitHal<H: Hal> {
         po2: usize,
         steps: usize,
     );
+
+    /// Insert a GPU-side dependency so that subsequent operations on the main
+    /// stream wait for eval_check (running on a separate stream) to complete.
+    /// Default is no-op (for CPU HAL or when eval_check uses the same stream).
+    fn eval_check_dep(&self) {}
 }
 
 pub fn tracker() -> &'static Mutex<MemoryTracker> {

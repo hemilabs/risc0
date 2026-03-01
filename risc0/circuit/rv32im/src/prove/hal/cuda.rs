@@ -226,6 +226,13 @@ impl<CH: CudaHash> CircuitHal<CudaHal<CH>> for CudaCircuitHal<CH> {
         })
         .unwrap();
     }
+
+    fn eval_check_dep(&self) {
+        extern "C" {
+            fn risc0_circuit_rv32im_cuda_eval_check_dep() -> *const std::os::raw::c_char;
+        }
+        risc0_sys::ffi_wrap(|| unsafe { risc0_circuit_rv32im_cuda_eval_check_dep() }).unwrap();
+    }
 }
 
 pub type CudaCircuitHalPoseidon2 = CudaCircuitHal<CudaHashPoseidon2>;

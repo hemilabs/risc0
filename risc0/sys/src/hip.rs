@@ -111,6 +111,22 @@ impl HipDeviceBuffer {
         Ok(vec)
     }
 
+    /// Copy a range of device data to a new host Vec.
+    /// `offset` and `len` are in bytes.
+    pub fn as_host_vec_range(&self, offset: usize, len: usize) -> anyhow::Result<Vec<u8>> {
+        assert!(offset + len <= self.len, "range [{offset}..{}] exceeds buffer size {}", offset + len, self.len);
+        let mut vec = vec![0u8; len];
+        hip_check(unsafe {
+            hipMemcpy(
+                vec.as_mut_ptr() as *mut c_void,
+                self.ptr.add(offset) as *const c_void,
+                len,
+                HIP_MEMCPY_DEVICE_TO_HOST,
+            )
+        });
+        Ok(vec)
+    }
+
     /// Set all 32-bit words to `value`. Equivalent to cust's set_32().
     pub fn set_32(&mut self, value: u32) {
         if value == 0 {

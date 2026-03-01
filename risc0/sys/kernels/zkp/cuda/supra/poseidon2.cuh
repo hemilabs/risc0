@@ -44,8 +44,11 @@ __device__ __forceinline__ void multiply_by_4x4_circulant(fr_t x[4]) {
   fr_t t1 = x[2] + x[3];
   fr_t t2 = x[1] + x[1] + t1;
   fr_t t3 = x[3] + x[3] + t0;
-  fr_t t4 = fr_t(4) * t1 + t3;
-  fr_t t5 = fr_t(4) * t0 + t2;
+  // Replace fr_t(4)*x with (x+x)+(x+x): 3 full-rate adds vs 3 quarter-rate muls
+  fr_t t1_2 = t1 + t1;
+  fr_t t0_2 = t0 + t0;
+  fr_t t4 = t1_2 + t1_2 + t3;
+  fr_t t5 = t0_2 + t0_2 + t2;
   fr_t t6 = t3 + t5;
   fr_t t7 = t2 + t4;
   x[0] = t6;
@@ -56,10 +59,11 @@ __device__ __forceinline__ void multiply_by_4x4_circulant(fr_t x[4]) {
 
 #ifdef __HIPCC__
 // ROCm 7.2 clang-22 gfx1201 miscompilation workaround:
-// Both the optimizer AND the optnone codegen produce wrong results
-// for the circulant loop. Use a fully-unrolled, copy-based approach
-// with no loop over groups and no optnone attribute.
-__device__ __attribute__((noinline)) void multiply_by_m_ext(fr_t cells[CELLS]) {
+// The circulant LOOP miscompiles, but this fully-unrolled, copy-based
+// approach with no loop is safe to forceinline (no loop = no miscompile).
+// forceinline eliminates scratch save/restore overhead (~9 noinline calls
+// per poseidon2_mix, each saving/restoring ~26 VGPRs to scratch memory).
+__device__ __forceinline__ void multiply_by_m_ext(fr_t cells[CELLS]) {
   fr_t s0{0u}, s1{0u}, s2{0u}, s3{0u}; // tmp_sums
 
   // Macro: apply 4x4 circulant on group G, accumulate sums
@@ -68,7 +72,8 @@ __device__ __attribute__((noinline)) void multiply_by_m_ext(fr_t cells[CELLS]) {
     fr_t c = cells[(G)*4+2], d = cells[(G)*4+3]; \
     fr_t t0 = a + b, t1 = c + d; \
     fr_t t2 = b + b + t1, t3 = d + d + t0; \
-    fr_t t4 = fr_t(4) * t1 + t3, t5 = fr_t(4) * t0 + t2; \
+    fr_t t1_2 = t1 + t1, t0_2 = t0 + t0; \
+    fr_t t4 = t1_2 + t1_2 + t3, t5 = t0_2 + t0_2 + t2; \
     cells[(G)*4+0] = t3 + t5; cells[(G)*4+1] = t5; \
     cells[(G)*4+2] = t2 + t4; cells[(G)*4+3] = t4; \
     s0 += cells[(G)*4+0]; s1 += cells[(G)*4+1]; \
@@ -79,7 +84,8 @@ __device__ __attribute__((noinline)) void multiply_by_m_ext(fr_t cells[CELLS]) {
   DO_GROUP(3); DO_GROUP(4); DO_GROUP(5);
   #undef DO_GROUP
 
-  // Add accumulated sums
+  // Add accumulated sums (unrolled to avoid any loop miscompilation risk)
+#pragma unroll
   for (uint32_t i = 0; i < CELLS; i += 4) {
     cells[i+0] += s0; cells[i+1] += s1;
     cells[i+2] += s2; cells[i+3] += s3;
@@ -122,9 +128,10 @@ __device__ __forceinline__ void partial_round(fr_t cells[CELLS], uint32_t round_
 }
 
 #ifdef __HIPCC__
-// ROCm 7.2 clang-22 gfx1201: noinline prevents optimizer from
-// miscompiling the round loops (full_round/partial_round are forceinline).
-__device__ __attribute__((noinline)) void poseidon2_mix(fr_t cells[CELLS]) {
+// ROCm 7.2 clang-22 gfx1201: forceinline eliminates scratch save/restore
+// overhead from noinline function calls. With multiply_by_m_ext already
+// forceinline, poseidon2_mix inlining avoids one more scratch round-trip.
+__device__ __forceinline__ void poseidon2_mix(fr_t cells[CELLS]) {
 #else
 __device__ __forceinline__ void poseidon2_mix(fr_t cells[CELLS]) {
 #endif

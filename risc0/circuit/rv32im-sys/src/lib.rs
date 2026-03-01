@@ -136,4 +136,10 @@ extern "C" {
 
     pub fn risc0_circuit_rv32im_cuda_warmup() -> *const std::os::raw::c_char;
     pub fn risc0_circuit_rv32im_cuda_warmup_eval_check() -> *const std::os::raw::c_char;
+
+    /// Make the persistent stream wait for the eval_check stream to complete.
+    /// Call this before operations on the persistent stream that read eval_check
+    /// output (e.g., iNTT on check_poly). GPU-side dependency only — CPU returns
+    /// immediately.
+    pub fn risc0_circuit_rv32im_cuda_eval_check_dep() -> *const std::os::raw::c_char;
 }

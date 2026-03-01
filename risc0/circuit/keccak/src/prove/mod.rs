@@ -96,7 +96,7 @@ where
 
 impl<H, C> KeccakProver for KeccakProverImpl<H, C>
 where
-    H: Hal<Field = CircuitField, Elem = Val, ExtElem = ExtVal>,
+    H: Hal<Field = CircuitField, Elem = Val, ExtElem = ExtVal> + 'static,
     C: CircuitHal<H> + CircuitWitnessGenerator<H>,
 {
     fn prove(&self, inputs: &[KeccakState], po2: usize) -> Result<Seal> {

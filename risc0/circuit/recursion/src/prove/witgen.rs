@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use anyhow::{Context as _, Result};
 use risc0_circuit_recursion_sys::{RawPreflightTrace, StepMode};
 use risc0_core::scope;
@@ -27,6 +30,13 @@ use risc0_zkp::{
 use crate::{CircuitImpl, CIRCUIT};
 
 use super::{preflight::Preflight, CircuitAccumulator, CircuitWitnessGenerator, Program};
+
+// Cache the transposed ctrl CPU vector to avoid recomputing it for same-program proofs.
+// Key: (code_rows, po2), Value: transposed ctrl vector ready for GPU upload.
+thread_local! {
+    static CTRL_CACHE: RefCell<HashMap<(usize, usize), Vec<BabyBearElem>>> =
+        RefCell::new(HashMap::new());
+}
 
 pub(crate) struct WitnessGenerator<H: Hal> {
     work_cycles: u32,
@@ -54,17 +64,23 @@ where
         let global = vec![BabyBearElem::INVALID; CircuitImpl::OUTPUT_SIZE];
         let global = hal.copy_from_elem("global", &global);
 
-        let mut ctrl = vec![BabyBearElem::ZERO; total_cycles * CIRCUIT.ctrl_size()];
-
-        // populate the ctrl buffer
-        let ctrl_size = CIRCUIT.ctrl_size();
-        assert_eq!(ctrl_size, zkr.code_size);
-        for i in 0..zkr.code_rows() {
-            for j in 0..ctrl_size {
-                ctrl[j * total_cycles + i] = zkr.code[i * ctrl_size + j];
-            }
-        }
-        let ctrl = hal.copy_from_elem("ctrl", &ctrl);
+        // Use cached transposed ctrl vector if available for this (code_rows, po2) pair.
+        let ctrl_key = (zkr.code_rows(), zkr.po2);
+        let ctrl = CTRL_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let ctrl_data = cache.entry(ctrl_key).or_insert_with(|| {
+                let ctrl_size = CIRCUIT.ctrl_size();
+                assert_eq!(ctrl_size, zkr.code_size);
+                let mut ctrl = vec![BabyBearElem::ZERO; total_cycles * ctrl_size];
+                for i in 0..zkr.code_rows() {
+                    for j in 0..ctrl_size {
+                        ctrl[j * total_cycles + i] = zkr.code[i * ctrl_size + j];
+                    }
+                }
+                ctrl
+            });
+            hal.copy_from_elem("ctrl", ctrl_data)
+        });
 
         let data = hal.alloc_elem_init(
             "data",

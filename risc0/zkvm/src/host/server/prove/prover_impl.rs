@@ -141,6 +141,8 @@ impl ProverServer for ProverImpl {
         let mut pending_receipt: Option<
             std::thread::JoinHandle<Result<SegmentReceipt>>,
         > = None;
+        // Metadata from the previous iteration, paired with the seal returned by prove_begin.
+        let mut prev_seal_meta: Option<(u32, u32, Option<Output>, String)> = None;
 
         for (seg_idx, segment_ref) in session.segments.iter().enumerate() {
             let t_seg = std::time::Instant::now();
@@ -194,74 +196,111 @@ impl ProverServer for ProverImpl {
                 }));
             }
 
-            // Extract metadata before prove_core consumes the inner preflight.
+            // Extract metadata before prove_begin consumes the inner preflight.
             let po2 = results.inner.po2();
             let segment_index = results.segment_index;
             let output = results.output;
             let hashfn = self.opts.hashfn.clone();
 
-            // GPU prove_core only (main thread, uses thread-local segment_prover).
+            // GPU prove_begin: main phase (overlapping with prev eval_check) +
+            // complete prev deferred finalize + launch eval_check for this segment.
+            // Returns the PREVIOUS segment's seal (None on first call).
             let t_psc = std::time::Instant::now();
-            let seal =
-                with_segment_prover(|sp| sp.prove_core(results.inner))?;
-            let prove_core_ms = t_psc.elapsed().as_secs_f64() * 1000.0;
+            let prev_seal =
+                with_segment_prover(|sp| sp.prove_begin(results.inner))?;
+            let prove_begin_ms = t_psc.elapsed().as_secs_f64() * 1000.0;
 
-            // Collect previous segment's decoded+verified receipt.
-            // The background thread ran during prove_core above, so join is nearly instant.
-            if let Some(handle) = pending_receipt.take() {
-                let prev_receipt = handle
-                    .join()
-                    .map_err(|_| anyhow!("receipt thread panicked"))??;
-                segments.push(prev_receipt);
+            // If we got a previous segment's seal, process it.
+            if let Some(seal) = prev_seal {
+                // Collect the background receipt from the segment before that.
+                if let Some(handle) = pending_receipt.take() {
+                    let receipt = handle
+                        .join()
+                        .map_err(|_| anyhow!("receipt thread panicked"))??;
+                    segments.push(receipt);
+                }
+
+                // Start background receipt for the PREVIOUS segment.
+                let (prev_po2, prev_seg_idx, prev_output, prev_hashfn) =
+                    prev_seal_meta.take().unwrap();
+                let params = verify_params.clone();
+                let vp_digest = seg_verifier_params_digest;
+                let skip_verify_copy = skip_verify;
+                pending_receipt = Some(std::thread::spawn(move || {
+                    let mut claim =
+                        ReceiptClaim::decode_from_seal_v2(&seal, Some(prev_po2))?;
+                    claim.output = prev_output.into();
+                    let receipt = SegmentReceipt {
+                        seal,
+                        index: prev_seg_idx,
+                        hashfn: prev_hashfn,
+                        claim,
+                        verifier_parameters: vp_digest,
+                    };
+                    if !skip_verify_copy {
+                        receipt
+                            .verify_integrity_with_context(&VerifierContext {
+                                segment_verifier_parameters: params,
+                                ..VerifierContext::empty()
+                            })
+                            .context("verify segment")?;
+                    }
+                    Ok(receipt)
+                }));
             }
+
+            // Store current segment's metadata for next iteration.
+            prev_seal_meta = Some((po2, segment_index, output, hashfn));
 
             let t_prove = t_seg.elapsed() - t_preflight;
             let t_total = t_seg.elapsed();
             eprintln!(
-                "[prove_session] seg {seg_idx}: preflight={:.1}ms prove_core={:.1}ms prove={:.1}ms total={:.1}ms",
+                "[prove_session] seg {seg_idx}: preflight={:.1}ms prove_begin={:.1}ms prove={:.1}ms total={:.1}ms",
                 t_preflight.as_secs_f64() * 1000.0,
-                prove_core_ms,
+                prove_begin_ms,
                 t_prove.as_secs_f64() * 1000.0,
                 t_total.as_secs_f64() * 1000.0,
             );
-
-            // Start background thread: decode seal → build receipt → verify.
-            // This overlaps with prove_core(N+1), removing ~5ms decode from the critical path.
-            let params = verify_params.clone();
-            let vp_digest = seg_verifier_params_digest;
-            let skip_verify_copy = skip_verify;
-            pending_receipt = Some(std::thread::spawn(move || {
-                let mut claim = ReceiptClaim::decode_from_seal_v2(&seal, Some(po2))?;
-                claim.output = output.into();
-                let receipt = SegmentReceipt {
-                    seal,
-                    index: segment_index,
-                    hashfn,
-                    claim,
-                    verifier_parameters: vp_digest,
-                };
-                if !skip_verify_copy {
-                    receipt
-                        .verify_integrity_with_context(&VerifierContext {
-                            segment_verifier_parameters: params,
-                            ..VerifierContext::empty()
-                        })
-                        .context("verify segment")?;
-                }
-                Ok(receipt)
-            }));
 
             for hook in &session.hooks {
                 hook.on_post_prove_segment(&segment);
             }
         }
 
-        // Collect the final segment's decoded+verified receipt.
+        // Complete the last segment's deferred finalize.
+        let last_seal = with_segment_prover(|sp| sp.prove_end())?;
+
+        // Collect the second-to-last receipt (if any).
         if let Some(handle) = pending_receipt.take() {
-            let final_receipt = handle
+            let receipt = handle
                 .join()
                 .map_err(|_| anyhow!("receipt thread panicked"))??;
-            segments.push(final_receipt);
+            segments.push(receipt);
+        }
+
+        // Process the last segment's seal.
+        {
+            let (last_po2, last_seg_idx, last_output, last_hashfn) =
+                prev_seal_meta.take().unwrap();
+            let mut claim =
+                ReceiptClaim::decode_from_seal_v2(&last_seal, Some(last_po2))?;
+            claim.output = last_output.into();
+            let receipt = SegmentReceipt {
+                seal: last_seal,
+                index: last_seg_idx,
+                hashfn: last_hashfn,
+                claim,
+                verifier_parameters: seg_verifier_params_digest,
+            };
+            if !skip_verify {
+                receipt
+                    .verify_integrity_with_context(&VerifierContext {
+                        segment_verifier_parameters: verify_params.clone(),
+                        ..VerifierContext::empty()
+                    })
+                    .context("verify segment")?;
+            }
+            segments.push(receipt);
         }
 
         let (assumptions, session_assumption_receipts): (Vec<_>, Vec<_>) =

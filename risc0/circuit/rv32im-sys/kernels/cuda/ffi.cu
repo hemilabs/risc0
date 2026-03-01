@@ -550,26 +550,33 @@ const char* risc0_circuit_rv32im_cuda_accum(AccumBuffers* buffers,
       stepAccum<<<cfg.grid, cfg.block, 0, stream>>>(d_ctx, lastCycle);
 
       size_t rows = buffers->accum.rows;
+#ifdef __HIPCC__
+      // Pre-allocate temp storage once for all 4 column scans
+      {
+        size_t col0 = buffers->accum.cols - 4;
+        Fp* itFirst = buffers->accum.buf + col0 * rows;
+        size_t n = lastCycle;
+        size_t temp_bytes = 0;
+        hipcub::DeviceScan::InclusiveScan(nullptr, temp_bytes, itFirst, itFirst, AddOp(), n, stream);
+        void* d_temp = nullptr;
+        CUDA_OK(hipMallocAsync(&d_temp, temp_bytes, stream));
+        for (size_t j = 0; j < 4; j++) {
+          Fp* itBegin = buffers->accum.buf + (col0 + j) * rows;
+          hipcub::DeviceScan::InclusiveScan(d_temp, temp_bytes, itBegin, itBegin, AddOp(), n, stream);
+        }
+        CUDA_OK(hipFreeAsync(d_temp, stream));
+      }
+#else
       for (size_t j = 0; j < 4; j++) {
         size_t col = buffers->accum.cols - 4 + j;
         Fp* itBegin = buffers->accum.buf + col * rows;
         Fp* itEnd = buffers->accum.buf + col * rows + lastCycle;
-#ifdef __HIPCC__
-        // Use hipcub::DeviceScan for HIP (no thrust dependency)
-        size_t n = itEnd - itBegin;
-        size_t temp_bytes = 0;
-        hipcub::DeviceScan::InclusiveScan(nullptr, temp_bytes, itBegin, itBegin, AddOp(), n, stream);
-        void* d_temp = nullptr;
-        CUDA_OK(hipMallocAsync(&d_temp, temp_bytes, stream));
-        hipcub::DeviceScan::InclusiveScan(d_temp, temp_bytes, itBegin, itBegin, AddOp(), n, stream);
-        CUDA_OK(hipFreeAsync(d_temp, stream));
-#else
         // par_nosync (CUDA 12.2+) uses cudaMallocAsync for temp storage instead
         // of cudaMalloc, avoiding implicit device-wide synchronization per scan call.
         auto policy = thrust::cuda::par_nosync.on(stream);
         thrust::inclusive_scan(policy, itBegin, itEnd, itBegin);
-#endif
       }
+#endif
 
       finalizeAccum<<<cfg.grid, cfg.block, 0, stream>>>(d_ctx, lastCycle);
     }

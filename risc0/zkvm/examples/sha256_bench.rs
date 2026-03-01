@@ -1,19 +1,25 @@
 use std::time::Instant;
 
-use risc0_zkvm::{get_prover_server, ExecutorEnv, ExecutorImpl, ProverOpts, VerifierContext};
+use risc0_zkvm::{get_prover_server, ExecutorEnv, ExecutorImpl, ProverOpts, ReceiptKind, VerifierContext};
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 use risc0_circuit_rv32im;
 use risc0_zkvm_methods::{bench::BenchmarkSpec, BENCH_ELF, BENCH_ID};
 
 fn main() {
-    let iters: u32 = std::env::args()
-        .nth(1)
+    let args: Vec<String> = std::env::args().collect();
+    let iters: u32 = args.get(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(10_000);
 
-    let po2: Option<u32> = std::env::args()
-        .nth(2)
+    let po2: Option<u32> = args.get(2)
         .and_then(|s| s.parse().ok());
+
+    // Receipt kind: "composite" (default), "succinct", or "groth16"
+    let receipt_kind = match args.get(3).map(|s| s.as_str()) {
+        Some("succinct") => ReceiptKind::Succinct,
+        Some("groth16") => ReceiptKind::Groth16,
+        _ => ReceiptKind::Composite,
+    };
 
     // Support loading an external guest ELF for apples-to-apples benchmarking
     let external_elf = std::env::var("BENCH_ELF_PATH").ok().map(|p| {
@@ -42,7 +48,10 @@ fn main() {
         session.user_cycles,
     );
 
-    let opts = ProverOpts::composite().with_hashfn("poseidon2".to_string());
+    let opts = ProverOpts::default()
+        .with_receipt_kind(receipt_kind)
+        .with_hashfn("poseidon2".to_string());
+    eprintln!("Receipt kind: {:?}", receipt_kind);
     let prover = get_prover_server(&opts).unwrap();
     let ctx = VerifierContext::default();
 
@@ -52,7 +61,13 @@ fn main() {
     #[cfg(feature = "rocm")]
     risc0_circuit_rv32im::prove::rocm_warmup();
 
-    eprintln!("Proving {} segments...", session.segments.len());
+    let kind_str = match receipt_kind {
+        ReceiptKind::Composite => "composite",
+        ReceiptKind::Succinct => "succinct",
+        ReceiptKind::Groth16 => "groth16",
+        _ => "unknown",
+    };
+    eprintln!("Proving {} segments ({kind_str})...", session.segments.len());
     let t0 = Instant::now();
     let prove_info = prover.prove_session(&ctx, &session).unwrap();
     let elapsed = t0.elapsed();
