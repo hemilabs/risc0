@@ -28,7 +28,7 @@ use cust::{
     memory::{DeviceCopy, DevicePointer, GpuBuffer},
     prelude::*,
 };
-use parking_lot::{ReentrantMutex, ReentrantMutexGuard};
+use parking_lot::ReentrantMutex;
 use risc0_core::{
     field::{
         baby_bear::{BabyBear, BabyBearElem, BabyBearExtElem},
@@ -305,10 +305,8 @@ impl CudaHash for CudaHashPoseidon254 {
 pub struct CudaHal<Hash: CudaHash + ?Sized> {
     pub max_threads: u32,
     hash: Option<Box<Hash>>,
-    // Use primary context (None) to avoid per-instance CUDA module loading overhead.
-    // The primary context persists for the process lifetime, so modules load once.
     _context: Option<Context>,
-    _lock: ReentrantMutexGuard<'static, ()>,
+    _lock: parking_lot::ReentrantMutexGuard<'static, ()>,
 }
 
 pub type CudaHalSha256 = CudaHal<CudaHashSha256>;
@@ -369,7 +367,14 @@ impl Drop for RawBuffer {
         // Safety: self.buf is not accessed after take() since we're in Drop,
         // and ManuallyDrop's own drop is a no-op.
         let buf = unsafe { ManuallyDrop::take(&mut self.buf) };
-        BUFFER_POOL.with(|pool| pool.borrow_mut().push(size, buf));
+        // Use try_with to handle thread exit: if BUFFER_POOL TLS is already
+        // destroyed, the buffer is simply freed via cuMemFree (Drop).
+        let res = BUFFER_POOL.try_with(|pool| pool.borrow_mut().push(size, buf));
+        if res.is_err() {
+            // TLS destroyed — buf was captured by the closure but the closure
+            // was never called, so buf is dropped here via cuMemFree. This is
+            // fine during thread exit since the primary context is still alive.
+        }
     }
 }
 
@@ -510,29 +515,24 @@ impl<CH: CudaHash + ?Sized> CudaHal<CH> {
 
     fn new_from_hash(hash: Box<CH>) -> Self {
         let _lock = singleton().lock();
-
         let err = unsafe { sppark_init() };
         if err.code != 0 {
             panic!("Failure during sppark_init: {err}");
         }
-
         cust::init(CudaFlags::empty()).unwrap();
+
         let device = Device::get_device(0).unwrap();
+        let ctx = Context::new(device).unwrap();
         let max_threads = device
             .get_attribute(DeviceAttribute::MaxThreadsPerBlock)
             .unwrap();
-        // Use the primary context (from sppark_init/cust::init) instead of creating
-        // a new context. This avoids per-instance CUDA module loading (~100ms for
-        // large rv32im kernels) since modules persist in the primary context.
 
-        let mut hal = Self {
+        Self {
             max_threads: max_threads as u32,
-            _context: None,
-            hash: None,
+            _context: Some(ctx),
+            hash: Some(hash),
             _lock,
-        };
-        hal.hash = Some(hash);
-        hal
+        }
     }
 
     /// Synchronize the risc0 persistent CUDA stream.
@@ -555,13 +555,16 @@ impl<CH: CudaHash + ?Sized> CudaHal<CH> {
         let poly_size = polynomial.size();
         let pow = pow.to_u32_words();
 
-        let err = unsafe {
-            supra_poly_divide(
-                polynomial.as_device_ptr(),
-                poly_size,
-                &mut remainder as *mut _ as *mut u32,
-                pow.as_ptr(),
-            )
+        let err = {
+
+            unsafe {
+                supra_poly_divide(
+                    polynomial.as_device_ptr(),
+                    poly_size,
+                    &mut remainder as *mut _ as *mut u32,
+                    pow.as_ptr(),
+                )
+            }
         };
 
         if err.code != 0 {
@@ -583,14 +586,17 @@ impl<CH: CudaHash + ?Sized> CudaHal<CH> {
         let pows_words: Vec<u32> = pows.iter().flat_map(|p| p.to_u32_words()).collect();
         Self::sync_stream();
 
-        let err = unsafe {
-            supra_poly_divide_batch(
-                polynomial.as_device_ptr(),
-                poly_size,
-                remainders.as_mut_ptr() as *mut u32,
-                pows_words.as_ptr(),
-                num_divides as u32,
-            )
+        let err = {
+
+            unsafe {
+                supra_poly_divide_batch(
+                    polynomial.as_device_ptr(),
+                    poly_size,
+                    remainders.as_mut_ptr() as *mut u32,
+                    pows_words.as_ptr(),
+                    num_divides as u32,
+                )
+            }
         };
 
         if err.code != 0 {
@@ -696,9 +702,7 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
         assert_eq!(row_size, 1 << n_bits);
         assert!(n_bits >= expand_bits);
         assert!(n_bits < Self::Elem::MAX_ROU_PO2);
-        let ts = std::time::Instant::now();
         Self::sync_stream();
-        let sync_ms = ts.elapsed().as_secs_f64() * 1000.0;
 
         let err = unsafe {
             sppark_batch_expand_NTT(
@@ -709,8 +713,6 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
                 poly_count.try_into().unwrap(),
             )
         };
-        eprintln!("    [batch_expand_NTT] sync: {:.2}ms, total: {:.2}ms (in_bits={}, expand={}, count={})",
-            sync_ms, ts.elapsed().as_secs_f64() * 1000.0, in_bits, expand_bits, poly_count);
         if err.code != 0 {
             panic!("Failure during batch_expand_NTT: {err}");
         }
@@ -722,9 +724,7 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
         let n_bits = log2_ceil(row_size);
         assert_eq!(row_size, 1 << n_bits);
         assert!(n_bits < Self::Elem::MAX_ROU_PO2);
-        let ts = std::time::Instant::now();
         Self::sync_stream();
-        let sync_ms = ts.elapsed().as_secs_f64() * 1000.0;
 
         let err = unsafe {
             sppark_batch_iNTT(
@@ -733,8 +733,6 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
                 count.try_into().unwrap(),
             )
         };
-        eprintln!("    [batch_iNTT] sync: {:.2}ms, total: {:.2}ms (n_bits={}, count={})",
-            sync_ms, ts.elapsed().as_secs_f64() * 1000.0, n_bits, count);
         if err.code != 0 {
             panic!("Failure during batch_interpolate_ntt: {err}");
         }
@@ -881,12 +879,15 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
         let bits = log2_ceil(io.size() / poly_count);
         assert_eq!(io.size(), poly_count * (1 << bits));
 
-        let err = unsafe {
-            sppark_batch_zk_shift(
-                io.as_device_ptr(),
-                bits.try_into().unwrap(),
-                poly_count.try_into().unwrap(),
-            )
+        let err = {
+
+            unsafe {
+                sppark_batch_zk_shift(
+                    io.as_device_ptr(),
+                    bits.try_into().unwrap(),
+                    poly_count.try_into().unwrap(),
+                )
+            }
         };
         if err.code != 0 {
             panic!("Failure during zk_shift: {err}");
@@ -899,9 +900,7 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
         let n_bits = log2_ceil(row_size);
         assert_eq!(row_size, 1 << n_bits);
         assert!(n_bits < Self::Elem::MAX_ROU_PO2);
-        let ts = std::time::Instant::now();
         Self::sync_stream();
-        let sync_ms = ts.elapsed().as_secs_f64() * 1000.0;
 
         let err = unsafe {
             sppark_batch_iNTT_zk_shift(
@@ -910,8 +909,6 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
                 count.try_into().unwrap(),
             )
         };
-        eprintln!("    [batch_iNTT_zk] sync: {:.2}ms, total: {:.2}ms (n_bits={}, count={})",
-            sync_ms, ts.elapsed().as_secs_f64() * 1000.0, n_bits, count);
         if err.code != 0 {
             panic!("Failure during batch_iNTT_zk_shift: {err}");
         }
@@ -1291,15 +1288,18 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
             .collect();
 
         Self::sync_stream();
-        let err = unsafe {
-            supra_poly_divide_multi(
-                combos.as_device_ptr(),
-                cycles,
-                combo_indices.as_ptr(),
-                pows_per_combo.as_ptr(),
-                all_pows_flat.as_ptr(),
-                chunks.len() as u32,
-            )
+        let err = {
+
+            unsafe {
+                supra_poly_divide_multi(
+                    combos.as_device_ptr(),
+                    cycles,
+                    combo_indices.as_ptr(),
+                    pows_per_combo.as_ptr(),
+                    all_pows_flat.as_ptr(),
+                    chunks.len() as u32,
+                )
+            }
         };
         if err.code != 0 {
             panic!("Failure during supra_poly_divide_multi: {err}");

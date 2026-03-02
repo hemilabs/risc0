@@ -147,7 +147,6 @@ impl<'a, H: Hal> Prover<'a, H> {
         F: FnOnce(),
     {
         scope!("finalize");
-        let ft0 = std::time::Instant::now();
 
         // Set the poly mix value, which is used for constraint compression in the
         // DEEP-ALI protocol.
@@ -166,7 +165,6 @@ impl<'a, H: Hal> Prover<'a, H> {
             .iter()
             .map(|pg| &pg.as_ref().unwrap().evaluated)
             .collect();
-        let ft1 = std::time::Instant::now();
         circuit_hal.eval_check(
             &check_poly,
             groups.as_slice(),
@@ -177,8 +175,6 @@ impl<'a, H: Hal> Prover<'a, H> {
         );
         // eval_check is async on GPU — run CPU work while GPU computes
         post_eval_check();
-        eprintln!("  [finalize] alloc+eval_check: {:.2}ms (eval_check alone: {:.2}ms)",
-            ft0.elapsed().as_secs_f64() * 1000.0, ft1.elapsed().as_secs_f64() * 1000.0);
 
         #[cfg(feature = "circuit_debug")]
         let mut bad_z = None;
@@ -214,13 +210,10 @@ impl<'a, H: Hal> Prover<'a, H> {
         // the coefficients of g1, etc. So really, we can just reinterpret 4 polys of
         // invRate*size to 16 polys of size, without actually doing anything.
 
-        eprintln!("  [finalize] iNTT(check): {:.2}ms", ft0.elapsed().as_secs_f64() * 1000.0);
         // Make the PolyGroup + add it to the IOP;
         let check_group = PolyGroup::new(self.hal, check_poly, H::CHECK_SIZE, self.cycles, "check");
-        eprintln!("  [finalize] check_poly_group: {:.2}ms", ft0.elapsed().as_secs_f64() * 1000.0);
         check_group.merkle.commit(&mut self.iop);
         tracing::debug!("checkGroup: {}", check_group.merkle.root());
-        eprintln!("  [finalize] check_group+commit: {:.2}ms", ft0.elapsed().as_secs_f64() * 1000.0);
 
         // Now pick a value for Z, which is used as the DEEP-ALI query point.
         cfg_if::cfg_if! {
@@ -292,7 +285,6 @@ impl<'a, H: Hal> Prover<'a, H> {
             });
         });
 
-        eprintln!("  [finalize] eval_u: {:.1}ms", ft0.elapsed().as_secs_f64() * 1000.0);
         // Now, convert the values to coefficients via interpolation
         let mut coeff_u = vec![H::ExtElem::ZERO; eval_u.len()];
         scope!("poly_interpolate", {
@@ -308,7 +300,6 @@ impl<'a, H: Hal> Prover<'a, H> {
             }
         });
 
-        eprintln!("  [finalize] poly_interp: {:.1}ms", ft0.elapsed().as_secs_f64() * 1000.0);
         // Add in the coeffs of the check polynomials.
         let z_pow = z.pow(ext_size);
         scope!("misc", {
@@ -335,7 +326,6 @@ impl<'a, H: Hal> Prover<'a, H> {
             // Set the mix value, which is used for FRI batching.
         });
 
-        eprintln!("  [finalize] misc: {:.1}ms", ft0.elapsed().as_secs_f64() * 1000.0);
         let mix = self.iop.random_ext_elem();
         tracing::debug!("Mix = {mix:?}");
 
@@ -347,8 +337,6 @@ impl<'a, H: Hal> Prover<'a, H> {
             self.hal
                 .alloc_extelem_zeroed("combos", self.cycles * (combo_count + 1))
         );
-        eprintln!("  [finalize] alloc_combos: {:.1}ms", ft0.elapsed().as_secs_f64() * 1000.0);
-
         scope!("mix_poly_coeffs", {
             let mut cur_mix = H::ExtElem::ONE;
 
@@ -399,7 +387,6 @@ impl<'a, H: Hal> Prover<'a, H> {
             );
         });
 
-        eprintln!("  [finalize] mix_poly: {:.1}ms", ft0.elapsed().as_secs_f64() * 1000.0);
         scope!("load_combos", {
             let reg_sizes: Vec<_> = self.taps.regs().map(|x| x.size() as u32).collect();
             let reg_combo_ids: Vec<_> = self.taps.regs().map(|x| x.combo_id() as u32).collect();
@@ -435,7 +422,6 @@ impl<'a, H: Hal> Prover<'a, H> {
             });
         });
 
-        eprintln!("  [finalize] combos: {:.1}ms", ft0.elapsed().as_secs_f64() * 1000.0);
         // Sum the combos up into one final polynomial + make it into 4 Fp polys.
         // Additionally, it needs to be bit reversed to make everyone happy
         let final_poly_coeffs = scope!("sum", {
@@ -446,7 +432,6 @@ impl<'a, H: Hal> Prover<'a, H> {
             final_poly_coeffs
         });
 
-        eprintln!("  [finalize] sum+bitrev: {:.1}ms", ft0.elapsed().as_secs_f64() * 1000.0);
         // Finally do the FRI protocol to prove the degree of the polynomial
         scope!(
             "bit_rev",
@@ -482,7 +467,6 @@ impl<'a, H: Hal> Prover<'a, H> {
             },
         );
 
-        eprintln!("  [finalize] fri_prove: {:.1}ms", ft0.elapsed().as_secs_f64() * 1000.0);
         let proven_soundness_error =
             super::soundness::proven::<H>(self.taps, final_poly_coeffs.size());
         tracing::debug!("proven_soundness_error: {proven_soundness_error:?}");

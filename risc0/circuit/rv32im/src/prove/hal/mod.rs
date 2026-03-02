@@ -159,7 +159,6 @@ where
 
     fn prove_core(&self, preflight_results: PreflightResults) -> Result<Seal> {
         scope!("prove_core");
-        let t0 = std::time::Instant::now();
 
         cfg_if::cfg_if! {
             if #[cfg(feature = "witgen_debug")] {
@@ -174,19 +173,15 @@ where
         }
 
         let (hal, circuit_hal) = self.get_hal();
-        eprintln!("[prove_core] hal_factory: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
 
-        let t1 = std::time::Instant::now();
         let po2 = preflight_results.po2();
         let header = preflight_results.build_header();
         let mut witgen =
             WitnessGenerator::new(hal.as_ref(), circuit_hal.as_ref(), preflight_results, mode)?;
-        eprintln!("[prove_core] witgen: {:.1}ms", t1.elapsed().as_secs_f64() * 1000.0);
 
         let code = &witgen.code.buf;
         let data = &witgen.data.buf;
 
-        let t2 = std::time::Instant::now();
         let seal = scope!("prove_inner", {
             tracing::debug!("prove_inner");
 
@@ -202,7 +197,6 @@ where
             // already allocated vector.
             prover.iop().write_u32_slice(&[RV32IM_SEAL_VERSION]);
 
-            let mt0 = std::time::Instant::now();
             let (mix, global_clone) = scope!("main", {
                 // At the start of the protocol, seed the Fiat-Shamir transcript with context information
                 // about the proof system and circuit.
@@ -218,7 +212,6 @@ where
                 prover.iop().commit(&header_digest);
                 prover.iop().write_field_elem_slice(header.as_slice());
                 prover.set_po2(po2 as usize);
-                eprintln!("  [main] setup: {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0);
 
                 // Code buffer is always zeros (INVALID → zeroized, never written to).
                 // Cache its PolyGroup to skip iNTT/expand/merkle on subsequent segments
@@ -228,28 +221,23 @@ where
                     if let Some((ref cached, cached_po2)) = *cache {
                         if cached_po2 == po2 as usize {
                             prover.commit_cached_group(REGISTER_GROUP_CODE, cached.clone());
-                            eprintln!("  [main] commit(code) [cached]: {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0);
                         } else {
                             prover.commit_group(REGISTER_GROUP_CODE, code);
                             *cache = prover.get_group(REGISTER_GROUP_CODE).cloned()
                                 .map(|g| (g, po2 as usize));
-                            eprintln!("  [main] commit(code) [recomputed, po2 changed {cached_po2}->{po2}]: {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0);
                         }
                     } else {
                         prover.commit_group(REGISTER_GROUP_CODE, code);
                         *cache = prover.get_group(REGISTER_GROUP_CODE).cloned()
                             .map(|g| (g, po2 as usize));
-                        eprintln!("  [main] commit(code) [computed+cached]: {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0);
                     }
                 }
                 prover.commit_group(REGISTER_GROUP_DATA, data);
-                eprintln!("  [main] commit(data): {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0);
 
                 // Make the mixing values
                 let mix: [Val; REGCOUNT_MIX] = std::array::from_fn(|_| prover.iop().random_elem());
 
                 let mix = witgen.accum(hal.as_ref(), circuit_hal.as_ref(), &mix)?;
-                eprintln!("  [main] accum: {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0);
 
                 // Free dead witness buffers to reduce peak GPU memory.
                 // data.buf and code.buf are no longer needed after accum().
@@ -258,7 +246,6 @@ where
                 witgen.code.buf = hal.alloc_elem("code_freed", 1);
 
                 prover.commit_group(REGISTER_GROUP_ACCUM, &witgen.accum.buf);
-                eprintln!("  [main] commit(accum): {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0);
 
                 // Free accum witness buffer — PolyGroup now owns the data.
                 witgen.accum.buf = hal.alloc_elem("accum_freed", 1);
@@ -274,24 +261,13 @@ where
             // All borrows on witgen (through code, data, global, accum) are now
             // released by NLL. Move witgen into a closure that runs during GPU
             // eval_check to overlap CPU drop with GPU compute.
-            let t3 = std::time::Instant::now();
-            let result = prover.finalize_with_hook(
+            prover.finalize_with_hook(
                 &[&mix.buf, &global_clone],
                 circuit_hal.as_ref(),
                 move || {
-                    let td = std::time::Instant::now();
                     drop(witgen);
-                    eprintln!("[prove_core] witgen_drop (overlapped with eval_check): {:.1}ms",
-                        td.elapsed().as_secs_f64() * 1000.0);
                 },
-            );
-
-            eprintln!("[prove_core] prove_inner: {:.1}ms (main: {:.1}ms, finalize: {:.1}ms)",
-                t2.elapsed().as_secs_f64() * 1000.0,
-                (t3 - t2).as_secs_f64() * 1000.0,
-                t3.elapsed().as_secs_f64() * 1000.0);
-            eprintln!("[prove_core] TOTAL: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
-            result
+            )
         });
 
         Ok(seal)

@@ -212,6 +212,7 @@ impl Prover {
     }
 }
 
+
 pub(crate) struct RecursionProverImpl<H, C>
 where
     H: Hal<Field = BabyBear, Elem = BabyBearElem, ExtElem = BabyBearExtElem>,

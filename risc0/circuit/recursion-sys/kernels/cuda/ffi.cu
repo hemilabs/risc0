@@ -21,11 +21,9 @@
 #include "vendor/nvtx3/nvtx3.hpp"
 
 #include <cstring>
-#include <cuda/std/array>
 #include <cuda_runtime.h>
 #include <exception>
 #include <thrust/execution_policy.h>
-#include <thrust/host_vector.h>
 #include <thrust/sort.h>
 #include <vector>
 
@@ -156,149 +154,147 @@ __global__ void parStepVerifyAccum(AccumContext* ctx) {
   }
 }
 
-struct HostExecContext {
-  ExecContext* ctx;
-  CudaStream stream;
-  LaunchConfig cfg;
+// Static cache for device-side allocations that persist across recursion proofs.
+// Eliminates ~774 cudaMalloc/cudaFree + ~86 cudaStreamCreate/Destroy per proving run.
+struct RecursionDeviceCache {
+  cudaStream_t stream = nullptr;
 
-  HostExecContext(ExecBuffers* buffers, PreflightTrace* trace, size_t totalCycles)
-      : cfg(getSimpleConfig(trace->numCycles)) {
-    CUDA_OK(cudaMallocManaged(&ctx, sizeof(ExecContext)));
-    ctx->buffers.ctrl = buffers->ctrl;
-    ctx->buffers.data = buffers->data;
-    ctx->buffers.global = buffers->global;
-    ctx->totalCycles = totalCycles;
+  // Managed-memory context structs (CPU writes fields, GPU reads via page migration)
+  ExecContext* exec_ctx = nullptr;
+  PreflightTrace* exec_trace = nullptr;
+  AccumContext* accum_ctx = nullptr;
 
-    CUDA_OK(cudaMallocManaged(&ctx->trace, sizeof(PreflightTrace)));
-    ctx->trace->numWoms = trace->numWoms;
-    ctx->trace->numCycles = trace->numCycles;
-    ctx->trace->numIops = trace->numIops;
+  // Grow-only device buffers for preflight data
+  FpExt* d_wom = nullptr;
+  size_t wom_capacity = 0;
+  PreflightCycle* d_cycles = nullptr;
+  size_t cycles_capacity = 0;
+  FpExt* d_iops = nullptr;
+  size_t iops_capacity = 0;
 
-    CUDA_OK(cudaMalloc(&ctx->trace->wom, trace->numWoms * sizeof(FpExt)));
-    CUDA_OK(cudaMemcpy(
-        ctx->trace->wom, trace->wom, trace->numWoms * sizeof(FpExt), cudaMemcpyHostToDevice));
+  // Grow-only device buffers for WOM tracking
+  WomArgumentRow* d_womRows = nullptr;
+  size_t womRows_capacity = 0;
+  uint32_t* d_womIndex = nullptr;
+  size_t womIndex_capacity = 0;
 
-    CUDA_OK(cudaMalloc(&ctx->trace->cycles, trace->numCycles * sizeof(PreflightCycle)));
-    CUDA_OK(cudaMemcpy(ctx->trace->cycles,
-                       trace->cycles,
-                       trace->numCycles * sizeof(PreflightCycle),
-                       cudaMemcpyHostToDevice));
+  // Grow-only device buffer for accum
+  FpExt* d_accum = nullptr;
+  size_t accum_capacity = 0;
 
-    CUDA_OK(cudaMalloc(&ctx->trace->iops, trace->numIops * sizeof(FpExt)));
-    CUDA_OK(cudaMemcpy(
-        ctx->trace->iops, trace->iops, trace->numIops * sizeof(FpExt), cudaMemcpyHostToDevice));
+  // Cached host buffer for accum initialization
+  std::vector<FpExt> accumInit;
 
-    CUDA_OK(
-        cudaMalloc(&ctx->womRows, trace->numCycles * kMaxWomRowsPerCycle * sizeof(WomArgumentRow)));
-    CUDA_OK(cudaMemset(ctx->womRows,
-                       kInvalidPattern,
-                       trace->numCycles * kMaxWomRowsPerCycle * sizeof(WomArgumentRow)));
-
-    CUDA_OK(cudaMalloc(&ctx->womIndex, trace->numCycles * sizeof(uint32_t)));
-    CUDA_OK(cudaMemset(ctx->womIndex, 0, trace->numCycles * sizeof(uint32_t)));
+  void init() {
+    if (exec_ctx)
+      return;
+    CUDA_OK(cudaStreamCreate(&stream));
+    CUDA_OK(cudaMallocManaged(&exec_ctx, sizeof(ExecContext)));
+    CUDA_OK(cudaMallocManaged(&exec_trace, sizeof(PreflightTrace)));
+    CUDA_OK(cudaMallocManaged(&accum_ctx, sizeof(AccumContext)));
   }
 
-  ~HostExecContext() {
-    cudaFree(ctx->womIndex);
-    cudaFree(ctx->womRows);
-    cudaFree(ctx->trace->iops);
-    cudaFree(ctx->trace->cycles);
-    cudaFree(ctx->trace->wom);
-    cudaFree(ctx->trace);
-    cudaFree(ctx);
+  void ensure_buffers(size_t numWoms, size_t numCycles, size_t numIops) {
+    if (numWoms > wom_capacity) {
+      if (d_wom)
+        cudaFree(d_wom);
+      CUDA_OK(cudaMalloc(&d_wom, numWoms * sizeof(FpExt)));
+      wom_capacity = numWoms;
+    }
+    if (numCycles > cycles_capacity) {
+      if (d_cycles)
+        cudaFree(d_cycles);
+      CUDA_OK(cudaMalloc(&d_cycles, numCycles * sizeof(PreflightCycle)));
+      cycles_capacity = numCycles;
+    }
+    if (numIops > iops_capacity) {
+      if (d_iops)
+        cudaFree(d_iops);
+      CUDA_OK(cudaMalloc(&d_iops, numIops * sizeof(FpExt)));
+      iops_capacity = numIops;
+    }
+    if (numCycles > womRows_capacity) {
+      if (d_womRows)
+        cudaFree(d_womRows);
+      CUDA_OK(cudaMalloc(&d_womRows, numCycles * kMaxWomRowsPerCycle * sizeof(WomArgumentRow)));
+      womRows_capacity = numCycles;
+    }
+    if (numCycles > womIndex_capacity) {
+      if (d_womIndex)
+        cudaFree(d_womIndex);
+      CUDA_OK(cudaMalloc(&d_womIndex, numCycles * sizeof(uint32_t)));
+      womIndex_capacity = numCycles;
+    }
   }
 
-  void doStepExec(uint32_t mode) {
-    nvtx3::scoped_range range("stepExec");
-    switch (mode) {
-    case kStepModeParallel: {
-      parStepExec<<<cfg.grid, cfg.block, 0, stream>>>(ctx);
-    } break;
-    case kStepModeSeqForward: {
-      fwdStepExec<<<cfg.grid, cfg.block, 0, stream>>>(ctx);
-    } break;
-    case kStepModeSeqReverse: {
-      revStepExec<<<cfg.grid, cfg.block, 0, stream>>>(ctx);
-    } break;
-    }
-    CUDA_OK(cudaStreamSynchronize(stream));
+  void setup_exec(ExecBuffers* buffers, PreflightTrace* trace, size_t totalCycles) {
+    init();
+    ensure_buffers(trace->numWoms, trace->numCycles, trace->numIops);
+
+    cudaStream_t s = stream;
+
+    // Upload preflight data (async)
+    CUDA_OK(cudaMemcpyAsync(
+        d_wom, trace->wom, trace->numWoms * sizeof(FpExt), cudaMemcpyHostToDevice, s));
+    CUDA_OK(cudaMemcpyAsync(d_cycles,
+                             trace->cycles,
+                             trace->numCycles * sizeof(PreflightCycle),
+                             cudaMemcpyHostToDevice,
+                             s));
+    CUDA_OK(cudaMemcpyAsync(
+        d_iops, trace->iops, trace->numIops * sizeof(FpExt), cudaMemcpyHostToDevice, s));
+
+    // Reset WOM data (async)
+    CUDA_OK(cudaMemsetAsync(
+        d_womRows, kInvalidPattern, trace->numCycles * kMaxWomRowsPerCycle * sizeof(WomArgumentRow), s));
+    CUDA_OK(cudaMemsetAsync(d_womIndex, 0, trace->numCycles * sizeof(uint32_t), s));
+
+    // Update managed-memory structs (CPU writes, safe after cudaDeviceSynchronize)
+    exec_trace->wom = d_wom;
+    exec_trace->cycles = d_cycles;
+    exec_trace->iops = d_iops;
+    exec_trace->numWoms = trace->numWoms;
+    exec_trace->numCycles = trace->numCycles;
+    exec_trace->numIops = trace->numIops;
+
+    exec_ctx->buffers.ctrl = buffers->ctrl;
+    exec_ctx->buffers.data = buffers->data;
+    exec_ctx->buffers.global = buffers->global;
+    exec_ctx->trace = exec_trace;
+    exec_ctx->totalCycles = totalCycles;
+    exec_ctx->womRows = d_womRows;
+    exec_ctx->womIndex = d_womIndex;
   }
 
-  void verifyWom(uint32_t mode) {
-    nvtx3::scoped_range range("verifyWom");
-    uint32_t numCycles = ctx->trace->numCycles;
-
-    {
-      nvtx3::scoped_range range("sortWom");
-      thrust::sort(thrust::device, ctx->womRows, ctx->womRows + numCycles * kMaxWomRowsPerCycle);
+  void setup_accum(AccumBuffers* buffers, size_t workCycles, size_t totalCycles) {
+    init();
+    if (workCycles > accum_capacity) {
+      if (d_accum)
+        cudaFree(d_accum);
+      CUDA_OK(cudaMalloc(&d_accum, workCycles * sizeof(FpExt)));
+      accum_capacity = workCycles;
     }
 
-    {
-      nvtx3::scoped_range range("scan");
-      thrust::exclusive_scan(
-          thrust::device, ctx->womIndex, ctx->womIndex + numCycles, ctx->womIndex);
+    // Initialize accum to FpExt(1) using cached host buffer
+    if (accumInit.size() < workCycles) {
+      accumInit.resize(workCycles, FpExt(1));
     }
+    CUDA_OK(cudaMemcpyAsync(
+        d_accum, accumInit.data(), workCycles * sizeof(FpExt), cudaMemcpyHostToDevice, stream));
 
-    {
-      nvtx3::scoped_range range("injectWomBacks");
-      injectWomBacks<<<cfg.grid, cfg.block, 0, stream>>>(ctx);
-      CUDA_OK(cudaStreamSynchronize(stream));
-    }
-
-    {
-      nvtx3::scoped_range range("stepVerifyWom");
-      parStepVerifyWom<<<cfg.grid, cfg.block, 0, stream>>>(ctx);
-      CUDA_OK(cudaStreamSynchronize(stream));
-    }
+    // Update managed-memory struct (CPU writes, safe after cudaDeviceSynchronize)
+    accum_ctx->buffers.ctrl = buffers->ctrl;
+    accum_ctx->buffers.global = buffers->global;
+    accum_ctx->buffers.data = buffers->data;
+    accum_ctx->buffers.mix = buffers->mix;
+    accum_ctx->buffers.accum = buffers->accum;
+    accum_ctx->totalCycles = totalCycles;
+    accum_ctx->workCycles = workCycles;
+    accum_ctx->accum = d_accum;
   }
 };
 
-struct HostAccumContext {
-  AccumContext* ctx;
-  CudaStream stream;
-  LaunchConfig cfg;
-
-  HostAccumContext(AccumBuffers* buffers, size_t workCycles, size_t totalCycles)
-      : cfg(getSimpleConfig(workCycles)) {
-    CUDA_OK(cudaMallocManaged(&ctx, sizeof(AccumContext)));
-    ctx->buffers.ctrl = buffers->ctrl;
-    ctx->buffers.global = buffers->global;
-    ctx->buffers.data = buffers->data;
-    ctx->buffers.mix = buffers->mix;
-    ctx->buffers.accum = buffers->accum;
-    ctx->totalCycles = totalCycles;
-    ctx->workCycles = workCycles;
-
-    std::vector<FpExt> accumInit(workCycles, FpExt(1));
-    CUDA_OK(cudaMalloc(&ctx->accum, workCycles * sizeof(FpExt)));
-    CUDA_OK(cudaMemcpy(
-        ctx->accum, accumInit.data(), workCycles * sizeof(FpExt), cudaMemcpyHostToDevice));
-  }
-
-  ~HostAccumContext() {
-    cudaFree(ctx->accum);
-    cudaFree(ctx);
-  }
-
-  void computeAccum() {
-    nvtx3::scoped_range range("computeAccum");
-    parStepComputeAccum<<<cfg.grid, cfg.block, 0, stream>>>(ctx);
-    CUDA_OK(cudaStreamSynchronize(stream));
-  }
-
-  void calcPrefixProducts() {
-    nvtx3::scoped_range range("calcPrefixProducts");
-    sppark::calcPrefixProducts(ctx->accum, ctx->workCycles);
-    CUDA_OK(cudaStreamSynchronize(stream));
-  }
-
-  void verifyAccum() {
-    nvtx3::scoped_range range("verifyAccum");
-    CUDA_OK(cudaDeviceSynchronize());
-    parStepVerifyAccum<<<cfg.grid, cfg.block, 0, stream>>>(ctx);
-    CUDA_OK(cudaStreamSynchronize(stream));
-  }
-};
+static RecursionDeviceCache g_cache;
 
 extern "C" {
 
@@ -307,10 +303,57 @@ const char* risc0_circuit_recursion_cuda_witgen(uint32_t mode,
                                                 PreflightTrace* trace,
                                                 uint32_t totalCycles) {
   try {
+    // Full device sync to ensure all prior GPU work is visible.
     CUDA_OK(cudaDeviceSynchronize());
-    HostExecContext ctx(buffers, trace, totalCycles);
-    ctx.doStepExec(mode);
-    ctx.verifyWom(mode);
+    g_cache.setup_exec(buffers, trace, totalCycles);
+
+    ExecContext* ctx = g_cache.exec_ctx;
+    cudaStream_t s = g_cache.stream;
+    LaunchConfig cfg = getSimpleConfig(trace->numCycles);
+
+    {
+      nvtx3::scoped_range range("stepExec");
+      switch (mode) {
+      case kStepModeParallel:
+        parStepExec<<<cfg.grid, cfg.block, 0, s>>>(ctx);
+        break;
+      case kStepModeSeqForward:
+        fwdStepExec<<<cfg.grid, cfg.block, 0, s>>>(ctx);
+        break;
+      case kStepModeSeqReverse:
+        revStepExec<<<cfg.grid, cfg.block, 0, s>>>(ctx);
+        break;
+      }
+      CUDA_OK(cudaStreamSynchronize(s));
+    }
+
+    {
+      nvtx3::scoped_range range("verifyWom");
+      uint32_t numCycles = trace->numCycles;
+
+      {
+        nvtx3::scoped_range range("sortWom");
+        thrust::sort(thrust::device, ctx->womRows, ctx->womRows + numCycles * kMaxWomRowsPerCycle);
+      }
+
+      {
+        nvtx3::scoped_range range("scan");
+        thrust::exclusive_scan(
+            thrust::device, ctx->womIndex, ctx->womIndex + numCycles, ctx->womIndex);
+      }
+
+      {
+        nvtx3::scoped_range range("injectWomBacks");
+        injectWomBacks<<<cfg.grid, cfg.block, 0, s>>>(ctx);
+        CUDA_OK(cudaStreamSynchronize(s));
+      }
+
+      {
+        nvtx3::scoped_range range("stepVerifyWom");
+        parStepVerifyWom<<<cfg.grid, cfg.block, 0, s>>>(ctx);
+        CUDA_OK(cudaStreamSynchronize(s));
+      }
+    }
   } catch (const std::exception& err) {
     return strdup(err.what());
   }
@@ -321,11 +364,31 @@ const char* risc0_circuit_recursion_cuda_accum(AccumBuffers* buffers,
                                                uint32_t workCycles,
                                                uint32_t totalCycles) {
   try {
+    // Full device sync to ensure all prior GPU work is visible.
     CUDA_OK(cudaDeviceSynchronize());
-    HostAccumContext ctx(buffers, workCycles, totalCycles);
-    ctx.computeAccum();
-    ctx.calcPrefixProducts();
-    ctx.verifyAccum();
+    g_cache.setup_accum(buffers, workCycles, totalCycles);
+
+    AccumContext* ctx = g_cache.accum_ctx;
+    cudaStream_t s = g_cache.stream;
+    LaunchConfig cfg = getSimpleConfig(workCycles);
+
+    {
+      nvtx3::scoped_range range("computeAccum");
+      parStepComputeAccum<<<cfg.grid, cfg.block, 0, s>>>(ctx);
+      CUDA_OK(cudaStreamSynchronize(s));
+    }
+
+    {
+      nvtx3::scoped_range range("calcPrefixProducts");
+      sppark::calcPrefixProducts(ctx->accum, ctx->workCycles);
+      CUDA_OK(cudaStreamSynchronize(s));
+    }
+
+    {
+      nvtx3::scoped_range range("verifyAccum");
+      parStepVerifyAccum<<<cfg.grid, cfg.block, 0, s>>>(ctx);
+      CUDA_OK(cudaStreamSynchronize(s));
+    }
   } catch (const std::exception& err) {
     return strdup(err.what());
   }

@@ -128,7 +128,6 @@ where
     ) -> Result<Self> {
         scope!("witness_generator_new");
 
-        let tn0 = std::time::Instant::now();
         let (global, code, data, accum) = Self::hal_generate_witness(
             hal,
             circuit_hal,
@@ -138,9 +137,8 @@ where
             preflight_results.cycles,
             preflight_results.injector,
         )?;
-        let tn1 = std::time::Instant::now();
 
-        let result = Self {
+        Ok(Self {
             cycles: preflight_results.cycles,
             global,
             code,
@@ -148,10 +146,7 @@ where
             accum,
             trace: preflight_results.trace,
             bigint_rows: preflight_results.bigint_rows,
-        };
-        eprintln!("      [witgen_new] hal_gen={:.1}ms struct_build={:.1}ms",
-            (tn1-tn0).as_secs_f64()*1000.0, tn1.elapsed().as_secs_f64()*1000.0);
-        Ok(result)
+        })
     }
 
     #[allow(clippy::type_complexity)]
@@ -166,7 +161,6 @@ where
     ) -> Result<(MetaBuffer<H>, MetaBuffer<H>, MetaBuffer<H>, MetaBuffer<H>), anyhow::Error> {
         scope!("hal_generate_witness");
 
-        let tw0 = std::time::Instant::now();
         let global = MetaBuffer {
             buf: hal.copy_from_elem("global", &global),
             rows: 1,
@@ -174,19 +168,16 @@ where
             checked: true,
         };
         let code = MetaBuffer::new("code", hal, cycles, REGCOUNT_CODE, false);
-        let tw1 = std::time::Instant::now();
         let data = scope!(
             "alloc(data)",
             MetaBuffer::new("data", hal, cycles, REGCOUNT_DATA, true)
         );
-        let tw2 = std::time::Instant::now();
         // Allocate accum before generate_witness so its set_32 init (default stream)
         // runs while the persistent stream is idle, avoiding implicit blocking-stream sync.
         let accum = scope!(
             "alloc(accum)",
             MetaBuffer::new("accum", hal, cycles, REGCOUNT_ACCUM, true)
         );
-        let tw3 = std::time::Instant::now();
         hal.scatter(
             &data.buf,
             &injector.index,
@@ -194,33 +185,17 @@ where
             &injector.values,
         );
         hal.scatter_bits(&data.buf, &injector.bit_data, cycles as u32);
-        let tw4 = std::time::Instant::now();
         // Drop 126MB of injector Vecs in background while GPU runs generate_witness.
         // After scatter + scatter_bits, all host data has been copied to GPU (sync memcpy).
-        let inj_idx = injector.index.len();
-        let inj_off = injector.offsets.len();
-        let inj_val = injector.values.len();
-        let inj_bits = injector.bit_data.len() / 3;
         let _drop_handle = std::thread::spawn(move || drop(injector));
         circuit_hal
             .generate_witness(mode, trace, &global, &data)
             .context("witness generation failure")?;
-        let tw5 = std::time::Instant::now();
         scope!("zeroize", {
             hal.eltwise_zeroize_elem(&global.buf);
             hal.eltwise_zeroize_elem(&code.buf);
             hal.eltwise_zeroize_elem(&data.buf);
         });
-        let tw6 = std::time::Instant::now();
-        eprintln!("      [hal_witgen] global+code={:.1}ms data={:.1}ms accum={:.1}ms scatter={:.1}ms ffi={:.1}ms zeroize={:.1}ms (inj: idx={} off={} val={} bits={})",
-            (tw1-tw0).as_secs_f64()*1000.0,
-            (tw2-tw1).as_secs_f64()*1000.0,
-            (tw3-tw2).as_secs_f64()*1000.0,
-            (tw4-tw3).as_secs_f64()*1000.0,
-            (tw5-tw4).as_secs_f64()*1000.0,
-            (tw6-tw5).as_secs_f64()*1000.0,
-            inj_idx, inj_off, inj_val, inj_bits,
-        );
         Ok((global, code, data, accum))
     }
 
@@ -230,7 +205,6 @@ where
         circuit_hal: &C,
         mix: &[Val],
     ) -> Result<MetaBuffer<H>> {
-        let ta0 = std::time::Instant::now();
         // use final mix to compute BigIntAccumPowers
         let last_mix = ExtVal::from_subelems(mix[mix.len() - 4..].iter().cloned());
 
@@ -248,7 +222,6 @@ where
                 injector.push();
             }
         }
-        eprintln!("    [accum] bigint_inject: {:.1}ms", ta0.elapsed().as_secs_f64() * 1000.0);
 
         hal.scatter(
             &self.accum.buf,
@@ -256,7 +229,6 @@ where
             &injector.offsets,
             &injector.values,
         );
-        eprintln!("    [accum] scatter: {:.1}ms", ta0.elapsed().as_secs_f64() * 1000.0);
 
         let mix = MetaBuffer {
             buf: hal.copy_from_elem("mix", mix),
@@ -264,15 +236,12 @@ where
             cols: REGCOUNT_MIX,
             checked: true,
         };
-        eprintln!("    [accum] mix_upload: {:.1}ms", ta0.elapsed().as_secs_f64() * 1000.0);
 
         circuit_hal.step_accum(&self.trace, &self.data, &self.accum, &self.global, &mix)?;
-        eprintln!("    [accum] step_accum: {:.1}ms", ta0.elapsed().as_secs_f64() * 1000.0);
 
         scope!("zeroize(accum)", {
             hal.eltwise_zeroize_elem(&self.accum.buf);
         });
-        eprintln!("    [accum] zeroize: {:.1}ms", ta0.elapsed().as_secs_f64() * 1000.0);
 
         Ok(mix)
     }

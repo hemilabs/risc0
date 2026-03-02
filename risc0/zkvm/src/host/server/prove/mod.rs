@@ -206,45 +206,55 @@ pub trait ProverServer: private::Sealed {
         &self,
         receipt: &CompositeReceipt,
     ) -> Result<SuccinctReceipt<ReceiptClaim>> {
-        use crate::host::recursion::prove::{batch_preflight_joins, batch_preflight_lifts};
+        use crate::host::recursion::prove::{
+            batch_preflight_joins, batch_preflight_lifts, join as join_fn, lift as lift_fn,
+        };
 
-        // Pre-compute lift preflights for all segments in parallel (CPU-only).
+        // Phase 1: Batch-preflight all lifts (parallel CPU), then lift sequentially (GPU).
         if receipt.segments.len() > 1 {
             let _ = batch_preflight_lifts(&receipt.segments);
         }
-
-        // Phase 1: Lift all segments.
-        let mut receipts: Vec<SuccinctReceipt<ReceiptClaim>> = receipt
-            .segments
-            .iter()
-            .map(|seg| self.lift(seg))
-            .collect::<Result<Vec<_>>>()?;
+        let mut receipts: Vec<SuccinctReceipt<ReceiptClaim>> = Vec::new();
+        for seg in receipt.segments.iter() {
+            receipts.push(lift_fn(seg)?);
+        }
 
         ensure!(
             !receipts.is_empty(),
             "malformed composite receipt has no continuation segment receipts"
         );
 
-        // Phase 2: Tree reduction via pairwise joins.
-        // At each level, batch-compute join preflights for all pairs with rayon,
-        // then execute joins sequentially with cached preflights (~70ms vs ~97ms each).
+        // Phase 2: Tree reduction — pairwise joins, odd receipt carried at end.
+        // Batch-preflight each level's joins in parallel (CPU), then run sequentially (GPU).
         while receipts.len() > 1 {
-            let pairs: Vec<_> = receipts
-                .chunks(2)
-                .filter_map(|c| if c.len() == 2 { Some((&c[0], &c[1])) } else { None })
-                .collect();
-            if !pairs.is_empty() {
-                let _ = batch_preflight_joins(&pairs);
-            }
-
             let mut next_level = Vec::new();
             let mut iter = receipts.into_iter();
+            let mut odd = None;
+
+            let mut pairs: Vec<(
+                SuccinctReceipt<ReceiptClaim>,
+                SuccinctReceipt<ReceiptClaim>,
+            )> = Vec::new();
             while let Some(left) = iter.next() {
                 if let Some(right) = iter.next() {
-                    next_level.push(self.join(&left, &right)?);
+                    pairs.push((left, right));
                 } else {
-                    next_level.push(left);
+                    odd = Some(left);
                 }
+            }
+
+            // Batch-preflight all joins for this level (parallel CPU).
+            {
+                let refs: Vec<_> = pairs.iter().map(|(l, r)| (l, r)).collect();
+                let _ = batch_preflight_joins(&refs);
+            }
+
+            for (l, r) in pairs.into_iter() {
+                next_level.push(join_fn(&l, &r)?);
+            }
+            // Carry odd receipt at the END to preserve segment ordering.
+            if let Some(o) = odd {
+                next_level.push(o);
             }
             receipts = next_level;
         }

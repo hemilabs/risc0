@@ -113,6 +113,7 @@ pub fn batch_preflight_lifts(segments: &[SegmentReceipt]) -> Result<()> {
 /// by the corresponding `join()` calls, saving ~27ms of CPU work per join.
 /// Pairs must be in the same order as the subsequent `join()` calls.
 #[cfg(feature = "prove")]
+#[allow(dead_code)]
 pub fn batch_preflight_joins(
     pairs: &[(&SuccinctReceipt<ReceiptClaim>, &SuccinctReceipt<ReceiptClaim>)],
 ) -> Result<()> {
@@ -1063,6 +1064,7 @@ impl Prover {
     pub fn run(&mut self) -> Result<RecursionReceipt> {
         self.prover.run()
     }
+
 }
 
 fn check_resolve_assumption<Claim>(

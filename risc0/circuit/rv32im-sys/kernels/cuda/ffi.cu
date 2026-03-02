@@ -32,7 +32,6 @@
 #pragma GCC diagnostic pop
 #endif
 
-#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cuda/std/array>
@@ -475,9 +474,7 @@ const char* risc0_circuit_rv32im_cuda_witgen(uint32_t mode,
                                              uint32_t lastCycle) {
   try {
     cudaStream_t stream = getPersistentStream();
-    auto t0 = std::chrono::steady_clock::now();
     DeviceExecContext* d_ctx = g_cache.setup_exec(buffers, preflight, lastCycle, stream);
-    auto t1 = std::chrono::steady_clock::now();
     size_t split = preflight->tableSplitCycle;
 
     switch (mode) {
@@ -489,9 +486,6 @@ const char* risc0_circuit_rv32im_cuda_witgen(uint32_t mode,
         nvtx3::scoped_range range("par_stepExec");
         par_stepExec<<<cfg1.grid, cfg1.block, 0, stream>>>(d_ctx, 0, split);
         par_stepExec<<<cfg2.grid, cfg2.block, 0, stream>>>(d_ctx, split, phase2Count);
-        // No sync needed: subsequent operations on same stream (zeroize, iNTT)
-        // are ordered by CUDA stream semantics. The ~2ms of CPU work (Fiat-Shamir
-        // setup + commit(code)) that follows overlaps with GPU step_exec.
       }
     } break;
     case kStepModeSeqForward:
@@ -503,10 +497,6 @@ const char* risc0_circuit_rv32im_cuda_witgen(uint32_t mode,
       CUDA_OK(cudaStreamSynchronize(stream));
       break;
     }
-    auto t2 = std::chrono::steady_clock::now();
-    fprintf(stderr, "      [ffi_witgen] ctx_setup: %.1fms, kernels(async): %.1fms\n",
-            std::chrono::duration<double, std::milli>(t1 - t0).count(),
-            std::chrono::duration<double, std::milli>(t2 - t1).count());
   } catch (const std::exception& err) {
     return strdup(err.what());
   } catch (...) {
@@ -520,10 +510,7 @@ const char* risc0_circuit_rv32im_cuda_accum(AccumBuffers* buffers,
                                             uint32_t lastCycle) {
   try {
     cudaStream_t stream = getPersistentStream();
-
-    auto t0 = std::chrono::steady_clock::now();
     DeviceAccumContext* d_ctx = g_cache.setup_accum(buffers, preflight, lastCycle, stream);
-    auto t1 = std::chrono::steady_clock::now();
     auto cfg = getSimpleConfig(lastCycle);
 
     {
@@ -543,10 +530,6 @@ const char* risc0_circuit_rv32im_cuda_accum(AccumBuffers* buffers,
 
       finalizeAccum<<<cfg.grid, cfg.block, 0, stream>>>(d_ctx, lastCycle);
     }
-    auto t2 = std::chrono::steady_clock::now();
-    fprintf(stderr, "      [ffi_accum] ctx_setup: %.1fms, kernels: %.1fms\n",
-            std::chrono::duration<double, std::milli>(t1 - t0).count(),
-            std::chrono::duration<double, std::milli>(t2 - t1).count());
 
   } catch (const std::exception& err) {
     return strdup(err.what());
