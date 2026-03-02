@@ -185,8 +185,10 @@ where
 {
     fn prove(&self, program: Program, input: VecDeque<u32>) -> Result<RecursionReceipt> {
         scope!("prove");
+        let t0 = std::time::Instant::now();
 
         let preflight = self.preflight(&program, input)?;
+        let t_preflight = t0.elapsed();
 
         let witgen = WitnessGenerator::new(
             self.hal.as_ref(),
@@ -194,6 +196,7 @@ where
             &program,
             &preflight,
         )?;
+        let t_witgen = t0.elapsed();
 
         let global = &witgen.global;
 
@@ -201,7 +204,7 @@ where
             let mut prover = risc0_zkp::prove::Prover::new(self.hal.as_ref(), TAPSET);
             let hashfn = &self.hal.get_hash_suite().hashfn;
 
-            let mix = scope!("main", {
+            let (mix, t_ctrl, t_data, t_accum, t_accum_commit) = scope!("main", {
                 // At the start of the protocol, seed the Fiat-Shamir transcript with context information
                 // about the proof system and circuit.
                 prover
@@ -242,20 +245,36 @@ where
                         }
                     }
                 }
+                let t_ctrl = t0.elapsed();
                 prover.commit_group(REGISTER_GROUP_DATA, &witgen.data);
+                let t_data = t0.elapsed();
 
                 // Make the mixing values
                 let mix: [BabyBearElem; CircuitImpl::MIX_SIZE] =
                     std::array::from_fn(|_| prover.iop().random_elem());
 
                 let mix = witgen.accum(&self.hal, self.circuit_hal.as_ref(), &mix)?;
+                let t_accum = t0.elapsed();
 
                 prover.commit_group(REGISTER_GROUP_ACCUM, &witgen.accum);
+                let t_accum_commit = t0.elapsed();
 
-                mix
+                (mix, t_ctrl, t_data, t_accum, t_accum_commit)
             });
 
-            prover.finalize(&[&mix, global], self.circuit_hal.as_ref())
+            let t_main = t0.elapsed();
+            let seal = prover.finalize(&[&mix, global], self.circuit_hal.as_ref());
+            let t_final = t0.elapsed();
+            eprintln!("[recursion] preflight={:.1}ms witgen={:.1}ms ctrl={:.1}ms data={:.1}ms accum={:.1}ms accum_commit={:.1}ms finalize={:.1}ms total={:.1}ms",
+                t_preflight.as_secs_f64()*1000.0,
+                (t_witgen - t_preflight).as_secs_f64()*1000.0,
+                (t_ctrl - t_witgen).as_secs_f64()*1000.0,
+                (t_data - t_ctrl).as_secs_f64()*1000.0,
+                (t_accum - t_data).as_secs_f64()*1000.0,
+                (t_accum_commit - t_accum).as_secs_f64()*1000.0,
+                (t_final - t_main).as_secs_f64()*1000.0,
+                t_final.as_secs_f64()*1000.0);
+            seal
         });
 
         Ok(RecursionReceipt {

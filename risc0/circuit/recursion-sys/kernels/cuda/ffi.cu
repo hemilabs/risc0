@@ -24,6 +24,7 @@
 namespace nvtx3 { struct scoped_range { scoped_range(const char*) {} }; }
 #endif
 
+#include <chrono>
 #include <cstring>
 #ifdef __HIPCC__
 #include <array>
@@ -38,11 +39,17 @@ namespace cuda { namespace std { using ::std::array; } }
 #include <thrust/execution_policy.h>
 #include <thrust/host_vector.h>
 #include <thrust/sort.h>
+#ifdef __HIPCC__
+#include <thrust/system/hip/execution_policy.h>
+#else
+#include <thrust/system/cuda/execution_policy.h>
+#endif
 #include <vector>
 
 constexpr size_t kStepModeParallel = 0;
 constexpr size_t kStepModeSeqForward = 1;
 constexpr size_t kStepModeSeqReverse = 2;
+
 
 namespace sppark {
 void calcPrefixProducts(void* d_inout, uint32_t count);
@@ -241,26 +248,26 @@ struct HostExecContext {
     ctx->trace->numIops = trace->numIops;
 
     ctx->trace->wom = g_execCache.wom;
-    CUDA_OK(cudaMemcpy(
-        ctx->trace->wom, trace->wom, trace->numWoms * sizeof(FpExt), cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMemcpyAsync(
+        ctx->trace->wom, trace->wom, trace->numWoms * sizeof(FpExt), cudaMemcpyHostToDevice, stream));
 
     ctx->trace->cycles = g_execCache.cycles;
-    CUDA_OK(cudaMemcpy(ctx->trace->cycles,
+    CUDA_OK(cudaMemcpyAsync(ctx->trace->cycles,
                        trace->cycles,
                        trace->numCycles * sizeof(PreflightCycle),
-                       cudaMemcpyHostToDevice));
+                       cudaMemcpyHostToDevice, stream));
 
     ctx->trace->iops = g_execCache.iops;
-    CUDA_OK(cudaMemcpy(
-        ctx->trace->iops, trace->iops, trace->numIops * sizeof(FpExt), cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMemcpyAsync(
+        ctx->trace->iops, trace->iops, trace->numIops * sizeof(FpExt), cudaMemcpyHostToDevice, stream));
 
     ctx->womRows = g_execCache.womRows;
-    CUDA_OK(cudaMemset(ctx->womRows,
+    CUDA_OK(cudaMemsetAsync(ctx->womRows,
                        kInvalidPattern,
-                       trace->numCycles * kMaxWomRowsPerCycle * sizeof(WomArgumentRow)));
+                       trace->numCycles * kMaxWomRowsPerCycle * sizeof(WomArgumentRow), stream));
 
     ctx->womIndex = g_execCache.womIndex;
-    CUDA_OK(cudaMemset(ctx->womIndex, 0, trace->numCycles * sizeof(uint32_t)));
+    CUDA_OK(cudaMemsetAsync(ctx->womIndex, 0, trace->numCycles * sizeof(uint32_t), stream));
   }
 
   ~HostExecContext() {
@@ -269,6 +276,7 @@ struct HostExecContext {
 
   void doStepExec(uint32_t mode) {
     nvtx3::scoped_range range("stepExec");
+    auto t0 = std::chrono::high_resolution_clock::now();
     switch (mode) {
     case kStepModeParallel: {
       parStepExec<<<cfg.grid, cfg.block, 0, stream>>>(ctx);
@@ -281,34 +289,56 @@ struct HostExecContext {
     } break;
     }
     CUDA_OK(cudaStreamSynchronize(stream));
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    fprintf(stderr, "      [rec_witgen] step_exec: %.1fms\n", ms);
   }
 
   void verifyWom(uint32_t mode) {
     nvtx3::scoped_range range("verifyWom");
     uint32_t numCycles = ctx->trace->numCycles;
 
+#ifdef __HIPCC__
+    auto par = thrust::hip::par.on(stream);
+#else
+    auto par = thrust::cuda::par.on(stream);
+#endif
+
+    auto t0 = std::chrono::high_resolution_clock::now();
     {
       nvtx3::scoped_range range("sortWom");
-      thrust::sort(thrust::device, ctx->womRows, ctx->womRows + numCycles * kMaxWomRowsPerCycle);
+      thrust::sort(par, ctx->womRows, ctx->womRows + numCycles * kMaxWomRowsPerCycle);
     }
+    CUDA_OK(cudaStreamSynchronize(stream));
+    auto t1 = std::chrono::high_resolution_clock::now();
 
     {
       nvtx3::scoped_range range("scan");
       thrust::exclusive_scan(
-          thrust::device, ctx->womIndex, ctx->womIndex + numCycles, ctx->womIndex);
+          par, ctx->womIndex, ctx->womIndex + numCycles, ctx->womIndex);
     }
+    CUDA_OK(cudaStreamSynchronize(stream));
+    auto t2 = std::chrono::high_resolution_clock::now();
 
     {
       nvtx3::scoped_range range("injectWomBacks");
       injectWomBacks<<<cfg.grid, cfg.block, 0, stream>>>(ctx);
       CUDA_OK(cudaStreamSynchronize(stream));
     }
+    auto t3 = std::chrono::high_resolution_clock::now();
 
     {
       nvtx3::scoped_range range("stepVerifyWom");
       parStepVerifyWom<<<cfg.grid, cfg.block, 0, stream>>>(ctx);
       CUDA_OK(cudaStreamSynchronize(stream));
     }
+    auto t4 = std::chrono::high_resolution_clock::now();
+
+    fprintf(stderr, "      [rec_witgen] sort=%.1fms scan=%.1fms inject=%.1fms verify=%.1fms\n",
+            std::chrono::duration<double, std::milli>(t1 - t0).count(),
+            std::chrono::duration<double, std::milli>(t2 - t1).count(),
+            std::chrono::duration<double, std::milli>(t3 - t2).count(),
+            std::chrono::duration<double, std::milli>(t4 - t3).count());
   }
 };
 
@@ -357,8 +387,8 @@ struct HostAccumContext {
 
     ctx->accum = g_accumCache.accum;
     std::vector<FpExt> accumInit(workCycles, FpExt(1));
-    CUDA_OK(cudaMemcpy(
-        ctx->accum, accumInit.data(), workCycles * sizeof(FpExt), cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMemcpyAsync(
+        ctx->accum, accumInit.data(), workCycles * sizeof(FpExt), cudaMemcpyHostToDevice, stream));
   }
 
   ~HostAccumContext() {
@@ -379,7 +409,6 @@ struct HostAccumContext {
 
   void verifyAccum() {
     nvtx3::scoped_range range("verifyAccum");
-    CUDA_OK(cudaDeviceSynchronize());
     parStepVerifyAccum<<<cfg.grid, cfg.block, 0, stream>>>(ctx);
     CUDA_OK(cudaStreamSynchronize(stream));
   }
@@ -392,7 +421,6 @@ const char* risc0_circuit_recursion_cuda_witgen(uint32_t mode,
                                                 PreflightTrace* trace,
                                                 uint32_t totalCycles) {
   try {
-    CUDA_OK(cudaDeviceSynchronize());
     HostExecContext ctx(buffers, trace, totalCycles);
     ctx.doStepExec(mode);
     ctx.verifyWom(mode);
@@ -406,7 +434,6 @@ const char* risc0_circuit_recursion_cuda_accum(AccumBuffers* buffers,
                                                uint32_t workCycles,
                                                uint32_t totalCycles) {
   try {
-    CUDA_OK(cudaDeviceSynchronize());
     HostAccumContext ctx(buffers, workCycles, totalCycles);
     ctx.computeAccum();
     ctx.calcPrefixProducts();

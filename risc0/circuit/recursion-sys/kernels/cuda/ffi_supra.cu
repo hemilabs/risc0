@@ -73,8 +73,9 @@ extern "C" const char* risc0_circuit_recursion_cuda_eval_check(Fp* check,
 #ifdef __HIPCC__
     {
       void* dev_ptr = nullptr;
-      hipGetSymbolAddress(&dev_ptr, HIP_SYMBOL(poly_mix));
-      hipMemcpy(dev_ptr, poly_mix_pows, sizeof(poly_mix), hipMemcpyHostToDevice);
+      CUDA_OK(hipGetSymbolAddress(&dev_ptr, HIP_SYMBOL(poly_mix)));
+      CUDA_OK(hipMemcpyAsync(dev_ptr, poly_mix_pows, sizeof(poly_mix),
+                              hipMemcpyHostToDevice, stream));
     }
 #else
     cudaMemcpyToSymbol(poly_mix, poly_mix_pows, sizeof(poly_mix));

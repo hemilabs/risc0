@@ -98,15 +98,15 @@ fn build_rocm_kernels() {
     std::fs::write(&supra_amalg_path, &supra_amalg).unwrap();
 
     let mut obj_files = Vec::new();
-    for (amalg_path, obj_name) in [
-        (&risc0_amalg_path, "risc0_kernels_rocm.o"),
-        (&supra_amalg_path, "supra_kernels_rocm.o"),
+    for (amalg_path, obj_name, opt_level) in [
+        (&risc0_amalg_path, "risc0_kernels_rocm.o", "-O3"),
+        (&supra_amalg_path, "supra_kernels_rocm.o", "-O2"),
     ] {
         let obj = out_dir.join(obj_name);
         let status = Command::new(&hipcc)
             .arg("-x").arg("hip")
             .arg("-std=c++17")
-            .arg("-O2")
+            .arg(opt_level)
             .arg("-fPIC")
             .arg("-Wno-unused-function")
             .arg("-Wno-unused-parameter")

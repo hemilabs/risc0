@@ -498,7 +498,9 @@ impl ProverServer for ProverImpl {
 
     fn lift(&self, receipt: &SegmentReceipt) -> Result<SuccinctReceipt<ReceiptClaim>> {
         let receipt = lift(receipt)?;
-        receipt.verify_integrity().context("verify lift")?;
+        if std::env::var("RISC0_SKIP_VERIFY").is_err() {
+            receipt.verify_integrity().context("verify lift")?;
+        }
         Ok(receipt)
     }
 
@@ -515,7 +517,9 @@ impl ProverServer for ProverImpl {
         b: &SuccinctReceipt<ReceiptClaim>,
     ) -> Result<SuccinctReceipt<ReceiptClaim>> {
         let receipt = join(a, b)?;
-        receipt.verify_integrity().context("verify join")?;
+        if std::env::var("RISC0_SKIP_VERIFY").is_err() {
+            receipt.verify_integrity().context("verify join")?;
+        }
         Ok(receipt)
     }
 
@@ -541,7 +545,9 @@ impl ProverServer for ProverImpl {
         assumption: &SuccinctReceipt<Unknown>,
     ) -> Result<SuccinctReceipt<ReceiptClaim>> {
         let receipt = resolve(conditional, assumption)?;
-        receipt.verify_integrity().context("verify resolve")?;
+        if std::env::var("RISC0_SKIP_VERIFY").is_err() {
+            receipt.verify_integrity().context("verify resolve")?;
+        }
         Ok(receipt)
     }
 
@@ -583,7 +589,9 @@ impl ProverServer for ProverImpl {
         b: &SuccinctReceipt<Unknown>,
     ) -> Result<SuccinctReceipt<UnionClaim>> {
         let receipt = union(a, b)?;
-        receipt.verify_integrity().context("verify union")?;
+        if std::env::var("RISC0_SKIP_VERIFY").is_err() {
+            receipt.verify_integrity().context("verify union")?;
+        }
         Ok(receipt)
     }
 

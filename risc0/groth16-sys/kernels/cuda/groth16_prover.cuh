@@ -30,6 +30,7 @@ __global__ __launch_bounds__(512) void witness_into_poly(fr_t* out,
 }
 #else // Host pass
 
+#include <chrono>
 #include <cmath>
 #include <fstream>
 #include <random>
@@ -315,10 +316,19 @@ public:
 
   groth16_proof prove(const char* public_file_path, const fr_t* witness) {
     size_t domain_size = (size_t)1 << lg_domain_size;
+    auto t_start = std::chrono::high_resolution_clock::now();
+    auto t_prev = t_start;
+    auto lap = [&](const char* label) {
+      auto now = std::chrono::high_resolution_clock::now();
+      double ms = std::chrono::duration<double, std::milli>(now - t_prev).count();
+      fprintf(stderr, "  [groth16] %-20s %7.1fms\n", label, ms);
+      t_prev = now;
+    };
 
     msm_results results;
 
     gpu.HtoD(&d_witness[0], &witness[0], witness_size);
+    lap("witness_upload");
 
     std::exception_ptr eptr = nullptr;
     std::thread write_public_file_thread = std::thread([&] {
@@ -344,6 +354,7 @@ public:
       CUDA_OK(cudaGetLastError());
 
       sync_event.wait(gpu);
+      lap("witness_into_poly");
 
       gpu.bzero(&d_c[0], domain_size);
       coeff_wise_mul<<<gpu.sm_count(), 1024, 0, gpu>>>(&d_c[0], &d_a[0], &d_b[0], lg_domain_size);
@@ -355,19 +366,28 @@ public:
           &d_a[0], &d_b[0], &d_c[0], lg_domain_size);
       CUDA_OK(cudaGetLastError());
       gpu.sync();
+      lap("ntt_sequence");
       msm_g1.invoke(results.h, srs.get_h(), domain_size, d_poly_a_b_c);
+      lap("msm_h");
 
       coeff_wise_add<<<gpu.sm_count(), 1024, 0, gpu>>>(&d_witness[0], &d_fuzz[0], witness_size);
       CUDA_OK(cudaGetLastError());
 
+      fprintf(stderr, "  [groth16] SRS sizes: a=%zu b_g1=%zu b_g2=%zu c=%zu h=%zu\n",
+              srs.get_a_size(), srs.get_b_g1_size(), srs.get_b_g2_size(),
+              srs.get_c_size(), domain_size);
       msm_g1.invoke(results.a, srs.get_a(), srs.get_a_size(), d_witness, false);
+      lap("msm_a");
       msm_g1.invoke(results.b_g1, srs.get_b_g1(), srs.get_b_g1_size(), d_witness, false);
+      lap("msm_b_g1");
       msm_g2.invoke(results.b_g2, srs.get_b_g2(), srs.get_b_g2_size(), d_witness, false);
+      lap("msm_b_g2");
       msm_g1.invoke(results.c,
                     srs.get_c(),
                     srs.get_c_size(),
                     dev_ptr_t<fr_t>{&d_witness[witness_size - srs.get_c_size()]},
                     false);
+      lap("msm_c");
 
       write_public_file_thread.join();
       if (eptr != nullptr) {
@@ -421,6 +441,11 @@ public:
     p1.cneg(true);
     results.c.add(p1);
 
+    {
+      auto now = std::chrono::high_resolution_clock::now();
+      double total_ms = std::chrono::duration<double, std::milli>(now - t_start).count();
+      fprintf(stderr, "  [groth16] %-20s %7.1fms\n", "TOTAL", total_ms);
+    }
     return groth16_proof{results.a, results.c, results.b_g2};
   }
 
