@@ -1,5 +1,6 @@
 #include "ff/baby_bear.hpp"
 #include "ntt/ntt.cuh"
+#include <mutex>
 
 // Batched LDE expand kernel: write all output elements in one coalesced pass.
 // For each output position, either copy the corresponding input element
@@ -34,11 +35,14 @@ __global__ void batch_lde_expand_kernel(
 }
 
 static inline int cached_sm_count() {
+    // Benign race: worst case two threads both compute the same value.
     static int count = 0;
     if (count == 0) {
         int device;
         CUDA_OK(cudaGetDevice(&device));
-        CUDA_OK(cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device));
+        int c;
+        CUDA_OK(cudaDeviceGetAttribute(&c, cudaDevAttrMultiProcessorCount, device));
+        count = c;
     }
     return count;
 }
@@ -70,40 +74,41 @@ extern "C" RustError::by_value sppark_init() {
   // calls sppark_init() and needs the context to be current for cust/DeviceBuffer.
   (void)select_gpu();
 
-  static bool initialized = false;
-  if (initialized)
-    return RustError{cudaSuccess};
+  // Thread-safe initialization using std::call_once
+  static std::once_flag init_flag;
+  static RustError init_result{cudaSuccess};
 
-  // Use lg_domain_size=16 (64K elements) to exercise all NTT kernel variants
-  // (CT_NTT<8,true/false>, GS_NTT<8,true/false>, batch_bit_reverse,
-  // LDE_distribute_powers). The small size (256KB) runs in ~1ms but avoids
-  // ~5-10ms of first-launch stalls during the actual proof.
-  uint32_t lg_domain_size = 16;
-  uint32_t domain_size = 1U << lg_domain_size;
+  std::call_once(init_flag, []() {
+    // Use lg_domain_size=16 (64K elements) to exercise all NTT kernel variants
+    // (CT_NTT<8,true/false>, GS_NTT<8,true/false>, batch_bit_reverse,
+    // LDE_distribute_powers). The small size (256KB) runs in ~1ms but avoids
+    // ~5-10ms of first-launch stalls during the actual proof.
+    uint32_t lg_domain_size = 16;
+    uint32_t domain_size = 1U << lg_domain_size;
 
-  std::vector<fr_t> inout(domain_size, fr_t(0));
-  inout[0] = fr_t(1);
-  inout[1] = fr_t(1);
+    std::vector<fr_t> inout(domain_size, fr_t(0));
+    inout[0] = fr_t(1);
+    inout[1] = fr_t(1);
 
-  const gpu_t& gpu = select_gpu();
+    const gpu_t& gpu = select_gpu();
 
-  try {
-    NTT::Base(gpu,
-              &inout[0],
-              lg_domain_size,
-              NTT::InputOutputOrder::NR,
-              NTT::Direction::forward,
-              NTT::Type::standard);
-    gpu.sync();
-  } catch (const cuda_error& e) {
-    gpu.sync();
-    return RustError{e.code(), e.what()};
-  } catch (...) {
-    return RustError(cudaErrorUnknown, "Generic exception");
-  }
+    try {
+      NTT::Base(gpu,
+                &inout[0],
+                lg_domain_size,
+                NTT::InputOutputOrder::NR,
+                NTT::Direction::forward,
+                NTT::Type::standard);
+      gpu.sync();
+    } catch (const cuda_error& e) {
+      gpu.sync();
+      init_result = RustError{e.code(), e.what()};
+    } catch (...) {
+      init_result = RustError(cudaErrorUnknown, "Generic exception");
+    }
+  });
 
-  initialized = true;
-  return RustError{cudaSuccess};
+  return init_result;
 }
 
 extern "C" RustError::by_value sppark_batch_expand(
@@ -117,6 +122,7 @@ extern "C" RustError::by_value sppark_batch_expand(
 
   try {
     launch_batch_expand(gpu, d_out, d_in, domain_size, lg_domain_size, lg_blowup, poly_count);
+    CUDA_OK(cudaGetLastError());
     gpu.sync();
   } catch (const cuda_error& e) {
     gpu.sync();
@@ -147,6 +153,7 @@ sppark_batch_NTT(fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly_count) {
                             NTT::Type::standard,
                             poly_count, domain_size);
 
+    CUDA_OK(cudaGetLastError());
     gpu.sync();
   } catch (const cuda_error& e) {
     gpu.sync();
@@ -177,6 +184,7 @@ sppark_batch_iNTT(fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly_count) {
                             NTT::Type::standard,
                             poly_count, domain_size);
 
+    CUDA_OK(cudaGetLastError());
     gpu.sync();
   } catch (const cuda_error& e) {
     gpu.sync();
@@ -201,6 +209,7 @@ sppark_batch_zk_shift(fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly_coun
     // Single batched kernel for all columns instead of per-column launches
     NTT::LDE_powers_batch(gpu, d_inout, lg_domain_size, poly_count, domain_size);
 
+    CUDA_OK(cudaGetLastError());
     gpu.sync();
   } catch (const cuda_error& e) {
     gpu.sync();
@@ -233,6 +242,7 @@ sppark_batch_iNTT_zk_shift(fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly
     // Single batched ZK shift for all columns
     NTT::LDE_powers_batch(gpu, d_inout, lg_domain_size, poly_count, domain_size);
 
+    CUDA_OK(cudaGetLastError());
     gpu.sync();
   } catch (const cuda_error& e) {
     gpu.sync();
@@ -269,6 +279,7 @@ sppark_batch_expand_NTT(fr_t* d_out, fr_t* d_in,
                             NTT::Type::standard,
                             poly_count, ext_domain_size);
 
+    CUDA_OK(cudaGetLastError());
     gpu.sync();
   } catch (const cuda_error& e) {
     gpu.sync();

@@ -237,7 +237,9 @@ struct DeviceCache {
   }
 };
 
-static DeviceCache g_cache;
+// Thread-local cache: each proving thread gets its own device-side buffers,
+// enabling concurrent segment proving without data races.
+static thread_local DeviceCache g_cache;
 
 __device__ ::cuda::std::array<uint32_t, 2>
 divide_rv32im(uint32_t numer, uint32_t denom, uint32_t signType) {

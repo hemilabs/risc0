@@ -68,7 +68,9 @@ struct LaunchConfig {
 };
 
 inline cudaStream_t getPersistentStream() {
-  static cudaStream_t stream = nullptr;
+  // Thread-local stream: harmless in single-threaded mode (one stream per thread),
+  // and enables future multi-thread proving without cache invalidation.
+  static thread_local cudaStream_t stream = nullptr;
   if (!stream) {
     CUDA_OK(cudaStreamCreate(&stream));
   }

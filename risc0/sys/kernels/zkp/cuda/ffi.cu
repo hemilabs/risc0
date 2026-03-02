@@ -162,11 +162,11 @@ const char* risc0_zkp_cuda_scatter_from_host(Fp* into,
   try {
     cudaStream_t stream = getPersistentStream();
 
-    // Persistent device buffers (grow-only, reused across segments).
-    static uint32_t* d_index = nullptr;
-    static uint32_t* d_offsets = nullptr;
-    static Fp* d_values = nullptr;
-    static size_t cap_d_index = 0, cap_d_offsets = 0, cap_d_values = 0;
+    // Thread-local device buffers (grow-only, reused across segments per thread).
+    static thread_local uint32_t* d_index = nullptr;
+    static thread_local uint32_t* d_offsets = nullptr;
+    static thread_local Fp* d_values = nullptr;
+    static thread_local size_t cap_d_index = 0, cap_d_offsets = 0, cap_d_values = 0;
 
     size_t index_bytes = index_count * sizeof(uint32_t);
     size_t offsets_bytes = offsets_count * sizeof(uint32_t);
@@ -218,9 +218,9 @@ const char* risc0_zkp_cuda_scatter_bits_from_host(Fp* into,
   try {
     cudaStream_t stream = getPersistentStream();
 
-    // Persistent device buffer (grow-only, reused across segments).
-    static uint32_t* d_bitdata = nullptr;
-    static size_t cap_d_bitdata = 0;
+    // Thread-local device buffer (grow-only, reused across segments per thread).
+    static thread_local uint32_t* d_bitdata = nullptr;
+    static thread_local size_t cap_d_bitdata = 0;
 
     size_t data_bytes = (size_t)triplet_count * 3 * sizeof(uint32_t);
 

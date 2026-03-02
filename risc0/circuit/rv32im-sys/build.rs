@@ -134,8 +134,64 @@ fn build_cuda_kernels() {
     // Copy cached object to OUT_DIR for this build.
     std::fs::copy(&eval_check_cached, &eval_check_obj).unwrap();
 
-    // Step 2: Compile remaining .cu files with -dc (separate compilation) via cc crate.
-    // Exclude eval_check files (compiled standalone above).
+    // Step 2: Compile witgen_combined.cu WITHOUT -dc (standalone mode).
+    // Same technique as eval_check: inlines 210+ device functions in step_Top
+    // and step_TopAccum call chains, eliminating cross-TU ABI overhead.
+    //
+    // CACHING: witgen compilation can be very long. Hash all witgen source files
+    // and skip recompilation when only unrelated files changed.
+    let witgen_cached = cache_dir.join("witgen_combined_standalone.o");
+    let witgen_stamp = cache_dir.join("witgen_hash.stamp");
+    let witgen_obj = out_dir.join("witgen_combined_standalone.o");
+    let witgen_hash = witgen_source_hash();
+    let witgen_cached_hash = std::fs::read_to_string(&witgen_stamp).unwrap_or_default();
+    let witgen_need_rebuild = witgen_hash != witgen_cached_hash || !witgen_cached.exists();
+    if witgen_need_rebuild {
+        eprintln!("witgen: source changed (or first build), compiling standalone...");
+        let mut cmd = Command::new("nvcc");
+        cmd.current_dir("kernels/cuda")
+            .arg("-ccbin=c++")
+            .arg("-std=c++17")
+            .arg("-Xcompiler")
+            .arg("-O3,-ffunction-sections,-fdata-sections,-fPIC")
+            .arg("-Xcompiler")
+            .arg("-Wno-unused-function,-Wno-unused-parameter")
+            .arg("-m64")
+            // Use -O2 for ptxas (not -O3): the 56MB PTX from 210+ inlined device
+            // functions would take hours to optimize at -O3. -O2 compiles in ~15 min
+            // while still inlining and optimizing the hot paths.
+            .arg("-Xptxas")
+            .arg("-O2")
+            .arg("-diag-suppress=177")
+            .arg("-diag-suppress=550")
+            .arg("-diag-suppress=2922")
+            .arg("-I")
+            .arg(&cuda_root)
+            .arg("-I")
+            .arg(&cxx_root)
+            .arg("-I")
+            .arg(&sppark_root);
+        if use_native_arch {
+            cmd.arg("-arch=native");
+        }
+        cmd.arg("-c") // compile only, NO --device-c
+            .arg("witgen_combined.cu")
+            .arg("-o")
+            .arg(&witgen_cached);
+        let status = cmd.status().expect("failed to run nvcc for witgen_combined.cu");
+        assert!(
+            status.success(),
+            "nvcc failed for witgen_combined.cu (standalone mode)"
+        );
+        std::fs::write(&witgen_stamp, &witgen_hash).unwrap();
+    } else {
+        eprintln!("witgen: source unchanged, reusing cached object");
+    }
+    std::fs::copy(&witgen_cached, &witgen_obj).unwrap();
+
+    // Step 3: Compile remaining .cu files with -dc (separate compilation) via cc crate.
+    // Exclude eval_check files (compiled standalone in step 1) and witgen files
+    // (compiled standalone in step 2).
     let mut build = cc::Build::new();
     build
         .cuda(true)
@@ -170,17 +226,20 @@ fn build_cuda_kernels() {
                     | "eval_check_3.cu"
                     | "eval_check_combined.cu"
                     | "witgen_combined.cu"
+                    | "steps.cu"
+                    | "ffi.cu"
             )
         })
         .collect();
     build.files(cuda_files).compile(output);
 
-    // Step 3: Add standalone objects to the archive.
+    // Step 4: Add standalone objects to the archive.
     let archive = out_dir.join(format!("lib{output}.a"));
     let status = Command::new("ar")
         .arg("rcs")
         .arg(&archive)
         .arg(&eval_check_obj)
+        .arg(&witgen_obj)
         .status()
         .expect("failed to run ar");
     assert!(status.success(), "ar failed to add standalone objects");
@@ -192,6 +251,35 @@ fn rerun_if_changed<P: AsRef<Path>>(path: P) {
 
 fn glob_paths(pattern: &str) -> Vec<PathBuf> {
     glob::glob(pattern).unwrap().map(|x| x.unwrap()).collect()
+}
+
+/// Hash the contents of all files relevant to witgen compilation.
+/// Returns a hex string that changes when any witgen source changes.
+fn witgen_source_hash() -> String {
+    let mut hasher = DefaultHasher::new();
+    let files = [
+        "kernels/cuda/witgen_combined.cu",
+        "kernels/cuda/steps.cu",
+        "kernels/cuda/steps.cuh",
+        "kernels/cuda/ffi.cu",
+        "kernels/cuda/witgen.h",
+    ];
+    for f in &files {
+        if let Ok(contents) = std::fs::read(f) {
+            f.hash(&mut hasher);
+            contents.hash(&mut hasher);
+        }
+    }
+    if let Ok(v) = env::var("DEP_RISC0_SYS_CUDA_ROOT") {
+        v.hash(&mut hasher);
+    }
+    if let Ok(v) = env::var("DEP_RISC0_SYS_CXX_ROOT") {
+        v.hash(&mut hasher);
+    }
+    if let Ok(v) = env::var("DEP_SPPARK_ROOT") {
+        v.hash(&mut hasher);
+    }
+    format!("{:016x}", hasher.finish())
 }
 
 /// Hash the contents of all files relevant to eval_check compilation.

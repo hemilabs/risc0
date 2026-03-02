@@ -9,45 +9,52 @@
 #include "poseidon2.cuh"
 #include "poseidon254.cuh"
 
+#include <mutex>
+
 // Workaround: cudaGetDeviceProperties returns multiProcessorCount=1
 // in some VM/passthrough setups, while cudaDeviceGetAttribute returns
 // the correct value. Cache the correct SM count for use in cooperative
 // kernel launches.
 static int get_real_sm_count() {
+    // Benign race: worst case two threads both compute the same value.
     static int sm_count = 0;
     if (sm_count == 0) {
         int device;
         cudaGetDevice(&device);
-        cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device);
+        int c;
+        cudaDeviceGetAttribute(&c, cudaDevAttrMultiProcessorCount, device);
+        sm_count = c;
     }
     return sm_count;
 }
 
 extern "C" RustError::by_value sppark_poseidon2_init() {
-  static bool initialized = false;
-  if (initialized)
-    return RustError{cudaSuccess};
+  // Thread-safe initialization using std::call_once
+  static std::once_flag init_flag;
+  static RustError init_result{cudaSuccess};
 
-  const gpu_t& gpu = select_gpu();
-  try {
-    // Allocate tiny device buffer and run 1-hash poseidon2_fold to trigger
-    // CUDA module loading for poseidon2 kernels (~5-10ms first-use overhead).
-    void* d_buf = nullptr;
-    CUDA_OK(cudaMalloc(&d_buf, 2048));
-    CUDA_OK(cudaMemset(d_buf, 0, 2048));
-    _poseidon2_fold<<<1, 1, 0, gpu>>>(
-        (poseidon_out_t*)d_buf,
-        (const poseidon_in_t*)((char*)d_buf + 1024),
-        1);
-    CUDA_OK(cudaGetLastError());
-    gpu.sync();
-    CUDA_OK(cudaFree(d_buf));
-  } catch (const cuda_error& e) {
-    gpu.sync();
-    return RustError{e.code(), e.what()};
-  }
-  initialized = true;
-  return RustError{cudaSuccess};
+  std::call_once(init_flag, []() {
+    const gpu_t& gpu = select_gpu();
+    try {
+      // Allocate tiny device buffer and run 1-hash poseidon2_fold to trigger
+      // CUDA module loading for poseidon2 kernels (~5-10ms first-use overhead).
+      void* d_buf = nullptr;
+      CUDA_OK(cudaMalloc(&d_buf, 2048));
+      CUDA_OK(cudaMemset(d_buf, 0, 2048));
+      _poseidon2_fold<<<1, 1, 0, gpu>>>(
+          (poseidon_out_t*)d_buf,
+          (const poseidon_in_t*)((char*)d_buf + 1024),
+          1);
+      CUDA_OK(cudaGetLastError());
+      gpu.sync();
+      CUDA_OK(cudaFree(d_buf));
+    } catch (const cuda_error& e) {
+      gpu.sync();
+      init_result = RustError{e.code(), e.what()};
+    }
+  });
+
+  return init_result;
 }
 
 extern "C" RustError::by_value
@@ -283,7 +290,7 @@ supra_poly_divide_batch(fr4_t d_inout[/*len*/], size_t len,
 // Batch polynomial division across multiple combo slices.
 // Each combo slice (at combos_base + combo_indices[c] * stride) is divided
 // by its respective roots in-place. No remainder check — all kernels are
-// pipelined with a single gpu.sync() at the end for better GPU utilization.
+// pipelined on the sppark stream for better GPU utilization.
 extern "C" RustError::by_value
 supra_poly_divide_multi(fr4_t* combos_base, size_t stride,
                         const uint32_t combo_indices[],
