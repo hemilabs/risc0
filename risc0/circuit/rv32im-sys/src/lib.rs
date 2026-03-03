@@ -73,6 +73,7 @@ pub struct RawBuffer {
 pub struct RawExecBuffers {
     pub global: RawBuffer,
     pub data: RawBuffer,
+    pub pre_data: RawBuffer,
 }
 
 #[repr(C)]

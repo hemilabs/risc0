@@ -36,6 +36,7 @@ namespace risc0::circuit::rv32im_v2::cpu {
 struct ExecBuffers {
   Buffer<true> global;
   Buffer<false> data;
+  Buffer<false> pre_data;  // unused by CPU; layout must match RawExecBuffers
 };
 
 struct AccumBuffers {

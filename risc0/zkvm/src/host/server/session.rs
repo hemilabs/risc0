@@ -37,6 +37,7 @@ use crate::{
 
 use super::exec::syscall::{SyscallKind, SyscallMetric};
 
+#[allow(dead_code)]
 #[derive(Clone, Default, Serialize, Deserialize, Debug)]
 pub struct PageFaults {
     pub(crate) reads: BTreeSet<u32>,

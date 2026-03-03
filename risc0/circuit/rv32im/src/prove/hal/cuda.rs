@@ -64,6 +64,7 @@ impl<CH: CudaHash> CircuitWitnessGenerator<CudaHal<CH>> for CudaCircuitHal<CH> {
         preflight: &PreflightTrace,
         global: &MetaBuffer<CudaHal<CH>>,
         data: &MetaBuffer<CudaHal<CH>>,
+        pre_data: &MetaBuffer<CudaHal<CH>>,
     ) -> Result<()> {
         scope!("witgen");
 
@@ -73,6 +74,7 @@ impl<CH: CudaHash> CircuitWitnessGenerator<CudaHal<CH>> for CudaCircuitHal<CH> {
 
         let global_ptr = global.buf.as_device_ptr();
         let data_ptr = data.buf.as_device_ptr();
+        let pre_data_ptr = pre_data.buf.as_device_ptr();
         let buffers = RawExecBuffers {
             global: RawBuffer {
                 buf: global_ptr.as_ptr() as *const Val,
@@ -85,6 +87,12 @@ impl<CH: CudaHash> CircuitWitnessGenerator<CudaHal<CH>> for CudaCircuitHal<CH> {
                 rows: data.rows,
                 cols: data.cols,
                 checked: data.checked,
+            },
+            pre_data: RawBuffer {
+                buf: pre_data_ptr.as_ptr() as *const Val,
+                rows: pre_data.rows,
+                cols: pre_data.cols,
+                checked: false,
             },
         };
 

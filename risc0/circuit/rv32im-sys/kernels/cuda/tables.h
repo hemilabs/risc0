@@ -26,7 +26,7 @@ namespace cuda {
     T val;
     __device__ void operator++()    { atomicAdd(&val, T(1)); }
     __device__ void operator++(int) { atomicAdd(&val, T(1)); }
-    __device__ operator T() const   { return val; }
+    __device__ operator T() const   { return atomicAdd(const_cast<T*>(&val), T(0)); }
   };
 }
 #else

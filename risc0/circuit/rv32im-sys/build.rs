@@ -326,10 +326,20 @@ fn build_rocm_kernels() {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
         let mut hasher = DefaultHasher::new();
+        // Hash .cu files
         for cu in &cuda_files {
             let abs = std::fs::canonicalize(cu).unwrap();
             if let Ok(content) = std::fs::read_to_string(&abs) {
                 content.hash(&mut hasher);
+            }
+        }
+        // Also hash header files (.h, .cuh, .inc) since they affect compilation
+        for pattern in &["kernels/cuda/*.h", "kernels/cuda/*.cuh", "kernels/cuda/*.inc"] {
+            for hdr in glob_paths(pattern) {
+                let abs = std::fs::canonicalize(&hdr).unwrap();
+                if let Ok(content) = std::fs::read_to_string(&abs) {
+                    content.hash(&mut hasher);
+                }
             }
         }
         format!("{:016x}", hasher.finish())

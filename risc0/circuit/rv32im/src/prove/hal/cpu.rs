@@ -53,6 +53,7 @@ impl CircuitWitnessGenerator<CpuHal> for CpuCircuitHal {
         preflight: &PreflightTrace,
         global: &MetaBuffer<CpuHal>,
         data: &MetaBuffer<CpuHal>,
+        _pre_data: &MetaBuffer<CpuHal>,
     ) -> Result<()> {
         scope!("cpu_witgen");
         let cycles = preflight.cycles.len();
@@ -71,6 +72,13 @@ impl CircuitWitnessGenerator<CpuHal> for CpuCircuitHal {
                 rows: data.rows,
                 cols: data.cols,
                 checked: data.checked,
+            },
+            // CPU runs sequentially; no race condition, so pre_data aliases data.
+            pre_data: RawBuffer {
+                buf: data_buf.as_ptr(),
+                rows: data.rows,
+                cols: data.cols,
+                checked: false,
             },
         };
         let preflight = RawPreflightTrace {

@@ -186,14 +186,31 @@ where
             "alloc(accum)",
             MetaBuffer::new("accum", hal, cycles, REGCOUNT_ACCUM, true)
         );
+        // Allocate a read-only copy of the data buffer for pre-injected back() values.
+        // In parallel GPU witgen, the data buffer uses a union layout where different
+        // instruction types share the same columns. Thread C may overwrite a pre-injected
+        // value (e.g., nextState_0) while thread C+1 reads it via back(1). The pre_data
+        // buffer is never written by the kernel, eliminating this race condition.
+        let pre_data = scope!(
+            "alloc(pre_data)",
+            MetaBuffer::new("pre_data", hal, cycles, REGCOUNT_DATA, false)
+        );
         let tw3 = std::time::Instant::now();
+        // Scatter pre-injected values to both data and pre_data.
         hal.scatter(
             &data.buf,
             &injector.index,
             &injector.offsets,
             &injector.values,
         );
+        hal.scatter(
+            &pre_data.buf,
+            &injector.index,
+            &injector.offsets,
+            &injector.values,
+        );
         hal.scatter_bits(&data.buf, &injector.bit_data, cycles as u32);
+        hal.scatter_bits(&pre_data.buf, &injector.bit_data, cycles as u32);
         let tw4 = std::time::Instant::now();
         // Drop 126MB of injector Vecs in background while GPU runs generate_witness.
         // After scatter + scatter_bits, all host data has been copied to GPU (sync memcpy).
@@ -203,7 +220,7 @@ where
         let inj_bits = injector.bit_data.len() / 3;
         let _drop_handle = std::thread::spawn(move || drop(injector));
         circuit_hal
-            .generate_witness(mode, trace, &global, &data)
+            .generate_witness(mode, trace, &global, &data, &pre_data)
             .context("witness generation failure")?;
         let tw5 = std::time::Instant::now();
         scope!("zeroize", {
@@ -212,7 +229,7 @@ where
             hal.eltwise_zeroize_elem(&data.buf);
         });
         let tw6 = std::time::Instant::now();
-        eprintln!("      [hal_witgen] global+code={:.1}ms data={:.1}ms accum={:.1}ms scatter={:.1}ms ffi={:.1}ms zeroize={:.1}ms (inj: idx={} off={} val={} bits={})",
+        eprintln!("      [hal_witgen] global+code={:.1}ms data+pre_data={:.1}ms accum={:.1}ms scatter={:.1}ms ffi={:.1}ms zeroize={:.1}ms (inj: idx={} off={} val={} bits={})",
             (tw1-tw0).as_secs_f64()*1000.0,
             (tw2-tw1).as_secs_f64()*1000.0,
             (tw3-tw2).as_secs_f64()*1000.0,

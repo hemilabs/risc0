@@ -88,6 +88,7 @@ pub(crate) trait CircuitWitnessGenerator<H: Hal> {
         preflight: &PreflightTrace,
         global: &MetaBuffer<H>,
         data: &MetaBuffer<H>,
+        pre_data: &MetaBuffer<H>,
     ) -> Result<()>;
 }
 
@@ -166,17 +167,11 @@ where
         scope!("prove_core");
         let t0 = std::time::Instant::now();
 
-        cfg_if::cfg_if! {
-            if #[cfg(feature = "witgen_debug")] {
-                let mode = if std::env::var_os("RISC0_WITGEN_DEBUG").is_some() {
-                    StepMode::SeqForward
-                } else {
-                    StepMode::Parallel
-                };
-            } else {
-                let mode = StepMode::Parallel;
-            }
-        }
+        let mode = if std::env::var_os("RISC0_WITGEN_SEQ").is_some() {
+            StepMode::SeqForward
+        } else {
+            StepMode::Parallel
+        };
 
         let (hal, circuit_hal) = self.get_hal();
         eprintln!("[prove_core] hal_factory: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
@@ -297,17 +292,11 @@ where
         scope!("prove_begin");
         let t0 = std::time::Instant::now();
 
-        cfg_if::cfg_if! {
-            if #[cfg(feature = "witgen_debug")] {
-                let mode = if std::env::var_os("RISC0_WITGEN_DEBUG").is_some() {
-                    StepMode::SeqForward
-                } else {
-                    StepMode::Parallel
-                };
-            } else {
-                let mode = StepMode::Parallel;
-            }
-        }
+        let mode = if std::env::var_os("RISC0_WITGEN_SEQ").is_some() {
+            StepMode::SeqForward
+        } else {
+            StepMode::Parallel
+        };
 
         let (hal, circuit_hal) = self.get_hal();
 

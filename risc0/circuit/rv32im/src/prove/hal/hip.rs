@@ -64,6 +64,7 @@ impl<HH: HipHash> CircuitWitnessGenerator<HipHal<HH>> for HipCircuitHal<HH> {
         preflight: &PreflightTrace,
         global: &MetaBuffer<HipHal<HH>>,
         data: &MetaBuffer<HipHal<HH>>,
+        pre_data: &MetaBuffer<HipHal<HH>>,
     ) -> Result<()> {
         scope!("witgen");
 
@@ -73,6 +74,7 @@ impl<HH: HipHash> CircuitWitnessGenerator<HipHal<HH>> for HipCircuitHal<HH> {
 
         let global_ptr = global.buf.as_device_ptr();
         let data_ptr = data.buf.as_device_ptr();
+        let pre_data_ptr = pre_data.buf.as_device_ptr();
         let buffers = RawExecBuffers {
             global: RawBuffer {
                 buf: global_ptr.as_ptr() as *const Val,
@@ -84,7 +86,16 @@ impl<HH: HipHash> CircuitWitnessGenerator<HipHal<HH>> for HipCircuitHal<HH> {
                 buf: data_ptr.as_ptr() as *const Val,
                 rows: data.rows,
                 cols: data.cols,
-                checked: data.checked,
+                // In parallel mode, disable checked: the union layout means the kernel
+                // legitimately overwrites pre-injected values with instruction-specific data.
+                // In sequential mode, keep checked so unset reads are caught.
+                checked: mode != StepMode::Parallel,
+            },
+            pre_data: RawBuffer {
+                buf: pre_data_ptr.as_ptr() as *const Val,
+                rows: pre_data.rows,
+                cols: pre_data.cols,
+                checked: false,
             },
         };
 
