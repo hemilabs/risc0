@@ -73,6 +73,7 @@ fn build_cuda_kernels(cxx_root: &Path) {
 
 fn build_rocm_kernels(cxx_root: &Path) {
     let sppark_root = env::var("DEP_SPPARK_ROOT").unwrap();
+    println!("cargo:rerun-if-env-changed=RISC0_HIP_ARCH");
 
     env::set_var("HIP_PLATFORM", "amd");
 

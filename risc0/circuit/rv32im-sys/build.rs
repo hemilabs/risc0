@@ -196,6 +196,7 @@ fn build_rocm_kernels() {
     let output = "risc0_rv32im_cuda";
 
     println!("cargo:rerun-if-env-changed=HIPCC");
+    println!("cargo:rerun-if-env-changed=RISC0_HIP_ARCH");
     println!("cargo:rerun-if-env-changed=SCCACHE_RECACHE");
     rerun_if_changed("kernels/cuda");
 
@@ -242,44 +243,28 @@ fn build_rocm_kernels() {
     let need_rebuild = current_hash != cached_hash || !eval_check_cached.exists();
     if need_rebuild {
         eprintln!("eval_check (rocm): source changed (or first build), compiling standalone...");
-        let mut cmd = Command::new(&hipcc);
-        cmd.current_dir("kernels/cuda")
-            .arg("-x")
-            .arg("hip")
-            .arg("-std=c++17")
-            .arg("-O3")
-            .arg("-fPIC")
-            .arg("-Wno-unused-function")
-            .arg("-Wno-unused-parameter")
-            .arg(format!("--offload-arch={}", std::env::var("RISC0_HIP_ARCH").unwrap_or_else(|_| "native".to_string())))
-            .arg("-mllvm")
-            .arg("-amdgpu-early-inline-all=false")
-            .arg("-mllvm")
-            .arg("-amdgpu-use-aa-in-codegen")
-            .arg("-mllvm")
-            .arg("-amdgpu-schedule-metric-bias=0")
-            .arg("-mllvm")
-            .arg("-amdgpu-internalize-symbols")
-            .arg("-mllvm")
-            .arg("-amdgpu-schedule-relaxed-occupancy")
-            .arg("-include")
-            .arg(format!("{}/util/cuda2hip.hpp", &sppark_root))
-            .arg("-I")
-            .arg(&cuda_root)
-            .arg("-I")
-            .arg(&cxx_root)
-            .arg("-I")
-            .arg(&sppark_root)
-            .arg("-c")
-            .arg("eval_check_combined.cu")
-            .arg("-o")
-            .arg(&eval_check_cached);
-        let status = cmd
-            .status()
-            .expect("failed to run hipcc for eval_check_combined.cu");
-        assert!(
-            status.success(),
-            "hipcc failed for eval_check_combined.cu (standalone mode)"
+        let include_cuda2hip = format!("{}/util/cuda2hip.hpp", &sppark_root);
+        let eval_check_flags: Vec<&str> = vec![
+            "-x", "hip",
+            "-std=c++17", "-O3", "-fPIC",
+            "-Wno-unused-function", "-Wno-unused-parameter",
+            "-mllvm", "-amdgpu-early-inline-all=false",
+            "-mllvm", "-amdgpu-use-aa-in-codegen",
+            "-mllvm", "-amdgpu-schedule-metric-bias=0",
+            "-mllvm", "-amdgpu-internalize-symbols",
+            "-mllvm", "-amdgpu-schedule-relaxed-occupancy",
+            "-include", &include_cuda2hip,
+            "-I", &cuda_root,
+            "-I", &cxx_root,
+            "-I", &sppark_root,
+        ];
+        risc0_build_kernel::hip_compile(
+            &hipcc,
+            &eval_check_flags,
+            Path::new("eval_check_combined.cu"),
+            &eval_check_cached,
+            &risc0_build_kernel::hip_arches(),
+            Some(Path::new("kernels/cuda")),
         );
         std::fs::write(&eval_check_stamp, &current_hash).unwrap();
     } else {
@@ -347,26 +332,27 @@ fn build_rocm_kernels() {
     let remaining_prev = std::fs::read_to_string(&remaining_stamp).unwrap_or_default();
     if remaining_hash != remaining_prev || !remaining_cached.exists() {
         eprintln!("remaining_kernels (rocm): source changed, compiling...");
-        let status = Command::new(&hipcc)
-            .arg("-x").arg("hip")
-            .arg("-std=c++17")
-            .arg("-O3")
-            .arg("-fPIC")
-            .arg("-Wno-unused-function")
-            .arg("-Wno-unused-parameter")
-            .arg(format!("--offload-arch={}", std::env::var("RISC0_HIP_ARCH").unwrap_or_else(|_| "native".to_string())))
-            .arg("-mllvm")
-            .arg("-amdgpu-early-inline-all=false")
-            .arg("-include").arg(format!("{sppark_root}/util/cuda2hip.hpp"))
-            .arg("-I").arg(&cuda_root)
-            .arg("-I").arg(&cxx_root)
-            .arg("-I").arg(&sppark_root)
-            .arg("-I").arg(&kernel_dir)
-            .arg("-c").arg(&amalg_path)
-            .arg("-o").arg(&remaining_cached)
-            .status()
-            .unwrap_or_else(|e| panic!("failed to run hipcc: {e}"));
-        assert!(status.success(), "hipcc failed for amalgamated kernels");
+        let include_cuda2hip = format!("{sppark_root}/util/cuda2hip.hpp");
+        let kernel_dir_str = kernel_dir.to_str().unwrap();
+        let remaining_flags: Vec<&str> = vec![
+            "-x", "hip",
+            "-std=c++17", "-O3", "-fPIC",
+            "-Wno-unused-function", "-Wno-unused-parameter",
+            "-mllvm", "-amdgpu-early-inline-all=false",
+            "-include", &include_cuda2hip,
+            "-I", &cuda_root,
+            "-I", &cxx_root,
+            "-I", &sppark_root,
+            "-I", kernel_dir_str,
+        ];
+        risc0_build_kernel::hip_compile(
+            &hipcc,
+            &remaining_flags,
+            &amalg_path,
+            &remaining_cached,
+            &risc0_build_kernel::hip_arches(),
+            None,
+        );
         std::fs::write(&remaining_stamp, &remaining_hash).unwrap();
     } else {
         eprintln!("remaining_kernels (rocm): source unchanged, reusing cached object");
@@ -393,26 +379,27 @@ fn build_rocm_kernels() {
         let prev_hash = std::fs::read_to_string(&cached_stamp).unwrap_or_default();
         if src_hash != prev_hash || !cached_obj.exists() {
             eprintln!("{stem} (rocm): source changed, compiling...");
-            let status = Command::new(&hipcc)
-                .arg("-x").arg("hip")
-                .arg("-std=c++17")
-                .arg("-O3")
-                .arg("-fPIC")
-                .arg("-Wno-unused-function")
-                .arg("-Wno-unused-parameter")
-                .arg(format!("--offload-arch={}", std::env::var("RISC0_HIP_ARCH").unwrap_or_else(|_| "native".to_string())))
-                .arg("-mllvm")
-                .arg("-amdgpu-early-inline-all=false")
-                .arg("-include").arg(format!("{sppark_root}/util/cuda2hip.hpp"))
-                .arg("-I").arg(&cuda_root)
-                .arg("-I").arg(&cxx_root)
-                .arg("-I").arg(&sppark_root)
-                .arg("-I").arg(&kernel_dir)
-                .arg("-c").arg(cu)
-                .arg("-o").arg(&cached_obj)
-                .status()
-                .unwrap_or_else(|e| panic!("failed to run hipcc for {stem}: {e}"));
-            assert!(status.success(), "hipcc failed for {stem}.cu");
+            let include_cuda2hip = format!("{sppark_root}/util/cuda2hip.hpp");
+            let kernel_dir_str = kernel_dir.to_str().unwrap();
+            let sep_flags: Vec<&str> = vec![
+                "-x", "hip",
+                "-std=c++17", "-O3", "-fPIC",
+                "-Wno-unused-function", "-Wno-unused-parameter",
+                "-mllvm", "-amdgpu-early-inline-all=false",
+                "-include", &include_cuda2hip,
+                "-I", &cuda_root,
+                "-I", &cxx_root,
+                "-I", &sppark_root,
+                "-I", kernel_dir_str,
+            ];
+            risc0_build_kernel::hip_compile(
+                &hipcc,
+                &sep_flags,
+                cu,
+                &cached_obj,
+                &risc0_build_kernel::hip_arches(),
+                None,
+            );
             std::fs::write(&cached_stamp, &src_hash).unwrap();
         } else {
             eprintln!("{stem} (rocm): source unchanged, reusing cached object");

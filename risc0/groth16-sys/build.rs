@@ -46,6 +46,7 @@ fn build_rocm_kernels() {
     let output = "risc0_groth16_cuda";
 
     println!("cargo:rerun-if-env-changed=HIPCC");
+    println!("cargo:rerun-if-env-changed=RISC0_HIP_ARCH");
     for entry in std::fs::read_dir("kernels/cuda").unwrap() {
         let path = entry.unwrap().path();
         println!("cargo:rerun-if-changed={}", path.display());
@@ -58,34 +59,28 @@ fn build_rocm_kernels() {
     let out_dir = env::var("OUT_DIR").map(PathBuf::from).unwrap();
     let kernel_dir = std::fs::canonicalize("kernels/cuda").unwrap();
 
-    let mut cmd = Command::new(&hipcc);
-    cmd.arg("-x").arg("hip")
-        .arg("-std=c++17")
-        .arg("-O2")
-        .arg("-fPIC")
-        .arg("-Wno-unused-function")
-        .arg("-Wno-unused-parameter")
-        .arg("-Wno-missing-braces")
-        .arg(format!("--offload-arch={}", std::env::var("RISC0_HIP_ARCH").unwrap_or_else(|_| "native".to_string())))
-        .arg("-mllvm").arg("-amdgpu-early-inline-all=false")
-        .arg("-include").arg(format!("{sppark_root}/util/cuda2hip.hpp"))
-        .arg("-I").arg(&kernel_dir)
-        .arg("-I").arg(env::var("DEP_BLST_C_SRC").unwrap())
-        .arg("-I").arg(&sppark_root)
-        .arg("-D__ADX__");
+    let include_cuda2hip = format!("{sppark_root}/util/cuda2hip.hpp");
+    let blst_src = env::var("DEP_BLST_C_SRC").unwrap();
+    let arches = risc0_build_kernel::hip_arches();
+    let mut base_flags: Vec<&str> = vec![
+        "-x", "hip",
+        "-std=c++17", "-O2", "-fPIC",
+        "-Wno-unused-function", "-Wno-unused-parameter", "-Wno-missing-braces",
+        "-mllvm", "-amdgpu-early-inline-all=false",
+        "-include", &include_cuda2hip,
+        "-I", kernel_dir.to_str().unwrap(),
+        "-I", &blst_src,
+        "-I", &sppark_root,
+        "-D__ADX__",
+    ];
 
     if env::var("CARGO_FEATURE_SETUP").is_ok() {
-        cmd.arg("-DSRS_READ_COEFFS");
+        base_flags.push("-DSRS_READ_COEFFS");
     }
 
     let obj = out_dir.join("groth16_ffi.o");
-    cmd.arg("-c")
-        .arg(kernel_dir.join("ffi.cu"))
-        .arg("-o").arg(&obj);
-
-    let status = cmd.status()
-        .unwrap_or_else(|e| panic!("failed to run hipcc: {e}"));
-    assert!(status.success(), "hipcc failed for groth16 ffi.cu");
+    let ffi_cu = kernel_dir.join("ffi.cu");
+    risc0_build_kernel::hip_compile(&hipcc, &base_flags, &ffi_cu, &obj, &arches, None);
 
     // Merge blst objects into our archive so that the linker can resolve
     // blst symbols referenced by host-side fp2_t/xyzz_t/jacobian_t code

@@ -89,6 +89,7 @@ fn build_rocm_kernels() {
     let output = "risc0_keccak_cuda";
 
     println!("cargo:rerun-if-env-changed=HIPCC");
+    println!("cargo:rerun-if-env-changed=RISC0_HIP_ARCH");
     println!("cargo:rerun-if-env-changed=SCCACHE_RECACHE");
     rerun_if_changed("kernels/cuda");
 
@@ -138,32 +139,27 @@ fn build_rocm_kernels() {
     let supra_amalg_path = out_dir.join("supra_kernels_rocm.cu");
     std::fs::write(&supra_amalg_path, &supra_amalg).unwrap();
 
+    let include_cuda2hip = format!("{sppark_root}/util/cuda2hip.hpp");
+    let kernel_dir_str = kernel_dir.to_str().unwrap();
+    let arches = risc0_build_kernel::hip_arches();
+    let base_flags: Vec<&str> = vec![
+        "-x", "hip",
+        "-std=c++17", "-O2", "-fPIC",
+        "-Wno-unused-function", "-Wno-unused-parameter", "-Wno-missing-braces",
+        "-mllvm", "-amdgpu-early-inline-all=false",
+        "-include", &include_cuda2hip,
+        "-I", &cuda_root,
+        "-I", &sppark_root,
+        "-I", kernel_dir_str,
+    ];
+
     let mut obj_files = Vec::new();
-    // Compile risc0-types amalgamation
     for (amalg_path, obj_name) in [
         (&risc0_amalg_path, "risc0_kernels_rocm.o"),
         (&supra_amalg_path, "supra_kernels_rocm.o"),
     ] {
         let obj = out_dir.join(obj_name);
-        let status = Command::new(&hipcc)
-            .arg("-x").arg("hip")
-            .arg("-std=c++17")
-            .arg("-O2")
-            .arg("-fPIC")
-            .arg("-Wno-unused-function")
-            .arg("-Wno-unused-parameter")
-            .arg("-Wno-missing-braces")
-            .arg(format!("--offload-arch={}", std::env::var("RISC0_HIP_ARCH").unwrap_or_else(|_| "native".to_string())))
-            .arg("-mllvm").arg("-amdgpu-early-inline-all=false")
-            .arg("-include").arg(format!("{sppark_root}/util/cuda2hip.hpp"))
-            .arg("-I").arg(&cuda_root)
-            .arg("-I").arg(&sppark_root)
-            .arg("-I").arg(&kernel_dir)
-            .arg("-c").arg(amalg_path)
-            .arg("-o").arg(&obj)
-            .status()
-            .unwrap_or_else(|e| panic!("failed to run hipcc for {obj_name}: {e}"));
-        assert!(status.success(), "hipcc failed for {obj_name}");
+        risc0_build_kernel::hip_compile(&hipcc, &base_flags, amalg_path, &obj, &arches, None);
         obj_files.push(obj);
     }
 
