@@ -15,6 +15,7 @@
 //! Raw HIP runtime FFI bindings for ROCm GPU support.
 //! Replaces the `cust` crate which only supports CUDA.
 
+use std::cell::RefCell;
 use std::ffi::c_void;
 use std::os::raw::c_int;
 
@@ -24,6 +25,9 @@ pub const HIP_MEMCPY_DEVICE_TO_HOST: i32 = 2;
 
 // hipDeviceAttribute_t values we need
 pub const HIP_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK: i32 = 56;
+
+/// Opaque stream handle (hipStream_t is a pointer type).
+pub type HipStream = *mut c_void;
 
 extern "C" {
     pub fn hipInit(flags: u32) -> c_int;
@@ -36,8 +40,21 @@ extern "C" {
     pub fn hipMalloc(ptr: *mut *mut c_void, size: usize) -> c_int;
     pub fn hipFree(ptr: *mut c_void) -> c_int;
     pub fn hipMemcpy(dst: *mut c_void, src: *const c_void, size: usize, kind: c_int) -> c_int;
+    pub fn hipMemcpyAsync(
+        dst: *mut c_void,
+        src: *const c_void,
+        size: usize,
+        kind: c_int,
+        stream: HipStream,
+    ) -> c_int;
     pub fn hipMemset(dst: *mut c_void, value: c_int, size: usize) -> c_int;
+    pub fn hipMemsetAsync(dst: *mut c_void, value: c_int, size: usize, stream: HipStream)
+        -> c_int;
     pub fn hipMemsetD32(dst: *mut c_void, value: c_int, count: usize) -> c_int;
+
+    pub fn hipStreamCreate(stream: *mut HipStream) -> c_int;
+    pub fn hipStreamSynchronize(stream: HipStream) -> c_int;
+    pub fn hipStreamDestroy(stream: HipStream) -> c_int;
 
     pub fn hipGetErrorString(error: c_int) -> *const std::os::raw::c_char;
 }
@@ -59,6 +76,25 @@ pub fn hip_check(err: c_int) {
         };
         panic!("HIP error {err}: {msg}");
     }
+}
+
+// Thread-local copy stream for async memcpy/memset operations.
+// Using a dedicated stream avoids syncing ALL GPU streams (which hipMemcpy does).
+// This is critical on ROCm where hipMemcpy syncs ALL streams, blocking
+// eval_check running on stream2 during the STARK pipeline.
+thread_local! {
+    static COPY_STREAM: RefCell<HipStream> = RefCell::new(std::ptr::null_mut());
+}
+
+/// Get or create the thread-local copy stream.
+fn get_copy_stream() -> HipStream {
+    COPY_STREAM.with(|cell| {
+        let mut stream = cell.borrow_mut();
+        if stream.is_null() {
+            hip_check(unsafe { hipStreamCreate(&mut *stream) });
+        }
+        *stream
+    })
 }
 
 /// RAII wrapper for HIP device memory, replacing cust::DeviceBuffer<u8>.
@@ -83,23 +119,31 @@ impl HipDeviceBuffer {
         })
     }
 
-    /// Copy host data to device.
+    /// Copy host data to device (async on copy stream, does NOT sync other streams).
     pub fn copy_from(&mut self, data: &[u8]) -> anyhow::Result<()> {
         assert!(data.len() <= self.len);
+        let stream = get_copy_stream();
         hip_check(unsafe {
-            hipMemcpy(
+            hipMemcpyAsync(
                 self.ptr as *mut c_void,
                 data.as_ptr() as *const c_void,
                 data.len(),
                 HIP_MEMCPY_HOST_TO_DEVICE,
+                stream,
             )
         });
+        // Sync only the copy stream so the host buffer can be safely freed/reused.
+        // This does NOT sync other streams (eval_check on stream2 continues).
+        hip_check(unsafe { hipStreamSynchronize(stream) });
         Ok(())
     }
 
     /// Copy device data to a new host Vec.
+    /// Note: D2H copies need a device-wide sync to ensure GPU kernels that
+    /// produced the data have completed (they run on other streams).
     pub fn as_host_vec(&self) -> anyhow::Result<Vec<u8>> {
         let mut vec = vec![0u8; self.len];
+        // D2H needs device sync since data was produced on unknown streams.
         hip_check(unsafe {
             hipMemcpy(
                 vec.as_mut_ptr() as *mut c_void,
@@ -114,8 +158,14 @@ impl HipDeviceBuffer {
     /// Copy a range of device data to a new host Vec.
     /// `offset` and `len` are in bytes.
     pub fn as_host_vec_range(&self, offset: usize, len: usize) -> anyhow::Result<Vec<u8>> {
-        assert!(offset + len <= self.len, "range [{offset}..{}] exceeds buffer size {}", offset + len, self.len);
+        assert!(
+            offset + len <= self.len,
+            "range [{offset}..{}] exceeds buffer size {}",
+            offset + len,
+            self.len
+        );
         let mut vec = vec![0u8; len];
+        // D2H needs device sync since data was produced on unknown streams.
         hip_check(unsafe {
             hipMemcpy(
                 vec.as_mut_ptr() as *mut c_void,
@@ -128,15 +178,19 @@ impl HipDeviceBuffer {
     }
 
     /// Set all 32-bit words to `value`. Equivalent to cust's set_32().
+    /// Uses async memset on copy stream to avoid syncing all GPU streams.
     pub fn set_32(&mut self, value: u32) {
+        let stream = get_copy_stream();
         if value == 0 {
-            hip_check(unsafe { hipMemset(self.ptr as *mut c_void, 0, self.len) });
+            hip_check(unsafe { hipMemsetAsync(self.ptr as *mut c_void, 0, self.len, stream) });
         } else {
+            // hipMemsetD32 has no async variant in HIP; fall back to sync.
             let count = self.len / 4;
             hip_check(unsafe {
                 hipMemsetD32(self.ptr as *mut c_void, value as c_int, count)
             });
         }
+        hip_check(unsafe { hipStreamSynchronize(stream) });
     }
 
     /// Get the device pointer.
