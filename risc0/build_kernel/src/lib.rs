@@ -404,22 +404,10 @@ pub fn hip_compile(
     arches: &str,
     work_dir: Option<&Path>,
 ) {
-    let arch_list: Vec<&str> = arches.split(',').map(|s| s.trim()).collect();
-
-    if arch_list.len() <= 1 || arches == "native" {
-        hip_compile_single(hipcc, flags, source, output, arches, work_dir);
-        return;
-    }
-
-    // Try parallel compilation; fall back to sequential on failure.
-    if let Err(e) = hip_compile_parallel(hipcc, flags, source, output, &arch_list, work_dir) {
-        eprintln!(
-            "hip_compile: parallel build failed ({e:#}), falling back to sequential for {}",
-            source.display()
-        );
-        let joined = arch_list.join(",");
-        hip_compile_single(hipcc, flags, source, output, &joined, work_dir);
-    }
+    // Always use single-invocation hipcc which correctly generates
+    // __hip_fatbin_* symbols. The host/device split + clang-offload-bundler
+    // approach doesn't produce proper fat binary symbols in ROCm 7.x.
+    hip_compile_single(hipcc, flags, source, output, arches, work_dir);
 }
 
 /// Single-invocation hipcc compilation (original behaviour).
