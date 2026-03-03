@@ -327,6 +327,8 @@ fn build_rocm_kernels() {
                 }
             }
         }
+        // Hash target architectures so cache invalidates when arch list changes
+        risc0_build_kernel::hip_arches().hash(&mut hasher);
         format!("{:016x}", hasher.finish())
     };
     let remaining_prev = std::fs::read_to_string(&remaining_stamp).unwrap_or_default();
@@ -374,6 +376,8 @@ fn build_rocm_kernels() {
             if let Ok(content) = std::fs::read_to_string(cu) {
                 content.hash(&mut hasher);
             }
+            // Hash target architectures so cache invalidates when arch list changes
+            risc0_build_kernel::hip_arches().hash(&mut hasher);
             format!("{:016x}", hasher.finish())
         };
         let prev_hash = std::fs::read_to_string(&cached_stamp).unwrap_or_default();
@@ -467,5 +471,7 @@ fn eval_check_source_hash() -> String {
     if let Ok(v) = env::var("DEP_SPPARK_ROOT") {
         v.hash(&mut hasher);
     }
+    // Hash target architectures so cache invalidates when arch list changes
+    risc0_build_kernel::hip_arches().hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
