@@ -153,7 +153,7 @@ fn build_rocm_kernels() {
             .arg("-Wno-unused-function")
             .arg("-Wno-unused-parameter")
             .arg("-Wno-missing-braces")
-            .arg("--offload-arch=native")
+            .arg(format!("--offload-arch={}", std::env::var("RISC0_HIP_ARCH").unwrap_or_else(|_| "native".to_string())))
             .arg("-mllvm").arg("-amdgpu-early-inline-all=false")
             .arg("-include").arg(format!("{sppark_root}/util/cuda2hip.hpp"))
             .arg("-I").arg(&cuda_root)
