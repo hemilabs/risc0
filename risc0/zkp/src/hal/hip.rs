@@ -339,6 +339,7 @@ impl RawBuffer {
         }
     }
 
+    #[allow(dead_code)]
     pub fn set_u32(&mut self, value: u32) {
         self.buf.set_32(value);
     }
@@ -393,9 +394,24 @@ impl<T> BufferImpl<T> {
         // scope!("copy_from");
         let bytes_len = std::mem::size_of_val(slice);
         assert!(bytes_len > 0);
-        let mut buffer = RawBuffer::new(name, bytes_len);
+        let buffer = RawBuffer::new(name, bytes_len);
+        // Use async H2D copy on persistent stream to avoid device-wide sync from hipMemcpy.
+        extern "C" {
+            fn risc0_zkp_cuda_memcpy_h2d(
+                dst: *mut std::os::raw::c_void,
+                src: *const std::os::raw::c_void,
+                size: usize,
+            ) -> *const std::os::raw::c_char;
+        }
         let bytes = unchecked_cast(slice);
-        buffer.buf.copy_from(bytes).unwrap();
+        ffi_wrap(|| unsafe {
+            risc0_zkp_cuda_memcpy_h2d(
+                buffer.buf.as_device_ptr().0 as *mut std::os::raw::c_void,
+                bytes.as_ptr() as *const std::os::raw::c_void,
+                bytes.len(),
+            )
+        })
+        .unwrap();
 
         BufferImpl {
             buffer: Rc::new(RefCell::new(buffer)),
@@ -618,10 +634,22 @@ impl<HH: HipHash + ?Sized> Hal for HipHal<HH> {
         value: Self::Elem,
     ) -> Self::Buffer<Self::Elem> {
         let buffer = self.alloc_elem(name, size);
-        buffer
-            .buffer
-            .borrow_mut()
-            .set_u32(value.as_u32_montgomery());
+        // Use async fill on persistent stream to avoid device-wide sync from hipMemsetD32.
+        extern "C" {
+            fn risc0_zkp_cuda_fill_u32(
+                buf: DevicePointer<u8>,
+                value: u32,
+                count: u32,
+            ) -> *const std::os::raw::c_char;
+        }
+        ffi_wrap(|| unsafe {
+            risc0_zkp_cuda_fill_u32(
+                buffer.as_device_ptr(),
+                value.as_u32_montgomery(),
+                size as u32,
+            )
+        })
+        .unwrap();
         buffer
     }
 
@@ -635,7 +663,19 @@ impl<HH: HipHash + ?Sized> Hal for HipHal<HH> {
 
     fn alloc_extelem_zeroed(&self, name: &'static str, size: usize) -> Self::Buffer<Self::ExtElem> {
         let buffer = self.alloc_extelem(name, size);
-        buffer.buffer.borrow_mut().set_u32(0);
+        // Use async fill on persistent stream to avoid device-wide sync from hipMemset.
+        extern "C" {
+            fn risc0_zkp_cuda_fill_u32(
+                buf: DevicePointer<u8>,
+                value: u32,
+                count: u32,
+            ) -> *const std::os::raw::c_char;
+        }
+        let ext_count = size * std::mem::size_of::<Self::ExtElem>() / 4;
+        ffi_wrap(|| unsafe {
+            risc0_zkp_cuda_fill_u32(buffer.as_device_ptr(), 0, ext_count as u32)
+        })
+        .unwrap();
         buffer
     }
 

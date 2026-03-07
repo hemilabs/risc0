@@ -101,6 +101,16 @@ pub fn digest_to_fr(digest: &Digest) -> Fr {
     Fr::from_repr(repr).unwrap()
 }
 
+/// Returns the canonical little-endian byte representation of a digest as a BN254 Fr element.
+/// This is equivalent to `digest_to_fr(digest).to_repr()` but avoids exposing the `Fr` type.
+pub fn digest_to_fr_bytes(digest: &Digest) -> [u8; 32] {
+    let fr = digest_to_fr(digest);
+    let repr = fr.to_repr();
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(repr.as_ref());
+    bytes
+}
+
 fn fr_to_digest(fr: &Fr) -> Digest {
     let repr = fr.to_repr();
     Digest::try_from(repr.as_ref()).unwrap()

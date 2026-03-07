@@ -135,14 +135,34 @@ fn build_rocm_kernels() {
         obj_files.push(obj);
     }
 
-    // Archive
+    // Device-link: with -fgpu-rdc, device code is compiled as bitcode in each .o file.
+    // We must link all device code together into a single GPU code object so that
+    // cross-TU device function calls resolve and __noinline__ functions stay separate.
+    let device_linked = out_dir.join("device_linked_rocm.o");
+    {
+        let mut cmd = Command::new(&hipcc);
+        cmd.arg("--offload-arch=native")
+            .arg("-fgpu-rdc")
+            .arg("-fPIC")
+            .arg("-r")
+            .arg("-nostdlib");
+        for obj in &obj_files {
+            cmd.arg(obj);
+        }
+        cmd.arg("-o").arg(&device_linked);
+        let status = cmd
+            .status()
+            .unwrap_or_else(|e| panic!("failed to run hipcc device link: {e}"));
+        assert!(status.success(), "hipcc device link failed");
+    }
+
+    // Archive: with -fgpu-rdc, the device-linked .o contains both the host stubs
+    // and the fully linked GPU code, so we only archive it (not the individual .o files,
+    // which would cause duplicate symbol errors).
     let lib_path = out_dir.join(format!("lib{output}.a"));
     let _ = std::fs::remove_file(&lib_path);
     let mut ar_cmd = Command::new("ar");
-    ar_cmd.arg("rcs").arg(&lib_path);
-    for obj in &obj_files {
-        ar_cmd.arg(obj);
-    }
+    ar_cmd.arg("rcs").arg(&lib_path).arg(&device_linked);
     let status = ar_cmd.status().expect("failed to run ar");
     assert!(status.success(), "ar failed");
 

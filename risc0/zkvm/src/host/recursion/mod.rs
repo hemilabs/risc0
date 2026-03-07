@@ -35,6 +35,6 @@ pub use risc0_circuit_recursion::control_id::{ALLOWED_CONTROL_IDS, ALLOWED_CONTR
 #[cfg(feature = "prove")]
 pub use self::prove::test_zkr;
 #[cfg(feature = "prove")]
-pub use self::prove::{identity_p254, join, lift, resolve, Prover, RECURSION_PO2};
+pub use self::prove::{identity_p254, join, join_with_opts, lift, lift_with_opts, resolve, Prover, RECURSION_PO2};
 #[cfg(feature = "prove")]
 pub use risc0_circuit_recursion::prove::Program;

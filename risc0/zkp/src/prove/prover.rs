@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::LazyLock;
+
 use risc0_core::{
     field::{Elem, ExtElem, RootsOfUnity},
     scope, scope_with,
@@ -24,6 +26,8 @@ use crate::{
     taps::TapSet,
     INV_RATE,
 };
+
+static VERBOSE: LazyLock<bool> = LazyLock::new(|| std::env::var("RISC0_VERBOSE").is_ok());
 
 /// Object to generate a zero-knowledge proof of the execution of some circuit.
 pub struct Prover<'a, H: Hal> {
@@ -52,6 +56,7 @@ pub struct DeferredFinalize<H: Hal> {
 
 fn make_coeffs<H: Hal>(hal: &H, witness: &H::Buffer<H::Elem>, count: usize) -> H::Buffer<H::Elem> {
     scope!("make_coeffs");
+    let t0 = std::time::Instant::now();
     let coeffs = hal.alloc_elem("coeffs", witness.size());
     hal.eltwise_copy_elem(&coeffs, witness);
     // Do interpolate + zk_shift (f(x) -> f(3x), multiplying coefficients c_i by 3^i)
@@ -59,6 +64,14 @@ fn make_coeffs<H: Hal>(hal: &H, witness: &H::Buffer<H::Elem>, count: usize) -> H
     hal.batch_interpolate_ntt_zk_shift(&coeffs, count);
     #[cfg(feature = "circuit_debug")]
     hal.batch_interpolate_ntt(&coeffs, count);
+    if std::env::var_os("RISC0_VERBOSE").is_some() {
+        eprintln!(
+            "[make_coeffs] name={} count={count} size={} intt_zk={:.1}ms",
+            witness.name(),
+            witness.size() / count,
+            t0.elapsed().as_secs_f64() * 1000.0,
+        );
+    }
     coeffs
 }
 
@@ -193,14 +206,16 @@ impl<'a, H: Hal> Prover<'a, H> {
         let ext_size = H::ExtElem::EXT_SIZE;
 
         // Now generate the check polynomial.
+        let _ft_alloc = std::time::Instant::now();
         let check_poly = self.hal.alloc_elem("check_poly", ext_size * domain);
+        let _t_alloc = _ft_alloc.elapsed();
 
         let groups: Vec<&_> = self
             .groups
             .iter()
             .map(|pg| &pg.as_ref().unwrap().evaluated)
             .collect();
-        let ft1 = std::time::Instant::now();
+        let _ft1 = std::time::Instant::now();
         circuit_hal.eval_check(
             &check_poly,
             groups.as_slice(),
@@ -209,10 +224,20 @@ impl<'a, H: Hal> Prover<'a, H> {
             self.po2,
             self.cycles,
         );
+        let _t_eval_check = _ft1.elapsed();
         // eval_check is async on GPU — run CPU work while GPU computes
+        let _ft_drop = std::time::Instant::now();
         post_eval_check();
-        eprintln!("  [finalize] alloc+eval_check: {:.2}ms (eval_check alone: {:.2}ms)",
-            ft0.elapsed().as_secs_f64() * 1000.0, ft1.elapsed().as_secs_f64() * 1000.0);
+        let _t_drop = _ft_drop.elapsed();
+        if std::env::var_os("RISC0_VERBOSE").is_some() {
+            eprintln!(
+                "[start_finalize] alloc={:.1}ms eval_check_launch={:.1}ms post_eval_check={:.1}ms total={:.1}ms",
+                _t_alloc.as_secs_f64() * 1000.0,
+                _t_eval_check.as_secs_f64() * 1000.0,
+                _t_drop.as_secs_f64() * 1000.0,
+                ft0.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
 
         // SAFETY: taps is always &'static TAPSET in practice.
         let taps: &'static TapSet<'static> = unsafe {
@@ -243,14 +268,17 @@ impl<H: Hal> DeferredFinalize<H> {
     /// produce the final proof seal.
     pub fn complete<C: CircuitHal<H>>(mut self, hal: &H, circuit_hal: &C) -> Vec<u32> {
         scope!("finalize_complete");
-        let ft0 = self.ft0;
+        let _ft0 = self.ft0;
         let ext_size = H::ExtElem::EXT_SIZE;
+        let ft = std::time::Instant::now();
 
         // Insert GPU dependency: make persistent stream wait for eval_check stream.
         circuit_hal.eval_check_dep();
+        let t_eval_check_dep = ft.elapsed();
 
         // Convert to coefficients.
         hal.batch_interpolate_ntt(&self.check_poly, ext_size);
+        let t_check_intt = ft.elapsed();
 
         // The next step is to convert the degree 4*n check polynomial into 4 degree n
         // polynomials so that f(x) = g0(x^4) + g1(x^4) x + g2(x^4) x^2 + g3(x^4)
@@ -263,13 +291,11 @@ impl<H: Hal> DeferredFinalize<H> {
         // the coefficients of g1, etc. So really, we can just reinterpret 4 polys of
         // invRate*size to 16 polys of size, without actually doing anything.
 
-        eprintln!("  [finalize] iNTT(check): {:.2}ms", ft0.elapsed().as_secs_f64() * 1000.0);
         // Make the PolyGroup + add it to the IOP;
         let check_group = PolyGroup::new(hal, self.check_poly, H::CHECK_SIZE, self.cycles, "check");
-        eprintln!("  [finalize] check_poly_group: {:.2}ms", ft0.elapsed().as_secs_f64() * 1000.0);
         check_group.merkle.commit(&mut self.iop);
         tracing::debug!("checkGroup: {}", check_group.merkle.root());
-        eprintln!("  [finalize] check_group+commit: {:.2}ms", ft0.elapsed().as_secs_f64() * 1000.0);
+        let t_check_commit = ft.elapsed();
 
         // Now pick a value for Z, which is used as the DEEP-ALI query point.
         cfg_if::cfg_if! {
@@ -341,7 +367,6 @@ impl<H: Hal> DeferredFinalize<H> {
             });
         });
 
-        eprintln!("  [finalize] eval_u: {:.1}ms", ft0.elapsed().as_secs_f64() * 1000.0);
         // Now, convert the values to coefficients via interpolation
         let mut coeff_u = vec![H::ExtElem::ZERO; eval_u.len()];
         scope!("poly_interpolate", {
@@ -357,7 +382,6 @@ impl<H: Hal> DeferredFinalize<H> {
             }
         });
 
-        eprintln!("  [finalize] poly_interp: {:.1}ms", ft0.elapsed().as_secs_f64() * 1000.0);
         // Add in the coeffs of the check polynomials.
         let z_pow = z.pow(ext_size);
         scope!("misc", {
@@ -382,7 +406,8 @@ impl<H: Hal> DeferredFinalize<H> {
             // Set the mix value, which is used for FRI batching.
         });
 
-        eprintln!("  [finalize] misc: {:.1}ms", ft0.elapsed().as_secs_f64() * 1000.0);
+        let t_eval_u = ft.elapsed();
+
         let mix = self.iop.random_ext_elem();
         tracing::debug!("Mix = {mix:?}");
 
@@ -393,8 +418,6 @@ impl<H: Hal> DeferredFinalize<H> {
             "alloc(combos)",
             hal.alloc_extelem_zeroed("combos", self.cycles * (combo_count + 1))
         );
-        eprintln!("  [finalize] alloc_combos: {:.1}ms", ft0.elapsed().as_secs_f64() * 1000.0);
-
         scope!("mix_poly_coeffs", {
             let mut cur_mix = H::ExtElem::ONE;
 
@@ -445,7 +468,6 @@ impl<H: Hal> DeferredFinalize<H> {
             );
         });
 
-        eprintln!("  [finalize] mix_poly: {:.1}ms", ft0.elapsed().as_secs_f64() * 1000.0);
         scope!("load_combos", {
             let reg_sizes: Vec<_> = self.taps.regs().map(|x| x.size() as u32).collect();
             let reg_combo_ids: Vec<_> = self.taps.regs().map(|x| x.combo_id() as u32).collect();
@@ -481,7 +503,8 @@ impl<H: Hal> DeferredFinalize<H> {
             });
         });
 
-        eprintln!("  [finalize] combos: {:.1}ms", ft0.elapsed().as_secs_f64() * 1000.0);
+        let t_combos = ft.elapsed();
+
         // Sum the combos up into one final polynomial + make it into 4 Fp polys.
         // Additionally, it needs to be bit reversed to make everyone happy
         let final_poly_coeffs = scope!("sum", {
@@ -491,13 +514,13 @@ impl<H: Hal> DeferredFinalize<H> {
             final_poly_coeffs
         });
 
-        eprintln!("  [finalize] sum+bitrev: {:.1}ms", ft0.elapsed().as_secs_f64() * 1000.0);
         // Finally do the FRI protocol to prove the degree of the polynomial
         scope!(
             "bit_rev",
             hal.batch_bit_reverse(&final_poly_coeffs, ext_size)
         );
         tracing::debug!("FRI-proof, size = {}", final_poly_coeffs.size() / ext_size);
+        let t_pre_fri = ft.elapsed();
 
         fri_prove(
             hal,
@@ -527,7 +550,6 @@ impl<H: Hal> DeferredFinalize<H> {
             },
         );
 
-        eprintln!("  [finalize] fri_prove: {:.1}ms", ft0.elapsed().as_secs_f64() * 1000.0);
         let proven_soundness_error =
             super::soundness::proven::<H>(self.taps, final_poly_coeffs.size());
         tracing::debug!("proven_soundness_error: {proven_soundness_error:?}");
@@ -535,6 +557,20 @@ impl<H: Hal> DeferredFinalize<H> {
         let conjectured_security =
             super::soundness::toy_model_security::<H>(self.taps, final_poly_coeffs.size());
         tracing::debug!("conjectured_security: {conjectured_security:?}");
+
+        let t_total = ft.elapsed();
+        if *VERBOSE {
+            eprintln!(
+                "[finalize] eval_check_dep={:.1}ms check_intt={:.1}ms check_commit={:.1}ms eval_u={:.1}ms combos={:.1}ms fri={:.1}ms total={:.1}ms",
+                t_eval_check_dep.as_secs_f64() * 1000.0,
+                (t_check_intt - t_eval_check_dep).as_secs_f64() * 1000.0,
+                (t_check_commit - t_check_intt).as_secs_f64() * 1000.0,
+                (t_eval_u - t_check_commit).as_secs_f64() * 1000.0,
+                (t_combos - t_eval_u).as_secs_f64() * 1000.0,
+                (t_total - t_pre_fri).as_secs_f64() * 1000.0,
+                t_total.as_secs_f64() * 1000.0,
+            );
+        }
 
         // Return final proof
         let proof = self.iop.proof;

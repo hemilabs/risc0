@@ -23,7 +23,8 @@ use std::{
 
 use human_repr::{HumanCount, HumanDuration, HumanThroughput};
 use risc0_zkvm::{
-    get_prover_server, sha::Digest, ExecutorEnv, ExecutorImpl, ProverOpts, Session, VerifierContext,
+    get_prover_server, sha::Digest, ExecutorEnv, ExecutorImpl, ProverOpts, ReceiptKind, Session,
+    VerifierContext,
 };
 use serde::Serialize;
 use serde_with::{serde_as, DurationNanoSeconds};
@@ -112,10 +113,15 @@ impl Job {
     }
 
     fn exec_compute(&self) -> (Session, Duration) {
-        let env = ExecutorEnv::builder()
-            .write_slice(&self.input)
-            .build()
-            .unwrap();
+        let mut builder = ExecutorEnv::builder();
+        builder.write_slice(&self.input);
+        let segment_po2: u32 = std::env::var("RISC0_SEGMENT_PO2")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(22);
+        eprintln!("[benchmark] Using segment_limit_po2={segment_po2}");
+        builder.segment_limit_po2(segment_po2);
+        let env = builder.build().unwrap();
         let mut exec = ExecutorImpl::from_elf(env, &self.elf).unwrap();
         let start = Instant::now();
         let session = exec.run().unwrap();
@@ -132,8 +138,39 @@ impl Job {
         metrics.user_cycles = session.user_cycles;
         metrics.exec_duration = duration;
 
-        let prover = get_prover_server(&ProverOpts::succinct()).unwrap();
-        let ctx = VerifierContext::default();
+        let use_groth16 = std::env::var("RISC0_RECEIPT_KIND")
+            .map(|v| v.eq_ignore_ascii_case("groth16"))
+            .unwrap_or(false);
+
+        let segment_po2: usize = std::env::var("RISC0_SEGMENT_PO2")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(22);
+
+        let receipt_kind = if use_groth16 {
+            eprintln!("[benchmark] Using Groth16 receipt kind");
+            ReceiptKind::Groth16
+        } else {
+            ReceiptKind::Succinct
+        };
+
+        let opts = if segment_po2 > 22 {
+            eprintln!("[benchmark] Using from_max_po2({segment_po2}) for ProverOpts");
+            ProverOpts::from_max_po2(segment_po2).with_receipt_kind(receipt_kind)
+        } else {
+            if use_groth16 {
+                ProverOpts::groth16()
+            } else {
+                ProverOpts::succinct()
+            }
+        };
+
+        let prover = get_prover_server(&opts).unwrap();
+        let ctx = if segment_po2 > 22 {
+            VerifierContext::from_max_po2(segment_po2)
+        } else {
+            VerifierContext::default()
+        };
 
         let start = Instant::now();
         let receipt = prover.prove_session(&ctx, &session).unwrap().receipt;
@@ -142,10 +179,14 @@ impl Job {
         metrics.total_duration = metrics.exec_duration + metrics.proof_duration;
         metrics.speed = self.size as f32 / metrics.total_duration.as_secs_f32();
         metrics.output_bytes = receipt.journal.bytes.len();
-        metrics.proof_bytes = receipt.inner.succinct().unwrap().seal_size();
+        metrics.proof_bytes = if use_groth16 {
+            receipt.inner.groth16().map(|g| g.seal.len()).unwrap_or(0)
+        } else {
+            receipt.inner.succinct().unwrap().seal_size()
+        };
 
         let start = Instant::now();
-        receipt.verify(self.image_id).unwrap();
+        receipt.verify_with_context(&ctx, self.image_id).unwrap();
         metrics.verify_duration = start.elapsed();
 
         metrics

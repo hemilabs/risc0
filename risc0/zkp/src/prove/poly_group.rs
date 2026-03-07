@@ -82,9 +82,22 @@ impl<H: Hal> PolyGroup<H> {
         assert_eq!(coeffs.size(), count * size);
         let domain = size * INV_RATE;
         let evaluated = hal.alloc_elem("evaluated", count * domain);
+        let t0 = std::time::Instant::now();
         hal.batch_expand_into_evaluate_ntt(&evaluated, &coeffs, count, log2_ceil(INV_RATE));
+        let t_ntt = t0.elapsed();
         hal.batch_bit_reverse(&coeffs, count);
+        let t_bitrev = t0.elapsed();
         let merkle = MerkleTreeProver::new(hal, &evaluated, domain, count, QUERIES);
+        let t_merkle = t0.elapsed();
+        if std::env::var_os("RISC0_VERBOSE").is_some() {
+            eprintln!(
+                "[poly_group({name})] count={count} size={size} domain={domain} ntt={:.1}ms bitrev={:.1}ms merkle={:.1}ms total={:.1}ms",
+                t_ntt.as_secs_f64() * 1000.0,
+                (t_bitrev - t_ntt).as_secs_f64() * 1000.0,
+                (t_merkle - t_bitrev).as_secs_f64() * 1000.0,
+                t_merkle.as_secs_f64() * 1000.0,
+            );
+        }
         PolyGroup {
             coeffs,
             count,

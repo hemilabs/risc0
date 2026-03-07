@@ -52,6 +52,36 @@ const char* risc0_zkp_cuda_sync_stream() {
   return nullptr;
 }
 
+// Async H2D copy: uses persistent stream to avoid device-wide sync from hipMemcpy.
+const char* risc0_zkp_cuda_memcpy_h2d(void* dst, const void* src, size_t size) {
+  try {
+    cudaStream_t stream = getPersistentStream();
+    CUDA_OK(cudaMemcpyAsync(dst, src, size, cudaMemcpyHostToDevice, stream));
+  } catch (const std::exception& err) {
+    return strdup(err.what());
+  }
+  return nullptr;
+}
+
+// Async fill: uses persistent stream to avoid device-wide sync from hipMemsetD32.
+const char* risc0_zkp_cuda_fill_u32(uint32_t* buf, uint32_t value, uint32_t count) {
+  try {
+    cudaStream_t stream = getPersistentStream();
+    if (value == 0) {
+      CUDA_OK(cudaMemsetAsync(buf, 0, (size_t)count * 4, stream));
+    } else {
+#ifdef __HIPCC__
+      CUDA_OK(hipMemsetD32Async(buf, value, count, stream));
+#else
+      CUDA_OK(cuMemsetD32Async((CUdeviceptr)buf, value, count, stream));
+#endif
+    }
+  } catch (const std::exception& err) {
+    return strdup(err.what());
+  }
+  return nullptr;
+}
+
 const char* risc0_zkp_cuda_eltwise_add_fp(Fp* out, const Fp* x, const Fp* y, uint32_t count) {
   return launchKernel(eltwise_add_fp, count, 0, out, x, y, count);
 }
@@ -149,8 +179,8 @@ const char* risc0_zkp_cuda_scatter_bits(Fp* into,
   return launchKernel(scatter_bits, count, 0, into, data, cycles, count);
 }
 
-// Scatter from host memory using persistent device buffers.
-// Reuses grow-only device buffers across segments to avoid per-call allocation.
+// Scatter from host memory using persistent device + pinned host buffers.
+// Pinned host buffers avoid HIP's slow pageable memory staging path.
 const char* risc0_zkp_cuda_scatter_from_host(Fp* into,
                                              const uint32_t* h_index,
                                              uint32_t index_count,
@@ -168,9 +198,14 @@ const char* risc0_zkp_cuda_scatter_from_host(Fp* into,
     static Fp* d_values = nullptr;
     static size_t cap_d_index = 0, cap_d_offsets = 0, cap_d_values = 0;
 
+    // Persistent pinned host staging buffers (grow-only).
+    static void* h_pinned = nullptr;
+    static size_t cap_h_pinned = 0;
+
     size_t index_bytes = index_count * sizeof(uint32_t);
     size_t offsets_bytes = offsets_count * sizeof(uint32_t);
     size_t values_bytes = values_count * sizeof(Fp);
+    size_t total_bytes = index_bytes + offsets_bytes + values_bytes;
 
     // Grow device buffers if needed.
     if (index_bytes > cap_d_index) {
@@ -189,12 +224,25 @@ const char* risc0_zkp_cuda_scatter_from_host(Fp* into,
       cap_d_values = values_bytes;
     }
 
-    // Async H2D transfers (CUDA driver stages pageable memory internally).
-    CUDA_OK(cudaMemcpyAsync(d_index, h_index, index_bytes,
+    // Grow pinned host staging buffer if needed.
+    if (total_bytes > cap_h_pinned) {
+      if (h_pinned) CUDA_OK(cudaFreeHost(h_pinned));
+      CUDA_OK(cudaHostAlloc(&h_pinned, total_bytes, cudaHostAllocDefault));
+      cap_h_pinned = total_bytes;
+    }
+
+    // Copy to pinned staging buffer (fast CPU memcpy).
+    char* pin = (char*)h_pinned;
+    memcpy(pin, h_index, index_bytes);
+    memcpy(pin + index_bytes, h_offsets, offsets_bytes);
+    memcpy(pin + index_bytes + offsets_bytes, h_values, values_bytes);
+
+    // Truly async H2D transfers from pinned memory.
+    CUDA_OK(cudaMemcpyAsync(d_index, pin, index_bytes,
                             cudaMemcpyHostToDevice, stream));
-    CUDA_OK(cudaMemcpyAsync(d_offsets, h_offsets, offsets_bytes,
+    CUDA_OK(cudaMemcpyAsync(d_offsets, pin + index_bytes, offsets_bytes,
                             cudaMemcpyHostToDevice, stream));
-    CUDA_OK(cudaMemcpyAsync(d_values, h_values, values_bytes,
+    CUDA_OK(cudaMemcpyAsync(d_values, pin + index_bytes + offsets_bytes, values_bytes,
                             cudaMemcpyHostToDevice, stream));
 
     // Launch scatter kernel on same stream (waits for DMA implicitly).
@@ -210,7 +258,7 @@ const char* risc0_zkp_cuda_scatter_from_host(Fp* into,
   return nullptr;
 }
 
-// Scatter bits from host memory using persistent device buffer.
+// Scatter bits from host memory using persistent device + pinned host buffer.
 const char* risc0_zkp_cuda_scatter_bits_from_host(Fp* into,
                                                   const uint32_t* h_data,
                                                   uint32_t triplet_count,
@@ -222,6 +270,10 @@ const char* risc0_zkp_cuda_scatter_bits_from_host(Fp* into,
     static uint32_t* d_bitdata = nullptr;
     static size_t cap_d_bitdata = 0;
 
+    // Persistent pinned host staging buffer (grow-only).
+    static void* h_pinned_bits = nullptr;
+    static size_t cap_h_pinned_bits = 0;
+
     size_t data_bytes = (size_t)triplet_count * 3 * sizeof(uint32_t);
 
     if (data_bytes > cap_d_bitdata) {
@@ -230,8 +282,16 @@ const char* risc0_zkp_cuda_scatter_bits_from_host(Fp* into,
       cap_d_bitdata = data_bytes;
     }
 
-    // Async H2D transfer (CUDA driver stages pageable memory internally).
-    CUDA_OK(cudaMemcpyAsync(d_bitdata, h_data, data_bytes,
+    // Grow pinned host staging buffer if needed.
+    if (data_bytes > cap_h_pinned_bits) {
+      if (h_pinned_bits) CUDA_OK(cudaFreeHost(h_pinned_bits));
+      CUDA_OK(cudaHostAlloc(&h_pinned_bits, data_bytes, cudaHostAllocDefault));
+      cap_h_pinned_bits = data_bytes;
+    }
+
+    // Copy to pinned staging and do truly async H2D.
+    memcpy(h_pinned_bits, h_data, data_bytes);
+    CUDA_OK(cudaMemcpyAsync(d_bitdata, h_pinned_bits, data_bytes,
                             cudaMemcpyHostToDevice, stream));
 
     // Launch scatter_bits kernel on same stream.

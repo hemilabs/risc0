@@ -164,7 +164,15 @@ __device__ __forceinline__ void poseidon2_mix(fr_t cells[CELLS]) {
 
 } // namespace poseidon2
 
-__launch_bounds__(256, 3) __global__
+#ifdef __HIPCC__
+// MI300X (CDNA3, gfx942): 512 VGPRs/SIMD, ~50 VGPRs/thread for Poseidon2.
+// 512 threads = 8 wavefronts/block × 2 blocks/CU = 16 wavefronts/CU (40% occ)
+// vs 256 threads × 3 = 12 wavefronts/CU (30% occ).
+__launch_bounds__(512, 2)
+#else
+__launch_bounds__(256, 3)
+#endif
+__global__
     void _poseidon2_fold(poseidon_out_t* output, const poseidon_in_t* input, uint32_t output_size) {
   uint32_t gid = blockDim.x * blockIdx.x + threadIdx.x;
 
@@ -190,7 +198,12 @@ __launch_bounds__(256, 3) __global__
   output[gid] = tmp;
 }
 
-__launch_bounds__(256, 3) __global__
+#ifdef __HIPCC__
+__launch_bounds__(512, 2)
+#else
+__launch_bounds__(256, 3)
+#endif
+__global__
     void _poseidon2_rows(poseidon_out_t* out, const fr_t* matrix, uint32_t dim_x, uint32_t dim_y) {
   uint32_t gid = blockDim.x * blockIdx.x + threadIdx.x;
   if (gid >= dim_x)

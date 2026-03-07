@@ -18,10 +18,12 @@ pub(crate) mod cuda;
 #[cfg(feature = "rocm")]
 pub(crate) mod hip;
 
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, rc::Rc, sync::LazyLock};
 
 use anyhow::Result;
 use risc0_core::scope;
+
+static VERBOSE: LazyLock<bool> = LazyLock::new(|| std::env::var("RISC0_VERBOSE").is_ok());
 use risc0_zkp::{
     adapter::{CircuitInfo as _, PROOF_SYSTEM_INFO},
     field::Elem as _,
@@ -174,14 +176,14 @@ where
         };
 
         let (hal, circuit_hal) = self.get_hal();
-        eprintln!("[prove_core] hal_factory: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+        if *VERBOSE { eprintln!("[prove_core] hal_factory: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0); }
 
         let t1 = std::time::Instant::now();
         let po2 = preflight_results.po2();
         let header = preflight_results.build_header();
         let witgen =
             WitnessGenerator::new(hal.as_ref(), circuit_hal.as_ref(), preflight_results, mode)?;
-        eprintln!("[prove_core] witgen: {:.1}ms", t1.elapsed().as_secs_f64() * 1000.0);
+        if *VERBOSE { eprintln!("[prove_core] witgen: {:.1}ms", t1.elapsed().as_secs_f64() * 1000.0); }
 
         let code = &witgen.code.buf;
         let data = &witgen.data.buf;
@@ -218,7 +220,7 @@ where
                 prover.iop().commit(&header_digest);
                 prover.iop().write_field_elem_slice(header.as_slice());
                 prover.set_po2(po2 as usize);
-                eprintln!("  [main] setup: {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0);
+                if *VERBOSE { eprintln!("  [main] setup: {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0); }
 
                 // Code buffer is always zeros (INVALID → zeroized, never written to).
                 // Cache its PolyGroup to skip iNTT/expand/merkle on subsequent segments
@@ -228,31 +230,31 @@ where
                     if let Some((ref cached, cached_po2)) = *cache {
                         if cached_po2 == po2 as usize {
                             prover.commit_cached_group(REGISTER_GROUP_CODE, cached.clone());
-                            eprintln!("  [main] commit(code) [cached]: {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0);
+                            if *VERBOSE { eprintln!("  [main] commit(code) [cached]: {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0); }
                         } else {
                             prover.commit_group(REGISTER_GROUP_CODE, code);
                             *cache = prover.get_group(REGISTER_GROUP_CODE).cloned()
                                 .map(|g| (g, po2 as usize));
-                            eprintln!("  [main] commit(code) [recomputed, po2 changed {cached_po2}->{po2}]: {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0);
+                            if *VERBOSE { eprintln!("  [main] commit(code) [recomputed, po2 changed {cached_po2}->{po2}]: {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0); }
                         }
                     } else {
                         prover.commit_group(REGISTER_GROUP_CODE, code);
                         *cache = prover.get_group(REGISTER_GROUP_CODE).cloned()
                             .map(|g| (g, po2 as usize));
-                        eprintln!("  [main] commit(code) [computed+cached]: {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0);
+                        if *VERBOSE { eprintln!("  [main] commit(code) [computed+cached]: {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0); }
                     }
                 }
                 prover.commit_group(REGISTER_GROUP_DATA, data);
-                eprintln!("  [main] commit(data): {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0);
+                if *VERBOSE { eprintln!("  [main] commit(data): {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0); }
 
                 // Make the mixing values
                 let mix: [Val; REGCOUNT_MIX] = std::array::from_fn(|_| prover.iop().random_elem());
 
                 let mix = witgen.accum(hal.as_ref(), circuit_hal.as_ref(), &mix)?;
-                eprintln!("  [main] accum: {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0);
+                if *VERBOSE { eprintln!("  [main] accum: {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0); }
 
                 prover.commit_group(REGISTER_GROUP_ACCUM, &witgen.accum.buf);
-                eprintln!("  [main] commit(accum): {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0);
+                if *VERBOSE { eprintln!("  [main] commit(accum): {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0); }
 
                 // Clone tiny global buffer (90 elements = 360 bytes) so witgen can
                 // be dropped during async GPU eval_check.
@@ -272,16 +274,16 @@ where
                 move || {
                     let td = std::time::Instant::now();
                     drop(witgen);
-                    eprintln!("[prove_core] witgen_drop (overlapped with eval_check): {:.1}ms",
-                        td.elapsed().as_secs_f64() * 1000.0);
+                    if *VERBOSE { eprintln!("[prove_core] witgen_drop (overlapped with eval_check): {:.1}ms",
+                        td.elapsed().as_secs_f64() * 1000.0); }
                 },
             );
 
-            eprintln!("[prove_core] prove_inner: {:.1}ms (main: {:.1}ms, finalize: {:.1}ms)",
+            if *VERBOSE { eprintln!("[prove_core] prove_inner: {:.1}ms (main: {:.1}ms, finalize: {:.1}ms)",
                 t2.elapsed().as_secs_f64() * 1000.0,
                 (t3 - t2).as_secs_f64() * 1000.0,
                 t3.elapsed().as_secs_f64() * 1000.0);
-            eprintln!("[prove_core] TOTAL: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+            eprintln!("[prove_core] TOTAL: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0); }
             result
         });
 
@@ -305,25 +307,6 @@ where
         let witgen =
             WitnessGenerator::new(hal.as_ref(), circuit_hal.as_ref(), preflight_results, mode)?;
         let t_witgen = t0.elapsed();
-
-        // Complete previous deferred finalize (if any) BEFORE creating PolyGroups.
-        // Witgen allocates ~1.3GB of raw witness buffers. The prev DeferredFinalize
-        // holds ~6.4GB of PolyGroups. Both must coexist during witgen (they overlap
-        // with eval_check on stream2). But commit_group(data) allocates ~4.2GB more,
-        // which would push total over 16GB VRAM. So we complete + free the prev
-        // deferred here, after witgen provides overlap with eval_check.
-        let prev_seal = if let Some(deferred) = self.pending_finalize.borrow_mut().take() {
-            let tp = std::time::Instant::now();
-            let seal = deferred.complete(hal.as_ref(), circuit_hal.as_ref());
-            eprintln!(
-                "[prove_begin] completed prev finalize: {:.1}ms (after witgen={:.1}ms)",
-                tp.elapsed().as_secs_f64() * 1000.0,
-                t_witgen.as_secs_f64() * 1000.0
-            );
-            Some(seal)
-        } else {
-            None
-        };
 
         let code = &witgen.code.buf;
         let data = &witgen.data.buf;
@@ -367,11 +350,32 @@ where
                     .map(|g| (g, po2 as usize));
             }
         }
-        prover.commit_group(REGISTER_GROUP_DATA, data);
+        // Complete previous deferred finalize after witgen provides overlap with eval_check.
+        let prev_seal = if let Some(deferred) = self.pending_finalize.borrow_mut().take() {
+            let tp = std::time::Instant::now();
+            let seal = deferred.complete(hal.as_ref(), circuit_hal.as_ref());
+            if *VERBOSE { eprintln!(
+                "[prove_begin] completed prev finalize: {:.1}ms (after witgen={:.1}ms)",
+                tp.elapsed().as_secs_f64() * 1000.0,
+                t_witgen.as_secs_f64() * 1000.0,
+            ); }
+            Some(seal)
+        } else {
+            None
+        };
 
+        let td = std::time::Instant::now();
+        prover.commit_group(REGISTER_GROUP_DATA, data);
+        let t_data_commit = td.elapsed();
+
+        let ta = std::time::Instant::now();
         let mix: [Val; REGCOUNT_MIX] = std::array::from_fn(|_| prover.iop().random_elem());
         let mix = witgen.accum(hal.as_ref(), circuit_hal.as_ref(), &mix)?;
+        let t_accum = ta.elapsed();
+
+        let tac = std::time::Instant::now();
         prover.commit_group(REGISTER_GROUP_ACCUM, &witgen.accum.buf);
+        let t_accum_commit = tac.elapsed();
 
         let global_clone = hal.alloc_elem("global_clone", witgen.global.buf.size());
         hal.eltwise_copy_elem(&global_clone, &witgen.global.buf);
@@ -384,19 +388,20 @@ where
             circuit_hal.as_ref(),
             move || drop(witgen),
         );
-        // Keep globals alive until eval_check completes — eval_check reads from
-        // these buffers asynchronously on stream2. Without this, hipFree/cudaFree
-        // would either sync all streams (defeating pipelining) or cause use-after-free.
+        // Keep globals alive until eval_check completes.
         deferred.keep_alive_buf(mix.buf);
         deferred.keep_alive_buf(global_clone);
         *self.pending_finalize.borrow_mut() = Some(deferred);
 
-        eprintln!(
-            "[prove_begin] witgen={:.1}ms main={:.1}ms total={:.1}ms",
+        if *VERBOSE { eprintln!(
+            "[prove_begin] witgen={:.1}ms data_commit={:.1}ms accum={:.1}ms accum_commit={:.1}ms main={:.1}ms total={:.1}ms",
             t_witgen.as_secs_f64() * 1000.0,
+            t_data_commit.as_secs_f64() * 1000.0,
+            t_accum.as_secs_f64() * 1000.0,
+            t_accum_commit.as_secs_f64() * 1000.0,
             t_main.as_secs_f64() * 1000.0,
             t0.elapsed().as_secs_f64() * 1000.0
-        );
+        ); }
 
         Ok(prev_seal)
     }
@@ -411,10 +416,10 @@ where
             .ok_or_else(|| anyhow::anyhow!("prove_end: no pending finalize"))?;
         let t0 = std::time::Instant::now();
         let seal = deferred.complete(hal.as_ref(), circuit_hal.as_ref());
-        eprintln!(
+        if *VERBOSE { eprintln!(
             "[prove_end] finalize: {:.1}ms",
             t0.elapsed().as_secs_f64() * 1000.0
-        );
+        ); }
         Ok(seal)
     }
 }

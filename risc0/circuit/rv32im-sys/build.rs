@@ -175,6 +175,7 @@ fn build_cuda_kernels() {
                     | "eval_check_2.cu"
                     | "eval_check_3.cu"
                     | "eval_check_combined.cu"
+                    | "eval_check_kernel.cu"  // RDC-only, not used by NVIDIA
                     | "witgen_combined.cu"
             )
         })
@@ -288,6 +289,7 @@ fn build_rocm_kernels() {
                     | "eval_check_2.cu"
                     | "eval_check_3.cu"
                     | "eval_check_combined.cu"
+                    | "eval_check_kernel.cu"
                     | "witgen_combined.cu"
                     | "ffi_supra.cu"
             )

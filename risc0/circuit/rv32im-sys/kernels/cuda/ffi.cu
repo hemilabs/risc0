@@ -39,6 +39,7 @@ namespace nvtx3 { struct scoped_range { scoped_range(const char*) {} }; }
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <string.h>
 
 #ifdef __HIPCC__
@@ -51,6 +52,8 @@ namespace cuda { namespace std { using ::std::array; } }
 #include <thrust/execution_policy.h>
 #include <thrust/scan.h>
 #endif
+
+static bool g_verbose = (std::getenv("RISC0_VERBOSE") != nullptr);
 
 namespace risc0::circuit::rv32im_v2::cuda {
 
@@ -126,6 +129,11 @@ struct DeviceCache {
   uint8_t* d_bigintBytes = nullptr;
   size_t bigintBytes_capacity = 0;
 
+  // Persistent pinned host staging buffer for preflight data uploads (grow-only).
+  // Avoids HIP's slow pageable memory staging path for large H2D copies.
+  void* h_pinned_preflight = nullptr;
+  size_t cap_h_pinned_preflight = 0;
+
 
   void init(cudaStream_t stream) {
     if (exec_ctx) return;  // already initialized
@@ -179,14 +187,32 @@ struct DeviceCache {
     CUDA_OK(cudaMemcpyAsync(d_exec_pre_data, &buffers->pre_data, sizeof(Buffer), cudaMemcpyHostToDevice, stream));
     CUDA_OK(cudaMemcpyAsync(d_exec_global, &buffers->global, sizeof(Buffer), cudaMemcpyHostToDevice, stream));
 
-    // Upload preflight data (async H2D, CUDA driver stages pageable memory).
-    CUDA_OK(cudaMemcpyAsync(d_cycles, preflight->cycles,
-                            lastCycle * sizeof(PreflightCycle), cudaMemcpyHostToDevice, stream));
-    CUDA_OK(cudaMemcpyAsync(d_txns, preflight->txns,
-                            preflight->txnsLen * sizeof(MemoryTransaction), cudaMemcpyHostToDevice, stream));
-    if (preflight->bigintBytesLen > 0) {
-      CUDA_OK(cudaMemcpyAsync(d_bigintBytes, preflight->bigintBytes,
-                              preflight->bigintBytesLen, cudaMemcpyHostToDevice, stream));
+    // Upload preflight data via pinned staging buffer for truly async H2D.
+    size_t cycles_bytes = lastCycle * sizeof(PreflightCycle);
+    size_t txns_bytes = preflight->txnsLen * sizeof(MemoryTransaction);
+    size_t bigint_bytes = preflight->bigintBytesLen;
+    size_t total_pf_bytes = cycles_bytes + txns_bytes + bigint_bytes;
+
+    // Grow pinned staging buffer if needed.
+    if (total_pf_bytes > cap_h_pinned_preflight) {
+      if (h_pinned_preflight) CUDA_OK(cudaFreeHost(h_pinned_preflight));
+      CUDA_OK(cudaHostAlloc(&h_pinned_preflight, total_pf_bytes, cudaHostAllocDefault));
+      cap_h_pinned_preflight = total_pf_bytes;
+    }
+
+    // Copy to pinned staging (fast CPU memcpy).
+    char* pin = (char*)h_pinned_preflight;
+    memcpy(pin, preflight->cycles, cycles_bytes);
+    memcpy(pin + cycles_bytes, preflight->txns, txns_bytes);
+    if (bigint_bytes > 0) {
+      memcpy(pin + cycles_bytes + txns_bytes, preflight->bigintBytes, bigint_bytes);
+    }
+
+    // Truly async H2D from pinned memory.
+    CUDA_OK(cudaMemcpyAsync(d_cycles, pin, cycles_bytes, cudaMemcpyHostToDevice, stream));
+    CUDA_OK(cudaMemcpyAsync(d_txns, pin + cycles_bytes, txns_bytes, cudaMemcpyHostToDevice, stream));
+    if (bigint_bytes > 0) {
+      CUDA_OK(cudaMemcpyAsync(d_bigintBytes, pin + cycles_bytes + txns_bytes, bigint_bytes, cudaMemcpyHostToDevice, stream));
     }
 
     // Build and upload PreflightTrace descriptor
@@ -520,7 +546,7 @@ const char* risc0_circuit_rv32im_cuda_witgen(uint32_t mode,
     } break;
     }
     auto t2 = std::chrono::steady_clock::now();
-    fprintf(stderr, "      [ffi_witgen] ctx_setup: %.1fms, kernels(async): %.1fms\n",
+    if (g_verbose) fprintf(stderr, "      [ffi_witgen] ctx_setup: %.1fms, kernels(async): %.1fms\n",
             std::chrono::duration<double, std::milli>(t1 - t0).count(),
             std::chrono::duration<double, std::milli>(t2 - t1).count());
   } catch (const std::exception& err) {
@@ -578,7 +604,7 @@ const char* risc0_circuit_rv32im_cuda_accum(AccumBuffers* buffers,
       finalizeAccum<<<cfg.grid, cfg.block, 0, stream>>>(d_ctx, lastCycle);
     }
     auto t2 = std::chrono::steady_clock::now();
-    fprintf(stderr, "      [ffi_accum] ctx_setup: %.1fms, kernels: %.1fms\n",
+    if (g_verbose) fprintf(stderr, "      [ffi_accum] ctx_setup: %.1fms, kernels: %.1fms\n",
             std::chrono::duration<double, std::milli>(t1 - t0).count(),
             std::chrono::duration<double, std::milli>(t2 - t1).count());
 

@@ -68,8 +68,13 @@ extern "C" RustError::by_value
 sppark_poseidon2_fold(poseidon_out_t* d_out, const poseidon_in_t* d_in, size_t num_hashes) {
   const gpu_t& gpu = select_gpu();
 
-  size_t block_size = num_hashes < 256 ? num_hashes : 256;
-  size_t num_blocks = num_hashes < 256 ? 1 : num_hashes / 256;
+#ifdef __HIPCC__
+  const size_t P2_BLOCK = 512;
+#else
+  const size_t P2_BLOCK = 256;
+#endif
+  size_t block_size = num_hashes < P2_BLOCK ? num_hashes : P2_BLOCK;
+  size_t num_blocks = num_hashes < P2_BLOCK ? 1 : num_hashes / P2_BLOCK;
 
   try {
     (void)cudaGetLastError(); // consume any stale async errors
@@ -90,12 +95,18 @@ extern "C" RustError::by_value
 sppark_poseidon2_fold_tree(poseidon_out_t* nodes, uint32_t layers) {
   const gpu_t& gpu = select_gpu();
 
+#ifdef __HIPCC__
+  const size_t P2_BLOCK = 512;
+#else
+  const size_t P2_BLOCK = 256;
+#endif
+
   try {
     (void)cudaGetLastError(); // consume any stale async errors
     for (int i = layers - 1; i >= 0; i--) {
       uint32_t layer_size = 1u << i;
-      size_t block_size = layer_size < 256 ? layer_size : 256;
-      size_t num_blocks = layer_size < 256 ? 1 : layer_size / 256;
+      size_t block_size = layer_size < P2_BLOCK ? layer_size : P2_BLOCK;
+      size_t num_blocks = layer_size < P2_BLOCK ? 1 : layer_size / P2_BLOCK;
 
       _poseidon2_fold<<<num_blocks, block_size, 0, gpu>>>(
           nodes + layer_size,
@@ -116,7 +127,12 @@ extern "C" RustError::by_value
 sppark_poseidon2_rows(poseidon_out_t* d_out, const fr_t* d_in, uint32_t count, uint32_t col_size) {
   const gpu_t& gpu = select_gpu();
 
-  size_t block_size = count < 256 ? count : 256;
+#ifdef __HIPCC__
+  const size_t P2_BLOCK = 512;
+#else
+  const size_t P2_BLOCK = 256;
+#endif
+  size_t block_size = count < P2_BLOCK ? count : P2_BLOCK;
   size_t num_blocks = (count + block_size - 1) / block_size;
 
   try {

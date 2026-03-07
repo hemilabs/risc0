@@ -28,6 +28,7 @@ __global__ __launch_bounds__(512) void witness_into_poly(fr_t* out,
     out[coeff.c] = sum;
   }
 }
+
 #else // Host pass
 
 #include <cmath>
@@ -78,6 +79,8 @@ __global__ __launch_bounds__(512) void witness_into_poly(fr_t* out,
                                                          const coeff_t* coeffs,
                                                          slice_t<uint32_t> indices,
                                                          const fr_t* witness) {}
+__global__ __launch_bounds__(64) void diag_g2_double(uint32_t* out,
+                                                      const uint32_t* inp) {}
 #else
 __global__ __launch_bounds__(512) void witness_into_poly(fr_t* out,
                                                          const coeff_t* coeffs,

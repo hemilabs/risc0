@@ -21,9 +21,11 @@ pub(crate) mod sha2;
 #[cfg(test)]
 mod tests;
 
-use std::iter::zip;
+use std::{iter::zip, sync::LazyLock};
 
 use anyhow::{Context, Result};
+
+static VERBOSE: LazyLock<bool> = LazyLock::new(|| std::env::var("RISC0_VERBOSE").is_ok());
 use preflight::PreflightTrace;
 use rayon::prelude::*;
 use risc0_binfmt::{PovwNonce, WordAddr};
@@ -149,8 +151,8 @@ where
             trace: preflight_results.trace,
             bigint_rows: preflight_results.bigint_rows,
         };
-        eprintln!("      [witgen_new] hal_gen={:.1}ms struct_build={:.1}ms",
-            (tn1-tn0).as_secs_f64()*1000.0, tn1.elapsed().as_secs_f64()*1000.0);
+        if *VERBOSE { eprintln!("      [witgen_new] hal_gen={:.1}ms struct_build={:.1}ms",
+            (tn1-tn0).as_secs_f64()*1000.0, tn1.elapsed().as_secs_f64()*1000.0); }
         Ok(result)
     }
 
@@ -197,21 +199,32 @@ where
         );
         let tw3 = std::time::Instant::now();
         // Scatter pre-injected values to both data and pre_data.
+        let ts0 = std::time::Instant::now();
         hal.scatter(
             &data.buf,
             &injector.index,
             &injector.offsets,
             &injector.values,
         );
+        let ts1 = std::time::Instant::now();
         hal.scatter(
             &pre_data.buf,
             &injector.index,
             &injector.offsets,
             &injector.values,
         );
+        let ts2 = std::time::Instant::now();
         hal.scatter_bits(&data.buf, &injector.bit_data, cycles as u32);
+        let ts3 = std::time::Instant::now();
         hal.scatter_bits(&pre_data.buf, &injector.bit_data, cycles as u32);
         let tw4 = std::time::Instant::now();
+        if *VERBOSE { eprintln!("      [scatter_detail] s1={:.1}ms s2={:.1}ms sb1={:.1}ms sb2={:.1}ms total={:.1}ms",
+            (ts1-ts0).as_secs_f64()*1000.0,
+            (ts2-ts1).as_secs_f64()*1000.0,
+            (ts3-ts2).as_secs_f64()*1000.0,
+            (tw4-ts3).as_secs_f64()*1000.0,
+            (tw4-tw3).as_secs_f64()*1000.0,
+        ); }
         // Drop 126MB of injector Vecs in background while GPU runs generate_witness.
         // After scatter + scatter_bits, all host data has been copied to GPU (sync memcpy).
         let inj_idx = injector.index.len();
@@ -229,7 +242,7 @@ where
             hal.eltwise_zeroize_elem(&data.buf);
         });
         let tw6 = std::time::Instant::now();
-        eprintln!("      [hal_witgen] global+code={:.1}ms data+pre_data={:.1}ms accum={:.1}ms scatter={:.1}ms ffi={:.1}ms zeroize={:.1}ms (inj: idx={} off={} val={} bits={})",
+        if *VERBOSE { eprintln!("      [hal_witgen] global+code={:.1}ms data+pre_data={:.1}ms accum={:.1}ms scatter={:.1}ms ffi={:.1}ms zeroize={:.1}ms (inj: idx={} off={} val={} bits={})",
             (tw1-tw0).as_secs_f64()*1000.0,
             (tw2-tw1).as_secs_f64()*1000.0,
             (tw3-tw2).as_secs_f64()*1000.0,
@@ -237,7 +250,7 @@ where
             (tw5-tw4).as_secs_f64()*1000.0,
             (tw6-tw5).as_secs_f64()*1000.0,
             inj_idx, inj_off, inj_val, inj_bits,
-        );
+        ); }
         Ok((global, code, data, accum))
     }
 
@@ -265,7 +278,7 @@ where
                 injector.push();
             }
         }
-        eprintln!("    [accum] bigint_inject: {:.1}ms", ta0.elapsed().as_secs_f64() * 1000.0);
+        if *VERBOSE { eprintln!("    [accum] bigint_inject: {:.1}ms", ta0.elapsed().as_secs_f64() * 1000.0); }
 
         hal.scatter(
             &self.accum.buf,
@@ -273,7 +286,7 @@ where
             &injector.offsets,
             &injector.values,
         );
-        eprintln!("    [accum] scatter: {:.1}ms", ta0.elapsed().as_secs_f64() * 1000.0);
+        if *VERBOSE { eprintln!("    [accum] scatter: {:.1}ms", ta0.elapsed().as_secs_f64() * 1000.0); }
 
         let mix = MetaBuffer {
             buf: hal.copy_from_elem("mix", mix),
@@ -281,15 +294,15 @@ where
             cols: REGCOUNT_MIX,
             checked: true,
         };
-        eprintln!("    [accum] mix_upload: {:.1}ms", ta0.elapsed().as_secs_f64() * 1000.0);
+        if *VERBOSE { eprintln!("    [accum] mix_upload: {:.1}ms", ta0.elapsed().as_secs_f64() * 1000.0); }
 
         circuit_hal.step_accum(&self.trace, &self.data, &self.accum, &self.global, &mix)?;
-        eprintln!("    [accum] step_accum: {:.1}ms", ta0.elapsed().as_secs_f64() * 1000.0);
+        if *VERBOSE { eprintln!("    [accum] step_accum: {:.1}ms", ta0.elapsed().as_secs_f64() * 1000.0); }
 
         scope!("zeroize(accum)", {
             hal.eltwise_zeroize_elem(&self.accum.buf);
         });
-        eprintln!("    [accum] zeroize: {:.1}ms", ta0.elapsed().as_secs_f64() * 1000.0);
+        if *VERBOSE { eprintln!("    [accum] zeroize: {:.1}ms", ta0.elapsed().as_secs_f64() * 1000.0); }
 
         Ok(mix)
     }

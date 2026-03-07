@@ -1,21 +1,16 @@
-// Combined compilation of all eval_check device functions + kernel into a single
-// translation unit, compiled WITHOUT -dc (separate compilation). This allows
-// NVCC to inline the 20 device functions in the poly_fp call chain, eliminating
-// 19 cross-TU function calls with full ABI overhead (save/restore all registers,
-// pass parameters through local memory → ~9KB local memory per thread).
+// eval_check kernel + host wrappers for -fgpu-rdc (separate compilation) builds.
+// The 20 rv32im_v2_* device functions are in eval_check_0.cu through eval_check_3.cu,
+// each compiled as a separate TU. This allows the compiler to allocate registers
+// independently per function, reducing overall register pressure and scratch usage
+// compared to the monolithic inlined version (eval_check_combined.cu).
 
-#include "eval_check_0.cu"
-#include "eval_check_1.cu"
-#include "eval_check_2.cu"
-#include "eval_check_3.cu"
-
-// --- eval_check kernel + host wrappers (moved from ffi_supra.cu) ---
-
+#include "eval_check.cuh"
 #include "cuda.h"
 
 namespace risc0::circuit::rv32im_v2::cuda {
 
-// poly_mix is defined in eval_check.cuh (included by eval_check_0.cu)
+// Define poly_mix here (declared extern in eval_check.cuh when EVAL_CHECK_RDC is set)
+__constant__ FpExt poly_mix[kNumPolyMixPows];
 
 #ifndef EVAL_CHECK_THREADS
 #define EVAL_CHECK_THREADS 256
@@ -48,7 +43,7 @@ __global__ void eval_check_diag(Fp* check,
   check[15] = poly_mix[457][1];
 }
 
-__launch_bounds__(EVAL_CHECK_THREADS, 1)
+__launch_bounds__(EVAL_CHECK_THREADS)
 __global__ void eval_check(Fp* check,
                            const Fp* ctrl,
                            const Fp* data,
@@ -165,15 +160,15 @@ const char* risc0_circuit_rv32im_cuda_eval_check(Fp* check,
   return nullptr;
 }
 
-// Wait for eval_check to complete before reading check_poly.
-// Uses cudaDeviceSynchronize() because eval_check runs on its own stream
-// (getEvalCheckStream) while downstream operations (iNTT via sppark, Merkle
-// via risc0-sys) run on separate streams. Each library's getPersistentStream()
-// is a static-local in its own TU, so stream-based cudaStreamWaitEvent would
-// only sync one stream. cudaDeviceSynchronize() ensures ALL streams are drained.
+// Make the persistent stream wait for eval_check to complete.
+// Call this before operations on the persistent stream that read eval_check output
+// (e.g., iNTT on check_poly). This is a GPU-side dependency — the CPU returns
+// immediately; only the persistent stream blocks until eval_check finishes.
 const char* risc0_circuit_rv32im_cuda_eval_check_dep() {
   try {
-    CUDA_OK(cudaDeviceSynchronize());
+    cudaEvent_t event = getEvalCheckEvent();
+    CUDA_OK(cudaEventRecord(event, getEvalCheckStream()));
+    CUDA_OK(cudaStreamWaitEvent(getPersistentStream(), event, 0));
   } catch (const std::exception& err) {
     return strdup(err.what());
   } catch (...) {

@@ -15,10 +15,13 @@
 pub mod zkr;
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    cell::RefCell,
+    collections::{BTreeMap, HashMap, VecDeque},
     fmt::Debug,
-    sync::Mutex,
+    sync::{Arc, LazyLock, Mutex},
 };
+
+static VERBOSE: LazyLock<bool> = LazyLock::new(|| std::env::var("RISC0_VERBOSE").is_ok());
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use risc0_binfmt::read_sha_halfs;
@@ -71,16 +74,28 @@ pub(crate) static ZKR_REGISTRY: Mutex<ZkrRegistry> = Mutex::new(BTreeMap::new())
 /// constant-time verification procedure, with respect to the original segment length, and is then
 /// used as the input to all other recursion programs (e.g. join, resolve, and identity_p254).
 pub fn lift(segment_receipt: &SegmentReceipt) -> Result<SuccinctReceipt<ReceiptClaim>> {
+    lift_with_opts(segment_receipt, ProverOpts::succinct())
+}
+
+/// Run the lift program with custom ProverOpts (e.g. for non-default max_segment_po2).
+pub fn lift_with_opts(segment_receipt: &SegmentReceipt, opts: ProverOpts) -> Result<SuccinctReceipt<ReceiptClaim>> {
     tracing::debug!("Proving lift: claim = {:#?}", segment_receipt.claim);
-    let mut prover = Prover::new_lift(segment_receipt, ProverOpts::succinct())?;
+    let t0 = std::time::Instant::now();
+    let mut prover = Prover::new_lift(segment_receipt, opts)?;
+    let setup_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     let receipt = prover.prover.run()?;
+    let run_ms = t0.elapsed().as_secs_f64() * 1000.0 - setup_ms;
+
+    let t1 = std::time::Instant::now();
     let claim_decoded = ReceiptClaim::decode(&mut receipt.out_stream())?;
     tracing::debug!("Proving lift finished: decoded claim = {claim_decoded:#?}");
-
     let claim = claim_decoded.merge(&segment_receipt.claim)?;
+    let result = make_succinct_receipt(prover, receipt, claim);
+    let post_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
-    make_succinct_receipt(prover, receipt, claim)
+    if *VERBOSE { eprintln!("[lift_detail] setup={setup_ms:.1}ms run={run_ms:.1}ms post={post_ms:.1}ms"); }
+    result
 }
 
 /// Run the lift program to create a succinct work claim receipt from a segment receipt.
@@ -117,10 +132,19 @@ pub fn join(
     a: &SuccinctReceipt<ReceiptClaim>,
     b: &SuccinctReceipt<ReceiptClaim>,
 ) -> Result<SuccinctReceipt<ReceiptClaim>> {
+    join_with_opts(a, b, ProverOpts::succinct())
+}
+
+/// Run the join program with custom ProverOpts.
+pub fn join_with_opts(
+    a: &SuccinctReceipt<ReceiptClaim>,
+    b: &SuccinctReceipt<ReceiptClaim>,
+    opts: ProverOpts,
+) -> Result<SuccinctReceipt<ReceiptClaim>> {
     tracing::debug!("Proving join: a.claim = {:#?}", a.claim);
     tracing::debug!("Proving join: b.claim = {:#?}", b.claim);
 
-    let mut prover = Prover::new_join(a, b, ProverOpts::succinct())?;
+    let mut prover = Prover::new_join(a, b, opts)?;
     let receipt = prover.prover.run()?;
 
     let claim_decoded = ReceiptClaim::decode(&mut receipt.out_stream())?;
@@ -128,7 +152,6 @@ pub fn join(
 
     // Compute the expected claim and merge it with the decoded claim, checking that they match.
     let claim = claim_decoded.merge(&a.claim.join(&b.claim)?.value()?)?;
-
     make_succinct_receipt(prover, receipt, claim)
 }
 
@@ -397,7 +420,7 @@ pub fn prove_zkr(
     input: &[u8],
 ) -> Result<SuccinctReceipt<Unknown>> {
     let opts = ProverOpts::succinct().with_control_ids(allowed_control_ids);
-    let mut prover = Prover::new(program, *control_id, opts.clone());
+    let mut prover = Prover::new(Arc::new(program), *control_id, opts.clone());
     prover.add_input(bytemuck::cast_slice(input));
 
     tracing::debug!("Running prover");
@@ -466,20 +489,23 @@ pub fn get_registered_zkr(control_id: &Digest) -> Result<Program> {
         .unwrap_or_else(|| bail!("Control id {control_id} unregistered"))
 }
 
-/// Private utility to make a SuccinctReceipt from a RecursionReceipt, the Prover and the Claim.
-fn make_succinct_receipt<Claim>(
+/// Utility to make a SuccinctReceipt from a RecursionReceipt, the Prover and the Claim.
+pub(crate) fn make_succinct_receipt<Claim>(
     prover: Prover,
     receipt: RecursionReceipt,
     claim: impl Into<MaybePruned<Claim>>,
 ) -> Result<SuccinctReceipt<Claim>> {
+    // Derive verifier parameters from the prover's control_ids.
+    let verifier_parameters = SuccinctReceiptVerifierParameters::from_max_po2(
+        prover.opts.max_segment_po2,
+    ).digest();
     Ok(SuccinctReceipt {
         seal: receipt.seal,
         hashfn: prover.opts.hashfn.clone(),
         control_id: prover.control_id,
         control_inclusion_proof: prover.control_inclusion_proof()?,
         claim: claim.into(),
-        // TODO(victor): This should be derived from the ProverOpts instead of being default.
-        verifier_parameters: SuccinctReceiptVerifierParameters::default().digest(),
+        verifier_parameters,
     })
 }
 
@@ -557,7 +583,7 @@ macro_rules! ensure_poseidon2 {
 }
 
 impl Prover {
-    pub(crate) fn new(program: Program, control_id: Digest, opts: ProverOpts) -> Self {
+    pub(crate) fn new(program: Arc<Program>, control_id: Digest, opts: ProverOpts) -> Self {
         Self {
             prover: risc0_circuit_recursion::prove::Prover::new(program, &opts.hashfn),
             control_id,
@@ -571,14 +597,26 @@ impl Prover {
     }
 
     /// Returns a Merkle inclusion proof of this prover's control ID in the set of allowed IDs.
+    /// Cached per control_id since the proof is deterministic for a given set of control_ids.
     pub fn control_inclusion_proof(&self) -> Result<MerkleProof> {
-        let hashfn = self
-            .opts
-            .hash_suite()
-            .context("ProverOpts contains invalid hashfn")?
-            .hashfn;
-        MerkleGroup::new(self.opts.control_ids.clone())?
-            .get_proof(&self.control_id, hashfn.as_ref())
+        thread_local! {
+            static PROOF_CACHE: RefCell<HashMap<Digest, MerkleProof>> =
+                RefCell::new(HashMap::new());
+        }
+        PROOF_CACHE.with(|cache| {
+            if let Some(proof) = cache.borrow().get(&self.control_id) {
+                return Ok(proof.clone());
+            }
+            let hashfn = self
+                .opts
+                .hash_suite()
+                .context("ProverOpts contains invalid hashfn")?
+                .hashfn;
+            let proof = MerkleGroup::new(self.opts.control_ids.clone())?
+                .get_proof(&self.control_id, hashfn.as_ref())?;
+            cache.borrow_mut().insert(self.control_id, proof.clone());
+            Ok(proof)
+        })
     }
 
     /// Initialize a recursion prover with the test recursion program. This program is used in
@@ -619,10 +657,24 @@ impl Prover {
     fn new_lift_inner(segment: &SegmentReceipt, opts: ProverOpts, povw: bool) -> Result<Self> {
         ensure_poseidon2!(segment);
 
+        // Cache merkle root by (hashfn, max_segment_po2) to support non-default control_ids.
+        thread_local! {
+            static MERKLE_ROOT_CACHE: RefCell<HashMap<(String, usize), Digest>> =
+                RefCell::new(HashMap::new());
+        }
         let inner_hash_suite = hash_suite_from_name(&segment.hashfn)
             .ok_or_else(|| anyhow!("unsupported hash function: {}", segment.hashfn))?;
-        let allowed_ids = MerkleGroup::new(opts.control_ids.clone())?;
-        let merkle_root = allowed_ids.calc_root(inner_hash_suite.hashfn.as_ref());
+        let cache_key = (segment.hashfn.clone(), opts.max_segment_po2);
+        let merkle_root = MERKLE_ROOT_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if let Some(root) = cache.get(&cache_key) {
+                return *root;
+            }
+            let allowed_ids = MerkleGroup::new(opts.control_ids.clone()).unwrap();
+            let root = allowed_ids.calc_root(inner_hash_suite.hashfn.as_ref());
+            cache.insert(cache_key.clone(), root);
+            root
+        });
 
         let out_size = risc0_circuit_rv32im::CircuitImpl::OUTPUT_SIZE;
 
@@ -698,11 +750,12 @@ impl Prover {
         // the determined control root does not match what the downstream verifier expects, they
         // will reject.
         let merkle_root = a.control_root()?;
+        let b_root = b.control_root()?;
         ensure!(
-            merkle_root == b.control_root()?,
+            merkle_root == b_root,
             "merkle roots for a and b do not match: {} != {}",
             merkle_root,
-            b.control_root()?
+            b_root
         );
 
         prover.add_input_digest(&merkle_root, DigestKind::Poseidon2);
@@ -955,6 +1008,12 @@ impl Prover {
         let zero_root = BabyBearElem::new((a.control_root()? == Digest::ZERO) as u32);
         self.add_input(bytemuck::cast_slice(&[zero_root]));
         Ok(())
+    }
+
+    /// Pre-compute the CPU preflight for pipelining. Can be called from any thread.
+    /// If called before `run()`, `run()` will skip the preflight step and use this result.
+    pub fn prepare(&mut self) -> Result<()> {
+        self.prover.prepare()
     }
 
     /// Run the prover, producing a receipt of execution for the recursion circuit over the loaded

@@ -392,6 +392,9 @@ const char* risc0_circuit_recursion_cuda_witgen(uint32_t mode,
                                                 PreflightTrace* trace,
                                                 uint32_t totalCycles) {
   try {
+    // Sync all GPU work before accessing buffers written by external streams
+    // (e.g., Rust HAL's persistent stream). hipMemcpy doesn't reliably
+    // synchronize across all streams on ROCm.
     CUDA_OK(cudaDeviceSynchronize());
     HostExecContext ctx(buffers, trace, totalCycles);
     ctx.doStepExec(mode);
@@ -406,6 +409,7 @@ const char* risc0_circuit_recursion_cuda_accum(AccumBuffers* buffers,
                                                uint32_t workCycles,
                                                uint32_t totalCycles) {
   try {
+    // Sync all GPU work before accessing buffers written by external streams
     CUDA_OK(cudaDeviceSynchronize());
     HostAccumContext ctx(buffers, workCycles, totalCycles);
     ctx.computeAccum();

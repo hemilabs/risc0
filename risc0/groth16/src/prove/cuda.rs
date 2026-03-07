@@ -23,6 +23,11 @@ use crate::{ProofJson, Seal};
 
 use super::seal_to_json::to_json;
 
+pub(crate) fn preload_graph() -> Result<()> {
+    // TODO: add PARSED_GRAPH caching to cuda.rs (like hip.rs)
+    Ok(())
+}
+
 pub(crate) fn shrink_wrap(seal_bytes: &[u8]) -> Result<Seal> {
     tracing::info!("shrink_wrap: {} seal bytes", seal_bytes.len());
 

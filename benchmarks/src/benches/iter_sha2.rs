@@ -18,7 +18,7 @@ use crate::Job;
 
 pub fn new_jobs() -> Vec<Job> {
     let mut jobs = Vec::new();
-    for spec in [1, 10, 100] {
+    for spec in [100000] {
         let guest_input = (spec, vec![0u8; 32]);
         jobs.push(Job::new(
             format!("iter_sha2-{spec}"),

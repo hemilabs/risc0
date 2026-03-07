@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{cell::RefCell, collections::HashMap};
+use std::{cell::RefCell, collections::HashMap, sync::LazyLock};
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
+
+static VERBOSE: LazyLock<bool> = LazyLock::new(|| std::env::var("RISC0_VERBOSE").is_ok());
 
 use super::{keccak::prove_keccak, ProverServer};
 use risc0_circuit_rv32im::prove::SegmentProver;
@@ -45,7 +47,7 @@ use crate::{
     host::{
         client::prove::opts::ReceiptKind,
         prove_info::ProveInfo,
-        recursion::{identity_p254, join, lift, resolve},
+        recursion::{identity_p254, join, join_with_opts, lift, lift_with_opts, resolve},
         server::{exec::executor::ExecutorImpl, prove::union_peak::UnionPeak},
     },
     mmr::MerkleMountainAccumulator,
@@ -115,6 +117,19 @@ impl ProverServer for ProverImpl {
         }));
         #[cfg(not(any(feature = "cuda", feature = "rocm")))]
         let mut warmup_handle: Option<std::thread::JoinHandle<()>> = None;
+
+        // Preload circom graph on background thread so the ~728ms file read + parse
+        // overlaps with segment proving and recursion.  Only needed for Groth16.
+        #[cfg(any(feature = "cuda", feature = "rocm"))]
+        let _graph_preload = if self.opts.receipt_kind == ReceiptKind::Groth16 {
+            Some(std::thread::spawn(|| {
+                if let Err(e) = risc0_groth16::prove::preload_graph() {
+                    eprintln!("[groth16] graph preload failed (non-fatal): {e}");
+                }
+            }))
+        } else {
+            None
+        };
 
         let skip_verify = std::env::var("RISC0_SKIP_VERIFY").is_ok();
         let max_po2 = self.opts.max_segment_po2;
@@ -254,13 +269,13 @@ impl ProverServer for ProverImpl {
 
             let t_prove = t_seg.elapsed() - t_preflight;
             let t_total = t_seg.elapsed();
-            eprintln!(
+            if *VERBOSE { eprintln!(
                 "[prove_session] seg {seg_idx}: preflight={:.1}ms prove_begin={:.1}ms prove={:.1}ms total={:.1}ms",
                 t_preflight.as_secs_f64() * 1000.0,
                 prove_begin_ms,
                 t_prove.as_secs_f64() * 1000.0,
                 t_total.as_secs_f64() * 1000.0,
-            );
+            ); }
 
             for hook in &session.hooks {
                 hook.on_post_prove_segment(&segment);
@@ -474,10 +489,10 @@ impl ProverServer for ProverImpl {
         let t_psc = std::time::Instant::now();
         let seal =
             with_segment_prover(|sp| sp.prove_core(preflight_results.inner))?;
-        eprintln!("[prove_segment_core] prove_core: {:.1}ms", t_psc.elapsed().as_secs_f64() * 1000.0);
+        if *VERBOSE { eprintln!("[prove_segment_core] prove_core: {:.1}ms", t_psc.elapsed().as_secs_f64() * 1000.0); }
         let t_dec = std::time::Instant::now();
         let mut claim = ReceiptClaim::decode_from_seal_v2(&seal, Some(po2))?;
-        eprintln!("[prove_segment_core] decode: {:.1}ms (seal len: {})", t_dec.elapsed().as_secs_f64() * 1000.0, seal.len());
+        if *VERBOSE { eprintln!("[prove_segment_core] decode: {:.1}ms (seal len: {})", t_dec.elapsed().as_secs_f64() * 1000.0, seal.len()); }
         claim.output = preflight_results.output.into();
 
         let verifier_parameters = ctx
@@ -497,8 +512,22 @@ impl ProverServer for ProverImpl {
     }
 
     fn lift(&self, receipt: &SegmentReceipt) -> Result<SuccinctReceipt<ReceiptClaim>> {
-        let receipt = lift(receipt)?;
-        receipt.verify_integrity().context("verify lift")?;
+        let t0 = std::time::Instant::now();
+        let receipt = if self.opts.max_segment_po2 > crate::receipt::DEFAULT_MAX_PO2 {
+            let recursion_opts = ProverOpts::from_max_po2(self.opts.max_segment_po2)
+                .with_receipt_kind(ReceiptKind::Succinct);
+            lift_with_opts(receipt, recursion_opts)?
+        } else {
+            lift(receipt)?
+        };
+        let prove_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        if std::env::var("RISC0_SKIP_VERIFY").is_err() {
+            let t1 = std::time::Instant::now();
+            receipt.verify_integrity().context("verify lift")?;
+            if *VERBOSE { eprintln!("[lift] prove={prove_ms:.1}ms verify={:.1}ms", t1.elapsed().as_secs_f64() * 1000.0); }
+        } else {
+            if *VERBOSE { eprintln!("[lift] prove={prove_ms:.1}ms verify=skipped"); }
+        }
         Ok(receipt)
     }
 
@@ -514,8 +543,22 @@ impl ProverServer for ProverImpl {
         a: &SuccinctReceipt<ReceiptClaim>,
         b: &SuccinctReceipt<ReceiptClaim>,
     ) -> Result<SuccinctReceipt<ReceiptClaim>> {
-        let receipt = join(a, b)?;
-        receipt.verify_integrity().context("verify join")?;
+        let t0 = std::time::Instant::now();
+        let receipt = if self.opts.max_segment_po2 > crate::receipt::DEFAULT_MAX_PO2 {
+            let recursion_opts = ProverOpts::from_max_po2(self.opts.max_segment_po2)
+                .with_receipt_kind(ReceiptKind::Succinct);
+            join_with_opts(a, b, recursion_opts)?
+        } else {
+            join(a, b)?
+        };
+        let prove_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        if std::env::var("RISC0_SKIP_VERIFY").is_err() {
+            let t1 = std::time::Instant::now();
+            receipt.verify_integrity().context("verify join")?;
+            if *VERBOSE { eprintln!("[join] prove={prove_ms:.1}ms verify={:.1}ms", t1.elapsed().as_secs_f64() * 1000.0); }
+        } else {
+            if *VERBOSE { eprintln!("[join] prove={prove_ms:.1}ms verify=skipped"); }
+        }
         Ok(receipt)
     }
 
@@ -540,8 +583,16 @@ impl ProverServer for ProverImpl {
         conditional: &SuccinctReceipt<ReceiptClaim>,
         assumption: &SuccinctReceipt<Unknown>,
     ) -> Result<SuccinctReceipt<ReceiptClaim>> {
+        let t0 = std::time::Instant::now();
         let receipt = resolve(conditional, assumption)?;
-        receipt.verify_integrity().context("verify resolve")?;
+        let prove_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        if std::env::var("RISC0_SKIP_VERIFY").is_err() {
+            let t1 = std::time::Instant::now();
+            receipt.verify_integrity().context("verify resolve")?;
+            if *VERBOSE { eprintln!("[resolve] prove={prove_ms:.1}ms verify={:.1}ms", t1.elapsed().as_secs_f64() * 1000.0); }
+        } else {
+            if *VERBOSE { eprintln!("[resolve] prove={prove_ms:.1}ms verify=skipped"); }
+        }
         Ok(receipt)
     }
 
@@ -582,8 +633,16 @@ impl ProverServer for ProverImpl {
         a: &SuccinctReceipt<Unknown>,
         b: &SuccinctReceipt<Unknown>,
     ) -> Result<SuccinctReceipt<UnionClaim>> {
+        let t0 = std::time::Instant::now();
         let receipt = union(a, b)?;
-        receipt.verify_integrity().context("verify union")?;
+        let prove_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        if std::env::var("RISC0_SKIP_VERIFY").is_err() {
+            let t1 = std::time::Instant::now();
+            receipt.verify_integrity().context("verify union")?;
+            if *VERBOSE { eprintln!("[union] prove={prove_ms:.1}ms verify={:.1}ms", t1.elapsed().as_secs_f64() * 1000.0); }
+        } else {
+            if *VERBOSE { eprintln!("[union] prove={prove_ms:.1}ms verify=skipped"); }
+        }
         Ok(receipt)
     }
 
@@ -592,6 +651,165 @@ impl ProverServer for ProverImpl {
         a: &SuccinctReceipt<WorkClaim<ReceiptClaim>>,
     ) -> Result<SuccinctReceipt<ReceiptClaim>> {
         unwrap_povw(a)
+    }
+
+    /// Pipelined composite_to_succinct: overlaps next lift's CPU preflight with
+    /// current join's GPU work. Saves ~35ms per step (~1.5s for SHA256 100K).
+    fn composite_to_succinct(
+        &self,
+        composite_receipt: &CompositeReceipt,
+    ) -> Result<SuccinctReceipt<ReceiptClaim>> {
+        use crate::{
+            claim::merge::Merge,
+            host::recursion::prove::{
+                make_succinct_receipt, Prover as RecursionProverJob,
+            },
+        };
+
+        let t_pipeline = std::time::Instant::now();
+        let segments = &composite_receipt.segments;
+        let num_segments = segments.len();
+        let skip_verify = std::env::var("RISC0_SKIP_VERIFY").is_ok();
+        eprintln!(
+            "[composite_to_succinct] starting: {} segments, {} assumptions (pipelined)",
+            num_segments,
+            composite_receipt.assumption_receipts.len()
+        );
+
+        let mut accumulator: Option<SuccinctReceipt<ReceiptClaim>> = None;
+
+        // Use from_max_po2 opts for recursion when segment po2 > default.
+        let recursion_opts = if self.opts.max_segment_po2 > crate::receipt::DEFAULT_MAX_PO2 {
+            ProverOpts::from_max_po2(self.opts.max_segment_po2)
+                .with_receipt_kind(ReceiptKind::Succinct)
+        } else {
+            ProverOpts::succinct()
+        };
+
+        // Pipeline: while GPU runs join(N), prepare lift(N+1) preflight on background CPU thread.
+        // Lift preflight is ~35ms CPU that overlaps with join's ~115ms GPU work.
+        let mut pending_prepared_lift: Option<
+            std::thread::JoinHandle<Result<RecursionProverJob>>,
+        > = None;
+
+        for step_idx in 0..num_segments {
+            let t_step = std::time::Instant::now();
+
+            // Get the lifted receipt.
+            let lifted: SuccinctReceipt<ReceiptClaim> =
+                if let Some(handle) = pending_prepared_lift.take() {
+                    // Use the pre-prepared prover (preflight cached on background thread).
+                    let mut prover = handle
+                        .join()
+                        .map_err(|_| anyhow!("lift prepare thread panicked"))??;
+                    let receipt = prover.run()?;
+                    let claim_decoded = ReceiptClaim::decode(&mut receipt.out_stream())?;
+                    let claim = claim_decoded.merge(&segments[step_idx].claim)?;
+                    make_succinct_receipt(prover, receipt, claim)?
+                } else {
+                    // First segment: compute full lift (no pipelining available yet).
+                    lift_with_opts(&segments[step_idx], recursion_opts.clone())?
+                };
+            let lift_ms = t_step.elapsed().as_secs_f64() * 1000.0;
+
+            // Before running join, start preparing next lift in background.
+            if step_idx + 1 < num_segments {
+                // Construct the next lift Prover on main thread (borrows &SegmentReceipt).
+                let next_prover = RecursionProverJob::new_lift(
+                    &segments[step_idx + 1],
+                    recursion_opts.clone(),
+                )?;
+                // Send to background thread for CPU-only preflight computation.
+                pending_prepared_lift =
+                    Some(std::thread::spawn(move || -> Result<RecursionProverJob> {
+                        let mut p = next_prover;
+                        p.prepare()?;
+                        Ok(p)
+                    }));
+            }
+
+            // Run join on main thread (GPU) while background thread prepares next lift.
+            let result = match accumulator.take() {
+                Some(left) => {
+                    let t_join = std::time::Instant::now();
+                    let joined = join_with_opts(&left, &lifted, recursion_opts.clone())?;
+                    let join_ms = t_join.elapsed().as_secs_f64() * 1000.0;
+                    if !skip_verify {
+                        let t_v = std::time::Instant::now();
+                        joined.verify_integrity().context("verify join")?;
+                        if *VERBOSE { eprintln!(
+                            "[join] prove={join_ms:.1}ms verify={:.1}ms",
+                            t_v.elapsed().as_secs_f64() * 1000.0
+                        ); }
+                    } else {
+                        if *VERBOSE { eprintln!("[join] prove={join_ms:.1}ms verify=skipped"); }
+                    }
+                    if *VERBOSE { eprintln!(
+                        "[composite_to_succinct] step {step_idx}/{num_segments}: \
+                         lift={lift_ms:.1}ms join={join_ms:.1}ms total={:.1}ms",
+                        t_step.elapsed().as_secs_f64() * 1000.0
+                    ); }
+                    joined
+                }
+                None => {
+                    if !skip_verify {
+                        let t_v = std::time::Instant::now();
+                        lifted.verify_integrity().context("verify lift")?;
+                        if *VERBOSE { eprintln!(
+                            "[lift] prove={lift_ms:.1}ms verify={:.1}ms",
+                            t_v.elapsed().as_secs_f64() * 1000.0
+                        ); }
+                    } else {
+                        if *VERBOSE { eprintln!("[lift] prove={lift_ms:.1}ms verify=skipped"); }
+                    }
+                    if *VERBOSE { eprintln!(
+                        "[composite_to_succinct] step {step_idx}/{num_segments}: \
+                         lift={lift_ms:.1}ms (first)"
+                    ); }
+                    lifted
+                }
+            };
+            accumulator = Some(result);
+        }
+
+        eprintln!(
+            "[composite_to_succinct] lift/join done: {:.1}s",
+            t_pipeline.elapsed().as_secs_f64()
+        );
+
+        let continuation_receipt = accumulator.ok_or_else(|| {
+            anyhow!("malformed composite receipt has no continuation segment receipts")
+        })?;
+
+        // Compress assumptions and resolve them (same as generic implementation).
+        let result = composite_receipt.assumption_receipts.iter().try_fold(
+            continuation_receipt,
+            |conditional, assumption| match assumption {
+                InnerAssumptionReceipt::Succinct(assumption) => {
+                    self.resolve(&conditional, assumption)
+                }
+                InnerAssumptionReceipt::Composite(assumption) => {
+                    self.resolve(
+                        &conditional,
+                        &SuccinctReceipt::<ReceiptClaim>::into_unknown(
+                            <Self as super::Compress<_>>::composite_to_succinct(self, assumption)?,
+                        ),
+                    )
+                }
+                InnerAssumptionReceipt::Fake(_) => bail!(
+                    "compressing composite receipts with fake receipt assumptions is not supported"
+                ),
+                InnerAssumptionReceipt::Groth16(_) => bail!(
+                    "compressing composite receipts with Groth16 receipt assumptions is not supported"
+                ),
+            },
+        )?;
+
+        eprintln!(
+            "[composite_to_succinct] total: {:.1}s",
+            t_pipeline.elapsed().as_secs_f64()
+        );
+        Ok(result)
     }
 }
 

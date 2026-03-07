@@ -118,11 +118,10 @@ impl Verifier {
             .map_err(|err| anyhow!(err))?;
 
         let mut encoded_proof = Vec::new();
-        let proof = Proof::<Bn254> {
-            a: g1_from_bytes(&seal.a)?,
-            b: g2_from_bytes(&seal.b)?,
-            c: g1_from_bytes(&seal.c)?,
-        };
+        let a = g1_from_bytes(&seal.a).map_err(|e| anyhow!("g1_from_bytes(a) failed: {e}"))?;
+        let b = g2_from_bytes(&seal.b).map_err(|e| anyhow!("g2_from_bytes(b) failed: {e}"))?;
+        let c = g1_from_bytes(&seal.c).map_err(|e| anyhow!("g1_from_bytes(c) failed: {e}"))?;
+        let proof = Proof::<Bn254> { a, b, c };
         proof
             .serialize_uncompressed(&mut encoded_proof)
             .map_err(|err| anyhow!(err))?;

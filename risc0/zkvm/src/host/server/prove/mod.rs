@@ -200,9 +200,24 @@ pub trait ProverServer: private::Sealed {
         &self,
         receipt: &SuccinctReceipt<ReceiptClaim>,
     ) -> Result<Groth16Receipt<ReceiptClaim>> {
+        let t0 = std::time::Instant::now();
         let ident_receipt = self.identity_p254(receipt).unwrap();
+        let ident_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        let t1 = std::time::Instant::now();
         let seal_bytes = ident_receipt.get_seal_bytes();
+        let seal_ms = t1.elapsed().as_secs_f64() * 1000.0;
+
+        let t2 = std::time::Instant::now();
         let seal = shrink_wrap(&seal_bytes)?.to_vec();
+        let wrap_ms = t2.elapsed().as_secs_f64() * 1000.0;
+
+        eprintln!(
+            "[succinct_to_groth16] identity_p254={ident_ms:.1}ms get_seal={seal_ms:.1}ms \
+             shrink_wrap={wrap_ms:.1}ms total={:.1}ms",
+            t0.elapsed().as_secs_f64() * 1000.0,
+        );
+
         Ok(Groth16Receipt {
             seal,
             claim: receipt.claim.clone(),
@@ -360,25 +375,48 @@ where
         &self,
         composite_receipt: &CompositeReceipt,
     ) -> anyhow::Result<SuccinctReceipt<Claim>> {
+        let t_pipeline = std::time::Instant::now();
+        let num_segments = composite_receipt.segments.len();
+        eprintln!("[composite_to_succinct] starting: {} segments, {} assumptions",
+            num_segments, composite_receipt.assumption_receipts.len());
+
         // Compress all receipts in the top-level session into one succinct receipt for the session.
+        let mut step_idx = 0usize;
         let continuation_receipt = composite_receipt
             .segments
             .iter()
             .try_fold(
                 None,
                 |left: Option<SuccinctReceipt<Claim>>, right: &SegmentReceipt| -> Result<_> {
-                    Ok(Some(match left {
-                        Some(left) => self.join(&left, &self.lift(right)?)?,
-                        None => self.lift(right)?,
-                    }))
+                    let t_step = std::time::Instant::now();
+                    let lifted = self.lift(right)?;
+                    let lift_ms = t_step.elapsed().as_secs_f64() * 1000.0;
+                    let result = match left {
+                        Some(left) => {
+                            let t_join = std::time::Instant::now();
+                            let joined = self.join(&left, &lifted)?;
+                            let join_ms = t_join.elapsed().as_secs_f64() * 1000.0;
+                            eprintln!("[composite_to_succinct] step {step_idx}/{num_segments}: lift={lift_ms:.1}ms join={join_ms:.1}ms total={:.1}ms",
+                                t_step.elapsed().as_secs_f64() * 1000.0);
+                            joined
+                        }
+                        None => {
+                            eprintln!("[composite_to_succinct] step {step_idx}/{num_segments}: lift={lift_ms:.1}ms (first)");
+                            lifted
+                        }
+                    };
+                    step_idx += 1;
+                    Ok(Some(result))
                 },
             )?
             .ok_or_else(|| {
                 anyhow!("malformed composite receipt has no continuation segment receipts")
             })?;
 
+        eprintln!("[composite_to_succinct] lift/join done: {:.1}s", t_pipeline.elapsed().as_secs_f64());
+
         // Compress assumptions and resolve them to get the final succinct receipt.
-        composite_receipt.assumption_receipts.iter().try_fold(
+        let result = composite_receipt.assumption_receipts.iter().try_fold(
             continuation_receipt,
             |conditional: SuccinctReceipt<Claim>, assumption: &InnerAssumptionReceipt| match assumption {
                 InnerAssumptionReceipt::Succinct(assumption) => self.resolve(&conditional, assumption),
@@ -392,7 +430,10 @@ where
                     "compressing composite receipts with Groth16 receipt assumptions is not supported"
                 )
             },
-        )
+        )?;
+
+        eprintln!("[composite_to_succinct] total: {:.1}s", t_pipeline.elapsed().as_secs_f64());
+        Ok(result)
     }
 }
 

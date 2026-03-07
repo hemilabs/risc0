@@ -56,6 +56,7 @@ where
         circuit_hal: &C,
         zkr: &Program,
         preflight: &Preflight,
+        cached_ctrl_buffer: Option<H::Buffer<H::Elem>>,
     ) -> Result<Self> {
         scope!("witgen");
 
@@ -64,23 +65,28 @@ where
         let global = vec![BabyBearElem::INVALID; CircuitImpl::OUTPUT_SIZE];
         let global = hal.copy_from_elem("global", &global);
 
-        // Use cached transposed ctrl vector if available for this (code_rows, po2) pair.
-        let ctrl_key = (zkr.code_rows(), zkr.po2);
-        let ctrl = CTRL_CACHE.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            let ctrl_data = cache.entry(ctrl_key).or_insert_with(|| {
-                let ctrl_size = CIRCUIT.ctrl_size();
-                assert_eq!(ctrl_size, zkr.code_size);
-                let mut ctrl = vec![BabyBearElem::ZERO; total_cycles * ctrl_size];
-                for i in 0..zkr.code_rows() {
-                    for j in 0..ctrl_size {
-                        ctrl[j * total_cycles + i] = zkr.code[i * ctrl_size + j];
+        // Use pre-existing GPU ctrl buffer if provided (avoids ~24MB re-upload per proof).
+        let ctrl = if let Some(buf) = cached_ctrl_buffer {
+            buf
+        } else {
+            // Use cached transposed ctrl vector if available for this (code_rows, po2) pair.
+            let ctrl_key = (zkr.code_rows(), zkr.po2);
+            CTRL_CACHE.with(|cache| {
+                let mut cache = cache.borrow_mut();
+                let ctrl_data = cache.entry(ctrl_key).or_insert_with(|| {
+                    let ctrl_size = CIRCUIT.ctrl_size();
+                    assert_eq!(ctrl_size, zkr.code_size);
+                    let mut ctrl = vec![BabyBearElem::ZERO; total_cycles * ctrl_size];
+                    for i in 0..zkr.code_rows() {
+                        for j in 0..ctrl_size {
+                            ctrl[j * total_cycles + i] = zkr.code[i * ctrl_size + j];
+                        }
                     }
-                }
-                ctrl
-            });
-            hal.copy_from_elem("ctrl", ctrl_data)
-        });
+                    ctrl
+                });
+                hal.copy_from_elem("ctrl", ctrl_data)
+            })
+        };
 
         let data = hal.alloc_elem_init(
             "data",

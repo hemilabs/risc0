@@ -77,24 +77,31 @@ __global__ void batch_evaluate_any(
   }
 }
 
-__global__ void fri_fold(Fp* out, const Fp* in, const FpExt* mix, const uint32_t count) {
+__global__ void fri_fold(Fp* __restrict__ out,
+                         const Fp* __restrict__ in_ptr,
+                         const FpExt* __restrict__ mix,
+                         const uint32_t count) {
   uint idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < count) {
+    // Cache mix value in register to avoid repeated global memory reads
+    const FpExt mixVal = *mix;
     FpExt tot;
     FpExt curMix(1);
+    #pragma unroll
     for (uint32_t i = 0; i < kFriFold; i++) {
       size_t rev_i = __brev(i) >> (32 - log2Ceil(kFriFold));
       size_t rev_idx = rev_i * count + idx;
-      FpExt factor(in[0 * count * kFriFold + rev_idx],
-                   in[1 * count * kFriFold + rev_idx],
-                   in[2 * count * kFriFold + rev_idx],
-                   in[3 * count * kFriFold + rev_idx]);
+      FpExt factor(in_ptr[0 * count * kFriFold + rev_idx],
+                   in_ptr[1 * count * kFriFold + rev_idx],
+                   in_ptr[2 * count * kFriFold + rev_idx],
+                   in_ptr[3 * count * kFriFold + rev_idx]);
       tot += curMix * factor;
-      curMix *= *mix;
+      curMix *= mixVal;
     }
-    for (size_t i = 0; i < 4; i++) {
-      out[count * i + idx] = tot.elems[i];
-    }
+    out[count * 0 + idx] = tot.elems[0];
+    out[count * 1 + idx] = tot.elems[1];
+    out[count * 2 + idx] = tot.elems[2];
+    out[count * 3 + idx] = tot.elems[3];
   }
 }
 

@@ -29,6 +29,21 @@ use crate::Seal;
 
 pub use self::seal_to_json::to_json;
 
+/// Preload the circom graph for Groth16 witness calculation.
+/// Call on a background thread to overlap the ~728ms graph read+parse
+/// with other work (e.g. composite_to_succinct recursion proving).
+pub fn preload_graph() -> Result<()> {
+    cfg_if::cfg_if! {
+        if #[cfg(feature = "cuda")] {
+            self::cuda::preload_graph()
+        } else if #[cfg(feature = "rocm")] {
+            self::hip::preload_graph()
+        } else {
+            Ok(()) // docker mode doesn't use local graph
+        }
+    }
+}
+
 /// Produce a Groth16 proof from an `identity_p254` seal.
 pub fn shrink_wrap(identity_p254_seal_bytes: &[u8]) -> Result<Seal> {
     cfg_if::cfg_if! {

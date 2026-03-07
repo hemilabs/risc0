@@ -7200,6 +7200,7 @@ dependencies = [
  "hex",
  "num-bigint 0.4.6",
  "num-traits",
+ "rayon",
  "risc0-binfmt",
  "risc0-core",
  "risc0-groth16-sys",

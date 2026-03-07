@@ -20,6 +20,7 @@ circom-witnesscalc = { version = "0.2.1", optional = true }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 num-bigint = { version = "0.4", default-features = false }
 num-traits = { version = "0.2", default-features = false }
+rayon = { version = "1.8", optional = true }
 risc0-binfmt = { workspace = true }
 risc0-core = { workspace = true, optional = true }
 risc0-groth16-sys = { workspace = true, optional = true }
@@ -52,6 +53,7 @@ cuda = [
 ]
 rocm = [
   "dep:circom-witnesscalc",
+  "dep:rayon",
   "dep:risc0-groth16-sys",
   "dep:wtns-file",
   "prove",

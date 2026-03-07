@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::io::{Cursor, Read as _};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context as _, Result};
 
@@ -20,10 +22,47 @@ use super::Program;
 
 const ZKR_ZIP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/recursion_zkr.zip"));
 
-pub fn get_zkr(name: &str, po2: usize) -> Result<Program> {
-    let mut zip = zip::ZipArchive::new(Cursor::new(ZKR_ZIP))?;
-    let encoded = extract_zkr(&mut zip, name)?;
-    Ok(Program::from_encoded(&encoded, po2))
+/// Cache decompressed ZKR data to avoid repeated ZIP extraction.
+/// For SHA256 100K: 85 get_zkr calls (43 lifts + 42 joins), but only ~3 unique programs.
+static ZKR_ENCODED_CACHE: Mutex<Option<HashMap<String, Vec<u32>>>> = Mutex::new(None);
+
+/// Cache fully constructed Program objects keyed by (name, po2) behind Arc to avoid
+/// cloning ~24MB code vectors on each call (~2.4ms × 85 proofs = 200ms for SHA256 100K).
+static ZKR_PROGRAM_CACHE: Mutex<Option<HashMap<(String, usize), Arc<Program>>>> =
+    Mutex::new(None);
+
+pub fn get_zkr(name: &str, po2: usize) -> Result<Arc<Program>> {
+    // Check program cache first (avoids from_encoded conversion + 24MB clone).
+    {
+        let mut guard = ZKR_PROGRAM_CACHE.lock().unwrap();
+        let cache = guard.get_or_insert_with(HashMap::new);
+        let key = (name.to_string(), po2);
+        if let Some(prog) = cache.get(&key) {
+            return Ok(Arc::clone(prog));
+        }
+    }
+
+    // Fall back to encoded cache for first call with this (name, po2).
+    let program = {
+        let mut guard = ZKR_ENCODED_CACHE.lock().unwrap();
+        let cache = guard.get_or_insert_with(HashMap::new);
+        if !cache.contains_key(name) {
+            let mut zip = zip::ZipArchive::new(Cursor::new(ZKR_ZIP))?;
+            let encoded = extract_zkr(&mut zip, name)?;
+            cache.insert(name.to_string(), encoded);
+        }
+        let encoded = cache.get(name).unwrap();
+        Arc::new(Program::from_encoded(encoded, po2))
+    };
+
+    // Cache the constructed Program for subsequent calls.
+    {
+        let mut guard = ZKR_PROGRAM_CACHE.lock().unwrap();
+        let cache = guard.get_or_insert_with(HashMap::new);
+        cache.insert((name.to_string(), po2), Arc::clone(&program));
+    }
+
+    Ok(program)
 }
 
 /// Iterate over all provided zkr programs.
