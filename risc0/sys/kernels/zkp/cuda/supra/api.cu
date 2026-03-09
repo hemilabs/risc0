@@ -37,6 +37,20 @@ static int get_real_sm_count() {
     return sm_count;
 }
 
+#ifdef __HIPCC__
+// Detect wavefront size: 32 = RDNA (gfx10/11/12), 64 = CDNA (gfx9xx).
+// Used to select Poseidon2 block size matching launch_bounds.
+static int get_warp_size() {
+    static int ws = 0;
+    if (ws == 0) {
+        int device;
+        hipGetDevice(&device);
+        hipDeviceGetAttribute(&ws, hipDeviceAttributeWarpSize, device);
+    }
+    return ws;
+}
+#endif
+
 extern "C" RustError::by_value sppark_poseidon2_init() {
   static bool initialized = false;
   if (initialized)
@@ -69,7 +83,9 @@ sppark_poseidon2_fold(poseidon_out_t* d_out, const poseidon_in_t* d_in, size_t n
   const gpu_t& gpu = select_gpu();
 
 #ifdef __HIPCC__
-  const size_t P2_BLOCK = 512;
+  // RDNA (gfx12xx, wave32): 256 threads matches launch_bounds(256,3)
+  // CDNA (gfx9xx, wave64):  512 threads matches launch_bounds(512,2)
+  const size_t P2_BLOCK = (get_warp_size() >= 64) ? 512 : 256;
 #else
   const size_t P2_BLOCK = 256;
 #endif
@@ -96,7 +112,9 @@ sppark_poseidon2_fold_tree(poseidon_out_t* nodes, uint32_t layers) {
   const gpu_t& gpu = select_gpu();
 
 #ifdef __HIPCC__
-  const size_t P2_BLOCK = 512;
+  // RDNA (gfx12xx, wave32): 256 threads matches launch_bounds(256,3)
+  // CDNA (gfx9xx, wave64):  512 threads matches launch_bounds(512,2)
+  const size_t P2_BLOCK = (get_warp_size() >= 64) ? 512 : 256;
 #else
   const size_t P2_BLOCK = 256;
 #endif
@@ -128,7 +146,9 @@ sppark_poseidon2_rows(poseidon_out_t* d_out, const fr_t* d_in, uint32_t count, u
   const gpu_t& gpu = select_gpu();
 
 #ifdef __HIPCC__
-  const size_t P2_BLOCK = 512;
+  // RDNA (gfx12xx, wave32): 256 threads matches launch_bounds(256,3)
+  // CDNA (gfx9xx, wave64):  512 threads matches launch_bounds(512,2)
+  const size_t P2_BLOCK = (get_warp_size() >= 64) ? 512 : 256;
 #else
   const size_t P2_BLOCK = 256;
 #endif

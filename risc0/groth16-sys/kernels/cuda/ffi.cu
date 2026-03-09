@@ -1,5 +1,7 @@
 #include <cstring>
 #include <iostream>
+#include <memory>
+#include <mutex>
 
 #define FEATURE_BN254
 
@@ -151,21 +153,55 @@ struct ProveParams {
   const fr_t* witness;
 };
 
+// Cached SRS + prover to avoid reloading ~200MB of point data and
+// reinitializing GPU memory on every Groth16 prove call.
+// Preloaded on a background thread via risc0_groth16_cuda_preload().
+static std::unique_ptr<SRS> cached_srs;
+static std::unique_ptr<groth16_prover> cached_prover;
+static std::mutex cached_mutex;
+
+extern "C" const char* risc0_groth16_cuda_preload(SetupParams* setup_params) {
+  try {
+    std::lock_guard<std::mutex> lock(cached_mutex);
+    if (!cached_srs) {
+      cached_srs = std::make_unique<SRS>(0, setup_params->srs_path);
+    }
+    if (!cached_prover) {
+      cached_prover = std::make_unique<groth16_prover>(
+          *cached_srs, setup_params->pcoeffs_path, setup_params->fres_path);
+    }
+  } catch (const std::exception& err) {
+    return strdup(err.what());
+  }
+  return nullptr;
+}
+
 extern "C" const char* risc0_groth16_cuda_prove(SetupParams* setup_params,
                                                 ProveParams* prover_params) {
 
   try {
     // Release cached async memory pool allocations from prior GPU work (e.g.
     // STARK proving) so that the Groth16 prover has enough VRAM.
+    // Only needed on first call (before SRS/prover are cached).
     {
-      cudaMemPool_t pool;
-      if (cudaDeviceGetDefaultMemPool(&pool, 0) == cudaSuccess)
-        cudaMemPoolTrimTo(pool, 0);
+      std::lock_guard<std::mutex> lock(cached_mutex);
+      if (!cached_prover) {
+        cudaMemPool_t pool;
+        if (cudaDeviceGetDefaultMemPool(&pool, 0) == cudaSuccess)
+          cudaMemPoolTrimTo(pool, 0);
+      }
+
+      if (!cached_srs) {
+        cached_srs = std::make_unique<SRS>(0, setup_params->srs_path);
+      }
+      if (!cached_prover) {
+        cached_prover = std::make_unique<groth16_prover>(
+            *cached_srs, setup_params->pcoeffs_path, setup_params->fres_path);
+      }
     }
 
-    SRS srs(0, setup_params->srs_path);
-    groth16_prover prover(srs, setup_params->pcoeffs_path, setup_params->fres_path);
-    groth16_proof proof = prover.prove(prover_params->public_path, prover_params->witness);
+    groth16_proof proof = cached_prover->prove(
+        prover_params->public_path, prover_params->witness);
     write_proof_file(prover_params->proof_path, proof);
   } catch (const std::exception& err) {
     return strdup(err.what());

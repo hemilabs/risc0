@@ -51,22 +51,18 @@ struct ExecContext {
   size_t cycle;
 };
 
-// Non-virtual buffer object. Eliminates virtual dispatch to prevent
-// .uses_dynamic_stack on AMD GPUs and enables full inlining of load/store.
 struct BufferObj {
-  bool isGlobal;
-  Buffer buf;
-  Buffer preDataBuf;
-  size_t zeroBack;
+  __device__ virtual Val load(ExecContext& ctx, size_t col, size_t back) = 0;
+  __device__ virtual void store(ExecContext& ctx, size_t col, Val val) = 0;
+};
 
-  __device__ BufferObj()
-      : isGlobal(false), buf{nullptr, 0, 0, false},
-        preDataBuf{nullptr, 0, 0, false}, zeroBack(0) {}
+struct MutableBufObj : public BufferObj {
+  __device__ MutableBufObj(Buffer& buf, size_t zeroBack = 0)
+      : buf(buf), preDataBuf{nullptr, 0, 0, false}, zeroBack(zeroBack) {}
+  __device__ MutableBufObj(Buffer& buf, Buffer preDataBuf, size_t zeroBack = 0)
+      : buf(buf), preDataBuf(preDataBuf), zeroBack(zeroBack) {}
 
-  __device__ Val load(ExecContext& ctx, size_t col, size_t back) {
-    if (isGlobal) {
-      return buf.get(0, col);
-    }
+  __device__ Val load(ExecContext& ctx, size_t col, size_t back) override {
     if (zeroBack && col > zeroBack && back > 0) {
       return 0;
     }
@@ -77,39 +73,29 @@ struct BufferObj {
     return buf.get(backRow, col);
   }
 
-  __device__ void store(ExecContext& ctx, size_t col, Val val) {
-    if (isGlobal) {
-      buf.set(0, col, val);
-    } else {
-      buf.set(ctx.cycle, col, val);
-    }
+  __device__ void store(ExecContext& ctx, size_t col, Val val) override {
+    buf.set(ctx.cycle, col, val);
   }
-};
 
-struct MutableBufObj : BufferObj {
-  __device__ MutableBufObj(Buffer& buf_, size_t zeroBack_ = 0) {
-    isGlobal = false;
-    buf = buf_;
-    preDataBuf = {nullptr, 0, 0, false};
-    zeroBack = zeroBack_;
-  }
-  __device__ MutableBufObj(Buffer& buf_, Buffer preDataBuf_, size_t zeroBack_ = 0) {
-    isGlobal = false;
-    buf = buf_;
-    preDataBuf = preDataBuf_;
-    zeroBack = zeroBack_;
-  }
+  Buffer& buf;
+  Buffer preDataBuf;
+  size_t zeroBack;
 };
 
 using MutableBuf = MutableBufObj*;
 
-struct GlobalBufObj : BufferObj {
-  __device__ GlobalBufObj(Buffer& buf_) {
-    isGlobal = true;
-    buf = buf_;
-    preDataBuf = {nullptr, 0, 0, false};
-    zeroBack = 0;
+struct GlobalBufObj : public BufferObj {
+  __device__ GlobalBufObj(Buffer& buf) : buf(buf) {}
+
+  __device__ Val load(ExecContext& ctx, size_t col, size_t back) override {
+    return buf.get(0, col);
   }
+
+  __device__ void store(ExecContext& ctx, size_t col, Val val) override {
+    buf.set(0, col, val);
+  }
+
+  Buffer& buf;
 };
 
 using GlobalBuf = GlobalBufObj*;
@@ -186,11 +172,11 @@ __device__ inline void store(ExecContext& ctx, BoundLayout<Reg> reg, Val val) {
 }
 
 __device__ inline void set(ExecContext& ctx, BufferObj* buf, size_t offset, Val val) {
-  buf->store(ctx, offset, val);
+  static_cast<MutableBufObj*>(buf)->store(ctx, offset, val);
 }
 
 __device__ inline void setGlobal(ExecContext& ctx, BufferObj* buf, size_t offset, Val val) {
-  buf->store(ctx, offset, val);
+  static_cast<GlobalBufObj*>(buf)->store(ctx, offset, val);
 }
 
 __device__ inline void storeExt(ExecContext& ctx, BoundLayout<Reg> reg, ExtVal val) {
@@ -212,11 +198,11 @@ __device__ inline ExtVal loadExt(ExecContext& ctx, BoundLayout<Reg> reg, size_t 
 }
 
 __device__ inline Val get(ExecContext& ctx, BufferObj* buf, size_t offset, size_t back) {
-  return buf->load(ctx, offset, back);
+  return static_cast<MutableBufObj*>(buf)->load(ctx, offset, back);
 }
 
 __device__ inline Val getGlobal(ExecContext& ctx, BufferObj* buf, size_t offset) {
-  return buf->load(ctx, offset, 0);
+  return static_cast<GlobalBufObj*>(buf)->load(ctx, offset, 0);
 }
 
 #define LOAD(reg, back) load(ctx, reg, back)

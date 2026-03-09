@@ -164,10 +164,11 @@ __device__ __forceinline__ void poseidon2_mix(fr_t cells[CELLS]) {
 
 } // namespace poseidon2
 
-#ifdef __HIPCC__
-// MI300X (CDNA3, gfx942): 512 VGPRs/SIMD, ~50 VGPRs/thread for Poseidon2.
-// 512 threads = 8 wavefronts/block × 2 blocks/CU = 16 wavefronts/CU (40% occ)
-// vs 256 threads × 3 = 12 wavefronts/CU (30% occ).
+#if defined(__HIPCC__) && defined(__GFX12__)
+// RDNA4 (gfx1201): 256 threads × 3 blocks/CU optimal (avoids VGPR spilling)
+__launch_bounds__(256, 3)
+#elif defined(__HIPCC__)
+// CDNA3 (gfx942): 512 threads × 2 blocks/CU for higher occupancy
 __launch_bounds__(512, 2)
 #else
 __launch_bounds__(256, 3)
@@ -198,7 +199,9 @@ __global__
   output[gid] = tmp;
 }
 
-#ifdef __HIPCC__
+#if defined(__HIPCC__) && defined(__GFX12__)
+__launch_bounds__(256, 3)
+#elif defined(__HIPCC__)
 __launch_bounds__(512, 2)
 #else
 __launch_bounds__(256, 3)

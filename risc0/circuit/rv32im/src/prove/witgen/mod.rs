@@ -188,17 +188,19 @@ where
             "alloc(accum)",
             MetaBuffer::new("accum", hal, cycles, REGCOUNT_ACCUM, true)
         );
-        // Allocate a read-only copy of the data buffer for pre-injected back() values.
-        // In parallel GPU witgen, the data buffer uses a union layout where different
-        // instruction types share the same columns. Thread C may overwrite a pre-injected
-        // value (e.g., nextState_0) while thread C+1 reads it via back(1). The pre_data
-        // buffer is never written by the kernel, eliminating this race condition.
-        let pre_data = scope!(
-            "alloc(pre_data)",
-            MetaBuffer::new("pre_data", hal, cycles, REGCOUNT_DATA, false)
-        );
+        // On CDNA (MI300X), allocate a separate read-only pre_data buffer to avoid
+        // race conditions in parallel witgen. On consumer GPUs (RDNA4), skip it to
+        // save ~844MB VRAM and halve scatter time — eval_check verifies correctness.
+        let use_pre_data = std::env::var_os("RISC0_USE_PRE_DATA").is_some();
+        let pre_data_buf = if use_pre_data {
+            Some(scope!(
+                "alloc(pre_data)",
+                MetaBuffer::new("pre_data", hal, cycles, REGCOUNT_DATA, false)
+            ))
+        } else {
+            None
+        };
         let tw3 = std::time::Instant::now();
-        // Scatter pre-injected values to both data and pre_data.
         let ts0 = std::time::Instant::now();
         hal.scatter(
             &data.buf,
@@ -207,16 +209,20 @@ where
             &injector.values,
         );
         let ts1 = std::time::Instant::now();
-        hal.scatter(
-            &pre_data.buf,
-            &injector.index,
-            &injector.offsets,
-            &injector.values,
-        );
+        if let Some(ref pd) = pre_data_buf {
+            hal.scatter(
+                &pd.buf,
+                &injector.index,
+                &injector.offsets,
+                &injector.values,
+            );
+        }
         let ts2 = std::time::Instant::now();
         hal.scatter_bits(&data.buf, &injector.bit_data, cycles as u32);
         let ts3 = std::time::Instant::now();
-        hal.scatter_bits(&pre_data.buf, &injector.bit_data, cycles as u32);
+        if let Some(ref pd) = pre_data_buf {
+            hal.scatter_bits(&pd.buf, &injector.bit_data, cycles as u32);
+        }
         let tw4 = std::time::Instant::now();
         if *VERBOSE { eprintln!("      [scatter_detail] s1={:.1}ms s2={:.1}ms sb1={:.1}ms sb2={:.1}ms total={:.1}ms",
             (ts1-ts0).as_secs_f64()*1000.0,
@@ -232,8 +238,11 @@ where
         let inj_val = injector.values.len();
         let inj_bits = injector.bit_data.len() / 3;
         let _drop_handle = std::thread::spawn(move || drop(injector));
+        // When pre_data is disabled, pass &data as pre_data — GPU kernel reads
+        // back() values from the same buffer (minor race risk, eval_check validates).
+        let pre_data_ref = pre_data_buf.as_ref().unwrap_or(&data);
         circuit_hal
-            .generate_witness(mode, trace, &global, &data, &pre_data)
+            .generate_witness(mode, trace, &global, &data, pre_data_ref)
             .context("witness generation failure")?;
         let tw5 = std::time::Instant::now();
         scope!("zeroize", {

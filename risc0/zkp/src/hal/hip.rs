@@ -329,9 +329,13 @@ impl RawBuffer {
         let buf = BUFFER_POOL
             .with(|pool| pool.borrow_mut().pop(size))
             .unwrap_or_else(|| {
-                HipDeviceBuffer::uninitialized(size)
-                    .context(format!("allocation failed on {name}: {size} bytes"))
-                    .unwrap()
+                HipDeviceBuffer::uninitialized(size).unwrap_or_else(|_| {
+                    // OOM: clear the buffer pool to free cached GPU memory and retry.
+                    clear_buffer_pool();
+                    HipDeviceBuffer::uninitialized(size)
+                        .context(format!("allocation failed on {name}: {size} bytes"))
+                        .unwrap()
+                })
             });
         Self {
             name,
@@ -766,20 +770,16 @@ impl<HH: HipHash + ?Sized> Hal for HipHal<HH> {
         assert_eq!(row_size * count, io.size());
         let bits = log2_ceil(row_size);
         assert_eq!(row_size, 1 << bits);
-        let io_size = io.size();
 
-        extern "C" {
-            fn risc0_zkp_cuda_batch_bit_reverse(
-                io: DevicePointer<u8>,
-                bits: u32,
-                count: u32,
-            ) -> *const std::os::raw::c_char;
+        // Sync persistent stream before sppark operates on the buffer.
+        Self::sync_stream();
+
+        let err = unsafe {
+            sppark_batch_bit_reverse(io.as_device_ptr(), bits as u32, count as u32)
+        };
+        if err.code != 0 {
+            panic!("Failure during sppark_batch_bit_reverse: {err}");
         }
-
-        ffi_wrap(|| unsafe {
-            risc0_zkp_cuda_batch_bit_reverse(io.as_device_ptr(), bits as u32, io_size as u32)
-        })
-        .unwrap();
     }
 
     fn batch_evaluate_any(

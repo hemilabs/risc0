@@ -443,6 +443,7 @@ fn hip_compile_single(
 ///   1. Host code compiled once (`--offload-host-only`).
 ///   2. Device code compiled per-arch in parallel (`--offload-device-only`).
 ///   3. Results merged with `clang-offload-bundler`.
+#[allow(dead_code)]
 fn hip_compile_parallel(
     hipcc: &str,
     flags: &[&str],
@@ -558,6 +559,7 @@ fn hip_compile_parallel(
 }
 
 /// Locate `clang-offload-bundler`, searching ROCm paths and hipcc's neighbourhood.
+#[allow(dead_code)]
 fn find_offload_bundler(hipcc: &str) -> String {
     // 1. Explicit env var.
     if let Ok(path) = env::var("CLANG_OFFLOAD_BUNDLER") {

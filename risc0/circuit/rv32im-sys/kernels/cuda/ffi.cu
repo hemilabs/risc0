@@ -324,7 +324,9 @@ divide_rv32im(uint32_t numer, uint32_t denom, uint32_t signType) {
 
 __device__ ::cuda::std::array<Val, 5> extern_getMemoryTxn(ExecContext& ctx, Val addrElem) {
   uint32_t addr = addrElem.asUInt32();
-  size_t txnIdx = atomicAdd(&ctx.preflight.cycles[ctx.cycle].txnIdx, 1u);
+  // Plain post-increment: each thread handles exactly one cycle, so no
+  // contention. atomicAdd is unnecessary and expensive on RDNA4.
+  size_t txnIdx = ctx.preflight.cycles[ctx.cycle].txnIdx++;
   const MemoryTransaction& txn = ctx.preflight.txns[txnIdx];
 
   // Assertions removed: in parallel witgen, union layout overwrites can cause
@@ -434,8 +436,14 @@ __device__ void nextStep(DeviceExecContext* ctx, uint32_t cycle) {
   ExecContext execCtx(*ctx->preflight, *ctx->tables, cycle);
   Buffer dataBuf = *ctx->data;
   Buffer preDataBuf = *ctx->pre_data;
+  // When pre_data points to same memory as data, null it out to eliminate
+  // the per-load preDataBuf branch (one check per cycle vs thousands per cycle).
+  if (preDataBuf.buf == dataBuf.buf) {
+    preDataBuf.buf = nullptr;
+  }
   MutableBufObj data(dataBuf, preDataBuf);
-  GlobalBufObj global(*ctx->global);
+  Buffer globalBuf = *ctx->global;
+  GlobalBufObj global(globalBuf);
   step_Top(execCtx, &data, &global);
 }
 
@@ -469,10 +477,14 @@ __global__ void stepAccum(DeviceAccumContext* ctx, uint32_t count) {
   }
 
   ExecContext execCtx(*ctx->preflight, *ctx->tables, cycle);
-  MutableBufObj data(*ctx->data);
-  MutableBufObj accum(*ctx->accum, /*zeroBack=*/kUserAccumSplit);
-  GlobalBufObj mix(*ctx->mix);
-  GlobalBufObj global(*ctx->global);
+  Buffer dataBuf = *ctx->data;
+  MutableBufObj data(dataBuf);
+  Buffer accumBuf = *ctx->accum;
+  MutableBufObj accum(accumBuf, /*zeroBack=*/kUserAccumSplit);
+  Buffer mixBuf = *ctx->mix;
+  GlobalBufObj mix(mixBuf);
+  Buffer globalBuf = *ctx->global;
+  GlobalBufObj global(globalBuf);
   step_TopAccum(execCtx, &accum, &data, &global, &mix);
 }
 
@@ -574,20 +586,25 @@ const char* risc0_circuit_rv32im_cuda_accum(AccumBuffers* buffers,
 
       size_t rows = buffers->accum.rows;
 #ifdef __HIPCC__
-      // Pre-allocate temp storage once for all 4 column scans
+      // Cached temp storage for hipcub scans (avoids hipMallocAsync per segment)
       {
         size_t col0 = buffers->accum.cols - 4;
         Fp* itFirst = buffers->accum.buf + col0 * rows;
         size_t n = lastCycle;
         size_t temp_bytes = 0;
         hipcub::DeviceScan::InclusiveScan(nullptr, temp_bytes, itFirst, itFirst, AddOp(), n, stream);
-        void* d_temp = nullptr;
-        CUDA_OK(hipMallocAsync(&d_temp, temp_bytes, stream));
+
+        static void* s_scan_temp = nullptr;
+        static size_t s_scan_temp_bytes = 0;
+        if (temp_bytes > s_scan_temp_bytes) {
+          if (s_scan_temp) CUDA_OK(hipFree(s_scan_temp));
+          CUDA_OK(hipMalloc(&s_scan_temp, temp_bytes));
+          s_scan_temp_bytes = temp_bytes;
+        }
         for (size_t j = 0; j < 4; j++) {
           Fp* itBegin = buffers->accum.buf + (col0 + j) * rows;
-          hipcub::DeviceScan::InclusiveScan(d_temp, temp_bytes, itBegin, itBegin, AddOp(), n, stream);
+          hipcub::DeviceScan::InclusiveScan(s_scan_temp, temp_bytes, itBegin, itBegin, AddOp(), n, stream);
         }
-        CUDA_OK(hipFreeAsync(d_temp, stream));
       }
 #else
       for (size_t j = 0; j < 4; j++) {

@@ -67,6 +67,16 @@ impl ProverParams {
 }
 
 #[cfg(any(feature = "cuda", feature = "rocm"))]
+pub fn preload(setup_params: &SetupParams) -> anyhow::Result<()> {
+    let setup_params = RawSetupParams {
+        pcoeffs_path: setup_params.pcoeffs_path.c_str.as_ptr(),
+        fres_path: setup_params.fres_path.c_str.as_ptr(),
+        srs_path: setup_params.srs_path.c_str.as_ptr(),
+    };
+    ffi_wrap(|| unsafe { risc0_groth16_cuda_preload(&setup_params) })
+}
+
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 pub fn prove(prover_params: &ProverParams, setup_params: &SetupParams) -> anyhow::Result<()> {
     let setup_params = RawSetupParams {
         pcoeffs_path: setup_params.pcoeffs_path.c_str.as_ptr(),
@@ -113,6 +123,11 @@ extern "C" {
     fn risc0_groth16_cuda_prove(
         setup: *const RawSetupParams,
         params: *const RawProverParams,
+    ) -> *const c_char;
+
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    fn risc0_groth16_cuda_preload(
+        setup: *const RawSetupParams,
     ) -> *const c_char;
 
     #[cfg(all(any(feature = "cuda", feature = "rocm"), feature = "setup"))]

@@ -36,9 +36,10 @@ use crate::{ProofJson, Seal};
 
 use super::seal_format::{IopType, K_SEAL_ELEMS, K_SEAL_TYPES, K_SEAL_WORDS};
 
-/// Preload and cache the circom graph for witness calculation.
-/// Call this early (e.g. on a background thread) to overlap the ~728ms
-/// graph read+parse with other work (like composite_to_succinct).
+/// Preload and cache the circom graph for witness calculation, plus
+/// preload the SRS and prover on the GPU.
+/// Call this early (e.g. on a background thread) to overlap the ~1.2s graph
+/// read+parse and ~1.2s SRS load with segment proving.
 pub(crate) fn preload_graph() -> Result<()> {
     let root_dir = Rzup::new()
         .context("failed to initialize rzup")?
@@ -137,18 +138,35 @@ pub(crate) fn shrink_wrap(seal_bytes: &[u8]) -> Result<Seal> {
     let iop_values = seal_to_u254_values(seal_bytes)?;
     let seal_convert_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
+    // Clear STARK buffer pool and start SRS/prover preloading on GPU,
+    // then compute the circom witness on CPU in parallel (~2s CPU overlaps ~1.2s GPU).
+    let t0 = std::time::Instant::now();
+    {
+        let _lock = risc0_zkp::hal::hip::singleton().lock();
+        risc0_zkp::hal::hip::clear_buffer_pool();
+    }
+    let clear_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    // Start SRS preloading on background thread (GPU work, ~1.2s)
+    let setup_params_clone = SetupParams::new(&root_dir)
+        .context("failed to create groth16 setup params for preload")?;
+    let preload_handle = std::thread::spawn(move || {
+        risc0_groth16_sys::preload(&setup_params_clone)
+    });
+
+    // Compute circom witness on CPU (~2s) — overlaps with SRS preload
     let witness_params = WitnessParams::new(&root_dir);
     let witness = calc_witness_binary(&witness_params.graph_path, iop_values)
         .context("failed to calculate groth16 witness")?;
 
+    // Wait for SRS preload to finish
+    preload_handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("SRS preload thread panicked"))?
+        .context("SRS preload failed")?;
+
     {
         let _lock = risc0_zkp::hal::hip::singleton().lock();
-
-        // Release cached GPU buffers from the STARK/recursion prover so the
-        // Groth16 prover (which uses sppark's own allocator) has enough VRAM.
-        let t0 = std::time::Instant::now();
-        risc0_zkp::hal::hip::clear_buffer_pool();
-        let clear_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         let prover_params = ProverParams::new(work_dir, witness.as_ptr())
             .context("failed to create groth16 prover parameters")?;

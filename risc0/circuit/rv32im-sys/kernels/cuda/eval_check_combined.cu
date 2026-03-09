@@ -17,8 +17,15 @@ namespace risc0::circuit::rv32im_v2::cuda {
 
 // poly_mix is defined in eval_check.cuh (included by eval_check_0.cu)
 
+#ifdef __HIPCC__
+// RDNA4: 128 threads reduces scratch working set → better cache reuse
+#ifndef EVAL_CHECK_THREADS
+#define EVAL_CHECK_THREADS 128
+#endif
+#else
 #ifndef EVAL_CHECK_THREADS
 #define EVAL_CHECK_THREADS 256
+#endif
 #endif
 
 // Diagnostic kernel: write poly_mix[0..3] and data samples to check[0..15]
@@ -168,9 +175,8 @@ const char* risc0_circuit_rv32im_cuda_eval_check(Fp* check,
 // Wait for eval_check to complete before reading check_poly.
 // Uses cudaDeviceSynchronize() because eval_check runs on its own stream
 // (getEvalCheckStream) while downstream operations (iNTT via sppark, Merkle
-// via risc0-sys) run on separate streams. Each library's getPersistentStream()
-// is a static-local in its own TU, so stream-based cudaStreamWaitEvent would
-// only sync one stream. cudaDeviceSynchronize() ensures ALL streams are drained.
+// via risc0-sys) run on separate streams. cudaDeviceSynchronize() ensures
+// ALL streams are drained.
 const char* risc0_circuit_rv32im_cuda_eval_check_dep() {
   try {
     CUDA_OK(cudaDeviceSynchronize());

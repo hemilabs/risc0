@@ -64,7 +64,7 @@ fn build_rocm_kernels() {
     let arches = risc0_build_kernel::hip_arches();
     let mut base_flags: Vec<&str> = vec![
         "-x", "hip",
-        "-std=c++17", "-O2", "-fPIC",
+        "-std=c++17", "-O3", "-fPIC",
         "-Wno-unused-function", "-Wno-unused-parameter", "-Wno-missing-braces",
         "-mllvm", "-amdgpu-early-inline-all=false",
         "-include", &include_cuda2hip,

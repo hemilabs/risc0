@@ -171,7 +171,6 @@ sppark_batch_iNTT(fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly_count) {
   const gpu_t& gpu = select_gpu();
 
   try {
-    // Single batched iNTT call processes all columns in parallel
     NTT::Base_dev_ptr_batch(gpu,
                             d_inout,
                             lg_domain_size,
@@ -271,6 +270,34 @@ sppark_batch_expand_NTT(fr_t* d_out, fr_t* d_in,
                             NTT::Direction::forward,
                             NTT::Type::standard,
                             poly_count, ext_domain_size);
+
+    gpu.sync_zero();
+  } catch (const cuda_error& e) {
+    gpu.sync_zero();
+    return RustError{e.code(), e.what()};
+  } catch (...) {
+    return RustError(cudaErrorUnknown, "Generic exception");
+  }
+
+  return RustError{cudaSuccess};
+}
+
+// Batched bit-reverse permutation on the sppark stream.
+// Uses sppark's optimized bit_rev (shared memory + Z_COUNT blocking) per polynomial.
+extern "C" RustError::by_value
+sppark_batch_bit_reverse(fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly_count) {
+  if (lg_domain_size == 0 || poly_count == 0)
+    return RustError{cudaSuccess};
+
+  uint64_t domain_size = 1ULL << lg_domain_size;
+
+  const gpu_t& gpu = select_gpu();
+
+  try {
+    for (uint32_t i = 0; i < poly_count; i++) {
+      NTT::bit_rev(&d_inout[i * domain_size], &d_inout[i * domain_size],
+                    lg_domain_size, gpu);
+    }
 
     gpu.sync_zero();
   } catch (const cuda_error& e) {

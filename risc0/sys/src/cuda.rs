@@ -74,6 +74,12 @@ extern "C" {
         poly_count: u32,
     ) -> sppark::Error;
 
+    pub fn sppark_batch_bit_reverse(
+        d_inout: DevicePointer<u8>,
+        lg_domain_size: u32,
+        poly_count: u32,
+    ) -> sppark::Error;
+
     pub fn sppark_batch_expand_NTT(
         d_out: DevicePointer<u8>,
         d_in: DevicePointer<u8>,

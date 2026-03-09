@@ -25,13 +25,11 @@ struct Buffer {
   bool checked;  // retained for FFI layout compatibility
 
   __device__ void set(size_t row, size_t col, Fp val) {
-    volatile uint32_t* p = reinterpret_cast<volatile uint32_t*>(&buf[col * rows + row]);
-    *p = val.asRaw();
+    buf[col * rows + row] = val;
   }
 
   __device__ Fp get(size_t row, size_t col) {
-    volatile uint32_t* p = reinterpret_cast<volatile uint32_t*>(&buf[col * rows + row]);
-    return Fp::fromRaw(*p);
+    return buf[col * rows + row];
   }
 };
 
