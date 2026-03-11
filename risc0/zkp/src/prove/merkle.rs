@@ -27,8 +27,8 @@ use crate::{
 pub struct MerkleTreeProver<H: Hal> {
     params: MerkleTreeParams,
 
-    // The retained matrix of values
-    matrix: H::Buffer<H::Elem>,
+    // The retained matrix of values (Option to allow releasing for VRAM savings)
+    pub(crate) matrix: Option<H::Buffer<H::Elem>>,
 
     // A heap style array where node N has children 2*N and 2*N+1.  The size of
     // this buffer is (1 << (layers + 1)) and begins at offset 1 (zero is unused
@@ -54,8 +54,26 @@ impl<H: Hal> Clone for MerkleTreeProver<H> {
             nodes: self.nodes.clone(),
             root: self.root,
             sample_buf: self.sample_buf.clone(),
-            cached_top_nodes: self.cached_top_nodes.clone(), // Rc bump — shares cache
+            cached_top_nodes: self.cached_top_nodes.clone(),
         }
+    }
+}
+
+impl<H: Hal> MerkleTreeProver<H> {
+    /// Release the matrix buffer to free GPU memory.
+    /// After this, batch_prove will panic unless set_matrix() is called first.
+    pub fn release_matrix(&mut self) {
+        self.matrix = None;
+    }
+
+    /// Set the matrix buffer (e.g., after reconstructing evaluated from coefficients).
+    pub fn set_matrix(&mut self, matrix: H::Buffer<H::Elem>) {
+        self.matrix = Some(matrix);
+    }
+
+    /// Check if the matrix is present.
+    pub fn matrix_is_some(&self) -> bool {
+        self.matrix.is_some()
     }
 }
 
@@ -97,7 +115,7 @@ impl<H: Hal> MerkleTreeProver<H> {
         };
         MerkleTreeProver {
             params,
-            matrix: matrix.clone(),
+            matrix: Some(matrix.clone()),
             nodes,
             root,
             sample_buf,
@@ -140,9 +158,10 @@ impl<H: Hal> MerkleTreeProver<H> {
     /// wrong row is specified.
     pub fn prove(&self, hal: &H, iop: &mut WriteIOP<H::Field>, idx: usize) -> Vec<H::Elem> {
         assert!(idx < self.params.row_size);
+        let matrix = self.matrix.as_ref().expect("matrix released; call set_matrix() first");
         let mut out = Vec::with_capacity(self.params.col_size);
         if hal.has_unified_memory() {
-            self.matrix.view(|view| {
+            matrix.view(|view| {
                 for i in 0..self.params.col_size {
                     out.push(view[idx + i * self.params.row_size]);
                 }
@@ -150,7 +169,7 @@ impl<H: Hal> MerkleTreeProver<H> {
         } else if let Some(ref sample) = self.sample_buf {
             hal.gather_sample(
                 sample,
-                &self.matrix,
+                matrix,
                 idx,
                 self.params.col_size,
                 self.params.row_size,
@@ -184,12 +203,13 @@ impl<H: Hal> MerkleTreeProver<H> {
         if n == 0 {
             return Vec::new();
         }
+        let matrix = self.matrix.as_ref().expect("matrix released; call set_matrix() first");
         let col_size = self.params.col_size;
 
         // Collect column data for all queries
         let mut all_col_data: Vec<Vec<H::Elem>> = Vec::with_capacity(n);
         if hal.has_unified_memory() {
-            self.matrix.view(|view| {
+            matrix.view(|view| {
                 for &idx in indices {
                     assert!(idx < self.params.row_size);
                     let mut out = Vec::with_capacity(col_size);
@@ -206,7 +226,7 @@ impl<H: Hal> MerkleTreeProver<H> {
                 assert!(idx < self.params.row_size);
                 hal.gather_sample(
                     &batch_buf.slice(i * col_size, col_size),
-                    &self.matrix,
+                    matrix,
                     idx,
                     col_size,
                     self.params.row_size,

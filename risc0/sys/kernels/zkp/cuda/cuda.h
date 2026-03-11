@@ -78,24 +78,26 @@ struct LaunchConfig {
 };
 
 inline cudaStream_t getPersistentStream() {
-  static cudaStream_t stream = nullptr;
-  if (!stream) {
-    CUDA_OK(cudaStreamCreate(&stream));
+  int device = 0;
+  cudaGetDevice(&device);
+  static cudaStream_t streams[16] = {};
+  if (!streams[device]) {
+    CUDA_OK(cudaStreamCreate(&streams[device]));
   }
-  return stream;
+  return streams[device];
 }
 
 inline LaunchConfig getCachedSimpleConfig(uint32_t count) {
-  static int block = 0;
-  if (block == 0) {
-    int device;
-    CUDA_OK(cudaGetDevice(&device));
+  int device = 0;
+  cudaGetDevice(&device);
+  static int blocks[16] = {};
+  if (blocks[device] == 0) {
     int maxThreads;
     CUDA_OK(cudaDeviceGetAttribute(&maxThreads, cudaDevAttrMaxThreadsPerBlock, device));
-    block = maxThreads / 4;
+    blocks[device] = maxThreads / 4;
   }
-  int grid = (count + block - 1) / block;
-  return LaunchConfig{grid, block, 0};
+  int grid = (count + blocks[device] - 1) / blocks[device];
+  return LaunchConfig{grid, blocks[device], 0};
 }
 
 // Backward-compat alias used by circuit ffi files

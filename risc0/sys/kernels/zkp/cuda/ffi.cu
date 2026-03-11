@@ -191,16 +191,18 @@ const char* risc0_zkp_cuda_scatter_from_host(Fp* into,
                                              uint32_t count) {
   try {
     cudaStream_t stream = getPersistentStream();
+    int dev = 0;
+    cudaGetDevice(&dev);
 
-    // Persistent device buffers (grow-only, reused across segments).
-    static uint32_t* d_index = nullptr;
-    static uint32_t* d_offsets = nullptr;
-    static Fp* d_values = nullptr;
-    static size_t cap_d_index = 0, cap_d_offsets = 0, cap_d_values = 0;
+    // Per-device persistent device buffers (grow-only, reused across segments).
+    static uint32_t* d_index[16] = {};
+    static uint32_t* d_offsets[16] = {};
+    static Fp* d_values[16] = {};
+    static size_t cap_d_index[16] = {}, cap_d_offsets[16] = {}, cap_d_values[16] = {};
 
-    // Persistent pinned host staging buffers (grow-only).
-    static void* h_pinned = nullptr;
-    static size_t cap_h_pinned = 0;
+    // Per-device persistent pinned host staging buffers (grow-only).
+    static void* h_pinned[16] = {};
+    static size_t cap_h_pinned[16] = {};
 
     size_t index_bytes = index_count * sizeof(uint32_t);
     size_t offsets_bytes = offsets_count * sizeof(uint32_t);
@@ -208,47 +210,47 @@ const char* risc0_zkp_cuda_scatter_from_host(Fp* into,
     size_t total_bytes = index_bytes + offsets_bytes + values_bytes;
 
     // Grow device buffers if needed.
-    if (index_bytes > cap_d_index) {
-      if (d_index) CUDA_OK(cudaFree(d_index));
-      CUDA_OK(cudaMalloc(&d_index, index_bytes));
-      cap_d_index = index_bytes;
+    if (index_bytes > cap_d_index[dev]) {
+      if (d_index[dev]) CUDA_OK(cudaFree(d_index[dev]));
+      CUDA_OK(cudaMalloc(&d_index[dev], index_bytes));
+      cap_d_index[dev] = index_bytes;
     }
-    if (offsets_bytes > cap_d_offsets) {
-      if (d_offsets) CUDA_OK(cudaFree(d_offsets));
-      CUDA_OK(cudaMalloc(&d_offsets, offsets_bytes));
-      cap_d_offsets = offsets_bytes;
+    if (offsets_bytes > cap_d_offsets[dev]) {
+      if (d_offsets[dev]) CUDA_OK(cudaFree(d_offsets[dev]));
+      CUDA_OK(cudaMalloc(&d_offsets[dev], offsets_bytes));
+      cap_d_offsets[dev] = offsets_bytes;
     }
-    if (values_bytes > cap_d_values) {
-      if (d_values) CUDA_OK(cudaFree(d_values));
-      CUDA_OK(cudaMalloc(&d_values, values_bytes));
-      cap_d_values = values_bytes;
+    if (values_bytes > cap_d_values[dev]) {
+      if (d_values[dev]) CUDA_OK(cudaFree(d_values[dev]));
+      CUDA_OK(cudaMalloc(&d_values[dev], values_bytes));
+      cap_d_values[dev] = values_bytes;
     }
 
     // Grow pinned host staging buffer if needed.
-    if (total_bytes > cap_h_pinned) {
-      if (h_pinned) CUDA_OK(cudaFreeHost(h_pinned));
-      CUDA_OK(cudaHostAlloc(&h_pinned, total_bytes, cudaHostAllocDefault));
-      cap_h_pinned = total_bytes;
+    if (total_bytes > cap_h_pinned[dev]) {
+      if (h_pinned[dev]) CUDA_OK(cudaFreeHost(h_pinned[dev]));
+      CUDA_OK(cudaHostAlloc(&h_pinned[dev], total_bytes, cudaHostAllocDefault));
+      cap_h_pinned[dev] = total_bytes;
     }
 
     // Copy to pinned staging buffer (fast CPU memcpy).
-    char* pin = (char*)h_pinned;
+    char* pin = (char*)h_pinned[dev];
     memcpy(pin, h_index, index_bytes);
     memcpy(pin + index_bytes, h_offsets, offsets_bytes);
     memcpy(pin + index_bytes + offsets_bytes, h_values, values_bytes);
 
     // Truly async H2D transfers from pinned memory.
-    CUDA_OK(cudaMemcpyAsync(d_index, pin, index_bytes,
+    CUDA_OK(cudaMemcpyAsync(d_index[dev], pin, index_bytes,
                             cudaMemcpyHostToDevice, stream));
-    CUDA_OK(cudaMemcpyAsync(d_offsets, pin + index_bytes, offsets_bytes,
+    CUDA_OK(cudaMemcpyAsync(d_offsets[dev], pin + index_bytes, offsets_bytes,
                             cudaMemcpyHostToDevice, stream));
-    CUDA_OK(cudaMemcpyAsync(d_values, pin + index_bytes + offsets_bytes, values_bytes,
+    CUDA_OK(cudaMemcpyAsync(d_values[dev], pin + index_bytes + offsets_bytes, values_bytes,
                             cudaMemcpyHostToDevice, stream));
 
     // Launch scatter kernel on same stream (waits for DMA implicitly).
     LaunchConfig cfg = getCachedSimpleConfig(count);
     scatter<<<cfg.grid, cfg.block, 0, stream>>>(
-        into, d_index, d_offsets, d_values, count);
+        into, d_index[dev], d_offsets[dev], d_values[dev], count);
 
   } catch (const std::exception& err) {
     return strdup(err.what());
@@ -265,39 +267,41 @@ const char* risc0_zkp_cuda_scatter_bits_from_host(Fp* into,
                                                   uint32_t cycles) {
   try {
     cudaStream_t stream = getPersistentStream();
+    int dev = 0;
+    cudaGetDevice(&dev);
 
-    // Persistent device buffer (grow-only, reused across segments).
-    static uint32_t* d_bitdata = nullptr;
-    static size_t cap_d_bitdata = 0;
+    // Per-device persistent device buffer (grow-only, reused across segments).
+    static uint32_t* d_bitdata[16] = {};
+    static size_t cap_d_bitdata[16] = {};
 
-    // Persistent pinned host staging buffer (grow-only).
-    static void* h_pinned_bits = nullptr;
-    static size_t cap_h_pinned_bits = 0;
+    // Per-device persistent pinned host staging buffer (grow-only).
+    static void* h_pinned_bits[16] = {};
+    static size_t cap_h_pinned_bits[16] = {};
 
     size_t data_bytes = (size_t)triplet_count * 3 * sizeof(uint32_t);
 
-    if (data_bytes > cap_d_bitdata) {
-      if (d_bitdata) CUDA_OK(cudaFree(d_bitdata));
-      CUDA_OK(cudaMalloc(&d_bitdata, data_bytes));
-      cap_d_bitdata = data_bytes;
+    if (data_bytes > cap_d_bitdata[dev]) {
+      if (d_bitdata[dev]) CUDA_OK(cudaFree(d_bitdata[dev]));
+      CUDA_OK(cudaMalloc(&d_bitdata[dev], data_bytes));
+      cap_d_bitdata[dev] = data_bytes;
     }
 
     // Grow pinned host staging buffer if needed.
-    if (data_bytes > cap_h_pinned_bits) {
-      if (h_pinned_bits) CUDA_OK(cudaFreeHost(h_pinned_bits));
-      CUDA_OK(cudaHostAlloc(&h_pinned_bits, data_bytes, cudaHostAllocDefault));
-      cap_h_pinned_bits = data_bytes;
+    if (data_bytes > cap_h_pinned_bits[dev]) {
+      if (h_pinned_bits[dev]) CUDA_OK(cudaFreeHost(h_pinned_bits[dev]));
+      CUDA_OK(cudaHostAlloc(&h_pinned_bits[dev], data_bytes, cudaHostAllocDefault));
+      cap_h_pinned_bits[dev] = data_bytes;
     }
 
     // Copy to pinned staging and do truly async H2D.
-    memcpy(h_pinned_bits, h_data, data_bytes);
-    CUDA_OK(cudaMemcpyAsync(d_bitdata, h_pinned_bits, data_bytes,
+    memcpy(h_pinned_bits[dev], h_data, data_bytes);
+    CUDA_OK(cudaMemcpyAsync(d_bitdata[dev], h_pinned_bits[dev], data_bytes,
                             cudaMemcpyHostToDevice, stream));
 
     // Launch scatter_bits kernel on same stream.
     LaunchConfig cfg = getCachedSimpleConfig(triplet_count);
     scatter_bits<<<cfg.grid, cfg.block, 0, stream>>>(
-        into, d_bitdata, cycles, triplet_count);
+        into, d_bitdata[dev], cycles, triplet_count);
 
   } catch (const std::exception& err) {
     return strdup(err.what());

@@ -28,35 +28,37 @@ void _poseidon254_rows(bn254_t*, const fr_t*, size_t, uint32_t) {}
 // the correct value. Cache the correct SM count for use in cooperative
 // kernel launches.
 static int get_real_sm_count() {
-    static int sm_count = 0;
-    if (sm_count == 0) {
-        int device;
-        cudaGetDevice(&device);
-        cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device);
+    int device = 0;
+    cudaGetDevice(&device);
+    static int sm_counts[16] = {};
+    if (sm_counts[device] == 0) {
+        cudaDeviceGetAttribute(&sm_counts[device], cudaDevAttrMultiProcessorCount, device);
     }
-    return sm_count;
+    return sm_counts[device];
 }
 
 #ifdef __HIPCC__
 // Detect wavefront size: 32 = RDNA (gfx10/11/12), 64 = CDNA (gfx9xx).
 // Used to select Poseidon2 block size matching launch_bounds.
 static int get_warp_size() {
-    static int ws = 0;
-    if (ws == 0) {
-        int device;
-        hipGetDevice(&device);
-        hipDeviceGetAttribute(&ws, hipDeviceAttributeWarpSize, device);
+    int device = 0;
+    hipGetDevice(&device);
+    static int ws[16] = {};
+    if (ws[device] == 0) {
+        hipDeviceGetAttribute(&ws[device], hipDeviceAttributeWarpSize, device);
     }
-    return ws;
+    return ws[device];
 }
 #endif
 
 extern "C" RustError::by_value sppark_poseidon2_init() {
-  static bool initialized = false;
-  if (initialized)
+  int device = 0;
+  cudaGetDevice(&device);
+  static bool initialized[16] = {};
+  if (initialized[device])
     return RustError{cudaSuccess};
 
-  const gpu_t& gpu = select_gpu();
+  const gpu_t& gpu = select_gpu(-1);
   try {
     // Allocate tiny device buffer and run 1-hash poseidon2_fold to trigger
     // CUDA module loading for poseidon2 kernels (~5-10ms first-use overhead).
@@ -74,13 +76,13 @@ extern "C" RustError::by_value sppark_poseidon2_init() {
     gpu.sync();
     return RustError{e.code(), e.what()};
   }
-  initialized = true;
+  initialized[device] = true;
   return RustError{cudaSuccess};
 }
 
 extern "C" RustError::by_value
 sppark_poseidon2_fold(poseidon_out_t* d_out, const poseidon_in_t* d_in, size_t num_hashes) {
-  const gpu_t& gpu = select_gpu();
+  const gpu_t& gpu = select_gpu(-1);
 
 #ifdef __HIPCC__
   // RDNA (gfx12xx, wave32): 256 threads matches launch_bounds(256,3)
@@ -109,7 +111,7 @@ sppark_poseidon2_fold(poseidon_out_t* d_out, const poseidon_in_t* d_in, size_t n
 
 extern "C" RustError::by_value
 sppark_poseidon2_fold_tree(poseidon_out_t* nodes, uint32_t layers) {
-  const gpu_t& gpu = select_gpu();
+  const gpu_t& gpu = select_gpu(-1);
 
 #ifdef __HIPCC__
   // RDNA (gfx12xx, wave32): 256 threads matches launch_bounds(256,3)
@@ -143,7 +145,7 @@ sppark_poseidon2_fold_tree(poseidon_out_t* nodes, uint32_t layers) {
 
 extern "C" RustError::by_value
 sppark_poseidon2_rows(poseidon_out_t* d_out, const fr_t* d_in, uint32_t count, uint32_t col_size) {
-  const gpu_t& gpu = select_gpu();
+  const gpu_t& gpu = select_gpu(-1);
 
 #ifdef __HIPCC__
   // RDNA (gfx12xx, wave32): 256 threads matches launch_bounds(256,3)
@@ -203,7 +205,7 @@ static void compute_grid_block_size(size_t total_count, size_t& block_size, size
 
 extern "C" RustError::by_value
 sppark_poseidon254_fold(alt_bn128::fr_t* d_out, const alt_bn128::fr_t* d_in, size_t num_hashes) {
-  const gpu_t& gpu = select_gpu();
+  const gpu_t& gpu = select_gpu(-1);
 
   size_t block_size = 512;
   size_t num_blocks = gpu.sm_count();
@@ -227,7 +229,7 @@ sppark_poseidon254_fold(alt_bn128::fr_t* d_out, const alt_bn128::fr_t* d_in, siz
 
 extern "C" RustError::by_value
 sppark_poseidon254_fold_tree(alt_bn128::fr_t* nodes, uint32_t layers) {
-  const gpu_t& gpu = select_gpu();
+  const gpu_t& gpu = select_gpu(-1);
 
   size_t block_size = 512;
   size_t num_blocks = gpu.sm_count();
@@ -257,7 +259,7 @@ sppark_poseidon254_fold_tree(alt_bn128::fr_t* nodes, uint32_t layers) {
 
 extern "C" RustError::by_value
 sppark_poseidon254_rows(alt_bn128::fr_t* d_out, const fr_t* d_in, size_t count, uint32_t col_size) {
-  const gpu_t& gpu = select_gpu();
+  const gpu_t& gpu = select_gpu(-1);
 
   size_t block_size = 512;
   size_t num_blocks = gpu.sm_count();
@@ -280,7 +282,7 @@ sppark_poseidon254_rows(alt_bn128::fr_t* d_out, const fr_t* d_in, size_t count, 
 }
 
 extern "C" RustError::by_value sppark_prefix_product(fr4_t d_inout[/*count*/], uint32_t count) {
-  const gpu_t& gpu = select_gpu();
+  const gpu_t& gpu = select_gpu(-1);
 
   try {
     prefix_op<Multiply<fr4_t>>(d_inout, count, gpu);
@@ -295,7 +297,7 @@ extern "C" RustError::by_value sppark_prefix_product(fr4_t d_inout[/*count*/], u
 
 extern "C" RustError::by_value
 supra_poly_divide(fr4_t d_inout[/*len*/], size_t len, fr4_t* remainder, const fr4_t& pow) {
-  const gpu_t& gpu = select_gpu();
+  const gpu_t& gpu = select_gpu(-1);
 
   try {
     div_by_x_minus_z<true>(d_inout, len, pow, gpu, get_real_sm_count());
@@ -313,7 +315,7 @@ extern "C" RustError::by_value
 supra_poly_divide_batch(fr4_t d_inout[/*len*/], size_t len,
                         fr4_t* remainders, const fr4_t pows[],
                         uint32_t num_divides) {
-  const gpu_t& gpu = select_gpu();
+  const gpu_t& gpu = select_gpu(-1);
   int sm_count = get_real_sm_count();
 
   try {
@@ -340,7 +342,7 @@ supra_poly_divide_multi(fr4_t* combos_base, size_t stride,
                         const uint32_t pows_per_combo[],
                         const uint32_t all_pows_raw[],
                         uint32_t num_combos) {
-  const gpu_t& gpu = select_gpu();
+  const gpu_t& gpu = select_gpu(-1);
   int sm_count = get_real_sm_count();
   const fr4_t* all_pows = reinterpret_cast<const fr4_t*>(all_pows_raw);
 

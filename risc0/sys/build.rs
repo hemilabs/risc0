@@ -77,7 +77,7 @@ fn build_rocm_kernels(cxx_root: &Path) {
 
     env::set_var("HIP_PLATFORM", "amd");
 
-    let hipcc = env::var("HIPCC").unwrap_or_else(|_| "hipcc".to_string());
+    let hipcc = risc0_build_kernel::find_hipcc();
 
     let mut build = cc::Build::new();
     build
@@ -112,12 +112,7 @@ fn build_rocm_kernels(cxx_root: &Path) {
         .compile("risc0_zkp_cuda");
 
     // Link against HIP runtime
-    if let Ok(hip_path) = env::var("HIP_PATH") {
-        println!("cargo:rustc-link-search=native={}/lib", hip_path);
-    } else if std::path::Path::new("/opt/rocm/lib").exists() {
-        println!("cargo:rustc-link-search=native=/opt/rocm/lib");
-    }
-    println!("cargo:rustc-link-lib=amdhip64");
+    risc0_build_kernel::emit_rocm_lib_link();
 }
 
 fn build_metal_kernels() {

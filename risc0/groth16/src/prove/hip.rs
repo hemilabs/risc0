@@ -138,12 +138,17 @@ pub(crate) fn shrink_wrap(seal_bytes: &[u8]) -> Result<Seal> {
     let iop_values = seal_to_u254_values(seal_bytes)?;
     let seal_convert_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-    // Clear STARK buffer pool and start SRS/prover preloading on GPU,
-    // then compute the circom witness on CPU in parallel (~2s CPU overlaps ~1.2s GPU).
+    // RISC0_GROTH16_DEVICE overrides groth16 device. Otherwise device 0.
+    let groth16_device: i32 = std::env::var("RISC0_GROTH16_DEVICE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     let t0 = std::time::Instant::now();
-    {
+    if groth16_device == 0 {
         let _lock = risc0_zkp::hal::hip::singleton().lock();
         risc0_zkp::hal::hip::clear_buffer_pool();
+    } else {
+        risc0_zkp::hal::hip::switch_to_device(groth16_device);
     }
     let clear_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
@@ -151,6 +156,7 @@ pub(crate) fn shrink_wrap(seal_bytes: &[u8]) -> Result<Seal> {
     let setup_params_clone = SetupParams::new(&root_dir)
         .context("failed to create groth16 setup params for preload")?;
     let preload_handle = std::thread::spawn(move || {
+        risc0_zkp::hal::hip::switch_to_device(groth16_device);
         risc0_groth16_sys::preload(&setup_params_clone)
     });
 
@@ -166,7 +172,7 @@ pub(crate) fn shrink_wrap(seal_bytes: &[u8]) -> Result<Seal> {
         .context("SRS preload failed")?;
 
     {
-        let _lock = risc0_zkp::hal::hip::singleton().lock();
+        let _lock = risc0_zkp::hal::hip::singleton_for_device(groth16_device).lock();
 
         let prover_params = ProverParams::new(work_dir, witness.as_ptr())
             .context("failed to create groth16 prover parameters")?;
@@ -183,7 +189,7 @@ pub(crate) fn shrink_wrap(seal_bytes: &[u8]) -> Result<Seal> {
         eprintln!(
             "[groth16_shrink_wrap] rzup={setup_ms:.1}ms seal_convert={seal_convert_ms:.1}ms \
              clear_pool={clear_ms:.1}ms gpu_prove={prove_ms:.1}ms read_proof={read_ms:.1}ms \
-             total={:.1}ms",
+             device={groth16_device} total={:.1}ms",
             t_total.elapsed().as_secs_f64() * 1000.0,
         );
 

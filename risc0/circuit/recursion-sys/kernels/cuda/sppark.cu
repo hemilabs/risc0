@@ -19,7 +19,7 @@
 namespace sppark {
 
 void calcPrefixProducts(void* d_inout, uint32_t count) {
-  const gpu_t& gpu = select_gpu();
+  const gpu_t& gpu = select_gpu(-1);
   prefix_op<Multiply<fr4_t>>(static_cast<fr4_t*>(d_inout), count, gpu);
   gpu.sync();
 }

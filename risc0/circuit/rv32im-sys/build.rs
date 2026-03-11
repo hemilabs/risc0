@@ -184,7 +184,8 @@ fn build_cuda_kernels() {
 
     // Step 3: Add standalone objects to the archive.
     let archive = out_dir.join(format!("lib{output}.a"));
-    let status = Command::new("ar")
+    let ar = risc0_build_kernel::find_ar_tool();
+    let status = Command::new(&ar)
         .arg("rcs")
         .arg(&archive)
         .arg(&eval_check_obj)
@@ -220,7 +221,7 @@ fn build_rocm_kernels() {
     let cuda_root = env::var("DEP_RISC0_SYS_CUDA_ROOT").unwrap();
     let cxx_root = env::var("DEP_RISC0_SYS_CXX_ROOT").unwrap();
     let sppark_root = env::var("DEP_SPPARK_ROOT").unwrap();
-    let hipcc = env::var("HIPCC").unwrap_or_else(|_| "hipcc".to_string());
+    let hipcc = risc0_build_kernel::find_hipcc();
 
     // Step 1: Compile eval_check_combined.cu standalone with hipcc.
     // -mllvm -amdgpu-early-inline-all=false prevents OOM on this large kernel
@@ -417,7 +418,8 @@ fn build_rocm_kernels() {
     // Step 3: Archive all objects
     let archive = out_dir.join(format!("lib{output}.a"));
     let _ = std::fs::remove_file(&archive);
-    let mut ar_cmd = Command::new("ar");
+    let ar = risc0_build_kernel::find_ar_tool();
+    let mut ar_cmd = Command::new(&ar);
     ar_cmd.arg("rcs").arg(&archive);
     for obj in &all_objs {
         ar_cmd.arg(obj);
@@ -429,12 +431,7 @@ fn build_rocm_kernels() {
     println!("cargo:rustc-link-lib=static={output}");
 
     // Link against HIP runtime
-    if let Ok(hip_path) = env::var("HIP_PATH") {
-        println!("cargo:rustc-link-search=native={}/lib", hip_path);
-    } else if std::path::Path::new("/opt/rocm/lib").exists() {
-        println!("cargo:rustc-link-search=native=/opt/rocm/lib");
-    }
-    println!("cargo:rustc-link-lib=amdhip64");
+    risc0_build_kernel::emit_rocm_lib_link();
 }
 
 fn rerun_if_changed<P: AsRef<Path>>(path: P) {

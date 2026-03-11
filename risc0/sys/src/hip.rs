@@ -39,7 +39,10 @@ extern "C" {
     pub fn hipMemset(dst: *mut c_void, value: c_int, size: usize) -> c_int;
     pub fn hipMemsetD32(dst: *mut c_void, value: c_int, count: usize) -> c_int;
 
+    pub fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> c_int;
+
     pub fn hipGetErrorString(error: c_int) -> *const std::os::raw::c_char;
+    pub fn hipGetLastError() -> c_int;
 }
 
 /// Check a HIP return code and panic with the error string if it failed.

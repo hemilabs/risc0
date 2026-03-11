@@ -79,10 +79,10 @@ pub fn segment_prover() -> Result<Box<dyn SegmentProver>> {
 #[cfg(feature = "rocm")]
 pub fn rocm_warmup() {
     use risc0_sys::ffi_wrap;
-    // Initialize HIP runtime and select device 0.
+    // Initialize HIP runtime and select the thread's device.
     unsafe {
         risc0_sys::hip::hipInit(0);
-        risc0_sys::hip::hipSetDevice(0);
+        risc0_sys::hip::hipSetDevice(risc0_zkp::hal::hip::get_device_for_thread());
     }
     // Warmup rv32im circuit kernels (par_stepExec, stepAccum, finalizeAccum, eval_check).
     // The C function names are the same regardless of CUDA or HIP compilation.

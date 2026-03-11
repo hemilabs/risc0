@@ -289,7 +289,13 @@ struct DeviceCache {
   }
 };
 
-static DeviceCache g_cache;
+static DeviceCache g_cache[16];
+
+static inline DeviceCache& get_cache() {
+  int dev = 0;
+  cudaGetDevice(&dev);
+  return g_cache[dev];
+}
 
 __device__ ::cuda::std::array<uint32_t, 2>
 divide_rv32im(uint32_t numer, uint32_t denom, uint32_t signType) {
@@ -527,7 +533,7 @@ const char* risc0_circuit_rv32im_cuda_witgen(uint32_t mode,
   try {
     cudaStream_t stream = getPersistentStream();
     auto t0 = std::chrono::steady_clock::now();
-    DeviceExecContext* d_ctx = g_cache.setup_exec(buffers, preflight, lastCycle, stream);
+    DeviceExecContext* d_ctx = get_cache().setup_exec(buffers, preflight, lastCycle, stream);
     auto t1 = std::chrono::steady_clock::now();
     size_t split = preflight->tableSplitCycle;
 
@@ -547,7 +553,7 @@ const char* risc0_circuit_rv32im_cuda_witgen(uint32_t mode,
       // Sequential modes don't need pre_data (no cross-thread race).
       // Null it out so MutableBufObj falls through to the mutable data buffer.
       Buffer nullBuf = {nullptr, 0, 0, false};
-      CUDA_OK(cudaMemcpyAsync(g_cache.d_exec_pre_data, &nullBuf, sizeof(Buffer),
+      CUDA_OK(cudaMemcpyAsync(get_cache().d_exec_pre_data, &nullBuf, sizeof(Buffer),
                                cudaMemcpyHostToDevice, stream));
       if (mode == kStepModeSeqForward) {
         fwd_stepExec<<<1, 1, 0, stream>>>(d_ctx, lastCycle);
@@ -576,7 +582,7 @@ const char* risc0_circuit_rv32im_cuda_accum(AccumBuffers* buffers,
     cudaStream_t stream = getPersistentStream();
 
     auto t0 = std::chrono::steady_clock::now();
-    DeviceAccumContext* d_ctx = g_cache.setup_accum(buffers, preflight, lastCycle, stream);
+    DeviceAccumContext* d_ctx = get_cache().setup_accum(buffers, preflight, lastCycle, stream);
     auto t1 = std::chrono::steady_clock::now();
     auto cfg = getSimpleConfig(lastCycle);
 
@@ -594,16 +600,18 @@ const char* risc0_circuit_rv32im_cuda_accum(AccumBuffers* buffers,
         size_t temp_bytes = 0;
         hipcub::DeviceScan::InclusiveScan(nullptr, temp_bytes, itFirst, itFirst, AddOp(), n, stream);
 
-        static void* s_scan_temp = nullptr;
-        static size_t s_scan_temp_bytes = 0;
-        if (temp_bytes > s_scan_temp_bytes) {
-          if (s_scan_temp) CUDA_OK(hipFree(s_scan_temp));
-          CUDA_OK(hipMalloc(&s_scan_temp, temp_bytes));
-          s_scan_temp_bytes = temp_bytes;
+        int scan_dev = 0;
+        cudaGetDevice(&scan_dev);
+        static void* s_scan_temp[16] = {};
+        static size_t s_scan_temp_bytes[16] = {};
+        if (temp_bytes > s_scan_temp_bytes[scan_dev]) {
+          if (s_scan_temp[scan_dev]) CUDA_OK(hipFree(s_scan_temp[scan_dev]));
+          CUDA_OK(hipMalloc(&s_scan_temp[scan_dev], temp_bytes));
+          s_scan_temp_bytes[scan_dev] = temp_bytes;
         }
         for (size_t j = 0; j < 4; j++) {
           Fp* itBegin = buffers->accum.buf + (col0 + j) * rows;
-          hipcub::DeviceScan::InclusiveScan(s_scan_temp, temp_bytes, itBegin, itBegin, AddOp(), n, stream);
+          hipcub::DeviceScan::InclusiveScan(s_scan_temp[scan_dev], temp_bytes, itBegin, itBegin, AddOp(), n, stream);
         }
       }
 #else

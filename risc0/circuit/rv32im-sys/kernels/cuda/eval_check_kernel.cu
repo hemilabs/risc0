@@ -81,19 +81,23 @@ using namespace risc0::circuit::rv32im_v2::cuda;
 // eval_check uses only ~6% of GPU wave slots (128 out of 2048), so 94% of
 // compute resources remain available for concurrent work.
 static cudaStream_t getEvalCheckStream() {
-  static cudaStream_t stream = nullptr;
-  if (!stream) {
-    CUDA_OK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+  int dev = 0;
+  cudaGetDevice(&dev);
+  static cudaStream_t streams[16] = {};
+  if (!streams[dev]) {
+    CUDA_OK(cudaStreamCreateWithFlags(&streams[dev], cudaStreamNonBlocking));
   }
-  return stream;
+  return streams[dev];
 }
 
 static cudaEvent_t getEvalCheckEvent() {
-  static cudaEvent_t event = nullptr;
-  if (!event) {
-    CUDA_OK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+  int dev = 0;
+  cudaGetDevice(&dev);
+  static cudaEvent_t events[16] = {};
+  if (!events[dev]) {
+    CUDA_OK(cudaEventCreateWithFlags(&events[dev], cudaEventDisableTiming));
   }
-  return event;
+  return events[dev];
 }
 
 extern "C" {
@@ -130,14 +134,19 @@ const char* risc0_circuit_rv32im_cuda_eval_check(Fp* check,
       cudaFuncSetCacheConfig((const void*)eval_check, cudaFuncCachePreferL1);
       cacheConfigSet = true;
     }
-    // Copy poly_mix_pows to __constant__ memory on eval_check stream
+    // Copy poly_mix_pows to __constant__ memory on eval_check stream.
+    // The caller's host buffer (poly_mix_pows) may be freed before this
+    // async copy executes (it's queued behind an event wait).  Stage into
+    // a persistent host buffer so the source stays valid.
 #ifdef __HIPCC__
     // HIP: hipMemcpyToSymbol doesn't work reliably without -fgpu-rdc.
     // Use hipGetSymbolAddress + hipMemcpyAsync instead.
     {
+      static char poly_mix_staging[sizeof(poly_mix)];
+      memcpy(poly_mix_staging, poly_mix_pows, sizeof(poly_mix));
       void* dev_ptr = nullptr;
       CUDA_OK(hipGetSymbolAddress(&dev_ptr, HIP_SYMBOL(poly_mix)));
-      CUDA_OK(hipMemcpyAsync(dev_ptr, poly_mix_pows, sizeof(poly_mix),
+      CUDA_OK(hipMemcpyAsync(dev_ptr, poly_mix_staging, sizeof(poly_mix),
                               hipMemcpyHostToDevice, stream));
     }
 #else

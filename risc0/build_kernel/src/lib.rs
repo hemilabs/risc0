@@ -374,8 +374,117 @@ fn rerun_if_changed<P: AsRef<Path>>(path: P) {
 }
 
 // ---------------------------------------------------------------------------
-// HIP multi-arch parallel compilation
+// HIP build utilities (cross-platform: Linux + Windows)
 // ---------------------------------------------------------------------------
+
+/// Find the hipcc compiler, handling Windows HIP SDK quirks.
+///
+/// On Windows, the HIP SDK ships `hipcc` as a Perl wrapper script and
+/// `hipcc.bin.exe` as the actual compiler driver. This function checks
+/// `HIPCC` env var first, then tries `hipcc.bin.exe` on Windows (avoids
+/// Perl dependency), then falls back to `hipcc` on PATH.
+pub fn find_hipcc() -> String {
+    if let Ok(hipcc) = env::var("HIPCC") {
+        return hipcc;
+    }
+
+    if cfg!(target_os = "windows") {
+        // Try hipcc.bin.exe from HIP_PATH (avoids Perl dependency)
+        if let Ok(hip_path) = env::var("HIP_PATH") {
+            let candidate = PathBuf::from(&hip_path).join("bin").join("hipcc.bin.exe");
+            if candidate.exists() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+        // Try standard Windows ROCm install paths
+        if let Some(candidate) = find_in_windows_rocm("bin", "hipcc.bin.exe") {
+            return candidate;
+        }
+    }
+
+    "hipcc".to_string()
+}
+
+/// Find a platform-appropriate static archive tool (`ar` / `llvm-ar`).
+///
+/// On Windows, GNU `ar` is typically not available. This function looks for
+/// `llvm-ar` in the HIP SDK installation and on PATH.
+/// On Unix, returns `ar`.
+///
+/// Respects the `AR` environment variable.
+pub fn find_ar_tool() -> String {
+    if let Ok(ar) = env::var("AR") {
+        return ar;
+    }
+
+    if cfg!(target_os = "windows") {
+        // Try llvm-ar from HIP SDK
+        if let Ok(hip_path) = env::var("HIP_PATH") {
+            for subdir in &["bin", "llvm/bin"] {
+                let candidate = PathBuf::from(&hip_path).join(subdir).join("llvm-ar.exe");
+                if candidate.exists() {
+                    return candidate.to_string_lossy().into_owned();
+                }
+            }
+        }
+        // Try standard Windows ROCm install paths
+        for subdir in &["bin", "llvm\\bin"] {
+            if let Some(candidate) = find_in_windows_rocm(subdir, "llvm-ar.exe") {
+                return candidate;
+            }
+        }
+        // Fall back to llvm-ar on PATH (better chance than ar on Windows)
+        return "llvm-ar".to_string();
+    }
+
+    "ar".to_string()
+}
+
+/// Emit `cargo:rustc-link-search` for the HIP runtime library directory.
+///
+/// Checks `HIP_PATH` env var first, then platform-specific default locations
+/// (`/opt/rocm/lib` on Linux, `C:\Program Files\AMD\ROCm\<ver>\lib` on Windows).
+pub fn emit_rocm_lib_link() {
+    if let Ok(hip_path) = env::var("HIP_PATH") {
+        println!("cargo:rustc-link-search=native={}/lib", hip_path);
+    } else if cfg!(target_os = "windows") {
+        if let Some(lib_path) = find_in_windows_rocm("lib", "amdhip64.lib") {
+            // Return the directory, not the file
+            let p = PathBuf::from(&lib_path);
+            if let Some(parent) = p.parent() {
+                println!("cargo:rustc-link-search=native={}", parent.display());
+            }
+        }
+    } else if Path::new("/opt/rocm/lib").exists() {
+        println!("cargo:rustc-link-search=native=/opt/rocm/lib");
+    }
+    println!("cargo:rustc-link-lib=amdhip64");
+}
+
+/// Search Windows standard ROCm install paths for a file.
+///
+/// Looks in `C:\Program Files\AMD\ROCm\<version>\<subdir>\<filename>`,
+/// trying the latest version first.
+fn find_in_windows_rocm(subdir: &str, filename: &str) -> Option<String> {
+    let program_files = env::var("ProgramFiles")
+        .unwrap_or_else(|_| r"C:\Program Files".to_string());
+    let rocm_dir = PathBuf::from(&program_files).join("AMD").join("ROCm");
+    if let Ok(entries) = fs::read_dir(&rocm_dir) {
+        let mut versions: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .collect();
+        versions.sort();
+        // Try latest version first
+        for ver in versions.iter().rev() {
+            let candidate = ver.join(subdir).join(filename);
+            if candidate.exists() {
+                return Some(candidate.to_string_lossy().into_owned());
+            }
+        }
+    }
+    None
+}
 
 /// Resolve `RISC0_HIP_ARCH` from the environment, defaulting to `"native"`.
 pub fn hip_arches() -> String {
@@ -532,7 +641,14 @@ fn hip_compile_parallel(
 
     // Host input first.
     cmd.arg(format!("-input={}", host_obj.display()));
-    let mut targets = "host-x86_64-unknown-linux-gnu".to_string();
+    let host_triple = if cfg!(target_os = "windows") {
+        "host-x86_64-pc-windows-msvc"
+    } else if cfg!(target_os = "macos") {
+        "host-x86_64-apple-darwin"
+    } else {
+        "host-x86_64-unknown-linux-gnu"
+    };
+    let mut targets = host_triple.to_string();
 
     // Device inputs.
     for (arch, dev_obj) in arch_list.iter().zip(&dev_objs) {
@@ -561,25 +677,46 @@ fn hip_compile_parallel(
 /// Locate `clang-offload-bundler`, searching ROCm paths and hipcc's neighbourhood.
 #[allow(dead_code)]
 fn find_offload_bundler(hipcc: &str) -> String {
+    let exe_name = if cfg!(target_os = "windows") {
+        "clang-offload-bundler.exe"
+    } else {
+        "clang-offload-bundler"
+    };
+
     // 1. Explicit env var.
     if let Ok(path) = env::var("CLANG_OFFLOAD_BUNDLER") {
         return path;
     }
 
-    // 2. Standard ROCm install.
-    let rocm_path = "/opt/rocm/llvm/bin/clang-offload-bundler";
-    if Path::new(rocm_path).is_file() {
-        return rocm_path.to_string();
+    // 2. Platform-specific standard install paths.
+    if cfg!(target_os = "windows") {
+        // Windows: check HIP SDK paths
+        if let Ok(hip_path) = env::var("HIP_PATH") {
+            for subdir in &["bin", "llvm/bin"] {
+                let candidate = PathBuf::from(&hip_path).join(subdir).join(exe_name);
+                if candidate.is_file() {
+                    return candidate.to_string_lossy().into_owned();
+                }
+            }
+        }
+        if let Some(path) = find_in_windows_rocm("llvm\\bin", exe_name) {
+            return path;
+        }
+    } else {
+        let rocm_path = "/opt/rocm/llvm/bin/clang-offload-bundler";
+        if Path::new(rocm_path).is_file() {
+            return rocm_path.to_string();
+        }
     }
 
     // 3. Adjacent to hipcc.
     if let Ok(resolved) = fs::canonicalize(hipcc) {
         if let Some(bin_dir) = resolved.parent() {
-            // hipcc is usually in /opt/rocm/bin/ ; bundler in /opt/rocm/llvm/bin/
-            let candidate = bin_dir.join("../llvm/bin/clang-offload-bundler");
+            // hipcc is usually in <rocm>/bin/ ; bundler in <rocm>/llvm/bin/
+            let candidate = bin_dir.join("../llvm/bin").join(exe_name);
             if let Ok(canon) = fs::canonicalize(&candidate) {
                 if canon.is_file() {
-                    return canon.to_string_lossy().to_string();
+                    return canon.to_string_lossy().into_owned();
                 }
             }
         }

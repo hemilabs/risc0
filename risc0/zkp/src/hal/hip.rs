@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     fmt::Debug,
     marker::PhantomData,
@@ -35,7 +35,7 @@ use risc0_sys::{
     cuda::{DevicePointer, *},
     ffi_wrap,
     hip::{
-        hip_check, hipDeviceGetAttribute, hipInit, hipSetDevice,
+        hip_check, hipDeviceGetAttribute, hipGetDeviceCount, hipInit, hipSetDevice,
         HipDeviceBuffer, HIP_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
     },
 };
@@ -97,6 +97,51 @@ impl BufferPool {
 
 thread_local! {
     static BUFFER_POOL: RefCell<BufferPool> = RefCell::new(BufferPool::new());
+    /// Which HIP device this thread should use (default 0).
+    static THREAD_DEVICE: Cell<i32> = Cell::new(0);
+}
+
+/// Set the HIP device ID for the current thread.
+/// Must be called BEFORE creating any HipHal instance on this thread.
+pub fn set_device_for_thread(device_id: i32) {
+    THREAD_DEVICE.with(|d| d.set(device_id));
+}
+
+/// Switch the current thread to a different HIP device.
+/// Calls both the Rust thread-local and the HIP runtime hipSetDevice.
+pub fn switch_to_device(device_id: i32) {
+    set_device_for_thread(device_id);
+    hip_check(unsafe { hipSetDevice(device_id) });
+}
+
+/// Get the HIP device ID for the current thread.
+pub fn get_device_for_thread() -> i32 {
+    THREAD_DEVICE.with(|d| d.get())
+}
+
+/// Return the number of HIP devices available.
+pub fn device_count() -> i32 {
+    let mut count: i32 = 0;
+    let err = unsafe { hipGetDeviceCount(&mut count) };
+    if err == risc0_sys::hip::HIP_SUCCESS {
+        count
+    } else {
+        1
+    }
+}
+
+/// Return the secondary device ID for recursion/Groth16, or None if single-GPU.
+/// Reads RISC0_MULTI_GPU env var. Set to "1" to enable multi-GPU.
+pub fn recursion_device() -> Option<i32> {
+    static CACHE: OnceLock<Option<i32>> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        if std::env::var("RISC0_MULTI_GPU").is_ok() && device_count() >= 2 {
+            // Use whatever device is NOT the main STARK device (device 0).
+            Some(1)
+        } else {
+            None
+        }
+    })
 }
 
 /// Release all cached GPU buffers back to the HIP runtime.
@@ -112,10 +157,18 @@ pub fn clear_buffer_pool() {
     });
 }
 
-// The GPU becomes unstable as the number of concurrent provers grow.
+// Per-device locks: prevents concurrent provers on the SAME device.
+// Different devices can run concurrently.
 pub fn singleton() -> &'static ReentrantMutex<()> {
-    static ONCE: OnceLock<ReentrantMutex<()>> = OnceLock::new();
-    ONCE.get_or_init(|| ReentrantMutex::new(()))
+    singleton_for_device(0)
+}
+
+pub fn singleton_for_device(device: i32) -> &'static ReentrantMutex<()> {
+    static ONCE: OnceLock<Vec<ReentrantMutex<()>>> = OnceLock::new();
+    let locks = ONCE.get_or_init(|| {
+        (0..16).map(|_| ReentrantMutex::new(())).collect()
+    });
+    &locks[device as usize]
 }
 
 pub trait HipHash {
@@ -332,6 +385,10 @@ impl RawBuffer {
                 HipDeviceBuffer::uninitialized(size).unwrap_or_else(|_| {
                     // OOM: clear the buffer pool to free cached GPU memory and retry.
                     clear_buffer_pool();
+                    // Clear the stale HIP error from the failed hipMalloc above.
+                    // Without this, sppark's cudaGetLastError() picks up the old
+                    // "out of memory" error and panics even though the retry succeeds.
+                    unsafe { risc0_sys::hip::hipGetLastError(); }
                     HipDeviceBuffer::uninitialized(size)
                         .context(format!("allocation failed on {name}: {size} bytes"))
                         .unwrap()
@@ -358,7 +415,16 @@ impl Drop for RawBuffer {
         // Safety: self.buf is not accessed after take() since we're in Drop,
         // and ManuallyDrop's own drop is a no-op.
         let buf = unsafe { ManuallyDrop::take(&mut self.buf) };
-        BUFFER_POOL.with(|pool| pool.borrow_mut().push(size, buf));
+        // During thread shutdown, TLS may already be destroyed. Use try_with
+        // to gracefully handle this — if the pool is gone, just drop the buffer
+        // directly (hipFree via HipDeviceBuffer's own Drop).
+        match BUFFER_POOL.try_with(|pool| pool.borrow_mut().push(size, buf)) {
+            Ok(()) => {}
+            Err(_) => {
+                // TLS destroyed; closure was never called, so `buf` (captured
+                // by the closure) drops here via HipDeviceBuffer::drop (hipFree).
+            }
+        }
     }
 }
 
@@ -515,22 +581,24 @@ impl<HH: HipHash + ?Sized> HipHal<HH> {
     }
 
     fn new_from_hash(hash: Box<HH>) -> Self {
-        let _lock = singleton().lock();
+        let device = get_device_for_thread();
+        let _lock = singleton_for_device(device).lock();
+
+        // Set device BEFORE sppark_init so NTT tables land on the right GPU.
+        hip_check(unsafe { hipInit(0) });
+        hip_check(unsafe { hipSetDevice(device) });
 
         let err = unsafe { sppark_init() };
         if err.code != 0 {
             panic!("Failure during sppark_init: {err}");
         }
 
-        hip_check(unsafe { hipInit(0) });
-        hip_check(unsafe { hipSetDevice(0) });
-
         let mut max_threads: i32 = 0;
         hip_check(unsafe {
             hipDeviceGetAttribute(
                 &mut max_threads,
                 HIP_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
-                0,
+                device,
             )
         });
 
@@ -861,6 +929,30 @@ impl<HH: HipHash + ?Sized> Hal for HipHal<HH> {
 
     fn has_unified_memory(&self) -> bool {
         false
+    }
+
+    fn gpu_free_memory(&self) -> usize {
+        let mut free: usize = 0;
+        let mut total: usize = 0;
+        let err = unsafe { risc0_sys::hip::hipMemGetInfo(&mut free, &mut total) };
+        if err == risc0_sys::hip::HIP_SUCCESS {
+            // Add pool contents to free count, since those are reclaimable.
+            let pool_bytes = BUFFER_POOL.with(|pool| pool.borrow().total_cached);
+            free + pool_bytes
+        } else {
+            usize::MAX
+        }
+    }
+
+    fn gpu_total_memory(&self) -> usize {
+        let mut free: usize = 0;
+        let mut total: usize = 0;
+        let err = unsafe { risc0_sys::hip::hipMemGetInfo(&mut free, &mut total) };
+        if err == risc0_sys::hip::HIP_SUCCESS {
+            total
+        } else {
+            usize::MAX
+        }
     }
 
     fn batch_get_digest_at(&self, buf: &Self::Buffer<Digest>, indices: &[usize]) -> Vec<Digest> {

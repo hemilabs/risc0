@@ -213,7 +213,7 @@ impl<'a, H: Hal> Prover<'a, H> {
         let groups: Vec<&_> = self
             .groups
             .iter()
-            .map(|pg| &pg.as_ref().unwrap().evaluated)
+            .map(|pg| pg.as_ref().unwrap().evaluated.as_ref().unwrap())
             .collect();
         let _ft1 = std::time::Instant::now();
         circuit_hal.eval_check(
@@ -275,6 +275,20 @@ impl<H: Hal> DeferredFinalize<H> {
         // Insert GPU dependency: make persistent stream wait for eval_check stream.
         circuit_hal.eval_check_dep();
         let t_eval_check_dep = ft.elapsed();
+
+        // On tight-VRAM GPUs, release evaluated buffers (both PolyGroup.evaluated
+        // AND merkle.matrix) to free memory for check PolyGroup + FRI allocations.
+        // Evaluated will be reconstructed from coefficients before FRI batch_prove.
+        // Only needed when total VRAM < ~20 GB AND po2 >= 21 (large domains).
+        // At po2=20, evaluated buffers (~3.5 GB) fit comfortably in 16 GB.
+        let low_mem = hal.gpu_total_memory() < 20 * 1024 * 1024 * 1024 && self.po2 >= 21;
+        if low_mem {
+            for pg in self.groups.iter_mut() {
+                if let Some(pg) = pg.as_mut() {
+                    pg.release_evaluated();
+                }
+            }
+        }
 
         // Convert to coefficients.
         hal.batch_interpolate_ntt(&self.check_poly, ext_size);
@@ -522,33 +536,65 @@ impl<H: Hal> DeferredFinalize<H> {
         tracing::debug!("FRI-proof, size = {}", final_poly_coeffs.size() / ext_size);
         let t_pre_fri = ft.elapsed();
 
-        fri_prove(
-            hal,
-            &mut self.iop,
-            &final_poly_coeffs,
-            |indices: &[usize]| -> Vec<Vec<(Vec<H::Elem>, Vec<Digest>)>> {
-                // Batch-prove each tree across all query indices
-                let mut trees: Vec<Vec<(Vec<H::Elem>, Vec<Digest>)>> = Vec::new();
-                for pg in self.groups.iter() {
-                    trees.push(pg.as_ref().unwrap().merkle.batch_prove(hal, indices));
-                }
-                trees.push(check_group.merkle.batch_prove(hal, indices));
-
-                // Transpose: trees[tree_idx][query_idx] -> result[query_idx][tree_idx]
-                let n = indices.len();
-                let num_trees = trees.len();
-                let mut result: Vec<Vec<(Vec<H::Elem>, Vec<Digest>)>> =
-                    Vec::with_capacity(n);
-                for q in 0..n {
-                    let mut query_data = Vec::with_capacity(num_trees);
-                    for tree in trees.iter_mut() {
-                        query_data.push(std::mem::take(&mut tree[q]));
+        if low_mem {
+            // Low-memory path: reconstruct evaluated on-demand for each group
+            // during FRI batch_prove, then release immediately after.
+            let groups_cell = core::cell::RefCell::new(std::mem::take(&mut self.groups));
+            fri_prove(
+                hal,
+                &mut self.iop,
+                &final_poly_coeffs,
+                |indices: &[usize]| -> Vec<Vec<(Vec<H::Elem>, Vec<Digest>)>> {
+                    let mut groups = groups_cell.borrow_mut();
+                    let mut trees: Vec<Vec<(Vec<H::Elem>, Vec<Digest>)>> = Vec::new();
+                    for pg in groups.iter_mut() {
+                        let pg = pg.as_mut().unwrap();
+                        pg.restore_evaluated(hal);
+                        trees.push(pg.merkle.batch_prove(hal, indices));
+                        pg.release_evaluated();
                     }
-                    result.push(query_data);
-                }
-                result
-            },
-        );
+                    trees.push(check_group.merkle.batch_prove(hal, indices));
+                    let n = indices.len();
+                    let num_trees = trees.len();
+                    let mut result: Vec<Vec<(Vec<H::Elem>, Vec<Digest>)>> =
+                        Vec::with_capacity(n);
+                    for q in 0..n {
+                        let mut query_data = Vec::with_capacity(num_trees);
+                        for tree in trees.iter_mut() {
+                            query_data.push(std::mem::take(&mut tree[q]));
+                        }
+                        result.push(query_data);
+                    }
+                    result
+                },
+            );
+        } else {
+            // Normal path: evaluated buffers still in memory
+            fri_prove(
+                hal,
+                &mut self.iop,
+                &final_poly_coeffs,
+                |indices: &[usize]| -> Vec<Vec<(Vec<H::Elem>, Vec<Digest>)>> {
+                    let mut trees: Vec<Vec<(Vec<H::Elem>, Vec<Digest>)>> = Vec::new();
+                    for pg in self.groups.iter() {
+                        trees.push(pg.as_ref().unwrap().merkle.batch_prove(hal, indices));
+                    }
+                    trees.push(check_group.merkle.batch_prove(hal, indices));
+                    let n = indices.len();
+                    let num_trees = trees.len();
+                    let mut result: Vec<Vec<(Vec<H::Elem>, Vec<Digest>)>> =
+                        Vec::with_capacity(n);
+                    for q in 0..n {
+                        let mut query_data = Vec::with_capacity(num_trees);
+                        for tree in trees.iter_mut() {
+                            query_data.push(std::mem::take(&mut tree[q]));
+                        }
+                        result.push(query_data);
+                    }
+                    result
+                },
+            );
+        }
 
         let proven_soundness_error =
             super::soundness::proven::<H>(self.taps, final_poly_coeffs.size());

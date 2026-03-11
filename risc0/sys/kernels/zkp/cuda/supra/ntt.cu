@@ -37,13 +37,13 @@ __global__ void batch_lde_expand_kernel(
 }
 
 static inline int cached_sm_count() {
-    static int count = 0;
-    if (count == 0) {
-        int device;
-        CUDA_OK(cudaGetDevice(&device));
-        CUDA_OK(cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device));
+    int device = 0;
+    CUDA_OK(cudaGetDevice(&device));
+    static int counts[16] = {};
+    if (counts[device] == 0) {
+        CUDA_OK(cudaDeviceGetAttribute(&counts[device], cudaDevAttrMultiProcessorCount, device));
     }
-    return count;
+    return counts[device];
 }
 
 static inline void launch_batch_expand(const gpu_t& gpu,
@@ -67,14 +67,14 @@ static inline void launch_batch_expand(const gpu_t& gpu,
 }
 
 extern "C" RustError::by_value sppark_init() {
-  // Always call select_gpu() to ensure the primary CUDA context is retained
-  // on the calling thread. This is critical when cuda_warmup() runs on a
-  // background thread first (setting initialized=true), then the main thread
-  // calls sppark_init() and needs the context to be current for cust/DeviceBuffer.
-  (void)select_gpu();
+  // Always call select_gpu(-1) to ensure the CUDA context is retained
+  // on the calling thread for its current device.
+  (void)select_gpu(-1);
 
-  static bool initialized = false;
-  if (initialized)
+  int device = 0;
+  cudaGetDevice(&device);
+  static bool initialized[16] = {};
+  if (initialized[device])
     return RustError{cudaSuccess};
 
   // Use lg_domain_size=16 (64K elements) to exercise all NTT kernel variants
@@ -88,7 +88,7 @@ extern "C" RustError::by_value sppark_init() {
   inout[0] = fr_t(1);
   inout[1] = fr_t(1);
 
-  const gpu_t& gpu = select_gpu();
+  const gpu_t& gpu = select_gpu(-1);
 
   try {
     NTT::Base(gpu,
@@ -105,7 +105,7 @@ extern "C" RustError::by_value sppark_init() {
     return RustError(cudaErrorUnknown, "Generic exception");
   }
 
-  initialized = true;
+  initialized[device] = true;
   return RustError{cudaSuccess};
 }
 
@@ -116,7 +116,7 @@ extern "C" RustError::by_value sppark_batch_expand(
 
   uint32_t domain_size = 1U << lg_domain_size;
 
-  const gpu_t& gpu = select_gpu();
+  const gpu_t& gpu = select_gpu(-1);
 
   try {
     launch_batch_expand(gpu, d_out, d_in, domain_size, lg_domain_size, lg_blowup, poly_count);
@@ -138,7 +138,7 @@ sppark_batch_NTT(fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly_count) {
 
   uint32_t domain_size = 1U << lg_domain_size;
 
-  const gpu_t& gpu = select_gpu();
+  const gpu_t& gpu = select_gpu(-1);
 
   try {
     // Single batched NTT call processes all columns in parallel
@@ -168,7 +168,7 @@ sppark_batch_iNTT(fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly_count) {
 
   uint32_t domain_size = 1U << lg_domain_size;
 
-  const gpu_t& gpu = select_gpu();
+  const gpu_t& gpu = select_gpu(-1);
 
   try {
     NTT::Base_dev_ptr_batch(gpu,
@@ -197,7 +197,7 @@ sppark_batch_zk_shift(fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly_coun
 
   uint32_t domain_size = 1U << lg_domain_size;
 
-  const gpu_t& gpu = select_gpu();
+  const gpu_t& gpu = select_gpu(-1);
 
   try {
     // Single batched kernel for all columns instead of per-column launches
@@ -221,7 +221,7 @@ sppark_batch_iNTT_zk_shift(fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly
 
   uint32_t domain_size = 1U << lg_domain_size;
 
-  const gpu_t& gpu = select_gpu();
+  const gpu_t& gpu = select_gpu(-1);
 
   try {
     // Single batched iNTT call processes all columns in parallel
@@ -256,7 +256,7 @@ sppark_batch_expand_NTT(fr_t* d_out, fr_t* d_in,
   uint32_t ext_domain_size = domain_size << lg_blowup;
   uint32_t lg_ext = lg_domain_size + lg_blowup;
 
-  const gpu_t& gpu = select_gpu();
+  const gpu_t& gpu = select_gpu(-1);
 
   try {
     // Batched expand: single kernel for all columns
@@ -291,7 +291,7 @@ sppark_batch_bit_reverse(fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly_c
 
   uint64_t domain_size = 1ULL << lg_domain_size;
 
-  const gpu_t& gpu = select_gpu();
+  const gpu_t& gpu = select_gpu(-1);
 
   try {
     for (uint32_t i = 0; i < poly_count; i++) {

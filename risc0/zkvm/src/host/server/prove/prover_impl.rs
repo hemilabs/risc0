@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{cell::RefCell, collections::HashMap, sync::LazyLock};
+use std::{cell::RefCell, collections::HashMap, sync::LazyLock, sync::mpsc};
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 
@@ -51,7 +51,7 @@ use crate::{
         server::{exec::executor::ExecutorImpl, prove::union_peak::UnionPeak},
     },
     mmr::MerkleMountainAccumulator,
-    receipt::{InnerReceipt, SegmentReceipt, SuccinctReceipt},
+    receipt::{Groth16Receipt, Groth16ReceiptVerifierParameters, InnerReceipt, SegmentReceipt, SuccinctReceipt},
     recursion::prove::{
         join_povw, join_unwrap_povw, lift_povw, resolve_povw, resolve_unwrap_povw, union,
         unwrap_povw,
@@ -71,6 +71,346 @@ impl ProverImpl {
     /// Construct a [ProverImpl].
     pub fn new(opts: ProverOpts) -> Self {
         Self { opts }
+    }
+
+    /// Parallel STARK proving: both GPUs prove segments simultaneously, then recursion runs
+    /// sequentially. This halves STARK time at the cost of sequential recursion.
+    #[cfg(feature = "rocm")]
+    fn prove_session_parallel_stark(
+        &self,
+        ctx: &VerifierContext,
+        session: &Session,
+    ) -> Result<ProveInfo> {
+        let t_total = std::time::Instant::now();
+        let max_po2 = self.opts.max_segment_po2;
+        let num_segments = session.segments.len();
+
+        // Preload circom graph in background.
+        let _graph_preload = if self.opts.receipt_kind == ReceiptKind::Groth16 {
+            Some(std::thread::spawn(|| {
+                if let Err(e) = risc0_groth16::prove::preload_graph() {
+                    eprintln!("[groth16] graph preload failed (non-fatal): {e}");
+                }
+            }))
+        } else {
+            None
+        };
+
+        // Warmup both GPUs sequentially (sppark init has shared static state).
+        let warmup0 = std::thread::spawn(|| {
+            risc0_zkp::hal::hip::switch_to_device(0);
+            risc0_circuit_rv32im::prove::rocm_warmup();
+        });
+        let _ = warmup0.join();
+        let warmup1 = std::thread::spawn(|| {
+            risc0_zkp::hal::hip::switch_to_device(1);
+            risc0_circuit_rv32im::prove::rocm_warmup();
+        });
+        let _ = warmup1.join();
+
+        // Split segments between GPUs.
+        // GPU1 (7900 XTX, gfx1100) is ~15% faster per segment than GPU0 (9070 XT, gfx1201)
+        // due to higher memory BW and more CUs. Give GPU0 ~46% and GPU1 ~54%.
+        let split = (num_segments * 46 + 50) / 100;
+        eprintln!(
+            "[parallel-stark] {} segments: GPU0={}, GPU1={}",
+            num_segments, split, num_segments - split
+        );
+
+        let seg_verifier_params_digest = ctx
+            .segment_verifier_parameters
+            .as_ref()
+            .ok_or_else(|| anyhow!("segment receipt verifier parameters missing from context"))?
+            .digest();
+        let hashfn = self.opts.hashfn.clone();
+
+        // Resolve all segments upfront (needed for Send to threads).
+        let all_segments: Vec<Segment> = session
+            .segments
+            .iter()
+            .map(|s| s.resolve())
+            .collect::<Result<_>>()?;
+
+        // Thread function: prove a subset of segments on a specific GPU device.
+        let prove_subset = |device: i32,
+                            segments: Vec<Segment>,
+                            vp_digest: crate::sha::Digest,
+                            hashfn: String,
+                            max_po2: usize|
+         -> Result<Vec<SegmentReceipt>> {
+            risc0_zkp::hal::hip::switch_to_device(device);
+
+            // Each thread gets its own SegmentProver (thread-local).
+            let sp = risc0_circuit_rv32im::prove::segment_prover()?;
+            let mut receipts = Vec::with_capacity(segments.len());
+            let mut prev_po2_stash: u32 = 0;
+
+            for (local_idx, segment) in segments.iter().enumerate() {
+                let t0 = std::time::Instant::now();
+                ensure!(
+                    segment.po2() <= max_po2,
+                    "segment po2 exceeds max: {} > {}",
+                    segment.po2(),
+                    max_po2
+                );
+                let rand_z = ExtVal::random(&mut rand::rng());
+                let preflight = risc0_circuit_rv32im::prove::PreflightResults::new(
+                    &segment.inner,
+                    rand_z,
+                )?;
+                let po2 = preflight.po2();
+
+                // Use prove_begin/prove_end pipeline for eval_check overlap.
+                let prev_seal = sp.prove_begin(preflight)?;
+
+                // Process previous segment's seal (if any).
+                if let Some(seal) = prev_seal {
+                    let prev_seg = &segments[local_idx - 1];
+                    let prev_po2 = prev_po2_stash;
+                    let mut claim =
+                        ReceiptClaim::decode_from_seal_v2(&seal, Some(prev_po2))?;
+                    claim.output = prev_seg.output.clone().into();
+                    receipts.push(SegmentReceipt {
+                        seal,
+                        index: prev_seg.index,
+                        hashfn: hashfn.clone(),
+                        claim,
+                        verifier_parameters: vp_digest,
+                    });
+                }
+                prev_po2_stash = po2;
+
+                if *VERBOSE {
+                    eprintln!(
+                        "[parallel-stark] GPU{device} seg {}: {:.1}ms",
+                        segment.index,
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+            }
+
+            // Complete last segment's deferred finalize.
+            let last_seal = sp.prove_end()?;
+            let last_seg = segments.last().unwrap();
+            let mut claim =
+                ReceiptClaim::decode_from_seal_v2(&last_seal, Some(prev_po2_stash))?;
+            claim.output = last_seg.output.clone().into();
+            receipts.push(SegmentReceipt {
+                seal: last_seal,
+                index: last_seg.index,
+                hashfn: hashfn.clone(),
+                claim,
+                verifier_parameters: vp_digest,
+            });
+
+            Ok(receipts)
+        };
+
+        // Split segments and spawn two STARK threads.
+        let segs0 = all_segments[..split].to_vec();
+        let segs1 = all_segments[split..].to_vec();
+        let vp0 = seg_verifier_params_digest;
+        let vp1 = seg_verifier_params_digest;
+        let hf0 = hashfn.clone();
+        let hf1 = hashfn.clone();
+
+        let t_stark = std::time::Instant::now();
+        let handle0 = std::thread::Builder::new()
+            .name("stark-gpu0".into())
+            .spawn(move || prove_subset(0, segs0, vp0, hf0, max_po2))?;
+        let handle1 = std::thread::Builder::new()
+            .name("stark-gpu1".into())
+            .spawn(move || prove_subset(1, segs1, vp1, hf1, max_po2))?;
+
+        let receipts0 = handle0
+            .join()
+            .map_err(|_| anyhow!("STARK GPU0 thread panicked"))??;
+        let receipts1 = handle1
+            .join()
+            .map_err(|_| anyhow!("STARK GPU1 thread panicked"))??;
+
+        let stark_ms = t_stark.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "[parallel-stark] STARK done: {:.1}ms ({} + {} receipts)",
+            stark_ms,
+            receipts0.len(),
+            receipts1.len()
+        );
+
+        // Merge receipts in segment index order.
+        let mut segments: Vec<SegmentReceipt> = Vec::with_capacity(num_segments);
+        segments.extend(receipts0);
+        segments.extend(receipts1);
+        segments.sort_by_key(|r| r.index);
+
+        // Merge output + assumptions into the last segment.
+        let (assumptions, _session_assumption_receipts): (Vec<_>, Vec<_>) =
+            session.assumptions.iter().cloned().unzip();
+        segments
+            .last_mut()
+            .ok_or_else(|| anyhow!("session is empty"))?
+            .claim
+            .output
+            .merge_with(
+                &session
+                    .journal
+                    .as_ref()
+                    .map(|journal| Output {
+                        journal: MaybePruned::Pruned(journal.digest()),
+                        assumptions: assumptions.into(),
+                    })
+                    .into(),
+            )?;
+
+        let verifier_parameters = ctx
+            .composite_verifier_parameters()
+            .ok_or_else(|| anyhow!("composite receipt verifier parameters missing from context"))?
+            .digest();
+
+        let composite_receipt = CompositeReceipt {
+            segments,
+            assumption_receipts: Vec::new(),
+            verifier_parameters,
+        };
+
+        if self.opts.receipt_kind == ReceiptKind::Composite {
+            let receipt = Receipt::new(
+                InnerReceipt::Composite(composite_receipt),
+                session.journal.clone().unwrap_or_default().bytes,
+            );
+            return Ok(ProveInfo {
+                receipt,
+                work_receipt: None,
+                stats: session.stats(),
+            });
+        }
+
+        // Recursion: multi-GPU lift+join pipeline.
+        // Lift(N+1) on device 0 overlaps with join(acc, lift(N)) on device 1.
+        // Saves ~175ms per step (42 steps = ~7.3s).
+        let t_rec = std::time::Instant::now();
+        let lift_device = 0;
+        let join_device = 1;
+
+        let segments_ref = &composite_receipt.segments;
+        let num_segs = segments_ref.len();
+        let recursion_opts = if self.opts.max_segment_po2 > crate::receipt::DEFAULT_MAX_PO2 {
+            ProverOpts::from_max_po2(self.opts.max_segment_po2)
+                .with_receipt_kind(ReceiptKind::Succinct)
+        } else {
+            ProverOpts::succinct()
+        };
+        let _skip_verify = std::env::var("RISC0_SKIP_VERIFY").is_ok();
+
+        // Multi-GPU recursion pipeline:
+        // - Persistent lift thread on device 0 (preserves thread-local PROVER_CACHE
+        //   across all lifts → cached ctrl PolyGroup reuse).
+        // - Main thread does joins on device 1.
+        // - Pipeline: lift(N+1) overlaps with join(N).
+        //
+        // IMPORTANT: The main thread must NEVER call lift_with_opts, because the
+        // RecursionProverImpl caches its HipHal (which holds a per-device
+        // ReentrantMutex lock) in thread-local storage. If the main thread cached
+        // a device 0 prover, the persistent lift thread would deadlock trying to
+        // acquire device 0's lock.
+
+        // Channel-based persistent lift thread: receives segments, returns lifted receipts.
+        let (lift_tx, lift_rx) = std::sync::mpsc::sync_channel::<(SegmentReceipt, ProverOpts)>(1);
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<Result<SuccinctReceipt<ReceiptClaim>>>(1);
+
+        let lift_thread = std::thread::Builder::new()
+            .name("lift-gpu0".into())
+            .spawn(move || {
+                risc0_zkp::hal::hip::switch_to_device(lift_device);
+                // Process lift requests until channel closes.
+                while let Ok((seg, opts)) = lift_rx.recv() {
+                    let result = lift_with_opts(&seg, opts);
+                    if result_tx.send(result).is_err() {
+                        break; // main thread dropped receiver
+                    }
+                }
+            })?;
+
+        // Send lift(0).
+        lift_tx.send((segments_ref[0].clone(), recursion_opts.clone()))?;
+        let mut accumulator = result_rx.recv()
+            .map_err(|_| anyhow!("lift thread died"))??;
+        if *VERBOSE { eprintln!("[parallel-recursion] step 0/{num_segs}: lift on device {lift_device}"); }
+
+        // Send lift(1) ahead (will run while main thread is idle or doing join).
+        if num_segs > 1 {
+            lift_tx.send((segments_ref[1].clone(), recursion_opts.clone()))?;
+        }
+
+        // Pipelined loop: join(N) on device 1 overlaps with lift(N+1) on device 0.
+        for step_idx in 1..num_segs {
+            let t_step = std::time::Instant::now();
+
+            // Wait for lift(step_idx) to complete.
+            let lifted = result_rx.recv()
+                .map_err(|_| anyhow!("lift thread died"))??;
+            let lift_ms = t_step.elapsed().as_secs_f64() * 1000.0;
+
+            // Send lift(step_idx+1) BEFORE running join.
+            // This way lift(N+1) runs on device 0 while join(N) runs on device 1.
+            if step_idx + 1 < num_segs {
+                lift_tx.send((segments_ref[step_idx + 1].clone(), recursion_opts.clone()))?;
+            }
+
+            // Run join on device 1 (overlaps with lift(N+1) on device 0).
+            let t_join = std::time::Instant::now();
+            risc0_zkp::hal::hip::switch_to_device(join_device);
+            let joined = join_with_opts(&accumulator, &lifted, recursion_opts.clone())?;
+            let join_ms = t_join.elapsed().as_secs_f64() * 1000.0;
+
+            if *VERBOSE {
+                eprintln!(
+                    "[parallel-recursion] step {step_idx}/{num_segs}: lift_wait={lift_ms:.1}ms join={join_ms:.1}ms total={:.1}ms",
+                    t_step.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            accumulator = joined;
+        }
+
+        // Shut down lift thread.
+        drop(lift_tx);
+        let _ = lift_thread.join();
+
+        let succinct_receipt = accumulator;
+        let rec_ms = t_rec.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("[parallel-stark] recursion done: {:.1}ms (multi-GPU pipeline)", rec_ms);
+
+        if self.opts.receipt_kind == ReceiptKind::Succinct {
+            let receipt = Receipt::new(
+                InnerReceipt::Succinct(succinct_receipt),
+                session.journal.clone().unwrap_or_default().bytes,
+            );
+            return Ok(ProveInfo {
+                receipt,
+                work_receipt: None,
+                stats: session.stats(),
+            });
+        }
+
+        // Groth16 wrapping.
+        // Use device 1 (7900 XTX) for Groth16 — full-rate INT32 makes MSM ~2.5x faster.
+        risc0_zkp::hal::hip::switch_to_device(1);
+        let groth16_receipt = self.succinct_to_groth16(&succinct_receipt)?;
+        let receipt = Receipt::new(
+            InnerReceipt::Groth16(groth16_receipt),
+            session.journal.clone().unwrap_or_default().bytes,
+        );
+
+        eprintln!(
+            "[parallel-stark] total: {:.1}ms",
+            t_total.elapsed().as_secs_f64() * 1000.0
+        );
+
+        Ok(ProveInfo {
+            receipt,
+            work_receipt: None,
+            stats: session.stats(),
+        })
     }
 }
 
@@ -104,6 +444,17 @@ impl ProverServer for ProverImpl {
             supported `hashfn` values are: \"poseidon2\".",
             &self.opts.hashfn
         );
+
+        // Check for parallel STARK mode: both GPUs prove segments simultaneously.
+        #[cfg(feature = "rocm")]
+        if std::env::var("RISC0_PARALLEL_STARK").is_ok()
+            && risc0_zkp::hal::hip::device_count() >= 2
+            && self.opts.receipt_kind != ReceiptKind::Composite
+            && !session.povw_job_id.is_some()
+            && session.assumptions.is_empty()
+        {
+            return self.prove_session_parallel_stark(ctx, session);
+        }
 
         // Trigger CUDA module loading in background while first segment is prepared.
         // With primary context, this is a one-time cost amortized across all segments.
@@ -158,6 +509,107 @@ impl ProverServer for ProverImpl {
         > = None;
         // Metadata from the previous iteration, paired with the seal returned by prove_begin.
         let mut prev_seal_meta: Option<(u32, u32, Option<Output>, String)> = None;
+
+        // Multi-GPU: overlap recursion on secondary device with STARK proving.
+        // Send SegmentReceipts to a background thread that runs lift+join on device 1.
+        #[cfg(feature = "rocm")]
+        let multi_gpu_active = risc0_zkp::hal::hip::recursion_device().is_some()
+            && self.opts.receipt_kind != ReceiptKind::Composite
+            && !session.povw_job_id.is_some()
+            && session.assumptions.is_empty();
+        #[cfg(not(feature = "rocm"))]
+        let multi_gpu_active = false;
+
+        let (mut recursion_tx, recursion_worker) = if multi_gpu_active {
+            let (tx, rx) = mpsc::channel::<SegmentReceipt>();
+            let max_po2 = self.opts.max_segment_po2;
+            let want_groth16 = self.opts.receipt_kind == ReceiptKind::Groth16;
+            let handle = std::thread::Builder::new()
+                .name("recursion-worker".into())
+                .spawn(move || -> Result<(SuccinctReceipt<ReceiptClaim>, Option<SuccinctReceipt<ReceiptClaim>>)> {
+                    #[cfg(feature = "rocm")]
+                    {
+                        let device = risc0_zkp::hal::hip::recursion_device().unwrap();
+                        risc0_zkp::hal::hip::switch_to_device(device);
+                    }
+
+                    let recursion_opts =
+                        if max_po2 > crate::receipt::DEFAULT_MAX_PO2 {
+                            ProverOpts::from_max_po2(max_po2)
+                                .with_receipt_kind(ReceiptKind::Succinct)
+                        } else {
+                            ProverOpts::succinct()
+                        };
+
+                    let mut accumulator: Option<SuccinctReceipt<ReceiptClaim>> = None;
+
+                    for (idx, segment_receipt) in rx.iter().enumerate() {
+                        let t0 = std::time::Instant::now();
+                        let lifted =
+                            lift_with_opts(&segment_receipt, recursion_opts.clone())?;
+                        let lift_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+                        accumulator = match accumulator.take() {
+                            Some(left) => {
+                                let t1 = std::time::Instant::now();
+                                let joined = join_with_opts(
+                                    &left,
+                                    &lifted,
+                                    recursion_opts.clone(),
+                                )?;
+                                let join_ms = t1.elapsed().as_secs_f64() * 1000.0;
+                                if *VERBOSE {
+                                    eprintln!(
+                                        "[multi-gpu recursion] step {idx}: \
+                                         lift={lift_ms:.1}ms join={join_ms:.1}ms"
+                                    );
+                                }
+                                Some(joined)
+                            }
+                            None => {
+                                if *VERBOSE {
+                                    eprintln!(
+                                        "[multi-gpu recursion] step {idx}: \
+                                         lift={lift_ms:.1}ms (first)"
+                                    );
+                                }
+                                Some(lifted)
+                            }
+                        };
+                    }
+
+                    let succinct = accumulator.ok_or_else(|| {
+                        anyhow!("no segments received by recursion worker")
+                    })?;
+
+                    // Run identity_p254 here to overlap with remaining STARK segments.
+                    let ident = if want_groth16 {
+                        let t0 = std::time::Instant::now();
+                        let r = identity_p254(&succinct)?;
+                        if *VERBOSE {
+                            eprintln!(
+                                "[multi-gpu recursion] identity_p254={:.1}ms",
+                                t0.elapsed().as_secs_f64() * 1000.0
+                            );
+                        }
+                        Some(r)
+                    } else {
+                        None
+                    };
+
+                    Ok((succinct, ident))
+                })?;
+            (Some(tx), Some(handle))
+        } else {
+            (None, None)
+        };
+        #[cfg(feature = "rocm")]
+        if multi_gpu_active {
+            eprintln!(
+                "[multi-gpu] recursion worker started on device {}",
+                risc0_zkp::hal::hip::recursion_device().unwrap_or(0)
+            );
+        }
 
         for (seg_idx, segment_ref) in session.segments.iter().enumerate() {
             let t_seg = std::time::Instant::now();
@@ -232,6 +684,10 @@ impl ProverServer for ProverImpl {
                     let receipt = handle
                         .join()
                         .map_err(|_| anyhow!("receipt thread panicked"))??;
+                    // Multi-GPU: send receipt to recursion worker for parallel lift+join
+                    if let Some(ref tx) = recursion_tx {
+                        let _ = tx.send(receipt.clone());
+                    }
                     segments.push(receipt);
                 }
 
@@ -290,6 +746,10 @@ impl ProverServer for ProverImpl {
             let receipt = handle
                 .join()
                 .map_err(|_| anyhow!("receipt thread panicked"))??;
+            // Multi-GPU: send to recursion worker
+            if let Some(ref tx) = recursion_tx {
+                let _ = tx.send(receipt.clone());
+            }
             segments.push(receipt);
         }
 
@@ -338,6 +798,12 @@ impl ProverServer for ProverImpl {
                     .into(),
             )
             .context("failed to merge output into final segment claim")?;
+
+        // Multi-GPU: send last receipt (with merged output) to recursion worker.
+        if let Some(tx) = recursion_tx.take() {
+            let _ = tx.send(segments.last().unwrap().clone());
+            // Channel closed on drop → worker finishes after processing this receipt.
+        }
 
         let verifier_parameters = ctx
             .composite_verifier_parameters()
@@ -409,13 +875,26 @@ impl ProverServer for ProverImpl {
             });
         }
 
-        let (succinct_receipt, work_receipt) = match session.povw_job_id.is_some() {
-            true => {
-                let work_receipt = self.composite_to_succinct_povw(&composite_receipt)?;
-                let unwrapped = self.unwrap_povw(&work_receipt)?;
-                (unwrapped, Some(work_receipt))
+        let (succinct_receipt, work_receipt, pre_ident) = if let Some(handle) = recursion_worker {
+            // Multi-GPU: collect the SuccinctReceipt from the background recursion worker.
+            // Assumptions already checked to be empty at multi_gpu_active decision.
+            let t_wait = std::time::Instant::now();
+            let (succinct, ident) = handle
+                .join()
+                .map_err(|_| anyhow!("recursion worker thread panicked"))??;
+            let wait_ms = t_wait.elapsed().as_secs_f64() * 1000.0;
+            eprintln!("[multi-gpu] recursion worker finished (wait={wait_ms:.1}ms)");
+            (succinct, None, ident)
+        } else {
+            match session.povw_job_id.is_some() {
+                true => {
+                    let work_receipt =
+                        self.composite_to_succinct_povw(&composite_receipt)?;
+                    let unwrapped = self.unwrap_povw(&work_receipt)?;
+                    (unwrapped, Some(work_receipt), None)
+                }
+                false => (self.composite_to_succinct(&composite_receipt)?, None, None),
             }
-            false => (self.composite_to_succinct(&composite_receipt)?, None),
         };
 
         if self.opts.receipt_kind == ReceiptKind::Succinct {
@@ -430,7 +909,25 @@ impl ProverServer for ProverImpl {
             });
         }
 
-        let groth16_receipt = self.succinct_to_groth16(&succinct_receipt)?;
+        let groth16_receipt = if let Some(ident_receipt) = pre_ident {
+            // identity_p254 already computed by recursion worker (overlapped with STARK).
+            use risc0_groth16::prove::shrink_wrap;
+            let t0 = std::time::Instant::now();
+            let seal_bytes = ident_receipt.get_seal_bytes();
+            let seal = shrink_wrap(&seal_bytes)?.to_vec();
+            let wrap_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            eprintln!(
+                "[succinct_to_groth16] identity_p254=pre-computed shrink_wrap={wrap_ms:.1}ms \
+                 total={wrap_ms:.1}ms"
+            );
+            Groth16Receipt {
+                seal,
+                claim: succinct_receipt.claim.clone(),
+                verifier_parameters: Groth16ReceiptVerifierParameters::default().digest(),
+            }
+        } else {
+            self.succinct_to_groth16(&succinct_receipt)?
+        };
 
         if self.opts.receipt_kind == ReceiptKind::Groth16 {
             let receipt = Receipt::new(

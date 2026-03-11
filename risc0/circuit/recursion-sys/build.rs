@@ -65,7 +65,7 @@ fn build_rocm_kernels() {
     let sppark_root = env::var("DEP_SPPARK_ROOT").unwrap();
     let cuda_root = env::var("DEP_RISC0_SYS_CUDA_ROOT").unwrap();
     let cxx_root = env::var("DEP_RISC0_SYS_CXX_ROOT").unwrap();
-    let hipcc = env::var("HIPCC").unwrap_or_else(|_| "hipcc".to_string());
+    let hipcc = risc0_build_kernel::find_hipcc();
     let out_dir = env::var("OUT_DIR").map(PathBuf::from).unwrap();
     let kernel_dir = std::fs::canonicalize("kernels/cuda").unwrap();
 
@@ -161,7 +161,8 @@ fn build_rocm_kernels() {
     // which would cause duplicate symbol errors).
     let lib_path = out_dir.join(format!("lib{output}.a"));
     let _ = std::fs::remove_file(&lib_path);
-    let mut ar_cmd = Command::new("ar");
+    let ar = risc0_build_kernel::find_ar_tool();
+    let mut ar_cmd = Command::new(&ar);
     ar_cmd.arg("rcs").arg(&lib_path).arg(&device_linked);
     let status = ar_cmd.status().expect("failed to run ar");
     assert!(status.success(), "ar failed");
@@ -170,12 +171,7 @@ fn build_rocm_kernels() {
     println!("cargo:rustc-link-lib=static={output}");
 
     // Link against HIP runtime
-    if let Ok(hip_path) = env::var("HIP_PATH") {
-        println!("cargo:rustc-link-search=native={}/lib", hip_path);
-    } else if std::path::Path::new("/opt/rocm/lib").exists() {
-        println!("cargo:rustc-link-search=native=/opt/rocm/lib");
-    }
-    println!("cargo:rustc-link-lib=amdhip64");
+    risc0_build_kernel::emit_rocm_lib_link();
 }
 
 fn rerun_if_changed<P: AsRef<Path>>(path: P) {

@@ -55,7 +55,7 @@ use crate::{
 pub struct PolyGroup<H: Hal> {
     pub coeffs: H::Buffer<H::Elem>,
     pub count: usize,
-    pub evaluated: H::Buffer<H::Elem>,
+    pub evaluated: Option<H::Buffer<H::Elem>>,
     pub merkle: MerkleTreeProver<H>,
 }
 
@@ -67,6 +67,34 @@ impl<H: Hal> Clone for PolyGroup<H> {
             evaluated: self.evaluated.clone(),
             merkle: self.merkle.clone(),
         }
+    }
+}
+
+impl<H: Hal> PolyGroup<H> {
+    /// Release evaluated buffers (both PolyGroup.evaluated and merkle.matrix)
+    /// to free GPU memory. On 16GB GPUs at po2=21, this frees ~10.5 GB.
+    /// Call restore_evaluated() before FRI batch_prove to reconstruct.
+    pub fn release_evaluated(&mut self) {
+        self.evaluated = None;
+        self.merkle.release_matrix();
+    }
+
+    /// Reconstruct the evaluated buffer from coefficients and restore it
+    /// into merkle.matrix for batch_prove. Costs 2× batch_bit_reverse +
+    /// 1× batch_expand_into_evaluate_ntt.
+    pub fn restore_evaluated(&mut self, hal: &H) {
+        if self.merkle.matrix_is_some() {
+            return; // Already restored or never released
+        }
+        let size = self.coeffs.size() / self.count;
+        let domain = size * INV_RATE;
+        let evaluated = hal.alloc_elem("evaluated", self.count * domain);
+        // Coefficients are bit-reversed; undo before expand+NTT
+        hal.batch_bit_reverse(&self.coeffs, self.count);
+        hal.batch_expand_into_evaluate_ntt(&evaluated, &self.coeffs, self.count, log2_ceil(INV_RATE));
+        // Re-bit-reverse coefficients (other code expects them bit-reversed)
+        hal.batch_bit_reverse(&self.coeffs, self.count);
+        self.merkle.set_matrix(evaluated);
     }
 }
 
@@ -101,7 +129,7 @@ impl<H: Hal> PolyGroup<H> {
         PolyGroup {
             coeffs,
             count,
-            evaluated,
+            evaluated: Some(evaluated),
             merkle,
         }
     }

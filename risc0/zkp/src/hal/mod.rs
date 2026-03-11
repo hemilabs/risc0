@@ -64,6 +64,18 @@ pub trait Hal {
 
     fn has_unified_memory(&self) -> bool;
 
+    /// Returns the amount of free GPU memory in bytes.
+    /// Returns `usize::MAX` for CPU HALs or when the information is unavailable.
+    fn gpu_free_memory(&self) -> usize {
+        usize::MAX
+    }
+
+    /// Returns the total GPU memory in bytes.
+    /// Returns `usize::MAX` for CPU HALs or when the information is unavailable.
+    fn gpu_total_memory(&self) -> usize {
+        usize::MAX
+    }
+
     fn get_hash_suite(&self) -> &HashSuite<Self::Field>;
 
     fn alloc_digest(&self, name: &'static str, size: usize) -> Self::Buffer<Digest>;
