@@ -1,45 +1,47 @@
-// Copyright 2024 RISC Zero, Inc.
+// Copyright 2026 RISC Zero, Inc.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
+// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// copied, modified, or distributed except according to those terms.
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use std::rc::Rc;
 
 use anyhow::Result;
 use risc0_circuit_keccak_sys::{
+    RawBuffer, RawExecBuffers, RawPreflightTrace, ScatterInfo,
     risc0_circuit_keccak_cuda_eval_check, risc0_circuit_keccak_cuda_reset,
-    risc0_circuit_keccak_cuda_scatter, risc0_circuit_keccak_cuda_witgen, RawBuffer, RawExecBuffers,
-    RawPreflightTrace, ScatterInfo,
+    risc0_circuit_keccak_cuda_scatter, risc0_circuit_keccak_cuda_witgen,
 };
 use risc0_core::{
     field::{
+        Elem, RootsOfUnity,
         baby_bear::{BabyBearElem, BabyBearExtElem},
-        map_pow, Elem, RootsOfUnity,
+        map_pow,
     },
     scope,
 };
 use risc0_sys::ffi_wrap;
 use risc0_zkp::{
+    INV_RATE,
     core::log2_ceil,
     field::ExtElem as _,
     hal::{
-        cuda::{BufferImpl as CudaBuffer, CudaHal, CudaHalPoseidon2, CudaHash, CudaHashPoseidon2},
         AccumPreflight, Buffer, CircuitHal, Hal,
+        cuda::{BufferImpl as CudaBuffer, CudaHal, CudaHalPoseidon2, CudaHash, CudaHashPoseidon2},
     },
-    INV_RATE,
 };
 
 use crate::{
-    prove::{KeccakProver, KeccakProverImpl, GLOBAL_MIX, GLOBAL_OUT},
+    prove::{GLOBAL_MIX, GLOBAL_OUT, KeccakProver, KeccakProverImpl},
     zirgen::{
         circuit::{REGISTER_GROUP_ACCUM, REGISTER_GROUP_CODE, REGISTER_GROUP_DATA},
         info::{NUM_POLY_MIX_POWERS, POLY_MIX_POWERS},
@@ -50,11 +52,14 @@ use super::{CircuitWitnessGenerator, MetaBuffer, PreflightCycleOrder, PreflightT
 use crate::prove::preflight::ControlState;
 
 pub struct CudaCircuitHal<CH: CudaHash> {
-    hal: Rc<CudaHal<CH>>, // retain a reference to ensure the context remains valid
+    hal: Rc<CudaHal<CH>>,
 }
 
 impl<CH: CudaHash> CudaCircuitHal<CH> {
     pub fn new(hal: Rc<CudaHal<CH>>) -> Self {
+        #[cfg(test)]
+        gpu_guard::assert_gpu_semaphore_held();
+
         Self { hal }
     }
 }
@@ -91,6 +96,7 @@ impl<CH: CudaHash> CircuitWitnessGenerator<CudaHal<CH>> for CudaCircuitHal<CH> {
         let from = self.hal.copy_from_u32("from", from);
         ffi_wrap(|| unsafe {
             risc0_circuit_keccak_cuda_scatter(
+                self.hal.stream.as_inner(),
                 into.buf.as_device_ptr(),
                 infos.as_ptr(),
                 from.as_device_ptr(),
@@ -144,7 +150,13 @@ impl<CH: CudaHash> CircuitWitnessGenerator<CudaHal<CH>> for CudaCircuitHal<CH> {
             run_order: run_order.as_ptr(),
         };
         ffi_wrap(|| unsafe {
-            risc0_circuit_keccak_cuda_witgen(mode as u32, &buffers, &preflight, cycles as u32)
+            risc0_circuit_keccak_cuda_witgen(
+                self.hal.stream.as_inner(),
+                mode as u32,
+                &buffers,
+                &preflight,
+                cycles as u32,
+            )
         })
     }
 }
@@ -198,13 +210,16 @@ impl<CH: CudaHash> CircuitHal<CudaHal<CH>> for CudaCircuitHal<CH> {
 
         tracing::debug!("steps: {steps}, domain: {domain}, po2: {po2}, rou: {rou:?}");
         let poly_mix_pows = map_pow(poly_mix, POLY_MIX_POWERS);
-        let poly_mix_pows: &[u32; BabyBearExtElem::EXT_SIZE * NUM_POLY_MIX_POWERS] =
+        let poly_mix_pows_vec: &[u32; BabyBearExtElem::EXT_SIZE * NUM_POLY_MIX_POWERS] =
             BabyBearExtElem::as_u32_slice(poly_mix_pows.as_slice())
                 .try_into()
                 .unwrap();
+        let poly_mix_pows =
+            CudaBuffer::copy_from("poly_mix", &poly_mix_pows_vec[..], self.hal.stream.clone());
 
         ffi_wrap(|| unsafe {
             risc0_circuit_keccak_cuda_eval_check(
+                self.hal.stream.as_inner(),
                 check.as_device_ptr(),
                 ctrl.as_device_ptr(),
                 data.as_device_ptr(),
@@ -214,7 +229,7 @@ impl<CH: CudaHash> CircuitHal<CudaHal<CH>> for CudaCircuitHal<CH> {
                 &rou as *const BabyBearElem,
                 po2 as u32,
                 domain as u32,
-                poly_mix_pows.as_ptr(),
+                poly_mix_pows.as_device_ptr().as_ptr() as *const BabyBearExtElem,
             )
         })
         .unwrap();
@@ -247,6 +262,7 @@ mod tests {
     use crate::prove::hal::cpu::CpuCircuitHal;
 
     #[test]
+    #[gpu_guard::gpu_guard]
     fn eval_check() {
         const PO2: usize = 4;
         let cpu_hal: CpuHal<BabyBear> = CpuHal::new(Sha256HashSuite::new_suite());

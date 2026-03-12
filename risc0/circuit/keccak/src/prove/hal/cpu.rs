@@ -1,41 +1,42 @@
-// Copyright 2024 RISC Zero, Inc.
+// Copyright 2026 RISC Zero, Inc.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
+// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// copied, modified, or distributed except according to those terms.
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use std::rc::Rc;
 
 use anyhow::Result;
 use rayon::{iter::IntoParallelIterator, prelude::*};
 use risc0_circuit_keccak_sys::{
-    risc0_circuit_keccak_cpu_poly_fp, risc0_circuit_keccak_cpu_witgen, RawBuffer, RawExecBuffers,
-    RawPreflightTrace, ScatterInfo,
+    RawBuffer, RawExecBuffers, RawPreflightTrace, ScatterInfo, risc0_circuit_keccak_cpu_poly_fp,
+    risc0_circuit_keccak_cpu_witgen,
 };
 use risc0_core::scope;
 use risc0_sys::ffi_wrap;
 use risc0_zkp::{
-    core::{hash::poseidon2::Poseidon2HashSuite, log2_ceil},
-    field::{map_pow, Elem as _, ExtElem as _, RootsOfUnity as _},
-    hal::{
-        cpu::{CpuBuffer, CpuHal},
-        AccumPreflight, CircuitHal,
-    },
     INV_RATE,
+    core::{hash::poseidon2::Poseidon2HashSuite, log2_ceil},
+    field::{Elem as _, ExtElem as _, RootsOfUnity as _, map_pow},
+    hal::{
+        AccumPreflight, CircuitHal,
+        cpu::{CpuBuffer, CpuHal},
+    },
 };
 
 use crate::{
-    prove::{KeccakProver, KeccakProverImpl, GLOBAL_MIX, GLOBAL_OUT},
+    prove::{GLOBAL_MIX, GLOBAL_OUT, KeccakProver, KeccakProverImpl},
     zirgen::{
-        circuit::{CircuitField, ExtVal, Val, REGISTER_GROUP_ACCUM, REGISTER_GROUP_DATA},
+        circuit::{CircuitField, ExtVal, REGISTER_GROUP_ACCUM, REGISTER_GROUP_DATA, Val},
         info::POLY_MIX_POWERS,
     },
 };
@@ -61,7 +62,11 @@ impl CircuitWitnessGenerator<CpuHal<CircuitField>> for CpuCircuitHal {
         let mut into_slice = into.buf.as_slice_mut();
         for info in infos {
             let inner_count = 32 / info.bits;
-            let mask: u32 = (1 << info.bits) - 1;
+            let mask: u32 = if info.bits == 32 {
+                0xffffffff
+            } else {
+                (1 << info.bits) - 1
+            };
             for i in 0..info.count as u32 {
                 let from_idx = info.offset + (i / inner_count);
                 let word = data[from_idx as usize];

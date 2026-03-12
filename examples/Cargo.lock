@@ -4558,6 +4558,7 @@ dependencies = [
 name = "risc0-circuit-recursion-sys"
 version = "4.0.1"
 dependencies = [
+ "cc",
  "glob",
  "risc0-build-kernel",
  "risc0-core",
@@ -4685,6 +4686,7 @@ version = "1.5.0"
 dependencies = [
  "anyhow",
  "blst",
+ "cc",
  "cust",
  "risc0-build-kernel",
  "sppark",

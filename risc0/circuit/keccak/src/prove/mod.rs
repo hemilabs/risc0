@@ -1,16 +1,17 @@
-// Copyright 2025 RISC Zero, Inc.
+// Copyright 2026 RISC Zero, Inc.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
+// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// copied, modified, or distributed except according to those terms.
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 
 mod hal;
 mod preflight;
@@ -36,16 +37,16 @@ use self::{
     preflight::PreflightTrace,
 };
 use crate::{
+    KeccakState,
     zirgen::{
+        CircuitImpl,
         circuit::{
-            CircuitField, ExtVal, Val, LAYOUT_GLOBAL, REGCOUNT_ACCUM, REGCOUNT_CODE, REGCOUNT_DATA,
+            CircuitField, ExtVal, LAYOUT_GLOBAL, REGCOUNT_ACCUM, REGCOUNT_CODE, REGCOUNT_DATA,
             REGCOUNT_GLOBAL, REGCOUNT_MIX, REGISTER_GROUP_ACCUM, REGISTER_GROUP_CODE,
-            REGISTER_GROUP_DATA,
+            REGISTER_GROUP_DATA, Val,
         },
         taps::TAPSET,
-        CircuitImpl,
     },
-    KeccakState,
 };
 
 const GLOBAL_MIX: usize = 0;
@@ -75,8 +76,6 @@ pub fn keccak_prover() -> Result<Box<dyn KeccakProver>> {
     cfg_if! {
         if #[cfg(feature = "cuda")] {
             self::hal::cuda::keccak_prover()
-        } else if #[cfg(feature = "rocm")] {
-            self::hal::hip::keccak_prover()
         // } else if #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), target_os = "ios"))] {
         //     self::metal::keccak_prover()
         } else {
@@ -96,7 +95,7 @@ where
 
 impl<H, C> KeccakProver for KeccakProverImpl<H, C>
 where
-    H: Hal<Field = CircuitField, Elem = Val, ExtElem = ExtVal> + 'static,
+    H: Hal<Field = CircuitField, Elem = Val, ExtElem = ExtVal>,
     C: CircuitHal<H> + CircuitWitnessGenerator<H>,
 {
     fn prove(&self, inputs: &[KeccakState], po2: usize) -> Result<Seal> {
@@ -148,9 +147,7 @@ where
         global.buf.view(|slice| {
             let mut digest = Digest::ZERO;
             for (i, word) in digest.as_mut_words().iter_mut().enumerate() {
-                let low: u32 = slice[i * 2].into();
-                let high: u32 = slice[i * 2 + 1].into();
-                *word = low | (high << 16);
+                *word = slice[i].into();
             }
             tracing::debug!("final digest: {digest}");
 
