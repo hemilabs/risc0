@@ -507,6 +507,14 @@ impl<CH: CudaHash + ?Sized> CudaHal<CH> {
         // a new context. This avoids per-instance CUDA module loading (~100ms for
         // large rv32im kernels) since modules persist in the primary context.
 
+        // Warmup: create the persistent CUDA stream and load the risc0-zkp kernel
+        // module. This retains the primary CUDA context so that subsequent
+        // DeviceBuffer allocations don't fail with "invalid device context".
+        extern "C" {
+            fn risc0_zkp_cuda_warmup() -> *const std::os::raw::c_char;
+        }
+        let _ = ffi_wrap(|| unsafe { risc0_zkp_cuda_warmup() });
+
         let mut hal = Self {
             max_threads: max_threads as u32,
             _context: None,
