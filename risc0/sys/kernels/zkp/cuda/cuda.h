@@ -77,9 +77,16 @@ struct LaunchConfig {
   LaunchConfig(int grid, int block, size_t shared = 0) : grid(grid), block(block), shared(shared) {}
 };
 
+inline int getCachedDevice() {
+  static int cached = -1;
+  if (cached < 0) {
+    cudaGetDevice(&cached);
+  }
+  return cached;
+}
+
 inline cudaStream_t getPersistentStream() {
-  int device = 0;
-  cudaGetDevice(&device);
+  int device = getCachedDevice();
   static cudaStream_t streams[16] = {};
   if (!streams[device]) {
     CUDA_OK(cudaStreamCreate(&streams[device]));
@@ -88,8 +95,7 @@ inline cudaStream_t getPersistentStream() {
 }
 
 inline LaunchConfig getCachedSimpleConfig(uint32_t count) {
-  int device = 0;
-  cudaGetDevice(&device);
+  int device = getCachedDevice();
   static int blocks[16] = {};
   if (blocks[device] == 0) {
     int maxThreads;

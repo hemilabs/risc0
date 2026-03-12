@@ -93,8 +93,7 @@ using namespace risc0::circuit::rv32im_v2::cuda;
 // eval_check uses only ~6% of GPU wave slots (128 out of 2048), so 94% of
 // compute resources remain available for concurrent work.
 static cudaStream_t getEvalCheckStream() {
-  int dev = 0;
-  cudaGetDevice(&dev);
+  int dev = getCachedDevice();
   static cudaStream_t streams[16] = {};
   if (!streams[dev]) {
     CUDA_OK(cudaStreamCreateWithFlags(&streams[dev], cudaStreamNonBlocking));
@@ -103,8 +102,7 @@ static cudaStream_t getEvalCheckStream() {
 }
 
 static cudaEvent_t getEvalCheckEvent() {
-  int dev = 0;
-  cudaGetDevice(&dev);
+  int dev = getCachedDevice();
   static cudaEvent_t events[16] = {};
   if (!events[dev]) {
     CUDA_OK(cudaEventCreateWithFlags(&events[dev], cudaEventDisableTiming));
@@ -181,14 +179,13 @@ const char* risc0_circuit_rv32im_cuda_eval_check(Fp* check,
   return nullptr;
 }
 
-// Wait for eval_check to complete before reading check_poly.
-// Uses cudaDeviceSynchronize() because eval_check runs on its own stream
-// (getEvalCheckStream) while downstream operations (iNTT via sppark, Merkle
-// via risc0-sys) run on separate streams. cudaDeviceSynchronize() ensures
-// ALL streams are drained.
+// Make persistent stream wait for eval_check completion via lightweight event sync.
+// This avoids cudaDeviceSynchronize() which blocks ALL streams and adds latency.
 const char* risc0_circuit_rv32im_cuda_eval_check_dep() {
   try {
-    CUDA_OK(cudaDeviceSynchronize());
+    cudaEvent_t event = getEvalCheckEvent();
+    CUDA_OK(cudaEventRecord(event, getEvalCheckStream()));
+    CUDA_OK(cudaStreamWaitEvent(getPersistentStream(), event, 0));
   } catch (const std::exception& err) {
     return strdup(err.what());
   } catch (...) {

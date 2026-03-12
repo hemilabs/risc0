@@ -1,6 +1,5 @@
 #include <cstring>
 #include <iostream>
-#include <memory>
 #include <mutex>
 
 #define FEATURE_BN254
@@ -156,8 +155,9 @@ struct ProveParams {
 // Per-device cached SRS + prover to avoid reloading ~200MB of point data and
 // reinitializing GPU memory on every Groth16 prove call.
 // Preloaded on a background thread via risc0_groth16_cuda_preload().
-static std::unique_ptr<SRS> cached_srs[16];
-static std::unique_ptr<groth16_prover> cached_prover[16];
+// Raw pointers: intentionally leaked at exit to avoid CUDA driver teardown crash.
+static SRS* cached_srs[16] = {};
+static groth16_prover* cached_prover[16] = {};
 static std::mutex cached_mutex;
 
 static int current_device() {
@@ -171,10 +171,10 @@ extern "C" const char* risc0_groth16_cuda_preload(SetupParams* setup_params) {
     int dev = current_device();
     std::lock_guard<std::mutex> lock(cached_mutex);
     if (!cached_srs[dev]) {
-      cached_srs[dev] = std::make_unique<SRS>(dev, setup_params->srs_path);
+      cached_srs[dev] = new SRS(dev, setup_params->srs_path);
     }
     if (!cached_prover[dev]) {
-      cached_prover[dev] = std::make_unique<groth16_prover>(
+      cached_prover[dev] = new groth16_prover(
           *cached_srs[dev], setup_params->pcoeffs_path, setup_params->fres_path);
     }
   } catch (const std::exception& err) {
@@ -200,10 +200,10 @@ extern "C" const char* risc0_groth16_cuda_prove(SetupParams* setup_params,
       }
 
       if (!cached_srs[dev]) {
-        cached_srs[dev] = std::make_unique<SRS>(dev, setup_params->srs_path);
+        cached_srs[dev] = new SRS(dev, setup_params->srs_path);
       }
       if (!cached_prover[dev]) {
-        cached_prover[dev] = std::make_unique<groth16_prover>(
+        cached_prover[dev] = new groth16_prover(
             *cached_srs[dev], setup_params->pcoeffs_path, setup_params->fres_path);
       }
     }

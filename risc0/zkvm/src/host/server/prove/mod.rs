@@ -376,36 +376,18 @@ where
         composite_receipt: &CompositeReceipt,
     ) -> anyhow::Result<SuccinctReceipt<Claim>> {
         let t_pipeline = std::time::Instant::now();
-        let num_segments = composite_receipt.segments.len();
-        eprintln!("[composite_to_succinct] starting: {} segments, {} assumptions",
-            num_segments, composite_receipt.assumption_receipts.len());
-
         // Compress all receipts in the top-level session into one succinct receipt for the session.
-        let mut step_idx = 0usize;
         let continuation_receipt = composite_receipt
             .segments
             .iter()
             .try_fold(
                 None,
                 |left: Option<SuccinctReceipt<Claim>>, right: &SegmentReceipt| -> Result<_> {
-                    let t_step = std::time::Instant::now();
                     let lifted = self.lift(right)?;
-                    let lift_ms = t_step.elapsed().as_secs_f64() * 1000.0;
                     let result = match left {
-                        Some(left) => {
-                            let t_join = std::time::Instant::now();
-                            let joined = self.join(&left, &lifted)?;
-                            let join_ms = t_join.elapsed().as_secs_f64() * 1000.0;
-                            eprintln!("[composite_to_succinct] step {step_idx}/{num_segments}: lift={lift_ms:.1}ms join={join_ms:.1}ms total={:.1}ms",
-                                t_step.elapsed().as_secs_f64() * 1000.0);
-                            joined
-                        }
-                        None => {
-                            eprintln!("[composite_to_succinct] step {step_idx}/{num_segments}: lift={lift_ms:.1}ms (first)");
-                            lifted
-                        }
+                        Some(left) => self.join(&left, &lifted)?,
+                        None => lifted,
                     };
-                    step_idx += 1;
                     Ok(Some(result))
                 },
             )?

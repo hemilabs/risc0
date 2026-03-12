@@ -45,13 +45,33 @@ fn build_cpu_kernels() {
 
 fn build_cuda_kernels() {
     rerun_if_changed("kernels/cuda");
+
+    let cuda_root = env::var("DEP_RISC0_SYS_CUDA_ROOT").unwrap();
+    let cxx_root = env::var("DEP_RISC0_SYS_CXX_ROOT").unwrap();
+    let sppark_root = env::var("DEP_SPPARK_ROOT").unwrap();
+
+    // Split build: step/ffi kernels get -maxrregcount=96 for higher occupancy,
+    // while eval_check/supra kernels keep unrestricted registers.
     KernelBuild::new(KernelType::Cuda)
-        .files(glob_paths("kernels/cuda/*.cu"))
+        .files(glob_paths("kernels/cuda/step_*.cu"))
+        .file("kernels/cuda/ffi.cu")
         .deps(["kernels/cuda"])
         .flag("-DFEATURE_BABY_BEAR")
-        .include(env::var("DEP_RISC0_SYS_CUDA_ROOT").unwrap())
-        .include(env::var("DEP_RISC0_SYS_CXX_ROOT").unwrap())
-        .include(env::var("DEP_SPPARK_ROOT").unwrap())
+        .flag("-maxrregcount=96")
+        .include(&cuda_root)
+        .include(&cxx_root)
+        .include(&sppark_root)
+        .compile("risc0_recursion_cuda_step");
+
+    KernelBuild::new(KernelType::Cuda)
+        .file("kernels/cuda/eval_check.cu")
+        .file("kernels/cuda/ffi_supra.cu")
+        .file("kernels/cuda/sppark.cu")
+        .deps(["kernels/cuda"])
+        .flag("-DFEATURE_BABY_BEAR")
+        .include(&cuda_root)
+        .include(&cxx_root)
+        .include(&sppark_root)
         .compile("risc0_recursion_cuda");
 }
 

@@ -44,6 +44,20 @@ pub fn preload_graph() -> Result<()> {
     }
 }
 
+/// Preload the SRS and Groth16 prover into C++ static cache.
+/// Call after STARK proving is complete and GPU is idle.
+pub fn preload_srs() -> Result<()> {
+    cfg_if::cfg_if! {
+        if #[cfg(feature = "cuda")] {
+            self::cuda::preload_srs()
+        } else if #[cfg(feature = "rocm")] {
+            Ok(()) // hip.rs handles SRS loading internally
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// Produce a Groth16 proof from an `identity_p254` seal.
 pub fn shrink_wrap(identity_p254_seal_bytes: &[u8]) -> Result<Seal> {
     cfg_if::cfg_if! {

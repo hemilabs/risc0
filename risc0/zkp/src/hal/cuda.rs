@@ -678,9 +678,7 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
         assert_eq!(row_size, 1 << n_bits);
         assert!(n_bits >= expand_bits);
         assert!(n_bits < Self::Elem::MAX_ROU_PO2);
-        let ts = std::time::Instant::now();
         Self::sync_stream();
-        let sync_ms = ts.elapsed().as_secs_f64() * 1000.0;
 
         let err = unsafe {
             sppark_batch_expand_NTT(
@@ -691,8 +689,6 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
                 poly_count.try_into().unwrap(),
             )
         };
-        eprintln!("    [batch_expand_NTT] sync: {:.2}ms, total: {:.2}ms (in_bits={}, expand={}, count={})",
-            sync_ms, ts.elapsed().as_secs_f64() * 1000.0, in_bits, expand_bits, poly_count);
         if err.code != 0 {
             panic!("Failure during batch_expand_NTT: {err}");
         }
@@ -704,9 +700,7 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
         let n_bits = log2_ceil(row_size);
         assert_eq!(row_size, 1 << n_bits);
         assert!(n_bits < Self::Elem::MAX_ROU_PO2);
-        let ts = std::time::Instant::now();
         Self::sync_stream();
-        let sync_ms = ts.elapsed().as_secs_f64() * 1000.0;
 
         let err = unsafe {
             sppark_batch_iNTT(
@@ -715,8 +709,6 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
                 count.try_into().unwrap(),
             )
         };
-        eprintln!("    [batch_iNTT] sync: {:.2}ms, total: {:.2}ms (n_bits={}, count={})",
-            sync_ms, ts.elapsed().as_secs_f64() * 1000.0, n_bits, count);
         if err.code != 0 {
             panic!("Failure during batch_interpolate_ntt: {err}");
         }
@@ -881,9 +873,7 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
         let n_bits = log2_ceil(row_size);
         assert_eq!(row_size, 1 << n_bits);
         assert!(n_bits < Self::Elem::MAX_ROU_PO2);
-        let ts = std::time::Instant::now();
         Self::sync_stream();
-        let sync_ms = ts.elapsed().as_secs_f64() * 1000.0;
 
         let err = unsafe {
             sppark_batch_iNTT_zk_shift(
@@ -892,8 +882,6 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
                 count.try_into().unwrap(),
             )
         };
-        eprintln!("    [batch_iNTT_zk] sync: {:.2}ms, total: {:.2}ms (n_bits={}, count={})",
-            sync_ms, ts.elapsed().as_secs_f64() * 1000.0, n_bits, count);
         if err.code != 0 {
             panic!("Failure during batch_iNTT_zk_shift: {err}");
         }

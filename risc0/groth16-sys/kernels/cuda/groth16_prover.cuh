@@ -362,6 +362,7 @@ public:
 
       coeff_wise_add<<<gpu.sm_count(), 1024, 0, gpu>>>(&d_witness[0], &d_fuzz[0], witness_size);
       CUDA_OK(cudaGetLastError());
+      gpu.sync();
 
       msm_g1.invoke(results.a, srs.get_a(), srs.get_a_size(), d_witness, false);
       msm_g1.invoke(results.b_g1, srs.get_b_g1(), srs.get_b_g1_size(), d_witness, false);

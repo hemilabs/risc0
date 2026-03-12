@@ -292,8 +292,7 @@ struct DeviceCache {
 static DeviceCache g_cache[16];
 
 static inline DeviceCache& get_cache() {
-  int dev = 0;
-  cudaGetDevice(&dev);
+  int dev = getCachedDevice();
   return g_cache[dev];
 }
 
@@ -600,8 +599,7 @@ const char* risc0_circuit_rv32im_cuda_accum(AccumBuffers* buffers,
         size_t temp_bytes = 0;
         hipcub::DeviceScan::InclusiveScan(nullptr, temp_bytes, itFirst, itFirst, AddOp(), n, stream);
 
-        int scan_dev = 0;
-        cudaGetDevice(&scan_dev);
+        int scan_dev = getCachedDevice();
         static void* s_scan_temp[16] = {};
         static size_t s_scan_temp_bytes[16] = {};
         if (temp_bytes > s_scan_temp_bytes[scan_dev]) {

@@ -73,7 +73,12 @@ const char* risc0_zkp_cuda_fill_u32(uint32_t* buf, uint32_t value, uint32_t coun
 #ifdef __HIPCC__
       CUDA_OK(hipMemsetD32Async(buf, value, count, stream));
 #else
-      CUDA_OK(cuMemsetD32Async((CUdeviceptr)buf, value, count, stream));
+      // cuMemsetD32Async returns CUresult (driver API) but CUDA_OK expects
+      // cudaError_t (runtime API). Cast through the compatible error code.
+      CUresult res = cuMemsetD32Async((CUdeviceptr)buf, value, count, stream);
+      if (res != CUDA_SUCCESS) {
+        throw std::runtime_error(fmt("cuMemsetD32Async failed: %d", (int)res));
+      }
 #endif
     }
   } catch (const std::exception& err) {
@@ -191,8 +196,7 @@ const char* risc0_zkp_cuda_scatter_from_host(Fp* into,
                                              uint32_t count) {
   try {
     cudaStream_t stream = getPersistentStream();
-    int dev = 0;
-    cudaGetDevice(&dev);
+    int dev = getCachedDevice();
 
     // Per-device persistent device buffers (grow-only, reused across segments).
     static uint32_t* d_index[16] = {};
@@ -267,8 +271,7 @@ const char* risc0_zkp_cuda_scatter_bits_from_host(Fp* into,
                                                   uint32_t cycles) {
   try {
     cudaStream_t stream = getPersistentStream();
-    int dev = 0;
-    cudaGetDevice(&dev);
+    int dev = getCachedDevice();
 
     // Per-device persistent device buffer (grow-only, reused across segments).
     static uint32_t* d_bitdata[16] = {};
