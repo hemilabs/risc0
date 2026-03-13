@@ -78,11 +78,19 @@ struct LaunchConfig {
 };
 
 inline int getCachedDevice() {
+#ifdef __HIPCC__
+  // HIP multi-GPU: different threads may use different devices,
+  // so we must query each time (or use thread_local).
+  int dev = 0;
+  cudaGetDevice(&dev);
+  return dev;
+#else
   static int cached = -1;
   if (cached < 0) {
     cudaGetDevice(&cached);
   }
   return cached;
+#endif
 }
 
 inline cudaStream_t getPersistentStream() {

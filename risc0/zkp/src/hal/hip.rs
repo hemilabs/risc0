@@ -19,7 +19,7 @@ use std::{
     marker::PhantomData,
     mem::ManuallyDrop,
     rc::Rc,
-    sync::OnceLock,
+    sync::{Once, OnceLock},
 };
 
 use anyhow::{bail, Context as _, Result};
@@ -99,6 +99,88 @@ thread_local! {
     static BUFFER_POOL: RefCell<BufferPool> = RefCell::new(BufferPool::new());
     /// Which HIP device this thread should use (default 0).
     static THREAD_DEVICE: Cell<i32> = Cell::new(0);
+}
+
+/// Auto-configure HSA_ENABLE_SDMA based on detected GPU architecture.
+///
+/// RDNA4 (gfx12xx) has buggy SDMA and benefits from HSA_ENABLE_SDMA=0.
+/// RDNA3 (gfx11xx) has working SDMA and is ~7% slower with it disabled.
+/// This must run BEFORE hipInit() since HSA reads the env var during init.
+///
+/// Reads GPU architectures from Linux sysfs without requiring HIP runtime.
+/// Respects any user-set HSA_ENABLE_SDMA value.
+fn auto_configure_sdma() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        // Don't override if user explicitly set it.
+        if std::env::var("HSA_ENABLE_SDMA").is_ok() {
+            return;
+        }
+
+        // Parse HIP_VISIBLE_DEVICES to know which GPUs are active.
+        let visible: Option<Vec<usize>> =
+            std::env::var("HIP_VISIBLE_DEVICES").ok().map(|val| {
+                val.split(',')
+                    .filter_map(|s| s.trim().parse().ok())
+                    .collect()
+            });
+
+        // Read GPU architectures from sysfs (works without HIP runtime).
+        // /sys/class/kfd/kfd/topology/nodes/*/properties has gfx_target_version.
+        // Node 0 is typically the CPU, GPU nodes start at 1+.
+        let mut gpu_index: usize = 0;
+        let mut all_rdna4 = true;
+        let mut found_gpu = false;
+
+        let Ok(entries) = std::fs::read_dir("/sys/class/kfd/kfd/topology/nodes") else {
+            return;
+        };
+        let mut node_dirs: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+        node_dirs.sort_by_key(|e| e.file_name());
+
+        for entry in node_dirs {
+            let props_path = entry.path().join("properties");
+            let Ok(content) = std::fs::read_to_string(&props_path) else {
+                continue;
+            };
+
+            // Find gfx_target_version line. CPU nodes have version 0.
+            let gfx_version = content.lines().find_map(|line| {
+                let line = line.trim();
+                if line.starts_with("gfx_target_version") {
+                    line.split_whitespace().nth(1)?.parse::<u32>().ok()
+                } else {
+                    None
+                }
+            });
+
+            let Some(ver) = gfx_version else { continue };
+            if ver == 0 {
+                continue; // CPU node
+            }
+
+            // This is a GPU node. Check if it's in the visible set.
+            let is_visible = match &visible {
+                Some(vis) => vis.contains(&gpu_index),
+                None => true,
+            };
+
+            if is_visible {
+                found_gpu = true;
+                // gfx12xx = 120000..129999 (RDNA4)
+                if ver < 120000 || ver >= 130000 {
+                    all_rdna4 = false;
+                }
+            }
+
+            gpu_index += 1;
+        }
+
+        if found_gpu && all_rdna4 {
+            tracing::info!("Auto-setting HSA_ENABLE_SDMA=0 for RDNA4 GPU(s)");
+            std::env::set_var("HSA_ENABLE_SDMA", "0");
+        }
+    });
 }
 
 /// Set the HIP device ID for the current thread.
@@ -583,6 +665,9 @@ impl<HH: HipHash + ?Sized> HipHal<HH> {
     fn new_from_hash(hash: Box<HH>) -> Self {
         let device = get_device_for_thread();
         let _lock = singleton_for_device(device).lock();
+
+        // Auto-configure SDMA before HIP runtime init reads env vars.
+        auto_configure_sdma();
 
         // Set device BEFORE sppark_init so NTT tables land on the right GPU.
         hip_check(unsafe { hipInit(0) });

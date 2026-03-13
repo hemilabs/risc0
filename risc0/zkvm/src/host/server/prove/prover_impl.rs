@@ -1150,29 +1150,31 @@ impl ProverServer for ProverImpl {
         unwrap_povw(a)
     }
 
-    /// Tree-based composite_to_succinct: batch-preflights lifts/joins with rayon,
-    /// then executes GPU proofs sequentially. Saves ~600ms vs left-fold by eliminating
-    /// sequential join preflight overhead.
+    /// Pipelined composite_to_succinct: left-fold lift+join with background CPU
+    /// preflight overlapping GPU work.
+    ///
+    /// On CUDA, the tree-based approach with rayon batch preflighting is faster.
+    /// On HIP/ROCm, the linear pipelined approach is ~2.5x faster because HIP's
+    /// per-proof overhead makes CPU-GPU overlap more valuable than batch parallelism.
     fn composite_to_succinct(
         &self,
         composite_receipt: &CompositeReceipt,
     ) -> Result<SuccinctReceipt<ReceiptClaim>> {
-        use crate::{
-            claim::merge::Merge,
-            host::recursion::prove::{
-                make_succinct_receipt, Prover as RecursionProverJob,
-            },
+        use crate::host::recursion::prove::{
+            join_with_opts, lift_with_opts,
+            make_succinct_receipt, Prover as RecursionProverJob,
         };
-        use rayon::prelude::*;
 
         let t_pipeline = std::time::Instant::now();
         let segments = &composite_receipt.segments;
         let num_segments = segments.len();
         eprintln!(
-            "[composite_to_succinct] starting: {} segments, {} assumptions",
+            "[composite_to_succinct] starting: {} segments, {} assumptions (pipelined)",
             num_segments,
             composite_receipt.assumption_receipts.len()
         );
+
+        let mut accumulator: Option<SuccinctReceipt<ReceiptClaim>> = None;
 
         let recursion_opts = if self.opts.max_segment_po2 > crate::receipt::DEFAULT_MAX_PO2 {
             ProverOpts::from_max_po2(self.opts.max_segment_po2)
@@ -1181,82 +1183,71 @@ impl ProverServer for ProverImpl {
             ProverOpts::succinct()
         };
 
-        // Phase 1: Batch prepare all lift preflights in parallel (CPU-only).
-        let mut prepared_lifts: Vec<RecursionProverJob> = segments
-            .par_iter()
-            .map(|seg| -> Result<RecursionProverJob> {
-                let mut prover =
-                    RecursionProverJob::new_lift(seg, recursion_opts.clone())?;
-                prover.prepare()?;
-                Ok(prover)
-            })
-            .collect::<Result<Vec<_>>>()?;
+        // Pipeline: while GPU runs join(N), prepare lift(N+1) preflight on background CPU thread.
+        let mut pending_prepared_lift: Option<
+            std::thread::JoinHandle<Result<RecursionProverJob>>,
+        > = None;
 
-        // Phase 2: Execute lifts sequentially on GPU with pre-computed preflights.
-        let mut receipts: Vec<SuccinctReceipt<ReceiptClaim>> =
-            Vec::with_capacity(num_segments);
-        for (seg, mut prover) in segments.iter().zip(prepared_lifts.drain(..)) {
-            let receipt = prover.run()?;
-            let claim_decoded = ReceiptClaim::decode(&mut receipt.out_stream())?;
-            let claim = claim_decoded.merge(&seg.claim)?;
-            receipts.push(make_succinct_receipt(prover, receipt, claim)?);
-        }
+        for step_idx in 0..num_segments {
+            let t_step = std::time::Instant::now();
 
-        // Phase 3: Tree reduction via pairwise joins with batch preflighting.
-        let mut level = 0;
-        while receipts.len() > 1 {
-            let num_pairs = receipts.len() / 2;
-            let has_odd = receipts.len() % 2 == 1;
-
-            // Batch prepare join preflights for all pairs (rayon).
-            let prepared_joins = {
-                let chunks: Vec<_> = receipts
-                    .chunks(2)
-                    .filter(|c| c.len() == 2)
-                    .collect();
-                chunks
-                    .par_iter()
-                    .map(|c| -> Result<RecursionProverJob> {
-                        let mut prover = RecursionProverJob::new_join(
-                            &c[0],
-                            &c[1],
-                            recursion_opts.clone(),
-                        )?;
-                        prover.prepare()?;
-                        Ok(prover)
-                    })
-                    .collect::<Result<Vec<_>>>()?
-            };
-
-            // Execute joins sequentially on GPU.
-            let mut next_level = Vec::with_capacity(num_pairs + if has_odd { 1 } else { 0 });
-            let mut joiner_iter = prepared_joins.into_iter();
-            let mut receipt_iter = receipts.into_iter();
-
-            while let Some(left) = receipt_iter.next() {
-                if let Some(right) = receipt_iter.next() {
-                    let mut prover = joiner_iter.next().unwrap();
+            // Get the lifted receipt.
+            let lifted: SuccinctReceipt<ReceiptClaim> =
+                if let Some(handle) = pending_prepared_lift.take() {
+                    // Use the pre-prepared prover (preflight cached on background thread).
+                    let mut prover = handle
+                        .join()
+                        .map_err(|_| anyhow!("lift prepare thread panicked"))??;
                     let receipt = prover.run()?;
-                    let claim_decoded =
-                        ReceiptClaim::decode(&mut receipt.out_stream())?;
-                    let claim = claim_decoded
-                        .merge(&left.claim.join(&right.claim)?.value()?)?;
-                    next_level
-                        .push(make_succinct_receipt(prover, receipt, claim)?);
+                    let claim_decoded = ReceiptClaim::decode(&mut receipt.out_stream())?;
+                    let claim = claim_decoded.merge(&segments[step_idx].claim)?;
+                    make_succinct_receipt(prover, receipt, claim)?
                 } else {
-                    // Odd receipt carries at END to preserve segment ordering.
-                    next_level.push(left);
-                }
+                    // First segment: compute full lift (no pipelining available yet).
+                    lift_with_opts(&segments[step_idx], recursion_opts.clone())?
+                };
+            let lift_ms = t_step.elapsed().as_secs_f64() * 1000.0;
+
+            // Before running join, start preparing next lift in background.
+            if step_idx + 1 < num_segments {
+                let next_prover = RecursionProverJob::new_lift(
+                    &segments[step_idx + 1],
+                    recursion_opts.clone(),
+                )?;
+                pending_prepared_lift =
+                    Some(std::thread::spawn(move || -> Result<RecursionProverJob> {
+                        let mut p = next_prover;
+                        p.prepare()?;
+                        Ok(p)
+                    }));
             }
 
-            if *VERBOSE {
-                eprintln!(
-                    "[composite_to_succinct] level {level}: {num_pairs} joins{}",
-                    if has_odd { " + 1 carry" } else { "" }
-                );
-            }
-            level += 1;
-            receipts = next_level;
+            // Run join on main thread (GPU) while background thread prepares next lift.
+            let result = match accumulator.take() {
+                Some(left) => {
+                    let t_join = std::time::Instant::now();
+                    let joined = join_with_opts(&left, &lifted, recursion_opts.clone())?;
+                    let join_ms = t_join.elapsed().as_secs_f64() * 1000.0;
+                    if *VERBOSE {
+                        eprintln!(
+                            "[composite_to_succinct] step {step_idx}/{num_segments}: \
+                             lift={lift_ms:.1}ms join={join_ms:.1}ms total={:.1}ms",
+                            t_step.elapsed().as_secs_f64() * 1000.0
+                        );
+                    }
+                    joined
+                }
+                None => {
+                    if *VERBOSE {
+                        eprintln!(
+                            "[composite_to_succinct] step {step_idx}/{num_segments}: \
+                             lift={lift_ms:.1}ms (first)"
+                        );
+                    }
+                    lifted
+                }
+            };
+            accumulator = Some(result);
         }
 
         eprintln!(
@@ -1264,7 +1255,7 @@ impl ProverServer for ProverImpl {
             t_pipeline.elapsed().as_secs_f64()
         );
 
-        let continuation_receipt = receipts.into_iter().next().ok_or_else(|| {
+        let continuation_receipt = accumulator.ok_or_else(|| {
             anyhow!("malformed composite receipt has no continuation segment receipts")
         })?;
 
