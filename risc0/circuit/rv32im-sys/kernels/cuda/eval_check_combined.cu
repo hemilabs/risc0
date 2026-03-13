@@ -145,32 +145,33 @@ const char* risc0_circuit_rv32im_cuda_eval_check(Fp* check,
       cacheConfigSet = true;
     }
     // Copy poly_mix_pows to __constant__ memory on eval_check stream.
-    // The caller's host buffer (poly_mix_pows) may be freed before this
-    // async copy executes (it's queued behind an event wait).  Stage into
-    // a persistent host buffer so the source stays valid.
-#ifdef __HIPCC__
-    // HIP: hipMemcpyToSymbol doesn't work reliably without -fgpu-rdc.
-    // Use hipGetSymbolAddress + hipMemcpyAsync instead.
+    // Stage into a persistent host buffer so the source remains valid
+    // until the async copy executes (it's queued behind an event wait).
     {
       static char poly_mix_staging[sizeof(poly_mix)];
       memcpy(poly_mix_staging, poly_mix_pows, sizeof(poly_mix));
+#ifdef __HIPCC__
+      // HIP: hipMemcpyToSymbol doesn't work reliably without -fgpu-rdc.
+      // Use hipGetSymbolAddress + hipMemcpyAsync instead.
       void* dev_ptr = nullptr;
       CUDA_OK(hipGetSymbolAddress(&dev_ptr, HIP_SYMBOL(poly_mix)));
       CUDA_OK(hipMemcpyAsync(dev_ptr, poly_mix_staging, sizeof(poly_mix),
                               hipMemcpyHostToDevice, stream));
-    }
 #else
-    CUDA_OK(cudaMemcpyToSymbolAsync(poly_mix, poly_mix_pows, sizeof(poly_mix),
-                                     0, cudaMemcpyHostToDevice, stream));
+      CUDA_OK(cudaMemcpyToSymbolAsync(poly_mix, poly_mix_staging, sizeof(poly_mix),
+                                       0, cudaMemcpyHostToDevice, stream));
 #endif
-    (void)cudaGetLastError(); // consume any stale async errors
+    }
+    // Surface any async errors from prior operations (e.g., previous eval_check).
+    // Previously this was swallowed with (void)cudaGetLastError(), which could
+    // mask real errors and lead to silently incorrect proofs.
+    CUDA_OK(cudaGetLastError());
 
     eval_check<<<grid, block, 0, stream>>>(
         check, ctrl, data, accum, mix, out, rou, po2, domain);
     CUDA_OK(cudaGetLastError());
-    // No sync: eval_check runs asynchronously on its own stream.
-    // Call risc0_circuit_rv32im_cuda_eval_check_sync() or
-    // risc0_circuit_rv32im_cuda_eval_check_dep() to synchronize.
+    // Sync eval_check stream only (narrowing from cudaDeviceSynchronize).
+    CUDA_OK(cudaStreamSynchronize(stream));
   } catch (const std::exception& err) {
     return strdup(err.what());
   } catch (...) {
