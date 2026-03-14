@@ -1,3 +1,4 @@
+#pragma once
 
 // This code is automatically generated
 

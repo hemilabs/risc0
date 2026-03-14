@@ -189,8 +189,7 @@ extern "C" {
 
 using namespace risc0::circuit::keccak::cuda;
 
-const char* risc0_circuit_keccak_cuda_witgen(cudaStream_t stream,
-                                             uint32_t mode,
+const char* risc0_circuit_keccak_cuda_witgen(uint32_t mode,
                                              ExecBuffers* buffers,
                                              PreflightTrace* preflight,
                                              uint32_t lastCycle) {
@@ -200,16 +199,16 @@ const char* risc0_circuit_keccak_cuda_witgen(cudaStream_t stream,
     auto cfg = getSimpleConfig(lastCycle);
     switch (mode) {
     case kStepModeSeqParallel:
-      par_stepExec<<<cfg.grid, cfg.block, 0, stream>>>(ctx.ctx, lastCycle);
+      par_stepExec<<<cfg.grid, cfg.block>>>(ctx.ctx, lastCycle);
       break;
     case kStepModeSeqForward:
-      fwd_stepExec<<<cfg.grid, cfg.block, 0, stream>>>(ctx.ctx, lastCycle);
+      fwd_stepExec<<<cfg.grid, cfg.block>>>(ctx.ctx, lastCycle);
       break;
     case kStepModeSeqReverse:
-      rev_stepExec<<<cfg.grid, cfg.block, 0, stream>>>(ctx.ctx, lastCycle);
+      rev_stepExec<<<cfg.grid, cfg.block>>>(ctx.ctx, lastCycle);
       break;
     }
-    CUDA_OK(cudaStreamSynchronize(stream));
+    CUDA_OK(cudaDeviceSynchronize());
   } catch (const std::exception& err) {
     return strdup(err.what());
   } catch (...) {
@@ -218,8 +217,7 @@ const char* risc0_circuit_keccak_cuda_witgen(cudaStream_t stream,
   return nullptr;
 }
 
-const char* risc0_circuit_keccak_cuda_scatter(cudaStream_t stream,
-                                              Fp* into,
+const char* risc0_circuit_keccak_cuda_scatter(Fp* into,
                                               const ScatterInfo* infos,
                                               const uint32_t* from,
                                               const uint32_t rows,
@@ -227,8 +225,8 @@ const char* risc0_circuit_keccak_cuda_scatter(cudaStream_t stream,
   try {
     ScatterContext ctx(infos, count);
     auto cfg = getSimpleConfig(count);
-    scatter_preflight<<<cfg.grid, cfg.block, 0, stream>>>(into, ctx.d_infos, from, rows, count);
-    CUDA_OK(cudaStreamSynchronize(stream));
+    scatter_preflight<<<cfg.grid, cfg.block>>>(into, ctx.d_infos, from, rows, count);
+    CUDA_OK(cudaDeviceSynchronize());
   } catch (const std::exception& err) {
     return strdup(err.what());
   } catch (...) {

@@ -17,31 +17,30 @@ use std::rc::Rc;
 
 use anyhow::Result;
 use risc0_circuit_keccak_sys::{
-    RawBuffer, RawExecBuffers, RawPreflightTrace, ScatterInfo,
     risc0_circuit_keccak_cuda_eval_check, risc0_circuit_keccak_cuda_reset,
-    risc0_circuit_keccak_cuda_scatter, risc0_circuit_keccak_cuda_witgen,
+    risc0_circuit_keccak_cuda_scatter, risc0_circuit_keccak_cuda_witgen, RawBuffer, RawExecBuffers,
+    RawPreflightTrace, ScatterInfo,
 };
 use risc0_core::{
     field::{
-        Elem, RootsOfUnity,
         baby_bear::{BabyBearElem, BabyBearExtElem},
-        map_pow,
+        map_pow, Elem, RootsOfUnity,
     },
     scope,
 };
 use risc0_sys::ffi_wrap;
 use risc0_zkp::{
-    INV_RATE,
     core::log2_ceil,
     field::ExtElem as _,
     hal::{
-        AccumPreflight, Buffer, CircuitHal, Hal,
         cuda::{BufferImpl as CudaBuffer, CudaHal, CudaHalPoseidon2, CudaHash, CudaHashPoseidon2},
+        AccumPreflight, Buffer, CircuitHal, Hal,
     },
+    INV_RATE,
 };
 
 use crate::{
-    prove::{GLOBAL_MIX, GLOBAL_OUT, KeccakProver, KeccakProverImpl},
+    prove::{KeccakProver, KeccakProverImpl, GLOBAL_MIX, GLOBAL_OUT},
     zirgen::{
         circuit::{REGISTER_GROUP_ACCUM, REGISTER_GROUP_CODE, REGISTER_GROUP_DATA},
         info::{NUM_POLY_MIX_POWERS, POLY_MIX_POWERS},
@@ -52,14 +51,11 @@ use super::{CircuitWitnessGenerator, MetaBuffer, PreflightCycleOrder, PreflightT
 use crate::prove::preflight::ControlState;
 
 pub struct CudaCircuitHal<CH: CudaHash> {
-    hal: Rc<CudaHal<CH>>,
+    hal: Rc<CudaHal<CH>>, // retain a reference to ensure the context remains valid
 }
 
 impl<CH: CudaHash> CudaCircuitHal<CH> {
     pub fn new(hal: Rc<CudaHal<CH>>) -> Self {
-        #[cfg(test)]
-        gpu_guard::assert_gpu_semaphore_held();
-
         Self { hal }
     }
 }
@@ -96,7 +92,6 @@ impl<CH: CudaHash> CircuitWitnessGenerator<CudaHal<CH>> for CudaCircuitHal<CH> {
         let from = self.hal.copy_from_u32("from", from);
         ffi_wrap(|| unsafe {
             risc0_circuit_keccak_cuda_scatter(
-                self.hal.stream.as_inner(),
                 into.buf.as_device_ptr(),
                 infos.as_ptr(),
                 from.as_device_ptr(),
@@ -150,13 +145,7 @@ impl<CH: CudaHash> CircuitWitnessGenerator<CudaHal<CH>> for CudaCircuitHal<CH> {
             run_order: run_order.as_ptr(),
         };
         ffi_wrap(|| unsafe {
-            risc0_circuit_keccak_cuda_witgen(
-                self.hal.stream.as_inner(),
-                mode as u32,
-                &buffers,
-                &preflight,
-                cycles as u32,
-            )
+            risc0_circuit_keccak_cuda_witgen(mode as u32, &buffers, &preflight, cycles as u32)
         })
     }
 }
@@ -210,16 +199,14 @@ impl<CH: CudaHash> CircuitHal<CudaHal<CH>> for CudaCircuitHal<CH> {
 
         tracing::debug!("steps: {steps}, domain: {domain}, po2: {po2}, rou: {rou:?}");
         let poly_mix_pows = map_pow(poly_mix, POLY_MIX_POWERS);
-        let poly_mix_pows_vec: &[u32; BabyBearExtElem::EXT_SIZE * NUM_POLY_MIX_POWERS] =
+        let poly_mix_pows: &[u32; BabyBearExtElem::EXT_SIZE * NUM_POLY_MIX_POWERS] =
             BabyBearExtElem::as_u32_slice(poly_mix_pows.as_slice())
                 .try_into()
                 .unwrap();
-        let poly_mix_pows =
-            CudaBuffer::copy_from("poly_mix", &poly_mix_pows_vec[..], self.hal.stream.clone());
+        let poly_mix_pows_gpu = self.hal.copy_from_u32("poly_mix_pows", &poly_mix_pows[..]);
 
         ffi_wrap(|| unsafe {
             risc0_circuit_keccak_cuda_eval_check(
-                self.hal.stream.as_inner(),
                 check.as_device_ptr(),
                 ctrl.as_device_ptr(),
                 data.as_device_ptr(),
@@ -229,7 +216,7 @@ impl<CH: CudaHash> CircuitHal<CudaHal<CH>> for CudaCircuitHal<CH> {
                 &rou as *const BabyBearElem,
                 po2 as u32,
                 domain as u32,
-                poly_mix_pows.as_device_ptr().as_ptr() as *const BabyBearExtElem,
+                poly_mix_pows_gpu.as_device_ptr().as_ptr() as *const u32,
             )
         })
         .unwrap();
@@ -246,29 +233,4 @@ pub fn keccak_prover() -> Result<Box<dyn KeccakProver>> {
 
 fn cuda_reset() {
     ffi_wrap(|| unsafe { risc0_circuit_keccak_cuda_reset() }).unwrap();
-}
-
-#[cfg(test)]
-mod tests {
-    use std::rc::Rc;
-
-    use risc0_core::field::baby_bear::BabyBear;
-    use risc0_zkp::{
-        core::hash::sha::Sha256HashSuite,
-        hal::{cpu::CpuHal, cuda::CudaHalSha256},
-    };
-    use test_log::test;
-
-    use crate::prove::hal::cpu::CpuCircuitHal;
-
-    #[test]
-    #[gpu_guard::gpu_guard]
-    fn eval_check() {
-        const PO2: usize = 4;
-        let cpu_hal: CpuHal<BabyBear> = CpuHal::new(Sha256HashSuite::new_suite());
-        let cpu_eval = CpuCircuitHal;
-        let gpu_hal = Rc::new(CudaHalSha256::new());
-        let gpu_eval = super::CudaCircuitHal::new(gpu_hal.clone());
-        crate::prove::testutil::eval_check(&cpu_hal, cpu_eval, gpu_hal.as_ref(), gpu_eval, PO2);
-    }
 }

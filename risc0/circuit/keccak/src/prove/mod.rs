@@ -76,6 +76,8 @@ pub fn keccak_prover() -> Result<Box<dyn KeccakProver>> {
     cfg_if! {
         if #[cfg(feature = "cuda")] {
             self::hal::cuda::keccak_prover()
+        } else if #[cfg(feature = "rocm")] {
+            self::hal::hip::keccak_prover()
         // } else if #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), target_os = "ios"))] {
         //     self::metal::keccak_prover()
         } else {
@@ -95,7 +97,7 @@ where
 
 impl<H, C> KeccakProver for KeccakProverImpl<H, C>
 where
-    H: Hal<Field = CircuitField, Elem = Val, ExtElem = ExtVal>,
+    H: Hal<Field = CircuitField, Elem = Val, ExtElem = ExtVal> + 'static,
     C: CircuitHal<H> + CircuitWitnessGenerator<H>,
 {
     fn prove(&self, inputs: &[KeccakState], po2: usize) -> Result<Seal> {
@@ -174,6 +176,12 @@ where
             .hal
             .alloc_elem_init("accum", cycles * REGCOUNT_ACCUM, H::Elem::ZERO);
         prover.commit_group(REGISTER_GROUP_ACCUM, &accum);
+
+        // Free original buffers before finalize (eval_check) to reduce peak GPU memory.
+        // The prover's PolyGroups hold their own expanded copies.
+        drop(code);
+        drop(data);
+        drop(accum);
 
         let seal = prover.finalize(&[&mix, &global.buf], self.circuit_hal.as_ref());
 
