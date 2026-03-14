@@ -65,6 +65,9 @@ __global__ void eval_check(Fp* check,
                            const Fp rou,
                            uint32_t po2,
                            uint32_t domain) {
+  // Enable shared memory spilling: trades STACK for SHARED, improving L1 cache
+  // utilization. With CUDA 12.9+: REG:255 STACK:8560 SHARED:16384 (~5% speedup).
+  asm volatile (".pragma \"enable_smem_spilling\";");
   uint32_t cycle = blockDim.x * blockIdx.x + threadIdx.x;
   if (cycle < domain) {
     FpExt tot = poly_fp(cycle, domain, ctrl, out, data, mix, accum);
@@ -170,7 +173,11 @@ const char* risc0_circuit_rv32im_cuda_eval_check(Fp* check,
     eval_check<<<grid, block, 0, stream>>>(
         check, ctrl, data, accum, mix, out, rou, po2, domain);
     CUDA_OK(cudaGetLastError());
-    // Sync eval_check stream only (narrowing from cudaDeviceSynchronize).
+    // Sync eval_check stream before returning. Required to prevent data corruption
+    // from concurrent kernel execution during pipelining (witgen(N+1) interferes
+    // with eval_check(N) at ~1% rate when running concurrently, even though they
+    // use separate streams and non-overlapping buffers — root cause appears to be
+    // a hardware-level resource conflict with REG:255 kernels on RTX 5090).
     CUDA_OK(cudaStreamSynchronize(stream));
   } catch (const std::exception& err) {
     return strdup(err.what());
@@ -180,8 +187,10 @@ const char* risc0_circuit_rv32im_cuda_eval_check(Fp* check,
   return nullptr;
 }
 
-// Make persistent stream wait for eval_check completion via lightweight event sync.
-// This avoids cudaDeviceSynchronize() which blocks ALL streams and adds latency.
+// Make persistent stream wait for eval_check completion.
+// With the synchronous eval_check above, this is effectively a no-op
+// (eval_check already completed before this is called). Retained for
+// correctness if eval_check is ever made async again.
 const char* risc0_circuit_rv32im_cuda_eval_check_dep() {
   try {
     cudaEvent_t event = getEvalCheckEvent();
