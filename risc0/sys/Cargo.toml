@@ -22,4 +22,5 @@ sppark = { workspace = true, optional = true }
 default = []
 cuda = ["dep:blst", "dep:cust", "dep:sppark"]
 rocm = ["dep:blst", "dep:sppark"]
+intel = []
 metal = []

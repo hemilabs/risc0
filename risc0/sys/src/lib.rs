@@ -18,6 +18,9 @@ pub mod cuda;
 #[cfg(feature = "rocm")]
 pub mod hip;
 
+#[cfg(feature = "intel")]
+pub mod intel;
+
 use std::ffi::CStr;
 
 use anyhow::{anyhow, Result};

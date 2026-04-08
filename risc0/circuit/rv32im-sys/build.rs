@@ -34,6 +34,10 @@ fn main() {
         build_rocm_kernels();
     }
 
+    if env::var("CARGO_FEATURE_INTEL").is_ok() {
+        build_intel_kernels();
+    }
+
     build_cpu_kernels();
 }
 
@@ -473,4 +477,233 @@ fn eval_check_source_hash() -> String {
     // Hash target architectures so cache invalidates when arch list changes
     risc0_build_kernel::hip_arches().hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+#[allow(dead_code)]
+fn build_intel_kernels() {
+    rerun_if_changed("kernels/intel");
+    rerun_if_changed("kernels/cxx");
+
+    let cxx_root = env::var("DEP_RISC0_SYS_CXX_ROOT").unwrap();
+    let out_dir = env::var("OUT_DIR").map(PathBuf::from).unwrap();
+
+    // Find icpx compiler
+    let icpx = env::var("RISC0_ICPX")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let oneapi = PathBuf::from("/opt/intel/oneapi/compiler/latest/bin/icpx");
+            if oneapi.exists() { oneapi } else { PathBuf::from("icpx") }
+        });
+
+    // Cache directory for the expensive eval_check compilation
+    let cache_dir = out_dir
+        .ancestors()
+        .find(|p| p.ends_with("release") || p.ends_with("debug"))
+        .map(|p| p.join("intel_rv32im_cache"))
+        .unwrap_or_else(|| out_dir.join("intel_rv32im_cache"));
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    let so_path = cache_dir.join("librisc0_rv32im_intel.so");
+
+    // Check if we can skip rebuild
+    let stamp_path = cache_dir.join("intel_eval_check.stamp");
+    let need_rebuild = !so_path.exists() || {
+        let stamp = std::fs::read_to_string(&stamp_path).unwrap_or_default();
+        stamp.is_empty() // Always rebuild if no stamp (TODO: hash sources)
+    };
+
+    if need_rebuild {
+        eprintln!("Building Intel SYCL eval_check kernel...");
+
+        let mut cmd = Command::new(&icpx);
+        cmd.arg("-shared")
+            .arg("-fPIC")
+            .arg("-fsycl")
+            .arg("-std=c++17")
+            .arg("-Os") // -Os + noinline + 256 GRF: best eval_check perf (18MB vs 30MB -O1, 2x fewer icache misses)
+            // Tell ocloc to skip expensive optimization passes via -cl-opt-disable.
+            // Without this, ocloc takes 3+ hours for the 52K-line kernel.
+            // AOT compilation for BMG. With __noinline__ on the 20 sub-functions,
+            // ocloc should handle this in reasonable time (est. 15-30 min).
+            .arg("-Wno-unused-parameter")
+            .arg("-Wno-unused-function")
+            .arg("-Wno-unused-variable")
+            .arg("-Wno-sign-compare")
+            .arg(format!("-I{cxx_root}"))
+            .arg("-Ikernels/cxx");
+
+        // Create an amalgamation file that includes all poly_fp sources
+        // in a single translation unit (required for SYCL device code).
+        // We handle the kInvRate redefinition by including all files in
+        // a namespace wrapper with the constant defined once.
+        let amalg_path = out_dir.join("intel_eval_check_amalg.cpp");
+        let mut amalg = String::new();
+        amalg.push_str("// Auto-generated amalgamation for SYCL device code\n");
+        amalg.push_str("#include \"fp.h\"\n");
+        amalg.push_str("#include \"fpext.h\"\n");
+        amalg.push_str("#include <cstdint>\n");
+        amalg.push_str("namespace risc0::circuit::rv32im_v2 {\n");
+        amalg.push_str("constexpr size_t kInvRate = 4;\n");
+        // Include the function bodies but skip their preamble (includes + kInvRate).
+        // CRITICAL: inject __attribute__((noinline)) before each rv32im_v2_* function
+        // DEFINITION (not declarations). Without noinline, LLVM/IGC tries to inline
+        // all 52K lines into one mega-function, causing ocloc to take 3+ hours.
+        // Tested selective inlining (pairs) — SLOWER due to increased per-function
+        // register pressure. All-noinline with 256 GRF is optimal.
+        for i in 0..4 {
+            let src = std::fs::read_to_string(
+                format!("kernels/cxx/rust_poly_fp_{i}.cpp")
+            ).unwrap();
+            if let Some(ns_start) = src.find("namespace risc0::circuit::rv32im_v2 {") {
+                let body_start = ns_start + "namespace risc0::circuit::rv32im_v2 {".len();
+                if let Some(body_end) = src.rfind('}') {
+                    let body = &src[body_start..body_end];
+                    let mut modified = String::new();
+                    for line in body.lines() {
+                        if line.starts_with("FpExt rv32im_v2_") && line.contains('{') {
+                            modified.push_str("__attribute__((noinline)) ");
+                        }
+                        modified.push_str(line);
+                        modified.push('\n');
+                    }
+                    amalg.push_str(&modified);
+                }
+            }
+        }
+        amalg.push_str("} // namespace risc0::circuit::rv32im_v2\n");
+        // Append the kernel wrapper
+        amalg.push_str(&std::fs::read_to_string("kernels/intel/eval_check.cpp").unwrap());
+        std::fs::write(&amalg_path, &amalg).unwrap();
+
+        cmd.arg(&amalg_path)
+            .arg("-o")
+            .arg(&so_path)
+            .arg("-fsycl-targets=intel_gpu_bmg_g31") // AOT with noinline sub-functions
+            // Force 256 GRF mode: doubles register file from 8KB to 16KB per thread,
+            // dramatically reducing the 42KB spill overhead. Trades occupancy (8→4 threads/EU)
+            // for fewer spills — net win since kernel is spill-bound, not compute-bound.
+            .arg("-Xs").arg("-options -cl-intel-256-GRF-per-thread");
+
+        eprintln!("  Running: {:?}", cmd);
+        let output = cmd.output().expect("Failed to run icpx");
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            panic!("Intel eval_check compilation failed:\n{}", stderr);
+        }
+        std::fs::write(&stamp_path, "built").unwrap();
+        eprintln!("  Built {}", so_path.display());
+    } else {
+        eprintln!("Using cached Intel eval_check kernel");
+    }
+
+    // Link eval_check
+    println!("cargo:rustc-link-search=native={}", cache_dir.display());
+    println!("cargo:rustc-link-lib=dylib=risc0_rv32im_intel");
+
+    // ========================================================================
+    // Build Intel SYCL witgen kernel (separate .so, ~34s compile)
+    // ========================================================================
+    let witgen_so = cache_dir.join("librisc0_rv32im_intel_witgen.so");
+    let witgen_stamp = cache_dir.join("intel_witgen.stamp");
+    let witgen_rebuild = !witgen_so.exists() || {
+        let stamp = std::fs::read_to_string(&witgen_stamp).unwrap_or_default();
+        stamp.is_empty()
+    };
+
+    if witgen_rebuild {
+        eprintln!("Building Intel SYCL witgen kernel...");
+
+        // Create witgen amalgamation: Intel headers + steps.cpp body + ffi_witgen.cpp
+        let witgen_amalg_path = out_dir.join("intel_witgen_amalg.cpp");
+        let mut witgen_amalg = String::new();
+        witgen_amalg.push_str("// Auto-generated SYCL witgen amalgamation\n");
+        witgen_amalg.push_str("#include \"steps.h\"\n");
+        witgen_amalg.push_str("#include \"witgen.h\"\n");
+        witgen_amalg.push_str("\n");
+        witgen_amalg.push_str("namespace risc0::circuit::rv32im_v2::intel {\n");
+
+        // Read steps.cpp, extract body, inject noinline
+        let steps_src = std::fs::read_to_string("kernels/cxx/steps.cpp").unwrap();
+        let ns_marker = "namespace risc0::circuit::rv32im_v2::cpu {";
+        if let Some(ns_start) = steps_src.find(ns_marker) {
+            let body_start = ns_start + ns_marker.len();
+            if let Some(body_end) = steps_src.rfind('}') {
+                let body = &steps_src[body_start..body_end];
+                let mut noinline_count = 0;
+                for line in body.lines() {
+                    let s = line.trim_start();
+
+                    // Inject noinline on function definitions
+                    if !s.is_empty() && !s.starts_with("//") && !s.starts_with('#')
+                        && !s.starts_with("namespace") && !s.starts_with("using")
+                        && !s.starts_with('}') && !s.starts_with('{')
+                        && !s.starts_with("if") && !s.starts_with("for")
+                        && !s.starts_with("while") && !s.starts_with("switch")
+                        && !s.starts_with("else") && !s.starts_with("return")
+                        && !s.starts_with("auto") && !s.starts_with("Val ")
+                        && !s.starts_with("ExtVal") && !s.starts_with("size_t")
+                        && s.contains('(') && s.trim_end().ends_with('{')
+                        && (s.contains("Struct ") || s.starts_with("void step_")
+                            || s.starts_with("ComponentStruct "))
+                    {
+                        witgen_amalg.push_str("__attribute__((noinline)) ");
+                        noinline_count += 1;
+                    }
+                    witgen_amalg.push_str(line);
+                    witgen_amalg.push('\n');
+                }
+                eprintln!("  Injected noinline on {} functions", noinline_count);
+            }
+        }
+        witgen_amalg.push_str("} // namespace risc0::circuit::rv32im_v2::intel\n\n");
+        // Append the kernel wrapper + extern implementations
+        witgen_amalg.push_str(
+            &std::fs::read_to_string("kernels/intel/ffi_witgen.cpp").unwrap()
+        );
+        std::fs::write(&witgen_amalg_path, &witgen_amalg).unwrap();
+
+        let mut cmd = Command::new(&icpx);
+        cmd.arg("-shared")
+            .arg("-fPIC")
+            .arg("-fsycl")
+            .arg("-std=c++17")
+            .arg("-Os") // -Os: different optimization passes to avoid icpx -O1 accum miscompilation
+            .arg("-Xs").arg("-options -cl-opt-disable")
+            .arg("-Wno-unused-parameter")
+            .arg("-Wno-unused-function")
+            .arg("-Wno-unused-variable")
+            .arg("-Wno-sign-compare")
+            .arg("-Wno-unused-but-set-variable")
+            .arg(format!("-Ikernels/intel"))
+            .arg(format!("-I{cxx_root}"))
+            .arg("-Ikernels/cxx")
+            .arg(&witgen_amalg_path)
+            .arg("-o")
+            .arg(&witgen_so)
+            .arg("-fsycl-targets=intel_gpu_bmg_g31");
+
+        eprintln!("  Running: {:?}", cmd);
+        let output = cmd.output().expect("Failed to run icpx for witgen");
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("Intel witgen compilation failed (non-fatal, using CPU fallback):\n{}", stderr);
+            // Don't panic — witgen can fall back to CPU
+        } else {
+            std::fs::write(&witgen_stamp, "built").unwrap();
+            eprintln!("  Built {}", witgen_so.display());
+        }
+    } else {
+        eprintln!("Using cached Intel witgen kernel");
+    }
+
+    // Link witgen .so (if it exists)
+    if witgen_so.exists() {
+        println!("cargo:rustc-link-lib=dylib=risc0_rv32im_intel_witgen");
+    }
+
+    // RPATH for runtime
+    let intel_lib = PathBuf::from("/opt/intel/oneapi/compiler/latest/lib");
+    if intel_lib.exists() {
+        println!("cargo:rustc-link-search=native={}", intel_lib.display());
+    }
 }

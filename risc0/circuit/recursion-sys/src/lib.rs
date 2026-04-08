@@ -107,3 +107,20 @@ extern "C" {
         poly_mix: *const BabyBearExtElem,
     ) -> *const std::os::raw::c_char;
 }
+
+#[cfg(feature = "intel")]
+extern "C" {
+    pub fn risc0_circuit_recursion_intel_eval_check(
+        queue: *mut std::os::raw::c_void,
+        check: *mut std::os::raw::c_void,
+        ctrl: *const std::os::raw::c_void,
+        data: *const std::os::raw::c_void,
+        accum: *const std::os::raw::c_void,
+        mix: *const std::os::raw::c_void,
+        out: *const std::os::raw::c_void,
+        poly_mix: *const std::os::raw::c_void,
+        rou: u32,
+        po2: u32,
+        domain: u32,
+    ) -> *const std::os::raw::c_char;
+}

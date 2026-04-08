@@ -79,5 +79,7 @@ opt-level = 3
 [profile.release]
 lto = true
 
-[patch.crates-io]
-sppark = { path = "/home/hotaisle/r0remoteamd/risc0-sppark/rust" }
+# Note: The sppark patch path is only needed for CUDA/ROCm builds.
+# Intel builds don't depend on sppark.
+# [patch.crates-io]
+# sppark = { path = "/home/hotaisle/r0remoteamd/risc0-sppark/rust" }

@@ -33,6 +33,10 @@ fn main() {
     if env::var("CARGO_FEATURE_ROCM").is_ok() {
         build_rocm_kernels();
     }
+
+    if env::var("CARGO_FEATURE_INTEL").is_ok() {
+        build_intel_kernels();
+    }
 }
 
 fn build_cpu_kernels() {
@@ -192,6 +196,128 @@ fn build_rocm_kernels() {
 
     // Link against HIP runtime
     risc0_build_kernel::emit_rocm_lib_link();
+}
+
+#[allow(dead_code)]
+fn build_intel_kernels() {
+    rerun_if_changed("kernels/intel");
+    rerun_if_changed("kernels/cxx");
+
+    let cxx_root = env::var("DEP_RISC0_SYS_CXX_ROOT").unwrap();
+    let out_dir = env::var("OUT_DIR").map(PathBuf::from).unwrap();
+
+    // Find icpx compiler
+    let icpx = env::var("RISC0_ICPX")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let oneapi = PathBuf::from("/opt/intel/oneapi/compiler/latest/bin/icpx");
+            if oneapi.exists() { oneapi } else { PathBuf::from("icpx") }
+        });
+
+    // Cache directory for the expensive eval_check compilation
+    let cache_dir = out_dir
+        .ancestors()
+        .find(|p| p.ends_with("release") || p.ends_with("debug"))
+        .map(|p| p.join("intel_recursion_cache"))
+        .unwrap_or_else(|| out_dir.join("intel_recursion_cache"));
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    let so_path = cache_dir.join("librisc0_recursion_intel.so");
+
+    // Check if we can skip rebuild
+    let stamp_path = cache_dir.join("intel_eval_check.stamp");
+    let need_rebuild = !so_path.exists() || {
+        let stamp = std::fs::read_to_string(&stamp_path).unwrap_or_default();
+        stamp.is_empty() // Always rebuild if no stamp (TODO: hash sources)
+    };
+
+    if need_rebuild {
+        eprintln!("Building Intel SYCL eval_check kernel for recursion...");
+
+        let mut cmd = Command::new(&icpx);
+        cmd.arg("-shared")
+            .arg("-fPIC")
+            .arg("-fsycl")
+            .arg("-std=c++17")
+            .arg("-O1") // -O1 with -cl-opt-disable for ocloc
+            .arg("-Xs").arg("-options -cl-opt-disable")
+            .arg("-Wno-unused-parameter")
+            .arg("-Wno-unused-function")
+            .arg("-Wno-unused-variable")
+            .arg("-Wno-sign-compare")
+            .arg(format!("-I{cxx_root}"))
+            .arg("-Ikernels/cxx");
+
+        // Create an amalgamation file that includes poly_fp.cpp + kernel wrapper
+        // in a single translation unit (required for SYCL device code).
+        // The recursion poly_fp.cpp is a single monolithic function (~24K lines),
+        // roughly half the size of rv32im's 52K. We mark the function itself as
+        // noinline so it compiles as a separate device function.
+        let amalg_path = out_dir.join("intel_recursion_eval_check_amalg.cpp");
+        let mut amalg = String::new();
+        amalg.push_str("// Auto-generated amalgamation for SYCL device code\n");
+        amalg.push_str("#include \"fp.h\"\n");
+        amalg.push_str("#include \"fpext.h\"\n");
+        amalg.push_str("#include <cstdint>\n");
+        amalg.push_str("namespace risc0::circuit::recursion {\n");
+        amalg.push_str("constexpr size_t kInvRate = 4;\n");
+
+        // Read poly_fp.cpp and extract the function body, skipping the preamble
+        let src = std::fs::read_to_string("kernels/cxx/poly_fp.cpp").unwrap();
+        if let Some(ns_start) = src.find("namespace risc0::circuit::recursion {") {
+            let body_start = ns_start + "namespace risc0::circuit::recursion {".len();
+            if let Some(body_end) = src.rfind('}') {
+                let body = &src[body_start..body_end];
+                // Inject __attribute__((noinline)) on the function definition.
+                // The function definition starts with "FpExt poly_fp(" at line start.
+                let mut modified = String::new();
+                let mut injected = false;
+                for line in body.lines() {
+                    if !injected && line.starts_with("FpExt poly_fp(") && line.contains('{') {
+                        // This is the function definition - inject noinline
+                        modified.push_str("__attribute__((noinline)) ");
+                        injected = true;
+                    } else if !injected && line.starts_with("FpExt poly_fp(") {
+                        // Forward declaration — skip, we already have it in header
+                        // Actually keep it but don't inject noinline on declarations
+                    }
+                    modified.push_str(line);
+                    modified.push('\n');
+                }
+                amalg.push_str(&modified);
+            }
+        }
+        amalg.push_str("} // namespace risc0::circuit::recursion\n");
+        // Append the kernel wrapper
+        amalg.push_str(&std::fs::read_to_string("kernels/intel/eval_check.cpp").unwrap());
+        std::fs::write(&amalg_path, &amalg).unwrap();
+
+        cmd.arg(&amalg_path)
+            .arg("-o")
+            .arg(&so_path)
+            .arg("-fsycl-targets=intel_gpu_bmg_g31"); // AOT for BMG
+
+        eprintln!("  Running: {:?}", cmd);
+        let output = cmd.output().expect("Failed to run icpx");
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            panic!("Intel recursion eval_check compilation failed:\n{}", stderr);
+        }
+        std::fs::write(&stamp_path, "built").unwrap();
+        eprintln!("  Built {}", so_path.display());
+    } else {
+        eprintln!("Using cached Intel recursion eval_check kernel");
+    }
+
+    // Link
+    println!("cargo:rustc-link-search=native={}", cache_dir.display());
+    println!("cargo:rustc-link-lib=dylib=risc0_recursion_intel");
+
+    // RPATH for runtime
+    let intel_lib = PathBuf::from("/opt/intel/oneapi/compiler/latest/lib");
+    if intel_lib.exists() {
+        println!("cargo:rustc-link-search=native={}", intel_lib.display());
+    }
 }
 
 fn rerun_if_changed<P: AsRef<Path>>(path: P) {

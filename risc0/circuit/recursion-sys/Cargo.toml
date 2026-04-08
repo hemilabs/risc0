@@ -22,4 +22,5 @@ risc0-build-kernel = { workspace = true }
 default = []
 cuda = ["dep:sppark", "risc0-sys/cuda"]
 rocm = ["dep:sppark", "risc0-sys/rocm"]
+intel = ["risc0-sys/intel"]
 metal = []

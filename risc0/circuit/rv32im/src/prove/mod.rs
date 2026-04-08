@@ -67,6 +67,8 @@ pub fn segment_prover() -> Result<Box<dyn SegmentProver>> {
             self::hal::hip::segment_prover()
         // } else if #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), target_os = "ios"))] {
         // self::hal::metal::segment_prover(hashfn)
+        } else if #[cfg(feature = "intel")] {
+            self::hal::intel::segment_prover()
         } else {
             self::hal::cpu::segment_prover()
         }

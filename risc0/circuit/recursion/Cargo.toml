@@ -66,6 +66,12 @@ rocm = [
   "risc0-zkp/rocm",
   "std",
 ]
+intel = [
+  "prove",
+  "risc0-circuit-recursion-sys/intel",
+  "risc0-zkp/intel",
+  "std",
+]
 default = ["prove", "test"]
 metal = ["prove"]
 prove = [

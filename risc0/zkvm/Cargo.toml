@@ -176,6 +176,12 @@ rocm = [
   "risc0-groth16/rocm",
   "risc0-zkp/rocm",
 ]
+intel = [
+  "prove",
+  "risc0-circuit-recursion/intel",
+  "risc0-circuit-rv32im/intel",
+  "risc0-zkp/intel",
+]
 default = ["client", "bonsai"]
 r0vm-ver-compat = []
 disable-dev-mode = []

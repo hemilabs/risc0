@@ -22,6 +22,12 @@ use risc0_build_kernel::{KernelBuild, KernelType};
 #[cfg(all(feature = "cuda", feature = "rocm"))]
 compile_error!("Features 'cuda' and 'rocm' are mutually exclusive. Enable only one GPU backend.");
 
+#[cfg(all(feature = "cuda", feature = "intel"))]
+compile_error!("Features 'cuda' and 'intel' are mutually exclusive. Enable only one GPU backend.");
+
+#[cfg(all(feature = "rocm", feature = "intel"))]
+compile_error!("Features 'rocm' and 'intel' are mutually exclusive. Enable only one GPU backend.");
+
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let cxx_root = manifest_dir.join("cxx");
@@ -41,6 +47,10 @@ fn main() {
             manifest_dir.join("kernels/zkp/cuda").to_string_lossy()
         );
         build_rocm_kernels(&cxx_root);
+    }
+
+    if env::var("CARGO_FEATURE_INTEL").is_ok() {
+        build_intel_kernels();
     }
 
     if env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "macos" || os == "ios") {
@@ -113,6 +123,90 @@ fn build_rocm_kernels(cxx_root: &Path) {
 
     // Link against HIP runtime
     risc0_build_kernel::emit_rocm_lib_link();
+}
+
+fn build_intel_kernels() {
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let intel_dir = manifest_dir.join("kernels/zkp/intel");
+
+    println!("cargo:rerun-if-changed={}", intel_dir.display());
+
+    // Find icpx compiler
+    let icpx = which_icpx();
+
+    // The ESIMD kernel sources. These are compiled into a single shared library
+    // that provides the extern "C" FFI functions called from intel.rs.
+    let sources = [
+        intel_dir.join("intel_ffi.cpp"),
+        intel_dir.join("ntt_kernel.cpp"),
+        intel_dir.join("poseidon2.cpp"),
+        intel_dir.join("poseidon254.cpp"),
+        intel_dir.join("eltwise_ops.cpp"),
+        intel_dir.join("fri_poly_ops.cpp"),
+    ];
+
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let lib_path = out_dir.join("librisc0_intel_kernels.so");
+
+    // Compile with icpx
+    let mut cmd = std::process::Command::new(&icpx);
+    cmd.arg("-fsycl")
+        .arg("-shared")
+        .arg("-fPIC")
+        .arg("-std=c++17")
+        .arg("-O3")
+        // ESIMD stateless mem: forces A64 addressing for correct large-buffer access.
+        // NOTE: -fsycl-device-code-split=off and -flto are used in benchmarks but cause
+        // massive JIT regression (~200s) when combined without AOT. Keep them out until
+        // AOT (-fsycl-targets=intel_gpu_bmg_g31) is added.
+        .arg("-fsycl-esimd-force-stateless-mem")
+        .arg("-Wno-unused-parameter")
+        .arg("-Wno-unused-function")
+        .arg("-Wno-unused-variable")
+        .arg("-o")
+        .arg(&lib_path)
+        .arg(format!("-I{}", intel_dir.display()));
+
+    for src in &sources {
+        cmd.arg(src);
+    }
+
+    let status = cmd.status().expect("Failed to run icpx. Is oneAPI installed?");
+    if !status.success() {
+        panic!("icpx compilation failed for Intel ESIMD kernels");
+    }
+
+    // Tell cargo to link against the compiled library
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=dylib=risc0_intel_kernels");
+
+    // Also link the SYCL runtime
+    if let Ok(oneapi_root) = env::var("ONEAPI_ROOT") {
+        let lib_dir = PathBuf::from(&oneapi_root).join("lib");
+        if lib_dir.exists() {
+            println!("cargo:rustc-link-search=native={}", lib_dir.display());
+        }
+    }
+    // Link sycl runtime (libsycl.so)
+    println!("cargo:rustc-link-lib=dylib=sycl");
+}
+
+fn which_icpx() -> PathBuf {
+    // Check RISC0_ICPX env var first, then PATH
+    if let Ok(icpx) = env::var("RISC0_ICPX") {
+        return PathBuf::from(icpx);
+    }
+    // Try to find icpx in PATH
+    if let Ok(output) = std::process::Command::new("which").arg("icpx").output() {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return PathBuf::from(path);
+            }
+        }
+    }
+    // Default: assume it's in PATH
+    PathBuf::from("icpx")
 }
 
 fn build_metal_kernels() {

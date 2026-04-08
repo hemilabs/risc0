@@ -73,6 +73,12 @@ rocm = [
   "risc0-sys/rocm",
   "risc0-zkp/rocm",
 ]
+intel = [
+  "prove",
+  "risc0-circuit-rv32im-sys/intel",
+  "risc0-sys/intel",
+  "risc0-zkp/intel",
+]
 default = []
 # entropy_finder = []
 execute = [

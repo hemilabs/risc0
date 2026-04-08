@@ -19,6 +19,8 @@ use risc0_zkp::hal::Hal;
 pub(crate) mod cpu;
 #[cfg(feature = "cuda")]
 pub(crate) mod cuda;
+#[cfg(feature = "intel")]
+pub(crate) mod intel;
 #[cfg(feature = "rocm")]
 pub(crate) mod hip;
 // #[cfg(all(
