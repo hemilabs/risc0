@@ -5,6 +5,7 @@
 #include <sycl/sycl.hpp>
 #include <cstring>
 #include <cstdio>
+#include <vector>
 
 // Forward declarations for ESIMD kernel functions (defined in other .cpp files)
 extern "C" {
@@ -708,15 +709,64 @@ const char* esimd_combos_divide_ffi(void* queue, void* d_combos,
         auto* remainders = static_cast<uint32_t*>(d_remainders);
         uint32_t col_stride = rows * 4;
 
-        // Process each division sequentially (but each division's row scan
-        // runs as a single-work-item GPU kernel to keep data on device).
-        for (uint32_t k = 0; k < info_count; k++) {
-            uint32_t off = k * 5;
-            q->single_task([=]() {
-                uint32_t comboId = info[off];
+        // Each DivideInfo entry divides one combo column by (x - z). The CPU
+        // caller (prover.rs) batches multiple back values per combo, so multiple
+        // entries may share the same comboId and must be serialized for that combo.
+        //
+        // Launch one work-item per division. Within a single work-item we process
+        // ALL entries for that comboId sequentially (since they share the column),
+        // not just one entry. This requires the CPU caller to group entries by combo.
+        //
+        // Caller's chunks list iterates combo_count first, so entries are already
+        // in groups: [(combo0, pows...), (combo1, pows...), ...]
+        // We can process each combo in parallel — each gets a work item that
+        // sequentially does all its divisions.
+
+        // The prover.rs builds chunks as: for combo_id 0..combo_count, push
+        // (i, pows). Then info entries are flattened: for each (i, pows), push
+        // info[k] = (i, z) for each z in pows.
+        // This means info entries are sorted by comboId first, then by pow index.
+        // So we can find groups by detecting comboId changes.
+
+        // Build group offsets on host (info is device-side, but small)
+        std::vector<uint32_t> h_info(info_count * 5);
+        q->memcpy(h_info.data(), info, info_count * 5 * sizeof(uint32_t)).wait();
+
+        // Find unique comboIds and their entry ranges
+        struct ComboGroup { uint32_t comboId; uint32_t start; uint32_t count; };
+        std::vector<ComboGroup> groups;
+        for (uint32_t k = 0; k < info_count;) {
+            uint32_t cid = h_info[k * 5];
+            uint32_t end = k + 1;
+            while (end < info_count && h_info[end * 5] == cid) end++;
+            groups.push_back({cid, k, end - k});
+            k = end;
+        }
+
+        // Upload group descriptors to device
+        uint32_t n_groups = groups.size();
+        uint32_t* d_groups = sycl::malloc_device<uint32_t>(n_groups * 3, *q);
+        std::vector<uint32_t> h_groups_flat(n_groups * 3);
+        for (uint32_t i = 0; i < n_groups; i++) {
+            h_groups_flat[i * 3 + 0] = groups[i].comboId;
+            h_groups_flat[i * 3 + 1] = groups[i].start;
+            h_groups_flat[i * 3 + 2] = groups[i].count;
+        }
+        q->memcpy(d_groups, h_groups_flat.data(), n_groups * 3 * sizeof(uint32_t)).wait();
+
+        // Launch one work-item per group; each processes its comboId's divisions sequentially.
+        q->parallel_for(sycl::range<1>(n_groups), [=](sycl::id<1> gid) {
+            uint32_t g = gid[0];
+            uint32_t comboId = d_groups[g * 3 + 0];
+            uint32_t start = d_groups[g * 3 + 1];
+            uint32_t count = d_groups[g * 3 + 2];
+            uint32_t* col = combos + comboId * col_stride;
+
+            for (uint32_t e = 0; e < count; e++) {
+                uint32_t k = start + e;
+                uint32_t off = k * 5;
                 bb31_sycl::FpExt4 z = {info[off + 1], info[off + 2],
                                          info[off + 3], info[off + 4]};
-                uint32_t* col = combos + comboId * col_stride;
 
                 bb31_sycl::FpExt4 cur = {0, 0, 0, 0};
                 for (uint32_t ii = rows; ii-- > 0;) {
@@ -735,9 +785,10 @@ const char* esimd_combos_divide_ffi(void* queue, void* d_combos,
                 remainders[k * 4 + 1] = cur.e[1];
                 remainders[k * 4 + 2] = cur.e[2];
                 remainders[k * 4 + 3] = cur.e[3];
-            });
-        }
-        q->wait();
+            }
+        }).wait();
+
+        sycl::free(d_groups, *q);
     )
 }
 

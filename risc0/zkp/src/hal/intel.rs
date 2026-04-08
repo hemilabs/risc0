@@ -945,9 +945,44 @@ impl<IH: IntelHash + ?Sized> Hal for IntelHal<IH> {
         });
     }
 
-    // combos_prepare and combos_divide use default CPU fallback implementations.
-    // GPU single-task combos_divide was tested on v5.0.0 and was slower than CPU
-    // (sequential polynomial division runs faster on CPU than on a single GPU thread).
+    // combos_divide uses default CPU fallback. GPU implementation is sequential
+    // (4M iterations per division) and even when parallelized across combos via
+    // parallel_for, scalar GPU execution is much slower than vectorized CPU.
+    // Tested 7135ms GPU vs 234ms CPU (30x slower).
+
+    fn combos_prepare(
+        &self,
+        combos: &Self::Buffer<Self::ExtElem>,
+        coeff_u: &[Self::ExtElem],
+        combo_count: usize,
+        cycles: usize,
+        reg_sizes: &[u32],
+        reg_combo_ids: &[u32],
+        mix: &Self::ExtElem,
+    ) {
+        scope!("combos_prepare");
+        // Upload small parameter buffers to GPU
+        let coeff_u_buf = self.copy_from_extelem("coeff_u", coeff_u);
+        let reg_sizes_buf = self.copy_from_u32("reg_sizes", reg_sizes);
+        let reg_combo_ids_buf = self.copy_from_u32("reg_combo_ids", reg_combo_ids);
+        let mix_buf = self.copy_from_extelem("mix", &[*mix]);
+
+        let queue = get_queue();
+        esimd_check(unsafe {
+            intel::esimd_combos_prepare_ffi(
+                queue,
+                combos.as_device_ptr().0 as *mut std::ffi::c_void,
+                coeff_u_buf.as_device_ptr().0 as *const std::ffi::c_void,
+                combo_count as u32,
+                cycles as u32,
+                reg_sizes.len() as u32,
+                reg_sizes_buf.as_device_ptr().0 as *const std::ffi::c_void,
+                reg_combo_ids_buf.as_device_ptr().0 as *const std::ffi::c_void,
+                Self::CHECK_SIZE as u32,
+                mix_buf.as_device_ptr().0 as *const std::ffi::c_void,
+            )
+        });
+    }
 }
 
 // ============================================================================
