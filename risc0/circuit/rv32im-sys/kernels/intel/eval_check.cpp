@@ -14,6 +14,11 @@ static const char* make_error(const char* msg) { return strdup(msg); }
 
 // Async eval_check: submit kernel but do NOT wait.
 // Caller must call risc0_circuit_rv32im_intel_eval_check_sync() to wait.
+//
+// Tested approaches:
+// - Persistent (20 WGs, loop): 16.9s — too few threads, no latency hiding
+// - Batched (BATCH_SIZE=4): 7.5s — loop overhead + register pressure increase
+// - Original 1-cycle-per-thread: 2.85s — best for this architecture
 extern "C" const char* risc0_circuit_rv32im_intel_eval_check(
     void* queue_ptr,
     void* d_check,
@@ -36,7 +41,6 @@ extern "C" const char* risc0_circuit_rv32im_intel_eval_check(
         auto* mix = static_cast<Fp*>(const_cast<void*>(d_mix));
         auto* poly_mix = static_cast<FpExt*>(const_cast<void*>(d_poly_mix));
 
-        // Construct rou from raw Montgomery bits
         Fp rou_val;
         std::memcpy(&rou_val, &rou_raw, sizeof(uint32_t));
 
