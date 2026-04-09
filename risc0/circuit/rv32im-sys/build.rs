@@ -594,9 +594,13 @@ fn build_intel_kernels() {
             } else {
                 let stderr = String::from_utf8_lossy(&mp_output.stderr);
                 eprintln!("{}", stderr);
-                // Append the multi-pass kernel wrapper with MULTIPASS_ENABLED
+                // Append the kernel wrapper. Set RISC0_BUILD_MULTIPASS=1 to enable
+                // the multi-pass kernel (currently has correctness bugs).
                 let mut amalg_content = std::fs::read_to_string(&amalg_path).unwrap();
-                amalg_content.push_str("\n#define MULTIPASS_ENABLED\n");
+                if std::env::var("RISC0_BUILD_MULTIPASS").is_ok() {
+                    amalg_content.push_str("\n#define MULTIPASS_ENABLED\n");
+                    eprintln!("  MULTIPASS_ENABLED defined (RISC0_BUILD_MULTIPASS set)");
+                }
                 amalg_content.push_str(&std::fs::read_to_string("kernels/intel/eval_check.cpp").unwrap());
                 std::fs::write(&amalg_path, &amalg_content).unwrap();
             }
