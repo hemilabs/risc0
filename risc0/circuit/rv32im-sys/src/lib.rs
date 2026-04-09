@@ -164,6 +164,34 @@ extern "C" {
         queue: *mut std::os::raw::c_void,
     ) -> *const std::os::raw::c_char;
 
+    // 2-way multi-pass eval_check (separate .so files per pass)
+    pub fn risc0_circuit_rv32im_intel_eval_check_pass1(
+        queue: *mut std::os::raw::c_void,
+        inter_fp: *mut std::os::raw::c_void,
+        inter_ext: *mut std::os::raw::c_void,
+        data: *const std::os::raw::c_void,
+        accum: *const std::os::raw::c_void,
+        out: *const std::os::raw::c_void,
+        mix: *const std::os::raw::c_void,
+        poly_mix: *const std::os::raw::c_void,
+        domain: u32,
+    ) -> *const std::os::raw::c_char;
+
+    pub fn risc0_circuit_rv32im_intel_eval_check_pass2(
+        queue: *mut std::os::raw::c_void,
+        check: *mut std::os::raw::c_void,
+        inter_fp: *const std::os::raw::c_void,
+        inter_ext: *const std::os::raw::c_void,
+        data: *const std::os::raw::c_void,
+        accum: *const std::os::raw::c_void,
+        out: *const std::os::raw::c_void,
+        mix: *const std::os::raw::c_void,
+        poly_mix: *const std::os::raw::c_void,
+        rou: u32,
+        po2: u32,
+        domain: u32,
+    ) -> *const std::os::raw::c_char;
+
     pub fn risc0_circuit_rv32im_intel_witgen(
         queue: *mut std::os::raw::c_void,
         mode: u32,

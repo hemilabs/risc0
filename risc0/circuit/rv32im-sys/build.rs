@@ -571,44 +571,15 @@ fn build_intel_kernels() {
             }
         }
         amalg.push_str("} // namespace risc0::circuit::rv32im_v2\n");
+        // Append the monolithic kernel wrapper
+        amalg.push_str(&std::fs::read_to_string("kernels/intel/eval_check.cpp").unwrap());
+        std::fs::write(&amalg_path, &amalg).unwrap();
 
-        // 2-way multi-pass: run gen_multipass.py to add _pass1 variants and poly_fp_pass2
+        // Also save the mono amalgamation (without kernel wrapper) for multipass generation
         let mono_path = out_dir.join("intel_eval_check_mono.cpp");
-        std::fs::write(&mono_path, &amalg).unwrap();
-        let multipass_script = PathBuf::from("kernels/intel/gen_multipass.py");
-        if multipass_script.exists() {
-            eprintln!("  Running gen_multipass.py for 2-way eval_check split...");
-            let mp_output = Command::new("python3")
-                .arg(&multipass_script)
-                .arg(&mono_path)
-                .arg(&amalg_path)
-                .output()
-                .expect("Failed to run gen_multipass.py");
-            if !mp_output.status.success() {
-                let stderr = String::from_utf8_lossy(&mp_output.stderr);
-                eprintln!("  gen_multipass.py failed (using monolithic fallback):\n{}", stderr);
-                // Fall back to monolithic
-                let mut mono = std::fs::read_to_string(&mono_path).unwrap();
-                mono.push_str(&std::fs::read_to_string("kernels/intel/eval_check.cpp").unwrap());
-                std::fs::write(&amalg_path, &mono).unwrap();
-            } else {
-                let stderr = String::from_utf8_lossy(&mp_output.stderr);
-                eprintln!("{}", stderr);
-                // Append the kernel wrapper. Set RISC0_BUILD_MULTIPASS=1 to enable
-                // the multi-pass kernel (currently has correctness bugs).
-                let mut amalg_content = std::fs::read_to_string(&amalg_path).unwrap();
-                if std::env::var("RISC0_BUILD_MULTIPASS").is_ok() {
-                    amalg_content.push_str("\n#define MULTIPASS_ENABLED\n");
-                    eprintln!("  MULTIPASS_ENABLED defined (RISC0_BUILD_MULTIPASS set)");
-                }
-                amalg_content.push_str(&std::fs::read_to_string("kernels/intel/eval_check.cpp").unwrap());
-                std::fs::write(&amalg_path, &amalg_content).unwrap();
-            }
-        } else {
-            eprintln!("  gen_multipass.py not found, using monolithic eval_check");
-            amalg.push_str(&std::fs::read_to_string("kernels/intel/eval_check.cpp").unwrap());
-            std::fs::write(&amalg_path, &amalg).unwrap();
-        }
+        let mono_content = amalg[..amalg.rfind("} // namespace risc0::circuit::rv32im_v2").unwrap()
+            + "} // namespace risc0::circuit::rv32im_v2\n".len()].to_string();
+        std::fs::write(&mono_path, &mono_content).unwrap();
 
         cmd.arg(&amalg_path)
             .arg("-o")
@@ -634,6 +605,100 @@ fn build_intel_kernels() {
     // Link eval_check
     println!("cargo:rustc-link-search=native={}", cache_dir.display());
     println!("cargo:rustc-link-lib=dylib=risc0_rv32im_intel");
+
+    // mono_path is the monolithic amalgamation without kernel wrapper (for multipass gen)
+    let mono_path = out_dir.join("intel_eval_check_mono.cpp");
+
+    // ========================================================================
+    // Build 2-way multi-pass eval_check (two separate .so files)
+    // Each .so has ~27K lines (half monolithic) → ~9MB GPU binary, fits in L2.
+    // ========================================================================
+    let pass1_so = cache_dir.join("librisc0_rv32im_intel_pass1.so");
+    let pass2_so = cache_dir.join("librisc0_rv32im_intel_pass2.so");
+    let multipass_stamp = cache_dir.join("intel_multipass.stamp");
+    let multipass_rebuild = !pass1_so.exists() || !pass2_so.exists() || {
+        let stamp = std::fs::read_to_string(&multipass_stamp).unwrap_or_default();
+        stamp.is_empty()
+    };
+
+    if multipass_rebuild {
+        let multipass_script = PathBuf::from("kernels/intel/gen_multipass.py");
+        if multipass_script.exists() {
+            eprintln!("Building 2-way multi-pass eval_check kernels...");
+            let pass1_amalg = out_dir.join("intel_eval_check_pass1.cpp");
+            let pass2_amalg = out_dir.join("intel_eval_check_pass2.cpp");
+
+            let mp_output = Command::new("python3")
+                .arg(&multipass_script)
+                .arg(&mono_path)
+                .arg(&pass1_amalg)
+                .arg(&pass2_amalg)
+                .output()
+                .expect("Failed to run gen_multipass.py");
+
+            if mp_output.status.success() {
+                let stderr = String::from_utf8_lossy(&mp_output.stderr);
+                eprintln!("{}", stderr);
+
+                // Compile pass1
+                eprintln!("  Compiling pass1...");
+                let p1_output = Command::new(&icpx)
+                    .arg("-shared").arg("-fPIC").arg("-fsycl").arg("-std=c++17")
+                    .arg("-Os")
+                    .arg("-Wno-unused-parameter").arg("-Wno-unused-function")
+                    .arg("-Wno-unused-variable").arg("-Wno-sign-compare")
+                    .arg(format!("-I{cxx_root}")).arg("-Ikernels/cxx")
+                    .arg(&pass1_amalg).arg("-o").arg(&pass1_so)
+                    .arg("-fsycl-targets=intel_gpu_bmg_g31")
+                    .arg("-Xs").arg("-options -cl-intel-256-GRF-per-thread")
+                    .output().expect("Failed to run icpx for pass1");
+
+                if !p1_output.status.success() {
+                    let stderr = String::from_utf8_lossy(&p1_output.stderr);
+                    eprintln!("  Pass1 compilation failed:\n{}", stderr);
+                } else {
+                    eprintln!("  Built {}", pass1_so.display());
+                }
+
+                // Compile pass2
+                eprintln!("  Compiling pass2...");
+                let p2_output = Command::new(&icpx)
+                    .arg("-shared").arg("-fPIC").arg("-fsycl").arg("-std=c++17")
+                    .arg("-Os")
+                    .arg("-Wno-unused-parameter").arg("-Wno-unused-function")
+                    .arg("-Wno-unused-variable").arg("-Wno-sign-compare")
+                    .arg(format!("-I{cxx_root}")).arg("-Ikernels/cxx")
+                    .arg(&pass2_amalg).arg("-o").arg(&pass2_so)
+                    .arg("-fsycl-targets=intel_gpu_bmg_g31")
+                    .arg("-Xs").arg("-options -cl-intel-256-GRF-per-thread")
+                    .output().expect("Failed to run icpx for pass2");
+
+                if !p2_output.status.success() {
+                    let stderr = String::from_utf8_lossy(&p2_output.stderr);
+                    eprintln!("  Pass2 compilation failed:\n{}", stderr);
+                } else {
+                    eprintln!("  Built {}", pass2_so.display());
+                }
+
+                if pass1_so.exists() && pass2_so.exists() {
+                    std::fs::write(&multipass_stamp, "built").unwrap();
+                }
+            } else {
+                let stderr = String::from_utf8_lossy(&mp_output.stderr);
+                eprintln!("  gen_multipass.py failed:\n{}", stderr);
+            }
+        }
+    } else {
+        eprintln!("Using cached multi-pass eval_check kernels");
+    }
+
+    // Link multi-pass .so files if they exist
+    if pass1_so.exists() {
+        println!("cargo:rustc-link-lib=dylib=risc0_rv32im_intel_pass1");
+    }
+    if pass2_so.exists() {
+        println!("cargo:rustc-link-lib=dylib=risc0_rv32im_intel_pass2");
+    }
 
     // ========================================================================
     // Build Intel SYCL witgen kernel (separate .so, ~34s compile)

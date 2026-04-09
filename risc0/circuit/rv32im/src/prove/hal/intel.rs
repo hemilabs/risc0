@@ -26,7 +26,7 @@ use risc0_zkp::{
         intel::{
             BufferImpl as IntelBuffer, IntelHal, IntelHalPoseidon2, IntelHash, IntelHashPoseidon2,
         },
-        AccumPreflight, CircuitHal,
+        AccumPreflight, CircuitHal, Hal,
     },
     INV_RATE,
 };
@@ -44,9 +44,11 @@ use crate::{
 };
 
 pub struct IntelCircuitHal<IH: IntelHash> {
-    _hal: Rc<IntelHal<IH>>, // retain a reference to ensure the context remains valid
-    // Keep poly_mix buffer alive while eval_check runs asynchronously on separate queue.
+    _hal: Rc<IntelHal<IH>>,
+    // Keep buffers alive while eval_check runs asynchronously on separate queue.
     eval_check_poly_mix: RefCell<Option<IntelBuffer<u32>>>,
+    eval_check_inter_fp: RefCell<Option<IntelBuffer<u32>>>,
+    eval_check_inter_ext: RefCell<Option<IntelBuffer<u32>>>,
 }
 
 impl<IH: IntelHash> IntelCircuitHal<IH> {
@@ -54,6 +56,8 @@ impl<IH: IntelHash> IntelCircuitHal<IH> {
         Self {
             _hal,
             eval_check_poly_mix: RefCell::new(None),
+            eval_check_inter_fp: RefCell::new(None),
+            eval_check_inter_ext: RefCell::new(None),
         }
     }
 }
@@ -165,25 +169,71 @@ impl<IH: IntelHash> CircuitHal<IntelHal<IH>> for IntelCircuitHal<IH> {
         let rou = Val::ROU_FWD[po2 + EXP_PO2];
         let rou_raw: u32 = unsafe { std::mem::transmute(rou) };
 
-        // Submit eval_check on a SEPARATE queue for pipelining.
-        // Next segment's witgen+commit+accum can run on the main queue while
-        // eval_check runs here. Call eval_check_dep() to synchronize.
         let eval_queue = risc0_sys::intel::get_eval_check_queue();
 
-        risc0_sys::intel::esimd_check(unsafe {
-            risc0_circuit_rv32im_sys::risc0_circuit_rv32im_intel_eval_check(
-                eval_queue,
-                check.as_device_ptr().0 as *mut std::ffi::c_void,
-                groups[REGISTER_GROUP_DATA].as_device_ptr().0 as *const std::ffi::c_void,
-                groups[REGISTER_GROUP_ACCUM].as_device_ptr().0 as *const std::ffi::c_void,
-                globals[GLOBAL_OUT].as_device_ptr().0 as *const std::ffi::c_void,
-                globals[GLOBAL_MIX].as_device_ptr().0 as *const std::ffi::c_void,
-                poly_mix_buf.as_device_ptr().0 as *const std::ffi::c_void,
-                rou_raw,
-                po2 as u32,
-                domain as u32,
-            )
-        });
+        let use_multipass = std::env::var_os("RISC0_MULTIPASS").is_some();
+
+        if use_multipass {
+            // 2-way multi-pass: allocate intermediate buffer, run pass1 then pass2
+            // Intermediate: 197 Fp + 7 FpExt per work item
+            // Intermediate: 197 Fp (u32) + 7 FpExt (4 u32 each) per work item
+            let n_inter_fp = 197 * domain;
+            let n_inter_ext = 7 * domain * 4; // FpExt = 4 x u32
+            let inter_fp = self._hal.alloc_u32("inter_fp", n_inter_fp);
+            let inter_ext = self._hal.alloc_u32("inter_ext", n_inter_ext);
+
+            // Pass 1: upper chain → writes intermediate
+            risc0_sys::intel::esimd_check(unsafe {
+                risc0_circuit_rv32im_sys::risc0_circuit_rv32im_intel_eval_check_pass1(
+                    eval_queue,
+                    inter_fp.as_device_ptr().0 as *mut std::ffi::c_void,
+                    inter_ext.as_device_ptr().0 as *mut std::ffi::c_void,
+                    groups[REGISTER_GROUP_DATA].as_device_ptr().0 as *const std::ffi::c_void,
+                    groups[REGISTER_GROUP_ACCUM].as_device_ptr().0 as *const std::ffi::c_void,
+                    globals[GLOBAL_OUT].as_device_ptr().0 as *const std::ffi::c_void,
+                    globals[GLOBAL_MIX].as_device_ptr().0 as *const std::ffi::c_void,
+                    poly_mix_buf.as_device_ptr().0 as *const std::ffi::c_void,
+                    domain as u32,
+                )
+            });
+
+            // Pass 2: reads intermediate → writes check buffer
+            risc0_sys::intel::esimd_check(unsafe {
+                risc0_circuit_rv32im_sys::risc0_circuit_rv32im_intel_eval_check_pass2(
+                    eval_queue,
+                    check.as_device_ptr().0 as *mut std::ffi::c_void,
+                    inter_fp.as_device_ptr().0 as *const std::ffi::c_void,
+                    inter_ext.as_device_ptr().0 as *const std::ffi::c_void,
+                    groups[REGISTER_GROUP_DATA].as_device_ptr().0 as *const std::ffi::c_void,
+                    groups[REGISTER_GROUP_ACCUM].as_device_ptr().0 as *const std::ffi::c_void,
+                    globals[GLOBAL_OUT].as_device_ptr().0 as *const std::ffi::c_void,
+                    globals[GLOBAL_MIX].as_device_ptr().0 as *const std::ffi::c_void,
+                    poly_mix_buf.as_device_ptr().0 as *const std::ffi::c_void,
+                    rou_raw,
+                    po2 as u32,
+                    domain as u32,
+                )
+            });
+            // Keep intermediate buffers alive until eval_check_dep()
+            *self.eval_check_inter_fp.borrow_mut() = Some(inter_fp);
+            *self.eval_check_inter_ext.borrow_mut() = Some(inter_ext);
+        } else {
+            // Monolithic: single kernel call
+            risc0_sys::intel::esimd_check(unsafe {
+                risc0_circuit_rv32im_sys::risc0_circuit_rv32im_intel_eval_check(
+                    eval_queue,
+                    check.as_device_ptr().0 as *mut std::ffi::c_void,
+                    groups[REGISTER_GROUP_DATA].as_device_ptr().0 as *const std::ffi::c_void,
+                    groups[REGISTER_GROUP_ACCUM].as_device_ptr().0 as *const std::ffi::c_void,
+                    globals[GLOBAL_OUT].as_device_ptr().0 as *const std::ffi::c_void,
+                    globals[GLOBAL_MIX].as_device_ptr().0 as *const std::ffi::c_void,
+                    poly_mix_buf.as_device_ptr().0 as *const std::ffi::c_void,
+                    rou_raw,
+                    po2 as u32,
+                    domain as u32,
+                )
+            });
+        }
 
         // Keep poly_mix_buf alive until eval_check_dep() or next eval_check()
         *self.eval_check_poly_mix.borrow_mut() = Some(poly_mix_buf);
@@ -196,8 +246,10 @@ impl<IH: IntelHash> CircuitHal<IntelHal<IH>> for IntelCircuitHal<IH> {
         risc0_sys::intel::esimd_check(unsafe {
             risc0_circuit_rv32im_sys::risc0_circuit_rv32im_intel_eval_check_sync(eval_queue)
         });
-        // Release poly_mix buffer now that eval_check is done
+        // Release all eval_check buffers now that it's done
         *self.eval_check_poly_mix.borrow_mut() = None;
+        *self.eval_check_inter_fp.borrow_mut() = None;
+        *self.eval_check_inter_ext.borrow_mut() = None;
     }
 
     fn accumulate(
