@@ -175,10 +175,12 @@ impl<IH: IntelHash> CircuitHal<IntelHal<IH>> for IntelCircuitHal<IH> {
 
         if use_multipass {
             // 2-way multi-pass: allocate intermediate buffer, run pass1 then pass2
-            // Intermediate: 197 Fp + 7 FpExt per work item
             // Intermediate: 197 Fp (u32) + 9 FpExt (7 by-val + 2 x34 cross-boundary)
             let n_inter_fp = 197 * domain;
-            let n_inter_ext = 9 * domain * 4; // 9 FpExt = 36 u32 per WI
+            let n_inter_ext = 9 * domain * 4;
+            let verbose = std::env::var_os("RISC0_VERBOSE").is_some();
+            let t0 = if verbose { Some(std::time::Instant::now()) } else { None };
+
             let inter_fp = self._hal.alloc_u32("inter_fp", n_inter_fp);
             let inter_ext = self._hal.alloc_u32("inter_ext", n_inter_ext);
 
@@ -197,6 +199,18 @@ impl<IH: IntelHash> CircuitHal<IntelHal<IH>> for IntelCircuitHal<IH> {
                 )
             });
 
+            if verbose {
+                // Sync to measure pass1 time
+                risc0_sys::intel::esimd_check(unsafe {
+                    risc0_circuit_rv32im_sys::risc0_circuit_rv32im_intel_eval_check_sync(eval_queue)
+                });
+                let t1 = std::time::Instant::now();
+                eprintln!("      [eval_check_pass1] {:.1}ms",
+                    t1.duration_since(t0.unwrap()).as_secs_f64() * 1000.0);
+            }
+
+            let t1 = if verbose { Some(std::time::Instant::now()) } else { None };
+
             // Pass 2: reads intermediate → writes check buffer
             risc0_sys::intel::esimd_check(unsafe {
                 risc0_circuit_rv32im_sys::risc0_circuit_rv32im_intel_eval_check_pass2(
@@ -214,6 +228,16 @@ impl<IH: IntelHash> CircuitHal<IntelHal<IH>> for IntelCircuitHal<IH> {
                     domain as u32,
                 )
             });
+
+            if verbose {
+                risc0_sys::intel::esimd_check(unsafe {
+                    risc0_circuit_rv32im_sys::risc0_circuit_rv32im_intel_eval_check_sync(eval_queue)
+                });
+                let t2 = std::time::Instant::now();
+                eprintln!("      [eval_check_pass2] {:.1}ms",
+                    t2.duration_since(t1.unwrap()).as_secs_f64() * 1000.0);
+            }
+
             // Keep intermediate buffers alive until eval_check_dep()
             *self.eval_check_inter_fp.borrow_mut() = Some(inter_fp);
             *self.eval_check_inter_ext.borrow_mut() = Some(inter_ext);
