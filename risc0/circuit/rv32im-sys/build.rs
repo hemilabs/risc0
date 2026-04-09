@@ -571,9 +571,40 @@ fn build_intel_kernels() {
             }
         }
         amalg.push_str("} // namespace risc0::circuit::rv32im_v2\n");
-        // Append the kernel wrapper
-        amalg.push_str(&std::fs::read_to_string("kernels/intel/eval_check.cpp").unwrap());
-        std::fs::write(&amalg_path, &amalg).unwrap();
+
+        // 2-way multi-pass: run gen_multipass.py to add _pass1 variants and poly_fp_pass2
+        let mono_path = out_dir.join("intel_eval_check_mono.cpp");
+        std::fs::write(&mono_path, &amalg).unwrap();
+        let multipass_script = PathBuf::from("kernels/intel/gen_multipass.py");
+        if multipass_script.exists() {
+            eprintln!("  Running gen_multipass.py for 2-way eval_check split...");
+            let mp_output = Command::new("python3")
+                .arg(&multipass_script)
+                .arg(&mono_path)
+                .arg(&amalg_path)
+                .output()
+                .expect("Failed to run gen_multipass.py");
+            if !mp_output.status.success() {
+                let stderr = String::from_utf8_lossy(&mp_output.stderr);
+                eprintln!("  gen_multipass.py failed (using monolithic fallback):\n{}", stderr);
+                // Fall back to monolithic
+                let mut mono = std::fs::read_to_string(&mono_path).unwrap();
+                mono.push_str(&std::fs::read_to_string("kernels/intel/eval_check.cpp").unwrap());
+                std::fs::write(&amalg_path, &mono).unwrap();
+            } else {
+                let stderr = String::from_utf8_lossy(&mp_output.stderr);
+                eprintln!("{}", stderr);
+                // Append the multi-pass kernel wrapper with MULTIPASS_ENABLED
+                let mut amalg_content = std::fs::read_to_string(&amalg_path).unwrap();
+                amalg_content.push_str("\n#define MULTIPASS_ENABLED\n");
+                amalg_content.push_str(&std::fs::read_to_string("kernels/intel/eval_check.cpp").unwrap());
+                std::fs::write(&amalg_path, &amalg_content).unwrap();
+            }
+        } else {
+            eprintln!("  gen_multipass.py not found, using monolithic eval_check");
+            amalg.push_str(&std::fs::read_to_string("kernels/intel/eval_check.cpp").unwrap());
+            std::fs::write(&amalg_path, &amalg).unwrap();
+        }
 
         cmd.arg(&amalg_path)
             .arg("-o")

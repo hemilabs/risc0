@@ -3,22 +3,17 @@
 //   - fp.h, fpext.h includes
 //   - All poly_fp function definitions (from rust_poly_fp_0..3.cpp)
 //   - namespace risc0::circuit::rv32im_v2 with kInvRate defined
-// So we only need the SYCL kernel wrapper here.
+//   - If MULTIPASS_ENABLED: poly_fp_pass1, poly_fp_pass2 (from gen_multipass.py)
 
 #include <sycl/sycl.hpp>
 #include <cstring>
+#include <cstdlib>
+#include <chrono>
 
 using namespace risc0;
 
 static const char* make_error(const char* msg) { return strdup(msg); }
 
-// Async eval_check: submit kernel but do NOT wait.
-// Caller must call risc0_circuit_rv32im_intel_eval_check_sync() to wait.
-//
-// Tested approaches:
-// - Persistent (20 WGs, loop): 16.9s — too few threads, no latency hiding
-// - Batched (BATCH_SIZE=4): 7.5s — loop overhead + register pressure increase
-// - Original 1-cycle-per-thread: 2.85s — best for this architecture
 extern "C" const char* risc0_circuit_rv32im_intel_eval_check(
     void* queue_ptr,
     void* d_check,
@@ -45,45 +40,101 @@ extern "C" const char* risc0_circuit_rv32im_intel_eval_check(
         std::memcpy(&rou_val, &rou_raw, sizeof(uint32_t));
 
         constexpr uint32_t WG_SIZE = 256;
-        // poly_mix: 458 FpExt = 7328 bytes in SLM (64KB per Xe-core).
-        // SLM gives 2.2x improvement on eval_check by mimicking CUDA's __constant__ broadcast.
         constexpr uint32_t POLY_MIX_COUNT = 458;
         uint32_t global_size = ((domain + WG_SIZE - 1) / WG_SIZE) * WG_SIZE;
 
+#ifdef MULTIPASS_ENABLED
+        // 2-way multi-pass: split eval_check into two kernel launches.
+        constexpr uint32_t N_INTER_FP = 134;
+        constexpr uint32_t N_INTER_EXT = 7;
+
+        auto t0 = std::chrono::steady_clock::now();
+        Fp* d_inter_fp = sycl::malloc_device<Fp>((size_t)N_INTER_FP * domain, *q);
+        FpExt* d_inter_ext = sycl::malloc_device<FpExt>((size_t)N_INTER_EXT * domain, *q);
+
+        // Pass 1
         q->submit([&](sycl::handler& h) {
             sycl::local_accessor<FpExt, 1> slm_poly_mix(sycl::range<1>(POLY_MIX_COUNT), h);
-
             h.parallel_for(
                 sycl::nd_range<1>(global_size, WG_SIZE),
-                [=](sycl::nd_item<1> item) [[intel::reqd_sub_group_size(16)]] {
+                [=](sycl::nd_item<1> item) {
                     uint32_t cycle = item.get_global_id(0);
                     uint32_t lid = item.get_local_id(0);
-
-                    // Cooperatively load poly_mix into SLM.
-                    for (uint32_t i = lid; i < POLY_MIX_COUNT; i += WG_SIZE) {
+                    for (uint32_t i = lid; i < POLY_MIX_COUNT; i += WG_SIZE)
                         slm_poly_mix[i] = poly_mix[i];
-                    }
                     sycl::group_barrier(item.get_group());
-
                     if (cycle >= domain) return;
-
                     Fp* args[4] = {accum, data, out, mix};
                     FpExt* pm = slm_poly_mix.get_multi_ptr<sycl::access::decorated::no>().get();
+                    circuit::rv32im_v2::poly_fp_pass1(
+                        (size_t)cycle, (size_t)domain, pm, args,
+                        d_inter_fp, d_inter_ext, domain);
+                });
+        });
 
-                    FpExt tot = circuit::rv32im_v2::poly_fp(
-                        (size_t)cycle, (size_t)domain, pm, args);
-
+        // Pass 2
+        q->submit([&](sycl::handler& h) {
+            sycl::local_accessor<FpExt, 1> slm_poly_mix(sycl::range<1>(POLY_MIX_COUNT), h);
+            h.parallel_for(
+                sycl::nd_range<1>(global_size, WG_SIZE),
+                [=](sycl::nd_item<1> item) {
+                    uint32_t cycle = item.get_global_id(0);
+                    uint32_t lid = item.get_local_id(0);
+                    for (uint32_t i = lid; i < POLY_MIX_COUNT; i += WG_SIZE)
+                        slm_poly_mix[i] = poly_mix[i];
+                    sycl::group_barrier(item.get_group());
+                    if (cycle >= domain) return;
+                    Fp* args[4] = {accum, data, out, mix};
+                    FpExt* pm = slm_poly_mix.get_multi_ptr<sycl::access::decorated::no>().get();
+                    FpExt tot = circuit::rv32im_v2::poly_fp_pass2(
+                        (size_t)cycle, (size_t)domain, pm, args,
+                        d_inter_fp, d_inter_ext, domain);
                     Fp x = Fp(3) * pow(rou_val, cycle);
                     Fp y = pow(x, uint32_t(1) << po2);
                     Fp quot = inv(y - Fp(1));
-
-                    for (uint32_t i = 0; i < 4; i++) {
+                    for (uint32_t i = 0; i < 4; i++)
                         check[i * domain + cycle] = tot.elems[i] * quot;
-                    }
                 });
         });
-        // Do NOT wait — eval_check runs asynchronously on its own queue.
 
+        // Free intermediate after both passes (in-order queue guarantees ordering)
+        q->submit([&](sycl::handler& h) {
+            h.host_task([=]() {
+                sycl::free(d_inter_fp, *q);
+                sycl::free(d_inter_ext, *q);
+            });
+        });
+
+        if (getenv("RISC0_VERBOSE")) {
+            auto t1 = std::chrono::steady_clock::now();
+            fprintf(stderr, "      [eval_check_multipass] 2-pass, inter=%u Fp + %u FpExt/WI\n",
+                    N_INTER_FP, N_INTER_EXT);
+        }
+#else
+        // Monolithic: single kernel call
+        q->submit([&](sycl::handler& h) {
+            sycl::local_accessor<FpExt, 1> slm_poly_mix(sycl::range<1>(POLY_MIX_COUNT), h);
+            h.parallel_for(
+                sycl::nd_range<1>(global_size, WG_SIZE),
+                [=](sycl::nd_item<1> item) {
+                    uint32_t cycle = item.get_global_id(0);
+                    uint32_t lid = item.get_local_id(0);
+                    for (uint32_t i = lid; i < POLY_MIX_COUNT; i += WG_SIZE)
+                        slm_poly_mix[i] = poly_mix[i];
+                    sycl::group_barrier(item.get_group());
+                    if (cycle >= domain) return;
+                    Fp* args[4] = {accum, data, out, mix};
+                    FpExt* pm = slm_poly_mix.get_multi_ptr<sycl::access::decorated::no>().get();
+                    FpExt tot = circuit::rv32im_v2::poly_fp(
+                        (size_t)cycle, (size_t)domain, pm, args);
+                    Fp x = Fp(3) * pow(rou_val, cycle);
+                    Fp y = pow(x, uint32_t(1) << po2);
+                    Fp quot = inv(y - Fp(1));
+                    for (uint32_t i = 0; i < 4; i++)
+                        check[i * domain + cycle] = tot.elems[i] * quot;
+                });
+        });
+#endif
         return nullptr;
     } catch (const sycl::exception& e) {
         return make_error(e.what());
@@ -94,7 +145,6 @@ extern "C" const char* risc0_circuit_rv32im_intel_eval_check(
     }
 }
 
-// Wait for eval_check to complete on its queue.
 extern "C" const char* risc0_circuit_rv32im_intel_eval_check_sync(
     void* queue_ptr)
 {
