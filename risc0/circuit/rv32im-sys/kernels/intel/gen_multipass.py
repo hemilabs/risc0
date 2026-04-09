@@ -37,6 +37,11 @@ PASS2_FNS = list(range(9, -1, -1))   # 9..0
 # The by-value FpExt args at the v10→v9 boundary
 BOUNDARY_BYVAL_EXTS = ['x1368', 'x708', 'x699', 'arg23', 'arg24', 'arg25', 'arg26']
 
+# Cross-boundary x34 (FpExt) indices: written by pass1 (v13/v12), read by pass2 (v9).
+# x34[1] is written by v13, x34[3] is written by v12, both read by v9.
+# (x34[0] and x34[2] are also written by pass1 but only read internally by pass1's v11.)
+CROSS_X34_INDICES = [1, 3]
+
 
 def find_function(content, fn_name):
     """Find a function definition (with __attribute__ prefix) and return (start, end, sig, body)."""
@@ -123,11 +128,17 @@ def make_pass1_variant(content, fn_idx):
         return_pattern = r'\s*return\s+x\d+;'
 
         replacement = "// === MULTI-PASS BOUNDARY: write intermediate state ===\n"
+        replacement += "    // Write x33 cross-boundary indices\n"
         replacement += "    for (uint32_t _i = 0; _i < CROSS_X33_COUNT; _i++) {\n"
         replacement += "        d_inter_fp[_i * domain + cycle] = arg0[CROSS_X33_INDICES[_i]];\n"
         replacement += "    }\n"
+        replacement += "    // Write 7 FpExt by-value args\n"
         for i, ext_name in enumerate(BOUNDARY_BYVAL_EXTS):
             replacement += f"    d_inter_ext[{i} * domain + cycle] = {ext_name};\n"
+        replacement += "    // Write x34 cross-boundary indices (arg2 is x34 in v10)\n"
+        for i, x34_idx in enumerate(CROSS_X34_INDICES):
+            slot = len(BOUNDARY_BYVAL_EXTS) + i
+            replacement += f"    d_inter_ext[{slot} * domain + cycle] = arg2[{x34_idx}];\n"
         replacement += "    return FpExt(0);"
 
         new_body = re.sub(tail_pattern + return_pattern, replacement, new_body)
@@ -187,12 +198,19 @@ def make_poly_fp_pass2(content):
 
     new_body = preamble
     new_body += "\n    // === MULTI-PASS PASS2: load intermediate state ===\n"
+    new_body += "    // Load x33 cross-boundary indices\n"
     new_body += "    for (uint32_t _i = 0; _i < CROSS_X33_COUNT; _i++) {\n"
     new_body += "        x33[CROSS_X33_INDICES[_i]] = d_inter_fp[_i * domain + cycle];\n"
     new_body += "    }\n"
 
+    new_body += "    // Load 7 FpExt by-value args\n"
     for i in range(7):
         new_body += f"    FpExt _ext{i} = d_inter_ext[{i} * domain + cycle];\n"
+
+    new_body += "    // Load x34 cross-boundary indices into x34[]\n"
+    for i, x34_idx in enumerate(CROSS_X34_INDICES):
+        slot = 7 + i
+        new_body += f"    x34[{x34_idx}] = d_inter_ext[{slot} * domain + cycle];\n"
 
     # v9 sig: (cycle, steps, poly_mix, Fp* arg0, FpExt arg1, FpExt* arg2,
     #          FpExt arg3..arg8, Fp* arg9, Fp* arg10, Fp* arg11)

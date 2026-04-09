@@ -176,9 +176,9 @@ impl<IH: IntelHash> CircuitHal<IntelHal<IH>> for IntelCircuitHal<IH> {
         if use_multipass {
             // 2-way multi-pass: allocate intermediate buffer, run pass1 then pass2
             // Intermediate: 197 Fp + 7 FpExt per work item
-            // Intermediate: 197 Fp (u32) + 7 FpExt (4 u32 each) per work item
+            // Intermediate: 197 Fp (u32) + 9 FpExt (7 by-val + 2 x34 cross-boundary)
             let n_inter_fp = 197 * domain;
-            let n_inter_ext = 7 * domain * 4; // FpExt = 4 x u32
+            let n_inter_ext = 9 * domain * 4; // 9 FpExt = 36 u32 per WI
             let inter_fp = self._hal.alloc_u32("inter_fp", n_inter_fp);
             let inter_ext = self._hal.alloc_u32("inter_ext", n_inter_ext);
 
