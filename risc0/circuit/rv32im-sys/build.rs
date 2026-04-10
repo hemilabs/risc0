@@ -589,6 +589,8 @@ fn build_intel_kernels() {
             // dramatically reducing the 42KB spill overhead. Trades occupancy (8→4 threads/EU)
             // for fewer spills — net win since kernel is spill-bound, not compute-bound.
             .arg("-Xs").arg("-options -cl-intel-256-GRF-per-thread");
+            // Tested and crashed ocloc (exit 226):
+            // -cl-intel-no-prera-scheduling, -cl-intel-vector-coalesing=4
 
         eprintln!("  Running: {:?}", cmd);
         let output = cmd.output().expect("Failed to run icpx");
