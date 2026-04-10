@@ -724,19 +724,28 @@ fn build_intel_kernels() {
         witgen_amalg.push_str("\n");
         witgen_amalg.push_str("namespace risc0::circuit::rv32im_v2::intel {\n");
 
-        // Read steps.cpp, extract body, inject noinline
+        // Read steps.cpp, extract body, inject noinline on large functions only.
+        // Two-pass approach:
+        //   Pass 1: Identify function definitions and measure sizes (via brace depth).
+        //   Pass 2: Inject __attribute__((noinline)) only on functions >= MIN_NOINLINE_SIZE.
+        // This reduces noinline count from ~210 to ~47, which may allow 256 GRF mode
+        // (eval_check works with 256 GRF and has only ~20 noinline functions).
         let steps_src = std::fs::read_to_string("kernels/cxx/steps.cpp").unwrap();
         let ns_marker = "namespace risc0::circuit::rv32im_v2::cpu {";
         if let Some(ns_start) = steps_src.find(ns_marker) {
             let body_start = ns_start + ns_marker.len();
             if let Some(body_end) = steps_src.rfind('}') {
                 let body = &steps_src[body_start..body_end];
-                let mut noinline_count = 0;
-                for line in body.lines() {
-                    let s = line.trim_start();
+                let body_lines: Vec<&str> = body.lines().collect();
 
-                    // Inject noinline on function definitions
-                    if !s.is_empty() && !s.starts_with("//") && !s.starts_with('#')
+                // Minimum function size (in lines) to receive noinline.
+                // Functions smaller than this will be allowed to inline into callers.
+                const MIN_NOINLINE_SIZE: usize = 50;
+
+                // Helper: detect if a line is a function definition (not a variable
+                // declaration with struct initializer).
+                let is_func_def = |s: &str| -> bool {
+                    !s.is_empty() && !s.starts_with("//") && !s.starts_with('#')
                         && !s.starts_with("namespace") && !s.starts_with("using")
                         && !s.starts_with('}') && !s.starts_with('{')
                         && !s.starts_with("if") && !s.starts_with("for")
@@ -747,14 +756,57 @@ fn build_intel_kernels() {
                         && s.contains('(') && s.trim_end().ends_with('{')
                         && (s.contains("Struct ") || s.starts_with("void step_")
                             || s.starts_with("ComponentStruct "))
-                    {
+                        // Exclude false positives: variable declarations like
+                        // "SomeStruct x5 = exec_Func(ctx, AnotherStruct{"
+                        // These have '=' before the first '('.
+                        && !s.split('(').next().unwrap_or("").contains('=')
+                };
+
+                // Pass 1: Find function definitions and measure sizes via brace depth.
+                let mut noinline_lines: std::collections::HashSet<usize> = std::collections::HashSet::new();
+                {
+                    let mut depth: i32 = 0;
+                    let mut func_start: Option<usize> = None;
+                    let mut total_funcs = 0usize;
+
+                    for (i, line) in body_lines.iter().enumerate() {
+                        let s = line.trim_start();
+
+                        if depth == 0 && is_func_def(s) {
+                            func_start = Some(i);
+                        }
+
+                        let opens = line.matches('{').count() as i32;
+                        let closes = line.matches('}').count() as i32;
+                        depth += opens - closes;
+
+                        if let Some(start) = func_start {
+                            if depth == 0 {
+                                let size = i - start + 1;
+                                total_funcs += 1;
+                                if size >= MIN_NOINLINE_SIZE {
+                                    noinline_lines.insert(start);
+                                }
+                                func_start = None;
+                            }
+                        }
+                    }
+                    eprintln!("  Pass 1: found {} functions, {} >= {} lines",
+                              total_funcs, noinline_lines.len(), MIN_NOINLINE_SIZE);
+                }
+
+                // Pass 2: Output with selective noinline injection.
+                let mut noinline_count = 0;
+                for (i, line) in body_lines.iter().enumerate() {
+                    if noinline_lines.contains(&i) {
                         witgen_amalg.push_str("__attribute__((noinline)) ");
                         noinline_count += 1;
                     }
                     witgen_amalg.push_str(line);
                     witgen_amalg.push('\n');
                 }
-                eprintln!("  Injected noinline on {} functions", noinline_count);
+                eprintln!("  Injected noinline on {} functions (min size: {} lines)",
+                          noinline_count, MIN_NOINLINE_SIZE);
             }
         }
         witgen_amalg.push_str("} // namespace risc0::circuit::rv32im_v2::intel\n\n");
@@ -765,14 +817,17 @@ fn build_intel_kernels() {
         std::fs::write(&witgen_amalg_path, &witgen_amalg).unwrap();
 
         let mut cmd = Command::new(&icpx);
+        // 256 GRF cannot be used for witgen:
+        // - cl-opt-disable + ANY GRF flag = ocloc exit 226 (INVALID_COMMAND_LINE)
+        // - Without cl-opt-disable = ocloc exit 254 (compilation resource exhaustion)
+        // - Stack calls + 256 GRF (without cl-opt-disable) = compiles but runtime TDR
+        // The only working config is: -Os + cl-opt-disable + 128 GRF (default).
         cmd.arg("-shared")
             .arg("-fPIC")
             .arg("-fsycl")
             .arg("-std=c++17")
-            .arg("-Os") // -Os: different optimization passes to avoid icpx -O1 accum miscompilation
+            .arg("-Os") // -Os: avoids icpx -O1 accum miscompilation
             .arg("-Xs").arg("-options -cl-opt-disable")
-            // Note: 256 GRF + cl-opt-disable crashes ocloc (exit 226). Cannot use 256 GRF for witgen.
-            // Note: 256 GRF alone (without cl-opt-disable) also crashes ocloc.
             .arg("-Wno-unused-parameter")
             .arg("-Wno-unused-function")
             .arg("-Wno-unused-variable")
