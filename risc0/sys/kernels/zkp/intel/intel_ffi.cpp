@@ -121,25 +121,26 @@ void esimd_free_device(void* queue, void* ptr) {
 void esimd_memcpy_htod(void* queue, void* dst, const void* src, size_t bytes) {
     auto* q = static_cast<sycl::queue*>(queue);
     q->memcpy(dst, src, bytes);
-    q->wait();
+    // No wait: in-order queue guarantees subsequent kernels see the data.
+    // Removing this lets CPU prepare next operations while GPU does the transfer.
 }
 
 void esimd_memcpy_dtoh(void* queue, void* dst, const void* src, size_t bytes) {
     auto* q = static_cast<sycl::queue*>(queue);
     q->memcpy(dst, src, bytes);
-    q->wait();
+    q->wait();  // Must wait: host reads dst immediately after return.
 }
 
 void esimd_memset(void* queue, void* ptr, int value, size_t bytes) {
     auto* q = static_cast<sycl::queue*>(queue);
     q->memset(ptr, value, bytes);
-    q->wait();
+    // No wait: in-order queue serializes subsequent operations.
 }
 
 void esimd_memcpy_dtod(void* queue, void* dst, const void* src, size_t bytes) {
     auto* q = static_cast<sycl::queue*>(queue);
     q->memcpy(dst, src, bytes);
-    q->wait();
+    // No wait: in-order queue serializes subsequent operations.
 }
 
 // GPU query: extract one column of data + Merkle auth path, entirely on device.

@@ -158,16 +158,21 @@ ESIMD_INLINE bb31::Vec16 sbox(bb31::Vec16 x) {
     return bb31::mont_mul(x6, x);
 }
 
-// Full Poseidon2 permutation — loads constants ON-THE-FLY from device pointers.
-// This avoids preloading all 213 constants into registers (would need 522 GRF,
-// only 256 available → massive spill). On-the-fly: ~140 GRF working set.
+// Full Poseidon2 permutation with cached constants.
+// Both round constants (213 scalars = 27 GRF) and M_INT diagonal (24 scalars = 3 GRF)
+// are cached in scalar private arrays, eliminating ~10K+ device memory reads per permutation.
+// (Previous comment claimed 522 GRF — that was wrong: 213 broadcast scalars, not Vec16s.)
 ESIMD_INLINE void poseidon2_mix(bb31::Vec16 cells[CELLS],
                                  const uint32_t* prc,   // round constants (device ptr)
                                  const uint32_t* pdiag) { // M_INT diagonal (device ptr)
+    // Cache ALL round constants in scalar registers (213 uint32_t = 27 GRF).
+    // Constants are broadcast to all 16 SIMD lanes via Vec16(scalar) — no vector storage needed.
+    uint32_t rc_s[NUM_ROUND_CONSTANTS];
+    for (uint32_t i = 0; i < NUM_ROUND_CONSTANTS; i++)
+        rc_s[i] = *(prc + i);
     uint32_t rc_off = 0;
 
     // Cache M_INT diagonal in scalar registers (24 uint32_t = 3 GRF).
-    // Eliminates 21×24 = 504 device memory reads per permutation.
     uint32_t diag_s[CELLS];
     for (uint32_t i = 0; i < CELLS; i++)
         diag_s[i] = *(pdiag + i);
@@ -178,7 +183,7 @@ ESIMD_INLINE void poseidon2_mix(bb31::Vec16 cells[CELLS],
     // First half of full rounds
     for (uint32_t r = 0; r < ROUNDS_HALF_FULL; r++) {
         for (uint32_t i = 0; i < CELLS; i++)
-            cells[i] = bb31::field_add(cells[i], bb31::Vec16(*(prc + rc_off + i)));
+            cells[i] = bb31::field_add(cells[i], bb31::Vec16(rc_s[rc_off + i]));
         rc_off += CELLS;
         for (uint32_t i = 0; i < CELLS; i++)
             cells[i] = sbox(cells[i]);
@@ -189,7 +194,7 @@ ESIMD_INLINE void poseidon2_mix(bb31::Vec16 cells[CELLS],
     // Note: diag product precomputation was tested but REGRESSED performance
     // (pushed register pressure past small GRF threshold, halving occupancy).
     for (uint32_t r = 0; r < ROUNDS_PARTIAL; r++) {
-        cells[0] = bb31::field_add(cells[0], bb31::Vec16(*(prc + rc_off)));
+        cells[0] = bb31::field_add(cells[0], bb31::Vec16(rc_s[rc_off]));
         rc_off += 1;
         cells[0] = sbox(cells[0]);
         // M_INT: sum + diag[i] * cells[i]
@@ -224,7 +229,7 @@ ESIMD_INLINE void poseidon2_mix(bb31::Vec16 cells[CELLS],
     // Second half of full rounds
     for (uint32_t r = 0; r < ROUNDS_HALF_FULL; r++) {
         for (uint32_t i = 0; i < CELLS; i++)
-            cells[i] = bb31::field_add(cells[i], bb31::Vec16(*(prc + rc_off + i)));
+            cells[i] = bb31::field_add(cells[i], bb31::Vec16(rc_s[rc_off + i]));
         rc_off += CELLS;
         for (uint32_t i = 0; i < CELLS; i++)
             cells[i] = sbox(cells[i]);

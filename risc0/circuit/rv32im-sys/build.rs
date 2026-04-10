@@ -769,6 +769,8 @@ fn build_intel_kernels() {
             .arg("-std=c++17")
             .arg("-Os") // -Os: different optimization passes to avoid icpx -O1 accum miscompilation
             .arg("-Xs").arg("-options -cl-opt-disable")
+            // Note: 256 GRF + cl-opt-disable crashes ocloc (exit 226). Cannot use 256 GRF for witgen.
+            // Note: 256 GRF alone (without cl-opt-disable) also crashes ocloc.
             .arg("-Wno-unused-parameter")
             .arg("-Wno-unused-function")
             .arg("-Wno-unused-variable")

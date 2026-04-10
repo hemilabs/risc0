@@ -239,7 +239,49 @@ pub type IntelHalSha256 = IntelHal<IntelHashSha256>;
 pub type IntelHalPoseidon254 = IntelHal<IntelHashPoseidon254>;
 
 // ============================================================================
-// RawBuffer - RAII device allocation with tracking
+// Buffer Pool — caches device allocations for reuse (matches CUDA HAL pattern)
+// ============================================================================
+
+use std::collections::HashMap;
+
+struct IntelBufferPool {
+    cache: HashMap<usize, Vec<IntelDeviceBuffer>>,
+    total_cached: usize,
+}
+
+const POOL_MAX_BYTES: usize = 16 << 30; // 16 GiB cap
+const POOL_SMALL_THRESHOLD: usize = 64 << 10; // Always pool buffers under 64 KiB
+
+impl IntelBufferPool {
+    fn new() -> Self {
+        Self { cache: HashMap::new(), total_cached: 0 }
+    }
+
+    fn pop(&mut self, size: usize) -> Option<IntelDeviceBuffer> {
+        if let Some(bufs) = self.cache.get_mut(&size) {
+            if let Some(buf) = bufs.pop() {
+                self.total_cached -= size;
+                return Some(buf);
+            }
+        }
+        None
+    }
+
+    fn push(&mut self, size: usize, buf: IntelDeviceBuffer) {
+        if size < POOL_SMALL_THRESHOLD || self.total_cached + size <= POOL_MAX_BYTES {
+            self.total_cached += size;
+            self.cache.entry(size).or_default().push(buf);
+        }
+        // else: drop the buffer (exceeds cap)
+    }
+}
+
+thread_local! {
+    static BUFFER_POOL: RefCell<IntelBufferPool> = RefCell::new(IntelBufferPool::new());
+}
+
+// ============================================================================
+// RawBuffer - RAII device allocation with tracking + pool
 // ============================================================================
 
 struct RawBuffer {
@@ -251,8 +293,11 @@ impl RawBuffer {
     pub fn new(name: &'static str, size: usize) -> Self {
         tracing::trace!("alloc: {size} bytes, {name}");
         tracker().lock().unwrap().alloc(size);
-        let buf = IntelDeviceBuffer::uninitialized(size)
-            .unwrap_or_else(|e| panic!("Intel GPU allocation failed on {name}: {size} bytes: {e}"));
+        let buf = BUFFER_POOL.with(|pool| pool.borrow_mut().pop(size))
+            .unwrap_or_else(|| {
+                IntelDeviceBuffer::uninitialized(size)
+                    .unwrap_or_else(|e| panic!("Intel GPU allocation failed on {name}: {size} bytes: {e}"))
+            });
         Self {
             name,
             buf: ManuallyDrop::new(buf),
@@ -265,9 +310,9 @@ impl Drop for RawBuffer {
         let size = self.buf.len();
         tracing::trace!("free: {size} bytes, {}", self.name);
         tracker().lock().unwrap().free(size);
-        // Safety: self.buf is not accessed after take() since we're in Drop,
-        // and ManuallyDrop's own drop is a no-op.
-        unsafe { ManuallyDrop::drop(&mut self.buf) };
+        // Return buffer to pool instead of freeing
+        let buf = unsafe { ManuallyDrop::take(&mut self.buf) };
+        BUFFER_POOL.with(|pool| pool.borrow_mut().push(size, buf));
     }
 }
 
