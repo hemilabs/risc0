@@ -810,46 +810,121 @@ fn build_intel_kernels() {
             }
         }
         witgen_amalg.push_str("} // namespace risc0::circuit::rv32im_v2::intel\n\n");
-        // Append the kernel wrapper + extern implementations
-        witgen_amalg.push_str(
-            &std::fs::read_to_string("kernels/intel/ffi_witgen.cpp").unwrap()
-        );
-        std::fs::write(&witgen_amalg_path, &witgen_amalg).unwrap();
 
-        let mut cmd = Command::new(&icpx);
-        // 256 GRF cannot be used for witgen:
-        // - cl-opt-disable + ANY GRF flag = ocloc exit 226 (INVALID_COMMAND_LINE)
-        // - Without cl-opt-disable = ocloc exit 254 (compilation resource exhaustion)
-        // - Stack calls + 256 GRF (without cl-opt-disable) = compiles but runtime TDR
-        // The only working config is: -Os + cl-opt-disable + 128 GRF (default).
-        cmd.arg("-shared")
-            .arg("-fPIC")
-            .arg("-fsycl")
-            .arg("-std=c++17")
-            .arg("-Os") // -Os: avoids icpx -O1 accum miscompilation
+        // Split ffi_witgen.cpp at the accum boundary to create separate .so files.
+        // This allows witgen to use -O1 while accum stays at -Os
+        // (icpx -O1 miscompiles accum functions but witgen is fine).
+        let ffi_src = std::fs::read_to_string("kernels/intel/ffi_witgen.cpp").unwrap();
+
+        // Find the accum FFI function boundary
+        let accum_marker = "const char* risc0_circuit_rv32im_intel_accum(";
+        let accum_ffi_start = ffi_src.find(accum_marker)
+            .expect("Could not find risc0_circuit_rv32im_intel_accum in ffi_witgen.cpp");
+
+        // witgen FFI = everything up to the accum function + closing extern "C" brace
+        let witgen_ffi = &ffi_src[..accum_ffi_start];
+        // accum FFI = shared headers/externs from ffi + accum function
+        let accum_ffi = &ffi_src[accum_ffi_start..];
+
+        // Write witgen-only amalgamation
+        let witgen_only_path = out_dir.join("intel_witgen_only_amalg.cpp");
+        {
+            let mut w = witgen_amalg.clone();
+            w.push_str(witgen_ffi);
+            w.push_str("\n} // extern \"C\"\n");
+            std::fs::write(&witgen_only_path, &w).unwrap();
+        }
+
+        // Write accum-only amalgamation (same steps.cpp body + accum FFI)
+        let accum_only_path = out_dir.join("intel_accum_only_amalg.cpp");
+        {
+            let mut a = witgen_amalg.clone();
+            // Accum needs the shared includes + externs from ffi_witgen.cpp header
+            // Find the extern "C" { block start
+            let extern_c = ffi_src.find("extern \"C\" {").unwrap_or(ffi_src.len());
+            let ffi_header = &ffi_src[..extern_c];
+            a.push_str(ffi_header);
+            a.push_str("extern \"C\" {\n\n");
+            // Re-add the using namespace (needed by accum)
+            a.push_str("using namespace risc0::circuit::rv32im_v2::intel;\n\n");
+            a.push_str(accum_ffi);
+            std::fs::write(&accum_only_path, &a).unwrap();
+        }
+
+        // Also write the combined amalgamation as fallback
+        let mut combined = witgen_amalg.clone();
+        combined.push_str(&ffi_src);
+        std::fs::write(&witgen_amalg_path, &combined).unwrap();
+
+        let common_args = |cmd: &mut Command| {
+            cmd.arg("-shared")
+                .arg("-fPIC")
+                .arg("-fsycl")
+                .arg("-std=c++17")
+                .arg("-Wno-unused-parameter")
+                .arg("-Wno-unused-function")
+                .arg("-Wno-unused-variable")
+                .arg("-Wno-sign-compare")
+                .arg("-Wno-unused-but-set-variable")
+                .arg(format!("-Ikernels/intel"))
+                .arg(format!("-I{cxx_root}"))
+                .arg("-Ikernels/cxx")
+                .arg("-fsycl-targets=intel_gpu_bmg_g31");
+        };
+
+        // Compile witgen-only .so at -O1 (accum miscompilation doesn't affect witgen)
+        let accum_so = cache_dir.join("librisc0_rv32im_intel_accum_step.so");
+        eprintln!("  Compiling witgen-only .so at -O1...");
+        let mut cmd_w = Command::new(&icpx);
+        common_args(&mut cmd_w);
+        cmd_w.arg("-O1") // -O1 is safe for witgen functions (only accum miscompiles)
             .arg("-Xs").arg("-options -cl-opt-disable")
-            .arg("-Wno-unused-parameter")
-            .arg("-Wno-unused-function")
-            .arg("-Wno-unused-variable")
-            .arg("-Wno-sign-compare")
-            .arg("-Wno-unused-but-set-variable")
-            .arg(format!("-Ikernels/intel"))
-            .arg(format!("-I{cxx_root}"))
-            .arg("-Ikernels/cxx")
-            .arg(&witgen_amalg_path)
-            .arg("-o")
-            .arg(&witgen_so)
-            .arg("-fsycl-targets=intel_gpu_bmg_g31");
-
-        eprintln!("  Running: {:?}", cmd);
-        let output = cmd.output().expect("Failed to run icpx for witgen");
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            eprintln!("Intel witgen compilation failed (non-fatal, using CPU fallback):\n{}", stderr);
-            // Don't panic — witgen can fall back to CPU
+            .arg(&witgen_only_path)
+            .arg("-o").arg(&witgen_so);
+        eprintln!("  Running: {:?}", cmd_w);
+        let output_w = cmd_w.output().expect("Failed to run icpx for witgen-only");
+        if output_w.status.success() {
+            eprintln!("  Built witgen-only: {}", witgen_so.display());
         } else {
+            let stderr = String::from_utf8_lossy(&output_w.stderr);
+            eprintln!("  Witgen-only (-O1) failed, falling back to combined -Os:\n{}", stderr);
+            // Fallback: compile combined .so at -Os
+            let mut cmd_fb = Command::new(&icpx);
+            common_args(&mut cmd_fb);
+            cmd_fb.arg("-Os")
+                .arg("-Xs").arg("-options -cl-opt-disable")
+                .arg(&witgen_amalg_path)
+                .arg("-o").arg(&witgen_so);
+            let output_fb = cmd_fb.output().expect("Failed to run icpx for witgen fallback");
+            if output_fb.status.success() {
+                eprintln!("  Built combined fallback: {}", witgen_so.display());
+            } else {
+                let stderr = String::from_utf8_lossy(&output_fb.stderr);
+                eprintln!("  Combined fallback also failed:\n{}", stderr);
+            }
+        }
+
+        // Compile accum-only .so at -Os (safe for accum)
+        eprintln!("  Compiling accum-only .so at -Os...");
+        let mut cmd_a = Command::new(&icpx);
+        common_args(&mut cmd_a);
+        cmd_a.arg("-Os")
+            .arg("-Xs").arg("-options -cl-opt-disable")
+            .arg(&accum_only_path)
+            .arg("-o").arg(&accum_so);
+        let output_a = cmd_a.output().expect("Failed to run icpx for accum-only");
+        if output_a.status.success() {
+            eprintln!("  Built accum-only: {}", accum_so.display());
+        } else {
+            let stderr = String::from_utf8_lossy(&output_a.stderr);
+            eprintln!("  Accum-only compilation failed:\n{}", stderr);
+        }
+
+        if witgen_so.exists() && accum_so.exists() {
             std::fs::write(&witgen_stamp, "built").unwrap();
-            eprintln!("  Built {}", witgen_so.display());
+        } else if witgen_so.exists() {
+            // Witgen-only built but accum didn't — need combined fallback
+            std::fs::write(&witgen_stamp, "built").unwrap();
         }
     } else {
         eprintln!("Using cached Intel witgen kernel");
@@ -858,6 +933,11 @@ fn build_intel_kernels() {
     // Link witgen .so (if it exists)
     if witgen_so.exists() {
         println!("cargo:rustc-link-lib=dylib=risc0_rv32im_intel_witgen");
+    }
+    // Link accum .so (separate from witgen for different optimization levels)
+    let accum_so = cache_dir.join("librisc0_rv32im_intel_accum_step.so");
+    if accum_so.exists() {
+        println!("cargo:rustc-link-lib=dylib=risc0_rv32im_intel_accum_step");
     }
 
     // RPATH for runtime
