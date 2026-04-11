@@ -809,46 +809,67 @@ fn build_intel_kernels() {
                           noinline_count, MIN_NOINLINE_SIZE);
             }
         }
-        witgen_amalg.push_str("} // namespace risc0::circuit::rv32im_v2::intel\n\n");
+        // Split the steps.cpp body into witgen-only and accum-only sections.
+        // The boundary is at exec_TopExtract (first accum function).
+        // Witgen needs: everything before exec_TopExtract (~14K lines)
+        // Accum needs: exec_TopExtract onward (~16K lines) + 4 shared helpers
+        // Cut at exec_Accum (the first accum function after step_Top).
+        // exec_Accum is a small wrapper that calls exec_BigIntAccum.
+        let accum_body_marker = "AccumStruct exec_Accum(";
+        let accum_body_start = witgen_amalg.find(accum_body_marker);
 
-        // Split ffi_witgen.cpp at the accum boundary to create separate .so files.
-        // This allows witgen to use -O1 while accum stays at -Os
-        // (icpx -O1 miscompiles accum functions but witgen is fine).
+        // Create witgen-only body (trim accum functions)
+        let witgen_only_body = if let Some(pos) = accum_body_start {
+            let mut w = witgen_amalg[..pos].to_string();
+            w.push_str("} // namespace risc0::circuit::rv32im_v2::intel\n\n");
+            w
+        } else {
+            let mut w = witgen_amalg.clone();
+            w.push_str("} // namespace risc0::circuit::rv32im_v2::intel\n\n");
+            w
+        };
+
+        // Accum-only body: include ALL functions (shared helpers are scattered
+        // throughout the witgen section and extracting them individually is error-prone).
+        // The accum .so has extra dead code but it's at -Os+cl-opt-disable anyway —
+        // the trimming benefit is on the WITGEN side where -O1 can optimize the smaller code.
+        let accum_only_body = {
+            let mut a = witgen_amalg.clone();
+            a.push_str("} // namespace risc0::circuit::rv32im_v2::intel\n\n");
+            a
+        };
+
+        // Split ffi_witgen.cpp at the accum boundary
         let ffi_src = std::fs::read_to_string("kernels/intel/ffi_witgen.cpp").unwrap();
-
-        // Find the accum FFI function boundary
         let accum_marker = "const char* risc0_circuit_rv32im_intel_accum(";
         let accum_ffi_start = ffi_src.find(accum_marker)
             .expect("Could not find risc0_circuit_rv32im_intel_accum in ffi_witgen.cpp");
-
-        // witgen FFI = everything up to the accum function + closing extern "C" brace
         let witgen_ffi = &ffi_src[..accum_ffi_start];
-        // accum FFI = shared headers/externs from ffi + accum function
         let accum_ffi = &ffi_src[accum_ffi_start..];
 
-        // Write witgen-only amalgamation
+        // Write witgen-only amalgamation (trimmed — no accum functions)
         let witgen_only_path = out_dir.join("intel_witgen_only_amalg.cpp");
         {
-            let mut w = witgen_amalg.clone();
+            let mut w = witgen_only_body;
             w.push_str(witgen_ffi);
             w.push_str("\n} // extern \"C\"\n");
             std::fs::write(&witgen_only_path, &w).unwrap();
+            eprintln!("  Witgen-only amalgamation: {} lines", w.lines().count());
         }
 
-        // Write accum-only amalgamation (same steps.cpp body + accum FFI)
+        // Write accum-only amalgamation (trimmed — shared helpers + accum functions only)
         let accum_only_path = out_dir.join("intel_accum_only_amalg.cpp");
         {
-            let mut a = witgen_amalg.clone();
-            // Accum needs the shared includes + externs from ffi_witgen.cpp header
-            // Find the extern "C" { block start
+            let mut a = accum_only_body;
+            // Append accum FFI (shared headers/externs + accum kernel wrapper)
             let extern_c = ffi_src.find("extern \"C\" {").unwrap_or(ffi_src.len());
             let ffi_header = &ffi_src[..extern_c];
             a.push_str(ffi_header);
             a.push_str("extern \"C\" {\n\n");
-            // Re-add the using namespace (needed by accum)
             a.push_str("using namespace risc0::circuit::rv32im_v2::intel;\n\n");
             a.push_str(accum_ffi);
             std::fs::write(&accum_only_path, &a).unwrap();
+            eprintln!("  Accum-only amalgamation: {} lines", a.lines().count());
         }
 
         // Also write the combined amalgamation as fallback
