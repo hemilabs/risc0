@@ -589,8 +589,6 @@ fn build_intel_kernels() {
             // dramatically reducing the 42KB spill overhead. Trades occupancy (8→4 threads/EU)
             // for fewer spills — net win since kernel is spill-bound, not compute-bound.
             .arg("-Xs").arg("-options -cl-intel-256-GRF-per-thread");
-            // Tested and crashed ocloc (exit 226):
-            // -cl-intel-no-prera-scheduling, -cl-intel-vector-coalesing=4
 
         eprintln!("  Running: {:?}", cmd);
         let output = cmd.output().expect("Failed to run icpx");
@@ -724,28 +722,19 @@ fn build_intel_kernels() {
         witgen_amalg.push_str("\n");
         witgen_amalg.push_str("namespace risc0::circuit::rv32im_v2::intel {\n");
 
-        // Read steps.cpp, extract body, inject noinline on large functions only.
-        // Two-pass approach:
-        //   Pass 1: Identify function definitions and measure sizes (via brace depth).
-        //   Pass 2: Inject __attribute__((noinline)) only on functions >= MIN_NOINLINE_SIZE.
-        // This reduces noinline count from ~210 to ~47, which may allow 256 GRF mode
-        // (eval_check works with 256 GRF and has only ~20 noinline functions).
+        // Read steps.cpp, extract body, inject noinline
         let steps_src = std::fs::read_to_string("kernels/cxx/steps.cpp").unwrap();
         let ns_marker = "namespace risc0::circuit::rv32im_v2::cpu {";
         if let Some(ns_start) = steps_src.find(ns_marker) {
             let body_start = ns_start + ns_marker.len();
             if let Some(body_end) = steps_src.rfind('}') {
                 let body = &steps_src[body_start..body_end];
-                let body_lines: Vec<&str> = body.lines().collect();
+                let mut noinline_count = 0;
+                for line in body.lines() {
+                    let s = line.trim_start();
 
-                // Minimum function size (in lines) to receive noinline.
-                // Functions smaller than this will be allowed to inline into callers.
-                const MIN_NOINLINE_SIZE: usize = 50;
-
-                // Helper: detect if a line is a function definition (not a variable
-                // declaration with struct initializer).
-                let is_func_def = |s: &str| -> bool {
-                    !s.is_empty() && !s.starts_with("//") && !s.starts_with('#')
+                    // Inject noinline on function definitions
+                    if !s.is_empty() && !s.starts_with("//") && !s.starts_with('#')
                         && !s.starts_with("namespace") && !s.starts_with("using")
                         && !s.starts_with('}') && !s.starts_with('{')
                         && !s.starts_with("if") && !s.starts_with("for")
@@ -756,196 +745,54 @@ fn build_intel_kernels() {
                         && s.contains('(') && s.trim_end().ends_with('{')
                         && (s.contains("Struct ") || s.starts_with("void step_")
                             || s.starts_with("ComponentStruct "))
-                        // Exclude false positives: variable declarations like
-                        // "SomeStruct x5 = exec_Func(ctx, AnotherStruct{"
-                        // These have '=' before the first '('.
-                        && !s.split('(').next().unwrap_or("").contains('=')
-                };
-
-                // Pass 1: Find function definitions and measure sizes via brace depth.
-                let mut noinline_lines: std::collections::HashSet<usize> = std::collections::HashSet::new();
-                {
-                    let mut depth: i32 = 0;
-                    let mut func_start: Option<usize> = None;
-                    let mut total_funcs = 0usize;
-
-                    for (i, line) in body_lines.iter().enumerate() {
-                        let s = line.trim_start();
-
-                        if depth == 0 && is_func_def(s) {
-                            func_start = Some(i);
-                        }
-
-                        let opens = line.matches('{').count() as i32;
-                        let closes = line.matches('}').count() as i32;
-                        depth += opens - closes;
-
-                        if let Some(start) = func_start {
-                            if depth == 0 {
-                                let size = i - start + 1;
-                                total_funcs += 1;
-                                if size >= MIN_NOINLINE_SIZE {
-                                    noinline_lines.insert(start);
-                                }
-                                func_start = None;
-                            }
-                        }
-                    }
-                    eprintln!("  Pass 1: found {} functions, {} >= {} lines",
-                              total_funcs, noinline_lines.len(), MIN_NOINLINE_SIZE);
-                }
-
-                // Pass 2: Output with selective noinline injection.
-                let mut noinline_count = 0;
-                for (i, line) in body_lines.iter().enumerate() {
-                    if noinline_lines.contains(&i) {
+                    {
                         witgen_amalg.push_str("__attribute__((noinline)) ");
                         noinline_count += 1;
                     }
                     witgen_amalg.push_str(line);
                     witgen_amalg.push('\n');
                 }
-                eprintln!("  Injected noinline on {} functions (min size: {} lines)",
-                          noinline_count, MIN_NOINLINE_SIZE);
+                eprintln!("  Injected noinline on {} functions", noinline_count);
             }
         }
-        // Split the steps.cpp body into witgen-only and accum-only sections.
-        // The boundary is at exec_TopExtract (first accum function).
-        // Witgen needs: everything before exec_TopExtract (~14K lines)
-        // Accum needs: exec_TopExtract onward (~16K lines) + 4 shared helpers
-        // Cut at exec_Accum (the first accum function after step_Top).
-        // exec_Accum is a small wrapper that calls exec_BigIntAccum.
-        let accum_body_marker = "AccumStruct exec_Accum(";
-        let accum_body_start = witgen_amalg.find(accum_body_marker);
+        witgen_amalg.push_str("} // namespace risc0::circuit::rv32im_v2::intel\n\n");
+        // Append the kernel wrapper + extern implementations
+        witgen_amalg.push_str(
+            &std::fs::read_to_string("kernels/intel/ffi_witgen.cpp").unwrap()
+        );
+        std::fs::write(&witgen_amalg_path, &witgen_amalg).unwrap();
 
-        // Create witgen-only body (trim accum functions)
-        let witgen_only_body = if let Some(pos) = accum_body_start {
-            let mut w = witgen_amalg[..pos].to_string();
-            w.push_str("} // namespace risc0::circuit::rv32im_v2::intel\n\n");
-            w
-        } else {
-            let mut w = witgen_amalg.clone();
-            w.push_str("} // namespace risc0::circuit::rv32im_v2::intel\n\n");
-            w
-        };
-
-        // Accum-only body: include ALL functions (shared helpers are scattered
-        // throughout the witgen section and extracting them individually is error-prone).
-        // The accum .so has extra dead code but it's at -Os+cl-opt-disable anyway —
-        // the trimming benefit is on the WITGEN side where -O1 can optimize the smaller code.
-        let accum_only_body = {
-            let mut a = witgen_amalg.clone();
-            a.push_str("} // namespace risc0::circuit::rv32im_v2::intel\n\n");
-            a
-        };
-
-        // Split ffi_witgen.cpp at the accum boundary
-        let ffi_src = std::fs::read_to_string("kernels/intel/ffi_witgen.cpp").unwrap();
-        let accum_marker = "const char* risc0_circuit_rv32im_intel_accum(";
-        let accum_ffi_start = ffi_src.find(accum_marker)
-            .expect("Could not find risc0_circuit_rv32im_intel_accum in ffi_witgen.cpp");
-        let witgen_ffi = &ffi_src[..accum_ffi_start];
-        let accum_ffi = &ffi_src[accum_ffi_start..];
-
-        // Write witgen-only amalgamation (trimmed — no accum functions)
-        let witgen_only_path = out_dir.join("intel_witgen_only_amalg.cpp");
-        {
-            let mut w = witgen_only_body;
-            w.push_str(witgen_ffi);
-            w.push_str("\n} // extern \"C\"\n");
-            std::fs::write(&witgen_only_path, &w).unwrap();
-            eprintln!("  Witgen-only amalgamation: {} lines", w.lines().count());
-        }
-
-        // Write accum-only amalgamation (trimmed — shared helpers + accum functions only)
-        let accum_only_path = out_dir.join("intel_accum_only_amalg.cpp");
-        {
-            let mut a = accum_only_body;
-            // Append accum FFI (shared headers/externs + accum kernel wrapper)
-            let extern_c = ffi_src.find("extern \"C\" {").unwrap_or(ffi_src.len());
-            let ffi_header = &ffi_src[..extern_c];
-            a.push_str(ffi_header);
-            a.push_str("extern \"C\" {\n\n");
-            a.push_str("using namespace risc0::circuit::rv32im_v2::intel;\n\n");
-            a.push_str(accum_ffi);
-            std::fs::write(&accum_only_path, &a).unwrap();
-            eprintln!("  Accum-only amalgamation: {} lines", a.lines().count());
-        }
-
-        // Also write the combined amalgamation as fallback
-        let mut combined = witgen_amalg.clone();
-        combined.push_str(&ffi_src);
-        std::fs::write(&witgen_amalg_path, &combined).unwrap();
-
-        let common_args = |cmd: &mut Command| {
-            cmd.arg("-shared")
-                .arg("-fPIC")
-                .arg("-fsycl")
-                .arg("-std=c++17")
-                .arg("-Wno-unused-parameter")
-                .arg("-Wno-unused-function")
-                .arg("-Wno-unused-variable")
-                .arg("-Wno-sign-compare")
-                .arg("-Wno-unused-but-set-variable")
-                .arg(format!("-Ikernels/intel"))
-                .arg(format!("-I{cxx_root}"))
-                .arg("-Ikernels/cxx")
-                .arg("-fsycl-targets=intel_gpu_bmg_g31");
-        };
-
-        // Compile witgen-only .so at -O1 (accum miscompilation doesn't affect witgen)
-        let accum_so = cache_dir.join("librisc0_rv32im_intel_accum_step.so");
-        eprintln!("  Compiling witgen-only .so at -O1...");
-        let mut cmd_w = Command::new(&icpx);
-        common_args(&mut cmd_w);
-        cmd_w.arg("-O1") // -O1 is safe for witgen functions (only accum miscompiles)
+        let mut cmd = Command::new(&icpx);
+        cmd.arg("-shared")
+            .arg("-fPIC")
+            .arg("-fsycl")
+            .arg("-std=c++17")
+            .arg("-Os") // -Os: different optimization passes to avoid icpx -O1 accum miscompilation
             .arg("-Xs").arg("-options -cl-opt-disable")
-            .arg(&witgen_only_path)
-            .arg("-o").arg(&witgen_so);
-        eprintln!("  Running: {:?}", cmd_w);
-        let output_w = cmd_w.output().expect("Failed to run icpx for witgen-only");
-        if output_w.status.success() {
-            eprintln!("  Built witgen-only: {}", witgen_so.display());
-        } else {
-            let stderr = String::from_utf8_lossy(&output_w.stderr);
-            eprintln!("  Witgen-only (-O1) failed, falling back to combined -Os:\n{}", stderr);
-            // Fallback: compile combined .so at -Os
-            let mut cmd_fb = Command::new(&icpx);
-            common_args(&mut cmd_fb);
-            cmd_fb.arg("-Os")
-                .arg("-Xs").arg("-options -cl-opt-disable")
-                .arg(&witgen_amalg_path)
-                .arg("-o").arg(&witgen_so);
-            let output_fb = cmd_fb.output().expect("Failed to run icpx for witgen fallback");
-            if output_fb.status.success() {
-                eprintln!("  Built combined fallback: {}", witgen_so.display());
-            } else {
-                let stderr = String::from_utf8_lossy(&output_fb.stderr);
-                eprintln!("  Combined fallback also failed:\n{}", stderr);
-            }
-        }
+            // Note: 256 GRF + cl-opt-disable crashes ocloc (exit 226). Cannot use 256 GRF for witgen.
+            // Note: 256 GRF alone (without cl-opt-disable) also crashes ocloc.
+            .arg("-Wno-unused-parameter")
+            .arg("-Wno-unused-function")
+            .arg("-Wno-unused-variable")
+            .arg("-Wno-sign-compare")
+            .arg("-Wno-unused-but-set-variable")
+            .arg(format!("-Ikernels/intel"))
+            .arg(format!("-I{cxx_root}"))
+            .arg("-Ikernels/cxx")
+            .arg(&witgen_amalg_path)
+            .arg("-o")
+            .arg(&witgen_so)
+            .arg("-fsycl-targets=intel_gpu_bmg_g31");
 
-        // Compile accum-only .so at -Os (safe for accum)
-        eprintln!("  Compiling accum-only .so at -Os...");
-        let mut cmd_a = Command::new(&icpx);
-        common_args(&mut cmd_a);
-        cmd_a.arg("-Os")
-            .arg("-Xs").arg("-options -cl-opt-disable")
-            .arg(&accum_only_path)
-            .arg("-o").arg(&accum_so);
-        let output_a = cmd_a.output().expect("Failed to run icpx for accum-only");
-        if output_a.status.success() {
-            eprintln!("  Built accum-only: {}", accum_so.display());
+        eprintln!("  Running: {:?}", cmd);
+        let output = cmd.output().expect("Failed to run icpx for witgen");
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("Intel witgen compilation failed (non-fatal, using CPU fallback):\n{}", stderr);
+            // Don't panic — witgen can fall back to CPU
         } else {
-            let stderr = String::from_utf8_lossy(&output_a.stderr);
-            eprintln!("  Accum-only compilation failed:\n{}", stderr);
-        }
-
-        if witgen_so.exists() && accum_so.exists() {
             std::fs::write(&witgen_stamp, "built").unwrap();
-        } else if witgen_so.exists() {
-            // Witgen-only built but accum didn't — need combined fallback
-            std::fs::write(&witgen_stamp, "built").unwrap();
+            eprintln!("  Built {}", witgen_so.display());
         }
     } else {
         eprintln!("Using cached Intel witgen kernel");
@@ -954,11 +801,6 @@ fn build_intel_kernels() {
     // Link witgen .so (if it exists)
     if witgen_so.exists() {
         println!("cargo:rustc-link-lib=dylib=risc0_rv32im_intel_witgen");
-    }
-    // Link accum .so (separate from witgen for different optimization levels)
-    let accum_so = cache_dir.join("librisc0_rv32im_intel_accum_step.so");
-    if accum_so.exists() {
-        println!("cargo:rustc-link-lib=dylib=risc0_rv32im_intel_accum_step");
     }
 
     // RPATH for runtime
