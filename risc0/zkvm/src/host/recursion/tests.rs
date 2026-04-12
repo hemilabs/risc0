@@ -684,3 +684,44 @@ fn bench_prove_multi_segment_po2_20() {
         "  Warm stats (excl first): avg={warm_avg:.3}s min={warm_min:.3}s max={warm_max:.3}s"
     );
 }
+
+#[test_log::test]
+fn bench_prove_session_pipelined_po2_20() {
+    // Benchmark: prove via prove_session (pipelined path) to test cross-segment overlap.
+    let segment_limit_po2 = 20;
+    let cycles: u64 = 5 * (1 << segment_limit_po2);
+    let env = ExecutorEnv::builder()
+        .write(&MultiTestSpec::BusyLoop { cycles })
+        .unwrap()
+        .segment_limit_po2(segment_limit_po2)
+        .build()
+        .unwrap();
+
+    tracing::info!("Executing rv32im at po2={segment_limit_po2} ({cycles} total cycles)");
+    let session = execute_elf(env, MULTI_TEST_ELF).unwrap();
+    let n_segments = session.segments.len();
+    tracing::info!("Got {n_segments} segment(s)");
+
+    let opts = ProverOpts::composite().with_hashfn("poseidon2".to_string());
+    let prover = get_prover_server(&opts).unwrap();
+    let ctx = VerifierContext::default();
+
+    // Warmup with prove_segment (known working)
+    {
+        let segment = session.segments[0].resolve().unwrap();
+        tracing::info!("Warmup...");
+        let _ = prover.prove_segment(&ctx, &segment).unwrap();
+    }
+
+    // Timed run via prove_session (pipelined)
+    tracing::info!("PIPELINED BENCHMARK: {n_segments} segments via prove_session...");
+    let start = std::time::Instant::now();
+    let _info = prover.prove_session(&ctx, &session).unwrap();
+    let elapsed = start.elapsed();
+    let total_secs = elapsed.as_secs_f64();
+    tracing::info!(
+        "PIPELINED RESULT: {n_segments} segments in {total_secs:.3}s ({:.3}s/seg, {:.1} seg/s)",
+        total_secs / n_segments as f64,
+        n_segments as f64 / total_secs,
+    );
+}

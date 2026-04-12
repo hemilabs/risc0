@@ -169,6 +169,14 @@ impl<IH: IntelHash> CircuitHal<IntelHal<IH>> for IntelCircuitHal<IH> {
         let rou = Val::ROU_FWD[po2 + EXP_PO2];
         let rou_raw: u32 = unsafe { std::mem::transmute(rou) };
 
+        // Sync main queue before submitting to eval_check queue.  The poly_mix
+        // upload (and all prior commits / NTTs) was enqueued on the main queue.
+        // Without this barrier the eval_check kernel on the separate queue can
+        // start reading poly_mix, check, groups, and globals before the main
+        // queue's writes are visible — a cross-queue data race that can hang the
+        // GPU on the second segment.
+        risc0_sys::intel::sync();
+
         let eval_queue = risc0_sys::intel::get_eval_check_queue();
 
         let use_multipass = std::env::var_os("RISC0_MULTIPASS").is_some();
