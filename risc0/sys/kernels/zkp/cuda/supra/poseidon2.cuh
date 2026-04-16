@@ -164,7 +164,7 @@ __device__ __forceinline__ void poseidon2_mix(fr_t cells[CELLS]) {
 
 } // namespace poseidon2
 
-#if defined(__HIPCC__) && defined(__GFX12__)
+#if defined(__HIPCC__) && (defined(__GFX11__) || defined(__GFX12__))
 // RDNA4 (gfx1201): 256 threads × 3 blocks/CU optimal (avoids VGPR spilling)
 __launch_bounds__(256, 3)
 #elif defined(__HIPCC__)
@@ -199,7 +199,7 @@ __global__
   output[gid] = tmp;
 }
 
-#if defined(__HIPCC__) && defined(__GFX12__)
+#if defined(__HIPCC__) && (defined(__GFX11__) || defined(__GFX12__))
 __launch_bounds__(256, 3)
 #elif defined(__HIPCC__)
 __launch_bounds__(512, 2)

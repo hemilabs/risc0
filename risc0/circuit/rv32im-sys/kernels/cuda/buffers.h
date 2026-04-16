@@ -24,13 +24,29 @@ struct Buffer {
   size_t cols;
   bool checked;  // retained for FFI layout compatibility
 
+#ifdef __HIPCC__
+  // HIP/AMDGPU: compiler barrier prevents reordering/coalescing of cross-row
+  // reads/writes. The SHA2 precompile does back-references at distance 68;
+  // without barriers hip-clang at -O2+ can reorder loads that produce a
+  // corrupt witness trace, resulting in invalid segment proofs.
+  __device__ void set(size_t row, size_t col, Fp val) {
+    buf[col * rows + row] = val;
+    asm volatile("" ::: "memory");
+  }
+  __device__ Fp get(size_t row, size_t col) {
+    asm volatile("" ::: "memory");
+    Fp v = buf[col * rows + row];
+    asm volatile("" ::: "memory");
+    return v;
+  }
+#else
   __device__ void set(size_t row, size_t col, Fp val) {
     buf[col * rows + row] = val;
   }
-
   __device__ Fp get(size_t row, size_t col) {
     return buf[col * rows + row];
   }
+#endif
 };
 
 } // namespace risc0::circuit::rv32im_v2::cuda
