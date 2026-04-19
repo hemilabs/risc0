@@ -92,7 +92,10 @@ sppark_poseidon2_fold(poseidon_out_t* d_out, const poseidon_in_t* d_in, size_t n
   const size_t P2_BLOCK = 256;
 #endif
   size_t block_size = num_hashes < P2_BLOCK ? num_hashes : P2_BLOCK;
-  size_t num_blocks = num_hashes < P2_BLOCK ? 1 : num_hashes / P2_BLOCK;
+  // Ceil-div: previously used `num_hashes / P2_BLOCK` which silently dropped
+  // up to P2_BLOCK-1 trailing hashes for non-pow2 input. _rows already used
+  // ceil; aligning fold for correctness.
+  size_t num_blocks = num_hashes < P2_BLOCK ? 1 : (num_hashes + P2_BLOCK - 1) / P2_BLOCK;
 
   try {
     (void)cudaGetLastError(); // consume any stale async errors

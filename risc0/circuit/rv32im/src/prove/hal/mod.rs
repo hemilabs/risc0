@@ -202,7 +202,7 @@ where
         let t1 = std::time::Instant::now();
         let po2 = preflight_results.po2();
         let header = preflight_results.build_header();
-        let witgen =
+        let mut witgen =
             WitnessGenerator::new(hal.as_ref(), circuit_hal.as_ref(), preflight_results, mode)?;
         if *VERBOSE {
             eprintln!(
@@ -212,7 +212,7 @@ where
         }
 
         let code = &witgen.code.buf;
-        let data = &witgen.data.buf;
+        let data = &witgen.data.as_ref().expect("witgen.data present").buf;
 
         let t2 = std::time::Instant::now();
         let seal = scope!("prove_inner", {
@@ -310,7 +310,7 @@ where
                     );
                 }
 
-                prover.commit_group(REGISTER_GROUP_ACCUM, &witgen.accum.buf);
+                prover.commit_group(REGISTER_GROUP_ACCUM, &witgen.accum.as_ref().unwrap().buf);
                 if *VERBOSE {
                     eprintln!(
                         "  [main] commit(accum): {:.1}ms",
@@ -319,30 +319,25 @@ where
                 }
 
                 // Clone tiny global buffer (90 elements = 360 bytes) so witgen can
-                // be dropped during async GPU eval_check.
+                // be dropped BEFORE eval_check launches — needed to fit po2=22
+                // in 24 GB (frees ~5 GB of witgen buffers).
                 let global_clone = hal.alloc_elem("global_clone", witgen.global.buf.size());
                 hal.eltwise_copy_elem(&global_clone, &witgen.global.buf);
 
                 (mix, global_clone)
             });
 
-            // All borrows on witgen (through code, data, global, accum) are now
-            // released by NLL. Move witgen into a closure that runs during GPU
-            // eval_check to overlap CPU drop with GPU compute.
+            // Drop witgen before eval_check launches to reclaim witgen.data
+            // (3.4 GB at po2=22) + witgen.accum (1.65 GB). Previously dropped
+            // inside a post_eval_check closure to overlap with GPU compute,
+            // but that keeps witgen live across eval_check's peak VRAM use.
+            drop(witgen);
+
             let t3 = std::time::Instant::now();
             let result = prover.finalize_with_hook(
                 &[&mix.buf, &global_clone],
                 circuit_hal.as_ref(),
-                move || {
-                    let td = std::time::Instant::now();
-                    drop(witgen);
-                    if *VERBOSE {
-                        eprintln!(
-                            "[prove_core] witgen_drop (overlapped with eval_check): {:.1}ms",
-                            td.elapsed().as_secs_f64() * 1000.0
-                        );
-                    }
-                },
+                || {},
             );
 
             if *VERBOSE {
@@ -377,12 +372,12 @@ where
 
         let po2 = preflight_results.po2();
         let header = preflight_results.build_header();
-        let witgen =
+        let mut witgen =
             WitnessGenerator::new(hal.as_ref(), circuit_hal.as_ref(), preflight_results, mode)?;
         let t_witgen = t0.elapsed();
 
         let code = &witgen.code.buf;
-        let data = &witgen.data.buf;
+        let data = &witgen.data.as_ref().expect("witgen.data present").buf;
 
         let mut prover = Prover::new(hal.as_ref(), TAPSET);
         let hashfn = &hal.get_hash_suite().hashfn;
@@ -441,7 +436,10 @@ where
         let t_accum = ta.elapsed();
 
         let tac = std::time::Instant::now();
-        prover.commit_group(REGISTER_GROUP_ACCUM, &witgen.accum.buf);
+        prover.commit_group(
+            REGISTER_GROUP_ACCUM,
+            &witgen.accum.as_ref().unwrap().buf,
+        );
         let t_accum_commit = tac.elapsed();
 
         let global_clone = hal.alloc_elem("global_clone", witgen.global.buf.size());
@@ -449,13 +447,19 @@ where
 
         let prev_seal = self.pending_seal.borrow_mut().take();
 
+        // Drop witgen BEFORE eval_check launches to free 5 GB of VRAM
+        // (witgen.data 3.4 GB + witgen.accum 1.65 GB at po2=22). The eval_check
+        // kernel only needs globals (copied to global_clone) and the committed
+        // PolyGroups' `evaluated` buffers, not any witgen buffer.
+        drop(witgen);
+
         let t_main = t0.elapsed();
 
         // Start finalize: launch eval_check on stream2 (async on GPU).
         let mut deferred = prover.start_finalize_with_hook(
             &[&mix.buf, &global_clone],
             circuit_hal.as_ref(),
-            move || drop(witgen),
+            || {},
         );
         // Keep globals alive until eval_check completes.
         deferred.keep_alive_buf(mix.buf);
