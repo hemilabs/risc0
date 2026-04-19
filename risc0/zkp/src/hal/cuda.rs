@@ -91,10 +91,43 @@ impl BufferPool {
         self.total_cached += size;
         self.cache.entry(size).or_default().push(buf);
     }
+
+    /// Release every cached buffer. Used as a last-resort when a large
+    /// allocation fails so the driver can reclaim fragmented device memory.
+    fn drain(&mut self) {
+        self.cache.clear();
+        self.total_cached = 0;
+    }
 }
 
 thread_local! {
     static BUFFER_POOL: RefCell<BufferPool> = RefCell::new(BufferPool::new());
+}
+
+// Raw CUDA driver bindings for memory pool trimming, needed on large-alloc
+// retry paths: cuMemAlloc will fail against a fragmented-but-technically-free
+// device address space if the stream-ordered mempool is hoarding reservations.
+// Cust doesn't surface cuMemPoolTrimTo, so bind it directly.
+#[repr(C)]
+struct CuMemPoolOpaque {
+    _private: [u8; 0],
+}
+type CuMemPool = *mut CuMemPoolOpaque;
+extern "C" {
+    fn cuDeviceGetDefaultMemPool(pool: *mut CuMemPool, dev: i32) -> i32;
+    fn cuMemPoolTrimTo(pool: CuMemPool, min_bytes_to_keep: usize) -> i32;
+    fn cuCtxSynchronize() -> i32;
+}
+
+fn trim_cuda_mempool() {
+    unsafe {
+        // Flush in-flight stream-ordered frees back to the pool, then trim to zero.
+        let _ = cuCtxSynchronize();
+        let mut pool: CuMemPool = std::ptr::null_mut();
+        if cuDeviceGetDefaultMemPool(&mut pool, 0) == 0 && !pool.is_null() {
+            let _ = cuMemPoolTrimTo(pool, 0);
+        }
+    }
 }
 
 // The GPU becomes unstable as the number of concurrent provers grow.
@@ -315,18 +348,338 @@ pub type CudaHalSha256 = CudaHal<CudaHashSha256>;
 pub type CudaHalPoseidon2 = CudaHal<CudaHashPoseidon2>;
 pub type CudaHalPoseidon254 = CudaHal<CudaHashPoseidon254>;
 
+
+// ====================== VMM (cuMemCreate / cuMemMap) allocator ======================
+// Composes a large contiguous virtual allocation from smaller physical chunks,
+// defeating device-memory fragmentation at po2=22 on 24 GB cards.
+//
+// Bindings come from cust_raw (re-exported via risc0_sys::cuda::*), but to
+// keep this file self-contained we link the driver functions directly.
+#[allow(dead_code)]
+mod vmm {
+    use std::os::raw::{c_int, c_uchar, c_ulonglong, c_ushort, c_void};
+
+    pub type CUdeviceptr = u64;
+    pub type CUmemGenericAllocationHandle = u64;
+
+    #[repr(i32)]
+    #[derive(Copy, Clone)]
+    pub enum CUmemLocationType {
+        Device = 1,
+    }
+    #[repr(i32)]
+    #[derive(Copy, Clone)]
+    pub enum CUmemAllocationType {
+        Pinned = 1,
+    }
+    #[repr(i32)]
+    #[derive(Copy, Clone)]
+    pub enum CUmemAllocationHandleType {
+        None = 0,
+    }
+    #[repr(i32)]
+    #[derive(Copy, Clone)]
+    pub enum CUmemAccessFlags {
+        ReadWrite = 3,
+    }
+    #[repr(i32)]
+    #[derive(Copy, Clone)]
+    pub enum CUmemAllocationGranularity {
+        Minimum = 0,
+        Recommended = 1,
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    pub struct CUmemLocation {
+        pub type_: c_int,
+        pub id: c_int,
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone, Default)]
+    pub struct CUmemAllocationPropFlags {
+        pub compression_type: c_uchar,
+        pub gpu_direct_rdma_capable: c_uchar,
+        pub usage: c_ushort,
+        pub reserved: [c_uchar; 4],
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    pub struct CUmemAllocationProp {
+        pub type_: c_int,
+        pub requested_handle_types: c_int,
+        pub location: CUmemLocation,
+        pub win32_handle_meta_data: *mut c_void,
+        pub alloc_flags: CUmemAllocationPropFlags,
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    pub struct CUmemAccessDesc {
+        pub location: CUmemLocation,
+        pub flags: c_int,
+    }
+
+    extern "C" {
+        pub fn cuMemAddressReserve(
+            ptr: *mut CUdeviceptr,
+            size: usize,
+            alignment: usize,
+            addr: CUdeviceptr,
+            flags: c_ulonglong,
+        ) -> c_int;
+        pub fn cuMemAddressFree(ptr: CUdeviceptr, size: usize) -> c_int;
+        pub fn cuMemCreate(
+            handle: *mut CUmemGenericAllocationHandle,
+            size: usize,
+            prop: *const CUmemAllocationProp,
+            flags: c_ulonglong,
+        ) -> c_int;
+        pub fn cuMemRelease(handle: CUmemGenericAllocationHandle) -> c_int;
+        pub fn cuMemMap(
+            ptr: CUdeviceptr,
+            size: usize,
+            offset: usize,
+            handle: CUmemGenericAllocationHandle,
+            flags: c_ulonglong,
+        ) -> c_int;
+        pub fn cuMemUnmap(ptr: CUdeviceptr, size: usize) -> c_int;
+        pub fn cuMemSetAccess(
+            ptr: CUdeviceptr,
+            size: usize,
+            desc: *const CUmemAccessDesc,
+            count: usize,
+        ) -> c_int;
+        pub fn cuMemGetAllocationGranularity(
+            granularity: *mut usize,
+            prop: *const CUmemAllocationProp,
+            option: c_int,
+        ) -> c_int;
+    }
+
+    fn make_prop(device: c_int) -> CUmemAllocationProp {
+        CUmemAllocationProp {
+            type_: CUmemAllocationType::Pinned as c_int,
+            requested_handle_types: CUmemAllocationHandleType::None as c_int,
+            location: CUmemLocation {
+                type_: CUmemLocationType::Device as c_int,
+                id: device,
+            },
+            win32_handle_meta_data: std::ptr::null_mut(),
+            alloc_flags: CUmemAllocationPropFlags::default(),
+        }
+    }
+
+    /// Round `v` up to the nearest multiple of `a` (power of two or not).
+    fn round_up(v: usize, a: usize) -> usize {
+        ((v + a - 1) / a) * a
+    }
+
+    /// VMM-backed allocation. Owns both the virtual reservation and the
+    /// physical chunks it's composed from. `ptr` is a normal CUdeviceptr
+    /// that works with every CUDA API (memcpy, kernel launch, etc.).
+    pub struct VmmAllocation {
+        pub ptr: CUdeviceptr,
+        pub size: usize,
+        reserve_size: usize,
+        chunks: Vec<(CUmemGenericAllocationHandle, usize)>, // (handle, mapped_bytes)
+    }
+
+    impl VmmAllocation {
+        /// Allocate `size` bytes on `device`, carved into `~chunk_size` chunks.
+        /// Returns None on any driver failure (caller falls back to cust).
+        pub fn new(size: usize, device: c_int, chunk_size_hint: usize) -> Option<Self> {
+            if size == 0 {
+                return None;
+            }
+            let prop = make_prop(device);
+
+            // Query granularity once; chunk size and reserve size must both be multiples.
+            let mut gran: usize = 0;
+            let rc = unsafe {
+                cuMemGetAllocationGranularity(
+                    &mut gran,
+                    &prop,
+                    CUmemAllocationGranularity::Recommended as c_int,
+                )
+            };
+            if rc != 0 || gran == 0 {
+                tracing::warn!("vmm: cuMemGetAllocationGranularity failed rc={rc}");
+                return None;
+            }
+
+            let chunk_size = round_up(chunk_size_hint.max(gran), gran);
+            let reserve_size = round_up(size, gran);
+
+            // Reserve the virtual address range.
+            let mut base: CUdeviceptr = 0;
+            let rc = unsafe { cuMemAddressReserve(&mut base, reserve_size, gran, 0, 0) };
+            if rc != 0 {
+                tracing::warn!(
+                    "vmm: cuMemAddressReserve({reserve_size}) failed rc={rc}"
+                );
+                return None;
+            }
+
+            // Allocate + map physical chunks back-to-back.
+            let mut alloc = VmmAllocation {
+                ptr: base,
+                size,
+                reserve_size,
+                chunks: Vec::with_capacity(reserve_size / chunk_size + 1),
+            };
+
+            let access = CUmemAccessDesc {
+                location: prop.location,
+                flags: CUmemAccessFlags::ReadWrite as c_int,
+            };
+
+            let mut offset = 0usize;
+            while offset < reserve_size {
+                let this_chunk = chunk_size.min(reserve_size - offset);
+                let mut handle: CUmemGenericAllocationHandle = 0;
+                let rc = unsafe { cuMemCreate(&mut handle, this_chunk, &prop, 0) };
+                if rc != 0 {
+                    tracing::warn!(
+                        "vmm: cuMemCreate(chunk {} / {} bytes at offset {offset}) failed rc={rc}",
+                        this_chunk, reserve_size
+                    );
+                    drop(alloc);
+                    return None;
+                }
+                let chunk_ptr = base + offset as u64;
+                let rc = unsafe { cuMemMap(chunk_ptr, this_chunk, 0, handle, 0) };
+                if rc != 0 {
+                    tracing::warn!("vmm: cuMemMap failed rc={rc}");
+                    unsafe { cuMemRelease(handle) };
+                    drop(alloc);
+                    return None;
+                }
+                let rc =
+                    unsafe { cuMemSetAccess(chunk_ptr, this_chunk, &access, 1) };
+                if rc != 0 {
+                    tracing::warn!("vmm: cuMemSetAccess failed rc={rc}");
+                    unsafe { cuMemUnmap(chunk_ptr, this_chunk) };
+                    unsafe { cuMemRelease(handle) };
+                    drop(alloc);
+                    return None;
+                }
+                alloc.chunks.push((handle, this_chunk));
+                offset += this_chunk;
+            }
+
+            tracing::info!(
+                "vmm: reserved {} bytes ({} chunks of {})",
+                reserve_size,
+                alloc.chunks.len(),
+                chunk_size
+            );
+            Some(alloc)
+        }
+    }
+
+    impl Drop for VmmAllocation {
+        fn drop(&mut self) {
+            let mut off = 0usize;
+            for (h, sz) in self.chunks.drain(..) {
+                unsafe {
+                    cuMemUnmap(self.ptr + off as u64, sz);
+                    cuMemRelease(h);
+                }
+                off += sz;
+            }
+            if self.reserve_size > 0 {
+                unsafe {
+                    cuMemAddressFree(self.ptr, self.reserve_size);
+                }
+            }
+        }
+    }
+
+    /// 8 GB: VMM path kicks in automatically at or above this size.
+    pub const VMM_AUTO_THRESHOLD: usize = 8usize << 30;
+    /// 256 MB physical chunks.
+    pub const VMM_CHUNK_SIZE: usize = 256usize << 20;
+
+    pub fn should_use_vmm(size: usize) -> bool {
+        if std::env::var("RISC0_VMM_ALLOC").ok().as_deref() == Some("1") {
+            return true;
+        }
+        if std::env::var("RISC0_VMM_ALLOC").ok().as_deref() == Some("0") {
+            return false;
+        }
+        size >= VMM_AUTO_THRESHOLD
+    }
+}
+// ====================================================================================
+
 struct RawBuffer {
     name: &'static str,
     buf: ManuallyDrop<DeviceBuffer<u8>>,
+    // Some() when the buffer is backed by the VMM allocator. On drop,
+    // we release the VMM mapping directly and SKIP the BufferPool cache
+    // (pooling VMM buffers by exact size yields little benefit at po2=22).
+    vmm: Option<vmm::VmmAllocation>,
+    /// When true, bypass BUFFER_POOL caching on drop and return the memory
+    /// directly to the CUDA driver via cuMemFree. Used for host-spilled
+    /// buffers whose size doesn't match any future allocation, so caching
+    /// them just wastes VRAM headroom.
+    bypass_pool: bool,
 }
 
 impl RawBuffer {
     pub fn new(name: &'static str, size: usize) -> Self {
         tracing::trace!("alloc: {size} bytes, {name}");
         tracker().lock().unwrap().alloc(size);
+
+        // VMM path: compose a large contiguous virtual allocation from ~256 MB
+        // physical chunks. Used for big buffers (>= 8 GB) or when forced via
+        // RISC0_VMM_ALLOC=1. Avoids fragmentation failures at po2=22.
+        if vmm::should_use_vmm(size) {
+            // Before attempting, drain our pool + the driver mempool so that
+            // every free byte is up for grabs as physical chunks.
+            BUFFER_POOL.with(|pool| pool.borrow_mut().drain());
+            trim_cuda_mempool();
+            if let Some(allocation) =
+                vmm::VmmAllocation::new(size, 0, vmm::VMM_CHUNK_SIZE)
+            {
+                // Wrap the VMM virtual pointer in a DeviceBuffer so the rest
+                // of this file keeps working unchanged. We never drop the
+                // DeviceBuffer itself (that would call cuMemFree on a VMM
+                // pointer, which is illegal); the VmmAllocation owns cleanup.
+                let dptr = DevicePointer::<u8>::from_raw(
+                    allocation.ptr as cust::sys::CUdeviceptr,
+                );
+                let buf = unsafe { DeviceBuffer::<u8>::from_raw_parts(dptr, size) };
+                return Self {
+                    name,
+                    buf: ManuallyDrop::new(buf),
+                    vmm: Some(allocation),
+                    bypass_pool: false,
+                };
+            }
+            tracing::warn!(
+                "vmm: alloc of {size} bytes failed for {name}; falling back to cuMemAlloc"
+            );
+        }
+
         let buf = BUFFER_POOL
             .with(|pool| pool.borrow_mut().pop(size))
             .unwrap_or_else(|| {
+                // First attempt: direct alloc.
+                if let Ok(b) = unsafe { DeviceBuffer::uninitialized(size) } {
+                    return b;
+                }
+                // Retry after draining our pool AND the CUDA stream-ordered mempool.
+                // Large allocations (>10 GB) often fail due to mempool reservations
+                // holding freed-but-retained memory; trimming reclaims it.
+                tracing::warn!(
+                    "allocation of {size} bytes for {name} failed; draining BUFFER_POOL + trimming CUDA mempool and retrying"
+                );
+                BUFFER_POOL.with(|pool| pool.borrow_mut().drain());
+                trim_cuda_mempool();
                 unsafe { DeviceBuffer::uninitialized(size) }
                     .context(format!("allocation failed on {name}: {size} bytes"))
                     .unwrap()
@@ -334,6 +687,8 @@ impl RawBuffer {
         Self {
             name,
             buf: ManuallyDrop::new(buf),
+            vmm: None,
+            bypass_pool: false,
         }
     }
 
@@ -347,11 +702,30 @@ impl Drop for RawBuffer {
         let size = self.buf.len();
         tracing::trace!("free: {size} bytes, {}", self.name);
         tracker().lock().unwrap().free(size);
+
+        if self.vmm.is_some() {
+            // VMM-backed: DO NOT run DeviceBuffer::drop (it would call
+            // cuMemFree on a cuMemMap'd virtual address, which is illegal).
+            // Forget the buffer wrapper; the VmmAllocation's Drop releases
+            // the actual mappings + handles + virtual reservation.
+            let _forget = unsafe { ManuallyDrop::take(&mut self.buf) };
+            std::mem::forget(_forget);
+            // VmmAllocation is dropped automatically when `self` is destroyed.
+            return;
+        }
+
         // Cache the buffer for reuse instead of calling cuMemFree.
         // Safety: self.buf is not accessed after take() since we're in Drop,
         // and ManuallyDrop's own drop is a no-op.
         let buf = unsafe { ManuallyDrop::take(&mut self.buf) };
-        BUFFER_POOL.with(|pool| pool.borrow_mut().push(size, buf));
+        if self.bypass_pool {
+            // Return memory directly to the driver (DeviceBuffer drop ->
+            // cuMemFree). Used for host-spilled buffers where caching the
+            // orphaned-size allocation wastes VRAM headroom.
+            drop(buf);
+        } else {
+            BUFFER_POOL.with(|pool| pool.borrow_mut().push(size, buf));
+        }
     }
 }
 
@@ -407,6 +781,14 @@ impl<T> BufferImpl<T> {
         let ptr = self.buffer.borrow_mut().buf.as_device_ptr();
         let offset = self.offset * std::mem::size_of::<T>();
         unsafe { ptr.offset(offset.try_into().unwrap()) }
+    }
+
+    /// Mark this buffer so that when all Rc clones are dropped, the underlying
+    /// device memory is returned to the driver immediately instead of being
+    /// cached in BUFFER_POOL. Use for host-spilled allocations whose size is
+    /// unlikely to be requested again soon.
+    pub fn set_bypass_pool(&self) {
+        self.buffer.borrow_mut().bypass_pool = true;
     }
 
     pub fn as_device_ptr_with_offset(&self, offset: usize) -> DevicePointer<u8> {
@@ -473,6 +855,10 @@ impl<T: Clone> Buffer<T> for BufferImpl<T> {
         let host_buf = buf.buf.as_host_vec().unwrap();
         let slice = unchecked_cast(&host_buf);
         slice.to_vec()
+    }
+
+    fn set_bypass_pool(&self) {
+        self.buffer.borrow_mut().bypass_pool = true;
     }
 }
 
@@ -822,6 +1208,13 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
 
     fn has_unified_memory(&self) -> bool {
         false
+    }
+
+    fn trim_device_memory(&self) {
+        // Trim only the CUDA stream-ordered mempool (where sppark's multi-GB
+        // NTT scratch lives after cudaFreeAsync). Do NOT drain our own
+        // BUFFER_POOL — small-buffer reuse there is still valuable.
+        trim_cuda_mempool();
     }
 
     fn batch_get_digest_at(&self, buf: &Self::Buffer<Digest>, indices: &[usize]) -> Vec<Digest> {

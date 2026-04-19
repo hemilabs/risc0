@@ -112,8 +112,14 @@ pub(crate) struct WitnessGenerator<H: Hal> {
     cycles: usize,
     pub global: MetaBuffer<H>,
     pub code: MetaBuffer<H>,
-    pub data: MetaBuffer<H>,
-    pub accum: MetaBuffer<H>,
+    /// Present until `accum()` consumes it to produce the witgen.accum buffer.
+    /// At po2>=22 it's dropped immediately after step_accum finishes (saves
+    /// 3.4 GB of VRAM during commit_group(ACCUM) + eval_check on a 24 GB card).
+    pub data: Option<MetaBuffer<H>>,
+    /// Accum buffer is allocated lazily inside `accum()` (not in `new()`) so that
+    /// its 1.6+ GB footprint at po2=22 doesn't stack with DATA's coeffs + evaluated
+    /// allocations during `commit_group(DATA)`. Always Some after `accum()` returns.
+    pub accum: Option<MetaBuffer<H>>,
     pub trace: PreflightTrace,
     bigint_rows: Vec<usize>,
 }
@@ -131,7 +137,7 @@ where
         scope!("witness_generator_new");
 
         let tn0 = std::time::Instant::now();
-        let (global, code, data, accum) = Self::hal_generate_witness(
+        let (global, code, data) = Self::hal_generate_witness(
             hal,
             circuit_hal,
             mode,
@@ -146,8 +152,8 @@ where
             cycles: preflight_results.cycles,
             global,
             code,
-            data,
-            accum,
+            data: Some(data),
+            accum: None,
             trace: preflight_results.trace,
             bigint_rows: preflight_results.bigint_rows,
         };
@@ -165,7 +171,7 @@ where
         global: Vec<Val>,
         cycles: usize,
         injector: Injector,
-    ) -> Result<(MetaBuffer<H>, MetaBuffer<H>, MetaBuffer<H>, MetaBuffer<H>), anyhow::Error> {
+    ) -> Result<(MetaBuffer<H>, MetaBuffer<H>, MetaBuffer<H>), anyhow::Error> {
         scope!("hal_generate_witness");
 
         let tw0 = std::time::Instant::now();
@@ -182,12 +188,6 @@ where
             MetaBuffer::new("data", hal, cycles, REGCOUNT_DATA, true)
         );
         let tw2 = std::time::Instant::now();
-        // Allocate accum before generate_witness so its set_32 init (default stream)
-        // runs while the persistent stream is idle, avoiding implicit blocking-stream sync.
-        let accum = scope!(
-            "alloc(accum)",
-            MetaBuffer::new("accum", hal, cycles, REGCOUNT_ACCUM, true)
-        );
         // On CDNA (MI300X), allocate a separate read-only pre_data buffer to avoid
         // race conditions in parallel witgen. On consumer GPUs (RDNA4), skip it to
         // save ~844MB VRAM and halve scatter time — eval_check verifies correctness.
@@ -260,16 +260,24 @@ where
             (tw6-tw5).as_secs_f64()*1000.0,
             inj_idx, inj_off, inj_val, inj_bits,
         ); }
-        Ok((global, code, data, accum))
+        Ok((global, code, data))
     }
 
     pub fn accum<C: CircuitAccumulator<H>>(
-        &self,
+        &mut self,
         hal: &H,
         circuit_hal: &C,
         mix: &[Val],
     ) -> Result<MetaBuffer<H>> {
         let ta0 = std::time::Instant::now();
+
+        // Lazily allocate the accum MetaBuffer (~1.6 GB at po2=22). Deferring this
+        // until now keeps peak VRAM during `commit_group(DATA)` lower — DATA's coeffs
+        // + evaluated already push close to the 24 GB limit on a 4090 at po2=22.
+        let accum = MetaBuffer::new("accum", hal, self.cycles, REGCOUNT_ACCUM, true);
+        self.accum = Some(accum);
+        let accum_buf = self.accum.as_ref().unwrap();
+
         // use final mix to compute BigIntAccumPowers
         let last_mix = ExtVal::from_subelems(mix[mix.len() - 4..].iter().cloned());
 
@@ -290,7 +298,7 @@ where
         if *VERBOSE { eprintln!("    [accum] bigint_inject: {:.1}ms", ta0.elapsed().as_secs_f64() * 1000.0); }
 
         hal.scatter(
-            &self.accum.buf,
+            &accum_buf.buf,
             &injector.index,
             &injector.offsets,
             &injector.values,
@@ -305,13 +313,21 @@ where
         };
         if *VERBOSE { eprintln!("    [accum] mix_upload: {:.1}ms", ta0.elapsed().as_secs_f64() * 1000.0); }
 
-        circuit_hal.step_accum(&self.trace, &self.data, &self.accum, &self.global, &mix)?;
+        let data_ref = self.data.as_ref().expect("witgen.data missing");
+        circuit_hal.step_accum(&self.trace, data_ref, accum_buf, &self.global, &mix)?;
         if *VERBOSE { eprintln!("    [accum] step_accum: {:.1}ms", ta0.elapsed().as_secs_f64() * 1000.0); }
 
         scope!("zeroize(accum)", {
-            hal.eltwise_zeroize_elem(&self.accum.buf);
+            hal.eltwise_zeroize_elem(&accum_buf.buf);
         });
         if *VERBOSE { eprintln!("    [accum] zeroize: {:.1}ms", ta0.elapsed().as_secs_f64() * 1000.0); }
+
+        // At po2>=22, drop witgen.data right after step_accum reads it.
+        // Frees 3.4 GB that's otherwise live through commit_group(ACCUM)
+        // and eval_check. No other path reads it on the current HAL.
+        if self.cycles >= (1 << 22) {
+            self.data = None;
+        }
 
         Ok(mix)
     }

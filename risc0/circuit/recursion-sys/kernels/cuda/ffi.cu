@@ -301,7 +301,8 @@ struct HostExecContext {
     {
       nvtx3::scoped_range range("injectWomBacks");
       injectWomBacks<<<cfg.grid, cfg.block, 0, stream>>>(ctx);
-      CUDA_OK(cudaStreamSynchronize(stream));
+      // No intermediate sync — the next kernel runs on the same stream and
+      // is naturally ordered after this one.
     }
 
     {

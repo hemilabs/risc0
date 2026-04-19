@@ -152,9 +152,32 @@ struct DeviceCache {
     CUDA_OK(cudaMallocAsync(&d_accum_mix, sizeof(Buffer), stream));
     CUDA_OK(cudaMallocAsync(&d_accum_preflight, sizeof(PreflightTrace), stream));
     CUDA_OK(cudaMallocAsync(&d_accum_tables, sizeof(LookupTables), stream));
-    // Shared lookup tables
+    // Shared lookup tables. These ~257 KB total (1 KB U8 + 256 KB U16) are
+    // hammered by every cycle in par_stepExec/stepAccum across millions of
+    // cycles per segment. Pin them into Ada's persisting-L2 cache window to
+    // keep them resident across kernel launches.
     CUDA_OK(cudaMallocAsync(&d_tableU8, (1 << 8) * sizeof(uint32_t), stream));
     CUDA_OK(cudaMallocAsync(&d_tableU16, (1 << 16) * sizeof(uint32_t), stream));
+    {
+      static bool s_persisting_set = false;
+      if (!s_persisting_set) {
+        size_t l2_persist_max = 0;
+        cudaDeviceGetLimit(&l2_persist_max, cudaLimitPersistingL2CacheSize);
+        size_t want = (size_t)24 << 20; // 24 MB carve-out (fits 257 KB easily)
+        if (l2_persist_max < want) {
+          (void)cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, want);
+        }
+        s_persisting_set = true;
+      }
+      cudaStreamAttrValue attr = {};
+      attr.accessPolicyWindow.base_ptr = d_tableU16;
+      attr.accessPolicyWindow.num_bytes =
+          ((size_t)((1 << 16) * sizeof(uint32_t))) + ((1 << 8) * sizeof(uint32_t));
+      attr.accessPolicyWindow.hitRatio = 1.0f;
+      attr.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+      attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+      (void)cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attr);
+    }
   }
 
   // Grow-only reallocation for variable-size preflight buffers

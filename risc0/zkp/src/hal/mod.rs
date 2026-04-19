@@ -52,6 +52,12 @@ pub trait Buffer<T>: Clone {
     fn view_mut<F: FnOnce(&mut [T])>(&self, f: F);
 
     fn to_vec(&self) -> Vec<T>;
+
+    /// Opt-in hint: when all clones of this Buffer are dropped, release the
+    /// underlying device memory directly to the driver instead of caching it
+    /// in a reuse pool. HALs without a reuse pool can leave this as the
+    /// default no-op.
+    fn set_bypass_pool(&self) {}
 }
 
 pub trait Hal {
@@ -63,6 +69,12 @@ pub trait Hal {
     const CHECK_SIZE: usize = INV_RATE * Self::ExtElem::EXT_SIZE;
 
     fn has_unified_memory(&self) -> bool;
+
+    /// Ask the HAL to return any cached / stream-ordered mempool memory back
+    /// to the driver. Called at GPU-memory-pressure points (e.g. after a host
+    /// spill at po2>=22) so the next large allocation can succeed.
+    /// Default no-op for HALs without a reuse cache.
+    fn trim_device_memory(&self) {}
 
     /// Returns the amount of free GPU memory in bytes.
     /// Returns `usize::MAX` for CPU HALs or when the information is unavailable.

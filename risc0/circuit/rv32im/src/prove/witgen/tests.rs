@@ -114,8 +114,8 @@ fn fwd_rev_ab_test(program: Program) {
         )
         .unwrap();
         let cycles = 1 << segment.po2;
-        let fwd_vec = fwd_witgen.data.to_vec();
-        let rev_vec = rev_witgen.data.to_vec();
+        let fwd_vec = fwd_witgen.data.as_ref().unwrap().to_vec();
+        let rev_vec = rev_witgen.data.as_ref().unwrap().to_vec();
         for row in 0..cycles {
             let fwd_row = &fwd_vec[row * REGCOUNT_DATA..row * REGCOUNT_DATA + REGCOUNT_DATA];
             let rev_row = &rev_vec[row * REGCOUNT_DATA..row * REGCOUNT_DATA + REGCOUNT_DATA];

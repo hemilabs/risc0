@@ -128,6 +128,23 @@ impl<'a, H: Hal> Prover<'a, H> {
 
         group_ref.merkle.commit(&mut self.iop);
 
+        // At po2>=22, spill this group's `evaluated` to host after commit.
+        // It's not needed again until eval_check; freeing the device buffer
+        // (3.4-13 GB depending on group) makes room for the next group's
+        // allocations. `DeferredFinalize::complete` restores them before
+        // circuit_hal.eval_check runs.
+        if self.po2 >= 22 {
+            let evaluated_bytes = group_ref
+                .evaluated
+                .as_ref()
+                .map(|e| e.size() * std::mem::size_of::<H::Elem>())
+                .unwrap_or(0);
+            if evaluated_bytes >= (1 << 30) {
+                // >= 1 GB
+                group_ref.release_evaluated_to_host(self.hal);
+            }
+        }
+
         tracing::debug!(
             "{} group root: {}",
             self.taps.group_name(tap_group_index),
@@ -205,6 +222,18 @@ impl<'a, H: Hal> Prover<'a, H> {
         let domain = self.cycles * INV_RATE;
         let ext_size = H::ExtElem::EXT_SIZE;
 
+        // Restore any host-spilled `evaluated` buffers before eval_check.
+        // At po2>=22, commit_group moved these off-device to free VRAM for
+        // subsequent groups' allocations; we bring them back for the kernel
+        // to read.
+        for pg in self.groups.iter_mut() {
+            if let Some(pg) = pg.as_mut() {
+                if pg.evaluated.is_none() && pg.evaluated_host.is_some() {
+                    pg.restore_evaluated_from_host(self.hal);
+                }
+            }
+        }
+
         // Now generate the check polynomial.
         let _ft_alloc = std::time::Instant::now();
         let check_poly = self.hal.alloc_elem("check_poly", ext_size * domain);
@@ -279,14 +308,25 @@ impl<H: Hal> DeferredFinalize<H> {
         // On tight-VRAM GPUs, release evaluated buffers (both PolyGroup.evaluated
         // AND merkle.matrix) to free memory for check PolyGroup + FRI allocations.
         // Evaluated will be reconstructed from coefficients before FRI batch_prove.
-        // Only needed when total VRAM < ~20 GB AND po2 >= 21 (large domains).
-        // At po2=20, evaluated buffers (~3.5 GB) fit comfortably in 16 GB.
-        let low_mem = hal.gpu_total_memory() < 20 * 1024 * 1024 * 1024 && self.po2 >= 21;
+        // po2>=22 is always low_mem regardless of VRAM (peak > 32 GB even on 24 GB cards);
+        // po2==21 is low_mem only on <20 GB cards.
+        let low_mem = self.po2 >= 22
+            || (hal.gpu_total_memory() < 20 * 1024 * 1024 * 1024 && self.po2 >= 21);
         if low_mem {
             for pg in self.groups.iter_mut() {
                 if let Some(pg) = pg.as_mut() {
                     pg.release_evaluated();
                 }
+            }
+        }
+
+        // Restore coeffs to device for all groups. Any group that had its
+        // coeffs spilled to host (via release_coeffs) at commit time to save
+        // VRAM during merkle/eval_check is reloaded here before the eval_u
+        // and mix_poly_coeffs phases below.
+        for pg in self.groups.iter_mut() {
+            if let Some(pg) = pg.as_mut() {
+                pg.restore_coeffs(hal);
             }
         }
 
@@ -366,7 +406,7 @@ impl<H: Hal> DeferredFinalize<H> {
                 let pg = pg.as_ref().unwrap();
                 let group_size = self.taps.group_taps(id).count();
                 hal.batch_evaluate_any(
-                    &pg.coeffs,
+                    pg.coeffs.as_ref().expect("coeffs must be restored"),
                     pg.count,
                     &which_buf.slice(offset, group_size),
                     &xs_buf.slice(offset, group_size),
@@ -404,7 +444,13 @@ impl<H: Hal> DeferredFinalize<H> {
             let out = hal.alloc_extelem("out", H::CHECK_SIZE);
             let which = hal.copy_from_u32("which", which.as_slice());
             let xs = hal.copy_from_extelem("xs", xs.as_slice());
-            hal.batch_evaluate_any(&check_group.coeffs, H::CHECK_SIZE, &which, &xs, &out);
+            hal.batch_evaluate_any(
+                check_group.coeffs.as_ref().expect("coeffs must be restored"),
+                H::CHECK_SIZE,
+                &which,
+                &xs,
+                &out,
+            );
             out.view(|view| {
                 coeff_u.extend(view);
             });
@@ -462,7 +508,7 @@ impl<H: Hal> DeferredFinalize<H> {
                     &combos,
                     &cur_mix,
                     &mix,
-                    &pg.coeffs,
+                    pg.coeffs.as_ref().expect("coeffs must be restored"),
                     &mix_which_buf.slice(which_offset, group_size),
                     group_size,
                     self.cycles,
@@ -475,7 +521,7 @@ impl<H: Hal> DeferredFinalize<H> {
                 &combos,
                 &cur_mix,
                 &mix,
-                &check_group.coeffs,
+                check_group.coeffs.as_ref().expect("coeffs must be restored"),
                 &mix_which_buf.slice(check_which_offset, H::CHECK_SIZE),
                 H::CHECK_SIZE,
                 self.cycles,
