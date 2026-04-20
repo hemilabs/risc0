@@ -771,6 +771,7 @@ fn build_intel_kernels() {
             .arg("-Xs").arg("-options -cl-opt-disable")
             // Note: 256 GRF + cl-opt-disable crashes ocloc (exit 226). Cannot use 256 GRF for witgen.
             // Note: 256 GRF alone (without cl-opt-disable) also crashes ocloc.
+            // Note: -cl-intel-enable-auto-large-GRF-mode tested 2026-04-20: no measurable effect.
             .arg("-Wno-unused-parameter")
             .arg("-Wno-unused-function")
             .arg("-Wno-unused-variable")

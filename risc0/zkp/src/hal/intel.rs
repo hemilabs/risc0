@@ -926,6 +926,33 @@ impl<IH: IntelHash + ?Sized> Hal for IntelHal<IH> {
 
     // ---- Gather / Scatter ----
 
+    fn batch_get_digest_at(&self, buf: &Self::Buffer<Digest>, indices: &[usize]) -> Vec<Digest> {
+        if indices.is_empty() {
+            return Vec::new();
+        }
+        let count = indices.len();
+        let indices_u32: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
+        let indices_buf = self.copy_from_u32("gather_indices", &indices_u32);
+        let output_buf: BufferImpl<Digest> = BufferImpl::new("gather_output", count);
+
+        let queue = get_queue();
+        esimd_check(unsafe {
+            intel::esimd_gather_digests_ffi(
+                queue,
+                output_buf.as_device_ptr().0 as *mut std::ffi::c_void,
+                buf.as_device_ptr().0 as *const std::ffi::c_void,
+                indices_buf.as_device_ptr().0 as *const std::ffi::c_void,
+                count as u32,
+            )
+        });
+
+        let mut result = Vec::new();
+        output_buf.view(|view| {
+            result = view.to_vec();
+        });
+        result
+    }
+
     fn gather_sample(
         &self,
         dst: &Self::Buffer<Self::Elem>,

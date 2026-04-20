@@ -77,19 +77,29 @@ static const char* make_error(const char* msg) {
 
 extern "C" {
 
+// Shared device and context for all queues — required for cross-queue event dependencies.
+static sycl::device* g_shared_device = nullptr;
+static sycl::context* g_shared_context = nullptr;
+
 void* esimd_create_queue() {
     try {
-        auto gpu_devices = sycl::device::get_devices(sycl::info::device_type::gpu);
-        for (auto& d : gpu_devices) {
-            auto name = d.get_info<sycl::info::device::name>();
-            if (name.find("Intel") != std::string::npos ||
-                name.find("0xe2") != std::string::npos) {
-                auto* q = new sycl::queue(d, sycl::property_list{
-                    sycl::property::queue::in_order{}});
-                return static_cast<void*>(q);
+        if (!g_shared_device) {
+            auto gpu_devices = sycl::device::get_devices(sycl::info::device_type::gpu);
+            for (auto& d : gpu_devices) {
+                auto name = d.get_info<sycl::info::device::name>();
+                if (name.find("Intel") != std::string::npos ||
+                    name.find("0xe2") != std::string::npos) {
+                    g_shared_device = new sycl::device(d);
+                    g_shared_context = new sycl::context(*g_shared_device);
+                    break;
+                }
             }
+            if (!g_shared_device) return nullptr;
         }
-        return nullptr; // no Intel GPU found
+        // All queues share the same context — enables cross-queue event barriers.
+        auto* q = new sycl::queue(*g_shared_context, *g_shared_device, sycl::property_list{
+            sycl::property::queue::in_order{}});
+        return static_cast<void*>(q);
     } catch (...) {
         return nullptr;
     }
@@ -106,6 +116,19 @@ void esimd_destroy_queue(void* queue) {
 void esimd_sync(void* queue) {
     auto* q = static_cast<sycl::queue*>(queue);
     q->wait();
+}
+
+// GPU-side cross-queue barrier: make dst_queue wait for all prior work on src_queue.
+// Unlike esimd_sync, this does NOT block the CPU — it only inserts a GPU-side dependency.
+// This is the SYCL equivalent of CUDA's cudaStreamWaitEvent.
+void esimd_cross_queue_barrier(void* src_queue, void* dst_queue) {
+    auto* src = static_cast<sycl::queue*>(src_queue);
+    auto* dst = static_cast<sycl::queue*>(dst_queue);
+    // Submit a barrier on the source queue — returns an event representing
+    // completion of all previously submitted work on src.
+    sycl::event src_done = src->ext_oneapi_submit_barrier();
+    // Make dst wait for that event — GPU-side only, CPU returns immediately.
+    dst->ext_oneapi_submit_barrier({src_done});
 }
 
 void* esimd_malloc_device(void* queue, size_t bytes) {
@@ -580,6 +603,27 @@ const char* esimd_scatter_fp_ffi(void* queue, void* into, const void* index,
                             static_cast<const uint32_t*>(index),
                             static_cast<const uint32_t*>(offsets),
                             static_cast<const uint32_t*>(values), count))
+}
+
+// Gather digests from `src` (Digest = 8 u32s) at scattered `indices` into `dst`.
+// Replaces N individual D2H get_at calls with one gather kernel + one bulk D2H.
+const char* esimd_gather_digests_ffi(void* queue, void* dst, const void* src,
+                                       const void* indices, uint32_t count) {
+    auto* q = static_cast<sycl::queue*>(queue);
+    auto* d = static_cast<uint32_t*>(dst);
+    const auto* s = static_cast<const uint32_t*>(src);
+    const auto* idx = static_cast<const uint32_t*>(indices);
+    FFI_WRAP(
+        q->submit([&](sycl::handler& h) {
+            h.parallel_for(sycl::range<1>(count), [=](sycl::id<1> i) {
+                uint32_t src_off = idx[i] * 8u;
+                uint32_t dst_off = (uint32_t)i * 8u;
+                for (int w = 0; w < 8; ++w) {
+                    d[dst_off + w] = s[src_off + w];
+                }
+            });
+        })
+    )
 }
 
 // ============================================================================

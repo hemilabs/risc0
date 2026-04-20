@@ -169,13 +169,10 @@ impl<IH: IntelHash> CircuitHal<IntelHal<IH>> for IntelCircuitHal<IH> {
         let rou = Val::ROU_FWD[po2 + EXP_PO2];
         let rou_raw: u32 = unsafe { std::mem::transmute(rou) };
 
-        // Sync main queue before submitting to eval_check queue.  The poly_mix
-        // upload (and all prior commits / NTTs) was enqueued on the main queue.
-        // Without this barrier the eval_check kernel on the separate queue can
-        // start reading poly_mix, check, groups, and globals before the main
-        // queue's writes are visible — a cross-queue data race that can hang the
-        // GPU on the second segment.
-        risc0_sys::intel::sync();
+        // GPU-side barrier: eval_check queue waits for all prior main-queue work
+        // (poly_mix upload, commits, NTTs) before reading those buffers.
+        // Uses SYCL ext_oneapi_submit_barrier — does NOT block the CPU.
+        risc0_sys::intel::main_to_eval_barrier();
 
         let eval_queue = risc0_sys::intel::get_eval_check_queue();
 
@@ -272,13 +269,11 @@ impl<IH: IntelHash> CircuitHal<IntelHal<IH>> for IntelCircuitHal<IH> {
     }
 
     fn eval_check_dep(&self) {
-        // Wait for eval_check (running on separate queue) before the main
-        // queue proceeds with operations that depend on the check buffer.
-        let eval_queue = risc0_sys::intel::get_eval_check_queue();
-        risc0_sys::intel::esimd_check(unsafe {
-            risc0_circuit_rv32im_sys::risc0_circuit_rv32im_intel_eval_check_sync(eval_queue)
-        });
-        // Release all eval_check buffers now that it's done
+        // GPU-side barrier: main queue waits for eval_check queue to finish
+        // before proceeding with operations that read the check buffer.
+        // Does NOT block the CPU — allows overlap with host-side work.
+        risc0_sys::intel::eval_to_main_barrier();
+        // Release all eval_check buffers now that the GPU dependency is set
         *self.eval_check_poly_mix.borrow_mut() = None;
         *self.eval_check_inter_fp.borrow_mut() = None;
         *self.eval_check_inter_ext.borrow_mut() = None;

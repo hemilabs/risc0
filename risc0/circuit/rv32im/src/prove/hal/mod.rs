@@ -352,19 +352,6 @@ where
                     .map(|g| (g, po2 as usize));
             }
         }
-        // Complete previous deferred finalize after witgen provides overlap with eval_check.
-        let prev_seal = if let Some(deferred) = self.pending_finalize.borrow_mut().take() {
-            let tp = std::time::Instant::now();
-            let seal = deferred.complete(hal.as_ref(), circuit_hal.as_ref());
-            if *VERBOSE { eprintln!(
-                "[prove_begin] completed prev finalize: {:.1}ms (after witgen={:.1}ms)",
-                tp.elapsed().as_secs_f64() * 1000.0,
-                t_witgen.as_secs_f64() * 1000.0,
-            ); }
-            Some(seal)
-        } else {
-            None
-        };
 
         let td = std::time::Instant::now();
         prover.commit_group(REGISTER_GROUP_DATA, data);
@@ -381,6 +368,21 @@ where
 
         let global_clone = hal.alloc_elem("global_clone", witgen.global.buf.size());
         hal.eltwise_copy_elem(&global_clone, &witgen.global.buf);
+
+        // Complete previous deferred finalize after witgen+commits+accum maximize
+        // overlap with eval_check(N) running on the eval_check queue.
+        let prev_seal = if let Some(deferred) = self.pending_finalize.borrow_mut().take() {
+            let tp = std::time::Instant::now();
+            let seal = deferred.complete(hal.as_ref(), circuit_hal.as_ref());
+            if *VERBOSE { eprintln!(
+                "[prove_begin] completed prev finalize: {:.1}ms (after witgen+commits={:.1}ms)",
+                tp.elapsed().as_secs_f64() * 1000.0,
+                t0.elapsed().as_secs_f64() * 1000.0,
+            ); }
+            Some(seal)
+        } else {
+            None
+        };
 
         let t_main = t0.elapsed();
 

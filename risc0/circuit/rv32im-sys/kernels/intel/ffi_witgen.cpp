@@ -260,7 +260,7 @@ const char* risc0_circuit_rv32im_intel_witgen(
     tables.tableU8 = g_cache.d_tableU8;
     tables.tableU16 = g_cache.d_tableU16;
 
-    constexpr uint32_t WG_SIZE = 256;
+    constexpr uint32_t WG_SIZE = 32;
 
     if (mode == kStepModeParallel) {
       uint32_t split = table_split_cycle;

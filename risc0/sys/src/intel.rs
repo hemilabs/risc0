@@ -29,6 +29,10 @@ extern "C" {
     pub fn esimd_destroy_queue(queue: *mut c_void);
     pub fn esimd_sync(queue: *mut c_void);
 
+    // GPU-side cross-queue barrier (SYCL ext_oneapi_submit_barrier).
+    // Makes dst_queue wait for all prior work on src_queue WITHOUT blocking the CPU.
+    pub fn esimd_cross_queue_barrier(src_queue: *mut c_void, dst_queue: *mut c_void);
+
     // Device memory management
     pub fn esimd_malloc_device(queue: *mut c_void, bytes: usize) -> *mut c_void;
     pub fn esimd_free_device(queue: *mut c_void, ptr: *mut c_void);
@@ -67,6 +71,7 @@ extern "C" {
     pub fn esimd_eltwise_zeroize_fp_ffi(queue: *mut c_void, elems: *mut c_void, count: u32) -> *const std::os::raw::c_char;
     pub fn esimd_gather_sample_fp_ffi(queue: *mut c_void, dst: *mut c_void, src: *const c_void, idx: u32, size: u32, stride: u32) -> *const std::os::raw::c_char;
     pub fn esimd_scatter_fp_ffi(queue: *mut c_void, into: *mut c_void, index: *const c_void, offsets: *const c_void, values: *const c_void, count: u32) -> *const std::os::raw::c_char;
+    pub fn esimd_gather_digests_ffi(queue: *mut c_void, dst: *mut c_void, src: *const c_void, indices: *const c_void, count: u32) -> *const std::os::raw::c_char;
 
     // FRI and polynomial operations
     pub fn esimd_fri_fold_ffi(queue: *mut c_void, d_out: *mut c_void, d_in: *const c_void, d_mix: *const c_void, count: u32) -> *const std::os::raw::c_char;
@@ -114,8 +119,22 @@ pub fn get_eval_check_queue() -> *mut c_void {
 }
 
 /// Synchronize the SYCL queue (wait for all submitted work to complete).
+/// WARNING: This blocks the CPU. Prefer GPU-side barriers for pipelining.
 pub fn sync() {
     unsafe { esimd_sync(get_queue()) };
+}
+
+/// GPU-side barrier: eval_check queue waits for main queue's prior work.
+/// Does NOT block the CPU — the dependency is resolved entirely on the GPU.
+/// This is the SYCL equivalent of CUDA's cudaStreamWaitEvent.
+pub fn main_to_eval_barrier() {
+    unsafe { esimd_cross_queue_barrier(get_queue(), get_eval_check_queue()) };
+}
+
+/// GPU-side barrier: main queue waits for eval_check queue to complete.
+/// Does NOT block the CPU.
+pub fn eval_to_main_barrier() {
+    unsafe { esimd_cross_queue_barrier(get_eval_check_queue(), get_queue()) };
 }
 
 // ============================================================================

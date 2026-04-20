@@ -317,8 +317,11 @@ void esimd_scatter(sycl::queue& q,
 void esimd_batch_bit_reverse(sycl::queue& q, uint32_t* io,
                               uint32_t nBits, uint32_t count) {
     auto* pd = io;
+    // Removed [[intel::sycl_explicit_simd]] — with that attribute each
+    // work-item ran SIMD1 (one lane). Plain SYCL lets the compiler pack
+    // work-items into subgroups for better memory access patterns.
     q.parallel_for(sycl::range<1>(count),
-        [=](sycl::id<1> gid) [[intel::sycl_explicit_simd]] {
+        [=](sycl::id<1> gid) {
             uint32_t totIdx = gid[0];
             uint32_t rowSize = 1u << nBits;
             uint32_t idx = totIdx & (rowSize - 1);
