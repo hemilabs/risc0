@@ -767,10 +767,10 @@ fn build_intel_kernels() {
             .arg("-fPIC")
             .arg("-fsycl")
             .arg("-std=c++17")
-            .arg("-Os") // -Os: different optimization passes to avoid icpx -O1 accum miscompilation
-            // 2026-04-21 experiment: patched IGC + no cl-opt-disable + explicit 256 GRF.
-            // Prior no-cl-opt-disable attempt (128 GRF implicit) caused runtime DEVICE_LOST.
-            // 256 GRF might avoid whatever runtime issue the 128-GRF path hit.
+            .arg("-Os") // -Os: different opt passes to avoid icpx -O1 accum miscompilation
+            // 2026-04-21: patched IGC + no cl-opt-disable + explicit 256 GRF (committed setup).
+            // 2026-04-22: -Xfinalizer presched-rp/spillAllowed flags tested via -options nesting,
+            // ocloc rejected with exit 226. Need different syntax — deferred.
             .arg("-Xs").arg("-options -cl-intel-256-GRF-per-thread")
             .arg("-Wno-unused-parameter")
             .arg("-Wno-unused-function")

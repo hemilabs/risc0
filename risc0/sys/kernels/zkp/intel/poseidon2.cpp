@@ -135,9 +135,32 @@ ESIMD_INLINE void multiply_by_m_ext(bb31::Vec16 cells[CELLS]) {
         sums[2] = bb31::field_add(sums[2], cells[g*4+2]);
         sums[3] = bb31::field_add(sums[3], cells[g*4+3]);
     }
-    for (uint32_t i = 0; i < CELLS; i++) {
-        cells[i] = bb31::field_add(cells[i], sums[i % 4]);
-    }
+    // Unrolled 6 groups × 4 cells (was: for i in 24, cells[i]+=sums[i%4]).
+    // Lets IGC scalar-replace sums[] and avoid reloading from the modulo-indexed array.
+    cells[0]  = bb31::field_add(cells[0],  sums[0]);
+    cells[1]  = bb31::field_add(cells[1],  sums[1]);
+    cells[2]  = bb31::field_add(cells[2],  sums[2]);
+    cells[3]  = bb31::field_add(cells[3],  sums[3]);
+    cells[4]  = bb31::field_add(cells[4],  sums[0]);
+    cells[5]  = bb31::field_add(cells[5],  sums[1]);
+    cells[6]  = bb31::field_add(cells[6],  sums[2]);
+    cells[7]  = bb31::field_add(cells[7],  sums[3]);
+    cells[8]  = bb31::field_add(cells[8],  sums[0]);
+    cells[9]  = bb31::field_add(cells[9],  sums[1]);
+    cells[10] = bb31::field_add(cells[10], sums[2]);
+    cells[11] = bb31::field_add(cells[11], sums[3]);
+    cells[12] = bb31::field_add(cells[12], sums[0]);
+    cells[13] = bb31::field_add(cells[13], sums[1]);
+    cells[14] = bb31::field_add(cells[14], sums[2]);
+    cells[15] = bb31::field_add(cells[15], sums[3]);
+    cells[16] = bb31::field_add(cells[16], sums[0]);
+    cells[17] = bb31::field_add(cells[17], sums[1]);
+    cells[18] = bb31::field_add(cells[18], sums[2]);
+    cells[19] = bb31::field_add(cells[19], sums[3]);
+    cells[20] = bb31::field_add(cells[20], sums[0]);
+    cells[21] = bb31::field_add(cells[21], sums[1]);
+    cells[22] = bb31::field_add(cells[22], sums[2]);
+    cells[23] = bb31::field_add(cells[23], sums[3]);
 }
 
 // Internal MDS matrix multiply: cell[i] = sum(all) + diag[i] * cell[i]

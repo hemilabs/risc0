@@ -235,10 +235,11 @@ const char* risc0_circuit_rv32im_intel_witgen(
       q.memcpy(g_cache.d_bigintBytes, h_bigint, bigint_len);
     }
 
-    // Zero lookup tables
+    // Zero lookup tables. NOTE: no q.wait() needed — in-order queue ensures the
+    // following kernel sees these uploads. The CPU-side flag below is host-only
+    // semantics, set unconditionally before subsequent calls observe it.
     q.memset(g_cache.d_tableU8, 0, 256 * sizeof(uint32_t));
     q.memset(g_cache.d_tableU16, 0, 65536 * sizeof(uint32_t));
-    q.wait();
     g_cache.preflight_on_device = true;
 
     auto t1 = std::chrono::steady_clock::now();
@@ -397,10 +398,9 @@ const char* risc0_circuit_rv32im_intel_accum(
         q.memcpy(g_cache.d_bigintBytes, h_bigint, bigint_len);
       }
     }
-    // Zero lookup tables for accum phase
+    // Zero lookup tables for accum phase. No q.wait() — in-order queue chains.
     q.memset(g_cache.d_tableU8, 0, 256 * sizeof(uint32_t));
     q.memset(g_cache.d_tableU16, 0, 65536 * sizeof(uint32_t));
-    q.wait();
 
     auto t1 = std::chrono::steady_clock::now();
 
