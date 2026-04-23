@@ -44,6 +44,7 @@ malachite = { version = "0.4.22", optional = true, default-features = false, fea
 ] }
 num-derive = { version = "0.4.2", optional = true }
 num-traits = { version = "0.2.19", optional = true }
+parking_lot = { version = "0.12", optional = true }
 postcard = { version = "1.1.1", optional = true, features = ["use-std"] }
 rand = { version = "0.9.1", optional = true }
 rayon = { version = "1.5", optional = true }
@@ -75,6 +76,7 @@ rocm = [
 ]
 intel = [
   "prove",
+  "dep:parking_lot",
   "risc0-circuit-rv32im-sys/intel",
   "risc0-sys/intel",
   "risc0-zkp/intel",

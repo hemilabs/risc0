@@ -17,7 +17,7 @@
 
 mod consts;
 
-use std::rc::Rc;
+use alloc::sync::Arc;
 
 use ff::{Field, PrimeField};
 use risc0_core::field::{
@@ -226,7 +226,7 @@ impl Rng<BabyBear> for Poseidon254Rng {
 struct PoseidonRngFactory;
 
 impl RngFactory<BabyBear> for PoseidonRngFactory {
-    fn new_rng(&self) -> Box<dyn Rng<BabyBear>> {
+    fn new_rng(&self) -> Box<dyn Rng<BabyBear> + Send> {
         Box::new(Poseidon254Rng::new())
     }
 }
@@ -239,8 +239,8 @@ impl Poseidon254HashSuite {
     pub fn new_suite() -> HashSuite<BabyBear> {
         HashSuite {
             name: "poseidon254".into(),
-            hashfn: Rc::new(Poseidon254HashFn {}),
-            rng: Rc::new(PoseidonRngFactory {}),
+            hashfn: Arc::new(Poseidon254HashFn {}),
+            rng: Arc::new(PoseidonRngFactory {}),
         }
     }
 }

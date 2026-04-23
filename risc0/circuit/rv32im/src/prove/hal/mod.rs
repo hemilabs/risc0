@@ -20,7 +20,7 @@ pub(crate) mod intel;
 #[cfg(feature = "rocm")]
 pub(crate) mod hip;
 
-use std::{cell::RefCell, rc::Rc, sync::LazyLock};
+use std::{cell::RefCell, sync::{Arc, LazyLock}};
 
 use anyhow::Result;
 use risc0_core::scope;
@@ -30,7 +30,7 @@ use risc0_zkp::{
     adapter::{CircuitInfo as _, PROOF_SYSTEM_INFO},
     field::Elem as _,
     hal::{Buffer, CircuitHal, Hal},
-    prove::{poly_group::PolyGroup, DeferredFinalize, Prover},
+    prove::{poly_group::PolyGroup, Prover},
 };
 
 use super::{
@@ -111,21 +111,27 @@ pub(crate) struct SegmentProverImpl<H, C, F>
 where
     H: Hal<Field = CircuitField, Elem = Val, ExtElem = ExtVal>,
     C: CircuitHal<H> + CircuitWitnessGenerator<H>,
-    F: Fn() -> (Rc<H>, Rc<C>),
+    F: Fn() -> (Arc<H>, Arc<C>),
 {
     hal_factory: F,
-    cached_hal: RefCell<Option<(Rc<H>, Rc<C>)>>,
+    cached_hal: RefCell<Option<(Arc<H>, Arc<C>)>>,
     /// Cached code PolyGroup (always zeros, same for every segment at same po2).
     cached_code_group: RefCell<Option<(PolyGroup<H>, usize)>>,
-    /// Deferred finalize from previous prove_begin call (for eval_check pipelining).
-    pending_finalize: RefCell<Option<DeferredFinalize<H>>>,
+    /// Backgrounded finalize from previous prove_begin call. Holds a
+    /// JoinHandle for the thread running DeferredFinalize::complete(); the
+    /// thread's CPU work (poly_interpolate, combos_divide, fri queries) runs
+    /// in parallel with the next segment's main GPU work (witgen, commits),
+    /// eliminating most of the ~335 ms sequential "completed prev finalize"
+    /// wait. Requires H and C to be Send+Sync+'static (post the IntelHal
+    /// Send refactor).
+    pending_finalize: RefCell<Option<std::thread::JoinHandle<Seal>>>,
 }
 
 impl<H, C, F> SegmentProverImpl<H, C, F>
 where
     H: Hal<Field = CircuitField, Elem = Val, ExtElem = ExtVal>,
     C: CircuitHal<H> + CircuitWitnessGenerator<H>,
-    F: Fn() -> (Rc<H>, Rc<C>),
+    F: Fn() -> (Arc<H>, Arc<C>),
 {
     pub fn new(hal_factory: F) -> Self {
         Self {
@@ -136,7 +142,7 @@ where
         }
     }
 
-    fn get_hal(&self) -> (Rc<H>, Rc<C>) {
+    fn get_hal(&self) -> (Arc<H>, Arc<C>) {
         let mut cached = self.cached_hal.borrow_mut();
         if let Some(ref hal) = *cached {
             return (hal.0.clone(), hal.1.clone());
@@ -149,9 +155,14 @@ where
 
 impl<H, C, F> SegmentProver for SegmentProverImpl<H, C, F>
 where
-    H: Hal<Field = CircuitField, Elem = Val, ExtElem = ExtVal> + 'static,
-    C: CircuitHal<H> + CircuitWitnessGenerator<H> + CircuitAccumulator<H>,
-    F: Fn() -> (Rc<H>, Rc<C>),
+    // Send + Sync + 'static so prove_begin can spawn the backgrounded
+    // finalize on a worker thread. The H::Buffer<T> bounds let
+    // DeferredFinalize<H> (which contains buffers of various T) be Send.
+    H: Hal<Field = CircuitField, Elem = Val, ExtElem = ExtVal> + Send + Sync + 'static,
+    H::Buffer<Val>: Send,
+    H::Buffer<risc0_zkp::core::digest::Digest>: Send,
+    C: CircuitHal<H> + CircuitWitnessGenerator<H> + CircuitAccumulator<H> + Send + Sync + 'static,
+    F: Fn() -> (Arc<H>, Arc<C>),
 {
     fn preflight(&self, segment: &Segment) -> Result<PreflightResults> {
         scope!("preflight");
@@ -369,13 +380,16 @@ where
         let global_clone = hal.alloc_elem("global_clone", witgen.global.buf.size());
         hal.eltwise_copy_elem(&global_clone, &witgen.global.buf);
 
-        // Complete previous deferred finalize after witgen+commits+accum maximize
-        // overlap with eval_check(N) running on the eval_check queue.
-        let prev_seal = if let Some(deferred) = self.pending_finalize.borrow_mut().take() {
+        // Join the prev segment's backgrounded finalize. Its CPU work has
+        // been running in parallel with THIS seg's main work (witgen +
+        // commits + accum + accum_commit), so the join wait is typically
+        // ~0 ms — finalize is already done by the time main finishes.
+        let prev_seal = if let Some(handle) = self.pending_finalize.borrow_mut().take() {
             let tp = std::time::Instant::now();
-            let seal = deferred.complete(hal.as_ref(), circuit_hal.as_ref());
+            let seal = handle.join()
+                .map_err(|_| anyhow::anyhow!("finalize thread panicked"))?;
             if *VERBOSE { eprintln!(
-                "[prove_begin] completed prev finalize: {:.1}ms (after witgen+commits={:.1}ms)",
+                "[prove_begin] joined prev finalize thread: {:.1}ms (after witgen+commits={:.1}ms)",
                 tp.elapsed().as_secs_f64() * 1000.0,
                 t0.elapsed().as_secs_f64() * 1000.0,
             ); }
@@ -395,7 +409,37 @@ where
         // Keep globals alive until eval_check completes.
         deferred.keep_alive_buf(mix.buf);
         deferred.keep_alive_buf(global_clone);
-        *self.pending_finalize.borrow_mut() = Some(deferred);
+
+        // Spawn the finalize completion on a background thread. The thread
+        // runs check_intt/check_commit GPU kernels and the CPU work
+        // (poly_interpolate, combos_divide, fri proving) in parallel with
+        // the NEXT iteration's main phase on this thread. Join happens at
+        // the start of the next prove_begin.
+        //
+        // For the Intel HAL, redirect this thread's get_queue() to the
+        // eval_check queue (a separate SYCL queue) so finalize GPU ops run
+        // concurrently with the main thread's witgen instead of serializing
+        // behind it on the shared main queue. eval_check_queue is otherwise
+        // idle at this point: the eval_check kernel for THIS segment hasn't
+        // been launched yet (start_finalize for THIS seg already queued it
+        // moments ago, but bg-thread finalize is for the PREVIOUS seg whose
+        // eval_check finished long ago).
+        let hal_for_thread = Arc::clone(&hal);
+        let circuit_hal_for_thread = Arc::clone(&circuit_hal);
+        let handle = std::thread::spawn(move || -> Seal {
+            #[cfg(feature = "intel")]
+            {
+                let q = risc0_sys::intel::get_eval_check_queue();
+                risc0_sys::intel::with_queue_override(q, || {
+                    deferred.complete(hal_for_thread.as_ref(), circuit_hal_for_thread.as_ref())
+                })
+            }
+            #[cfg(not(feature = "intel"))]
+            {
+                deferred.complete(hal_for_thread.as_ref(), circuit_hal_for_thread.as_ref())
+            }
+        });
+        *self.pending_finalize.borrow_mut() = Some(handle);
 
         if *VERBOSE { eprintln!(
             "[prove_begin] witgen={:.1}ms data_commit={:.1}ms accum={:.1}ms accum_commit={:.1}ms main={:.1}ms total={:.1}ms",
@@ -412,16 +456,18 @@ where
 
     fn prove_end(&self) -> Result<Seal> {
         scope!("prove_end");
-        let (hal, circuit_hal) = self.get_hal();
-        let deferred = self
+        // No GPU work here — just join the last segment's backgrounded
+        // finalize thread. The wait should be short or zero.
+        let handle = self
             .pending_finalize
             .borrow_mut()
             .take()
             .ok_or_else(|| anyhow::anyhow!("prove_end: no pending finalize"))?;
         let t0 = std::time::Instant::now();
-        let seal = deferred.complete(hal.as_ref(), circuit_hal.as_ref());
+        let seal = handle.join()
+            .map_err(|_| anyhow::anyhow!("finalize thread panicked in prove_end"))?;
         if *VERBOSE { eprintln!(
-            "[prove_end] finalize: {:.1}ms",
+            "[prove_end] joined finalize thread: {:.1}ms",
             t0.elapsed().as_secs_f64() * 1000.0
         ); }
         Ok(seal)

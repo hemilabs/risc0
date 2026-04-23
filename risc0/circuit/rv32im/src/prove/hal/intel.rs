@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use anyhow::Result;
+use parking_lot::Mutex;
 // CPU accum FFI used as fallback while GPU accum is being debugged
 use risc0_core::scope;
 use risc0_sys::ffi_wrap;
@@ -44,20 +44,23 @@ use crate::{
 };
 
 pub struct IntelCircuitHal<IH: IntelHash> {
-    _hal: Rc<IntelHal<IH>>,
+    _hal: Arc<IntelHal<IH>>,
     // Keep buffers alive while eval_check runs asynchronously on separate queue.
-    eval_check_poly_mix: RefCell<Option<IntelBuffer<u32>>>,
-    eval_check_inter_fp: RefCell<Option<IntelBuffer<u32>>>,
-    eval_check_inter_ext: RefCell<Option<IntelBuffer<u32>>>,
+    // Arc+Mutex (instead of Rc+RefCell) so IntelCircuitHal is Send — required
+    // for the finalize-overlap path that moves DeferredFinalize into the
+    // receipt background thread.
+    eval_check_poly_mix: Mutex<Option<IntelBuffer<u32>>>,
+    eval_check_inter_fp: Mutex<Option<IntelBuffer<u32>>>,
+    eval_check_inter_ext: Mutex<Option<IntelBuffer<u32>>>,
 }
 
 impl<IH: IntelHash> IntelCircuitHal<IH> {
-    pub fn new(_hal: Rc<IntelHal<IH>>) -> Self {
+    pub fn new(_hal: Arc<IntelHal<IH>>) -> Self {
         Self {
             _hal,
-            eval_check_poly_mix: RefCell::new(None),
-            eval_check_inter_fp: RefCell::new(None),
-            eval_check_inter_ext: RefCell::new(None),
+            eval_check_poly_mix: Mutex::new(None),
+            eval_check_inter_fp: Mutex::new(None),
+            eval_check_inter_ext: Mutex::new(None),
         }
     }
 }
@@ -244,8 +247,8 @@ impl<IH: IntelHash> CircuitHal<IntelHal<IH>> for IntelCircuitHal<IH> {
             }
 
             // Keep intermediate buffers alive until eval_check_dep()
-            *self.eval_check_inter_fp.borrow_mut() = Some(inter_fp);
-            *self.eval_check_inter_ext.borrow_mut() = Some(inter_ext);
+            *self.eval_check_inter_fp.lock() = Some(inter_fp);
+            *self.eval_check_inter_ext.lock() = Some(inter_ext);
         } else {
             // Monolithic: single kernel call
             risc0_sys::intel::esimd_check(unsafe {
@@ -265,7 +268,7 @@ impl<IH: IntelHash> CircuitHal<IntelHal<IH>> for IntelCircuitHal<IH> {
         }
 
         // Keep poly_mix_buf alive until eval_check_dep() or next eval_check()
-        *self.eval_check_poly_mix.borrow_mut() = Some(poly_mix_buf);
+        *self.eval_check_poly_mix.lock() = Some(poly_mix_buf);
     }
 
     fn eval_check_dep(&self) {
@@ -274,9 +277,9 @@ impl<IH: IntelHash> CircuitHal<IntelHal<IH>> for IntelCircuitHal<IH> {
         // Does NOT block the CPU — allows overlap with host-side work.
         risc0_sys::intel::eval_to_main_barrier();
         // Release all eval_check buffers now that the GPU dependency is set
-        *self.eval_check_poly_mix.borrow_mut() = None;
-        *self.eval_check_inter_fp.borrow_mut() = None;
-        *self.eval_check_inter_ext.borrow_mut() = None;
+        *self.eval_check_poly_mix.lock() = None;
+        *self.eval_check_inter_fp.lock() = None;
+        *self.eval_check_inter_ext.lock() = None;
     }
 
     fn accumulate(
@@ -297,8 +300,8 @@ pub type IntelCircuitHalPoseidon2 = IntelCircuitHal<IntelHashPoseidon2>;
 
 pub fn segment_prover() -> Result<Box<dyn SegmentProver>> {
     let hal_factory = || {
-        let hal = Rc::new(IntelHalPoseidon2::new());
-        let circuit_hal = Rc::new(IntelCircuitHalPoseidon2::new(hal.clone()));
+        let hal = Arc::new(IntelHalPoseidon2::new());
+        let circuit_hal = Arc::new(IntelCircuitHalPoseidon2::new(hal.clone()));
         (hal, circuit_hal)
     };
     Ok(Box::new(SegmentProverImpl::new(hal_factory)))

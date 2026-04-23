@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use anyhow::Result;
 use risc0_circuit_rv32im_sys::{
@@ -48,11 +48,11 @@ use super::{
 };
 
 pub struct CudaCircuitHal<CH: CudaHash> {
-    _hal: Rc<CudaHal<CH>>, // retain a reference to ensure the context remains valid
+    _hal: Arc<CudaHal<CH>>, // retain a reference to ensure the context remains valid
 }
 
 impl<CH: CudaHash> CudaCircuitHal<CH> {
-    pub fn new(_hal: Rc<CudaHal<CH>>) -> Self {
+    pub fn new(_hal: Arc<CudaHal<CH>>) -> Self {
         Self { _hal }
     }
 }
@@ -247,8 +247,8 @@ pub type CudaCircuitHalPoseidon2 = CudaCircuitHal<CudaHashPoseidon2>;
 
 pub fn segment_prover() -> Result<Box<dyn SegmentProver>> {
     let hal_factory = || {
-        let hal = Rc::new(CudaHalPoseidon2::new());
-        let circuit_hal = Rc::new(CudaCircuitHalPoseidon2::new(hal.clone()));
+        let hal = Arc::new(CudaHalPoseidon2::new());
+        let circuit_hal = Arc::new(CudaCircuitHalPoseidon2::new(hal.clone()));
         (hal, circuit_hal)
     };
     Ok(Box::new(SegmentProverImpl::new(hal_factory)))
@@ -256,7 +256,7 @@ pub fn segment_prover() -> Result<Box<dyn SegmentProver>> {
 
 #[cfg(test)]
 mod tests {
-    use std::rc::Rc;
+    use std::sync::Arc;
 
     use rand::Rng;
     use risc0_core::field::baby_bear::BabyBear;
@@ -331,7 +331,7 @@ mod tests {
         const PO2: usize = 4;
         let cpu_hal: CpuHal<BabyBear> = CpuHal::new(Sha256HashSuite::new_suite());
         let cpu_eval = CpuCircuitHal;
-        let gpu_hal = Rc::new(CudaHalSha256::new());
+        let gpu_hal = Arc::new(CudaHalSha256::new());
         let gpu_eval = super::CudaCircuitHal::new(gpu_hal.clone());
         let params = EvalCheckParams::new(PO2);
         let check1 = eval_check_impl(&params, &cpu_hal, &cpu_eval);

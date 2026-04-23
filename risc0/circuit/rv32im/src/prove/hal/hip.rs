@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use anyhow::Result;
 use risc0_circuit_rv32im_sys::{
@@ -48,11 +48,11 @@ use super::{
 };
 
 pub struct HipCircuitHal<HH: HipHash> {
-    _hal: Rc<HipHal<HH>>, // retain a reference to ensure the context remains valid
+    _hal: Arc<HipHal<HH>>, // retain a reference to ensure the context remains valid
 }
 
 impl<HH: HipHash> HipCircuitHal<HH> {
-    pub fn new(_hal: Rc<HipHal<HH>>) -> Self {
+    pub fn new(_hal: Arc<HipHal<HH>>) -> Self {
         Self { _hal }
     }
 }
@@ -250,8 +250,8 @@ pub type HipCircuitHalPoseidon2 = HipCircuitHal<HipHashPoseidon2>;
 
 pub fn segment_prover() -> Result<Box<dyn SegmentProver>> {
     let hal_factory = || {
-        let hal = Rc::new(HipHalPoseidon2::new());
-        let circuit_hal = Rc::new(HipCircuitHalPoseidon2::new(hal.clone()));
+        let hal = Arc::new(HipHalPoseidon2::new());
+        let circuit_hal = Arc::new(HipCircuitHalPoseidon2::new(hal.clone()));
         (hal, circuit_hal)
     };
     Ok(Box::new(SegmentProverImpl::new(hal_factory)))

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use anyhow::Result;
 use rayon::prelude::*;
@@ -230,7 +230,7 @@ impl CircuitHal<CpuHal> for CpuCircuitHal {
 pub fn segment_prover() -> Result<Box<dyn SegmentProver>> {
     let hal_factory = || {
         let suite = Poseidon2HashSuite::new_suite();
-        (Rc::new(CpuHal::new(suite)), Rc::new(CpuCircuitHal))
+        (Arc::new(CpuHal::new(suite)), Arc::new(CpuCircuitHal))
     };
     Ok(Box::new(SegmentProverImpl::new(hal_factory)))
 }

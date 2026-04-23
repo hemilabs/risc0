@@ -328,7 +328,7 @@ impl<F: Field> super::HashFn<F> for Sha256HashFn {
 struct Sha256RngFactory;
 
 impl<F: Field> super::RngFactory<F> for Sha256RngFactory {
-    fn new_rng(&self) -> Box<dyn super::Rng<F>> {
+    fn new_rng(&self) -> Box<dyn super::Rng<F> + Send> {
         Box::new(rng::ShaRng::new())
     }
 }
@@ -341,11 +341,11 @@ pub struct Sha256HashSuite<F: Field> {
 impl<F: Field> Sha256HashSuite<F> {
     /// Construct a Sha256HashSuite
     pub fn new_suite() -> super::HashSuite<F> {
-        use alloc::rc::Rc;
+        use alloc::sync::Arc;
         super::HashSuite {
             name: "sha-256".into(),
-            hashfn: Rc::new(Sha256HashFn {}),
-            rng: Rc::new(Sha256RngFactory {}),
+            hashfn: Arc::new(Sha256HashFn {}),
+            rng: Arc::new(Sha256RngFactory {}),
         }
     }
 }

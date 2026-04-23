@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use risc0_circuit_recursion_sys::{
@@ -48,11 +48,11 @@ use crate::{
 use super::{CircuitAccumulator, CircuitWitnessGenerator};
 
 struct IntelCircuitHal<IH: IntelHash> {
-    _hal: Rc<IntelHal<IH>>, // retain a reference to ensure the context remains valid
+    _hal: Arc<IntelHal<IH>>, // retain a reference to ensure the context remains valid
 }
 
 impl<IH: IntelHash> IntelCircuitHal<IH> {
-    pub fn new(_hal: Rc<IntelHal<IH>>) -> Self {
+    pub fn new(_hal: Arc<IntelHal<IH>>) -> Self {
         Self { _hal }
     }
 }
@@ -197,20 +197,20 @@ type IntelCircuitHalPoseidon254 = IntelCircuitHal<IntelHashPoseidon254>;
 pub(crate) fn recursion_prover(hashfn: &str) -> Result<Box<dyn RecursionProver>> {
     match hashfn {
         "poseidon2" => {
-            let hal = Rc::new(IntelHalPoseidon2::new());
-            let circuit_hal = Rc::new(IntelCircuitHalPoseidon2::new(hal.clone()));
+            let hal = Arc::new(IntelHalPoseidon2::new());
+            let circuit_hal = Arc::new(IntelCircuitHalPoseidon2::new(hal.clone()));
             Ok(Box::new(RecursionProverImpl::new(hal, circuit_hal)))
         }
         "sha-256" => {
-            let hal = Rc::new(IntelHalSha256::new());
-            let circuit_hal = Rc::new(IntelCircuitHalSha256::new(hal.clone()));
+            let hal = Arc::new(IntelHalSha256::new());
+            let circuit_hal = Arc::new(IntelCircuitHalSha256::new(hal.clone()));
             Ok(Box::new(RecursionProverImpl::new(hal, circuit_hal)))
         }
         "poseidon_254" => {
             // GPU Poseidon-254 via ESIMD — BN254 field arithmetic on Intel Arc.
             // hash_fold/hash_rows run entirely on GPU with zero PCIe round-trips.
-            let hal = Rc::new(IntelHalPoseidon254::new());
-            let circuit_hal = Rc::new(IntelCircuitHalPoseidon254::new(hal.clone()));
+            let hal = Arc::new(IntelHalPoseidon254::new());
+            let circuit_hal = Arc::new(IntelCircuitHalPoseidon254::new(hal.clone()));
             Ok(Box::new(RecursionProverImpl::new(hal, circuit_hal)))
         }
         _ => bail!("Unsupported hashfn: {hashfn}"),

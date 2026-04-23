@@ -22,7 +22,7 @@ mod program;
 mod witgen;
 pub mod zkr;
 
-use std::{cell::RefCell, collections::HashMap, collections::VecDeque, fmt::Debug, rc::Rc, sync::{Arc, LazyLock}};
+use std::{cell::RefCell, collections::HashMap, collections::VecDeque, fmt::Debug, sync::{Arc, LazyLock}};
 
 use anyhow::Result;
 use cfg_if::cfg_if;
@@ -204,8 +204,8 @@ where
     H: Hal<Field = BabyBear, Elem = BabyBearElem, ExtElem = BabyBearExtElem>,
     C: CircuitHal<H> + CircuitWitnessGenerator<H>,
 {
-    hal: Rc<H>,
-    circuit_hal: Rc<C>,
+    hal: Arc<H>,
+    circuit_hal: Arc<C>,
     // Cache ctrl PolyGroup by (code_rows, po2) to skip iNTT/expand/merkle on
     // repeated proofs with the same program (e.g. 43 lifts all use the same ZKR).
     cached_ctrl_group: RefCell<HashMap<(usize, usize), PolyGroup<H>>>,
@@ -344,7 +344,7 @@ where
     H: Hal<Field = BabyBear, Elem = BabyBearElem, ExtElem = BabyBearExtElem>,
     C: CircuitHal<H> + CircuitWitnessGenerator<H>,
 {
-    pub fn new(hal: Rc<H>, circuit_hal: Rc<C>) -> Self {
+    pub fn new(hal: Arc<H>, circuit_hal: Arc<C>) -> Self {
         Self {
             hal,
             circuit_hal,

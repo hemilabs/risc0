@@ -93,9 +93,45 @@ static INIT: Once = Once::new();
 static mut QUEUE: *mut c_void = std::ptr::null_mut();
 static mut EVAL_CHECK_QUEUE: *mut c_void = std::ptr::null_mut();
 
+// Per-thread queue override. When set (via [`with_queue_override`]) all
+// `get_queue()` calls on this thread return the override instead of the
+// main queue. Used by the background finalize thread to route its GPU
+// submissions onto the eval_check queue, so they run concurrently with
+// the main thread's witgen instead of serializing behind it.
+//
+// Pointer-as-usize because *mut c_void isn't Send (we need TLS, not shared,
+// but Cell wants Copy and *mut c_void is Copy — actually we use AtomicUsize
+// for thread-local Cell-like semantics). Simpler: thread_local Cell<usize>.
+std::thread_local! {
+    static QUEUE_OVERRIDE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Run `f` with `get_queue()` redirected to `queue` on this thread. Restores
+/// the previous override on exit (RAII via finally-style closure).
+pub fn with_queue_override<R>(queue: *mut c_void, f: impl FnOnce() -> R) -> R {
+    let prev = QUEUE_OVERRIDE.with(|c| {
+        let p = c.get();
+        c.set(queue as usize);
+        p
+    });
+    // Restore on panic: use a guard struct
+    struct Guard { prev: usize }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            QUEUE_OVERRIDE.with(|c| c.set(self.prev));
+        }
+    }
+    let _g = Guard { prev };
+    f()
+}
+
 /// Get the singleton SYCL queue (main), creating it on first call.
 /// Panics if no Intel GPU is found.
 pub fn get_queue() -> *mut c_void {
+    let override_q = QUEUE_OVERRIDE.with(|c| c.get());
+    if override_q != 0 {
+        return override_q as *mut c_void;
+    }
     unsafe {
         INIT.call_once(|| {
             QUEUE = esimd_create_queue();

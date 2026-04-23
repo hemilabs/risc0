@@ -19,11 +19,10 @@ use std::{
     fmt::Debug,
     marker::PhantomData,
     mem::ManuallyDrop,
-    rc::Rc,
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
 };
 
-use parking_lot::{ReentrantMutex, ReentrantMutexGuard};
+use parking_lot::{Mutex, ReentrantMutex};
 use risc0_core::{
     field::{
         baby_bear::{BabyBear, BabyBearElem, BabyBearExtElem},
@@ -231,8 +230,15 @@ impl IntelHash for IntelHashPoseidon254 {
 
 pub struct IntelHal<Hash: IntelHash + ?Sized> {
     hash: Option<Box<Hash>>,
-    _lock: ReentrantMutexGuard<'static, ()>,
 }
+
+// SAFETY: IntelHal holds no thread-pinned state. Underlying buffers use
+// Arc<Mutex<RawBuffer>>, the SYCL queue handle is a process-wide singleton
+// safe to access from any thread, and the singleton ReentrantMutex is
+// acquired per-method on entry to GPU-touching methods (not held across
+// thread boundaries).
+unsafe impl<Hash: IntelHash + ?Sized> Send for IntelHal<Hash> where Hash: Send {}
+unsafe impl<Hash: IntelHash + ?Sized> Sync for IntelHal<Hash> where Hash: Sync {}
 
 pub type IntelHalPoseidon2 = IntelHal<IntelHashPoseidon2>;
 pub type IntelHalSha256 = IntelHal<IntelHashSha256>;
@@ -322,7 +328,12 @@ impl Drop for RawBuffer {
 
 #[derive(Clone)]
 pub struct BufferImpl<T> {
-    buffer: Rc<RefCell<RawBuffer>>,
+    // Arc<Mutex<...>> instead of Rc<RefCell<...>> so buffers can be sent
+    // across thread boundaries (used for backgrounded finalize/receipt work).
+    // RawBuffer carries device pointers + size; the mutex serialises any
+    // mutating access (D2H/H2D copies, memset). Method-call frequency is
+    // low enough that parking_lot::Mutex overhead vs RefCell is negligible.
+    buffer: Arc<Mutex<RawBuffer>>,
     size: usize,
     offset: usize,
     marker: PhantomData<T>,
@@ -345,7 +356,7 @@ impl<T> BufferImpl<T> {
         let bytes_len = std::mem::size_of::<T>() * size;
         assert!(bytes_len > 0);
         BufferImpl {
-            buffer: Rc::new(RefCell::new(RawBuffer::new(name, bytes_len))),
+            buffer: Arc::new(Mutex::new(RawBuffer::new(name, bytes_len))),
             size,
             offset: 0,
             marker: PhantomData,
@@ -359,7 +370,7 @@ impl<T> BufferImpl<T> {
         let bytes: &[u8] = unchecked_cast(slice);
         buffer.buf.copy_from(bytes).unwrap();
         BufferImpl {
-            buffer: Rc::new(RefCell::new(buffer)),
+            buffer: Arc::new(Mutex::new(buffer)),
             size: slice.len(),
             offset: 0,
             marker: PhantomData,
@@ -367,13 +378,13 @@ impl<T> BufferImpl<T> {
     }
 
     pub fn as_device_ptr(&self) -> DevicePointer<u8> {
-        let ptr = self.buffer.borrow().buf.as_device_ptr();
+        let ptr = self.buffer.lock().buf.as_device_ptr();
         let offset = self.offset * std::mem::size_of::<T>();
         unsafe { ptr.offset(offset.try_into().unwrap()) }
     }
 
     pub fn as_device_ptr_with_offset(&self, offset: usize) -> DevicePointer<u8> {
-        let ptr = self.buffer.borrow().buf.as_device_ptr();
+        let ptr = self.buffer.lock().buf.as_device_ptr();
         let offset = (self.offset + offset) * std::mem::size_of::<T>();
         unsafe { ptr.offset(offset.try_into().unwrap()) }
     }
@@ -387,7 +398,7 @@ impl<T> BufferImpl<T> {
         let byte_offset = self.offset * item_size;
         let byte_len = self.size * item_size;
         let bytes: &[u8] = unchecked_cast(data);
-        let buf = self.buffer.borrow();
+        let buf = self.buffer.lock();
         let queue = get_queue();
         let ptr = buf.buf.as_device_ptr();
         unsafe {
@@ -403,7 +414,7 @@ impl<T> BufferImpl<T> {
 
 impl<T: Clone> Buffer<T> for BufferImpl<T> {
     fn name(&self) -> &'static str {
-        self.buffer.borrow().name
+        self.buffer.lock().name
     }
 
     fn size(&self) -> usize {
@@ -422,7 +433,7 @@ impl<T: Clone> Buffer<T> for BufferImpl<T> {
 
     fn get_at(&self, idx: usize) -> T {
         let item_size = std::mem::size_of::<T>();
-        let buf = self.buffer.borrow();
+        let buf = self.buffer.lock();
         let offset = (self.offset + idx) * item_size;
         let host_buf = buf.buf.as_host_vec_range(offset, item_size).unwrap();
         let slice: &[T] = unchecked_cast(&host_buf[..]);
@@ -432,7 +443,7 @@ impl<T: Clone> Buffer<T> for BufferImpl<T> {
     fn view<F: FnOnce(&[T])>(&self, f: F) {
         scope!("view");
         let item_size = std::mem::size_of::<T>();
-        let buf = self.buffer.borrow();
+        let buf = self.buffer.lock();
         let offset = self.offset * item_size;
         let len = self.size * item_size;
         let host_buf = buf.buf.as_host_vec_range(offset, len).unwrap();
@@ -445,7 +456,7 @@ impl<T: Clone> Buffer<T> for BufferImpl<T> {
         let item_size = std::mem::size_of::<T>();
         let byte_offset = self.offset * item_size;
         let byte_len = self.size * item_size;
-        let mut buf = self.buffer.borrow_mut();
+        let mut buf = self.buffer.lock();
         let total_bytes = buf.buf.len();
 
         if byte_offset == 0 && byte_len == total_bytes {
@@ -476,7 +487,7 @@ impl<T: Clone> Buffer<T> for BufferImpl<T> {
 
     fn to_vec(&self) -> Vec<T> {
         let item_size = std::mem::size_of::<T>();
-        let buf = self.buffer.borrow();
+        let buf = self.buffer.lock();
         let offset = self.offset * item_size;
         let len = self.size * item_size;
         let host_buf = buf.buf.as_host_vec_range(offset, len).unwrap();
@@ -504,7 +515,11 @@ impl<IH: IntelHash + ?Sized> IntelHal<IH> {
     }
 
     fn new_from_hash(hash: Box<IH>) -> Self {
-        let _lock = singleton().lock();
+        // Acquire singleton lock during init only — released at end of fn so
+        // IntelHal itself can be Send. GPU-touching methods re-acquire the
+        // lock per call (singleton is a ReentrantMutex; same-thread reentry
+        // is free).
+        let _init_lock = singleton().lock();
 
         // Ensure the SYCL queue is initialized (creates on first call)
         let queue = get_queue();
@@ -516,11 +531,9 @@ impl<IH: IntelHash + ?Sized> IntelHal<IH> {
             unsafe { intel::esimd_warmup(queue, 22) };
         }
 
-        let mut hal = Self {
-            hash: None,
-            _lock,
-        };
+        let mut hal = Self { hash: None };
         hal.hash = Some(hash);
+        // _init_lock dropped here — hal becomes Send-friendly.
         hal
     }
 }
@@ -584,13 +597,13 @@ impl<IH: IntelHash + ?Sized> Hal for IntelHal<IH> {
         let raw_bits: u32 = unsafe { std::mem::transmute(value) };
         if raw_bits == 0xFFFFFFFF {
             // INVALID sentinel: all bytes are 0xFF
-            buf.buffer.borrow_mut().buf.memset(0xFF_u8 as i32, bytes_len);
+            buf.buffer.lock().buf.memset(0xFF_u8 as i32, bytes_len);
         } else if raw_bits == 0 {
             // ZERO: all bytes are 0x00
-            buf.buffer.borrow_mut().buf.memset(0, bytes_len);
+            buf.buffer.lock().buf.memset(0, bytes_len);
         } else {
             // General case: use set_32
-            buf.buffer.borrow_mut().buf.set_32(raw_bits);
+            buf.buffer.lock().buf.set_32(raw_bits);
         }
         buf
     }
@@ -600,7 +613,7 @@ impl<IH: IntelHash + ?Sized> Hal for IntelHal<IH> {
     fn alloc_extelem_zeroed(&self, name: &'static str, size: usize) -> Self::Buffer<Self::ExtElem> {
         let buf = BufferImpl::new(name, size);
         let bytes_len = size * std::mem::size_of::<Self::ExtElem>();
-        buf.buffer.borrow_mut().buf.memset(0, bytes_len);
+        buf.buffer.lock().buf.memset(0, bytes_len);
         buf
     }
 

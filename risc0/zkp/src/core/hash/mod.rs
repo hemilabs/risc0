@@ -20,7 +20,7 @@ pub mod poseidon2;
 pub mod poseidon_254;
 pub mod sha;
 
-use alloc::{boxed::Box, rc::Rc, string::String};
+use alloc::{boxed::Box, string::String, sync::Arc};
 
 use risc0_core::field::{baby_bear::BabyBear, Field};
 
@@ -43,7 +43,7 @@ pub trait HashFn<F: Field>: Send + Sync {
 /// A trait that sets the PRNG used by Fiat-Shamir.  We allow specialization at
 /// this level rather than at RngCore because some hashes such as Poseidon have
 /// elements distributed uniformly over the field natively.
-pub trait Rng<F: Field> {
+pub trait Rng<F: Field>: Send {
     /// Mix in randomness from a Fiat-Shamir commitment.
     fn mix(&mut self, val: &Digest);
 
@@ -61,7 +61,7 @@ pub trait Rng<F: Field> {
 /// Responsible for constructing new Rngs.
 pub trait RngFactory<F: Field> {
     /// Construct a new Rng
-    fn new_rng(&self) -> Box<dyn Rng<F>>;
+    fn new_rng(&self) -> Box<dyn Rng<F> + Send>;
 }
 
 /// Make it easy compute both hash related traits from a single source
@@ -69,11 +69,12 @@ pub struct HashSuite<F: Field> {
     /// The name of this HashSuite.
     pub name: String,
 
-    /// Define the hash used by the HashSuite
-    pub hashfn: Rc<dyn HashFn<F>>,
+    /// Define the hash used by the HashSuite. Arc + Send + Sync so HashSuite
+    /// is Send+Sync and Hal types holding it can cross thread boundaries.
+    pub hashfn: Arc<dyn HashFn<F> + Send + Sync>,
 
-    /// Define an RNG factory
-    pub rng: Rc<dyn RngFactory<F>>,
+    /// Define an RNG factory.
+    pub rng: Arc<dyn RngFactory<F> + Send + Sync>,
 }
 
 impl<F: Field> Clone for HashSuite<F> {

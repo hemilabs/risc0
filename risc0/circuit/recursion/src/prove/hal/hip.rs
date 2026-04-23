@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use risc0_circuit_recursion_sys::{
@@ -49,11 +49,11 @@ type HipCircuitHalPoseidon2 = HipCircuitHal<HipHashPoseidon2>;
 type HipCircuitHalPoseidon254 = HipCircuitHal<HipHashPoseidon254>;
 
 struct HipCircuitHal<CH: HipHash> {
-    _hal: Rc<HipHal<CH>>, // retain a reference to ensure the context remains valid
+    _hal: Arc<HipHal<CH>>, // retain a reference to ensure the context remains valid
 }
 
 impl<CH: HipHash> HipCircuitHal<CH> {
-    pub fn new(_hal: Rc<HipHal<CH>>) -> Self {
+    pub fn new(_hal: Arc<HipHal<CH>>) -> Self {
         Self { _hal }
     }
 }
@@ -187,18 +187,18 @@ impl<CH: HipHash> CircuitHal<HipHal<CH>> for HipCircuitHal<CH> {
 pub(crate) fn recursion_prover(hashfn: &str) -> Result<Box<dyn RecursionProver>> {
     match hashfn {
         "poseidon2" => {
-            let hal = Rc::new(HipHalPoseidon2::new());
-            let circuit_hal = Rc::new(HipCircuitHalPoseidon2::new(hal.clone()));
+            let hal = Arc::new(HipHalPoseidon2::new());
+            let circuit_hal = Arc::new(HipCircuitHalPoseidon2::new(hal.clone()));
             Ok(Box::new(RecursionProverImpl::new(hal, circuit_hal)))
         }
         "poseidon_254" => {
-            let hal = Rc::new(HipHalPoseidon254::new());
-            let circuit_hal = Rc::new(HipCircuitHalPoseidon254::new(hal.clone()));
+            let hal = Arc::new(HipHalPoseidon254::new());
+            let circuit_hal = Arc::new(HipCircuitHalPoseidon254::new(hal.clone()));
             Ok(Box::new(RecursionProverImpl::new(hal, circuit_hal)))
         }
         "sha-256" => {
-            let hal = Rc::new(HipHalSha256::new());
-            let circuit_hal = Rc::new(HipCircuitHalSha256::new(hal.clone()));
+            let hal = Arc::new(HipHalSha256::new());
+            let circuit_hal = Arc::new(HipCircuitHalSha256::new(hal.clone()));
             Ok(Box::new(RecursionProverImpl::new(hal, circuit_hal)))
         }
         _ => bail!("Unsupported hashfn: {hashfn}"),

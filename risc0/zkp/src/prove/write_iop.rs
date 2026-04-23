@@ -23,7 +23,9 @@ use crate::core::{
 
 pub struct WriteIOP<F: Field> {
     pub proof: Vec<u32>,
-    pub rng: Box<dyn Rng<F>>,
+    // `+ Send` so WriteIOP is Send — required for the finalize-overlap path
+    // that moves DeferredFinalize<H> into a worker thread.
+    pub rng: Box<dyn Rng<F> + Send>,
 }
 
 impl<F: Field> WriteIOP<F> {

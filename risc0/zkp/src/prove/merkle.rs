@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use alloc::{rc::Rc, vec::Vec};
-use core::cell::RefCell;
+use alloc::{sync::Arc, vec::Vec};
+
+use parking_lot::Mutex;
 
 use risc0_core::scope;
 
@@ -41,9 +42,12 @@ pub struct MerkleTreeProver<H: Hal> {
     // Pre-allocated buffer for gather_sample in prove(), avoids per-query alloc/free
     sample_buf: Option<H::Buffer<H::Elem>>,
 
-    // Cached top nodes for commit() — shared across clones via Rc.
-    // Populated on first commit(), reused on subsequent commits to avoid GPU D2H.
-    cached_top_nodes: Rc<RefCell<Option<Vec<Digest>>>>,
+    // Cached top nodes for commit() — shared across clones via Arc.
+    // Populated on first commit(), reused on subsequent commits to avoid GPU
+    // D2H. Arc+spin::Mutex (instead of Rc+RefCell) so MerkleTreeProver is
+    // Send — required for the finalize-overlap path that moves the prover
+    // state into a background thread.
+    cached_top_nodes: Arc<Mutex<Option<Vec<Digest>>>>,
 }
 
 impl<H: Hal> Clone for MerkleTreeProver<H> {
@@ -119,7 +123,7 @@ impl<H: Hal> MerkleTreeProver<H> {
             nodes,
             root,
             sample_buf,
-            cached_top_nodes: Rc::new(RefCell::new(None)),
+            cached_top_nodes: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -127,7 +131,7 @@ impl<H: Hal> MerkleTreeProver<H> {
     pub fn commit(&self, iop: &mut WriteIOP<H::Field>) {
         scope!("commit");
         let top_size = self.params.top_size;
-        let cached = self.cached_top_nodes.borrow();
+        let cached = self.cached_top_nodes.lock();
         if let Some(ref top_nodes) = *cached {
             // Use cached CPU data — no GPU D2H needed.
             iop.write_pod_slice(top_nodes);
@@ -135,7 +139,7 @@ impl<H: Hal> MerkleTreeProver<H> {
             drop(cached);
             let slice = self.nodes.slice(top_size, top_size);
             slice.view(|view| {
-                *self.cached_top_nodes.borrow_mut() = Some(view.to_vec());
+                *self.cached_top_nodes.lock() = Some(view.to_vec());
                 iop.write_pod_slice(view);
             });
         }
