@@ -4,9 +4,13 @@
 
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/esimd.hpp>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+#include <sycl/ext/oneapi/properties/properties.hpp>
 #include "bb31_field.hpp"
 
 namespace esimd = sycl::ext::intel::esimd;
+namespace syclex = sycl::ext::intel::experimental;
+namespace syclex_oneapi = sycl::ext::oneapi::experimental;
 
 // ============================================================================
 // Poseidon2 Parameters
@@ -203,11 +207,15 @@ ESIMD_INLINE void poseidon2_mix(bb31::Vec16 cells[CELLS],
     // Initial external matrix
     multiply_by_m_ext(cells);
 
-    // First half of full rounds
+    // First half of full rounds. #pragma unroll on inner CELLS loops forces
+    // IGC to keep cells[] in flat GRF (no r[a0.X] indirection — agent #1 ISA
+    // disasm found 1164 indirect movs from these loops at 128-GRF).
     for (uint32_t r = 0; r < ROUNDS_HALF_FULL; r++) {
+        #pragma unroll
         for (uint32_t i = 0; i < CELLS; i++)
             cells[i] = bb31::field_add(cells[i], bb31::Vec16(rc_s[rc_off + i]));
         rc_off += CELLS;
+        #pragma unroll
         for (uint32_t i = 0; i < CELLS; i++)
             cells[i] = sbox(cells[i]);
         multiply_by_m_ext(cells);
@@ -245,15 +253,18 @@ ESIMD_INLINE void poseidon2_mix(bb31::Vec16 cells[CELLS],
         bb31::Vec16 h2 = bb31::field_add(q4, q5);
         bb31::Vec16 sum = bb31::field_add(bb31::field_add(h0, h1), h2);
 
+        #pragma unroll
         for (uint32_t i = 0; i < CELLS; i++)
             cells[i] = bb31::field_add(sum, bb31::mont_mul(bb31::Vec16(diag_s[i]), cells[i]));
     }
 
     // Second half of full rounds
     for (uint32_t r = 0; r < ROUNDS_HALF_FULL; r++) {
+        #pragma unroll
         for (uint32_t i = 0; i < CELLS; i++)
             cells[i] = bb31::field_add(cells[i], bb31::Vec16(rc_s[rc_off + i]));
         rc_off += CELLS;
+        #pragma unroll
         for (uint32_t i = 0; i < CELLS; i++)
             cells[i] = sbox(cells[i]);
         multiply_by_m_ext(cells);
@@ -293,7 +304,11 @@ void esimd_poseidon2_rows(sycl::queue& q,
     auto* pdiag = g_d_diag;
     uint32_t num_threads = (count + 15) / 16;
 
+    // R2-1: Request 256-GRF mode for this kernel. ISA disasm of round-1 build
+    // showed grf_count=128 with significant r[a0.X] indirection on cells[24];
+    // 256-GRF should let IGC keep cells in flat GRF without indirection.
     q.parallel_for(sycl::range<1>(num_threads),
+        syclex_oneapi::properties{syclex::grf_size<256>},
         [=](sycl::id<1> idx) [[intel::sycl_explicit_simd]] {
             uint32_t base_col = idx[0] * 16;
             if (base_col >= count) return;
@@ -369,6 +384,7 @@ void esimd_poseidon2_fold(sycl::queue& q,
     uint32_t num_threads = (num_hashes + 15) / 16;
 
     q.parallel_for(sycl::range<1>(num_threads),
+        syclex_oneapi::properties{syclex::grf_size<256>},
         [=](sycl::id<1> idx) [[intel::sycl_explicit_simd]] {
             uint32_t base = idx[0] * 16;
             if (base >= num_hashes) return;
