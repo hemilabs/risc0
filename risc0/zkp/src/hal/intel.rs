@@ -768,6 +768,29 @@ impl<IH: IntelHash + ?Sized> Hal for IntelHal<IH> {
         });
     }
 
+    // T1-C: Fused inverse-NTT + zk_shift. The standalone zk_shift kernel reads
+    // and writes the full buffer; fusing the multiply into the INTT final store
+    // eliminates one full-bandwidth pass per polynomial. Uses the same cached
+    // power table as zk_shift, so first-touch cost is unchanged.
+    fn batch_interpolate_ntt_zk_shift(&self, io: &Self::Buffer<Self::Elem>, count: usize) {
+        let row_size = io.size() / count;
+        assert_eq!(row_size * count, io.size());
+        let n_bits = log2_ceil(row_size);
+        assert_eq!(row_size, 1 << n_bits);
+        assert!(n_bits < Self::Elem::MAX_ROU_PO2);
+
+        let queue = get_queue();
+        esimd_check(unsafe {
+            intel::esimd_batch_inverse_ntt_zk_shift(
+                queue,
+                io.as_device_ptr().0 as *mut std::ffi::c_void,
+                n_bits as u32,
+                count as u32,
+                row_size as u32,
+            )
+        });
+    }
+
     fn mix_poly_coeffs(
         &self,
         output: &Self::Buffer<Self::ExtElem>,

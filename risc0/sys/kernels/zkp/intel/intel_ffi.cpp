@@ -14,6 +14,8 @@ extern "C" {
     void gpu_inverse_ntt_fast(sycl::queue& q, uint32_t* d_data, uint32_t lg_n);
     void gpu_forward_ntt_no_wait(sycl::queue& q, uint32_t* d_data, uint32_t lg_n);
     void gpu_inverse_ntt_no_wait(sycl::queue& q, uint32_t* d_data, uint32_t lg_n);
+    void gpu_inverse_ntt_zk_shift_no_wait(sycl::queue& q, uint32_t* d_data,
+                                          uint32_t lg_n, const uint32_t* d_zk_powers);
     void esimd_batch_bit_reverse(sycl::queue& q, uint32_t* io, uint32_t nBits, uint32_t count);
 
     // Poseidon2 (poseidon2.cpp)
@@ -509,6 +511,25 @@ const char* esimd_batch_zk_shift(void* queue, void* d_data,
         }
         q->wait();
         // d_powers is cached — do NOT free
+    )
+}
+
+// Batch inverse NTT with zk_shift fused into the final store.
+// Replaces esimd_batch_inverse_ntt + esimd_batch_zk_shift back-to-back —
+// eliminates one full-bandwidth pointwise-multiply pass per polynomial.
+// The zk_shift power table is the same (cached) one as esimd_batch_zk_shift.
+const char* esimd_batch_inverse_ntt_zk_shift(void* queue, void* d_data,
+                                              uint32_t lg_domain_size,
+                                              uint32_t poly_count, uint32_t stride) {
+    auto* q = static_cast<sycl::queue*>(queue);
+    FFI_WRAP(
+        auto* data = static_cast<uint32_t*>(d_data);
+        auto* d_powers = ensure_zk_shift_powers(*q, lg_domain_size);
+        for (uint32_t c = 0; c < poly_count; c++) {
+            gpu_inverse_ntt_zk_shift_no_wait(*q, data + c * stride,
+                                              lg_domain_size, d_powers);
+        }
+        q->wait();
     )
 }
 

@@ -1203,15 +1203,19 @@ static void ntt_ct_fused_small(sycl::queue& q, uint32_t* d_data, uint32_t lg_n,
 
 // GS DIF fused stages min(4,lg_n)..1 — used by inverse NTT
 // Processes in decreasing order: 4, 3, 2, 1
+// If d_zk_powers != nullptr, multiply final result by powers[base..base+16]
+// (zk_shift fusion — saves one DRAM round-trip per polynomial).
 static void ntt_gs_fused_small(sycl::queue& q, uint32_t* d_data, uint32_t lg_n,
                                 const uint32_t* d_twiddles, const TwiddleTables& tw,
-                                uint32_t scale_factor = bb31::ONE) {
+                                uint32_t scale_factor = bb31::ONE,
+                                const uint32_t* d_zk_powers = nullptr) {
     uint32_t n = 1u << lg_n;
     uint32_t num_blocks = n / 16;
     uint32_t max_s = (lg_n < 4) ? lg_n : 4;
 
     auto* pd = d_data;
     auto* ptw = d_twiddles;
+    auto* pzk = d_zk_powers;
     uint32_t off2 = (lg_n >= 2) ? tw.offsets[2] : 0;
     uint32_t off3 = (lg_n >= 3) ? tw.offsets[3] : 0;
     uint32_t off4 = (lg_n >= 4) ? tw.offsets[4] : 0;
@@ -1299,6 +1303,11 @@ static void ntt_gs_fused_small(sycl::queue& q, uint32_t* d_data, uint32_t lg_n,
             // Fuse 1/N scaling into final store (avoids separate bandwidth pass)
             if (scale_factor != bb31::ONE) {
                 data = bb31::mont_mul(data, bb31::Vec16(scale_factor));
+            }
+            // Fuse zk_shift (data[i] *= 3^bit_rev(i)) when caller provided a power table
+            if (pzk) {
+                auto pows = esimd::block_load<uint32_t, 16>(pzk + base);
+                data = bb31::mont_mul(data, pows);
             }
             esimd::block_store(pd + base, data);
         });
@@ -1494,16 +1503,20 @@ static void ntt_ct_slm_combined(sycl::queue& q, uint32_t* d_data, uint32_t lg_n,
 
 // GS DIF combined kernel: stages min(12,lg_n)..1 in one launch (inverse NTT)
 // 64 threads/WG, 4 loads per thread. Block = 4096 elements = 16 KB SLM.
+// If d_zk_powers != nullptr, fuses zk_shift (multiply by powers[i]) into the
+// final store, saving one full-bandwidth pass per polynomial.
 static void ntt_gs_slm_combined(sycl::queue& q, uint32_t* d_data, uint32_t lg_n,
                                  const uint32_t* d_twiddles, const TwiddleTables& tw,
                                  uint32_t scale_factor = bb31::ONE,
-                                 uint32_t total_elements = 0) {
+                                 uint32_t total_elements = 0,
+                                 const uint32_t* d_zk_powers = nullptr) {
     uint32_t n = total_elements ? total_elements : (1u << lg_n);
     uint32_t num_groups = n / SLM_BLOCK;
     uint32_t last_slm_stage = (lg_n < SLM_LG_BLOCK) ? lg_n : SLM_LG_BLOCK;
 
     auto* pd = d_data;
     auto* ptw = d_twiddles;
+    auto* pzk = d_zk_powers;
     uint32_t off2 = tw.offsets[2], off3 = tw.offsets[3], off4 = tw.offsets[4];
     uint32_t off5 = tw.offsets[5], off6 = tw.offsets[6], off7 = tw.offsets[7];
     uint32_t off8 = tw.offsets[8], off9 = tw.offsets[9], off10 = tw.offsets[10];
@@ -1582,6 +1595,14 @@ static void ntt_gs_slm_combined(sycl::queue& q, uint32_t* d_data, uint32_t lg_n,
                 if (sf != bb31::ONE) {
                     for (uint32_t c = 0; c < SLM_LOADS_PER_THREAD; c++)
                         dv[c] = bb31::mont_mul(dv[c], bb31::Vec16(sf));
+                }
+                // Fuse zk_shift multiply when caller provided a power table
+                if (pzk) {
+                    for (uint32_t c = 0; c < SLM_LOADS_PER_THREAD; c++) {
+                        auto pows = esimd::block_load<uint32_t, 16>(
+                            pzk + global_base + c*CHUNK + lid*16);
+                        dv[c] = bb31::mont_mul(dv[c], pows);
+                    }
                 }
                 for (uint32_t c = 0; c < SLM_LOADS_PER_THREAD; c++)
                     esimd::block_store(pd + global_base + c*CHUNK + lid*16, dv[c]);
@@ -3007,6 +3028,36 @@ void gpu_inverse_ntt_no_wait(sycl::queue& q, uint32_t* d_data, uint32_t lg_n) {
     } else {
         for (uint32_t s = lg_n; s > 4; s--) ntt_gs_stage_fast(q, d_data, lg_n, s, ntt::inverse_roots, tw.d_buffer+tw.offsets[s]);
         ntt_gs_fused_small(q, d_data, lg_n, tw.d_buffer, tw, inv_n);
+    }
+    // No q.wait() — caller batches
+}
+
+// Inverse NTT with zk_shift fused into the final store. d_zk_powers must point
+// to a table of 1<<lg_n elements where powers[i] = 3^bit_rev(i, lg_n) (Montgomery).
+// Saves one full-bandwidth multiply pass per polynomial vs running INTT then
+// a separate pointwise multiply.
+void gpu_inverse_ntt_zk_shift_no_wait(sycl::queue& q, uint32_t* d_data,
+                                       uint32_t lg_n, const uint32_t* d_zk_powers) {
+    if (lg_n < 4) { abort(); }
+    // Multipass path doesn't yet wire zk_shift fusion; fall back to two-step.
+    if (lg_n >= 26) {
+        gpu_inverse_ntt_multipass(q, d_data, lg_n);
+        // The caller should follow with a separate zk_shift pass; signalled by
+        // returning early without the fused store. (Multipass is unused at po2≤22.)
+        return;
+    }
+    const auto& tw = get_cached_twiddles(q, lg_n, false);
+    uint32_t inv_n = ntt::domain_inv[lg_n];
+    if (lg_n >= SLM_LG_BLOCK) {
+        uint32_t s = lg_n;
+        for (; s >= SLM_LG_BLOCK + 2; s -= 2)
+            ntt_gs_fused_2stage(q, d_data, lg_n, s, tw.d_buffer+tw.offsets[s], tw.d_buffer+tw.offsets[s-1]);
+        if (s == SLM_LG_BLOCK + 1) ntt_gs_stage_fast(q, d_data, lg_n, s, ntt::inverse_roots, tw.d_buffer+tw.offsets[s]);
+        // Fuse 1/N AND zk_shift into the SLM-combined final-store path
+        ntt_gs_slm_combined(q, d_data, lg_n, tw.d_buffer, tw, inv_n, /*total_elements=*/0, d_zk_powers);
+    } else {
+        for (uint32_t s = lg_n; s > 4; s--) ntt_gs_stage_fast(q, d_data, lg_n, s, ntt::inverse_roots, tw.d_buffer+tw.offsets[s]);
+        ntt_gs_fused_small(q, d_data, lg_n, tw.d_buffer, tw, inv_n, d_zk_powers);
     }
     // No q.wait() — caller batches
 }
