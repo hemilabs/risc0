@@ -24,7 +24,20 @@ extern "C" const char* risc0_circuit_rv32im_intel_eval_check(
         auto* poly_mix = static_cast<FpExt*>(const_cast<void*>(d_poly_mix));
         Fp rou_val;
         std::memcpy(&rou_val, &rou_raw, sizeof(uint32_t));
-        constexpr uint32_t WG_SIZE = 256, POLY_MIX_COUNT = 458;
+        // WG_SIZE=512 measured 11% E2E faster than WG=256 on B70 (BMG-G31)
+        // at PO2=20 segments; +44% on tiny workloads. eval_check kernel
+        // resource budget caps WG at 512 (compiled with `simd_size=16`,
+        // `eu_thread_count=4`, 256-GRF; 1024 exceeds resource limit).
+        // Runtime-tunable via RISC0_EVAL_CHECK_WG for further sweeps.
+        uint32_t WG_SIZE = 512;
+        if (const char* s = std::getenv("RISC0_EVAL_CHECK_WG")) {
+            int v = std::atoi(s);
+            if (v == 16 || v == 32 || v == 64 || v == 128 || v == 256 || v == 512) {
+                WG_SIZE = (uint32_t)v;
+            }
+        }
+        const uint32_t wgsz = WG_SIZE;
+        constexpr uint32_t POLY_MIX_COUNT = 458;
         uint32_t global_size = ((domain + WG_SIZE - 1) / WG_SIZE) * WG_SIZE;
         q->submit([&](sycl::handler& h) {
             sycl::local_accessor<FpExt, 1> slm(sycl::range<1>(POLY_MIX_COUNT), h);
@@ -32,7 +45,7 @@ extern "C" const char* risc0_circuit_rv32im_intel_eval_check(
                 [=](sycl::nd_item<1> item) {
                     uint32_t cycle = item.get_global_id(0);
                     uint32_t lid = item.get_local_id(0);
-                    for (uint32_t i = lid; i < POLY_MIX_COUNT; i += WG_SIZE) slm[i] = poly_mix[i];
+                    for (uint32_t i = lid; i < POLY_MIX_COUNT; i += wgsz) slm[i] = poly_mix[i];
                     sycl::group_barrier(item.get_group());
                     if (cycle >= domain) return;
                     Fp* args[4] = {accum, data, out, mix};

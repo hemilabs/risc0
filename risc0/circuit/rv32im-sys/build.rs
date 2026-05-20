@@ -22,6 +22,220 @@ use std::{
 
 use risc0_build_kernel::{KernelBuild, KernelType};
 
+/// Build-cache stamp utilities for the Intel SYCL kernels.
+///
+/// Replaces the previous `"built"` literal stamp (which never invalidated on
+/// source changes) with content-addressed SHA-256 hashing. Three independent
+/// stamps cover the three icpx compilations: monolithic eval_check, two-way
+/// multipass eval_check, and witgen. Each stamp is a small TOML record:
+///
+///     hash         = "<sha256 hex>"
+///     built_at     = "<utc rfc3339 timestamp>"
+///     icpx_version = "<first line of `icpx --version`>"
+///     status       = "ok" | "failed"
+///
+/// Cache hit requires all of: artifact present, stamp parses, hash matches,
+/// status is "ok". Anything else triggers a rebuild.
+mod stamp {
+    use sha2::{Digest, Sha256};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    fn update_len(h: &mut Sha256, n: u64) {
+        h.update(n.to_le_bytes());
+    }
+
+    /// Hash a list of files (path + content) and extra string ingredients.
+    /// Each file's path AND content go into the digest. Convenience wrapper:
+    /// label == content_path, suitable for in-tree relative paths.
+    #[allow(dead_code)] // kept as a convenience entry-point for callers that
+                       // don't need label/content separation
+    pub fn hash(files: &[&Path], extras: &[&str]) -> String {
+        let pairs: Vec<(PathBuf, PathBuf)> = files
+            .iter()
+            .map(|p| (p.to_path_buf(), p.to_path_buf()))
+            .collect();
+        hash_labeled(&pairs, extras)
+    }
+
+    /// Hash a list of (label, content_path) pairs and extra string
+    /// ingredients. The `label` participates in the digest as the file's
+    /// identity; `content_path` is where bytes are read from. This lets
+    /// callers strip absolute prefixes (e.g. `cxx_root` from external
+    /// dependency headers) so the hash stays portable across machines with
+    /// different workspace roots while still invalidating on content drift.
+    ///
+    /// Sorting is by label, deterministic byte-lex order. Each variable-
+    /// length field is length-prefixed (8-byte LE) so distinct input sets
+    /// cannot frame-collide. Present/missing files use distinct
+    /// discriminators (`OK` / `MISS`) so a real file whose content happens
+    /// to equal a sentinel cannot impersonate a missing file.
+    pub fn hash_labeled(items: &[(PathBuf, PathBuf)], extras: &[&str]) -> String {
+        let mut sorted: Vec<&(PathBuf, PathBuf)> = items.iter().collect();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut h = Sha256::new();
+        h.update(b"STAMP-V2\0");
+        for (label, content_path) in sorted {
+            // Use OS-encoded bytes (lossless on Linux), not `to_string_lossy`,
+            // so non-UTF8 labels still hash deterministically.
+            let path_bytes = label.as_os_str().as_encoded_bytes();
+            h.update(b"FILE");
+            update_len(&mut h, path_bytes.len() as u64);
+            h.update(path_bytes);
+            match std::fs::read(content_path) {
+                Ok(b) => {
+                    h.update(b"OK");
+                    update_len(&mut h, b.len() as u64);
+                    h.update(&b);
+                }
+                Err(_) => {
+                    h.update(b"MISS");
+                    update_len(&mut h, 0);
+                }
+            }
+        }
+        for s in extras {
+            let bytes = s.as_bytes();
+            h.update(b"EXTRA");
+            update_len(&mut h, bytes.len() as u64);
+            h.update(bytes);
+        }
+        format!("{:x}", h.finalize())
+    }
+
+    /// First line of `icpx --version`, trimmed and stripped of control chars.
+    /// On error, returns a discriminating string so distinct broken
+    /// environments don't coalesce onto the same cache key:
+    /// - `unknown-exec:<errno>` when the binary fails to spawn
+    ///   (ENOENT / EACCES / ENOMEM / E2BIG / ETXTBSY etc.)
+    /// - `unknown-exit:<code>` when icpx runs but exits non-zero
+    /// - `unknown` for the (unreachable) zero-exit + empty-stdout case
+    pub fn icpx_version(icpx: &Path) -> String {
+        let out = match Command::new(icpx).arg("--version").output() {
+            Ok(o) => o,
+            Err(e) => return format!("unknown-exec:{}", e.raw_os_error().unwrap_or(-1)),
+        };
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let first = stdout.lines().next().map(|s| s.trim()).unwrap_or("");
+        let sanitized: String = first.chars().filter(|c| !c.is_control()).collect();
+        if !out.status.success() {
+            return format!("unknown-exit:{}", out.status.code().unwrap_or(-1));
+        }
+        if sanitized.is_empty() {
+            return "unknown".into();
+        }
+        sanitized
+    }
+
+    /// Current UTC timestamp as RFC3339 via `date -u`. "unknown" on error.
+    pub fn now() -> String {
+        Command::new("date")
+            .arg("-u")
+            .arg("+%Y-%m-%dT%H:%M:%SZ")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| "unknown".into())
+    }
+
+    /// Parsed stamp record. Only fields needed for cache decisions are exposed.
+    pub struct Stamp {
+        pub hash: String,
+        pub status: String,
+    }
+
+    pub fn read(path: &Path) -> Option<Stamp> {
+        let s = std::fs::read_to_string(path).ok()?;
+        let mut hash = None;
+        let mut status = None;
+        for line in s.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((k, v)) = line.split_once('=') {
+                let k = k.trim();
+                let v = v.trim().trim_matches('"');
+                match k {
+                    "hash" => hash = Some(v.to_string()),
+                    "status" => status = Some(v.to_string()),
+                    _ => {}
+                }
+            }
+        }
+        Some(Stamp {
+            hash: hash?,
+            status: status?,
+        })
+    }
+
+    pub fn write(path: &Path, hash_value: &str, icpx_version: &str, status: &str) {
+        let now = now();
+        // Strip control characters first (so an icpx_version with embedded
+        // newlines/tabs cannot break TOML line-orientation), then escape the
+        // two TOML basic-string metacharacters in the order \\ → \\\\, " → \"
+        // (backslash MUST come first or the second pass would re-escape).
+        let escape = |s: &str| -> String {
+            let cleaned: String = s.chars().filter(|c| !c.is_control()).collect();
+            cleaned.replace('\\', "\\\\").replace('"', "\\\"")
+        };
+        let body = format!(
+            "hash = \"{}\"\nbuilt_at = \"{}\"\nicpx_version = \"{}\"\nstatus = \"{}\"\n",
+            escape(hash_value),
+            escape(&now),
+            escape(icpx_version),
+            escape(status),
+        );
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // Write to a per-process tempfile + rename so concurrent writers
+        // can't clobber each other's tmp before the rename completes. The
+        // suffix includes pid + nanos so two parallel `cargo build`s
+        // sharing the same cache_dir each get a unique tempfile path.
+        // `rename` is atomic on POSIX same-fs.
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp = {
+            let parent = path.parent().unwrap_or_else(|| Path::new("."));
+            let name = path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "stamp".into());
+            parent.join(format!("{name}.{pid}.{nanos}.tmp"))
+        };
+        std::fs::write(&tmp, body).expect("failed to write build-cache stamp tmp");
+        std::fs::rename(&tmp, path).expect("failed to rename build-cache stamp");
+    }
+
+    /// Cache hit only when artifact exists AND stamp parses AND hash matches
+    /// AND status == "ok".
+    pub fn need_rebuild(artifact: &Path, stamp_path: &Path, expected_hash: &str) -> bool {
+        need_rebuild_multi(&[artifact], stamp_path, expected_hash)
+    }
+
+    /// Multi-artifact variant: cache hit requires ALL artifacts present plus
+    /// the same stamp invariants. Used by the multipass branch which must
+    /// verify both pass1.so and pass2.so.
+    pub fn need_rebuild_multi(
+        artifacts: &[&Path],
+        stamp_path: &Path,
+        expected_hash: &str,
+    ) -> bool {
+        if artifacts.iter().any(|p| !p.exists()) {
+            return true;
+        }
+        match read(stamp_path) {
+            None => true,
+            Some(s) => s.hash != expected_hash || s.status != "ok",
+        }
+    }
+}
+
 #[cfg(all(feature = "cuda", feature = "rocm"))]
 compile_error!("Features 'cuda' and 'rocm' are mutually exclusive. Enable only one GPU backend.");
 
@@ -479,6 +693,359 @@ fn eval_check_source_hash() -> String {
     format!("{:016x}", hasher.finish())
 }
 
+/// Stamp version: bump when stamp inputs or layout change so older stamps
+/// invalidate cleanly without manual cache wiping. Bumping this string
+/// invalidates all three Intel stamps simultaneously.
+const INTEL_STAMP_VERSION: &str = "rv32im-v3";
+
+/// Default GRF mode used when `RISC0_INTEL_GRF_MODE` is unset. 256-GRF
+/// mode doubles the per-thread register file (8 KB → 16 KB) at the cost
+/// of halving occupancy (8 → 4 threads/EU). Phase 0c flips this to 128
+/// to test whether the kernel is spill-bound vs occupancy-bound.
+const DEFAULT_GRF_MODE: &str = "256";
+
+/// Phase 0c A/B knobs. Read at build-script time; their values participate
+/// in every Intel stamp hash so each (GRF, SIMD) combination caches
+/// separately under `intel_rv32im_cache_<variant>/`. Setting either to
+/// an unrecognized value is rejected by `intel_variant_tag` to avoid
+/// silently caching garbage on a typo.
+fn intel_grf_mode() -> String {
+    let v = std::env::var("RISC0_INTEL_GRF_MODE").unwrap_or_else(|_| DEFAULT_GRF_MODE.into());
+    match v.as_str() {
+        "128" | "256" => v,
+        other => panic!(
+            "RISC0_INTEL_GRF_MODE must be 128 or 256, got {:?}",
+            other
+        ),
+    }
+}
+
+/// `RISC0_INTEL_SIMD_WIDTH=16|32` forces the AOT compiler to emit a
+/// specific sub-group width via `-cl-intel-force-simd-size`. Default
+/// (unset OR empty string) lets the compiler choose. Phase 0c sweeps
+/// 16 vs 32 to test whether ILP is the bottleneck.
+///
+/// Note: ab_experiments.sh sets `RISC0_INTEL_SIMD_WIDTH=""` (empty
+/// string) for "auto" cells. Rust's `std::env::var` returns `Ok("")`
+/// (not `Err(NotPresent)`) for set-but-empty, so we explicitly treat
+/// empty as None to avoid panicking the build for every auto cell.
+fn intel_simd_width() -> Option<String> {
+    let v = std::env::var("RISC0_INTEL_SIMD_WIDTH").ok()?;
+    if v.is_empty() {
+        return None;
+    }
+    match v.as_str() {
+        "16" | "32" => Some(v),
+        other => panic!(
+            "RISC0_INTEL_SIMD_WIDTH must be 16, 32, or unset, got {:?}",
+            other
+        ),
+    }
+}
+
+/// Render the Phase 0c variant tag: `default` (no overrides), or a
+/// dash-joined name like `grf128` / `grf128_simd16`. Used as the cache
+/// subdirectory suffix and as a hash extra.
+fn intel_variant_tag() -> String {
+    let grf = intel_grf_mode();
+    let simd = intel_simd_width();
+    let mut parts: Vec<String> = Vec::new();
+    if grf != DEFAULT_GRF_MODE {
+        parts.push(format!("grf{grf}"));
+    }
+    if let Some(s) = &simd {
+        parts.push(format!("simd{s}"));
+    }
+    if parts.is_empty() {
+        "default".into()
+    } else {
+        parts.join("_")
+    }
+}
+
+/// Render the icpx `-Xs -options "..."` argument from the Phase 0c knobs.
+/// Concatenates `-cl-intel-{N}-GRF-per-thread` and (when set) the SIMD
+/// override.
+fn intel_xs_options() -> String {
+    let grf = intel_grf_mode();
+    let mut parts = vec![format!("-cl-intel-{grf}-GRF-per-thread")];
+    if let Some(s) = intel_simd_width() {
+        parts.push(format!("-cl-intel-force-simd-size={s}"));
+    }
+    parts.join(" ")
+}
+
+/// Cache_dir helper that suffixes the variant name so each (GRF, SIMD)
+/// combination has its own .so + stamp set. Switching variants does NOT
+/// re-trigger a 30-min icpx compile if that variant is already cached.
+fn intel_cache_subdir() -> String {
+    format!("intel_rv32im_cache_{}", intel_variant_tag())
+}
+
+/// Glob `*.h`/`*.hpp`/`*.cuh` headers from an absolute external include
+/// root (typically `DEP_RISC0_SYS_CXX_ROOT`, e.g. `risc0/sys/cxx/`) so
+/// their content participates in the input hash.
+///
+/// Returns (label, content_path) pairs where the label is a portable
+/// virtual path of the form `cxx_root/<basename>` — this keeps the hash
+/// invariant across machines that resolve the same dependency to
+/// different absolute filesystem prefixes (e.g. developer-laptop vs CI
+/// runner with workspace at /__w/...). Content is read from the real
+/// filesystem path.
+fn cxx_root_headers(cxx_root: &str) -> Vec<(PathBuf, PathBuf)> {
+    let mut out = Vec::new();
+    for ext in &["*.h", "*.hpp", "*.cuh"] {
+        let pattern = format!("{cxx_root}/{ext}");
+        if let Ok(paths) = glob::glob(&pattern) {
+            for p in paths.filter_map(Result::ok) {
+                if let Some(name) = p.file_name() {
+                    let label = PathBuf::from("cxx_root").join(name);
+                    out.push((label, p));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Build a `(label, content_path)` pair list for in-tree files (label ==
+/// content_path) plus cxx_root files (label == `cxx_root/<basename>`).
+fn build_pairs(in_tree: Vec<PathBuf>, cxx_root: &str) -> Vec<(PathBuf, PathBuf)> {
+    let mut pairs: Vec<(PathBuf, PathBuf)> =
+        in_tree.into_iter().map(|p| (p.clone(), p)).collect();
+    pairs.extend(cxx_root_headers(cxx_root));
+    pairs
+}
+
+/// Inputs for the monolithic eval_check kernel: the four generated
+/// `rust_poly_fp_*.cpp` halves of poly_fp + the SYCL kernel wrapper +
+/// transitive headers from `cxx_root` (fp.h, fpext.h).
+fn compute_mono_hash(cxx_root: &str, icpx_version: &str) -> String {
+    let mut in_tree = vec![
+        PathBuf::from("kernels/intel/eval_check.cpp"),
+        PathBuf::from("kernels/cxx/rust_poly_fp_0.cpp"),
+        PathBuf::from("kernels/cxx/rust_poly_fp_1.cpp"),
+        PathBuf::from("kernels/cxx/rust_poly_fp_2.cpp"),
+        PathBuf::from("kernels/cxx/rust_poly_fp_3.cpp"),
+        PathBuf::from("build.rs"),
+    ];
+    // When RISC0_TREE_REDUCE=1, include the transform script in the input hash
+    // so changes to the script invalidate the cache.
+    if std::env::var_os("RISC0_TREE_REDUCE").is_some() {
+        in_tree.push(PathBuf::from("kernels/intel/tree_reduce_fma.py"));
+    }
+    let tree_reduce_tag = if std::env::var_os("RISC0_TREE_REDUCE").is_some() { "tr1" } else { "tr0" };
+    let pairs = build_pairs(in_tree, cxx_root);
+    let variant = intel_variant_tag();
+    stamp::hash_labeled(
+        &pairs,
+        &[icpx_version, INTEL_STAMP_VERSION, "mono", &variant, tree_reduce_tag],
+    )
+}
+
+/// Inputs for the multipass eval_check kernels: the mono inputs plus the
+/// `gen_multipass.py` generator script that produces pass1/pass2
+/// amalgamations.
+fn compute_multipass_hash(cxx_root: &str, icpx_version: &str) -> String {
+    let in_tree = vec![
+        PathBuf::from("kernels/intel/eval_check.cpp"),
+        PathBuf::from("kernels/intel/gen_multipass.py"),
+        PathBuf::from("kernels/cxx/rust_poly_fp_0.cpp"),
+        PathBuf::from("kernels/cxx/rust_poly_fp_1.cpp"),
+        PathBuf::from("kernels/cxx/rust_poly_fp_2.cpp"),
+        PathBuf::from("kernels/cxx/rust_poly_fp_3.cpp"),
+        PathBuf::from("build.rs"),
+    ];
+    let pairs = build_pairs(in_tree, cxx_root);
+    let variant = intel_variant_tag();
+    stamp::hash_labeled(
+        &pairs,
+        &[icpx_version, INTEL_STAMP_VERSION, "multipass", &variant],
+    )
+}
+
+/// Inputs for the witgen kernel: `ffi_witgen.cpp`, `steps.cpp`, all Intel
+/// kernel headers, all shared cxx headers / `.inc` fragments, and the same
+/// external `cxx_root` headers as mono/multipass.
+fn compute_witgen_hash(cxx_root: &str, icpx_version: &str) -> String {
+    let mut in_tree: Vec<PathBuf> = vec![
+        PathBuf::from("kernels/intel/ffi_witgen.cpp"),
+        PathBuf::from("kernels/cxx/steps.cpp"),
+        PathBuf::from("build.rs"),
+    ];
+    in_tree.extend(glob_paths("kernels/intel/*.h"));
+    in_tree.extend(glob_paths("kernels/cxx/*.h"));
+    in_tree.extend(glob_paths("kernels/cxx/*.h.inc"));
+    in_tree.extend(glob_paths("kernels/cxx/*.cpp.inc"));
+    let pairs = build_pairs(in_tree, cxx_root);
+    let variant = intel_variant_tag();
+    stamp::hash_labeled(
+        &pairs,
+        &[icpx_version, INTEL_STAMP_VERSION, "witgen", &variant],
+    )
+}
+
+/// Recovery shim for the witgen kernel build.
+///
+/// The witgen amalgamation is large (~14k lines after `__attribute__((noinline))`
+/// injection) and its IGC compile path triggers a known SIGSEGV in
+/// `PreCompiledFuncImport::replaceFunc` on stock Intel IGC 2.30.1
+/// (icpx exit 254 / ocloc exit 226). The fix lives upstream-ready as
+/// `inteldebug/igc-bug-report/0001-PreCompiledFuncImport-fix-nullptr-arg-push-in-replac.patch`
+/// and requires either: (a) a patched libigc on `LD_LIBRARY_PATH` at
+/// build time, or (b) re-using an artifact from a build that DID have
+/// the patched libigc.
+///
+/// **Recovery is intentionally witgen-only**: eval_check (mono) panics
+/// on icpx failure because stale .so = wrong constraints = unsound
+/// proofs; multipass is an optional optimization that degrades cleanly
+/// at runtime. Witgen has a CPU fallback in the production prove path,
+/// and its inputs (`steps.cpp`) are far more stable than `poly_fp.cpp`,
+/// making artifact reuse safe.
+///
+/// **Same-variant only**: witgen icpx now uses `intel_xs_options()`
+/// which embeds the GRF mode and (optional) SIMD width into the
+/// emitted SPIR-V. Cross-variant fallback (e.g. copying the GRF=256
+/// `_default` .so into a GRF=128 cache) would silently link a
+/// wrong-flag binary, invalidating Phase 0c A/B measurements. So
+/// recovery only matches an existing artifact at the same (GRF, SIMD)
+/// variant — both in the current build's profile and the sibling
+/// release profile.
+///
+/// Search order (most-current first): same-profile same-variant cache,
+/// release same-variant cache (skipping self-pointer if current build
+/// is itself release+same-variant), legacy unsuffixed release cache
+/// only when running with the default variant.
+///
+/// Atomic write via tempfile + rename (matches Phase 0a stamp pattern):
+/// an interrupt mid-copy leaves no partial .so on disk.
+///
+/// Visibility via `cargo:warning=` so operators see the recovery
+/// message in default `cargo build` output (build-script `eprintln!`
+/// is suppressed unless `-vv` or build failure).
+fn try_recover_witgen_so(out_dir: &Path, dest_so: &Path) {
+    // Resolve target/ root structurally from OUT_DIR layout
+    // (`<target>/<profile>/build/<crate>-<hash>/out`) instead of
+    // string-matching "target" — works under custom CARGO_TARGET_DIR
+    // and `--target=<triple>` cross-compile dirs.
+    let target_root = out_dir
+        .ancestors()
+        .nth(4)
+        .map(Path::to_path_buf);
+    let target_root = match target_root {
+        Some(r) => r,
+        None => {
+            warn(&format!(
+                "witgen-recovery: could not resolve target/ root from OUT_DIR={}",
+                out_dir.display()
+            ));
+            return;
+        }
+    };
+    let variant = intel_variant_tag();
+    let so_name = "librisc0_rv32im_intel_witgen.so";
+    // Same-variant only. We DO include both same-profile and release
+    // candidates — a debug build's recovery can pull from release
+    // (icpx flags are profile-invariant for the same variant), but we
+    // skip self-pointer (release-mode build pointing at itself).
+    let candidates: Vec<PathBuf> = ["debug", "release"]
+        .iter()
+        .map(|profile| {
+            target_root
+                .join(profile)
+                .join(format!("intel_rv32im_cache_{variant}"))
+                .join(so_name)
+        })
+        // Legacy pre-Phase-0c release cache (no variant suffix). Only
+        // valid when current build is itself the default variant —
+        // the unsuffixed cache predates variant tagging and was
+        // implicitly GRF=256/SIMD=auto. Including it for non-default
+        // variants would re-introduce the cross-variant unsoundness.
+        .chain(std::iter::once_with(|| {
+            if variant == "default" {
+                target_root
+                    .join("release")
+                    .join("intel_rv32im_cache")
+                    .join(so_name)
+            } else {
+                // Sentinel that won't match `dest_so` and won't exist.
+                target_root.join("__phase0c_unreachable__").join(so_name)
+            }
+        }))
+        .collect();
+    let dest_canon = std::fs::canonicalize(dest_so.parent().unwrap_or(dest_so))
+        .ok()
+        .map(|p| p.join(dest_so.file_name().unwrap_or_default()));
+    for cand in &candidates {
+        if !cand.exists() {
+            continue;
+        }
+        // Skip self-pointer: when current build is release+same-variant,
+        // candidate #1 (release/intel_rv32im_cache_<variant>/...) IS
+        // dest_so. `std::fs::copy(p, p)` truncates the source on Linux,
+        // producing a 0-byte .so. Compare canonicalized paths to also
+        // catch symlink-equivalent targets.
+        let cand_canon = std::fs::canonicalize(cand).ok();
+        if let (Some(c), Some(d)) = (&cand_canon, &dest_canon) {
+            if c == d {
+                continue;
+            }
+        }
+        // Atomic copy: write to a tempfile in the dest's parent dir,
+        // then rename. POSIX rename is atomic same-fs.
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp = dest_so.with_file_name(format!(
+            "{}.{}.{}.tmp",
+            dest_so
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| so_name.into()),
+            pid,
+            nanos
+        ));
+        match std::fs::copy(cand, &tmp).and_then(|_| std::fs::rename(&tmp, dest_so)) {
+            Ok(_) => {
+                warn(&format!(
+                    "witgen-recovery: copied {} from {} (build patched-IGC unavailable). \
+                     NOTE: artifact may be stale relative to current steps.cpp; \
+                     install patched IGC per inteldebug/igc-bug-report/FIXED_INTEL_COMPILER_README.md \
+                     for a fresh rebuild.",
+                    so_name,
+                    cand.display()
+                ));
+                return;
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                warn(&format!(
+                    "witgen-recovery: found {} but copy/rename failed: {}",
+                    cand.display(),
+                    e
+                ));
+            }
+        }
+    }
+    warn(&format!(
+        "witgen-recovery: no same-variant fallback for variant '{}' under {}. \
+         Linker will fail on `risc0_circuit_rv32im_intel_witgen` unless the \
+         patched IGC build path is available — see \
+         inteldebug/igc-bug-report/FIXED_INTEL_COMPILER_README.md.",
+        variant,
+        target_root.display()
+    ));
+}
+
+/// Emit a build-script warning visible in default `cargo build` output.
+/// `cargo:warning=...` is the only build-script directive surfaced
+/// without `-vv`, so operator-actionable diagnostics use it.
+fn warn(msg: &str) {
+    println!("cargo:warning={msg}");
+}
+
 #[allow(dead_code)]
 fn build_intel_kernels() {
     rerun_if_changed("kernels/intel");
@@ -495,25 +1062,72 @@ fn build_intel_kernels() {
             if oneapi.exists() { oneapi } else { PathBuf::from("icpx") }
         });
 
-    // Cache directory for the expensive eval_check compilation
+    // Cache directory for the expensive eval_check compilation. Anchor on the
+    // <profile> directory under target/ regardless of profile name so custom
+    // profiles (e.g. `cargo build --profile=ci-fast`) still get a stable
+    // cache. OUT_DIR is always `<target>/<profile>/build/<crate>-<hash>/out`,
+    // so the profile dir is the ancestor whose parent's filename is "target".
     let cache_dir = out_dir
         .ancestors()
-        .find(|p| p.ends_with("release") || p.ends_with("debug"))
-        .map(|p| p.join("intel_rv32im_cache"))
-        .unwrap_or_else(|| out_dir.join("intel_rv32im_cache"));
+        .find(|p| {
+            p.parent()
+                .and_then(|q| q.file_name())
+                .map(|n| n == std::ffi::OsStr::new("target"))
+                .unwrap_or(false)
+        })
+        .map(|p| p.join(intel_cache_subdir()))
+        .unwrap_or_else(|| out_dir.join(intel_cache_subdir()));
+    // Re-run build.rs when Phase 0c knobs change so the active cache_dir
+    // and stamp inputs reflect the new variant.
+    println!("cargo:rerun-if-env-changed=RISC0_INTEL_GRF_MODE");
+    println!("cargo:rerun-if-env-changed=RISC0_INTEL_SIMD_WIDTH");
     std::fs::create_dir_all(&cache_dir).unwrap();
+
+    // Compute SHA-256 hashes of the inputs to each of the three icpx
+    // compilations. Each stamp covers a focused input set; all stamps
+    // include build.rs, the resolved icpx version, and the cxx_root path
+    // so toolchain or build-script changes invalidate the cache.
+    let icpx_version = stamp::icpx_version(&icpx);
+    let mono_hash = compute_mono_hash(&cxx_root, &icpx_version);
+    let multipass_hash = compute_multipass_hash(&cxx_root, &icpx_version);
+    let witgen_hash = compute_witgen_hash(&cxx_root, &icpx_version);
 
     let so_path = cache_dir.join("librisc0_rv32im_intel.so");
 
-    // Check if we can skip rebuild
+    // Check if we can skip rebuild: artifact present, stamp parses, hash
+    // matches the recomputed-from-source hash, status was "ok" last build.
     let stamp_path = cache_dir.join("intel_eval_check.stamp");
-    let need_rebuild = !so_path.exists() || {
-        let stamp = std::fs::read_to_string(&stamp_path).unwrap_or_default();
-        stamp.is_empty() // Always rebuild if no stamp (TODO: hash sources)
-    };
+    let need_rebuild = stamp::need_rebuild(&so_path, &stamp_path, &mono_hash);
 
     if need_rebuild {
         eprintln!("Building Intel SYCL eval_check kernel...");
+
+        // T3.2: Optional source-codegen pass that transforms Horner-style
+        // FpExt FMA chains into balanced tree reductions. Cuts the critical-
+        // path add-dependency depth from O(N) to O(log N) per chain. Opt-in
+        // via RISC0_TREE_REDUCE=1; controls which rust_poly_fp_*.cpp inputs
+        // feed the amalgamation. The transform is mathematically exact
+        // (commutativity + associativity of FpExt addition).
+        let use_tree_reduce = std::env::var_os("RISC0_TREE_REDUCE").is_some();
+        let poly_fp_dir = if use_tree_reduce {
+            let dst = out_dir.join("poly_fp_tree_reduced");
+            std::fs::create_dir_all(&dst).unwrap();
+            let script = std::path::PathBuf::from("kernels/intel/tree_reduce_fma.py");
+            let status = std::process::Command::new("python3")
+                .arg(&script)
+                .arg("kernels/cxx")
+                .arg(&dst)
+                .status()
+                .expect("Failed to run tree_reduce_fma.py");
+            if !status.success() {
+                panic!("tree_reduce_fma.py failed");
+            }
+            eprintln!("  RISC0_TREE_REDUCE=1: using tree-reduced poly_fp sources at {}",
+                      dst.display());
+            dst
+        } else {
+            std::path::PathBuf::from("kernels/cxx")
+        };
 
         let mut cmd = Command::new(&icpx);
         cmd.arg("-shared")
@@ -552,7 +1166,7 @@ fn build_intel_kernels() {
         // register pressure. All-noinline with 256 GRF is optimal.
         for i in 0..4 {
             let src = std::fs::read_to_string(
-                format!("kernels/cxx/rust_poly_fp_{i}.cpp")
+                poly_fp_dir.join(format!("rust_poly_fp_{i}.cpp"))
             ).unwrap();
             if let Some(ns_start) = src.find("namespace risc0::circuit::rv32im_v2 {") {
                 let body_start = ns_start + "namespace risc0::circuit::rv32im_v2 {".len();
@@ -588,15 +1202,16 @@ fn build_intel_kernels() {
             // Force 256 GRF mode: doubles register file from 8KB to 16KB per thread,
             // dramatically reducing the 42KB spill overhead. Trades occupancy (8→4 threads/EU)
             // for fewer spills — net win since kernel is spill-bound, not compute-bound.
-            .arg("-Xs").arg("-options -cl-intel-256-GRF-per-thread");
+            .arg("-Xs").arg(format!("-options {}", intel_xs_options()));
 
         eprintln!("  Running: {:?}", cmd);
         let output = cmd.output().expect("Failed to run icpx");
         if !output.status.success() {
+            stamp::write(&stamp_path, &mono_hash, &icpx_version, "failed");
             let stderr = String::from_utf8_lossy(&output.stderr);
             panic!("Intel eval_check compilation failed:\n{}", stderr);
         }
-        std::fs::write(&stamp_path, "built").unwrap();
+        stamp::write(&stamp_path, &mono_hash, &icpx_version, "ok");
         eprintln!("  Built {}", so_path.display());
     } else {
         eprintln!("Using cached Intel eval_check kernel");
@@ -616,10 +1231,14 @@ fn build_intel_kernels() {
     let pass1_so = cache_dir.join("librisc0_rv32im_intel_pass1.so");
     let pass2_so = cache_dir.join("librisc0_rv32im_intel_pass2.so");
     let multipass_stamp = cache_dir.join("intel_multipass.stamp");
-    let multipass_rebuild = !pass1_so.exists() || !pass2_so.exists() || {
-        let stamp = std::fs::read_to_string(&multipass_stamp).unwrap_or_default();
-        stamp.is_empty()
-    };
+    // Multipass cache is hit only when both pass-side .so files exist and the
+    // stamp hash matches mono+gen_multipass.py inputs. Either .so missing or
+    // hash drift triggers a full rebuild of both passes.
+    let multipass_rebuild = stamp::need_rebuild_multi(
+        &[&pass1_so, &pass2_so],
+        &multipass_stamp,
+        &multipass_hash,
+    );
 
     if multipass_rebuild {
         let multipass_script = PathBuf::from("kernels/intel/gen_multipass.py");
@@ -650,7 +1269,7 @@ fn build_intel_kernels() {
                     .arg(format!("-I{cxx_root}")).arg("-Ikernels/cxx")
                     .arg(&pass1_amalg).arg("-o").arg(&pass1_so)
                     .arg("-fsycl-targets=intel_gpu_bmg_g31")
-                    .arg("-Xs").arg("-options -cl-intel-256-GRF-per-thread")
+                    .arg("-Xs").arg(format!("-options {}", intel_xs_options()))
                     .output().expect("Failed to run icpx for pass1");
 
                 if !p1_output.status.success() {
@@ -670,7 +1289,7 @@ fn build_intel_kernels() {
                     .arg(format!("-I{cxx_root}")).arg("-Ikernels/cxx")
                     .arg(&pass2_amalg).arg("-o").arg(&pass2_so)
                     .arg("-fsycl-targets=intel_gpu_bmg_g31")
-                    .arg("-Xs").arg("-options -cl-intel-256-GRF-per-thread")
+                    .arg("-Xs").arg(format!("-options {}", intel_xs_options()))
                     .output().expect("Failed to run icpx for pass2");
 
                 if !p2_output.status.success() {
@@ -681,9 +1300,12 @@ fn build_intel_kernels() {
                 }
 
                 if pass1_so.exists() && pass2_so.exists() {
-                    std::fs::write(&multipass_stamp, "built").unwrap();
+                    stamp::write(&multipass_stamp, &multipass_hash, &icpx_version, "ok");
+                } else {
+                    stamp::write(&multipass_stamp, &multipass_hash, &icpx_version, "failed");
                 }
             } else {
+                stamp::write(&multipass_stamp, &multipass_hash, &icpx_version, "failed");
                 let stderr = String::from_utf8_lossy(&mp_output.stderr);
                 eprintln!("  gen_multipass.py failed:\n{}", stderr);
             }
@@ -705,10 +1327,7 @@ fn build_intel_kernels() {
     // ========================================================================
     let witgen_so = cache_dir.join("librisc0_rv32im_intel_witgen.so");
     let witgen_stamp = cache_dir.join("intel_witgen.stamp");
-    let witgen_rebuild = !witgen_so.exists() || {
-        let stamp = std::fs::read_to_string(&witgen_stamp).unwrap_or_default();
-        stamp.is_empty()
-    };
+    let witgen_rebuild = stamp::need_rebuild(&witgen_so, &witgen_stamp, &witgen_hash);
 
     if witgen_rebuild {
         eprintln!("Building Intel SYCL witgen kernel...");
@@ -771,7 +1390,7 @@ fn build_intel_kernels() {
             // 2026-04-21: patched IGC + no cl-opt-disable + explicit 256 GRF (committed setup).
             // 2026-04-22: -Xfinalizer presched-rp/spillAllowed flags tested via -options nesting,
             // ocloc rejected with exit 226. Need different syntax — deferred.
-            .arg("-Xs").arg("-options -cl-intel-256-GRF-per-thread")
+            .arg("-Xs").arg(format!("-options {}", intel_xs_options()))
             .arg("-Wno-unused-parameter")
             .arg("-Wno-unused-function")
             .arg("-Wno-unused-variable")
@@ -788,11 +1407,30 @@ fn build_intel_kernels() {
         eprintln!("  Running: {:?}", cmd);
         let output = cmd.output().expect("Failed to run icpx for witgen");
         if !output.status.success() {
+            stamp::write(&witgen_stamp, &witgen_hash, &icpx_version, "failed");
             let stderr = String::from_utf8_lossy(&output.stderr);
-            eprintln!("Intel witgen compilation failed (non-fatal, using CPU fallback):\n{}", stderr);
-            // Don't panic — witgen can fall back to CPU
+            // Surface failure summary via cargo:warning so it's visible
+            // in default cargo output; full stderr stays in eprintln
+            // for operators who want to grep on -vv builds.
+            warn(&format!(
+                "Intel witgen compilation failed (icpx exit {:?}); attempting recovery...",
+                output.status.code()
+            ));
+            eprintln!(
+                "Intel witgen compilation failed (non-fatal): icpx exit {:?}.\n{}",
+                output.status.code(),
+                stderr
+            );
+            // The witgen kernel requires a patched IGC at build time
+            // (see inteldebug/igc-bug-report/FIXED_INTEL_COMPILER_README.md).
+            // If a previously-built `.so` exists in any sibling profile/
+            // variant cache, copy it in so the linker can resolve
+            // `risc0_circuit_rv32im_intel_witgen` and tests can run.
+            // The .so is profile-and-variant invariant — same icpx flags
+            // and inputs in release vs debug — so copying is sound.
+            try_recover_witgen_so(&out_dir, &witgen_so);
         } else {
-            std::fs::write(&witgen_stamp, "built").unwrap();
+            stamp::write(&witgen_stamp, &witgen_hash, &icpx_version, "ok");
             eprintln!("  Built {}", witgen_so.display());
         }
     } else {

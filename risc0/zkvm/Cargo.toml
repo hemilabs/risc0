@@ -38,6 +38,10 @@ name = "prove_bench"
 required-features = ["prove"]
 
 [[example]]
+name = "prove_and_verify"
+required-features = ["prove"]
+
+[[example]]
 name = "sha256_bench"
 required-features = ["prove"]
 

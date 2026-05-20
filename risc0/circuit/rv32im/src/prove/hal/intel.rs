@@ -43,6 +43,32 @@ use crate::{
     },
 };
 
+/// Returns true when `phase` is listed in the comma-separated
+/// `RISC0_PHASE_DISABLE` env var. Used to disable specific optimization
+/// phases for failure-bisection without recompiling. Phase names match
+/// the convention in EVAL_CHECK_PLAN_V5 (e.g. `multipass`, `block_read`,
+/// `tree_decomp`, `subgroup_partition`).
+fn phase_disabled(phase: &str) -> bool {
+    // Trim and reject empty queries symmetrically with how CSV entries
+    // are normalized. Without this, `phase_disabled(" multipass ")`
+    // would silently fail to match `RISC0_PHASE_DISABLE=multipass`, and
+    // `phase_disabled("")` would match an empty CSV token from
+    // `RISC0_PHASE_DISABLE=",,"`.
+    let phase = phase.trim();
+    if phase.is_empty() {
+        return false;
+    }
+    std::env::var("RISC0_PHASE_DISABLE")
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .any(|s| s.eq_ignore_ascii_case(phase))
+        })
+        .unwrap_or(false)
+}
+
 pub struct IntelCircuitHal<IH: IntelHash> {
     _hal: Arc<IntelHal<IH>>,
     // Keep buffers alive while eval_check runs asynchronously on separate queue.
@@ -179,7 +205,12 @@ impl<IH: IntelHash> CircuitHal<IntelHal<IH>> for IntelCircuitHal<IH> {
 
         let eval_queue = risc0_sys::intel::get_eval_check_queue();
 
-        let use_multipass = std::env::var_os("RISC0_MULTIPASS").is_some();
+        // Phase 0b: respect RISC0_PHASE_DISABLE for failure-bisection. When
+        // `multipass` is listed there, fall back to the monolithic kernel
+        // even if RISC0_MULTIPASS is set — useful for narrowing whether a
+        // miscompare is multipass-specific.
+        let use_multipass =
+            std::env::var_os("RISC0_MULTIPASS").is_some() && !phase_disabled("multipass");
 
         if use_multipass {
             // 2-way multi-pass: allocate intermediate buffer, run pass1 then pass2
@@ -305,4 +336,622 @@ pub fn segment_prover() -> Result<Box<dyn SegmentProver>> {
         (hal, circuit_hal)
     };
     Ok(Box::new(SegmentProverImpl::new(hal_factory)))
+}
+
+// ===========================================================================
+// Phase 0b — bit-exact test harness for Intel SYCL eval_check.
+//
+// Mirror of `cuda.rs::tests::eval_check` (cuda.rs:329-366) plus directed
+// boundary cases covering BabyBear edge values (0, p-1) and one-hot column
+// inputs. Mono and multipass paths are both exercised and required to
+// produce byte-identical outputs to the CPU reference.
+//
+// Optional regression mode: with `RISC0_PHASE_0B_GENERATE_GOLDEN=1`, tests
+// write golden `.bin` files for the PO2=4 mono/multipass outputs; without
+// the env var, tests load the goldens (when present) and assert byte-for-
+// byte equality. This pins behavior so future kernel rewrites must
+// explicitly regenerate goldens.
+//
+// `RISC0_PHASE_DISABLE` env var is wired into the multipass selection
+// above so failure-bisection can skip individual optimization phases as
+// they land in Phase 1+.
+// ===========================================================================
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+    use std::sync::{Arc, OnceLock};
+
+    use parking_lot::{Mutex, MutexGuard};
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    use risc0_core::field::{baby_bear::BabyBear, Elem, ExtElem};
+    use risc0_zkp::{
+        adapter::CircuitInfo as _,
+        core::hash::sha::Sha256HashSuite,
+        hal::{cpu::CpuHal, intel::IntelHalSha256, Buffer, CircuitHal, Hal},
+    };
+    use test_log::test;
+
+    use super::{IntelCircuitHal, INV_RATE};
+    use crate::{
+        prove::hal::cpu::CpuCircuitHal,
+        zirgen::{
+            circuit::{
+                ExtVal, Val, REGISTER_GROUP_ACCUM, REGISTER_GROUP_CODE, REGISTER_GROUP_DATA,
+            },
+            taps::TAPSET,
+            CircuitImpl,
+        },
+    };
+
+    /// Process-global lock acquired by every test that mutates env vars.
+    /// `cargo test` runs in parallel by default and `libc::setenv` is not
+    /// thread-safe relative to concurrent `getenv` reads, so without this
+    /// guard six of the seven Phase 0b tests race on RISC0_MULTIPASS and
+    /// RISC0_PHASE_DISABLE.
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    fn env_lock() -> &'static Mutex<()> {
+        ENV_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// RAII guard that captures a set of env vars on construction and
+    /// restores their original values on Drop (even on panic). Holds the
+    /// global ENV_LOCK for its lifetime so env-mutating tests serialize.
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<OsString>)>,
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuard {
+        fn new(keys: &[&'static str]) -> Self {
+            let _guard = env_lock().lock();
+            let saved = keys
+                .iter()
+                .map(|k| (*k, std::env::var_os(k)))
+                .collect();
+            Self { saved, _guard }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.saved {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    /// Compare two `&[Val]` slices and panic with a focused diff on
+    /// mismatch: first divergent index, two cells of context on each
+    /// side, and a hint about regenerating goldens. Avoids the
+    /// 256-element vector dump that `assert_eq!` produces by default.
+    fn assert_check_eq(expected: &[Val], actual: &[Val], label: &str) {
+        if expected.len() != actual.len() {
+            panic!(
+                "{label}: length mismatch expected={} actual={}",
+                expected.len(),
+                actual.len()
+            );
+        }
+        let total_diffs = expected
+            .iter()
+            .zip(actual)
+            .filter(|(a, b)| a != b)
+            .count();
+        if total_diffs > 0 {
+            let i = expected
+                .iter()
+                .zip(actual)
+                .position(|(a, b)| a != b)
+                .expect("count > 0 implies position exists");
+            let lo = i.saturating_sub(2);
+            let hi = (i + 3).min(expected.len());
+            // Index column is decimal-padded to 8 chars: production PO2=20
+            // produces up to ExtVal::EXT_SIZE * INV_RATE * 2^20 = 2^24 ≈ 16M
+            // indices, which fits in 8 decimal digits exactly. Format width
+            // is padding-only, so larger PO2 still prints correctly (just
+            // unaligned).
+            let mut ctx = String::new();
+            for j in lo..hi {
+                let mark = if j == i { ">>" } else { "  " };
+                ctx.push_str(&format!(
+                    "\n  {mark} [{j:8}] expected=0x{:08x} actual=0x{:08x}",
+                    expected[j].as_u32(),
+                    actual[j].as_u32()
+                ));
+            }
+            panic!(
+                "{label}: {total_diffs} of {} elements differ; first at index {i}{ctx}\n\
+                 hint: rerun with --nocapture; set RISC0_PHASE_0B_GENERATE_GOLDEN=1 to \
+                 regenerate goldens if the kernel change is intentional",
+                expected.len()
+            );
+        }
+    }
+
+    /// Deterministic RNG seeds — distinct per test so a failure is
+    /// isolatable to the test that chose the seed.
+    const SEED_RANDOM: u64 = 0xB12E_BEEF_DEAD_C0DE;
+    const SEED_ONE_HOT: u64 = 0x01EC_AFEB_ABEF_00D0;
+    const SEED_ZERO_FILL: u64 = 0xBA5E_BA11_FACE_0FF1;
+    const SEED_PMINUS1: u64 = 0xDEAD_BEEF_BADF_00D1;
+
+    /// Bundle of inputs passed to a single `eval_check` invocation.
+    /// Mirrors `cuda.rs::tests::EvalCheckParams` field-for-field so test
+    /// code parallels easily.
+    struct EvalCheckParams {
+        po2: usize,
+        steps: usize,
+        domain: usize,
+        code: Vec<Val>,
+        data: Vec<Val>,
+        accum: Vec<Val>,
+        mix: Vec<Val>,
+        out: Vec<Val>,
+        poly_mix: ExtVal,
+    }
+
+    impl EvalCheckParams {
+        /// Random inputs, deterministic via `StdRng::seed_from_u64`.
+        /// `StdRng` aliases ChaCha12Rng in rand 0.9 (tracked by the rand
+        /// crate's reproducibility guarantees within a minor version).
+        ///
+        /// RNG byte-consumption order — code, data, accum, mix, out,
+        /// poly_mix — is part of the test contract: reordering field
+        /// initializers below would silently invalidate any goldens
+        /// derived from the same seed.
+        fn random(po2: usize, seed: u64) -> Self {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let steps = 1 << po2;
+            let domain = steps * INV_RATE;
+            let code_size = TAPSET.group_size(REGISTER_GROUP_CODE);
+            let data_size = TAPSET.group_size(REGISTER_GROUP_DATA);
+            let accum_size = TAPSET.group_size(REGISTER_GROUP_ACCUM);
+            Self {
+                po2,
+                steps,
+                domain,
+                code: random_fps(&mut rng, code_size * domain),
+                data: random_fps(&mut rng, data_size * domain),
+                accum: random_fps(&mut rng, accum_size * domain),
+                mix: random_fps(&mut rng, CircuitImpl::MIX_SIZE),
+                out: random_fps(&mut rng, CircuitImpl::OUTPUT_SIZE),
+                poly_mix: ExtVal::random(&mut rng),
+            }
+        }
+
+        /// All trace cells filled with the same Val. Use Val::ZERO and
+        /// Val::new(p-1) (== Val::ZERO - Val::ONE in BabyBear) to exercise
+        /// boundary arithmetic.
+        fn boundary_fill(po2: usize, fill: Val, seed: u64) -> Self {
+            let steps = 1 << po2;
+            let domain = steps * INV_RATE;
+            let code_size = TAPSET.group_size(REGISTER_GROUP_CODE);
+            let data_size = TAPSET.group_size(REGISTER_GROUP_DATA);
+            let accum_size = TAPSET.group_size(REGISTER_GROUP_ACCUM);
+            // poly_mix and out/mix get a non-zero deterministic value so the
+            // accumulation chain isn't trivially zero (which would mask
+            // ordering bugs in the kernel).
+            let mut rng = StdRng::seed_from_u64(seed);
+            Self {
+                po2,
+                steps,
+                domain,
+                code: vec![fill; code_size * domain],
+                data: vec![fill; data_size * domain],
+                accum: vec![fill; accum_size * domain],
+                mix: random_fps(&mut rng, CircuitImpl::MIX_SIZE),
+                out: random_fps(&mut rng, CircuitImpl::OUTPUT_SIZE),
+                poly_mix: ExtVal::random(&mut rng),
+            }
+        }
+
+        /// One-hot in the data buffer at (column, row). All other cells are
+        /// zero across all groups. Tests that a single non-zero cell
+        /// propagates correctly through the constraint evaluation.
+        fn one_hot_data(po2: usize, column: usize, row: usize) -> Self {
+            let steps = 1 << po2;
+            let domain = steps * INV_RATE;
+            let code_size = TAPSET.group_size(REGISTER_GROUP_CODE);
+            let data_size = TAPSET.group_size(REGISTER_GROUP_DATA);
+            let accum_size = TAPSET.group_size(REGISTER_GROUP_ACCUM);
+            assert!(column < data_size, "column {} out of range", column);
+            assert!(row < domain, "row {} out of range", row);
+            let mut data = vec![Val::ZERO; data_size * domain];
+            // Layout: data[col * domain + row]. Match the kernel's column-
+            // major indexing.
+            data[column * domain + row] = Val::ONE;
+            let mut rng = StdRng::seed_from_u64(SEED_ONE_HOT);
+            Self {
+                po2,
+                steps,
+                domain,
+                code: vec![Val::ZERO; code_size * domain],
+                data,
+                accum: vec![Val::ZERO; accum_size * domain],
+                mix: random_fps(&mut rng, CircuitImpl::MIX_SIZE),
+                out: random_fps(&mut rng, CircuitImpl::OUTPUT_SIZE),
+                poly_mix: ExtVal::random(&mut rng),
+            }
+        }
+    }
+
+    fn random_fps<E: Elem>(rng: &mut impl Rng, size: usize) -> Vec<E> {
+        (0..size).map(|_| E::random(rng)).collect()
+    }
+
+    /// Run eval_check against an arbitrary HAL pair, return the check buffer.
+    ///
+    /// IMPORTANT: `eval_check_dep()` MUST be called between submission
+    /// (which targets a separate `eval_queue` on the Intel HAL) and
+    /// `view()` (which waits only on the main queue). Without the
+    /// cross-queue barrier, `view()` would return while the kernel is
+    /// still in flight, reading uninitialized buffer memory — the
+    /// production prover sequences these the same way for the same
+    /// reason. The CPU HAL's `eval_check_dep` is a default-impl no-op,
+    /// so this call is also safe for the CPU reference.
+    fn eval_check_impl<H, C>(params: &EvalCheckParams, hal: &H, circuit_hal: &C) -> Vec<H::Elem>
+    where
+        H: Hal<Elem = Val, ExtElem = ExtVal>,
+        C: CircuitHal<H>,
+    {
+        let check = hal.alloc_elem("check", ExtVal::EXT_SIZE * params.domain);
+        let code = hal.copy_from_elem("code", &params.code);
+        let data = hal.copy_from_elem("data", &params.data);
+        let accum = hal.copy_from_elem("accum", &params.accum);
+        let mix = hal.copy_from_elem("mix", &params.mix);
+        let out = hal.copy_from_elem("out", &params.out);
+        circuit_hal.eval_check(
+            &check,
+            &[&accum, &code, &data],
+            &[&mix, &out],
+            params.poly_mix,
+            params.po2,
+            params.steps,
+        );
+        circuit_hal.eval_check_dep();
+        let mut ret = vec![H::Elem::ZERO; check.size()];
+        check.view(|view| ret.clone_from_slice(view));
+        ret
+    }
+
+    /// Run the Intel HAL's eval_check inside a scoped multipass setting.
+    /// The EnvGuard:
+    /// - serializes against other env-mutating tests (panic-safe restore);
+    /// - captures both RISC0_MULTIPASS and RISC0_PHASE_DISABLE so that a
+    ///   CI environment exporting RISC0_PHASE_DISABLE=multipass cannot
+    ///   silently downgrade multipass tests to the mono path.
+    ///
+    /// Removes only the `multipass` token from RISC0_PHASE_DISABLE so the
+    /// explicit `multipass` argument always wins, while preserving any
+    /// other phase entries (e.g. `block_read`, `tree_decomp`,
+    /// `subgroup_partition`) that CI may legitimately need disabled for
+    /// the same run. Without selective clearing, future Phase 1.5+ tests
+    /// would silently re-enable phases CI tried to disable.
+    fn intel_eval_check(params: &EvalCheckParams, multipass: bool) -> Vec<Val> {
+        let _env = EnvGuard::new(&["RISC0_MULTIPASS", "RISC0_PHASE_DISABLE"]);
+        if let Ok(prev) = std::env::var("RISC0_PHASE_DISABLE") {
+            let kept: Vec<&str> = prev
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("multipass"))
+                .collect();
+            if kept.is_empty() {
+                std::env::remove_var("RISC0_PHASE_DISABLE");
+            } else {
+                std::env::set_var("RISC0_PHASE_DISABLE", kept.join(","));
+            }
+        }
+        if multipass {
+            std::env::set_var("RISC0_MULTIPASS", "1");
+        } else {
+            std::env::remove_var("RISC0_MULTIPASS");
+        }
+        let hal = Arc::new(IntelHalSha256::new());
+        let circuit_hal = IntelCircuitHal::new(hal.clone());
+        eval_check_impl(params, hal.as_ref(), &circuit_hal)
+    }
+
+    fn cpu_eval_check(params: &EvalCheckParams) -> Vec<Val> {
+        let cpu_hal: CpuHal<BabyBear> = CpuHal::new(Sha256HashSuite::new_suite());
+        let cpu_eval = CpuCircuitHal;
+        eval_check_impl(params, &cpu_hal, &cpu_eval)
+    }
+
+    /// Path to the golden file for a given mode. Anchors on
+    /// `CARGO_MANIFEST_DIR` at compile time (via `env!`) so the path is
+    /// stable under cargo test, cargo nextest, or direct invocation of
+    /// the test binary regardless of cwd.
+    fn golden_path(mode: &str, po2: usize) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata")
+            .join("intel_eval_check")
+            .join(format!("{mode}_po2_{po2}.bin"))
+    }
+
+    /// Convert `&[Val]` to portable little-endian bytes of the NORMAL-form
+    /// (decoded) u32 representation. Independent of host endianness AND
+    /// of the Montgomery encoding constants — a future toolchain change
+    /// to `R = 2^32 mod P` does not silently invalidate goldens.
+    fn vals_to_normal_le_bytes(vals: &[Val]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(vals.len() * 4);
+        for v in vals {
+            out.extend_from_slice(&v.as_u32().to_le_bytes());
+        }
+        out
+    }
+
+    /// Generate or compare against a golden .bin file for byte-exact
+    /// regression testing. Three modes:
+    /// - `RISC0_PHASE_0B_GENERATE_GOLDEN=1`: write the golden;
+    /// - `RISC0_REQUIRE_GOLDEN=1`: missing golden is a panic (CI uses this);
+    /// - default: missing golden logs a notice and skips the assertion
+    ///   (lets a fresh checkout pass before goldens land).
+    fn assert_or_save_golden(mode: &str, po2: usize, observed: &[Val]) {
+        let path = golden_path(mode, po2);
+        let observed_bytes = vals_to_normal_le_bytes(observed);
+        if std::env::var_os("RISC0_PHASE_0B_GENERATE_GOLDEN").is_some() {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("failed to mkdir golden parent");
+            }
+            std::fs::write(&path, &observed_bytes).expect("failed to write golden");
+            eprintln!(
+                "wrote golden: {} ({} bytes)",
+                path.display(),
+                observed_bytes.len()
+            );
+            return;
+        }
+        match std::fs::read(&path) {
+            Ok(expected) => {
+                assert_eq!(
+                    observed_bytes, expected,
+                    "golden mismatch for {} (path={})",
+                    mode,
+                    path.display()
+                );
+            }
+            Err(_) => {
+                if std::env::var_os("RISC0_REQUIRE_GOLDEN").is_some() {
+                    panic!(
+                        "golden missing at {} and RISC0_REQUIRE_GOLDEN=1 is set — \
+                         run with RISC0_PHASE_0B_GENERATE_GOLDEN=1 on Battlemage \
+                         hardware to populate",
+                        path.display()
+                    );
+                }
+                eprintln!(
+                    "note: golden missing at {} — run with RISC0_PHASE_0B_GENERATE_GOLDEN=1 \
+                     to populate (skipping byte-exact assertion this run)",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    /// 1. Random differential — Intel mono path matches CPU reference.
+    #[test]
+    fn eval_check_random_mono() {
+        const PO2: usize = 4;
+        let params = EvalCheckParams::random(PO2, SEED_RANDOM);
+        let cpu = cpu_eval_check(&params);
+        let intel = intel_eval_check(&params, /* multipass = */ false);
+        assert_check_eq(&cpu, &intel, "Intel mono vs CPU");
+        assert_or_save_golden("mono_random", PO2, &intel);
+    }
+
+    /// 2. Random differential — Intel multipass path matches CPU reference.
+    #[test]
+    fn eval_check_random_multipass() {
+        const PO2: usize = 4;
+        let params = EvalCheckParams::random(PO2, SEED_RANDOM);
+        let cpu = cpu_eval_check(&params);
+        let intel = intel_eval_check(&params, /* multipass = */ true);
+        assert_check_eq(&cpu, &intel, "Intel multipass vs CPU");
+        assert_or_save_golden("multipass_random", PO2, &intel);
+    }
+
+    /// 3. Mono == multipass == CPU (tripod check). Comparing only mono to
+    /// multipass would miss a shared kernel bug where both produce the
+    /// same wrong answer; anchoring against CPU closes that gap.
+    #[test]
+    fn eval_check_mono_vs_multipass() {
+        const PO2: usize = 4;
+        let params = EvalCheckParams::random(PO2, SEED_RANDOM);
+        let cpu = cpu_eval_check(&params);
+        let mono = intel_eval_check(&params, false);
+        let multipass = intel_eval_check(&params, true);
+        assert_check_eq(&cpu, &mono, "tripod: mono vs CPU");
+        assert_check_eq(&cpu, &multipass, "tripod: multipass vs CPU");
+        assert_check_eq(&mono, &multipass, "tripod: mono vs multipass");
+    }
+
+    /// 4. Boundary fill with Val::ZERO. Exercises the kernel's handling of
+    /// the additive identity throughout the trace.
+    #[test]
+    fn eval_check_zero_fill() {
+        const PO2: usize = 4;
+        let params = EvalCheckParams::boundary_fill(PO2, Val::ZERO, SEED_ZERO_FILL);
+        let cpu = cpu_eval_check(&params);
+        let intel = intel_eval_check(&params, false);
+        assert_check_eq(&cpu, &intel, "zero_fill: mono vs CPU");
+        let multipass = intel_eval_check(&params, true);
+        assert_check_eq(&cpu, &multipass, "zero_fill: multipass vs CPU");
+    }
+
+    /// 5. Boundary fill with p-1 (== -1 in BabyBear). Exercises Mont mul
+    /// overflow paths — many constraint computations multiply (p-1) * x
+    /// which exercises the `t = ax + bx` and lazy-reduction code paths
+    /// that were the focus of round-1 review of FRI fold kernels.
+    #[test]
+    fn eval_check_p_minus_1_fill() {
+        const PO2: usize = 4;
+        // Val::new(p-1) where p = 0x78000001. In BabyBear: -Val::ONE.
+        let p_minus_1 = Val::ZERO - Val::ONE;
+        let params = EvalCheckParams::boundary_fill(PO2, p_minus_1, SEED_PMINUS1);
+        let cpu = cpu_eval_check(&params);
+        let intel = intel_eval_check(&params, false);
+        assert_check_eq(&cpu, &intel, "p_minus_1_fill: mono vs CPU");
+        let multipass = intel_eval_check(&params, true);
+        assert_check_eq(&cpu, &multipass, "p_minus_1_fill: multipass vs CPU");
+    }
+
+    /// 6. One-hot data column. Exposes any column-stride or per-row
+    /// indexing bug that would silently zero the propagation of a
+    /// single live cell.
+    #[test]
+    fn eval_check_one_hot_data() {
+        const PO2: usize = 4;
+        let data_size = TAPSET.group_size(REGISTER_GROUP_DATA);
+        // Pick a non-trivial interior column + interior row so we don't
+        // accidentally land on a boundary the kernel special-cases.
+        let column = data_size / 3;
+        let row = (1usize << PO2) * INV_RATE / 2 + 1;
+        let params = EvalCheckParams::one_hot_data(PO2, column, row);
+        let cpu = cpu_eval_check(&params);
+        let intel = intel_eval_check(&params, false);
+        assert_check_eq(&cpu, &intel, "one_hot_data: mono vs CPU");
+        let multipass = intel_eval_check(&params, true);
+        assert_check_eq(&cpu, &multipass, "one_hot_data: multipass vs CPU");
+    }
+
+    /// 8. Phase 0c profiling workload: runs `eval_check` `RISC0_PHASE0C_ITERS`
+    /// times (default 100) at PO2 `RISC0_PHASE0C_PO2` (default 4) with
+    /// 10-iter warmup, prints min/median/p99 latency to stdout. Gated
+    /// `#[ignore]` so it doesn't run under `cargo test`; invoke explicitly
+    /// via `cargo test --release --features intel --ignored phase0c_bench`
+    /// (typically wrapped in `unitrace`). Honors
+    /// `RISC0_PHASE0C_MULTIPASS=1` (the bench-only knob; do NOT set
+    /// `RISC0_MULTIPASS` directly — the bench overrides it).
+    #[test]
+    #[ignore = "Phase 0c profiling workload — long-running, GPU-only"]
+    fn phase0c_bench() {
+        use std::time::Instant;
+        let _env = EnvGuard::new(&["RISC0_MULTIPASS", "RISC0_PHASE_DISABLE"]);
+        let po2: usize = std::env::var("RISC0_PHASE0C_PO2")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4);
+        let iters: usize = std::env::var("RISC0_PHASE0C_ITERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(100)
+            .max(1); // Guard against accidental ITERS=0; index OOB would
+                    // panic on times[len/2] otherwise.
+        let warmup: usize = std::env::var("RISC0_PHASE0C_WARMUP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10);
+        let multipass = std::env::var_os("RISC0_PHASE0C_MULTIPASS").is_some();
+
+        eprintln!(
+            "phase0c_bench: po2={po2} iters={iters} warmup={warmup} multipass={multipass}"
+        );
+
+        // Build params once; the kernel reads input buffers, doesn't mutate
+        // them, so the same params can be reused across iterations.
+        let params = EvalCheckParams::random(po2, SEED_RANDOM);
+
+        // Configure multipass selector. EnvGuard restores on Drop.
+        if multipass {
+            std::env::set_var("RISC0_MULTIPASS", "1");
+        } else {
+            std::env::remove_var("RISC0_MULTIPASS");
+        }
+        // Always strip RISC0_PHASE_DISABLE for the bench: bisection during
+        // profiling is done by re-launching the bench, not by leaking env.
+        std::env::remove_var("RISC0_PHASE_DISABLE");
+
+        let hal = Arc::new(IntelHalSha256::new());
+        let circuit_hal = IntelCircuitHal::new(hal.clone());
+
+        // Warmup: discard timing, just amortize SYCL queue init + first-time
+        // ESIMD JIT into device cache.
+        for _ in 0..warmup {
+            let _ = eval_check_impl(&params, hal.as_ref(), &circuit_hal);
+        }
+
+        // Measure.
+        let mut times: Vec<u128> = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let t = Instant::now();
+            let _ = eval_check_impl(&params, hal.as_ref(), &circuit_hal);
+            times.push(t.elapsed().as_nanos());
+        }
+        times.sort_unstable();
+
+        let min = times[0];
+        let p50 = times[times.len() / 2];
+        let p99 = times[(times.len() * 99) / 100];
+        let max = *times.last().unwrap();
+        let mean: u128 = times.iter().sum::<u128>() / times.len() as u128;
+        // Coefficient of variation = stddev / mean. Used for V5's CoV<10%
+        // reproducibility gate.
+        let var: f64 = times
+            .iter()
+            .map(|&x| {
+                let d = x as f64 - mean as f64;
+                d * d
+            })
+            .sum::<f64>()
+            / times.len() as f64;
+        let cov = var.sqrt() / mean as f64;
+
+        // Machine-readable single line for run_profile.sh / classify.py.
+        println!(
+            "PHASE0C_BENCH po2={po2} iters={iters} multipass={multipass} \
+             min_ns={min} p50_ns={p50} p99_ns={p99} max_ns={max} \
+             mean_ns={mean} cov={cov:.4}"
+        );
+    }
+
+    /// 7. RISC0_PHASE_DISABLE=multipass should suppress multipass even
+    /// when RISC0_MULTIPASS is set. Verifies the bisection mechanism.
+    ///
+    /// EnvGuard ensures (a) we serialize against other env-mutating tests
+    /// and (b) restoration runs even on panic, so no state leaks to
+    /// downstream tests.
+    #[test]
+    fn phase_disable_overrides_multipass() {
+        let _env = EnvGuard::new(&["RISC0_MULTIPASS", "RISC0_PHASE_DISABLE"]);
+
+        // Plain match.
+        std::env::set_var("RISC0_PHASE_DISABLE", "multipass");
+        std::env::set_var("RISC0_MULTIPASS", "1");
+        assert!(
+            super::phase_disabled("multipass"),
+            "phase_disabled should report multipass disabled when env lists it"
+        );
+        assert!(
+            !super::phase_disabled("not_listed"),
+            "unrelated phases must remain enabled"
+        );
+        assert!(
+            super::phase_disabled("MultiPass"),
+            "phase matching must be ASCII case-insensitive"
+        );
+        assert!(
+            !super::phase_disabled(""),
+            "empty query never matches even with CSV empties"
+        );
+
+        // Whitespace + leading/trailing/double-comma robustness.
+        std::env::set_var("RISC0_PHASE_DISABLE", " multipass ,, block_read ,");
+        assert!(
+            super::phase_disabled("multipass"),
+            "leading/trailing whitespace must be trimmed"
+        );
+        assert!(
+            super::phase_disabled("block_read"),
+            "second entry after empty token must still match"
+        );
+        assert!(
+            !super::phase_disabled(""),
+            "empty query must not match the empty CSV tokens"
+        );
+    }
+
 }

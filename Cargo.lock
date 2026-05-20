@@ -7119,6 +7119,7 @@ dependencies = [
  "risc0-build-kernel",
  "risc0-core",
  "risc0-sys",
+ "sha2",
  "sppark",
 ]
 
@@ -7171,6 +7172,7 @@ dependencies = [
  "risc0-build-kernel",
  "risc0-core",
  "risc0-sys",
+ "sha2",
  "sppark",
 ]
 

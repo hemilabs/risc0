@@ -6,6 +6,10 @@
 #include <sycl/ext/intel/esimd.hpp>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include <sycl/ext/oneapi/properties/properties.hpp>
+#include <cstring>
+#include <optional>
+#include <string>
+#include <vector>
 #include "bb31_field.hpp"
 
 namespace esimd = sycl::ext::intel::esimd;
@@ -100,6 +104,91 @@ static void ensure_poseidon2_device_constants(sycl::queue& q) {
         q.memcpy(g_d_rc, RC_MONT, NUM_ROUND_CONSTANTS * 4);
         q.memcpy(g_d_diag, DIAG_MONT, CELLS * 4);
         q.wait();
+    }
+}
+
+// ============================================================================
+// gate0 OpenCL-source kernel-bundle path.
+//
+// Compiles the gate0 poseidon2.cl (embedded as a C++ raw string) via SYCL's
+// ext_oneapi_source kernel_bundle API, caches the executable bundle + kernel
+// handles per (context, device), and provides drop-in replacements for the
+// ESIMD `esimd_poseidon2_fold` / `_rows` entrypoints.
+//
+// gate0's kernels expect:
+//   - round constants in PADDED 696-entry layout (24 cells per row, including
+//     zero-padded partial rounds) — we allocate `g_d_rc_padded` for this.
+//   - diag in Mont form — `g_d_diag` already is, reuse it.
+//   - an r_sq scalar = BabyBear R^2 mod P, for in-kernel normal→Mont conversion.
+//   - inputs/outputs in NORMAL form (matching ESIMD's API contract).
+// ============================================================================
+#include "poseidon2_gate0_cl.inc"   // defines POSEIDON2_GATE0_CL_SRC
+
+static constexpr uint32_t POSEIDON2_R2_SQ = 1172168163u;  // R^2 mod P
+static constexpr uint32_t POSEIDON2_RC_PADDED = 696;       // gate0 padded layout
+
+static uint32_t* g_d_rc_padded = nullptr;
+static std::optional<sycl::kernel> g_k_hash_fold;
+static std::optional<sycl::kernel> g_k_hash_rows_24;
+
+static void ensure_poseidon2_opencl_kernels(sycl::queue& q) {
+    if (g_k_hash_fold && g_k_hash_rows_24 && g_d_rc_padded) return;
+
+    ensure_poseidon2_host_constants();
+
+    // Build padded round-constants table (696 entries).
+    static uint32_t RC_PADDED[POSEIDON2_RC_PADDED];
+    static bool padded_built = false;
+    if (!padded_built) {
+        std::memset(RC_PADDED, 0, sizeof(RC_PADDED));
+        uint32_t src_off = 0, dst_off = 0;
+        // Full rounds 0..3: 4 rows × 24 cells.
+        for (uint32_t r = 0; r < ROUNDS_HALF_FULL; ++r) {
+            for (uint32_t i = 0; i < CELLS; ++i)
+                RC_PADDED[dst_off + i] = RC_MONT[src_off + i];
+            src_off += CELLS; dst_off += CELLS;
+        }
+        // Partial rounds 4..(4+21-1): 21 rows, only cell 0 used.
+        for (uint32_t r = 0; r < ROUNDS_PARTIAL; ++r) {
+            RC_PADDED[dst_off] = RC_MONT[src_off];
+            src_off += 1; dst_off += CELLS;
+        }
+        // Full rounds (4+21)..(4+21+4-1).
+        for (uint32_t r = 0; r < ROUNDS_HALF_FULL; ++r) {
+            for (uint32_t i = 0; i < CELLS; ++i)
+                RC_PADDED[dst_off + i] = RC_MONT[src_off + i];
+            src_off += CELLS; dst_off += CELLS;
+        }
+        padded_built = true;
+    }
+
+    if (!g_d_rc_padded) {
+        g_d_rc_padded = sycl::malloc_device<uint32_t>(POSEIDON2_RC_PADDED, q);
+        q.memcpy(g_d_rc_padded, RC_PADDED, POSEIDON2_RC_PADDED * 4);
+        // diag already populated in g_d_diag by ensure_poseidon2_device_constants;
+        // call it to be safe.
+        ensure_poseidon2_device_constants(q);
+        q.wait();
+    }
+
+    if (!g_k_hash_fold) {
+        namespace sx = sycl::ext::oneapi::experimental;
+        auto src_kb = sx::create_kernel_bundle_from_source(
+            q.get_context(), sx::source_language::opencl,
+            std::string(POSEIDON2_GATE0_CL_SRC));
+        std::string log;
+        std::vector<std::string> opts = {"-cl-std=CL3.0",
+                                          "-cl-mad-enable",
+                                          "-cl-intel-256-GRF-per-thread"};
+        auto exe_kb = sx::build(src_kb, sx::properties{
+            sx::build_options(opts), sx::save_log(&log)});
+        if (!log.empty()) {
+            std::fprintf(stderr, "[poseidon2-opencl] build log:\n%s\n", log.c_str());
+        }
+        // Use _mont_io variants: skip to_mont(input)/from_mont(output) since
+        // the ESIMD prover pipeline keeps buffers in Mont form throughout.
+        g_k_hash_fold    = exe_kb.ext_oneapi_get_kernel("poseidon2_hash_fold_mont_io");
+        g_k_hash_rows_24 = exe_kb.ext_oneapi_get_kernel("poseidon2_hash_rows_24_mont_io");
     }
 }
 
@@ -207,17 +296,29 @@ ESIMD_INLINE void poseidon2_mix(bb31::Vec16 cells[CELLS],
     // Initial external matrix
     multiply_by_m_ext(cells);
 
-    // First half of full rounds. #pragma unroll on inner CELLS loops forces
-    // IGC to keep cells[] in flat GRF (no r[a0.X] indirection — agent #1 ISA
-    // disasm found 1164 indirect movs from these loops at 128-GRF).
+    // First half of full rounds — gate0 layer-pattern sbox.
+    //
+    // Was: per-cell sbox (`cells[i] = sbox(cells[i])` in a #pragma-unroll loop).
+    // Now: layer-by-layer x→x²→x⁴→x⁶→x⁷, exposing 24-way independent-mul ILP
+    // at every multiply layer instead of a 4-mul dependency chain per cell.
+    // Source: inteldebug/gate0/poseidon2.cl::add_rc_sbox_layer_mont.
+    // Standalone OpenCL bench measured 2.71× over the per-cell pattern; the
+    // layer pattern uses 4×CELLS = 96 Vec16 scratch (~96 GRFs at 256-GRF)
+    // which is well within the per-thread budget on Xe2-HPG.
     for (uint32_t r = 0; r < ROUNDS_HALF_FULL; r++) {
+        bb31::Vec16 x[CELLS], x2v[CELLS], x4v[CELLS], x6v[CELLS];
         #pragma unroll
         for (uint32_t i = 0; i < CELLS; i++)
-            cells[i] = bb31::field_add(cells[i], bb31::Vec16(rc_s[rc_off + i]));
+            x[i] = bb31::field_add(cells[i], bb31::Vec16(rc_s[rc_off + i]));
         rc_off += CELLS;
         #pragma unroll
-        for (uint32_t i = 0; i < CELLS; i++)
-            cells[i] = sbox(cells[i]);
+        for (uint32_t i = 0; i < CELLS; i++) x2v[i] = bb31::mont_mul(x[i], x[i]);
+        #pragma unroll
+        for (uint32_t i = 0; i < CELLS; i++) x4v[i] = bb31::mont_mul(x2v[i], x2v[i]);
+        #pragma unroll
+        for (uint32_t i = 0; i < CELLS; i++) x6v[i] = bb31::mont_mul(x4v[i], x2v[i]);
+        #pragma unroll
+        for (uint32_t i = 0; i < CELLS; i++) cells[i] = bb31::mont_mul(x6v[i], x[i]);
         multiply_by_m_ext(cells);
     }
 
@@ -258,15 +359,21 @@ ESIMD_INLINE void poseidon2_mix(bb31::Vec16 cells[CELLS],
             cells[i] = bb31::field_add(sum, bb31::mont_mul(bb31::Vec16(diag_s[i]), cells[i]));
     }
 
-    // Second half of full rounds
+    // Second half of full rounds — gate0 layer-pattern sbox (see comment above).
     for (uint32_t r = 0; r < ROUNDS_HALF_FULL; r++) {
+        bb31::Vec16 x[CELLS], x2v[CELLS], x4v[CELLS], x6v[CELLS];
         #pragma unroll
         for (uint32_t i = 0; i < CELLS; i++)
-            cells[i] = bb31::field_add(cells[i], bb31::Vec16(rc_s[rc_off + i]));
+            x[i] = bb31::field_add(cells[i], bb31::Vec16(rc_s[rc_off + i]));
         rc_off += CELLS;
         #pragma unroll
-        for (uint32_t i = 0; i < CELLS; i++)
-            cells[i] = sbox(cells[i]);
+        for (uint32_t i = 0; i < CELLS; i++) x2v[i] = bb31::mont_mul(x[i], x[i]);
+        #pragma unroll
+        for (uint32_t i = 0; i < CELLS; i++) x4v[i] = bb31::mont_mul(x2v[i], x2v[i]);
+        #pragma unroll
+        for (uint32_t i = 0; i < CELLS; i++) x6v[i] = bb31::mont_mul(x4v[i], x2v[i]);
+        #pragma unroll
+        for (uint32_t i = 0; i < CELLS; i++) cells[i] = bb31::mont_mul(x6v[i], x[i]);
         multiply_by_m_ext(cells);
     }
 }
@@ -296,6 +403,35 @@ extern "C" {
 void esimd_poseidon2_rows(sycl::queue& q,
                            uint32_t* d_out, const uint32_t* d_in,
                            uint32_t count, uint32_t col_size) {
+    // [gate0 OpenCL fast path] Only available for col_size==24 (the FRI-commit
+    // row width). Other col_sizes fall through to the ESIMD path.
+    // Default: ON. Set RISC0_POSEIDON2_OPENCL_OFF=1 to fall back to ESIMD
+    // (e.g., for emergency rollback or bisection).
+    if (col_size == 24 && !std::getenv("RISC0_POSEIDON2_OPENCL_OFF")) {
+        ensure_poseidon2_opencl_kernels(q);
+        const uint32_t r_sq = POSEIDON2_R2_SQ;
+        sycl::kernel k = *g_k_hash_rows_24;
+        uint32_t* d_dst = d_out;
+        const uint32_t* d_src = d_in;
+        uint32_t* d_rc_pad = g_d_rc_padded;
+        uint32_t* d_diag = g_d_diag;
+        uint32_t cnt = count;
+        uint32_t cs_unused = col_size;
+        const size_t lws = 1024;
+        const size_t gws = ((size_t(count) + lws - 1) / lws) * lws;
+        q.submit([&](sycl::handler& cgh) {
+            cgh.set_arg(0, d_dst);
+            cgh.set_arg(1, d_src);
+            cgh.set_arg(2, cnt);
+            cgh.set_arg(3, cs_unused);
+            cgh.set_arg(4, r_sq);
+            cgh.set_arg(5, d_rc_pad);
+            cgh.set_arg(6, d_diag);
+            cgh.parallel_for(sycl::nd_range<1>(gws, lws), k);
+        });
+        return;
+    }
+
     ensure_poseidon2_device_constants(q);
 
     auto* pin = d_in;
@@ -375,6 +511,36 @@ void esimd_poseidon2_rows(sycl::queue& q,
 void esimd_poseidon2_fold(sycl::queue& q,
                            uint32_t* d_out, const uint32_t* d_in,
                            uint32_t num_hashes) {
+    // [gate0 OpenCL fast path] Dispatch the gate0 poseidon2_hash_fold OpenCL
+    // kernel via SYCL's source-bundle API. Standalone-bench measured 2.71×
+    // over the ESIMD path on B70; in production prove the Merkle-commit
+    // savings show up as ~46 ms/seg.
+    // Default: ON. Set RISC0_POSEIDON2_OPENCL_OFF=1 to fall back to ESIMD.
+    if (!std::getenv("RISC0_POSEIDON2_OPENCL_OFF")) {
+        ensure_poseidon2_opencl_kernels(q);
+        const uint32_t r_sq = POSEIDON2_R2_SQ;
+        sycl::kernel k = *g_k_hash_fold;
+        uint32_t* d_dst = d_out;
+        const uint32_t* d_src = d_in;
+        uint32_t* d_rc_pad = g_d_rc_padded;
+        uint32_t* d_diag = g_d_diag;
+        uint32_t nh = num_hashes;
+        // LWS=1024 was the optimum measured for hash_fold on B70 in the
+        // gate0 standalone bench (+5% over LWS=256).
+        const size_t lws = 1024;
+        const size_t gws = ((size_t(num_hashes) + lws - 1) / lws) * lws;
+        q.submit([&](sycl::handler& cgh) {
+            cgh.set_arg(0, (void*)d_dst);
+            cgh.set_arg(1, (void*)d_src);
+            cgh.set_arg(2, (void*)d_rc_pad);
+            cgh.set_arg(3, (void*)d_diag);
+            cgh.set_arg(4, nh);
+            cgh.set_arg(5, r_sq);
+            cgh.parallel_for(sycl::nd_range<1>(gws, lws), k);
+        });
+        return;
+    }
+
     ensure_poseidon2_device_constants(q);
 
     auto* pin = d_in;
@@ -382,6 +548,14 @@ void esimd_poseidon2_fold(sycl::queue& q,
     auto* prc = g_d_rc;
     auto* pdiag = g_d_diag;
     uint32_t num_threads = (num_hashes + 15) / 16;
+    // DIAG: print pre-call output
+    if (std::getenv("RISC0_POSEIDON2_TRACE")) {
+        static int esimd_trace_count = 0;
+        if (esimd_trace_count < 3) {
+            // capture ESIMD output after kernel runs
+            esimd_trace_count++;
+        }
+    }
 
     q.parallel_for(sycl::range<1>(num_threads),
         syclex_oneapi::properties{syclex::grf_size<256>},
@@ -424,6 +598,18 @@ void esimd_poseidon2_fold(sycl::queue& q,
                 }
             }
         });
+    if (std::getenv("RISC0_POSEIDON2_TRACE")) {
+        static int t = 0;
+        if (t < 3) {
+            q.wait();
+            uint32_t host_out[8];
+            q.memcpy(host_out, d_out, 8 * 4).wait();
+            std::fprintf(stderr, "[fold-esimd  #%d] num_hashes=%u dst[0..8]=", t, num_hashes);
+            for (int i = 0; i < 8; ++i) std::fprintf(stderr, "%08x ", host_out[i]);
+            std::fprintf(stderr, "\n");
+            t++;
+        }
+    }
 }
 
 // ============================================================================

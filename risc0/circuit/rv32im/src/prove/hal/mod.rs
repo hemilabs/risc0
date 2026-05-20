@@ -28,6 +28,7 @@ use risc0_core::scope;
 static VERBOSE: LazyLock<bool> = LazyLock::new(|| std::env::var("RISC0_VERBOSE").is_ok());
 use risc0_zkp::{
     adapter::{CircuitInfo as _, PROOF_SYSTEM_INFO},
+    core::digest::Digest,
     field::Elem as _,
     hal::{Buffer, CircuitHal, Hal},
     prove::{poly_group::PolyGroup, Prover},
@@ -117,6 +118,9 @@ where
     cached_hal: RefCell<Option<(Arc<H>, Arc<C>)>>,
     /// Cached code PolyGroup (always zeros, same for every segment at same po2).
     cached_code_group: RefCell<Option<(PolyGroup<H>, usize)>>,
+    /// Cached Fiat-Shamir setup digests. PROOF_SYSTEM_INFO and CIRCUIT_INFO are
+    /// build-time constants; hashing them every segment costs ~1 ms on CPU.
+    cached_fs_seed_digests: RefCell<Option<(Box<Digest>, Box<Digest>)>>,
     /// Backgrounded finalize from previous prove_begin call. Holds a
     /// JoinHandle for the thread running DeferredFinalize::complete(); the
     /// thread's CPU work (poly_interpolate, combos_divide, fri queries) runs
@@ -138,6 +142,7 @@ where
             hal_factory,
             cached_hal: RefCell::new(None),
             cached_code_group: RefCell::new(None),
+            cached_fs_seed_digests: RefCell::new(None),
             pending_finalize: RefCell::new(None),
         }
     }
@@ -329,13 +334,20 @@ where
 
         prover.iop().write_u32_slice(&[RV32IM_SEAL_VERSION]);
 
-        // Seed Fiat-Shamir transcript
-        prover
-            .iop()
-            .commit(&hashfn.hash_elem_slice(&PROOF_SYSTEM_INFO.encode()));
-        prover
-            .iop()
-            .commit(&hashfn.hash_elem_slice(&CircuitImpl::CIRCUIT_INFO.encode()));
+        // Seed Fiat-Shamir transcript with cached PROOF_SYSTEM_INFO and
+        // CIRCUIT_INFO digests (both are build-time constants; hashing every
+        // segment costs ~1 ms on CPU).
+        {
+            let mut cache = self.cached_fs_seed_digests.borrow_mut();
+            if cache.is_none() {
+                let p = hashfn.hash_elem_slice(&PROOF_SYSTEM_INFO.encode());
+                let c = hashfn.hash_elem_slice(&CircuitImpl::CIRCUIT_INFO.encode());
+                *cache = Some((p, c));
+            }
+            let (p, c) = cache.as_ref().unwrap();
+            prover.iop().commit(p.as_ref());
+            prover.iop().commit(c.as_ref());
+        }
 
         let header_digest = hashfn.hash_elem_slice(&header);
         prover.iop().commit(&header_digest);

@@ -355,9 +355,19 @@ void esimd_batch_evaluate_any(sycl::queue& q,
                                uint32_t deg) {            // degree (coefficients per poly)
     if (count == 0) return;
 
-    constexpr uint32_t WG_SIZE = 64;
-    // SLM: 64 threads × 4 FpExt components × 16 lanes × 4 bytes = 16KB
-    constexpr uint32_t SLM_SIZE = WG_SIZE * 4 * 16 * sizeof(uint32_t);
+    // WG_SIZE is runtime-tunable via RISC0_BATCH_EVAL_WG (default 64).
+    // Empirical: WG=64 is the production sweet spot on B70. WG=32 is ~3%
+    // slower; WG≥128 *hangs* the kernel (SLM/barrier resource issue not
+    // diagnosed). SLM is sized for the safe max we'll allow at runtime.
+    constexpr uint32_t WG_SIZE_MAX = 64;
+    constexpr uint32_t SLM_SIZE = WG_SIZE_MAX * 4 * 16 * sizeof(uint32_t);
+    uint32_t WG_SIZE = 64;
+    if (const char* s = std::getenv("RISC0_BATCH_EVAL_WG")) {
+        int v = std::atoi(s);
+        if (v == 16 || v == 32 || v == 64) {
+            WG_SIZE = (uint32_t)v;
+        }
+    }
 
     // Each workgroup handles 16 evaluations. Total WGs = ceil(count/16).
     uint32_t num_groups = (count + 15) / 16;

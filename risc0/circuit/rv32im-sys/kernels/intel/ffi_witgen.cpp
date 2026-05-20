@@ -421,7 +421,16 @@ const char* risc0_circuit_rv32im_intel_accum(
     tables.tableU8 = g_cache.d_tableU8;
     tables.tableU16 = g_cache.d_tableU16;
 
-    constexpr uint32_t WG_SIZE = 256;
+    // WG_SIZE for accum phase1/phase3 kernels.
+    // Runtime-tunable via RISC0_ACCUM_WG for sweep without 30-min rebuilds.
+    // Default 256 matches the original (pre-tunable) value.
+    uint32_t WG_SIZE = 256;
+    if (const char* s = std::getenv("RISC0_ACCUM_WG")) {
+      int v = std::atoi(s);
+      if (v == 16 || v == 32 || v == 64 || v == 128 || v == 256 || v == 512 || v == 1024) {
+        WG_SIZE = (uint32_t)v;
+      }
+    }
 
     // Phase 1: step_TopAccum — parallel, one work-item per cycle
     {

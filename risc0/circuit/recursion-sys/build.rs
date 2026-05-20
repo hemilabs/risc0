@@ -20,6 +20,223 @@ use std::{
 
 use risc0_build_kernel::{KernelBuild, KernelType};
 
+/// Build-cache stamp utilities for the Intel SYCL recursion kernel.
+///
+/// Replaces the previous `"built"` literal stamp (which never invalidated on
+/// source changes) with content-addressed SHA-256 hashing. One stamp covers
+/// the recursion eval_check compilation. Stamp file format is a small TOML:
+///
+///     hash         = "<sha256 hex>"
+///     built_at     = "<utc rfc3339 timestamp>"
+///     icpx_version = "<first line of `icpx --version`>"
+///     status       = "ok" | "failed"
+///
+/// Cache hit requires all of: artifact present, stamp parses, hash matches,
+/// status is "ok". Anything else triggers a rebuild.
+mod stamp {
+    use sha2::{Digest, Sha256};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    fn update_len(h: &mut Sha256, n: u64) {
+        h.update(n.to_le_bytes());
+    }
+
+    #[allow(dead_code)] // kept as a convenience entry-point for callers that
+                       // don't need label/content separation
+    pub fn hash(files: &[&Path], extras: &[&str]) -> String {
+        let pairs: Vec<(PathBuf, PathBuf)> = files
+            .iter()
+            .map(|p| (p.to_path_buf(), p.to_path_buf()))
+            .collect();
+        hash_labeled(&pairs, extras)
+    }
+
+    pub fn hash_labeled(items: &[(PathBuf, PathBuf)], extras: &[&str]) -> String {
+        let mut sorted: Vec<&(PathBuf, PathBuf)> = items.iter().collect();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut h = Sha256::new();
+        h.update(b"STAMP-V2\0");
+        for (label, content_path) in sorted {
+            let path_bytes = label.as_os_str().as_encoded_bytes();
+            h.update(b"FILE");
+            update_len(&mut h, path_bytes.len() as u64);
+            h.update(path_bytes);
+            match std::fs::read(content_path) {
+                Ok(b) => {
+                    h.update(b"OK");
+                    update_len(&mut h, b.len() as u64);
+                    h.update(&b);
+                }
+                Err(_) => {
+                    h.update(b"MISS");
+                    update_len(&mut h, 0);
+                }
+            }
+        }
+        for s in extras {
+            let bytes = s.as_bytes();
+            h.update(b"EXTRA");
+            update_len(&mut h, bytes.len() as u64);
+            h.update(bytes);
+        }
+        format!("{:x}", h.finalize())
+    }
+
+    pub fn icpx_version(icpx: &Path) -> String {
+        let out = match Command::new(icpx).arg("--version").output() {
+            Ok(o) => o,
+            Err(e) => return format!("unknown-exec:{}", e.raw_os_error().unwrap_or(-1)),
+        };
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let first = stdout.lines().next().map(|s| s.trim()).unwrap_or("");
+        let sanitized: String = first.chars().filter(|c| !c.is_control()).collect();
+        if !out.status.success() {
+            return format!("unknown-exit:{}", out.status.code().unwrap_or(-1));
+        }
+        if sanitized.is_empty() {
+            return "unknown".into();
+        }
+        sanitized
+    }
+
+    pub fn now() -> String {
+        Command::new("date")
+            .arg("-u")
+            .arg("+%Y-%m-%dT%H:%M:%SZ")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| "unknown".into())
+    }
+
+    pub struct Stamp {
+        pub hash: String,
+        pub status: String,
+    }
+
+    pub fn read(path: &Path) -> Option<Stamp> {
+        let s = std::fs::read_to_string(path).ok()?;
+        let mut hash = None;
+        let mut status = None;
+        for line in s.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((k, v)) = line.split_once('=') {
+                let k = k.trim();
+                let v = v.trim().trim_matches('"');
+                match k {
+                    "hash" => hash = Some(v.to_string()),
+                    "status" => status = Some(v.to_string()),
+                    _ => {}
+                }
+            }
+        }
+        Some(Stamp {
+            hash: hash?,
+            status: status?,
+        })
+    }
+
+    pub fn write(path: &Path, hash_value: &str, icpx_version: &str, status: &str) {
+        let now = now();
+        let escape = |s: &str| -> String {
+            let cleaned: String = s.chars().filter(|c| !c.is_control()).collect();
+            cleaned.replace('\\', "\\\\").replace('"', "\\\"")
+        };
+        let body = format!(
+            "hash = \"{}\"\nbuilt_at = \"{}\"\nicpx_version = \"{}\"\nstatus = \"{}\"\n",
+            escape(hash_value),
+            escape(&now),
+            escape(icpx_version),
+            escape(status),
+        );
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp = {
+            let parent = path.parent().unwrap_or_else(|| Path::new("."));
+            let name = path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "stamp".into());
+            parent.join(format!("{name}.{pid}.{nanos}.tmp"))
+        };
+        std::fs::write(&tmp, body).expect("failed to write build-cache stamp tmp");
+        std::fs::rename(&tmp, path).expect("failed to rename build-cache stamp");
+    }
+
+    pub fn need_rebuild(artifact: &Path, stamp_path: &Path, expected_hash: &str) -> bool {
+        need_rebuild_multi(&[artifact], stamp_path, expected_hash)
+    }
+
+    pub fn need_rebuild_multi(
+        artifacts: &[&Path],
+        stamp_path: &Path,
+        expected_hash: &str,
+    ) -> bool {
+        if artifacts.iter().any(|p| !p.exists()) {
+            return true;
+        }
+        match read(stamp_path) {
+            None => true,
+            Some(s) => s.hash != expected_hash || s.status != "ok",
+        }
+    }
+}
+
+const RECURSION_INTEL_STAMP_VERSION: &str = "recursion-v2";
+
+/// Glob `*.h`/`*.hpp`/`*.cuh` from an absolute external include root
+/// (`DEP_RISC0_SYS_CXX_ROOT`) so upstream `fp.h`/`fpext.h` content edits
+/// invalidate the stamp. Returns (label, content_path) pairs where the
+/// label is a portable virtual `cxx_root/<basename>` path so the cache key
+/// stays stable across machines with different absolute workspace roots.
+fn cxx_root_headers(cxx_root: &str) -> Vec<(PathBuf, PathBuf)> {
+    let mut out = Vec::new();
+    for ext in &["*.h", "*.hpp", "*.cuh"] {
+        let pattern = format!("{cxx_root}/{ext}");
+        if let Ok(paths) = glob::glob(&pattern) {
+            for p in paths.filter_map(Result::ok) {
+                if let Some(name) = p.file_name() {
+                    let label = PathBuf::from("cxx_root").join(name);
+                    out.push((label, p));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Inputs for the recursion eval_check kernel: poly_fp + the SYCL kernel
+/// wrapper + transitive cxx_root headers + local cxx headers/.inc fragments
+/// (poly_fp.cpp transitively includes them).
+fn compute_recursion_intel_hash(cxx_root: &str, icpx_version: &str) -> String {
+    let mut in_tree: Vec<PathBuf> = vec![
+        PathBuf::from("kernels/intel/eval_check.cpp"),
+        PathBuf::from("kernels/cxx/poly_fp.cpp"),
+        PathBuf::from("build.rs"),
+    ];
+    in_tree.extend(glob_paths("kernels/cxx/*.h"));
+    in_tree.extend(glob_paths("kernels/cxx/*.h.inc"));
+    in_tree.extend(glob_paths("kernels/cxx/*.cpp.inc"));
+    let mut pairs: Vec<(PathBuf, PathBuf)> =
+        in_tree.into_iter().map(|p| (p.clone(), p)).collect();
+    pairs.extend(cxx_root_headers(cxx_root));
+    stamp::hash_labeled(
+        &pairs,
+        &[icpx_version, RECURSION_INTEL_STAMP_VERSION, "recursion"],
+    )
+}
+
 #[cfg(all(feature = "cuda", feature = "rocm"))]
 compile_error!("Features 'cuda' and 'rocm' are mutually exclusive. Enable only one GPU backend.");
 
@@ -214,22 +431,33 @@ fn build_intel_kernels() {
             if oneapi.exists() { oneapi } else { PathBuf::from("icpx") }
         });
 
-    // Cache directory for the expensive eval_check compilation
+    // Cache directory anchored on the <profile> dir under target/, regardless
+    // of profile name (so custom profiles still cache). OUT_DIR layout is
+    // `<target>/<profile>/build/<crate>-<hash>/out`.
     let cache_dir = out_dir
         .ancestors()
-        .find(|p| p.ends_with("release") || p.ends_with("debug"))
+        .find(|p| {
+            p.parent()
+                .and_then(|q| q.file_name())
+                .map(|n| n == std::ffi::OsStr::new("target"))
+                .unwrap_or(false)
+        })
         .map(|p| p.join("intel_recursion_cache"))
         .unwrap_or_else(|| out_dir.join("intel_recursion_cache"));
     std::fs::create_dir_all(&cache_dir).unwrap();
 
     let so_path = cache_dir.join("librisc0_recursion_intel.so");
 
-    // Check if we can skip rebuild
+    // Compute SHA-256 over the recursion eval_check inputs. Stamp invalidates
+    // when any of poly_fp.cpp, eval_check.cpp, build.rs, or the icpx version
+    // change.
+    let icpx_version = stamp::icpx_version(&icpx);
+    let recursion_hash = compute_recursion_intel_hash(&cxx_root, &icpx_version);
+
+    // Check if we can skip rebuild: artifact present, stamp parses, hash
+    // matches, status was "ok" last build.
     let stamp_path = cache_dir.join("intel_eval_check.stamp");
-    let need_rebuild = !so_path.exists() || {
-        let stamp = std::fs::read_to_string(&stamp_path).unwrap_or_default();
-        stamp.is_empty() // Always rebuild if no stamp (TODO: hash sources)
-    };
+    let need_rebuild = stamp::need_rebuild(&so_path, &stamp_path, &recursion_hash);
 
     if need_rebuild {
         eprintln!("Building Intel SYCL eval_check kernel for recursion...");
@@ -300,10 +528,11 @@ fn build_intel_kernels() {
         eprintln!("  Running: {:?}", cmd);
         let output = cmd.output().expect("Failed to run icpx");
         if !output.status.success() {
+            stamp::write(&stamp_path, &recursion_hash, &icpx_version, "failed");
             let stderr = String::from_utf8_lossy(&output.stderr);
             panic!("Intel recursion eval_check compilation failed:\n{}", stderr);
         }
-        std::fs::write(&stamp_path, "built").unwrap();
+        stamp::write(&stamp_path, &recursion_hash, &icpx_version, "ok");
         eprintln!("  Built {}", so_path.display());
     } else {
         eprintln!("Using cached Intel recursion eval_check kernel");

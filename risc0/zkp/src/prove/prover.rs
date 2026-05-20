@@ -336,6 +336,8 @@ impl<H: Hal> DeferredFinalize<H> {
         // Sometimes it's a requirement for matching generated code, but even when
         // it's not we keep the order for consistency.
 
+        let _eu_verbose = std::env::var_os("RISC0_VERBOSE").is_some();
+        let _eu_t0 = std::time::Instant::now();
         let mut eval_u: Vec<H::ExtElem> = Vec::new();
         scope!("eval_u", {
             // Calculate total taps to allocate a single combined output buffer.
@@ -380,9 +382,11 @@ impl<H: Hal> DeferredFinalize<H> {
                 eval_u.extend_from_slice(view);
             });
         });
+        let _eu_t_be = _eu_t0.elapsed();
 
         // Now, convert the values to coefficients via interpolation
         let mut coeff_u = vec![H::ExtElem::ZERO; eval_u.len()];
+        let _eu_t_interp_start = std::time::Instant::now();
         scope!("poly_interpolate", {
             let mut pos = 0;
             for reg in self.taps.regs() {
@@ -395,30 +399,56 @@ impl<H: Hal> DeferredFinalize<H> {
                 pos += reg.size();
             }
         });
+        let _eu_t_interp = _eu_t_interp_start.elapsed();
 
         // Add in the coeffs of the check polynomials.
         let z_pow = z.pow(ext_size);
+        let _eu_t_misc_start = std::time::Instant::now();
+        let mut _eu_t_be2 = std::time::Duration::ZERO;
+        let mut _eu_t_hash = std::time::Duration::ZERO;
+        let mut _eu_t_iop_w = std::time::Duration::ZERO;
+        let mut _eu_t_iop_c = std::time::Duration::ZERO;
         scope!("misc", {
             let which = Vec::from_iter(0u32..H::CHECK_SIZE as u32);
             let xs = vec![z_pow; H::CHECK_SIZE];
             let out = hal.alloc_extelem("out", H::CHECK_SIZE);
             let which = hal.copy_from_u32("which", which.as_slice());
             let xs = hal.copy_from_extelem("xs", xs.as_slice());
+            let _bt = std::time::Instant::now();
             hal.batch_evaluate_any(&check_group.coeffs, H::CHECK_SIZE, &which, &xs, &out);
             out.view(|view| {
                 coeff_u.extend(view);
             });
+            _eu_t_be2 = _bt.elapsed();
 
             tracing::debug!("Size of U = {}", coeff_u.len());
+            let _wt = std::time::Instant::now();
             self.iop.write_field_elem_slice(&coeff_u);
+            _eu_t_iop_w = _wt.elapsed();
+            let _ht = std::time::Instant::now();
             let hash_u = hal
                 .get_hash_suite()
                 .hashfn
                 .hash_ext_elem_slice(coeff_u.as_slice());
+            _eu_t_hash = _ht.elapsed();
+            let _ct = std::time::Instant::now();
             self.iop.commit(&hash_u);
-
+            _eu_t_iop_c = _ct.elapsed();
             // Set the mix value, which is used for FRI batching.
         });
+        let _eu_t_misc = _eu_t_misc_start.elapsed();
+        if _eu_verbose {
+            eprintln!(
+                "      [eval_u_decomp] eval_u_block={:.1}ms interp={:.1}ms misc(total)={:.1}ms (be2={:.1}ms iop_w={:.1}ms hash_u={:.1}ms iop_c={:.1}ms)",
+                _eu_t_be.as_secs_f64() * 1000.0,
+                _eu_t_interp.as_secs_f64() * 1000.0,
+                _eu_t_misc.as_secs_f64() * 1000.0,
+                _eu_t_be2.as_secs_f64() * 1000.0,
+                _eu_t_iop_w.as_secs_f64() * 1000.0,
+                _eu_t_hash.as_secs_f64() * 1000.0,
+                _eu_t_iop_c.as_secs_f64() * 1000.0,
+            );
+        }
 
         let t_eval_u = ft.elapsed();
 
