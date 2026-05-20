@@ -418,6 +418,11 @@ fn build_rocm_kernels() {
     println!("cargo:rerun-if-env-changed=HIPCC");
     println!("cargo:rerun-if-env-changed=RISC0_HIP_ARCH");
     println!("cargo:rerun-if-env-changed=SCCACHE_RECACHE");
+    // Tier-4 IGC experiment + T3.2 tree-reduce env vars must invalidate
+    // build.rs cache; otherwise changing them silently no-ops because cargo
+    // doesn't track unregistered env vars.
+    println!("cargo:rerun-if-env-changed=RISC0_IGC_EXTRA_OPTS");
+    println!("cargo:rerun-if-env-changed=RISC0_TREE_REDUCE");
     rerun_if_changed("kernels/cuda");
 
     env::set_var("SCCACHE_IDLE_TIMEOUT", "0");
@@ -772,6 +777,16 @@ fn intel_xs_options() -> String {
     if let Some(s) = intel_simd_width() {
         parts.push(format!("-cl-intel-force-simd-size={s}"));
     }
+    // Tier-4 IGC experiment hook: RISC0_IGC_EXTRA_OPTS injects extra
+    // -options tokens verbatim (e.g. for `-cl-intel-no-subgroup-ifp` or
+    // `-igc_opts 'VISAOptions=-presched-rp 200'`). Cache stamp picks this
+    // up via the env var read in compute_*_hash, so each setting gets
+    // its own .so without forcing a manual clean.
+    if let Ok(extra) = std::env::var("RISC0_IGC_EXTRA_OPTS") {
+        if !extra.is_empty() {
+            parts.push(extra);
+        }
+    }
     parts.join(" ")
 }
 
@@ -835,11 +850,22 @@ fn compute_mono_hash(cxx_root: &str, icpx_version: &str) -> String {
         in_tree.push(PathBuf::from("kernels/intel/tree_reduce_fma.py"));
     }
     let tree_reduce_tag = if std::env::var_os("RISC0_TREE_REDUCE").is_some() { "tr1" } else { "tr0" };
+    // Tier-4 IGC flag experiment: tag includes the RISC0_IGC_EXTRA_OPTS
+    // value so changing it triggers rebuild; an empty/unset value collapses
+    // to the canonical "iex-" tag (no extra opts).
+    let iex_raw = std::env::var("RISC0_IGC_EXTRA_OPTS").unwrap_or_default();
+    let iex_tag = format!("iex-{:x}", {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        iex_raw.hash(&mut h);
+        (h.finish() & 0xffffffff) as u32
+    });
     let pairs = build_pairs(in_tree, cxx_root);
     let variant = intel_variant_tag();
     stamp::hash_labeled(
         &pairs,
-        &[icpx_version, INTEL_STAMP_VERSION, "mono", &variant, tree_reduce_tag],
+        &[icpx_version, INTEL_STAMP_VERSION, "mono", &variant, tree_reduce_tag, &iex_tag],
     )
 }
 
@@ -1202,7 +1228,7 @@ fn build_intel_kernels() {
             // Force 256 GRF mode: doubles register file from 8KB to 16KB per thread,
             // dramatically reducing the 42KB spill overhead. Trades occupancy (8→4 threads/EU)
             // for fewer spills — net win since kernel is spill-bound, not compute-bound.
-            .arg("-Xs").arg(format!("-options {}", intel_xs_options()));
+            .arg("-Xs").arg(format!("-options \"{}\"", intel_xs_options()));
 
         eprintln!("  Running: {:?}", cmd);
         let output = cmd.output().expect("Failed to run icpx");
@@ -1269,7 +1295,7 @@ fn build_intel_kernels() {
                     .arg(format!("-I{cxx_root}")).arg("-Ikernels/cxx")
                     .arg(&pass1_amalg).arg("-o").arg(&pass1_so)
                     .arg("-fsycl-targets=intel_gpu_bmg_g31")
-                    .arg("-Xs").arg(format!("-options {}", intel_xs_options()))
+                    .arg("-Xs").arg(format!("-options \"{}\"", intel_xs_options()))
                     .output().expect("Failed to run icpx for pass1");
 
                 if !p1_output.status.success() {
@@ -1289,7 +1315,7 @@ fn build_intel_kernels() {
                     .arg(format!("-I{cxx_root}")).arg("-Ikernels/cxx")
                     .arg(&pass2_amalg).arg("-o").arg(&pass2_so)
                     .arg("-fsycl-targets=intel_gpu_bmg_g31")
-                    .arg("-Xs").arg(format!("-options {}", intel_xs_options()))
+                    .arg("-Xs").arg(format!("-options \"{}\"", intel_xs_options()))
                     .output().expect("Failed to run icpx for pass2");
 
                 if !p2_output.status.success() {
@@ -1390,7 +1416,7 @@ fn build_intel_kernels() {
             // 2026-04-21: patched IGC + no cl-opt-disable + explicit 256 GRF (committed setup).
             // 2026-04-22: -Xfinalizer presched-rp/spillAllowed flags tested via -options nesting,
             // ocloc rejected with exit 226. Need different syntax — deferred.
-            .arg("-Xs").arg(format!("-options {}", intel_xs_options()))
+            .arg("-Xs").arg(format!("-options \"{}\"", intel_xs_options()))
             .arg("-Wno-unused-parameter")
             .arg("-Wno-unused-function")
             .arg("-Wno-unused-variable")
