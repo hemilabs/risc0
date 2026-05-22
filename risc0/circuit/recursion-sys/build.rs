@@ -228,15 +228,24 @@ fn compute_recursion_intel_hash(cxx_root: &str, icpx_version: &str) -> String {
     in_tree.extend(glob_paths("kernels/cxx/*.h"));
     in_tree.extend(glob_paths("kernels/cxx/*.h.inc"));
     in_tree.extend(glob_paths("kernels/cxx/*.cpp.inc"));
+    if std::env::var_os("RISC0_RECURSION_SPLIT_POLY_FP").is_some() {
+        in_tree.push(PathBuf::from("kernels/intel/split_poly_fp.py"));
+    }
     let mut pairs: Vec<(PathBuf, PathBuf)> =
         in_tree.into_iter().map(|p| (p.clone(), p)).collect();
     pairs.extend(cxx_root_headers(cxx_root));
     // R3-A06 follow-up: include RISC0_RECURSION_OPTIMIZE env in stamp so the
     // cache invalidates when the user flips the optimization mode.
     let opt_tag = if std::env::var_os("RISC0_RECURSION_OPTIMIZE").is_some() { "opt1" } else { "opt0" };
+    let split_tag = if std::env::var_os("RISC0_RECURSION_SPLIT_POLY_FP").is_some() {
+        let n = std::env::var("RISC0_RECURSION_SPLIT_N").unwrap_or_else(|_| "10".to_string());
+        format!("split{n}")
+    } else {
+        "nosplit".to_string()
+    };
     stamp::hash_labeled(
         &pairs,
-        &[icpx_version, RECURSION_INTEL_STAMP_VERSION, "recursion", opt_tag],
+        &[icpx_version, RECURSION_INTEL_STAMP_VERSION, "recursion", opt_tag, &split_tag],
     )
 }
 
@@ -423,6 +432,8 @@ fn build_intel_kernels() {
     rerun_if_changed("kernels/intel");
     rerun_if_changed("kernels/cxx");
     println!("cargo:rerun-if-env-changed=RISC0_RECURSION_OPTIMIZE");
+    println!("cargo:rerun-if-env-changed=RISC0_RECURSION_SPLIT_POLY_FP");
+    println!("cargo:rerun-if-env-changed=RISC0_RECURSION_SPLIT_N");
 
     let cxx_root = env::var("DEP_RISC0_SYS_CXX_ROOT").unwrap();
     let out_dir = env::var("OUT_DIR").map(PathBuf::from).unwrap();
@@ -496,6 +507,21 @@ fn build_intel_kernels() {
         // The recursion poly_fp.cpp is a single monolithic function (~24K lines),
         // roughly half the size of rv32im's 52K. We mark the function itself as
         // noinline so it compiles as a separate device function.
+        //
+        // PR 2 / RISC0_RECURSION_SPLIT_POLY_FP=1 (default OFF — DO NOT FLIP):
+        // attempts to split the monolith into N noinline sub-functions via
+        // `kernels/intel/split_poly_fp.py`. The intent is to unblock
+        // `RISC0_RECURSION_OPTIMIZE=1` (which hangs IGC on the 24K-line
+        // monolith). Compiles cleanly but the resulting kernel triggers
+        // `UR_RESULT_ERROR_DEVICE_LOST` at runtime — closure-based re-emission
+        // inflates the .so 4.6× (13MB → 59.7MB) because recursion's codegen
+        // front-loads ~689 buffer reads used throughout the function. The
+        // right next-iteration design is to hoist buffer loads ONCE into
+        // `Fp x33[N]` / `FpExt x34[M]` scratch arrays in the entry `poly_fp`
+        // and pass pointers to sub-functions (rv32im's pattern). See the
+        // header docstring of split_poly_fp.py for full details. Kept in
+        // tree as a starting point for future work.
+        let split_poly_fp = std::env::var_os("RISC0_RECURSION_SPLIT_POLY_FP").is_some();
         let amalg_path = out_dir.join("intel_recursion_eval_check_amalg.cpp");
         let mut amalg = String::new();
         amalg.push_str("// Auto-generated amalgamation for SYCL device code\n");
@@ -505,29 +531,55 @@ fn build_intel_kernels() {
         amalg.push_str("namespace risc0::circuit::recursion {\n");
         amalg.push_str("constexpr size_t kInvRate = 4;\n");
 
-        // Read poly_fp.cpp and extract the function body, skipping the preamble
-        let src = std::fs::read_to_string("kernels/cxx/poly_fp.cpp").unwrap();
-        if let Some(ns_start) = src.find("namespace risc0::circuit::recursion {") {
-            let body_start = ns_start + "namespace risc0::circuit::recursion {".len();
-            if let Some(body_end) = src.rfind('}') {
-                let body = &src[body_start..body_end];
-                // Inject __attribute__((noinline)) on the function definition.
-                // The function definition starts with "FpExt poly_fp(" at line start.
-                let mut modified = String::new();
-                let mut injected = false;
-                for line in body.lines() {
-                    if !injected && line.starts_with("FpExt poly_fp(") && line.contains('{') {
-                        // This is the function definition - inject noinline
-                        modified.push_str("__attribute__((noinline)) ");
-                        injected = true;
-                    } else if !injected && line.starts_with("FpExt poly_fp(") {
-                        // Forward declaration — skip, we already have it in header
-                        // Actually keep it but don't inject noinline on declarations
+        if split_poly_fp {
+            // Run the splitter into OUT_DIR/poly_fp_split/, then include the
+            // produced rust_poly_fp_{0,1}.cpp files' bodies.
+            let split_dir = out_dir.join("poly_fp_split");
+            std::fs::create_dir_all(&split_dir).unwrap();
+            let split_script = PathBuf::from("kernels/intel/split_poly_fp.py");
+            let split_n = std::env::var("RISC0_RECURSION_SPLIT_N").unwrap_or_else(|_| "10".to_string());
+            let status = Command::new("python3")
+                .arg(&split_script)
+                .arg("kernels/cxx/poly_fp.cpp")
+                .arg(&split_dir)
+                .arg("--n").arg(&split_n)
+                .status()
+                .expect("Failed to run split_poly_fp.py");
+            if !status.success() {
+                panic!("split_poly_fp.py failed");
+            }
+            eprintln!("  RISC0_RECURSION_SPLIT_POLY_FP=1 (n={split_n}): split sources at {}", split_dir.display());
+            // Include both split files' bodies.
+            for fname in &["rust_poly_fp_0.cpp", "rust_poly_fp_1.cpp"] {
+                let src = std::fs::read_to_string(split_dir.join(fname)).unwrap();
+                if let Some(ns_start) = src.find("namespace risc0::circuit::recursion {") {
+                    let body_start = ns_start + "namespace risc0::circuit::recursion {".len();
+                    if let Some(body_end) = src.rfind('}') {
+                        amalg.push_str(&src[body_start..body_end]);
+                        amalg.push('\n');
                     }
-                    modified.push_str(line);
-                    modified.push('\n');
                 }
-                amalg.push_str(&modified);
+            }
+        } else {
+            // Original monolithic path. Read poly_fp.cpp and extract the function
+            // body, injecting __attribute__((noinline)) on the definition.
+            let src = std::fs::read_to_string("kernels/cxx/poly_fp.cpp").unwrap();
+            if let Some(ns_start) = src.find("namespace risc0::circuit::recursion {") {
+                let body_start = ns_start + "namespace risc0::circuit::recursion {".len();
+                if let Some(body_end) = src.rfind('}') {
+                    let body = &src[body_start..body_end];
+                    let mut modified = String::new();
+                    let mut injected = false;
+                    for line in body.lines() {
+                        if !injected && line.starts_with("FpExt poly_fp(") && line.contains('{') {
+                            modified.push_str("__attribute__((noinline)) ");
+                            injected = true;
+                        }
+                        modified.push_str(line);
+                        modified.push('\n');
+                    }
+                    amalg.push_str(&modified);
+                }
             }
         }
         amalg.push_str("} // namespace risc0::circuit::recursion\n");
