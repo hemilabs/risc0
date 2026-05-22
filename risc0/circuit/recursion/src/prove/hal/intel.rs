@@ -67,24 +67,37 @@ impl<IH: IntelHash> CircuitWitnessGenerator<IntelHal<IH>> for IntelCircuitHal<IH
         data: &IntelBuffer<BabyBearElem>,
         global: &IntelBuffer<BabyBearElem>,
     ) -> Result<()> {
+        let verbose = std::env::var_os("RISC0_VERBOSE").is_some();
+        let t0 = std::time::Instant::now();
         // Download GPU buffers to host for CPU FFI
         let ctrl_host = ctrl.to_vec();
         let data_host = data.to_vec();
         let global_host = global.to_vec();
+        let d2h_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         let buffers = RawExecBuffers {
             ctrl: ctrl_host.as_ptr(),
             data: data_host.as_ptr(),
             global: global_host.as_ptr(),
         };
+        let t1 = std::time::Instant::now();
         ffi_wrap(|| unsafe {
             risc0_circuit_recursion_cpu_witgen(mode, &buffers, preflight, total_cycles)
         })?;
+        let ffi_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
         // Upload results back to GPU (H2D only, no redundant D2H)
+        let t2 = std::time::Instant::now();
         ctrl.copy_from_host(&ctrl_host);
         data.copy_from_host(&data_host);
         global.copy_from_host(&global_host);
+        let h2d_ms = t2.elapsed().as_secs_f64() * 1000.0;
+
+        if verbose {
+            eprintln!("[recursion_witgen_intel] d2h={d2h_ms:.1}ms ffi_cpu={ffi_ms:.1}ms h2d={h2d_ms:.1}ms total={:.1}ms cycles={}",
+                t0.elapsed().as_secs_f64() * 1000.0,
+                total_cycles);
+        }
 
         Ok(())
     }
@@ -101,12 +114,15 @@ impl<IH: IntelHash> CircuitAccumulator<IntelHal<IH>> for IntelCircuitHal<IH> {
         mix: &IntelBuffer<BabyBearElem>,
         accum: &IntelBuffer<BabyBearElem>,
     ) -> Result<()> {
+        let verbose = std::env::var_os("RISC0_VERBOSE").is_some();
+        let t0 = std::time::Instant::now();
         // Download GPU buffers to host for CPU FFI
         let ctrl_host = ctrl.to_vec();
         let global_host = global.to_vec();
         let data_host = data.to_vec();
         let mix_host = mix.to_vec();
         let accum_host = accum.to_vec();
+        let d2h_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         let buffers = RawAccumBuffers {
             ctrl: ctrl_host.as_ptr(),
@@ -115,13 +131,23 @@ impl<IH: IntelHash> CircuitAccumulator<IntelHal<IH>> for IntelCircuitHal<IH> {
             mix: mix_host.as_ptr(),
             accum: accum_host.as_ptr(),
         };
+        let t1 = std::time::Instant::now();
         ffi_wrap(|| unsafe {
             risc0_circuit_recursion_cpu_accum(&buffers, work_cycles, total_cycles)
         })?;
+        let ffi_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
         // Upload modified buffers back to GPU (H2D only, no redundant D2H)
+        let t2 = std::time::Instant::now();
         accum.copy_from_host(&accum_host);
         global.copy_from_host(&global_host);
+        let h2d_ms = t2.elapsed().as_secs_f64() * 1000.0;
+
+        if verbose {
+            eprintln!("[recursion_accum_intel] d2h={d2h_ms:.1}ms ffi_cpu={ffi_ms:.1}ms h2d={h2d_ms:.1}ms total={:.1}ms work_cycles={} total_cycles={}",
+                t0.elapsed().as_secs_f64() * 1000.0,
+                work_cycles, total_cycles);
+        }
 
         Ok(())
     }

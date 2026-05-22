@@ -246,6 +246,11 @@ pub type IntelHalPoseidon254 = IntelHal<IntelHashPoseidon254>;
 
 // ============================================================================
 // Buffer Pool — caches device allocations for reuse (matches CUDA HAL pattern)
+//
+// NOTE: R2-A08 attempt at process-global pool was reverted due to intermittent
+// double-free in glibc tcache during validation runs. Root cause TBD; the
+// thread_local! variant is stable. Future work: instrument the global-pool
+// version to find which CPU-heap allocation was being freed twice.
 // ============================================================================
 
 use std::collections::HashMap;
@@ -958,6 +963,66 @@ impl<IH: IntelHash + ?Sized> Hal for IntelHal<IH> {
     fn hash_fold(&self, io: &Self::Buffer<Digest>, input_size: usize, output_size: usize) {
         assert_eq!(input_size, 2 * output_size);
         self.hash.as_ref().unwrap().hash_fold(io, output_size);
+    }
+
+    /// R2-A07: Override `hash_fold_tree` to stop GPU folding at `cutoff`
+    /// (default 1024 = gate0 OpenCL LWS) and finish remaining layers on CPU
+    /// via rayon + hashfn.hash_pair.
+    ///
+    /// Rationale: gate0 fold kernel hard-codes LWS=1024 (poseidon2.cpp:528).
+    /// Layers with num_hashes < 1024 launch a full 1024-WI WG → wasted
+    /// dispatch latency. ~7 merkle trees per seg × ~10 sub-LWS tail layers
+    /// ≈ 70 wasted submits/seg. CPU-finishing 1023 hash_pair ops on rayon is
+    /// faster than the dispatch overhead. CPU `hash_pair` is bit-exact with
+    /// the kernel's Mont-form I/O (project_poseidon2_mont_convention.md).
+    /// Tunable: RISC0_HASH_FOLD_CPU_CUTOFF (0 disables; default 1024).
+    fn hash_fold_tree(&self, io: &Self::Buffer<Digest>, layers: usize) {
+        // Default cutoff=512 based on cutoff-sweep (2 runs/setting on
+        // prove_and_verify 42-seg): 512 → 146.61s, 1024 → 146.91s, 2048 → 147.24s.
+        // 512 means GPU folds down to output_size=512, then CPU finishes one more
+        // layer than at cutoff=1024. Within measurement noise but reproducible.
+        let cutoff: usize = std::env::var("RISC0_HASH_FOLD_CPU_CUTOFF")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(512);
+
+        if cutoff == 0 || cutoff >= (1 << layers) {
+            for i in (0..layers).rev() {
+                let layer_size = 1 << i;
+                self.hash_fold(io, layer_size * 2, layer_size);
+            }
+            return;
+        }
+
+        let cutoff_log2 = (usize::BITS - 1 - cutoff.leading_zeros()) as usize;
+        let cutoff_po2: usize = 1 << cutoff_log2;
+
+        // GPU phase: fold while output_size >= cutoff_po2.
+        for i in (cutoff_log2..layers).rev() {
+            let layer_size = 1 << i;
+            self.hash_fold(io, layer_size * 2, layer_size);
+        }
+
+        // CPU phase: finish remaining cutoff_log2 layers using rayon + hash_pair.
+        // view_mut on a slice (intel.rs:454+) D2H's the region, runs the closure,
+        // and H2D's the modified bytes back to the device.
+        let region = io.slice(1, 2 * cutoff_po2 - 1);
+        let hash_suite = self.hash.as_ref().unwrap().get_hash_suite();
+        let hashfn = hash_suite.hashfn.clone();
+        region.view_mut(|buf| {
+            use rayon::prelude::*;
+            for i in (0..cutoff_log2).rev() {
+                let out_off = (1usize << i) - 1;
+                let in_off = (1usize << (i + 1)) - 1;
+                let layer_size = 1usize << i;
+                let (outs_full, ins_full) = buf.split_at_mut(in_off);
+                let outs = &mut outs_full[out_off..out_off + layer_size];
+                let ins = &ins_full[..2 * layer_size];
+                outs.par_iter_mut().enumerate().for_each(|(idx, out)| {
+                    *out = *hashfn.hash_pair(&ins[2 * idx], &ins[2 * idx + 1]);
+                });
+            }
+        });
     }
 
     // ---- Gather / Scatter ----

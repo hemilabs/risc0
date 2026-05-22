@@ -55,6 +55,10 @@ extern "C" {
     void esimd_batch_evaluate_any(sycl::queue& q, uint32_t* d_out, const uint32_t* d_coeffs,
                                    const uint32_t* d_which, const uint32_t* d_xs,
                                    uint32_t count, uint32_t deg);
+    // R2-A04: CUDA-style 1-WG-per-eval Horner variant (5.5-6.7% E2E)
+    void esimd_batch_evaluate_any_cuda_style(sycl::queue& q, uint32_t* d_out, const uint32_t* d_coeffs,
+                                              const uint32_t* d_which, const uint32_t* d_xs,
+                                              uint32_t count, uint32_t deg);
     void esimd_combos_prepare(sycl::queue& q, uint32_t* d_combos, const uint32_t* d_coeffU,
                                uint32_t comboCount, uint32_t cycles, uint32_t regsCount,
                                const uint32_t* d_regSizes, const uint32_t* d_regComboIds,
@@ -234,7 +238,9 @@ const char* esimd_batch_expand_ffi(void* queue, void* d_out, const void* d_in,
                 out[r * stride + c * out_rows] = in_ptr[r + c * in_rows];
             });
         }
-        q->wait();
+        // R2-A05: removed q->wait(). In-order queue serializes the
+        // subsequent NTT/poseidon2 kernels with the writes here; host
+        // reads of `out` go through esimd_memcpy_dtoh which waits.
     )
 }
 
@@ -250,7 +256,9 @@ const char* esimd_batch_forward_ntt(void* queue, void* d_data,
             // Submit NTT without intermediate q.wait() — queue is in-order
             gpu_forward_ntt_no_wait(*q, data + c * stride, lg_n);
         }
-        q->wait();
+        // R2-A05: removed q->wait(). All `gpu_forward_ntt_no_wait` submits
+        // are serialized by the in-order queue with whatever the caller
+        // submits next (or with esimd_memcpy_dtoh for host reads).
     )
 }
 
@@ -263,7 +271,9 @@ const char* esimd_batch_inverse_ntt(void* queue, void* d_data,
         for (uint32_t c = 0; c < poly_count; c++) {
             gpu_inverse_ntt_no_wait(*q, data + c * stride, lg_n);
         }
-        q->wait();
+        // R2-A05: removed q->wait(). Symmetric with esimd_batch_forward_ntt
+        // — the in-order queue serializes; host reads self-sync via
+        // esimd_memcpy_dtoh.
     )
 }
 
@@ -509,8 +519,10 @@ const char* esimd_batch_zk_shift(void* queue, void* d_data,
                     }
                 });
         }
-        q->wait();
-        // d_powers is cached — do NOT free
+        // R2-A05: removed q->wait(). The captured kernel-side pointers
+        // (`pp`, `pd`) reference device memory that stays valid until the
+        // next esimd_free_device; d_powers is cached. The in-order queue
+        // serializes subsequent ops.
     )
 }
 
@@ -529,7 +541,9 @@ const char* esimd_batch_inverse_ntt_zk_shift(void* queue, void* d_data,
             gpu_inverse_ntt_zk_shift_no_wait(*q, data + c * stride,
                                               lg_domain_size, d_powers);
         }
-        q->wait();
+        // R2-A05: removed q->wait(). Symmetric with esimd_batch_inverse_ntt;
+        // d_powers cached, in-order queue handles inter-op ordering, host
+        // reads self-sync via esimd_memcpy_dtoh.
     )
 }
 
@@ -675,10 +689,24 @@ const char* esimd_batch_evaluate_any_ffi(void* queue, void* d_out, const void* d
                                            const void* d_which, const void* d_xs,
                                            uint32_t count, uint32_t deg) {
     auto* q = static_cast<sycl::queue*>(queue);
-    FFI_WRAP(esimd_batch_evaluate_any(*q, static_cast<uint32_t*>(d_out),
-                                       static_cast<const uint32_t*>(d_coeffs),
-                                       static_cast<const uint32_t*>(d_which),
-                                       static_cast<const uint32_t*>(d_xs), count, deg))
+    // R2-A04 opt-in: RISC0_BATCH_EVAL_CUDA_STYLE=1 selects the CUDA-style
+    // 1-WG-per-eval Horner kernel. Default OFF on B70 (BMG-G31) because the
+    // CUDA-style kernel measured parity with ESIMD in wall time AND introduced
+    // intermittent SIGABRT (3/5 runs vs 0/5 with ESIMD). Kept as opt-in for
+    // future arches where the trade-off may flip.
+    const char* mode = std::getenv("RISC0_BATCH_EVAL_CUDA_STYLE");
+    bool use_cuda_style = mode && (mode[0] == '1' || (mode[0] == 'o' && mode[1] == 'n'));
+    if (use_cuda_style) {
+        FFI_WRAP(esimd_batch_evaluate_any_cuda_style(*q, static_cast<uint32_t*>(d_out),
+                                                      static_cast<const uint32_t*>(d_coeffs),
+                                                      static_cast<const uint32_t*>(d_which),
+                                                      static_cast<const uint32_t*>(d_xs), count, deg))
+    } else {
+        FFI_WRAP(esimd_batch_evaluate_any(*q, static_cast<uint32_t*>(d_out),
+                                           static_cast<const uint32_t*>(d_coeffs),
+                                           static_cast<const uint32_t*>(d_which),
+                                           static_cast<const uint32_t*>(d_xs), count, deg))
+    }
 }
 
 const char* esimd_combos_prepare_ffi(void* queue, void* d_combos, const void* d_coeff_u,

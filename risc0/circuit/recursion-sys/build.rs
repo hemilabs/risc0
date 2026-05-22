@@ -231,9 +231,12 @@ fn compute_recursion_intel_hash(cxx_root: &str, icpx_version: &str) -> String {
     let mut pairs: Vec<(PathBuf, PathBuf)> =
         in_tree.into_iter().map(|p| (p.clone(), p)).collect();
     pairs.extend(cxx_root_headers(cxx_root));
+    // R3-A06 follow-up: include RISC0_RECURSION_OPTIMIZE env in stamp so the
+    // cache invalidates when the user flips the optimization mode.
+    let opt_tag = if std::env::var_os("RISC0_RECURSION_OPTIMIZE").is_some() { "opt1" } else { "opt0" };
     stamp::hash_labeled(
         &pairs,
-        &[icpx_version, RECURSION_INTEL_STAMP_VERSION, "recursion"],
+        &[icpx_version, RECURSION_INTEL_STAMP_VERSION, "recursion", opt_tag],
     )
 }
 
@@ -419,6 +422,7 @@ fn build_rocm_kernels() {
 fn build_intel_kernels() {
     rerun_if_changed("kernels/intel");
     rerun_if_changed("kernels/cxx");
+    println!("cargo:rerun-if-env-changed=RISC0_RECURSION_OPTIMIZE");
 
     let cxx_root = env::var("DEP_RISC0_SYS_CXX_ROOT").unwrap();
     let out_dir = env::var("OUT_DIR").map(PathBuf::from).unwrap();
@@ -462,14 +466,25 @@ fn build_intel_kernels() {
     if need_rebuild {
         eprintln!("Building Intel SYCL eval_check kernel for recursion...");
 
+        // R3-A06 follow-up: by default we use `-O1 -cl-opt-disable` for fast
+        // builds (~3 min ocloc), trading runtime perf. Set
+        // `RISC0_RECURSION_OPTIMIZE=1` to compile with full optimization (-O2,
+        // no -cl-opt-disable). Compile time grows to ~30-50 min but the
+        // GPU kernel may run 2-5× faster, saving 1-4% Succinct E2E.
+        let recursion_optimize = std::env::var_os("RISC0_RECURSION_OPTIMIZE").is_some();
         let mut cmd = Command::new(&icpx);
         cmd.arg("-shared")
             .arg("-fPIC")
             .arg("-fsycl")
-            .arg("-std=c++17")
-            .arg("-O1") // -O1 with -cl-opt-disable for ocloc
-            .arg("-Xs").arg("-options -cl-opt-disable")
-            .arg("-Wno-unused-parameter")
+            .arg("-std=c++17");
+        if recursion_optimize {
+            cmd.arg("-O2")
+                .arg("-Xs").arg(format!("-options \"-cl-intel-256-GRF-per-thread\""));
+        } else {
+            cmd.arg("-O1") // -O1 with -cl-opt-disable for ocloc fast-compile default
+                .arg("-Xs").arg("-options -cl-opt-disable");
+        }
+        cmd.arg("-Wno-unused-parameter")
             .arg("-Wno-unused-function")
             .arg("-Wno-unused-variable")
             .arg("-Wno-sign-compare")

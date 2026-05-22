@@ -19,6 +19,7 @@ fn main() {
             ReceiptKind::Composite
         }
     };
+    let seg_po2: Option<usize> = std::env::args().nth(3).and_then(|s| s.parse().ok());
 
     let spec = BenchmarkSpec::HashBytesIter {
         buf: vec![0u8; 64],
@@ -26,7 +27,12 @@ fn main() {
     };
 
     eprintln!("Executing guest ({sha_iters} SHA256 iterations) -> {kind:?} receipt");
-    let env = ExecutorEnv::builder().write(&spec).unwrap().build().unwrap();
+    let mut env_builder = ExecutorEnv::builder();
+    env_builder.write(&spec).unwrap();
+    if let Some(p) = seg_po2 {
+        env_builder.segment_limit_po2(p as u32);
+    }
+    let env = env_builder.build().unwrap();
     let session = ExecutorImpl::from_elf(env, BENCH_ELF).unwrap().run().unwrap();
     eprintln!(
         "  segments: {}, total_cycles: {}, user_cycles: {}",
@@ -35,9 +41,13 @@ fn main() {
         session.user_cycles,
     );
 
-    let opts = ProverOpts::default()
+    let mut opts = ProverOpts::default()
         .with_hashfn("poseidon2".to_string())
         .with_receipt_kind(kind);
+    if let Some(p) = seg_po2 {
+        opts = opts.with_segment_po2_max(p);
+        eprintln!("  segment_po2 = {p}");
+    }
     let prover = get_prover_server(&opts).unwrap();
     let ctx = VerifierContext::default();
 

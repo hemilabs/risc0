@@ -423,6 +423,9 @@ fn build_rocm_kernels() {
     // doesn't track unregistered env vars.
     println!("cargo:rerun-if-env-changed=RISC0_IGC_EXTRA_OPTS");
     println!("cargo:rerun-if-env-changed=RISC0_TREE_REDUCE");
+    println!("cargo:rerun-if-env-changed=RISC0_POLY_FP_CSE");
+    println!("cargo:rerun-if-env-changed=RISC0_POLY_FP_CSE_TOP");
+    println!("cargo:rerun-if-env-changed=RISC0_POLY_FP_CSE_MIN_SHARE");
     rerun_if_changed("kernels/cuda");
 
     env::set_var("SCCACHE_IDLE_TIMEOUT", "0");
@@ -850,6 +853,28 @@ fn compute_mono_hash(cxx_root: &str, icpx_version: &str) -> String {
         in_tree.push(PathBuf::from("kernels/intel/tree_reduce_fma.py"));
     }
     let tree_reduce_tag = if std::env::var_os("RISC0_TREE_REDUCE").is_some() { "tr1" } else { "tr0" };
+    // T3.1 cross-function CSE: hoist shared args[group][col*steps+...] reads
+    // from the 20 noinline sub-functions into the entry poly_fp.
+    // DEFAULT ON (R3-A01 confirmed +11.5% E2E). Disable with RISC0_POLY_FP_CSE=0.
+    let cse_enabled = !matches!(
+        std::env::var("RISC0_POLY_FP_CSE").as_deref(),
+        Ok("0") | Ok("false") | Ok("off") | Ok("OFF"),
+    );
+    if cse_enabled {
+        in_tree.push(PathBuf::from("kernels/intel/poly_fp_cse.py"));
+    }
+    let cse_top = std::env::var("RISC0_POLY_FP_CSE_TOP").unwrap_or_default();
+    let cse_min = std::env::var("RISC0_POLY_FP_CSE_MIN_SHARE").unwrap_or_default();
+    // Normalize the env var into "1"/"0" so default-on and explicit "1" hash the same.
+    let cse_state = if cse_enabled { "1" } else { "0" };
+    let cse_raw = format!("{}|{}|{}", cse_state, cse_top, cse_min);
+    let cse_tag = format!("cse-{:x}", {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        cse_raw.hash(&mut h);
+        (h.finish() & 0xffffffff) as u32
+    });
     // Tier-4 IGC flag experiment: tag includes the RISC0_IGC_EXTRA_OPTS
     // value so changing it triggers rebuild; an empty/unset value collapses
     // to the canonical "iex-" tag (no extra opts).
@@ -865,7 +890,7 @@ fn compute_mono_hash(cxx_root: &str, icpx_version: &str) -> String {
     let variant = intel_variant_tag();
     stamp::hash_labeled(
         &pairs,
-        &[icpx_version, INTEL_STAMP_VERSION, "mono", &variant, tree_reduce_tag, &iex_tag],
+        &[icpx_version, INTEL_STAMP_VERSION, "mono", &variant, tree_reduce_tag, &iex_tag, &cse_tag],
     )
 }
 
@@ -1135,13 +1160,15 @@ fn build_intel_kernels() {
         // feed the amalgamation. The transform is mathematically exact
         // (commutativity + associativity of FpExt addition).
         let use_tree_reduce = std::env::var_os("RISC0_TREE_REDUCE").is_some();
-        let poly_fp_dir = if use_tree_reduce {
+        let mut current_src_dir: std::path::PathBuf =
+            std::path::PathBuf::from("kernels/cxx");
+        if use_tree_reduce {
             let dst = out_dir.join("poly_fp_tree_reduced");
             std::fs::create_dir_all(&dst).unwrap();
             let script = std::path::PathBuf::from("kernels/intel/tree_reduce_fma.py");
             let status = std::process::Command::new("python3")
                 .arg(&script)
-                .arg("kernels/cxx")
+                .arg(&current_src_dir)
                 .arg(&dst)
                 .status()
                 .expect("Failed to run tree_reduce_fma.py");
@@ -1150,10 +1177,46 @@ fn build_intel_kernels() {
             }
             eprintln!("  RISC0_TREE_REDUCE=1: using tree-reduced poly_fp sources at {}",
                       dst.display());
-            dst
-        } else {
-            std::path::PathBuf::from("kernels/cxx")
-        };
+            current_src_dir = dst;
+        }
+
+        // T3.1: Cross-function CSE — hoist shared args[buf][col*steps+...]
+        // reads from the 20 noinline sub-functions into the entry poly_fp.
+        // Bit-exact (same global loads, just relocated and forwarded by-value).
+        // DEFAULT ON: R3-A01 controlled A/B measured +11.5% E2E vs baseline
+        // (CSE median 16.876s vs baseline 19.060s on B70 BMG-G31, 5-seg fib).
+        // Disable with RISC0_POLY_FP_CSE=0.
+        // Tunables: RISC0_POLY_FP_CSE_TOP (default 16), RISC0_POLY_FP_CSE_MIN_SHARE (default 10).
+        let cse_enabled = !matches!(
+            std::env::var("RISC0_POLY_FP_CSE").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("OFF"),
+        );
+        if cse_enabled {
+            let dst = out_dir.join("poly_fp_cse");
+            std::fs::create_dir_all(&dst).unwrap();
+            let script = std::path::PathBuf::from("kernels/intel/poly_fp_cse.py");
+            let cse_top = std::env::var("RISC0_POLY_FP_CSE_TOP")
+                .unwrap_or_else(|_| "16".to_string());
+            let cse_min = std::env::var("RISC0_POLY_FP_CSE_MIN_SHARE")
+                .unwrap_or_else(|_| "10".to_string());
+            let status = std::process::Command::new("python3")
+                .arg(&script)
+                .arg(&current_src_dir)
+                .arg(&dst)
+                .arg("--top").arg(&cse_top)
+                .arg("--min-share").arg(&cse_min)
+                .status()
+                .expect("Failed to run poly_fp_cse.py");
+            if !status.success() {
+                panic!("poly_fp_cse.py failed");
+            }
+            eprintln!(
+                "  RISC0_POLY_FP_CSE=1 (top={}, min-share={}): hoisted-CSE sources at {}",
+                cse_top, cse_min, dst.display(),
+            );
+            current_src_dir = dst;
+        }
+        let poly_fp_dir = current_src_dir;
 
         let mut cmd = Command::new(&icpx);
         cmd.arg("-shared")

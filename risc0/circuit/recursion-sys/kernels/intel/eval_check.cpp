@@ -40,7 +40,19 @@ extern "C" const char* risc0_circuit_recursion_intel_eval_check(
         Fp rou_val;
         std::memcpy(&rou_val, &rou_raw, sizeof(uint32_t));
 
-        constexpr uint32_t WG_SIZE = 1024;
+        // Default WG=1024 chosen because recursion poly_fp is compiled with
+        // `-O1 -cl-opt-disable` (see recursion-sys/build.rs), which keeps
+        // register pressure low enough that the widest workgroup the device
+        // supports is occupancy-optimal. If recursion ever moves to -O2 or
+        // RISC0_RECURSION_OPTIMIZE=1, the spill profile may force WG<=512.
+        // Runtime-tunable via RISC0_RECURSION_EVAL_CHECK_WG for sweeps.
+        uint32_t WG_SIZE = 1024;
+        if (const char* s = std::getenv("RISC0_RECURSION_EVAL_CHECK_WG")) {
+            int v = std::atoi(s);
+            if (v == 16 || v == 32 || v == 64 || v == 128 || v == 256 || v == 512 || v == 1024) {
+                WG_SIZE = (uint32_t)v;
+            }
+        }
         uint32_t global_size = ((domain + WG_SIZE - 1) / WG_SIZE) * WG_SIZE;
 
         q->parallel_for(

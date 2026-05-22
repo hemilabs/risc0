@@ -475,6 +475,129 @@ void esimd_batch_evaluate_any(sycl::queue& q,
 }
 
 // ============================================================================
+// R2-A04: CUDA-style 1-WG-per-eval batch_evaluate_any (Horner reduction)
+//
+// Mirrors risc0/sys/kernels/zkp/cuda/kernels.cu:batch_evaluate_any.
+// One work-group per polynomial evaluation, WG_SIZE threads per Horner
+// reduction. Coalesced contiguous coefficient reads + 20% fewer mont_muls
+// than the ESIMD SIMD-16 gather kernel; 15-30× more WGs (saturates B70).
+// Estimated 2-3× kernel speedup → 5.5-6.7% E2E.
+//
+// Math identity: out[e] = Σ_{i=0..deg-1} coeffs[which[e]*deg + i] · x[e]^i,
+// computed as a top-down Horner reduction (associativity preserved over bb31).
+//
+// Bit-exact with CUDA reference (R3-A02 verified).
+//
+// Tunable: RISC0_BATCH_EVAL_WG_CUDA (default 256; one of 64/128/256/512/1024).
+// ============================================================================
+void esimd_batch_evaluate_any_cuda_style(sycl::queue& q,
+                                          uint32_t* d_out,
+                                          const uint32_t* d_coeffs,
+                                          const uint32_t* d_which,
+                                          const uint32_t* d_xs,
+                                          uint32_t count,
+                                          uint32_t deg) {
+    if (count == 0) return;
+
+    uint32_t WG_SIZE = 256;
+    if (const char* s = std::getenv("RISC0_BATCH_EVAL_WG_CUDA")) {
+        int v = std::atoi(s);
+        if (v == 64 || v == 128 || v == 256 || v == 512 || v == 1024) {
+            WG_SIZE = static_cast<uint32_t>(v);
+        }
+    }
+
+    const uint32_t num_groups = count;
+    auto* pout = d_out;
+    auto* pcoeffs = d_coeffs;
+    auto* pwhich = d_which;
+    auto* pxs = d_xs;
+
+    q.submit([&](sycl::handler& cgh) {
+        // SLM: one FpExt (4 u32) per work-item.
+        sycl::local_accessor<uint32_t, 1> tots(sycl::range<1>(WG_SIZE * 4), cgh);
+
+        cgh.parallel_for(
+            sycl::nd_range<1>(num_groups * WG_SIZE, WG_SIZE),
+            [=](sycl::nd_item<1> item) {
+                const uint32_t lid = item.get_local_id(0);
+                const uint32_t grp = item.get_group(0);
+                const uint32_t wg = item.get_local_range(0);
+
+                // Per-WG setup: read which[grp] and xs[grp] (one polynomial)
+                const uint32_t poly_off = pwhich[grp] * deg;
+                const uint32_t* cur_poly = pcoeffs + poly_off;
+
+                // Load FpExt x (AoS: 4 u32 starting at xs[grp*4])
+                uint32_t x[4] = { pxs[grp*4+0], pxs[grp*4+1], pxs[grp*4+2], pxs[grp*4+3] };
+
+                // stepx = x^WG_SIZE  (scalar; identical across threads of this WG)
+                uint32_t stepx[4];
+                scalar_ext_pow(stepx, x, wg);
+
+                // Horner reduction: K = ceil(deg / WG_SIZE)
+                const uint32_t K = (deg + wg - 1) / wg;
+                uint32_t tot[4] = { 0, 0, 0, 0 };
+
+                for (int k = (int)K - 1; k >= 0; --k) {
+                    // tot *= stepx
+                    uint32_t newtot[4];
+                    scalar_ext_mul(newtot, tot, stepx);
+                    tot[0] = newtot[0]; tot[1] = newtot[1];
+                    tot[2] = newtot[2]; tot[3] = newtot[3];
+
+                    // tot += coeff[lid + k*wg]  (Fp added into component 0)
+                    size_t i = (size_t)lid + (size_t)k * wg;
+                    if (i < deg) {
+                        tot[0] = scalar_field_add(tot[0], cur_poly[i]);
+                    }
+                }
+
+                // tot *= x^lid
+                {
+                    uint32_t pwx[4];
+                    scalar_ext_pow(pwx, x, lid);
+                    uint32_t t2[4];
+                    scalar_ext_mul(t2, tot, pwx);
+                    tot[0] = t2[0]; tot[1] = t2[1];
+                    tot[2] = t2[2]; tot[3] = t2[3];
+                }
+
+                // Store partial sum to SLM (4 u32 per thread)
+                tots[lid*4 + 0] = tot[0];
+                tots[lid*4 + 1] = tot[1];
+                tots[lid*4 + 2] = tot[2];
+                tots[lid*4 + 3] = tot[3];
+                item.barrier(sycl::access::fence_space::local_space);
+
+                // Tree reduction in SLM (component-wise field add)
+                for (uint32_t stride = wg >> 1; stride > 0; stride >>= 1) {
+                    if (lid < stride) {
+                        tots[lid*4 + 0] = scalar_field_add(tots[lid*4 + 0],
+                                                          tots[(lid + stride)*4 + 0]);
+                        tots[lid*4 + 1] = scalar_field_add(tots[lid*4 + 1],
+                                                          tots[(lid + stride)*4 + 1]);
+                        tots[lid*4 + 2] = scalar_field_add(tots[lid*4 + 2],
+                                                          tots[(lid + stride)*4 + 2]);
+                        tots[lid*4 + 3] = scalar_field_add(tots[lid*4 + 3],
+                                                          tots[(lid + stride)*4 + 3]);
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+
+                // Thread 0 writes the FpExt result (AoS: 4 u32)
+                if (lid == 0) {
+                    pout[grp*4 + 0] = tots[0];
+                    pout[grp*4 + 1] = tots[1];
+                    pout[grp*4 + 2] = tots[2];
+                    pout[grp*4 + 3] = tots[3];
+                }
+            });
+    });
+    q.wait();
+}
+
+// ============================================================================
 // Validation
 // ============================================================================
 int32_t validate_fri_poly_ops() {
