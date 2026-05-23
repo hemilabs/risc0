@@ -130,9 +130,10 @@ static constexpr uint32_t POSEIDON2_RC_PADDED = 696;       // gate0 padded layou
 static uint32_t* g_d_rc_padded = nullptr;
 static std::optional<sycl::kernel> g_k_hash_fold;
 static std::optional<sycl::kernel> g_k_hash_rows_24;
+static std::optional<sycl::kernel> g_k_hash_rows_generic;  // any col_size, Mont-IO REPLACE sponge
 
 static void ensure_poseidon2_opencl_kernels(sycl::queue& q) {
-    if (g_k_hash_fold && g_k_hash_rows_24 && g_d_rc_padded) return;
+    if (g_k_hash_fold && g_k_hash_rows_24 && g_k_hash_rows_generic && g_d_rc_padded) return;
 
     ensure_poseidon2_host_constants();
 
@@ -187,8 +188,9 @@ static void ensure_poseidon2_opencl_kernels(sycl::queue& q) {
         }
         // Use _mont_io variants: skip to_mont(input)/from_mont(output) since
         // the ESIMD prover pipeline keeps buffers in Mont form throughout.
-        g_k_hash_fold    = exe_kb.ext_oneapi_get_kernel("poseidon2_hash_fold_mont_io");
-        g_k_hash_rows_24 = exe_kb.ext_oneapi_get_kernel("poseidon2_hash_rows_24_mont_io");
+        g_k_hash_fold         = exe_kb.ext_oneapi_get_kernel("poseidon2_hash_fold_mont_io");
+        g_k_hash_rows_24      = exe_kb.ext_oneapi_get_kernel("poseidon2_hash_rows_24_mont_io");
+        g_k_hash_rows_generic = exe_kb.ext_oneapi_get_kernel("poseidon2_hash_rows_mont_io");
     }
 }
 
@@ -403,28 +405,36 @@ extern "C" {
 void esimd_poseidon2_rows(sycl::queue& q,
                            uint32_t* d_out, const uint32_t* d_in,
                            uint32_t count, uint32_t col_size) {
-    // [gate0 OpenCL fast path] Only available for col_size==24 (the FRI-commit
-    // row width). Other col_sizes fall through to the ESIMD path.
-    // Default: ON. Set RISC0_POSEIDON2_OPENCL_OFF=1 to fall back to ESIMD
-    // (e.g., for emergency rollback or bisection).
-    if (col_size == 24 && !std::getenv("RISC0_POSEIDON2_OPENCL_OFF")) {
+    // [gate0 OpenCL fast path]
+    // - col_size == 24: bespoke `poseidon2_hash_rows_24_mont_io` (FRI commit width).
+    // - col_size != 24: generic `poseidon2_hash_rows_mont_io` (loop variant of
+    //   the same REPLACE-style sponge ESIMD uses). Lights up the rv32im
+    //   data/code/accum/check merkle commits and recursion's data merkle
+    //   (col_size=128) — they were previously falling through to the slower
+    //   ESIMD path.
+    // Default: ON. Set RISC0_POSEIDON2_OPENCL_OFF=1 for emergency rollback.
+    // Set RISC0_POSEIDON2_ROWS_GENERIC_OFF=1 to keep only the col_size==24
+    // fast path lit (for bisection of the generic kernel).
+    bool opencl_ok = !std::getenv("RISC0_POSEIDON2_OPENCL_OFF");
+    bool generic_ok = opencl_ok && !std::getenv("RISC0_POSEIDON2_ROWS_GENERIC_OFF");
+    if (opencl_ok && (col_size == 24 || generic_ok)) {
         ensure_poseidon2_opencl_kernels(q);
         const uint32_t r_sq = POSEIDON2_R2_SQ;
-        sycl::kernel k = *g_k_hash_rows_24;
+        sycl::kernel k = (col_size == 24) ? *g_k_hash_rows_24 : *g_k_hash_rows_generic;
         uint32_t* d_dst = d_out;
         const uint32_t* d_src = d_in;
         uint32_t* d_rc_pad = g_d_rc_padded;
         uint32_t* d_diag = g_d_diag;
         uint32_t cnt = count;
-        uint32_t cs_unused = col_size;
+        uint32_t cs = col_size;
         const size_t lws = 1024;
         const size_t gws = ((size_t(count) + lws - 1) / lws) * lws;
         q.submit([&](sycl::handler& cgh) {
             cgh.set_arg(0, d_dst);
             cgh.set_arg(1, d_src);
             cgh.set_arg(2, cnt);
-            cgh.set_arg(3, cs_unused);
-            cgh.set_arg(4, r_sq);
+            cgh.set_arg(3, cs);       // generic kernel actually reads col_size; _24 ignores
+            cgh.set_arg(4, r_sq);     // unused by both _mont_io kernels (kept for ABI)
             cgh.set_arg(5, d_rc_pad);
             cgh.set_arg(6, d_diag);
             cgh.parallel_for(sycl::nd_range<1>(gws, lws), k);

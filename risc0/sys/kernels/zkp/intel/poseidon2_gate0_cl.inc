@@ -1929,4 +1929,106 @@ void poseidon2_hash_rows_24_mont_io(__global uint * restrict dst,
     #pragma unroll
     for (uint c = 0u; c < 8u; ++c) dst[col * 8u + c] = cells[c];
 }
+
+/* ============================================================================
+ * poseidon2_hash_rows_mont_io — generic col_size Mont-form-IO REPLACE-style
+ * sponge. Mirrors the ESIMD `esimd_poseidon2_rows` reference (poseidon2.cpp
+ * lines 446-490): for each 16-element block, REPLACE cells[0..15] with the
+ * inputs (zero-pad if partial), then permute. Last cell capacity carries
+ * across blocks.
+ *
+ * Used by `esimd_poseidon2_rows` for col_size != 24 (the col_size==24 case
+ * still goes through the bespoke `poseidon2_hash_rows_24_mont_io` because
+ * the merge-into-cap variant ESIMD uses for 24 is slightly different from
+ * the REPLACE variant used for larger col_sizes).
+ *
+ * r_sq_unused is kept in the signature for ABI parity with the to_mont
+ * variant; the Mont-IO path takes inputs already in Mont form.
+ * ============================================================================ */
+__attribute__((reqd_work_group_size(1024, 1, 1)))
+__kernel
+void poseidon2_hash_rows_mont_io(__global uint * restrict dst,
+                                  __global const uint * restrict src,
+                                  const uint count,
+                                  const uint col_size,
+                                  const uint r_sq_unused,
+                                  __global const uint * restrict round_cs_mont,
+                                  __global const uint * restrict m_int_diag_mont)
+{
+    const uint col = get_global_id(0);
+    if (col >= count) return;
+
+    uint cells[CELLS];
+    #pragma unroll
+    for (uint i = 0u; i < CELLS; ++i) cells[i] = 0u;
+
+    const uint CELLS_RATE = 16u;
+    uint absorbed = 0u;
+    while (absorbed < col_size) {
+        uint chunk = col_size - absorbed;
+        if (chunk > CELLS_RATE) chunk = CELLS_RATE;
+
+        // REPLACE-style sponge: overwrite the rate cells (matches ESIMD).
+        for (uint j = 0u; j < chunk; ++j) {
+            cells[j] = src[(absorbed + j) * count + col];
+        }
+        // Zero-pad remaining rate cells.
+        for (uint j = chunk; j < CELLS_RATE; ++j) {
+            cells[j] = 0u;
+        }
+        absorbed += chunk;
+
+        // Permute.
+        multiply_by_m_ext(cells);
+        uint rd = 0u;
+        #pragma unroll
+        for (uint r = 0u; r < ROUNDS_HALF_FULL; ++r) {
+            add_rc_sbox_layer_mont(cells, round_cs_mont + rd * CELLS);
+            multiply_by_m_ext(cells);
+            ++rd;
+        }
+        #pragma unroll
+        for (uint r = 0u; r < ROUNDS_PARTIAL; ++r) {
+            cells[0] = bb_add(cells[0], round_cs_mont[rd * CELLS]);
+            cells[0] = bb_sbox_mont(cells[0]);
+            multiply_by_m_int_mont(cells, m_int_diag_mont);
+            ++rd;
+        }
+        #pragma unroll
+        for (uint r = 0u; r < ROUNDS_HALF_FULL; ++r) {
+            add_rc_sbox_layer_mont(cells, round_cs_mont + rd * CELLS);
+            multiply_by_m_ext(cells);
+            ++rd;
+        }
+    }
+
+    // If col_size == 0 (degenerate), do one permutation.
+    if (col_size == 0u) {
+        multiply_by_m_ext(cells);
+        uint rd = 0u;
+        #pragma unroll
+        for (uint r = 0u; r < ROUNDS_HALF_FULL; ++r) {
+            add_rc_sbox_layer_mont(cells, round_cs_mont + rd * CELLS);
+            multiply_by_m_ext(cells);
+            ++rd;
+        }
+        #pragma unroll
+        for (uint r = 0u; r < ROUNDS_PARTIAL; ++r) {
+            cells[0] = bb_add(cells[0], round_cs_mont[rd * CELLS]);
+            cells[0] = bb_sbox_mont(cells[0]);
+            multiply_by_m_int_mont(cells, m_int_diag_mont);
+            ++rd;
+        }
+        #pragma unroll
+        for (uint r = 0u; r < ROUNDS_HALF_FULL; ++r) {
+            add_rc_sbox_layer_mont(cells, round_cs_mont + rd * CELLS);
+            multiply_by_m_ext(cells);
+            ++rd;
+        }
+    }
+
+    // Output first 8 cells (already in Mont form).
+    #pragma unroll
+    for (uint c = 0u; c < 8u; ++c) dst[col * 8u + c] = cells[c];
+}
 )OPENCL";
