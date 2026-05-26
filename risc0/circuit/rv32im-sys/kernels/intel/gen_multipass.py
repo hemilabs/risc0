@@ -180,6 +180,30 @@ def make_poly_fp_pass1(content):
     return f'__attribute__((noinline)) {new_sig} {{\n{new_body}\n}}\n'
 
 
+def extract_hoisted_params(content, fn_name):
+    """Extract CSE-hoisted `_h_data_*` parameter names from a function's
+    declaration (or definition signature). Returns [] if CSE isn't applied.
+    The CSE pass (poly_fp_cse.py) appends `Fp _h_data_<col>_<back>` params
+    to v9 when it hoists shared `args[buf][col*steps+back]` reads into the
+    parent `poly_fp`. These names ARE in scope at the pass2 v9 call site
+    because pass2's preamble carries them through verbatim from poly_fp."""
+    decl_re = re.compile(
+        rf'FpExt\s+{re.escape(fn_name)}\s*\((?P<params>[^)]*)\)\s*[;{{]'
+    )
+    m = decl_re.search(content)
+    if not m:
+        return []
+    params = m.group('params')
+    names = []
+    for piece in params.split(','):
+        piece = piece.strip()
+        # Match `Fp _h_data_<digits>_<digits>` (the CSE pass's name pattern).
+        nm = re.match(r'Fp\s+(_h_data_\d+_\d+)\s*$', piece)
+        if nm:
+            names.append(nm.group(1))
+    return names
+
+
 def make_poly_fp_pass2(content):
     """Create poly_fp_pass2 that reads intermediate and calls rv32im_v2_9."""
     result = find_function(content, 'poly_fp')
@@ -217,9 +241,23 @@ def make_poly_fp_pass2(content):
     # Mapping: arg0=x33, arg1=x1368, arg2=x34, arg3=x708,
     #          arg4=arg23, arg5=arg24, arg6=x699, arg7=arg25, arg8=arg26,
     #          arg9=data(args[1]), arg10=accum(args[0]), arg11=mix(args[3])
+    # CSE-aware v9 call. If poly_fp_cse.py hoisted `_h_data_*` params into
+    # v9's signature, append them to the call (their definitions live in
+    # `preamble`, which is the slice of poly_fp before rv32im_v2_19 — the
+    # CSE pass injects hoisted reads BEFORE that call, so they're in scope
+    # here too).
+    hoisted = extract_hoisted_params(content, 'rv32im_v2_9')
     new_body += "\n    auto _result = rv32im_v2_9(cycle, steps, poly_mix,\n"
     new_body += "        x33, _ext0, x34, _ext1, _ext3, _ext4, _ext2, _ext5, _ext6,\n"
-    new_body += "        /*data=*/args[1], /*accum=*/args[0], /*mix=*/args[3]);\n"
+    if hoisted:
+        new_body += "        /*data=*/args[1], /*accum=*/args[0], /*mix=*/args[3],\n"
+        # 4-per-line for readability
+        for i in range(0, len(hoisted), 4):
+            chunk = hoisted[i:i+4]
+            comma = "," if i + 4 < len(hoisted) else ");"
+            new_body += "        " + ", ".join(chunk) + comma + "\n"
+    else:
+        new_body += "        /*data=*/args[1], /*accum=*/args[0], /*mix=*/args[3]);\n"
     new_body += "    return _result;\n"
 
     return f'__attribute__((noinline)) {new_sig} {{\n{new_body}\n}}\n'
