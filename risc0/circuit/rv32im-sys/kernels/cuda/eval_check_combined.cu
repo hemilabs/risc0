@@ -186,11 +186,6 @@ const char* risc0_circuit_rv32im_cuda_eval_check(Fp* check,
     // eval_check_dep() records an event on this stream and makes the
     // persistent stream wait on it; with that in place, dependent work in the
     // next prove_begin is correctly ordered even when this sync is skipped.
-    static int s_cc_major = -1;
-    if (s_cc_major < 0) {
-      int dev = getCachedDevice();
-      cudaDeviceGetAttribute(&s_cc_major, cudaDevAttrComputeCapabilityMajor, dev);
-    }
     static int s_force_sync = -1;
     static int s_skip_sync = -1;
     if (s_force_sync < 0) {
@@ -203,8 +198,24 @@ const char* risc0_circuit_rv32im_cuda_eval_check(Fp* check,
     } else if (s_skip_sync) {
       needs_sync = false;
     } else {
+#ifdef __HIPCC__
+      // On HIP/ROCm, default to the serialized path. eval_check<->witgen
+      // pipelining was only ever validated safe on pre-Blackwell NVIDIA; on
+      // RDNA3 (gfx1100) it reproduces the same intermittent concurrent-kernel
+      // corruption seen on Blackwell, producing invalid multi-segment proofs.
+      // Also: `cudaDevAttrComputeCapabilityMajor` is CUDA-only and undeclared
+      // for the AMD platform, so the compute-capability gate below cannot be
+      // used here. Override with RISC0_EVAL_CHECK_SKIP_SYNC=1 to experiment.
+      needs_sync = true;
+#else
       // Sync only on Blackwell+ (compute capability major >= 12).
+      static int s_cc_major = -1;
+      if (s_cc_major < 0) {
+        int dev = getCachedDevice();
+        cudaDeviceGetAttribute(&s_cc_major, cudaDevAttrComputeCapabilityMajor, dev);
+      }
       needs_sync = s_cc_major >= 12;
+#endif
     }
     if (needs_sync) {
       CUDA_OK(cudaStreamSynchronize(stream));
