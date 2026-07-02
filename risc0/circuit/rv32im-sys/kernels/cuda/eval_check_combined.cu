@@ -68,7 +68,10 @@ __global__ void eval_check(Fp* check,
                            uint32_t domain) {
   // Enable shared memory spilling: trades STACK for SHARED, improving L1 cache
   // utilization. With CUDA 12.9+: REG:255 STACK:8560 SHARED:16384 (~5% speedup).
+  // PTX-only inline-asm directive; HIP/clang rejects it as "unknown directive".
+#ifndef __HIPCC__
   asm volatile (".pragma \"enable_smem_spilling\";");
+#endif
   uint32_t cycle = blockDim.x * blockIdx.x + threadIdx.x;
   if (cycle < domain) {
     FpExt tot = poly_fp(cycle, domain, ctrl, out, data, mix, accum);
