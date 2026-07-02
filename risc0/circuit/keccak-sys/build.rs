@@ -175,6 +175,16 @@ fn build_rocm_kernels() {
     let mut supra_amalg = String::new();
     for cu in &cu_files {
         let name = cu.file_name().unwrap().to_str().unwrap();
+        // eval_check_combined.cu is a full amalgamation that already #includes
+        // ffi_supra.cu AND eval_check_0..N.cu. Compiling any of those in the same
+        // TU too would double-define their symbols (keccak_*, eval_check,
+        // risc0_circuit_keccak_cuda_eval_check). So emit ONLY eval_check_combined.cu
+        // for the supra group (mirrors the CUDA path, which compiles just it).
+        if (name.starts_with("eval_check") && name != "eval_check_combined.cu")
+            || name == "ffi_supra.cu"
+        {
+            continue;
+        }
         let abs = std::fs::canonicalize(cu).unwrap();
         let line = format!("#include \"{}\"\n", abs.display());
         if name == "ffi_supra.cu" || name.starts_with("eval_check") {

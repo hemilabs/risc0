@@ -158,6 +158,10 @@ struct DeviceCache {
     // keep them resident across kernel launches.
     CUDA_OK(cudaMallocAsync(&d_tableU8, (1 << 8) * sizeof(uint32_t), stream));
     CUDA_OK(cudaMallocAsync(&d_tableU16, (1 << 16) * sizeof(uint32_t), stream));
+#ifndef __HIPCC__
+    // CUDA-only persisting-L2 cache tuning (Ada+). HIP/AMD has no equivalent of
+    // cudaLimitPersistingL2CacheSize / cudaStreamAttributeAccessPolicyWindow, so
+    // skip this pure performance optimization on ROCm.
     {
       static bool s_persisting_set = false;
       if (!s_persisting_set) {
@@ -178,6 +182,7 @@ struct DeviceCache {
       attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
       (void)cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &attr);
     }
+#endif
   }
 
   // Grow-only reallocation for variable-size preflight buffers

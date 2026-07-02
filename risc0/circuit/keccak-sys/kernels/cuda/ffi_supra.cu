@@ -35,8 +35,16 @@ __global__ __launch_bounds__(256, 1) void eval_check(Fp* check,
   uint32_t stride = blockDim.x * gridDim.x;
   for (uint32_t cycle = blockDim.x * blockIdx.x + threadIdx.x; cycle < domain; cycle += stride) {
     FpExt tot = poly_fp(cycle, domain, ctrl, out, data, mix, accum, poly_mix);
+#ifdef __HIPCC__
+    // HIP/clang cmath pow() overloads are ambiguous with bb31_t; use the field's
+    // operator^ (== exponentiation, see supra/fp.h: `pow(b, e) { return b ^ e; }`).
+    // Mirrors the rv32im eval_check_combined.cu HIP path.
+    Fp x = rou ^ (unsigned)cycle;
+    Fp y = (Fp(3) * x) ^ (unsigned)(1 << po2);
+#else
     Fp x = pow(rou, cycle);
     Fp y = pow(Fp(3) * x, 1 << po2);
+#endif
     FpExt ret = tot * inv(y - Fp(1));
     check[domain * 0 + cycle] = ret[0];
     check[domain * 1 + cycle] = ret[1];
