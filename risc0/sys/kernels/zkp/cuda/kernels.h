@@ -37,9 +37,9 @@ __global__ void eltwise_copy_fp_region(Fp* into,
 __global__ void
 eltwise_sum_fpext(Fp* out, const FpExt* in, const uint32_t to_add, const uint32_t count);
 
-__global__ void eltwise_zeroize_fp(Fp* elems);
+__global__ void eltwise_zeroize_fp(Fp* elems, const uint32_t count);
 
-__global__ void eltwise_zeroize_fpext(FpExt* elems);
+__global__ void eltwise_zeroize_fpext(FpExt* elems, const uint32_t count);
 
 __global__ void fri_fold(Fp* out, const Fp* in, const FpExt* mix, const uint32_t count);
 

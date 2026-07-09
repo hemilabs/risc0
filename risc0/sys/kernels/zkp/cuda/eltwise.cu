@@ -69,14 +69,23 @@ eltwise_sum_fpext(Fp* out, const FpExt* in, const uint32_t to_add, const uint32_
   }
 }
 
-__global__ void eltwise_zeroize_fp(Fp* elems) {
+__global__ void eltwise_zeroize_fp(Fp* elems, const uint32_t count) {
   uint idx = blockIdx.x * blockDim.x + threadIdx.x;
-  Fp val = elems[idx];
-  elems[idx] = val.zeroize();
+  // Bounds check (as in every other eltwise kernel): the launch rounds the grid
+  // up to a multiple of the block size, so without this guard threads with
+  // idx >= count read AND write up to blockDim-1 elements PAST the buffer, into
+  // adjacent pool-reused memory — corrupting other buffers (intermittent invalid
+  // multi-segment proofs) and reading uninitialized memory (initcheck flag).
+  if (idx < count) {
+    Fp val = elems[idx];
+    elems[idx] = val.zeroize();
+  }
 }
 
-__global__ void eltwise_zeroize_fpext(FpExt* elems) {
+__global__ void eltwise_zeroize_fpext(FpExt* elems, const uint32_t count) {
   uint idx = blockIdx.x * blockDim.x + threadIdx.x;
-  FpExt val = elems[idx];
-  elems[idx] = val.zeroize();
+  if (idx < count) {
+    FpExt val = elems[idx];
+    elems[idx] = val.zeroize();
+  }
 }
