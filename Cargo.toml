@@ -80,4 +80,7 @@ opt-level = 3
 lto = true
 
 [patch.crates-io]
-sppark = { path = "/home/hotaisle/r0remoteamd/risc0-sppark/rust" }
+# Points at the AMD-enabled sppark fork by immutable rev. Was an absolute path
+# ("/home/hotaisle/r0remoteamd/risc0-sppark/rust"), which only resolved on one
+# developer's machine and made this fork unbuildable standalone for anyone else.
+sppark = { git = "https://github.com/hemilabs/risc0-sppark", rev = "32f2101" }
