@@ -15,7 +15,6 @@
 //! Hardware Abstraction Layer (HAL) for Intel GPU acceleration via SYCL/ESIMD.
 
 use std::{
-    cell::RefCell,
     fmt::Debug,
     marker::PhantomData,
     mem::ManuallyDrop,
@@ -247,13 +246,20 @@ pub type IntelHalPoseidon254 = IntelHal<IntelHashPoseidon254>;
 // ============================================================================
 // Buffer Pool — caches device allocations for reuse (matches CUDA HAL pattern)
 //
-// NOTE: R2-A08 attempt at process-global pool was reverted due to intermittent
-// double-free in glibc tcache during validation runs. Root cause TBD; the
-// thread_local! variant is stable. Future work: instrument the global-pool
-// version to find which CPU-heap allocation was being freed twice.
+// One process-wide pool. Buffers routinely move between threads (each
+// segment's finalize thread takes ownership of that segment's prover buffers),
+// and per-thread pools freed ~7 GB of device memory every time a finalize
+// thread exited, while the main thread was allocating and uploading the next
+// segment's buffers. That cross-thread free/alloc churn coincided with
+// intermittent stale device data (GPU page faults / DEVICE_LOST). With a shared
+// pool, memory is recycled without going back to the driver, and nothing is
+// freed by thread or process exit (a free after DEVICE_LOST never returns).
+// Cross-thread reuse is ordered correctly because all work is submitted to a
+// single in-order queue: a buffer is only popped after its previous owner's
+// last submission.
 // ============================================================================
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::LazyLock};
 
 struct IntelBufferPool {
     cache: HashMap<usize, Vec<IntelDeviceBuffer>>,
@@ -278,18 +284,26 @@ impl IntelBufferPool {
         None
     }
 
-    fn push(&mut self, size: usize, buf: IntelDeviceBuffer) {
+    /// Returns the buffer back if the pool is full, so the caller frees it
+    /// outside the pool lock.
+    fn push(&mut self, size: usize, buf: IntelDeviceBuffer) -> Option<IntelDeviceBuffer> {
         if size < POOL_SMALL_THRESHOLD || self.total_cached + size <= POOL_MAX_BYTES {
             self.total_cached += size;
             self.cache.entry(size).or_default().push(buf);
+            None
+        } else {
+            Some(buf)
         }
-        // else: drop the buffer (exceeds cap)
+    }
+
+    fn take_all(&mut self) -> HashMap<usize, Vec<IntelDeviceBuffer>> {
+        self.total_cached = 0;
+        std::mem::take(&mut self.cache)
     }
 }
 
-thread_local! {
-    static BUFFER_POOL: RefCell<IntelBufferPool> = RefCell::new(IntelBufferPool::new());
-}
+static BUFFER_POOL: LazyLock<Mutex<IntelBufferPool>> =
+    LazyLock::new(|| Mutex::new(IntelBufferPool::new()));
 
 // ============================================================================
 // RawBuffer - RAII device allocation with tracking + pool
@@ -304,11 +318,16 @@ impl RawBuffer {
     pub fn new(name: &'static str, size: usize) -> Self {
         tracing::trace!("alloc: {size} bytes, {name}");
         tracker().lock().unwrap().alloc(size);
-        let buf = BUFFER_POOL.with(|pool| pool.borrow_mut().pop(size))
-            .unwrap_or_else(|| {
-                IntelDeviceBuffer::uninitialized(size)
-                    .unwrap_or_else(|e| panic!("Intel GPU allocation failed on {name}: {size} bytes: {e}"))
-            });
+        let pooled = BUFFER_POOL.lock().pop(size);
+        let buf = pooled.unwrap_or_else(|| {
+            IntelDeviceBuffer::uninitialized(size).unwrap_or_else(|_| {
+                // Cached buffers of other sizes may be holding the VRAM.
+                drop(BUFFER_POOL.lock().take_all());
+                IntelDeviceBuffer::uninitialized(size).unwrap_or_else(|e| {
+                    panic!("Intel GPU allocation failed on {name}: {size} bytes: {e}")
+                })
+            })
+        });
         Self {
             name,
             buf: ManuallyDrop::new(buf),
@@ -321,9 +340,9 @@ impl Drop for RawBuffer {
         let size = self.buf.len();
         tracing::trace!("free: {size} bytes, {}", self.name);
         tracker().lock().unwrap().free(size);
-        // Return buffer to pool instead of freeing
         let buf = unsafe { ManuallyDrop::take(&mut self.buf) };
-        BUFFER_POOL.with(|pool| pool.borrow_mut().push(size, buf));
+        let overflow = BUFFER_POOL.lock().push(size, buf);
+        drop(overflow);
     }
 }
 
@@ -1248,5 +1267,38 @@ mod tests {
     #[test]
     fn mix_poly_coeffs() {
         testutil::mix_poly_coeffs(IntelHalSha256::new());
+    }
+
+    // Callers free or reuse host buffers as soon as an upload returns (scatter
+    // injectors, view_mut write-back, set_32). The upload must not read host
+    // memory after returning, even when the in-order queue is backed up.
+    #[test]
+    fn upload_survives_immediate_host_reuse() {
+        use crate::{
+            field::{baby_bear::BabyBearElem as Elem, Elem as _},
+            hal::{Buffer as _, Hal as _},
+        };
+
+        let hal = IntelHalSha256::new();
+        const BUSY_PO2: usize = 22;
+        const BUSY_POLYS: usize = 16;
+        let busy = hal.alloc_elem_init("busy", BUSY_POLYS << BUSY_PO2, Elem::ONE);
+
+        const N: usize = 1 << 22;
+        let expected: Vec<Elem> = (0..N as u32).map(Elem::new).collect();
+        for round in 0..4 {
+            // ~160 ms of queued GPU work so the upload cannot execute before
+            // the host buffer is overwritten.
+            for _ in 0..32 {
+                hal.batch_interpolate_ntt(&busy, BUSY_POLYS);
+            }
+            let mut host = expected.clone();
+            let dev = hal.copy_from_elem("upload", &host);
+            host.fill(Elem::new(0xdead));
+            drop(host);
+            let back = dev.to_vec();
+            let bad = back.iter().zip(&expected).filter(|(a, b)| a != b).count();
+            assert_eq!(bad, 0, "round {round}: {bad}/{N} uploaded elements read after host reuse");
+        }
     }
 }

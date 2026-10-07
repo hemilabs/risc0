@@ -29,10 +29,6 @@ extern "C" {
     pub fn esimd_destroy_queue(queue: *mut c_void);
     pub fn esimd_sync(queue: *mut c_void);
 
-    // GPU-side cross-queue barrier (SYCL ext_oneapi_submit_barrier).
-    // Makes dst_queue wait for all prior work on src_queue WITHOUT blocking the CPU.
-    pub fn esimd_cross_queue_barrier(src_queue: *mut c_void, dst_queue: *mut c_void);
-
     // Device memory management
     pub fn esimd_malloc_device(queue: *mut c_void, bytes: usize) -> *mut c_void;
     pub fn esimd_free_device(queue: *mut c_void, ptr: *mut c_void);
@@ -92,86 +88,35 @@ extern "C" {
 
 static INIT: Once = Once::new();
 static mut QUEUE: *mut c_void = std::ptr::null_mut();
-static mut EVAL_CHECK_QUEUE: *mut c_void = std::ptr::null_mut();
 
-// Per-thread queue override. When set (via [`with_queue_override`]) all
-// `get_queue()` calls on this thread return the override instead of the
-// main queue. Used by the background finalize thread to route its GPU
-// submissions onto the eval_check queue, so they run concurrently with
-// the main thread's witgen instead of serializing behind it.
-//
-// Pointer-as-usize because *mut c_void isn't Send (we need TLS, not shared,
-// but Cell wants Copy and *mut c_void is Copy — actually we use AtomicUsize
-// for thread-local Cell-like semantics). Simpler: thread_local Cell<usize>.
-std::thread_local! {
-    static QUEUE_OVERRIDE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
+// All GPU work goes through this one in-order queue. With a second
+// concurrently executing queue (formerly used to overlap eval_check/finalize
+// with the next segment's witgen), device data was intermittently corrupted on
+// Arc Pro B70 (xe + NEO 26.09), surfacing as GPU page faults
+// (UR_RESULT_ERROR_DEVICE_LOST; faulting writes consistent with the injector
+// scatter reading stale indices) or as invalid proofs. The single queue, plus
+// the process-wide buffer pool in risc0-zkp's Intel HAL (which depends on it
+// for cross-thread reuse ordering), removed the failure at no measured
+// throughput cost.
 
-/// Run `f` with `get_queue()` redirected to `queue` on this thread. Restores
-/// the previous override on exit (RAII via finally-style closure).
-pub fn with_queue_override<R>(queue: *mut c_void, f: impl FnOnce() -> R) -> R {
-    let prev = QUEUE_OVERRIDE.with(|c| {
-        let p = c.get();
-        c.set(queue as usize);
-        p
-    });
-    // Restore on panic: use a guard struct
-    struct Guard { prev: usize }
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            QUEUE_OVERRIDE.with(|c| c.set(self.prev));
-        }
-    }
-    let _g = Guard { prev };
-    f()
-}
-
-/// Get the singleton SYCL queue (main), creating it on first call.
+/// Get the singleton SYCL queue, creating it on first call.
 /// Panics if no Intel GPU is found.
 pub fn get_queue() -> *mut c_void {
-    let override_q = QUEUE_OVERRIDE.with(|c| c.get());
-    if override_q != 0 {
-        return override_q as *mut c_void;
-    }
     unsafe {
         INIT.call_once(|| {
             QUEUE = esimd_create_queue();
             if QUEUE.is_null() {
                 panic!("Intel GPU: esimd_create_queue() returned null -- no Intel GPU found");
             }
-            EVAL_CHECK_QUEUE = esimd_create_queue();
-            if EVAL_CHECK_QUEUE.is_null() {
-                panic!("Intel GPU: esimd_create_queue() returned null for eval_check queue");
-            }
         });
         QUEUE
     }
 }
 
-/// Get the eval_check SYCL queue (separate from main queue for pipelining).
-pub fn get_eval_check_queue() -> *mut c_void {
-    // Ensure queues are initialized
-    let _ = get_queue();
-    unsafe { EVAL_CHECK_QUEUE }
-}
-
 /// Synchronize the SYCL queue (wait for all submitted work to complete).
-/// WARNING: This blocks the CPU. Prefer GPU-side barriers for pipelining.
+/// WARNING: This blocks the CPU.
 pub fn sync() {
     unsafe { esimd_sync(get_queue()) };
-}
-
-/// GPU-side barrier: eval_check queue waits for main queue's prior work.
-/// Does NOT block the CPU — the dependency is resolved entirely on the GPU.
-/// This is the SYCL equivalent of CUDA's cudaStreamWaitEvent.
-pub fn main_to_eval_barrier() {
-    unsafe { esimd_cross_queue_barrier(get_queue(), get_eval_check_queue()) };
-}
-
-/// GPU-side barrier: main queue waits for eval_check queue to complete.
-/// Does NOT block the CPU.
-pub fn eval_to_main_barrier() {
-    unsafe { esimd_cross_queue_barrier(get_eval_check_queue(), get_queue()) };
 }
 
 // ============================================================================

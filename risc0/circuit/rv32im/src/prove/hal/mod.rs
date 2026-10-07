@@ -422,34 +422,14 @@ where
         deferred.keep_alive_buf(mix.buf);
         deferred.keep_alive_buf(global_clone);
 
-        // Spawn the finalize completion on a background thread. The thread
-        // runs check_intt/check_commit GPU kernels and the CPU work
-        // (poly_interpolate, combos_divide, fri proving) in parallel with
-        // the NEXT iteration's main phase on this thread. Join happens at
-        // the start of the next prove_begin.
-        //
-        // For the Intel HAL, redirect this thread's get_queue() to the
-        // eval_check queue (a separate SYCL queue) so finalize GPU ops run
-        // concurrently with the main thread's witgen instead of serializing
-        // behind it on the shared main queue. eval_check_queue is otherwise
-        // idle at this point: the eval_check kernel for THIS segment hasn't
-        // been launched yet (start_finalize for THIS seg already queued it
-        // moments ago, but bg-thread finalize is for the PREVIOUS seg whose
-        // eval_check finished long ago).
+        // Spawn the finalize completion on a background thread. Its CPU work
+        // (poly_interpolate, combos_divide, fri proving) overlaps the NEXT
+        // iteration's main phase on this thread; its GPU work shares the single
+        // in-order queue. Join happens at the start of the next prove_begin.
         let hal_for_thread = Arc::clone(&hal);
         let circuit_hal_for_thread = Arc::clone(&circuit_hal);
         let handle = std::thread::spawn(move || -> Seal {
-            #[cfg(feature = "intel")]
-            {
-                let q = risc0_sys::intel::get_eval_check_queue();
-                risc0_sys::intel::with_queue_override(q, || {
-                    deferred.complete(hal_for_thread.as_ref(), circuit_hal_for_thread.as_ref())
-                })
-            }
-            #[cfg(not(feature = "intel"))]
-            {
-                deferred.complete(hal_for_thread.as_ref(), circuit_hal_for_thread.as_ref())
-            }
+            deferred.complete(hal_for_thread.as_ref(), circuit_hal_for_thread.as_ref())
         });
         *self.pending_finalize.borrow_mut() = Some(handle);
 

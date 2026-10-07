@@ -83,7 +83,7 @@ static const char* make_error(const char* msg) {
 
 extern "C" {
 
-// Shared device and context for all queues — required for cross-queue event dependencies.
+// Shared device and context for all queues.
 static sycl::device* g_shared_device = nullptr;
 static sycl::context* g_shared_context = nullptr;
 
@@ -102,7 +102,6 @@ void* esimd_create_queue() {
             }
             if (!g_shared_device) return nullptr;
         }
-        // All queues share the same context — enables cross-queue event barriers.
         auto* q = new sycl::queue(*g_shared_context, *g_shared_device, sycl::property_list{
             sycl::property::queue::in_order{}});
         return static_cast<void*>(q);
@@ -122,19 +121,6 @@ void esimd_destroy_queue(void* queue) {
 void esimd_sync(void* queue) {
     auto* q = static_cast<sycl::queue*>(queue);
     q->wait();
-}
-
-// GPU-side cross-queue barrier: make dst_queue wait for all prior work on src_queue.
-// Unlike esimd_sync, this does NOT block the CPU — it only inserts a GPU-side dependency.
-// This is the SYCL equivalent of CUDA's cudaStreamWaitEvent.
-void esimd_cross_queue_barrier(void* src_queue, void* dst_queue) {
-    auto* src = static_cast<sycl::queue*>(src_queue);
-    auto* dst = static_cast<sycl::queue*>(dst_queue);
-    // Submit a barrier on the source queue — returns an event representing
-    // completion of all previously submitted work on src.
-    sycl::event src_done = src->ext_oneapi_submit_barrier();
-    // Make dst wait for that event — GPU-side only, CPU returns immediately.
-    dst->ext_oneapi_submit_barrier({src_done});
 }
 
 void* esimd_malloc_device(void* queue, size_t bytes) {

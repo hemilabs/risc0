@@ -18,7 +18,6 @@ use anyhow::Result;
 use parking_lot::Mutex;
 // CPU accum FFI used as fallback while GPU accum is being debugged
 use risc0_core::scope;
-use risc0_sys::ffi_wrap;
 use risc0_zkp::{
     core::log2_ceil,
     field::{map_pow, RootsOfUnity as _},
@@ -69,9 +68,21 @@ fn phase_disabled(phase: &str) -> bool {
         .unwrap_or(false)
 }
 
+// The Intel witgen/accum FFI returns a pointer into a thread_local std::string
+// it owns. `ffi_wrap` would free() it, and the thread_local destructor frees it
+// again at thread exit (glibc "double free detected in tcache"), so copy only.
+fn borrowed_err_wrap(inner: impl FnOnce() -> *const std::os::raw::c_char) -> Result<()> {
+    let c_ptr = inner();
+    if c_ptr.is_null() {
+        return Ok(());
+    }
+    let msg = unsafe { std::ffi::CStr::from_ptr(c_ptr) }.to_string_lossy().into_owned();
+    Err(anyhow::anyhow!(msg))
+}
+
 pub struct IntelCircuitHal<IH: IntelHash> {
     _hal: Arc<IntelHal<IH>>,
-    // Keep buffers alive while eval_check runs asynchronously on separate queue.
+    // Keep eval_check inputs alive until eval_check_dep().
     // Arc+Mutex (instead of Rc+RefCell) so IntelCircuitHal is Send — required
     // for the finalize-overlap path that moves DeferredFinalize into the
     // receipt background thread.
@@ -105,7 +116,7 @@ impl<IH: IntelHash> CircuitWitnessGenerator<IntelHal<IH>> for IntelCircuitHal<IH
         tracing::debug!("witgen: {cycles} cycles (GPU)");
 
         let queue = risc0_sys::intel::get_queue();
-        ffi_wrap(|| unsafe {
+        borrowed_err_wrap(|| unsafe {
             risc0_circuit_rv32im_sys::risc0_circuit_rv32im_intel_witgen(
                 queue,
                 mode as u32,
@@ -145,7 +156,7 @@ impl<IH: IntelHash> CircuitAccumulator<IntelHal<IH>> for IntelCircuitHal<IH> {
         // GPU accum compiled at -Os (testing if different opts avoid icpx -O1 miscompilation)
         tracing::debug!("accumulate: {cycles} cycles (GPU, -Os)");
         let queue = risc0_sys::intel::get_queue();
-        ffi_wrap(|| unsafe {
+        borrowed_err_wrap(|| unsafe {
             risc0_circuit_rv32im_sys::risc0_circuit_rv32im_intel_accum(
                 queue,
                 data.buf.as_device_ptr().0 as *mut std::ffi::c_void,
@@ -183,8 +194,8 @@ impl<IH: IntelHash> CircuitHal<IntelHal<IH>> for IntelCircuitHal<IH> {
         let domain = steps * INV_RATE;
         let poly_mix_pows = map_pow(poly_mix, POLY_MIX_POWERS);
 
-        // Upload poly_mix_pows to GPU. Store in struct to keep alive while
-        // eval_check runs asynchronously on separate queue.
+        // Upload poly_mix_pows to GPU. Stored in the struct to keep it alive
+        // until eval_check_dep().
         let poly_mix_buf: IntelBuffer<u32> = IntelBuffer::copy_from(
             "poly_mix",
             unsafe {
@@ -198,12 +209,7 @@ impl<IH: IntelHash> CircuitHal<IntelHal<IH>> for IntelCircuitHal<IH> {
         let rou = Val::ROU_FWD[po2 + EXP_PO2];
         let rou_raw: u32 = unsafe { std::mem::transmute(rou) };
 
-        // GPU-side barrier: eval_check queue waits for all prior main-queue work
-        // (poly_mix upload, commits, NTTs) before reading those buffers.
-        // Uses SYCL ext_oneapi_submit_barrier — does NOT block the CPU.
-        risc0_sys::intel::main_to_eval_barrier();
-
-        let eval_queue = risc0_sys::intel::get_eval_check_queue();
+        let queue = risc0_sys::intel::get_queue();
 
         // Phase 0b: respect RISC0_PHASE_DISABLE for failure-bisection. When
         // `multipass` is listed there, fall back to the monolithic kernel
@@ -226,7 +232,7 @@ impl<IH: IntelHash> CircuitHal<IntelHal<IH>> for IntelCircuitHal<IH> {
             // Pass 1: upper chain → writes intermediate
             risc0_sys::intel::esimd_check(unsafe {
                 risc0_circuit_rv32im_sys::risc0_circuit_rv32im_intel_eval_check_pass1(
-                    eval_queue,
+                    queue,
                     inter_fp.as_device_ptr().0 as *mut std::ffi::c_void,
                     inter_ext.as_device_ptr().0 as *mut std::ffi::c_void,
                     groups[REGISTER_GROUP_DATA].as_device_ptr().0 as *const std::ffi::c_void,
@@ -241,7 +247,7 @@ impl<IH: IntelHash> CircuitHal<IntelHal<IH>> for IntelCircuitHal<IH> {
             if verbose {
                 // Sync to measure pass1 time
                 risc0_sys::intel::esimd_check(unsafe {
-                    risc0_circuit_rv32im_sys::risc0_circuit_rv32im_intel_eval_check_sync(eval_queue)
+                    risc0_circuit_rv32im_sys::risc0_circuit_rv32im_intel_eval_check_sync(queue)
                 });
                 let t1 = std::time::Instant::now();
                 eprintln!("      [eval_check_pass1] {:.1}ms",
@@ -253,7 +259,7 @@ impl<IH: IntelHash> CircuitHal<IntelHal<IH>> for IntelCircuitHal<IH> {
             // Pass 2: reads intermediate → writes check buffer
             risc0_sys::intel::esimd_check(unsafe {
                 risc0_circuit_rv32im_sys::risc0_circuit_rv32im_intel_eval_check_pass2(
-                    eval_queue,
+                    queue,
                     check.as_device_ptr().0 as *mut std::ffi::c_void,
                     inter_fp.as_device_ptr().0 as *const std::ffi::c_void,
                     inter_ext.as_device_ptr().0 as *const std::ffi::c_void,
@@ -270,7 +276,7 @@ impl<IH: IntelHash> CircuitHal<IntelHal<IH>> for IntelCircuitHal<IH> {
 
             if verbose {
                 risc0_sys::intel::esimd_check(unsafe {
-                    risc0_circuit_rv32im_sys::risc0_circuit_rv32im_intel_eval_check_sync(eval_queue)
+                    risc0_circuit_rv32im_sys::risc0_circuit_rv32im_intel_eval_check_sync(queue)
                 });
                 let t2 = std::time::Instant::now();
                 eprintln!("      [eval_check_pass2] {:.1}ms",
@@ -284,7 +290,7 @@ impl<IH: IntelHash> CircuitHal<IntelHal<IH>> for IntelCircuitHal<IH> {
             // Monolithic: single kernel call
             risc0_sys::intel::esimd_check(unsafe {
                 risc0_circuit_rv32im_sys::risc0_circuit_rv32im_intel_eval_check(
-                    eval_queue,
+                    queue,
                     check.as_device_ptr().0 as *mut std::ffi::c_void,
                     groups[REGISTER_GROUP_DATA].as_device_ptr().0 as *const std::ffi::c_void,
                     groups[REGISTER_GROUP_ACCUM].as_device_ptr().0 as *const std::ffi::c_void,
@@ -303,11 +309,8 @@ impl<IH: IntelHash> CircuitHal<IntelHal<IH>> for IntelCircuitHal<IH> {
     }
 
     fn eval_check_dep(&self) {
-        // GPU-side barrier: main queue waits for eval_check queue to finish
-        // before proceeding with operations that read the check buffer.
-        // Does NOT block the CPU — allows overlap with host-side work.
-        risc0_sys::intel::eval_to_main_barrier();
-        // Release all eval_check buffers now that the GPU dependency is set
+        // eval_check ran on the single in-order queue, so any later reuse of
+        // these buffers is ordered after it; they can go back to the pool now.
         *self.eval_check_poly_mix.lock() = None;
         *self.eval_check_inter_fp.lock() = None;
         *self.eval_check_inter_ext.lock() = None;
@@ -585,14 +588,9 @@ mod tests {
 
     /// Run eval_check against an arbitrary HAL pair, return the check buffer.
     ///
-    /// IMPORTANT: `eval_check_dep()` MUST be called between submission
-    /// (which targets a separate `eval_queue` on the Intel HAL) and
-    /// `view()` (which waits only on the main queue). Without the
-    /// cross-queue barrier, `view()` would return while the kernel is
-    /// still in flight, reading uninitialized buffer memory — the
-    /// production prover sequences these the same way for the same
-    /// reason. The CPU HAL's `eval_check_dep` is a default-impl no-op,
-    /// so this call is also safe for the CPU reference.
+    /// `eval_check_dep()` is called between submission and `view()` to
+    /// mirror the production prover's sequencing. The CPU HAL's
+    /// `eval_check_dep` is a default-impl no-op.
     fn eval_check_impl<H, C>(params: &EvalCheckParams, hal: &H, circuit_hal: &C) -> Vec<H::Elem>
     where
         H: Hal<Elem = Val, ExtElem = ExtVal>,
