@@ -914,7 +914,10 @@ impl ProverServer for ProverImpl {
             use risc0_groth16::prove::shrink_wrap;
             let t0 = std::time::Instant::now();
             let seal_bytes = ident_receipt.get_seal_bytes();
+            // See `release_hal_buffers`: the wrap cannot reclaim what the STARK HAL is caching.
+            super::release_hal_buffers();
             let seal = shrink_wrap(&seal_bytes)?.to_vec();
+            super::release_hal_buffers();
             let wrap_ms = t0.elapsed().as_secs_f64() * 1000.0;
             eprintln!(
                 "[succinct_to_groth16] identity_p254=pre-computed shrink_wrap={wrap_ms:.1}ms \

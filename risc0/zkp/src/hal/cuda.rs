@@ -130,6 +130,32 @@ fn trim_cuda_mempool() {
     }
 }
 
+/// Release every device buffer this thread's `BUFFER_POOL` is caching, and trim the CUDA
+/// stream-ordered mempool back to the driver. The CUDA counterpart of `hal::hip::clear_buffer_pool`.
+///
+/// The pool keeps freed buffers for reuse and is capped at `BUFFER_POOL_MAX_BYTES` (16 GB), which on
+/// a 16 GB card bounds nothing: after a STARK proof it can be holding most of the device. Allocations
+/// made through this HAL recover from that on failure (the drain-and-retry in `RawBuffer::new`), but
+/// code that allocates on its own has no such fallback. The Groth16 prover is that code — it uploads
+/// its SRS and allocates MSM scratch through sppark's `cudaMallocAsync` — so on an RTX 5080 (16.3 GB)
+/// a 46M-cycle proof finished its whole STARK, left ~10.5 GB cached here, and then failed in the wrap.
+/// Call this when the HAL's work is done and someone else's is about to begin.
+///
+/// Thread-local, like the pool: it releases only what the CALLING thread cached.
+pub fn clear_buffer_pool() {
+    let released = BUFFER_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        let cached = pool.total_cached;
+        pool.drain();
+        cached
+    });
+    trim_cuda_mempool();
+    tracing::info!(
+        "clear_buffer_pool: released {:.2} GiB of cached device buffers and trimmed the CUDA mempool",
+        released as f64 / (1u64 << 30) as f64
+    );
+}
+
 // The GPU becomes unstable as the number of concurrent provers grow.
 pub fn singleton() -> &'static ReentrantMutex<()> {
     static ONCE: OnceLock<ReentrantMutex<()>> = OnceLock::new();

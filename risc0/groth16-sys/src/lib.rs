@@ -76,6 +76,13 @@ pub fn preload(setup_params: &SetupParams) -> anyhow::Result<()> {
     ffi_wrap(|| unsafe { risc0_groth16_cuda_preload(&setup_params) })
 }
 
+/// Free the Groth16 prover and SRS cached on the current device, returning their GPU memory. The next
+/// `prove` rebuilds them. See `risc0_groth16_cuda_release`.
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+pub fn release() -> anyhow::Result<()> {
+    ffi_wrap(|| unsafe { risc0_groth16_cuda_release() })
+}
+
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 pub fn prove(prover_params: &ProverParams, setup_params: &SetupParams) -> anyhow::Result<()> {
     let setup_params = RawSetupParams {
@@ -129,6 +136,9 @@ extern "C" {
     fn risc0_groth16_cuda_preload(
         setup: *const RawSetupParams,
     ) -> *const c_char;
+
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    fn risc0_groth16_cuda_release() -> *const c_char;
 
     #[cfg(all(any(feature = "cuda", feature = "rocm"), feature = "setup"))]
     fn risc0_groth16_cuda_setup(params: *const RawSetupParams) -> *const c_char;

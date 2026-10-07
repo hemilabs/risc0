@@ -94,6 +94,12 @@ pub(crate) fn preload_srs() -> Result<()> {
     Ok(())
 }
 
+/// Drop the prover and SRS that `preload_srs` and `shrink_wrap` cached on the GPU. See
+/// `prove::release_srs`.
+pub(crate) fn release_srs() -> Result<()> {
+    risc0_groth16_sys::release().context("failed to release the cached groth16 SRS")
+}
+
 pub(crate) fn shrink_wrap(seal_bytes: &[u8]) -> Result<Seal> {
     tracing::info!("shrink_wrap: {} seal bytes", seal_bytes.len());
 

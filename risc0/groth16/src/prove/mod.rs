@@ -58,6 +58,27 @@ pub fn preload_srs() -> Result<()> {
     }
 }
 
+/// Free the Groth16 prover and SRS that `shrink_wrap` caches on the GPU, returning that memory to
+/// the device. The next `shrink_wrap` rebuilds them; measured, that adds at most ~0.1 s per proof
+/// (2.08-2.12 s wraps on an RTX 5080 releasing every time, against 2.01-2.05 s on an RTX 4090 keeping
+/// the cache).
+///
+/// The cache otherwise lives as long as the process, so every later STARK proof on that device has to
+/// fit beside it. On a card without the room — measured on a 16 GB RTX 5080, a 46M-cycle STARK at po2
+/// 20 peaked at 15.8 of 16.3 GB with the cache resident — call this after each proof. On a card with
+/// room, keeping the cache is faster. Deciding which is the caller's business, since only the caller
+/// knows what it will prove next.
+pub fn release_srs() -> Result<()> {
+    cfg_if::cfg_if! {
+        if #[cfg(feature = "cuda")] {
+            self::cuda::release_srs()
+        } else {
+            // ROCm caches through hip.rs's own path, untested here; docker mode holds nothing.
+            Ok(())
+        }
+    }
+}
+
 /// Produce a Groth16 proof from an `identity_p254` seal.
 pub fn shrink_wrap(identity_p254_seal_bytes: &[u8]) -> Result<Seal> {
     cfg_if::cfg_if! {

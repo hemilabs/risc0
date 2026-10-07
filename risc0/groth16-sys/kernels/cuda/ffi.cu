@@ -217,6 +217,35 @@ extern "C" const char* risc0_groth16_cuda_prove(SetupParams* setup_params,
   return nullptr;
 }
 
+// Free this device's cached prover and SRS, returning their GPU memory. The next prove call rebuilds
+// them. Measured on 2026-10-07 that adds at most ~0.1 s: an RTX 5080 releasing after every proof wrapped
+// in 2.08-2.12 s, an RTX 4090 keeping its cache in 2.01-2.05 s. (Either card's FIRST wrap in a process is
+// ~0.9 s slower, mostly the first read of the 3.45 GB proving key; that is paid once either way.)
+//
+// Nothing else ever frees the cache, so without this it occupies the card for the life of the process. On a 16 GB card the next STARK proof has to fit beside it: measured on an
+// RTX 5080, a 46M-cycle proof at po2 20 peaked at 15.8 of 16.3 GB with the cache resident, and failed
+// outright in a different program order. Callers without that room call this after each proof.
+extern "C" const char* risc0_groth16_cuda_release() {
+  try {
+    int dev = current_device();
+    std::lock_guard<std::mutex> lock(cached_mutex);
+    // The prover first: it was constructed from a reference to the SRS.
+    delete cached_prover[dev];
+    cached_prover[dev] = nullptr;
+    delete cached_srs[dev];
+    cached_srs[dev] = nullptr;
+    // gpu_ptr_t may free with cudaFreeAsync, so wait for those frees to reach the pool before
+    // handing the pool's reservation back to the driver.
+    cudaDeviceSynchronize();
+    cudaMemPool_t pool;
+    if (cudaDeviceGetDefaultMemPool(&pool, dev) == cudaSuccess)
+      cudaMemPoolTrimTo(pool, 0);
+  } catch (const std::exception& err) {
+    return strdup(err.what());
+  }
+  return nullptr;
+}
+
 #ifdef SRS_READ_COEFFS
 
 extern "C" const char* risc0_groth16_cuda_setup(SetupParams* params) {

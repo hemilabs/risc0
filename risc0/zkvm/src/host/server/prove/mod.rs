@@ -208,8 +208,11 @@ pub trait ProverServer: private::Sealed {
         let seal_bytes = ident_receipt.get_seal_bytes();
         let seal_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
+        // Hand the GPU to the Groth16 prover, then take it back. See `release_hal_buffers`.
+        release_hal_buffers();
         let t2 = std::time::Instant::now();
         let seal = shrink_wrap(&seal_bytes)?.to_vec();
+        release_hal_buffers();
         let wrap_ms = t2.elapsed().as_secs_f64() * 1000.0;
 
         eprintln!(
@@ -450,4 +453,18 @@ pub fn get_prover_server(opts: &ProverOpts) -> Result<Rc<dyn ProverServer>> {
     }
 
     Ok(Rc::new(ProverImpl::new(opts.clone())))
+}
+
+/// Return the STARK HAL's cached device memory to the driver, around the Groth16 wrap.
+///
+/// The wrap allocates through sppark rather than through the HAL, so it cannot reclaim what the HAL
+/// is caching and fails instead; see `risc0_zkp::hal::cuda::clear_buffer_pool`. Called BEFORE the wrap
+/// so it fits beside what the STARK left behind, and AFTER it so the next proof's STARK is not
+/// competing with the wrap's freed scratch.
+///
+/// Not called on ROCm, whose HAL has the same pool and its own `clear_buffer_pool`: that path was not
+/// tested when this was added.
+pub(crate) fn release_hal_buffers() {
+    #[cfg(feature = "cuda")]
+    risc0_zkp::hal::cuda::clear_buffer_pool();
 }
