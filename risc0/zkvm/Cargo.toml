@@ -45,6 +45,14 @@ required-features = ["prove"]
 name = "sha256_bench"
 required-features = ["prove"]
 
+[[example]]
+name = "prove_busy"
+required-features = ["prove"]
+
+[[example]]
+name = "prove_e2e"
+required-features = ["prove"]
+
 [dependencies]
 anyhow = { version = "1.0", default-features = false }
 borsh = { version = "1.5", default-features = false, features = ["derive"] }

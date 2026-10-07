@@ -1139,6 +1139,16 @@ fn build_intel_kernels() {
     // and stamp inputs reflect the new variant.
     println!("cargo:rerun-if-env-changed=RISC0_INTEL_GRF_MODE");
     println!("cargo:rerun-if-env-changed=RISC0_INTEL_SIMD_WIDTH");
+    // Same env vars that build_rocm_kernels declares; mirrored here so Intel
+    // builds also invalidate the stamp when any of them flip. Without this,
+    // toggling RISC0_LSC_HINTS / RISC0_POLY_FP_CSE* / RISC0_TREE_REDUCE /
+    // RISC0_IGC_EXTRA_OPTS silently reuses the stale .so cache.
+    println!("cargo:rerun-if-env-changed=RISC0_IGC_EXTRA_OPTS");
+    println!("cargo:rerun-if-env-changed=RISC0_TREE_REDUCE");
+    println!("cargo:rerun-if-env-changed=RISC0_POLY_FP_CSE");
+    println!("cargo:rerun-if-env-changed=RISC0_POLY_FP_CSE_TOP");
+    println!("cargo:rerun-if-env-changed=RISC0_POLY_FP_CSE_MIN_SHARE");
+    println!("cargo:rerun-if-env-changed=RISC0_LSC_HINTS");
     std::fs::create_dir_all(&cache_dir).unwrap();
 
     // Compute SHA-256 hashes of the inputs to each of the three icpx

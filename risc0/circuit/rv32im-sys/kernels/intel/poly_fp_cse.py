@@ -57,6 +57,16 @@ READ_RE_ARGS = re.compile(
     r'args\[(\d+)\]\[(\d+) \* steps \+ \(\(cycle - kInvRate \* (\d+)\) & mask\)\]'
 )
 
+# Lookbehind guards used by apply_lsc_hints() so a second pass over an
+# already-wrapped file is a no-op. Python's re module doesn't support
+# variable-width lookbehind, so these are fixed-width "&" negative lookbehinds.
+LSC_WRAPPED_READ_RE = re.compile(
+    r'(?<!&)arg(\d+)\[(\d+) \* steps \+ \(\(cycle - kInvRate \* (\d+)\) & mask\)\]'
+)
+LSC_WRAPPED_READ_RE_ARGS = re.compile(
+    r'(?<!&)args\[(\d+)\]\[(\d+) \* steps \+ \(\(cycle - kInvRate \* (\d+)\) & mask\)\]'
+)
+
 # Signature header for a sub-function definition (not declaration)
 DEF_RE = re.compile(
     r'^FpExt rv32im_v2_(\d+)\((.*)\)\s*\{?\s*$'
@@ -540,7 +550,10 @@ def transform(in_dir, out_dir, top_n=16, min_share=10):
 def apply_lsc_hints(out_dir):
     """Tier B4: wrap all remaining argK[...] / args[K][...] reads in the
     rust_poly_fp_*.cpp output files with ::risc0::lsc::cached_load(&...).
-    Idempotent — relies on the regex not matching the wrapped form."""
+
+    Idempotent: uses regexes with a `(?<!&)` negative lookbehind so a read
+    that's already preceded by `&` (the wrap we emit) is skipped. Running
+    this a second time over the same files is a no-op."""
     def wrap(m):
         return f'::risc0::lsc::cached_load(&{m.group(0)})'
     total = 0
@@ -550,8 +563,8 @@ def apply_lsc_hints(out_dir):
         path = os.path.join(out_dir, fname)
         with open(path) as f:
             content = f.read()
-        new_content, n1 = READ_RE.subn(wrap, content)
-        new_content, n2 = READ_RE_ARGS.subn(wrap, new_content)
+        new_content, n1 = LSC_WRAPPED_READ_RE.subn(wrap, content)
+        new_content, n2 = LSC_WRAPPED_READ_RE_ARGS.subn(wrap, new_content)
         if n1 + n2:
             with open(path, 'w') as f:
                 f.write(new_content)
