@@ -426,6 +426,7 @@ fn build_rocm_kernels() {
     println!("cargo:rerun-if-env-changed=RISC0_POLY_FP_CSE");
     println!("cargo:rerun-if-env-changed=RISC0_POLY_FP_CSE_TOP");
     println!("cargo:rerun-if-env-changed=RISC0_POLY_FP_CSE_MIN_SHARE");
+    println!("cargo:rerun-if-env-changed=RISC0_LSC_HINTS");
     rerun_if_changed("kernels/cuda");
 
     env::set_var("SCCACHE_IDLE_TIMEOUT", "0");
@@ -867,7 +868,13 @@ fn compute_mono_hash(cxx_root: &str, icpx_version: &str) -> String {
     let cse_min = std::env::var("RISC0_POLY_FP_CSE_MIN_SHARE").unwrap_or_default();
     // Normalize the env var into "1"/"0" so default-on and explicit "1" hash the same.
     let cse_state = if cse_enabled { "1" } else { "0" };
-    let cse_raw = format!("{}|{}|{}", cse_state, cse_top, cse_min);
+    // Tier B4: RISC0_LSC_HINTS toggles the cached_load() wrap; folded into
+    // cse_tag so flipping it invalidates the eval_check stamp.
+    let lsc_state = if matches!(
+        std::env::var("RISC0_LSC_HINTS").as_deref(),
+        Ok("1") | Ok("true") | Ok("on") | Ok("ON")
+    ) { "1" } else { "0" };
+    let cse_raw = format!("{}|{}|{}|lsc={}", cse_state, cse_top, cse_min, lsc_state);
     let cse_tag = format!("cse-{:x}", {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
@@ -1191,6 +1198,14 @@ fn build_intel_kernels() {
             std::env::var("RISC0_POLY_FP_CSE").as_deref(),
             Ok("0") | Ok("false") | Ok("off") | Ok("OFF"),
         );
+        // Tier B4: RISC0_LSC_HINTS=1 wraps remaining argK[...] reads with
+        // ::risc0::lsc::cached_load() for IGC LSC L1+L3-cached hints on the
+        // hot eval_check loads. Requires CSE enabled (the wrap runs as a
+        // CSE post-pass).
+        let lsc_hints_enabled = matches!(
+            std::env::var("RISC0_LSC_HINTS").as_deref(),
+            Ok("1") | Ok("true") | Ok("on") | Ok("ON")
+        );
         if cse_enabled {
             let dst = out_dir.join("poly_fp_cse");
             std::fs::create_dir_all(&dst).unwrap();
@@ -1199,20 +1214,24 @@ fn build_intel_kernels() {
                 .unwrap_or_else(|_| "16".to_string());
             let cse_min = std::env::var("RISC0_POLY_FP_CSE_MIN_SHARE")
                 .unwrap_or_else(|_| "10".to_string());
-            let status = std::process::Command::new("python3")
+            let mut script_cmd = std::process::Command::new("python3");
+            script_cmd
                 .arg(&script)
                 .arg(&current_src_dir)
                 .arg(&dst)
                 .arg("--top").arg(&cse_top)
-                .arg("--min-share").arg(&cse_min)
-                .status()
+                .arg("--min-share").arg(&cse_min);
+            if lsc_hints_enabled {
+                script_cmd.arg("--lsc-hints");
+            }
+            let status = script_cmd.status()
                 .expect("Failed to run poly_fp_cse.py");
             if !status.success() {
                 panic!("poly_fp_cse.py failed");
             }
             eprintln!(
-                "  RISC0_POLY_FP_CSE=1 (top={}, min-share={}): hoisted-CSE sources at {}",
-                cse_top, cse_min, dst.display(),
+                "  RISC0_POLY_FP_CSE=1 (top={}, min-share={}, lsc_hints={}): hoisted-CSE sources at {}",
+                cse_top, cse_min, lsc_hints_enabled, dst.display(),
             );
             current_src_dir = dst;
         }
@@ -1233,7 +1252,8 @@ fn build_intel_kernels() {
             .arg("-Wno-unused-variable")
             .arg("-Wno-sign-compare")
             .arg(format!("-I{cxx_root}"))
-            .arg("-Ikernels/cxx");
+            .arg("-Ikernels/cxx")
+            .arg("-Ikernels/intel");
 
         // Create an amalgamation file that includes all poly_fp sources
         // in a single translation unit (required for SYCL device code).
@@ -1245,6 +1265,11 @@ fn build_intel_kernels() {
         amalg.push_str("#include \"fp.h\"\n");
         amalg.push_str("#include \"fpext.h\"\n");
         amalg.push_str("#include <cstdint>\n");
+        if lsc_hints_enabled {
+            // Tier B4: pull in the cached_load helper at amalgamation level so
+            // the wrapped reads in rust_poly_fp_*.cpp resolve.
+            amalg.push_str("#include \"cached_load.h\"\n");
+        }
         amalg.push_str("namespace risc0::circuit::rv32im_v2 {\n");
         amalg.push_str("constexpr size_t kInvRate = 4;\n");
         // Include the function bodies but skip their preamble (includes + kInvRate).
@@ -1355,7 +1380,7 @@ fn build_intel_kernels() {
                     .arg("-Os")
                     .arg("-Wno-unused-parameter").arg("-Wno-unused-function")
                     .arg("-Wno-unused-variable").arg("-Wno-sign-compare")
-                    .arg(format!("-I{cxx_root}")).arg("-Ikernels/cxx")
+                    .arg(format!("-I{cxx_root}")).arg("-Ikernels/cxx").arg("-Ikernels/intel")
                     .arg(&pass1_amalg).arg("-o").arg(&pass1_so)
                     .arg("-fsycl-targets=intel_gpu_bmg_g31")
                     .arg("-Xs").arg(format!("-options \"{}\"", intel_xs_options()))
@@ -1375,7 +1400,7 @@ fn build_intel_kernels() {
                     .arg("-Os")
                     .arg("-Wno-unused-parameter").arg("-Wno-unused-function")
                     .arg("-Wno-unused-variable").arg("-Wno-sign-compare")
-                    .arg(format!("-I{cxx_root}")).arg("-Ikernels/cxx")
+                    .arg(format!("-I{cxx_root}")).arg("-Ikernels/cxx").arg("-Ikernels/intel")
                     .arg(&pass2_amalg).arg("-o").arg(&pass2_so)
                     .arg("-fsycl-targets=intel_gpu_bmg_g31")
                     .arg("-Xs").arg(format!("-options \"{}\"", intel_xs_options()))

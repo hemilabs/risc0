@@ -1183,18 +1183,22 @@ impl ProverServer for ProverImpl {
             ProverOpts::succinct()
         };
 
-        // Pipeline: while GPU runs join(N), prepare lift(N+1) preflight on background CPU thread.
-        let mut pending_prepared_lift: Option<
-            std::thread::JoinHandle<Result<RecursionProverJob>>,
-        > = None;
+        // Cross-segment pipelining: bg thread does CPU preflight of next lift
+        // while main thread runs the GPU join of the previous one. Validated
+        // ~3% E2E win at composite=42 segs.
+        //
+        // Note: GPU overlap (running the full lift on a second queue) was
+        // attempted via RISC0_LIFT_JOIN_OVERLAP env gate; produced invalid
+        // proofs on B70 (single-CCS hardware, shared recursion HAL state).
+        // See memory: project_lift_join_overlap_invalid.md
+        let mut pending_prepared_lift: Option<std::thread::JoinHandle<Result<RecursionProverJob>>> = None;
 
         for step_idx in 0..num_segments {
             let t_step = std::time::Instant::now();
 
             // Get the lifted receipt.
-            let lifted: SuccinctReceipt<ReceiptClaim> =
-                if let Some(handle) = pending_prepared_lift.take() {
-                    // Use the pre-prepared prover (preflight cached on background thread).
+            let lifted: SuccinctReceipt<ReceiptClaim> = match pending_prepared_lift.take() {
+                Some(handle) => {
                     let mut prover = handle
                         .join()
                         .map_err(|_| anyhow!("lift prepare thread panicked"))??;
@@ -1202,24 +1206,28 @@ impl ProverServer for ProverImpl {
                     let claim_decoded = ReceiptClaim::decode(&mut receipt.out_stream())?;
                     let claim = claim_decoded.merge(&segments[step_idx].claim)?;
                     make_succinct_receipt(prover, receipt, claim)?
-                } else {
+                }
+                None => {
                     // First segment: compute full lift (no pipelining available yet).
                     lift_with_opts(&segments[step_idx], recursion_opts.clone())?
-                };
+                }
+            };
             let lift_ms = t_step.elapsed().as_secs_f64() * 1000.0;
 
-            // Before running join, start preparing next lift in background.
+            // Start CPU preflight for next lift in background.
             if step_idx + 1 < num_segments {
+                let opts_next = recursion_opts.clone();
                 let next_prover = RecursionProverJob::new_lift(
                     &segments[step_idx + 1],
-                    recursion_opts.clone(),
+                    opts_next,
                 )?;
-                pending_prepared_lift =
-                    Some(std::thread::spawn(move || -> Result<RecursionProverJob> {
+                pending_prepared_lift = Some(std::thread::spawn(
+                    move || -> Result<RecursionProverJob> {
                         let mut p = next_prover;
                         p.prepare()?;
                         Ok(p)
-                    }));
+                    },
+                ));
             }
 
             // Run join on main thread (GPU) while background thread prepares next lift.

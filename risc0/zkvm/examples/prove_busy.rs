@@ -8,13 +8,18 @@ fn main() {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(2_900_000);
+    let po2: u32 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
 
     let spec = BenchmarkSpec::SimpleLoop { iters };
 
-    eprintln!("Executing guest (SimpleLoop {iters} iters)...");
+    eprintln!("Executing guest (SimpleLoop {iters} iters, segment_limit_po2={po2})...");
     let env = ExecutorEnv::builder()
         .write(&spec)
         .unwrap()
+        .segment_limit_po2(po2)
         .build()
         .unwrap();
     let session = ExecutorImpl::from_elf(env, BENCH_ELF).unwrap().run().unwrap();

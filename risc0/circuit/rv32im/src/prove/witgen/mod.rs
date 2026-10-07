@@ -193,10 +193,11 @@ where
         // save ~844MB VRAM and halve scatter time — eval_check verifies correctness.
         let use_pre_data = std::env::var_os("RISC0_USE_PRE_DATA").is_some();
         let pre_data_buf = if use_pre_data {
-            Some(scope!(
-                "alloc(pre_data)",
-                MetaBuffer::new("pre_data", hal, cycles, REGCOUNT_DATA, false)
-            ))
+            // Zero-init instead of INVALID: witgen back-references into unscattered
+            // pre_data positions must resolve to valid Fp; INVALID (0xFFFFFFFF) is
+            // non-canonical and can trigger UB in downstream arithmetic.
+            let buf = hal.alloc_elem_init("pre_data", cycles * REGCOUNT_DATA, Val::ZERO);
+            Some(MetaBuffer { buf, rows: cycles, cols: REGCOUNT_DATA, checked: false })
         } else {
             None
         };

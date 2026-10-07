@@ -52,6 +52,11 @@ READ_RE = re.compile(
     r'arg(\d+)\[(\d+) \* steps \+ \(\(cycle - kInvRate \* (\d+)\) & mask\)\]'
 )
 
+# Same shape but for the entry poly_fp's hoisted reads: args[K][...].
+READ_RE_ARGS = re.compile(
+    r'args\[(\d+)\]\[(\d+) \* steps \+ \(\(cycle - kInvRate \* (\d+)\) & mask\)\]'
+)
+
 # Signature header for a sub-function definition (not declaration)
 DEF_RE = re.compile(
     r'^FpExt rv32im_v2_(\d+)\((.*)\)\s*\{?\s*$'
@@ -532,6 +537,29 @@ def transform(in_dir, out_dir, top_n=16, min_share=10):
     return len(hoist_order)
 
 
+def apply_lsc_hints(out_dir):
+    """Tier B4: wrap all remaining argK[...] / args[K][...] reads in the
+    rust_poly_fp_*.cpp output files with ::risc0::lsc::cached_load(&...).
+    Idempotent — relies on the regex not matching the wrapped form."""
+    def wrap(m):
+        return f'::risc0::lsc::cached_load(&{m.group(0)})'
+    total = 0
+    for fname in sorted(os.listdir(out_dir)):
+        if not fname.startswith('rust_poly_fp_') or not fname.endswith('.cpp'):
+            continue
+        path = os.path.join(out_dir, fname)
+        with open(path) as f:
+            content = f.read()
+        new_content, n1 = READ_RE.subn(wrap, content)
+        new_content, n2 = READ_RE_ARGS.subn(wrap, new_content)
+        if n1 + n2:
+            with open(path, 'w') as f:
+                f.write(new_content)
+            print(f"[lsc-hints] {fname}: wrapped {n1 + n2} reads", file=sys.stderr)
+        total += n1 + n2
+    print(f"[lsc-hints] total reads wrapped: {total}", file=sys.stderr)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('in_dir')
@@ -541,11 +569,16 @@ def main():
                     help='Hoist at most this many tuples')
     ap.add_argument('--min-share', type=int, default=10,
                     help='Only hoist tuples shared by at least this many sub-fns')
+    ap.add_argument('--lsc-hints', action='store_true',
+                    help='Tier B4: wrap remaining buffer reads in '
+                         '::risc0::lsc::cached_load() for IGC LSC cache hints')
     args = ap.parse_args()
 
     if args.out_dir:
         transform(args.in_dir, args.out_dir,
                   top_n=args.top, min_share=args.min_share)
+        if args.lsc_hints:
+            apply_lsc_hints(args.out_dir)
         return
 
     agg, _, bufmap, _, _, _ = analyze_files(args.in_dir)
