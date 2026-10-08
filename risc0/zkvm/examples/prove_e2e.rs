@@ -163,6 +163,12 @@ fn main() -> ExitCode {
     println!("verify:        {:.3}s", verify_elapsed.as_secs_f64());
     println!("receipt size:  {receipt_bytes} bytes");
     println!("stats:         {:?}", prove_info.stats);
+    let mem = risc0_zkp::hal::tracker().lock().unwrap();
+    println!(
+        "GPU mem:       peak {:.2} GB, live at exit {:.2} GB (tracked buffers)",
+        mem.peak as f64 / 1e9,
+        mem.total as f64 / 1e9
+    );
 
     ExitCode::SUCCESS
 }

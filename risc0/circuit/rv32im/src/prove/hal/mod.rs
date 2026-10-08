@@ -121,14 +121,9 @@ where
     /// Cached Fiat-Shamir setup digests. PROOF_SYSTEM_INFO and CIRCUIT_INFO are
     /// build-time constants; hashing them every segment costs ~1 ms on CPU.
     cached_fs_seed_digests: RefCell<Option<(Box<Digest>, Box<Digest>)>>,
-    /// Backgrounded finalize from previous prove_begin call. Holds a
-    /// JoinHandle for the thread running DeferredFinalize::complete(); the
-    /// thread's CPU work (poly_interpolate, combos_divide, fri queries) runs
-    /// in parallel with the next segment's main GPU work (witgen, commits),
-    /// eliminating most of the ~335 ms sequential "completed prev finalize"
-    /// wait. Requires H and C to be Send+Sync+'static (post the IntelHal
-    /// Send refactor).
-    pending_finalize: RefCell<Option<std::thread::JoinHandle<Seal>>>,
+    /// Seal of the segment finished by the previous prove_begin call, returned
+    /// by the next prove_begin (or prove_end) to keep the pipelined API.
+    pending_seal: RefCell<Option<Seal>>,
 }
 
 impl<H, C, F> SegmentProverImpl<H, C, F>
@@ -143,7 +138,7 @@ where
             cached_hal: RefCell::new(None),
             cached_code_group: RefCell::new(None),
             cached_fs_seed_digests: RefCell::new(None),
-            pending_finalize: RefCell::new(None),
+            pending_seal: RefCell::new(None),
         }
     }
 
@@ -392,23 +387,7 @@ where
         let global_clone = hal.alloc_elem("global_clone", witgen.global.buf.size());
         hal.eltwise_copy_elem(&global_clone, &witgen.global.buf);
 
-        // Join the prev segment's backgrounded finalize. Its CPU work has
-        // been running in parallel with THIS seg's main work (witgen +
-        // commits + accum + accum_commit), so the join wait is typically
-        // ~0 ms — finalize is already done by the time main finishes.
-        let prev_seal = if let Some(handle) = self.pending_finalize.borrow_mut().take() {
-            let tp = std::time::Instant::now();
-            let seal = handle.join()
-                .map_err(|_| anyhow::anyhow!("finalize thread panicked"))?;
-            if *VERBOSE { eprintln!(
-                "[prove_begin] joined prev finalize thread: {:.1}ms (after witgen+commits={:.1}ms)",
-                tp.elapsed().as_secs_f64() * 1000.0,
-                t0.elapsed().as_secs_f64() * 1000.0,
-            ); }
-            Some(seal)
-        } else {
-            None
-        };
+        let prev_seal = self.pending_seal.borrow_mut().take();
 
         let t_main = t0.elapsed();
 
@@ -422,16 +401,14 @@ where
         deferred.keep_alive_buf(mix.buf);
         deferred.keep_alive_buf(global_clone);
 
-        // Spawn the finalize completion on a background thread. Its CPU work
-        // (poly_interpolate, combos_divide, fri proving) overlaps the NEXT
-        // iteration's main phase on this thread; its GPU work shares the single
-        // in-order queue. Join happens at the start of the next prove_begin.
-        let hal_for_thread = Arc::clone(&hal);
-        let circuit_hal_for_thread = Arc::clone(&circuit_hal);
-        let handle = std::thread::spawn(move || -> Seal {
-            deferred.complete(hal_for_thread.as_ref(), circuit_hal_for_thread.as_ref())
-        });
-        *self.pending_finalize.borrow_mut() = Some(handle);
+        // Finalize on this thread. A background finalize thread overlapping the
+        // next segment's GPU work (allocating and freeing device memory
+        // concurrently with it) intermittently corrupted device data on Intel
+        // (GPU page faults / invalid proofs), and holding two segments in
+        // flight does not fit po2=21 in VRAM. With one in-order queue the GPU
+        // work serialized anyway, so the overlap bought ~nothing.
+        let seal = deferred.complete(hal.as_ref(), circuit_hal.as_ref());
+        *self.pending_seal.borrow_mut() = Some(seal);
 
         if *VERBOSE { eprintln!(
             "[prove_begin] witgen={:.1}ms data_commit={:.1}ms accum={:.1}ms accum_commit={:.1}ms main={:.1}ms total={:.1}ms",
@@ -448,20 +425,9 @@ where
 
     fn prove_end(&self) -> Result<Seal> {
         scope!("prove_end");
-        // No GPU work here — just join the last segment's backgrounded
-        // finalize thread. The wait should be short or zero.
-        let handle = self
-            .pending_finalize
+        self.pending_seal
             .borrow_mut()
             .take()
-            .ok_or_else(|| anyhow::anyhow!("prove_end: no pending finalize"))?;
-        let t0 = std::time::Instant::now();
-        let seal = handle.join()
-            .map_err(|_| anyhow::anyhow!("finalize thread panicked in prove_end"))?;
-        if *VERBOSE { eprintln!(
-            "[prove_end] joined finalize thread: {:.1}ms",
-            t0.elapsed().as_secs_f64() * 1000.0
-        ); }
-        Ok(seal)
+            .ok_or_else(|| anyhow::anyhow!("prove_end: no pending seal"))
     }
 }
