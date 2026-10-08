@@ -5,7 +5,8 @@ ITERS=${1:-2900000}
 PO2=${2:-20}
 # Consume the two positional args before iterating any remaining KEY=VAL.
 if [ $# -ge 2 ]; then shift 2; elif [ $# -ge 1 ]; then shift; fi
-source /opt/intel/oneapi/setvars.sh > /dev/null 2>&1
+# setvars.sh returns 3 when the environment is already set up.
+source /opt/intel/oneapi/setvars.sh > /dev/null 2>&1 || true
 # Glob the risc0-sys build out dir(s) rather than hardcoding build-hash paths —
 # the hash changes on any build.rs edit, which silently broke the wrapper.
 RISC0_SYS_OUT=$(ls -td "$(pwd)"/target/release/build/risc0-sys-*/out 2>/dev/null | paste -sd ":" -)

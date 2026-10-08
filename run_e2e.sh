@@ -26,7 +26,8 @@ MODES=${*:-composite succinct groth16}
 
 cd "$(dirname "$0")"
 # Intel's setvars.sh is not clean under `set -u`, so source it before enabling.
-source /opt/intel/oneapi/setvars.sh > /dev/null 2>&1
+# setvars.sh returns 3 when the environment is already set up.
+source /opt/intel/oneapi/setvars.sh > /dev/null 2>&1 || true
 set -u
 
 # Glob the risc0-sys build out dir so the hash isn't hardcoded.
