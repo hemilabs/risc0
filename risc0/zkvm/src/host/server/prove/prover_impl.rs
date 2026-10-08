@@ -412,25 +412,8 @@ impl ProverImpl {
             stats: session.stats(),
         })
     }
-}
 
-impl ProverServer for ProverImpl {
-    fn prove(&self, env: ExecutorEnv<'_>, elf: &[u8]) -> Result<ProveInfo> {
-        let ctx = VerifierContext::default().with_dev_mode(self.opts.dev_mode());
-        self.prove_with_ctx(env, &ctx, elf)
-    }
-
-    fn prove_with_ctx(
-        &self,
-        env: ExecutorEnv<'_>,
-        ctx: &VerifierContext,
-        elf: &[u8],
-    ) -> Result<ProveInfo> {
-        let session = ExecutorImpl::from_elf(env, elf)?.run()?;
-        self.prove_session(ctx, &session)
-    }
-
-    fn prove_session(&self, ctx: &VerifierContext, session: &Session) -> Result<ProveInfo> {
+    fn prove_session_impl(&self, ctx: &VerifierContext, session: &Session) -> Result<ProveInfo> {
         tracing::debug!(
             "prove_session: exit_code = {:?}, journal = {:?}, segments: {}",
             session.exit_code,
@@ -947,6 +930,34 @@ impl ProverServer for ProverImpl {
             "proving not implemented for receipt kind {:?}",
             self.opts.receipt_kind
         );
+    }
+}
+
+impl ProverServer for ProverImpl {
+    fn prove(&self, env: ExecutorEnv<'_>, elf: &[u8]) -> Result<ProveInfo> {
+        let ctx = VerifierContext::default().with_dev_mode(self.opts.dev_mode());
+        self.prove_with_ctx(env, &ctx, elf)
+    }
+
+    fn prove_with_ctx(
+        &self,
+        env: ExecutorEnv<'_>,
+        ctx: &VerifierContext,
+        elf: &[u8],
+    ) -> Result<ProveInfo> {
+        let session = ExecutorImpl::from_elf(env, elf)?.run()?;
+        self.prove_session(ctx, &session)
+    }
+
+    fn prove_session(&self, ctx: &VerifierContext, session: &Session) -> Result<ProveInfo> {
+        let info = self.prove_session_impl(ctx, session)?;
+        // Return this session's pooled GPU buffers instead of holding them idle
+        // until the next session (cross-session reuse saves no measurable
+        // time, and stale sizes, e.g. from another po2, would crowd a later
+        // session). Only on success: freeing after DEVICE_LOST never returns.
+        #[cfg(feature = "intel")]
+        risc0_zkp::hal::intel::release_idle_buffers();
+        Ok(info)
     }
 
     fn segment_preflight(&self, segment: &Segment) -> Result<PreflightResults> {

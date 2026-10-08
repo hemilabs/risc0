@@ -299,6 +299,15 @@ impl IntelBufferPool {
     }
 }
 
+/// Frees all pooled (idle) buffers. Call between proving sessions, when no GPU
+/// work is in flight on another thread: otherwise buffers sized for an earlier
+/// workload (e.g. a different po2) stay allocated, up to the pool cap, for the
+/// life of the process and can crowd out a later, larger session.
+pub fn release_idle_buffers() {
+    let idle = BUFFER_POOL.lock().take_all();
+    drop(idle);
+}
+
 static BUFFER_POOL: LazyLock<Mutex<IntelBufferPool>> =
     LazyLock::new(|| Mutex::new(IntelBufferPool::new()));
 
