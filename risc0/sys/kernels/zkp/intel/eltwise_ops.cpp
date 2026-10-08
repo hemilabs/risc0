@@ -271,17 +271,23 @@ void esimd_gather_sample(sycl::queue& q,
                     // Fast path: contiguous read at src[base + idx]
                     auto data = esimd::block_load<uint32_t, 16>(ps + base + idx, ELT_LOAD);
                     esimd::block_store(pd + base, data, ELT_STORE);
-                } else {
-                    // Strided path: gather with computed offsets
+                } else if (stride < (1u << 26)) {
+                    // gather() takes 32-bit byte offsets, so offsets measured
+                    // from `ps` wrap once the source exceeds 4 GiB (e.g. the
+                    // po2=21 data group). Rebase on this group's first row:
+                    // the largest lane offset is 15 * stride * 4 < 4 GiB.
+                    const uint32_t* row0 = ps + size_t(base) * stride + idx;
                     esimd::simd<uint32_t, 16> lane_idx(0u, 1u);
-                    auto src_idx = (lane_idx + base) * stride + idx;
-                    auto byte_off = src_idx * (uint32_t)sizeof(uint32_t);
-                    auto data = esimd::gather<uint32_t, 16>(ps, byte_off);
+                    auto byte_off = lane_idx * (stride * (uint32_t)sizeof(uint32_t));
+                    auto data = esimd::gather<uint32_t, 16>(row0, byte_off);
                     esimd::block_store(pd + base, data, ELT_STORE);
+                } else {
+                    for (uint32_t i = base; i < base + 16; i++)
+                        *(pd + i) = *(ps + size_t(i) * stride + idx);
                 }
             } else {
                 for (uint32_t i = base; i < size; i++)
-                    *(pd + i) = *(ps + i * stride + idx);
+                    *(pd + i) = *(ps + size_t(i) * stride + idx);
             }
         });
 }

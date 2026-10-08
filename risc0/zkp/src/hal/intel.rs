@@ -246,17 +246,14 @@ pub type IntelHalPoseidon254 = IntelHal<IntelHashPoseidon254>;
 // ============================================================================
 // Buffer Pool — caches device allocations for reuse (matches CUDA HAL pattern)
 //
-// One process-wide pool. Buffers routinely move between threads (each
-// segment's finalize thread takes ownership of that segment's prover buffers),
-// and per-thread pools freed ~7 GB of device memory every time a finalize
-// thread exited, while the main thread was allocating and uploading the next
-// segment's buffers. That cross-thread free/alloc churn coincided with
-// intermittent stale device data (GPU page faults / DEVICE_LOST). With a shared
-// pool, memory is recycled without going back to the driver, and nothing is
-// freed by thread or process exit (a free after DEVICE_LOST never returns).
-// Cross-thread reuse is ordered correctly because all work is submitted to a
-// single in-order queue: a buffer is only popped after its previous owner's
-// last submission.
+// One process-wide pool rather than a thread_local one: buffers may be dropped
+// on threads other than the allocating one, and a thread_local pool frees its
+// whole cache when its thread exits. Device frees concurrent with GPU work on
+// other threads coincided with intermittent stale device data on Intel (GPU
+// page faults / DEVICE_LOST), and a free after DEVICE_LOST never returns, so
+// nothing here is freed at thread or process exit. Reuse across threads is
+// ordered by the single in-order queue: a buffer is only popped after its
+// previous owner's last submission.
 // ============================================================================
 
 use std::{collections::HashMap, sync::LazyLock};
@@ -322,7 +319,8 @@ impl RawBuffer {
         let buf = pooled.unwrap_or_else(|| {
             IntelDeviceBuffer::uninitialized(size).unwrap_or_else(|_| {
                 // Cached buffers of other sizes may be holding the VRAM.
-                drop(BUFFER_POOL.lock().take_all());
+                let all = BUFFER_POOL.lock().take_all();
+                drop(all);
                 IntelDeviceBuffer::uninitialized(size).unwrap_or_else(|e| {
                     panic!("Intel GPU allocation failed on {name}: {size} bytes: {e}")
                 })
@@ -1267,6 +1265,126 @@ mod tests {
     #[test]
     fn mix_poly_coeffs() {
         testutil::mix_poly_coeffs(IntelHalSha256::new());
+    }
+
+    // At po2=21 the data group's evaluated matrix (211 polys x 2^23) is ~7 GB,
+    // past 4 GiB; any 32-bit byte addressing wraps there. Run the ops that touch
+    // it at that size and compare against the CPU HAL.
+    #[test]
+    #[ignore = "needs ~10 GB of GPU memory and several minutes"]
+    fn large_buffer_ops_match_cpu() {
+        use crate::{
+            core::hash::poseidon2::Poseidon2HashSuite,
+            field::{baby_bear::BabyBearElem as Elem, Elem as _},
+            hal::{cpu::CpuHal, Buffer as _, Hal as _},
+        };
+
+        fn report<T: PartialEq>(name: &str, gpu: &[T], cpu: &[T], elem_bytes: usize) -> usize {
+            assert_eq!(gpu.len(), cpu.len(), "{name}: length");
+            let gib4 = (4usize << 30) / elem_bytes;
+            let mut bad = 0;
+            let mut beyond = 0;
+            let mut first = None;
+            for (i, (a, b)) in gpu.iter().zip(cpu).enumerate() {
+                if a != b {
+                    bad += 1;
+                    beyond += (i >= gib4) as usize;
+                    first.get_or_insert(i);
+                }
+            }
+            eprintln!(
+                "[large] {name}: {bad}/{} differ ({beyond} at/after the 4 GiB mark, index {gib4}); first={first:?}",
+                gpu.len()
+            );
+            bad
+        }
+
+        let gpu = IntelHalPoseidon2::new();
+        let cpu = CpuHal::new(Poseidon2HashSuite::new_suite());
+        let count = 211;
+        let expand_bits = 2;
+        let steps = 1 << 21;
+        let domain = steps << expand_bits;
+
+        let mut rng = rand::rng();
+        let input: Vec<Elem> = (0..count * steps).map(|_| Elem::random(&mut rng)).collect();
+        let gpu_in = gpu.copy_from_elem("in", &input);
+        let cpu_in = cpu.copy_from_elem("in", &input);
+        drop(input);
+
+        let gpu_eval = gpu.alloc_elem("eval", count * domain);
+        let cpu_eval = cpu.alloc_elem("eval", count * domain);
+        gpu.batch_expand_into_evaluate_ntt(&gpu_eval, &gpu_in, count, expand_bits);
+        cpu.batch_expand_into_evaluate_ntt(&cpu_eval, &cpu_in, count, expand_bits);
+        let mut bad = report("batch_expand_into_evaluate_ntt", &gpu_eval.to_vec(), &cpu_eval.to_vec(), 4);
+
+        let gpu_digests = gpu.alloc_digest("rows", domain);
+        let cpu_digests = cpu.alloc_digest("rows", domain);
+        gpu.hash_rows(&gpu_digests, &gpu_eval);
+        cpu.hash_rows(&cpu_digests, &cpu_eval);
+        bad += report("hash_rows", &gpu_digests.to_vec(), &cpu_digests.to_vec(), 32);
+
+        for idx in [0, domain / 2, domain - 1] {
+            let gpu_col = gpu.alloc_elem("sample", count);
+            let cpu_col = cpu.alloc_elem("sample", count);
+            gpu.gather_sample(&gpu_col, &gpu_eval, idx, count, domain);
+            cpu.gather_sample(&cpu_col, &cpu_eval, idx, count, domain);
+            bad += report(&format!("gather_sample idx={idx}"), &gpu_col.to_vec(), &cpu_col.to_vec(), 4);
+        }
+
+        assert_eq!(bad, 0, "Intel HAL diverged from CPU on a >4 GiB buffer");
+    }
+
+    // NTT-family ops at the sizes the prover uses for po2=20/21 (coeffs at
+    // lg = po2, the check polynomial at lg = po2 + 2), compared to the CPU HAL.
+    #[test]
+    #[ignore = "large: several GB of GPU memory"]
+    fn ntt_ops_at_prover_sizes_match_cpu() {
+        use crate::{
+            core::hash::poseidon2::Poseidon2HashSuite,
+            field::{baby_bear::BabyBearElem as Elem, Elem as _},
+            hal::{cpu::CpuHal, Buffer as _, Hal as _},
+        };
+
+        let gpu = IntelHalPoseidon2::new();
+        let cpu = CpuHal::new(Poseidon2HashSuite::new_suite());
+        let mut rng = rand::rng();
+        let mut bad_total = 0;
+        for (lg, count) in [(20, 4), (21, 4), (21, 211), (22, 4), (23, 4)] {
+            let n = count << lg;
+            let input: Vec<Elem> = (0..n).map(|_| Elem::random(&mut rng)).collect();
+            for op in ["interpolate", "interpolate_zk_shift", "bit_reverse", "zk_shift"] {
+                let g = gpu.copy_from_elem("io", &input);
+                let c = cpu.copy_from_elem("io", &input);
+                match op {
+                    "interpolate" => {
+                        gpu.batch_interpolate_ntt(&g, count);
+                        cpu.batch_interpolate_ntt(&c, count);
+                    }
+                    "interpolate_zk_shift" => {
+                        gpu.batch_interpolate_ntt_zk_shift(&g, count);
+                        cpu.batch_interpolate_ntt_zk_shift(&c, count);
+                    }
+                    "bit_reverse" => {
+                        gpu.batch_bit_reverse(&g, count);
+                        cpu.batch_bit_reverse(&c, count);
+                    }
+                    _ => {
+                        gpu.zk_shift(&g, count);
+                        cpu.zk_shift(&c, count);
+                    }
+                }
+                let (gv, cv) = (g.to_vec(), c.to_vec());
+                let bad: Vec<usize> = (0..n).filter(|&i| gv[i] != cv[i]).collect();
+                eprintln!(
+                    "[ntt] lg={lg} count={count} {op}: {}/{n} differ; first={:?}",
+                    bad.len(),
+                    bad.first()
+                );
+                bad_total += bad.len();
+            }
+        }
+        assert_eq!(bad_total, 0, "Intel NTT-family ops diverged from CPU");
     }
 
     // Callers free or reuse host buffers as soon as an upload returns (scatter

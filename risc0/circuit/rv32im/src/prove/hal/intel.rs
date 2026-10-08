@@ -741,6 +741,27 @@ mod tests {
         assert_or_save_golden("mono_random", PO2, &intel);
     }
 
+    /// Random differential at po2=21, where the data group's evaluated buffer
+    /// exceeds 4 GiB and any 32-bit byte addressing would wrap.
+    #[test]
+    #[ignore = "po2=21: ~10 GB host and GPU memory, several minutes"]
+    fn eval_check_random_mono_po2_21() {
+        const PO2: usize = 21;
+        let params = EvalCheckParams::random(PO2, SEED_RANDOM);
+        let cpu = cpu_eval_check(&params);
+        let intel = intel_eval_check(&params, /* multipass = */ false);
+        assert_eq!(cpu.len(), intel.len());
+        let bad: Vec<usize> = (0..cpu.len()).filter(|&i| cpu[i] != intel[i]).collect();
+        eprintln!(
+            "[eval_check po2=21] {}/{} differ; first={:?} last={:?}",
+            bad.len(),
+            cpu.len(),
+            bad.first(),
+            bad.last()
+        );
+        assert!(bad.is_empty(), "Intel eval_check diverged from CPU at po2=21");
+    }
+
     /// 2. Random differential — Intel multipass path matches CPU reference.
     #[test]
     fn eval_check_random_multipass() {
