@@ -423,6 +423,10 @@ where
         Ok(prev_seal)
     }
 
+    fn reset_pipeline(&self) {
+        self.pending_seal.borrow_mut().take();
+    }
+
     fn prove_end(&self) -> Result<Seal> {
         scope!("prove_end");
         self.pending_seal

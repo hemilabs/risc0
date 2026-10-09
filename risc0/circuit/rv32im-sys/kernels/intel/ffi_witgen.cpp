@@ -30,31 +30,38 @@ using ExtVal = FpExt;
 constexpr size_t kUserAccumSplit = 23;
 
 // ============================================================================
-// RISC-V integer division (matching CUDA's divide_rv32im)
+// RISC-V integer division (a copy of cxx/ffi.cpp divide_rv32im)
 // ============================================================================
 
 inline std::pair<uint32_t, uint32_t> divide_rv32im(uint32_t numer, uint32_t denom, uint32_t signType) {
-  uint32_t onesComp = (denom == 0) ? 0 : 1;
-  uint32_t negNumer = 0, negDenom = 0;
-  if (signType == 2) {
-    // Signed
-    negNumer = numer >> 31;
-    negDenom = denom >> 31;
-    if (negNumer) numer = -numer;
-    if (negDenom) denom = -denom;
+  // signType: 0 = unsigned, 1 = signed (DIV/REM), 2 = signed numerator with
+  // ones'-complement rounding (used for SRA/SRAI). Must match cxx/ffi.cpp.
+  uint32_t onesComp = (signType == 2);
+  bool negNumer = signType && int32_t(numer) < 0;
+  bool negDenom = signType == 1 && int32_t(denom) < 0;
+  if (negNumer) {
+    numer = -numer - onesComp;
   }
-  uint32_t quot, rem;
+  if (negDenom) {
+    denom = -denom - onesComp;
+  }
+  uint32_t quot;
+  uint32_t rem;
   if (denom == 0) {
-    quot = 0xFFFFFFFF;
+    quot = 0xffffffff;
     rem = numer;
   } else {
     quot = numer / denom;
     rem = numer % denom;
   }
-  uint32_t quotNegOut = negNumer ^ negDenom;
+  uint32_t quotNegOut = (negNumer ^ negDenom) - ((denom == 0) * negNumer);
   uint32_t remNegOut = negNumer;
-  if (quotNegOut) quot = -quot - onesComp;
-  if (remNegOut) rem = -rem - onesComp;
+  if (quotNegOut) {
+    quot = -quot - onesComp;
+  }
+  if (remNegOut) {
+    rem = -rem - onesComp;
+  }
   return {quot, rem};
 }
 

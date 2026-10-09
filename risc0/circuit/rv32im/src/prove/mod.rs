@@ -57,6 +57,10 @@ pub trait SegmentProver {
     fn prove_end(&self) -> Result<Seal> {
         anyhow::bail!("prove_end: no pending work (default impl)")
     }
+
+    /// Discards any seal left pending by an earlier pipeline, e.g. a session
+    /// that failed between prove_begin and prove_end. Call before a new one.
+    fn reset_pipeline(&self) {}
 }
 
 pub fn segment_prover() -> Result<Box<dyn SegmentProver>> {

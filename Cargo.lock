@@ -7410,7 +7410,6 @@ dependencies = [
  "risc0-binfmt",
  "risc0-build",
  "risc0-circuit-keccak",
- "risc0-circuit-keccak-methods",
  "risc0-circuit-recursion",
  "risc0-circuit-rv32im",
  "risc0-core",

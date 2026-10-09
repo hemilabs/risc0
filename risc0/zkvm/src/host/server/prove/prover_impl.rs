@@ -59,7 +59,7 @@ use crate::{
     sha::Digestible,
     Assumption, AssumptionReceipt, CompositeReceipt, ExecutorEnv, InnerAssumptionReceipt,
     MaybePruned, Output, PreflightResults, ProverOpts, Receipt, ReceiptClaim, Segment, Session,
-    UnionClaim, Unknown, VerifierContext, WorkClaim,
+    SuccinctReceiptVerifierParameters, UnionClaim, Unknown, VerifierContext, WorkClaim,
 };
 
 /// An implementation of a Prover that runs locally.
@@ -428,6 +428,13 @@ impl ProverImpl {
             &self.opts.hashfn
         );
 
+        // The segment prover is cached per thread; drop any seal a failed
+        // earlier session left in its pipeline.
+        with_segment_prover(|sp| {
+            sp.reset_pipeline();
+            Ok(())
+        })?;
+
         // Check for parallel STARK mode: both GPUs prove segments simultaneously.
         #[cfg(feature = "rocm")]
         if std::env::var("RISC0_PARALLEL_STARK").is_ok()
@@ -675,8 +682,9 @@ impl ProverImpl {
                 }
 
                 // Start background receipt for the PREVIOUS segment.
-                let (prev_po2, prev_seg_idx, prev_output, prev_hashfn) =
-                    prev_seal_meta.take().unwrap();
+                let (prev_po2, prev_seg_idx, prev_output, prev_hashfn) = prev_seal_meta
+                    .take()
+                    .ok_or_else(|| anyhow!("segment pipeline: seal without metadata"))?;
                 let params = verify_params.clone();
                 let vp_digest = seg_verifier_params_digest;
                 let skip_verify_copy = skip_verify;
@@ -738,8 +746,9 @@ impl ProverImpl {
 
         // Process the last segment's seal.
         {
-            let (last_po2, last_seg_idx, last_output, last_hashfn) =
-                prev_seal_meta.take().unwrap();
+            let (last_po2, last_seg_idx, last_output, last_hashfn) = prev_seal_meta
+                .take()
+                .ok_or_else(|| anyhow!("segment pipeline: seal without metadata"))?;
             let mut claim =
                 ReceiptClaim::decode_from_seal_v2(&last_seal, Some(last_po2))?;
             claim.output = last_output.into();
@@ -796,8 +805,13 @@ impl ProverImpl {
         let mut zkr_receipts = HashMap::new();
         let mut keccak_receipts: MerkleMountainAccumulator<UnionPeak> =
             MerkleMountainAccumulator::new();
+
+        let keccak_ctx = VerifierContext::default()
+            .with_succinct_verifier_parameters(SuccinctReceiptVerifierParameters::for_keccak());
+
         for proof_request in session.pending_keccaks.iter() {
-            let receipt = prove_keccak(proof_request)?;
+            let receipt = prove_keccak(proof_request).context("prove keccak")?;
+            receipt.verify_integrity_with_context(&keccak_ctx)?;
             tracing::debug!("adding keccak assumption: {}", receipt.claim.digest());
             keccak_receipts.insert(receipt)?;
         }
@@ -879,6 +893,15 @@ impl ProverImpl {
                 false => (self.composite_to_succinct(&composite_receipt)?, None, None),
             }
         };
+
+        // composite_to_succinct calls lift/join without the per-receipt
+        // verify_integrity of the default Compress impl; each join verifies its
+        // inputs in-circuit, so verifying the final receipt covers them.
+        if !skip_verify {
+            succinct_receipt
+                .verify_integrity_with_context(ctx)
+                .context("verify succinct")?;
+        }
 
         if self.opts.receipt_kind == ReceiptKind::Succinct {
             let receipt = Receipt::new(

@@ -75,6 +75,13 @@ pub trait IntelHash {
     fn get_hash_suite(&self) -> &HashSuite<BabyBear>;
 }
 
+/// Narrows a size/count/index for an FFI kernel argument. Kernels take u32;
+/// a silent wrap would make them process the wrong range instead of failing.
+#[inline]
+fn ffi_u32(x: usize) -> u32 {
+    u32::try_from(x).unwrap_or_else(|_| panic!("Intel kernel argument {x} exceeds u32"))
+}
+
 // ---- Poseidon2 (ESIMD GPU) ----
 
 pub struct IntelHashPoseidon2 {
@@ -97,7 +104,7 @@ impl IntelHash for IntelHashPoseidon2 {
                 queue,
                 output_ptr.0 as *mut std::ffi::c_void,
                 input_ptr.0 as *const std::ffi::c_void,
-                output_size as u32,
+                ffi_u32(output_size),
             )
         });
     }
@@ -112,8 +119,8 @@ impl IntelHash for IntelHashPoseidon2 {
                 queue,
                 output.as_device_ptr().0 as *mut std::ffi::c_void,
                 matrix.as_device_ptr().0 as *const std::ffi::c_void,
-                row_size as u32,
-                col_size as u32,
+                ffi_u32(row_size),
+                ffi_u32(col_size),
             )
         });
     }
@@ -197,7 +204,7 @@ impl IntelHash for IntelHashPoseidon254 {
                 queue,
                 output_ptr.0 as *mut std::ffi::c_void,
                 input_ptr.0 as *const std::ffi::c_void,
-                output_size as u32,
+                ffi_u32(output_size),
             )
         });
     }
@@ -212,8 +219,8 @@ impl IntelHash for IntelHashPoseidon254 {
                 queue,
                 output.as_device_ptr().0 as *mut std::ffi::c_void,
                 matrix.as_device_ptr().0 as *const std::ffi::c_void,
-                row_size as u32,
-                col_size as u32,
+                ffi_u32(row_size),
+                ffi_u32(col_size),
             )
         });
     }
@@ -699,10 +706,10 @@ impl<IH: IntelHash + ?Sized> Hal for IntelHal<IH> {
                 queue,
                 output.as_device_ptr().0 as *mut std::ffi::c_void,
                 input.as_device_ptr().0 as *const std::ffi::c_void,
-                in_size as u32,
-                out_size as u32,
-                poly_count as u32,
-                expand_bits as u32,
+                ffi_u32(in_size),
+                ffi_u32(out_size),
+                ffi_u32(poly_count),
+                ffi_u32(expand_bits),
             )
         });
 
@@ -711,9 +718,9 @@ impl<IH: IntelHash + ?Sized> Hal for IntelHal<IH> {
             intel::esimd_batch_forward_ntt(
                 queue,
                 output.as_device_ptr().0 as *mut std::ffi::c_void,
-                lg_out as u32,
-                poly_count as u32,
-                out_size as u32,
+                ffi_u32(lg_out),
+                ffi_u32(poly_count),
+                ffi_u32(out_size),
             )
         });
     }
@@ -730,9 +737,9 @@ impl<IH: IntelHash + ?Sized> Hal for IntelHal<IH> {
             intel::esimd_batch_inverse_ntt(
                 queue,
                 io.as_device_ptr().0 as *mut std::ffi::c_void,
-                n_bits as u32,
-                count as u32,
-                row_size as u32,
+                ffi_u32(n_bits),
+                ffi_u32(count),
+                ffi_u32(row_size),
             )
         });
     }
@@ -749,8 +756,8 @@ impl<IH: IntelHash + ?Sized> Hal for IntelHal<IH> {
             intel::esimd_batch_bit_reverse_ffi(
                 queue,
                 io.as_device_ptr().0 as *mut std::ffi::c_void,
-                bits as u32,
-                io.size() as u32,
+                ffi_u32(bits),
+                ffi_u32(io.size()),
             )
         });
     }
@@ -778,8 +785,8 @@ impl<IH: IntelHash + ?Sized> Hal for IntelHal<IH> {
                 coeffs.as_device_ptr().0 as *const std::ffi::c_void,
                 which.as_device_ptr().0 as *const std::ffi::c_void,
                 xs.as_device_ptr().0 as *const std::ffi::c_void,
-                eval_count as u32,
-                count as u32,
+                ffi_u32(eval_count),
+                ffi_u32(count),
             )
         });
     }
@@ -793,8 +800,8 @@ impl<IH: IntelHash + ?Sized> Hal for IntelHal<IH> {
             intel::esimd_batch_zk_shift(
                 queue,
                 io.as_device_ptr().0 as *mut std::ffi::c_void,
-                bits as u32,
-                poly_count as u32,
+                ffi_u32(bits),
+                ffi_u32(poly_count),
             )
         });
     }
@@ -815,9 +822,9 @@ impl<IH: IntelHash + ?Sized> Hal for IntelHal<IH> {
             intel::esimd_batch_inverse_ntt_zk_shift(
                 queue,
                 io.as_device_ptr().0 as *mut std::ffi::c_void,
-                n_bits as u32,
-                count as u32,
-                row_size as u32,
+                ffi_u32(n_bits),
+                ffi_u32(count),
+                ffi_u32(row_size),
             )
         });
     }
@@ -844,8 +851,8 @@ impl<IH: IntelHash + ?Sized> Hal for IntelHal<IH> {
                 combos.as_device_ptr().0 as *const std::ffi::c_void,
                 mix_start_buf.as_device_ptr().0 as *const std::ffi::c_void,
                 mix_buf.as_device_ptr().0 as *const std::ffi::c_void,
-                input_size as u32,
-                count as u32,
+                ffi_u32(input_size),
+                ffi_u32(count),
             )
         });
     }
@@ -869,7 +876,7 @@ impl<IH: IntelHash + ?Sized> Hal for IntelHal<IH> {
                 output.as_device_ptr().0 as *mut std::ffi::c_void,
                 input1.as_device_ptr().0 as *const std::ffi::c_void,
                 input2.as_device_ptr().0 as *const std::ffi::c_void,
-                count as u32,
+                ffi_u32(count),
             )
         });
     }
@@ -890,8 +897,8 @@ impl<IH: IntelHash + ?Sized> Hal for IntelHal<IH> {
                 queue,
                 output.as_device_ptr().0 as *mut std::ffi::c_void,
                 input.as_device_ptr().0 as *const std::ffi::c_void,
-                to_add as u32,
-                count as u32,
+                ffi_u32(to_add),
+                ffi_u32(count),
             )
         });
     }
@@ -910,7 +917,7 @@ impl<IH: IntelHash + ?Sized> Hal for IntelHal<IH> {
                 queue,
                 output.as_device_ptr().0 as *mut std::ffi::c_void,
                 input.as_device_ptr().0 as *const std::ffi::c_void,
-                count as u32,
+                ffi_u32(count),
             )
         });
     }
@@ -926,6 +933,11 @@ impl<IH: IntelHash + ?Sized> Hal for IntelHal<IH> {
         into_offset: usize,
         into_stride: usize,
     ) {
+        if from_rows > 0 && from_cols > 0 {
+            let last = (from_rows - 1, from_cols - 1);
+            assert!(from_offset + last.0 * from_stride + last.1 < from.len());
+            assert!(into_offset + last.0 * into_stride + last.1 < into.size());
+        }
         let from_buf = self.copy_from_elem("from", from);
 
         let queue = get_queue();
@@ -934,12 +946,12 @@ impl<IH: IntelHash + ?Sized> Hal for IntelHal<IH> {
                 queue,
                 into.as_device_ptr().0 as *mut std::ffi::c_void,
                 from_buf.as_device_ptr().0 as *const std::ffi::c_void,
-                from_rows as u32,
-                from_cols as u32,
-                from_offset as u32,
-                from_stride as u32,
-                into_offset as u32,
-                into_stride as u32,
+                ffi_u32(from_rows),
+                ffi_u32(from_cols),
+                ffi_u32(from_offset),
+                ffi_u32(from_stride),
+                ffi_u32(into_offset),
+                ffi_u32(into_stride),
             )
         });
     }
@@ -950,7 +962,7 @@ impl<IH: IntelHash + ?Sized> Hal for IntelHal<IH> {
             intel::esimd_eltwise_zeroize_fp_ffi(
                 queue,
                 elems.as_device_ptr().0 as *mut std::ffi::c_void,
-                elems.size() as u32,
+                ffi_u32(elems.size()),
             )
         });
     }
@@ -975,7 +987,7 @@ impl<IH: IntelHash + ?Sized> Hal for IntelHal<IH> {
                 output.as_device_ptr().0 as *mut std::ffi::c_void,
                 input.as_device_ptr().0 as *const std::ffi::c_void,
                 mix_buf.as_device_ptr().0 as *const std::ffi::c_void,
-                count as u32,
+                ffi_u32(count),
             )
         });
     }
@@ -1058,7 +1070,7 @@ impl<IH: IntelHash + ?Sized> Hal for IntelHal<IH> {
             return Vec::new();
         }
         let count = indices.len();
-        let indices_u32: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
+        let indices_u32: Vec<u32> = indices.iter().map(|&i| ffi_u32(i)).collect();
         let indices_buf = self.copy_from_u32("gather_indices", &indices_u32);
         let output_buf: BufferImpl<Digest> = BufferImpl::new("gather_output", count);
 
@@ -1069,7 +1081,7 @@ impl<IH: IntelHash + ?Sized> Hal for IntelHal<IH> {
                 output_buf.as_device_ptr().0 as *mut std::ffi::c_void,
                 buf.as_device_ptr().0 as *const std::ffi::c_void,
                 indices_buf.as_device_ptr().0 as *const std::ffi::c_void,
-                count as u32,
+                ffi_u32(count),
             )
         });
 
@@ -1088,15 +1100,24 @@ impl<IH: IntelHash + ?Sized> Hal for IntelHal<IH> {
         size: usize,
         stride: usize,
     ) {
+        // The kernel dereferences raw device pointers; mirror the CPU HAL's
+        // slice bounds checks so a bad call panics instead of faulting the GPU.
+        assert!(dst.size() >= size, "gather_sample: dst too small");
+        if size > 0 {
+            assert!(
+                (size - 1) * stride + idx < src.size(),
+                "gather_sample: src out of range"
+            );
+        }
         let queue = get_queue();
         esimd_check(unsafe {
             intel::esimd_gather_sample_fp_ffi(
                 queue,
                 dst.as_device_ptr().0 as *mut std::ffi::c_void,
                 src.as_device_ptr().0 as *const std::ffi::c_void,
-                idx as u32,
-                size as u32,
-                stride as u32,
+                ffi_u32(idx),
+                ffi_u32(size),
+                ffi_u32(stride),
             )
         });
     }
@@ -1115,6 +1136,14 @@ impl<IH: IntelHash + ?Sized> Hal for IntelHal<IH> {
         if count == 0 {
             return;
         }
+        // The kernel writes through raw device pointers (see gather_sample).
+        let n = index[count] as usize;
+        assert!(n <= offsets.len() && n <= values.len(), "scatter: index exceeds inputs");
+        debug_assert!(index.windows(2).all(|w| w[0] <= w[1]), "scatter: index not sorted");
+        debug_assert!(
+            offsets[..n].iter().all(|&o| (o as usize) < into.size()),
+            "scatter: offset out of range"
+        );
 
         // Upload index, offsets, values to device then call ESIMD scatter
         let index_buf = self.copy_from_u32("scatter_index", index);
@@ -1129,7 +1158,7 @@ impl<IH: IntelHash + ?Sized> Hal for IntelHal<IH> {
                 index_buf.as_device_ptr().0 as *const std::ffi::c_void,
                 offsets_buf.as_device_ptr().0 as *const std::ffi::c_void,
                 values_buf.as_device_ptr().0 as *const std::ffi::c_void,
-                count as u32,
+                ffi_u32(count),
             )
         });
     }
@@ -1172,12 +1201,12 @@ impl<IH: IntelHash + ?Sized> Hal for IntelHal<IH> {
                 queue,
                 combos.as_device_ptr().0 as *mut std::ffi::c_void,
                 coeff_u_buf.as_device_ptr().0 as *const std::ffi::c_void,
-                combo_count as u32,
-                cycles as u32,
-                reg_sizes.len() as u32,
+                ffi_u32(combo_count),
+                ffi_u32(cycles),
+                ffi_u32(reg_sizes.len()),
                 reg_sizes_buf.as_device_ptr().0 as *const std::ffi::c_void,
                 reg_combo_ids_buf.as_device_ptr().0 as *const std::ffi::c_void,
-                Self::CHECK_SIZE as u32,
+                ffi_u32(Self::CHECK_SIZE),
                 mix_buf.as_device_ptr().0 as *const std::ffi::c_void,
             )
         });
@@ -1280,6 +1309,99 @@ mod tests {
     // past 4 GiB; any 32-bit byte addressing wraps there. Run the ops that touch
     // it at that size and compare against the CPU HAL.
     #[test]
+    #[ignore = "requires an Intel GPU; run explicitly"]
+    fn poseidon254_hash_ops_match_cpu() {
+        use crate::{
+            core::hash::poseidon_254::Poseidon254HashSuite,
+            field::{baby_bear::BabyBearElem as Elem, Elem as _},
+            hal::{cpu::CpuHal, Buffer as _, Hal as _},
+        };
+        use rand::{rngs::StdRng, SeedableRng as _};
+
+        let gpu = super::IntelHalPoseidon254::new();
+        let cpu = CpuHal::new(Poseidon254HashSuite::new_suite());
+        let mut rng = StdRng::seed_from_u64(9);
+        let mut failures = vec![];
+        for &cols in &[1usize, 7, 8, 9, 16, 17, 24, 33, 64] {
+            for &rows in &[1usize, 2, 8, 15, 16, 17, 1024, 1 << 16] {
+                let data: Vec<Elem> = (0..rows * cols).map(|_| Elem::random(&mut rng)).collect();
+                let g_out = gpu.alloc_digest("out", rows);
+                gpu.hash_rows(&g_out, &gpu.copy_from_elem("in", &data));
+                let c_out = cpu.alloc_digest("out", rows);
+                cpu.hash_rows(&c_out, &cpu.copy_from_elem("in", &data));
+                let bad = g_out.to_vec().iter().zip(&c_out.to_vec()).filter(|(a, b)| a != b).count();
+                if bad > 0 {
+                    eprintln!("[p254 rows] cols={cols} rows={rows}: {bad} differ");
+                    failures.push(format!("rows {cols}x{rows}"));
+                }
+            }
+        }
+        // Whole-tree fold, including the GPU/CPU cutoff and sub-16 layers.
+        for layers in [1usize, 3, 4, 5, 9, 10, 11, 16] {
+            let leaves = 1usize << layers;
+            let digests: Vec<crate::core::digest::Digest> = (0..2 * leaves)
+                .map(|_| {
+                    // Digests are canonical BN254 Fr encodings: keep the top
+                    // limb below r's (0x30644e72).
+                    let mut w: Vec<u32> = (0..8).map(|_| Elem::random(&mut rng).as_u32()).collect();
+                    w[7] %= 0x3000_0000;
+                    crate::core::digest::Digest::try_from(w.as_slice()).unwrap()
+                })
+                .collect();
+            let g = gpu.copy_from_digest("tree", &digests);
+            let c = cpu.copy_from_digest("tree", &digests);
+            gpu.hash_fold_tree(&g, layers);
+            for i in (0..layers).rev() {
+                cpu.hash_fold(&c, 2 << i, 1 << i);
+            }
+            let (gv, cv) = (g.to_vec(), c.to_vec());
+            if gv[1] != cv[1] {
+                eprintln!("[p254 fold] layers={layers}: root differs");
+                failures.push(format!("fold {layers}"));
+            }
+        }
+        assert!(failures.is_empty(), "Poseidon-254 mismatches: {failures:?}");
+    }
+
+    #[test]
+    #[ignore = "requires an Intel GPU; run explicitly"]
+    fn poseidon2_hash_rows_shapes_match_cpu() {
+        use crate::{
+            core::hash::poseidon2::Poseidon2HashSuite,
+            field::{baby_bear::BabyBearElem as Elem, Elem as _},
+            hal::{cpu::CpuHal, Buffer as _, Hal as _},
+        };
+        use rand::{rngs::StdRng, SeedableRng as _};
+
+        let gpu = IntelHalPoseidon2::new();
+        let cpu = CpuHal::new(Poseidon2HashSuite::new_suite());
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut failures = vec![];
+        // Column counts of the rv32im/recursion commit groups plus sponge-block
+        // edge cases; row counts span the small-po2 domains.
+        for &cols in &[1usize, 15, 16, 17, 23, 24, 25, 32, 33, 48, 103, 128, 211] {
+            for &rows in &[16usize, 1024, 1 << 14, 1 << 16, 1 << 18] {
+                let data: Vec<Elem> = (0..rows * cols).map(|_| Elem::random(&mut rng)).collect();
+                let g_in = gpu.copy_from_elem("in", &data);
+                let g_out = gpu.alloc_digest("out", rows);
+                gpu.hash_rows(&g_out, &g_in);
+                let c_in = cpu.copy_from_elem("in", &data);
+                let c_out = cpu.alloc_digest("out", rows);
+                cpu.hash_rows(&c_out, &c_in);
+                let g = g_out.to_vec();
+                let c = c_out.to_vec();
+                let bad = g.iter().zip(&c).filter(|(a, b)| a != b).count();
+                if bad > 0 {
+                    let first = g.iter().zip(&c).position(|(a, b)| a != b);
+                    eprintln!("[hash_rows] cols={cols} rows={rows}: {bad} differ, first={first:?}");
+                    failures.push((cols, rows));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "hash_rows mismatches: {failures:?}");
+    }
+
+    #[test]
     #[ignore = "needs ~10 GB of GPU memory and several minutes"]
     fn large_buffer_ops_match_cpu() {
         use crate::{
@@ -1359,7 +1481,12 @@ mod tests {
         let cpu = CpuHal::new(Poseidon2HashSuite::new_suite());
         let mut rng = rand::rng();
         let mut bad_total = 0;
-        for (lg, count) in [(20, 4), (21, 4), (21, 211), (22, 4), (23, 4)] {
+        let mut cases = vec![(20, 4), (21, 4), (21, 211), (22, 4), (23, 4)];
+        // Small-po2 domains (lg = po2 + 2) at the commit-group widths.
+        for lg in 14..=19 {
+            cases.extend([(lg, 16), (lg, 103), (lg, 211)]);
+        }
+        for (lg, count) in cases {
             let n = count << lg;
             let input: Vec<Elem> = (0..n).map(|_| Elem::random(&mut rng)).collect();
             for op in ["interpolate", "interpolate_zk_shift", "bit_reverse", "zk_shift"] {
@@ -1391,6 +1518,22 @@ mod tests {
                     bad.first()
                 );
                 bad_total += bad.len();
+            }
+        }
+        // Commit path: coefficients at 2^(lg-2) expanded into the 2^lg domain.
+        for lg in 14..=21 {
+            for count in [16usize, 103, 211] {
+                let n_in = count << (lg - 2);
+                let input: Vec<Elem> = (0..n_in).map(|_| Elem::random(&mut rng)).collect();
+                let (gi, ci) = (gpu.copy_from_elem("in", &input), cpu.copy_from_elem("in", &input));
+                let go = gpu.alloc_elem("out", count << lg);
+                let co = cpu.alloc_elem("out", count << lg);
+                gpu.batch_expand_into_evaluate_ntt(&go, &gi, count, 2);
+                cpu.batch_expand_into_evaluate_ntt(&co, &ci, count, 2);
+                let (gv, cv) = (go.to_vec(), co.to_vec());
+                let bad = gv.iter().zip(&cv).filter(|(a, b)| a != b).count();
+                eprintln!("[ntt] lg={lg} count={count} expand_evaluate: {bad} differ");
+                bad_total += bad;
             }
         }
         assert_eq!(bad_total, 0, "Intel NTT-family ops diverged from CPU");

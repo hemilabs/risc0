@@ -1,6 +1,7 @@
 #pragma once
 
 #include "bn254_poseidon.hpp"
+#include "bb31_field.hpp"
 
 // Poseidon-254 hash kernels for Intel ESIMD (SIMD16 lane-per-hash).
 // hash_fold:  digest pairs → digests (Merkle tree levels)
@@ -14,11 +15,16 @@ namespace bn254 {
 static constexpr uint32_t BB31_P = 0x78000001u;
 
 // ============================================================================
-// bb31_absorb_8: Pack 8 BabyBear u32 values into one Fr (Montgomery form).
-// Computes val[0] + val[1]*p + val[2]*p^2 + ... + val[7]*p^7 (mod r).
+// bb31_absorb_8: Pack 8 BabyBear values into one Fr (Montgomery form).
+// Computes val[0] + val[1]*p + val[2]*p^2 + ... + val[7]*p^7 (mod r) over the
+// CANONICAL values, matching the CPU's `val.as_u32()`. `vals` are raw device
+// words, i.e. BabyBear Montgomery form, so convert first (mont_mul by 1).
 // Evaluated via Horner in normal form, then one to_mont at the end.
 // ============================================================================
 ESIMD_INLINE Fp bb31_absorb_8(Vec16 vals[8]) {
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) vals[k] = bb31::mont_mul(vals[k], Vec16(1u));
+
     Fp acc = Fp::zero();
     acc.v[0] = vals[7];
 

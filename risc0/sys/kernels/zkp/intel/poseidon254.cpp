@@ -13,14 +13,16 @@ static uint32_t* g_d_p254_rc = nullptr;   // 150 x 8 = 1200 uint32_t
 static uint32_t* g_d_p254_mds = nullptr;  // 9 x 8 = 72 uint32_t
 
 static void ensure_poseidon254_device_constants(sycl::queue& q) {
-    if (g_d_p254_rc) return;
-
-    g_d_p254_rc = sycl::malloc_device<uint32_t>(150 * 8, q);
-    g_d_p254_mds = sycl::malloc_device<uint32_t>(9 * 8, q);
-
-    q.memcpy(g_d_p254_rc, &POSEIDON254_RC[0][0], 150 * 8 * sizeof(uint32_t));
-    q.memcpy(g_d_p254_mds, &POSEIDON254_MDS[0][0], 9 * 8 * sizeof(uint32_t));
-    q.wait();
+    // Thread-safe one-time init (C++11 magic static).
+    static const bool once = [&] {
+        g_d_p254_rc = sycl::malloc_device<uint32_t>(150 * 8, q);
+        g_d_p254_mds = sycl::malloc_device<uint32_t>(9 * 8, q);
+        q.memcpy(g_d_p254_rc, &POSEIDON254_RC[0][0], 150 * 8 * sizeof(uint32_t));
+        q.memcpy(g_d_p254_mds, &POSEIDON254_MDS[0][0], 9 * 8 * sizeof(uint32_t));
+        q.wait();
+        return true;
+    }();
+    (void)once;
 }
 
 // ============================================================================
@@ -45,14 +47,16 @@ static void poseidon254_fold_impl(sycl::queue& q, uint32_t* d_out,
             #pragma unroll
             for (int l = 0; l < 16; ++l) lanes[l] = l;
 
+            // count need not be a multiple of 16 (tail layers of a small tree).
+            esimd::simd_mask<16> live = (base + lanes) < count;
             esimd::simd<uint32_t, 16> left_base  = (2u * (base + lanes)) * 8u;
             esimd::simd<uint32_t, 16> right_base = left_base + 8u;
 
             bn254::Fp a_raw, b_raw;
             #pragma unroll
             for (int j = 0; j < 8; ++j) {
-                a_raw.v[j] = esimd::gather<uint32_t, 16>(d_in, (left_base + j) * 4u);
-                b_raw.v[j] = esimd::gather<uint32_t, 16>(d_in, (right_base + j) * 4u);
+                a_raw.v[j] = esimd::gather<uint32_t, 16>(d_in, (left_base + j) * 4u, live);
+                b_raw.v[j] = esimd::gather<uint32_t, 16>(d_in, (right_base + j) * 4u, live);
             }
 
             bn254::Fp a_mont = bn254::to_mont(a_raw);
@@ -69,7 +73,7 @@ static void poseidon254_fold_impl(sycl::queue& q, uint32_t* d_out,
             esimd::simd<uint32_t, 16> out_base = (base + lanes) * 8u;
             #pragma unroll
             for (int j = 0; j < 8; ++j) {
-                esimd::scatter<uint32_t, 16>(d_out, (out_base + j) * 4u, result.v[j]);
+                esimd::scatter<uint32_t, 16>(d_out, (out_base + j) * 4u, result.v[j], live);
             }
         }).wait();
 }
@@ -89,6 +93,13 @@ static void poseidon254_rows_impl(sycl::queue& q, uint32_t* d_out,
             uint32_t base = idx[0] * 16;
             if (base >= row_size) return;
 
+            esimd::simd<uint32_t, 16> lanes;
+            #pragma unroll
+            for (int l = 0; l < 16; ++l) lanes[l] = l;
+            // row_size need not be a multiple of 16: mask the tail group.
+            const bool full = base + 16 <= row_size;
+            esimd::simd_mask<16> live = (base + lanes) < row_size;
+
             bn254::Fp cells[3];
             cells[0] = bn254::Fp::zero();
             cells[1] = bn254::Fp::zero();
@@ -100,9 +111,13 @@ static void poseidon254_rows_impl(sycl::queue& q, uint32_t* d_out,
                 bn254::Vec16 vals[8];
                 #pragma unroll
                 for (int k = 0; k < 8; ++k) {
-                    if (col + k < col_size) {
+                    if (col + k < col_size && full) {
                         vals[k] = esimd::block_load<uint32_t, 16>(
                             d_matrix + (uint64_t)(col + k) * row_size + base);
+                    } else if (col + k < col_size) {
+                        vals[k] = esimd::gather<uint32_t, 16>(
+                            d_matrix + (uint64_t)(col + k) * row_size + base,
+                            lanes * 4u, live);
                     } else {
                         vals[k] = bn254::Vec16(0u);
                     }
@@ -125,13 +140,10 @@ static void poseidon254_rows_impl(sycl::queue& q, uint32_t* d_out,
 
             bn254::Fp result = bn254::from_mont(cells[0]);
 
-            esimd::simd<uint32_t, 16> lanes;
-            #pragma unroll
-            for (int l = 0; l < 16; ++l) lanes[l] = l;
             esimd::simd<uint32_t, 16> out_base = (base + lanes) * 8u;
             #pragma unroll
             for (int j = 0; j < 8; ++j) {
-                esimd::scatter<uint32_t, 16>(d_out, (out_base + j) * 4u, result.v[j]);
+                esimd::scatter<uint32_t, 16>(d_out, (out_base + j) * 4u, result.v[j], live);
             }
         }).wait();
 }

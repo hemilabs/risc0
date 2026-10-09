@@ -23,6 +23,7 @@ use anyhow::bail;
 use borsh::{BorshDeserialize, BorshSerialize};
 use derive_more::Debug;
 use risc0_binfmt::{read_sha_halfs, tagged_struct, Digestible};
+use risc0_circuit_keccak::KECCAK_CONTROL_ROOT;
 use risc0_circuit_recursion::{
     control_id::{ALLOWED_CONTROL_ROOT, MIN_LIFT_PO2, POSEIDON2_CONTROL_IDS, SHA256_CONTROL_IDS},
     CircuitImpl, CIRCUIT,
@@ -318,14 +319,17 @@ pub(crate) fn allowed_control_root(
 pub struct SuccinctReceiptVerifierParameters {
     /// Control root used to verify the control ID binding the executed recursion program.
     pub control_root: Digest,
+
     /// Control root used to verify the recursive control root in the output of the receipt.
     ///
     /// Usually, this should be set to None, which means it is equal to control_root. It may be set
     /// to a different value than control root when switching hash functions (e.g. recursively
     /// verifying a receipt produced with "poseidon2", producing a new receipt using "sha-256").
     pub inner_control_root: Option<Digest>,
+
     /// Protocol info string distinguishing the proof system under which the receipt should verify.
     pub proof_system_info: ProtocolInfo,
+
     /// Protocol info string distinguishing circuit with which the receipt should verify.
     pub circuit_info: ProtocolInfo,
 }
@@ -349,6 +353,16 @@ impl SuccinctReceiptVerifierParameters {
     #[stability::unstable]
     pub fn all_po2s() -> Self {
         Self::from_max_po2(risc0_zkp::MAX_CYCLES_PO2)
+    }
+
+    /// Construct verifier parameters that will accept lifted keccak receipts.
+    pub fn for_keccak() -> Self {
+        Self {
+            control_root: KECCAK_CONTROL_ROOT,
+            inner_control_root: None,
+            proof_system_info: PROOF_SYSTEM_INFO,
+            circuit_info: CircuitImpl::CIRCUIT_INFO,
+        }
     }
 }
 
@@ -419,5 +433,19 @@ mod tests {
             allowed_control_root("poseidon2", 24).unwrap(),
             allowed_control_root("poseidon2", 25).unwrap(),
         );
+    }
+}
+
+#[cfg(all(test, feature = "prove"))]
+mod keccak_control_root_tests {
+    #[test]
+    fn keccak_control_root_matches_allowed_ids() {
+        use risc0_circuit_keccak::KECCAK_CONTROL_ROOT;
+        use risc0_zkp::core::hash::poseidon2::Poseidon2HashSuite;
+
+        let hashfn = Poseidon2HashSuite::new_suite().hashfn;
+        let ids = crate::host::server::prove::keccak::keccak_allowed_control_ids();
+        let group = crate::receipt::merkle::MerkleGroup::new(ids).unwrap();
+        assert_eq!(group.calc_root(hashfn.as_ref()), KECCAK_CONTROL_ROOT);
     }
 }

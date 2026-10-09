@@ -306,6 +306,7 @@ impl<IH: IntelHash> CircuitHal<IntelHal<IH>> for IntelCircuitHal<IH> {
 
         // Keep poly_mix_buf alive until eval_check_dep() or next eval_check()
         *self.eval_check_poly_mix.lock() = Some(poly_mix_buf);
+        shadow_eval_check(check, groups, globals, poly_mix, po2, steps);
     }
 
     fn eval_check_dep(&self) {
@@ -762,6 +763,30 @@ mod tests {
         assert!(bad.is_empty(), "Intel eval_check diverged from CPU at po2=21");
     }
 
+    /// Intel eval_check matches CPU at the small production po2s, on both
+    /// the mono and multipass paths.
+    #[test]
+    #[ignore = "slow: CPU reference at production po2"]
+    fn eval_check_random_small_po2s() {
+        let mut failures = vec![];
+        for po2 in [15usize, 16, 17] {
+            let params = EvalCheckParams::random(po2, SEED_RANDOM);
+            let cpu = cpu_eval_check(&params);
+            for multipass in [false, true] {
+                let intel = intel_eval_check(&params, multipass);
+                let bad = (0..cpu.len()).filter(|&i| cpu[i] != intel[i]).count();
+                eprintln!(
+                    "[eval_check po2={po2} multipass={multipass}] {bad}/{} differ",
+                    cpu.len()
+                );
+                if bad > 0 {
+                    failures.push((po2, multipass));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "Intel eval_check diverged: {failures:?}");
+    }
+
     /// 2. Random differential — Intel multipass path matches CPU reference.
     #[test]
     fn eval_check_random_multipass() {
@@ -973,4 +998,74 @@ mod tests {
         );
     }
 
+}
+
+/// Debug aid: with `RISC0_INTEL_EVAL_CHECK_SHADOW=1`, wait for the GPU
+/// eval_check, rerun it on the CPU from the same inputs and report diverging
+/// cells. This is how the po2=16 warmup-order bug (whole SIMD16 threads of the
+/// monolithic kernel computing garbage) was found; random-input A/B tests
+/// cannot see failures that depend on runtime state. Very slow; off by default.
+fn shadow_eval_check(
+    check: &IntelBuffer<Val>,
+    groups: &[&IntelBuffer<Val>],
+    globals: &[&IntelBuffer<Val>],
+    poly_mix: ExtVal,
+    po2: usize,
+    steps: usize,
+) {
+    use risc0_zkp::{
+        core::hash::poseidon2::Poseidon2HashSuite,
+        hal::{cpu::CpuHal, Buffer as _},
+    };
+    if std::env::var_os("RISC0_INTEL_EVAL_CHECK_SHADOW").is_none() {
+        return;
+    }
+    let cpu_hal: CpuHal<risc0_core::field::baby_bear::BabyBear> =
+        CpuHal::new(Poseidon2HashSuite::new_suite());
+    let g: Vec<_> = groups
+        .iter()
+        .map(|b| cpu_hal.copy_from_elem("g", &b.to_vec()))
+        .collect();
+    let gl: Vec<_> = globals
+        .iter()
+        .map(|b| cpu_hal.copy_from_elem("gl", &b.to_vec()))
+        .collect();
+    let c = cpu_hal.alloc_elem("check", check.size());
+    let gr: Vec<&_> = g.iter().collect();
+    let glr: Vec<&_> = gl.iter().collect();
+    crate::prove::hal::cpu::CpuCircuitHal.eval_check(&c, &gr, &glr, poly_mix, po2, steps);
+    let (gv, cv) = (check.to_vec(), c.to_vec());
+    let bad = gv.iter().zip(&cv).filter(|(a, b)| a != b).count();
+    let first = gv.iter().zip(&cv).position(|(a, b)| a != b);
+    eprintln!(
+        "[eval_check shadow] po2={po2} groups={:?} bad={bad}/{} first={first:?}",
+        groups.iter().map(|b| b.size()).collect::<Vec<_>>(),
+        gv.len()
+    );
+    if bad > 0 {
+        let domain = steps * INV_RATE;
+        let idx: Vec<usize> = (0..gv.len()).filter(|&i| gv[i] != cv[i]).collect();
+        let mut by_comp = [0usize; 4];
+        let mut by_mod16 = [0usize; 16];
+        let mut rows = std::collections::BTreeSet::new();
+        for &i in &idx {
+            by_comp[i / domain] += 1;
+            by_mod16[(i % domain) % 16] += 1;
+            rows.insert(i % domain);
+        }
+        let r: Vec<_> = rows.iter().take(24).collect();
+        eprintln!(
+            "[eval_check shadow] by_comp={by_comp:?} rows={} first_rows={r:?}",
+            rows.len()
+        );
+        eprintln!("[eval_check shadow] by_row_mod16={by_mod16:?}");
+        let mut cyc = std::collections::BTreeMap::new();
+        for &row in &rows {
+            *cyc.entry(row % INV_RATE).or_insert(0usize) += 1;
+        }
+        eprintln!(
+            "[eval_check shadow] by_row_mod_INV_RATE={cyc:?} max_row={:?}",
+            rows.iter().last()
+        );
+    }
 }

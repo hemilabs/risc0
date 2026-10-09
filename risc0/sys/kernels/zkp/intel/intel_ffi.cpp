@@ -21,6 +21,8 @@ extern "C" {
     // Poseidon2 (poseidon2.cpp)
     void esimd_poseidon2_rows(sycl::queue& q, uint32_t* d_out, const uint32_t* d_in,
                                uint32_t count, uint32_t col_size);
+    void esimd_poseidon2_rows_esimd(sycl::queue& q, uint32_t* d_out, const uint32_t* d_in,
+                               uint32_t count, uint32_t col_size);
     void esimd_poseidon2_fold(sycl::queue& q, uint32_t* d_out, const uint32_t* d_in,
                                uint32_t num_hashes);
 
@@ -921,8 +923,9 @@ void esimd_warmup(void* queue, uint32_t max_lg_n) {
         gpu_inverse_ntt_fast(*q, d, 14);
     }
 
-    // Trigger poseidon2 constant initialization
-    esimd_poseidon2_rows(*q, d, d, 1, 16);
+    // Trigger poseidon2 constant initialization (ESIMD path only; see
+    // esimd_poseidon2_rows_esimd).
+    esimd_poseidon2_rows_esimd(*q, d, d, 1, 16);
 
     // Warm up poseidon2 fold (Merkle tree folding)
     // fold needs in[16*num_hashes], out[8*num_hashes]; with num_hashes=1 fits in d
@@ -942,6 +945,7 @@ void esimd_warmup(void* queue, uint32_t max_lg_n) {
         q->memset(d2, 0, 64 * 4);
         q->wait();
         esimd_batch_expand_ffi(queue, d2, d, 16, 64, 1, 2);
+        q->wait();  // sycl::free does not wait for kernels using the buffer
         sycl::free(d2, *q);
     }
 
@@ -955,6 +959,7 @@ void esimd_warmup(void* queue, uint32_t max_lg_n) {
         q->memset(d_mix4, 0, 4 * 4);
         q->wait();
         esimd_fri_fold(*q, d, d, d_mix4, 1);
+        q->wait();  // sycl::free does not wait for kernels using the buffer
         sycl::free(d_mix4, *q);
     }
 
@@ -964,6 +969,7 @@ void esimd_warmup(void* queue, uint32_t max_lg_n) {
         q->memset(d_scratch, 0, 16 * 4);
         q->wait();
         esimd_mix_poly_coeffs(*q, d, d_scratch, d_scratch, d_scratch, d_scratch, 1, 1);
+        q->wait();  // sycl::free does not wait for kernels using the buffer
         sycl::free(d_scratch, *q);
     }
 
@@ -973,6 +979,7 @@ void esimd_warmup(void* queue, uint32_t max_lg_n) {
         q->memset(d_eval, 0, 16 * 4);
         q->wait();
         esimd_batch_evaluate_any(*q, d, d_eval, d_eval, d_eval, 1, 1);
+        q->wait();  // sycl::free does not wait for kernels using the buffer
         sycl::free(d_eval, *q);
     }
 
@@ -984,8 +991,11 @@ void esimd_warmup(void* queue, uint32_t max_lg_n) {
         q->wait();
         gpu_forward_ntt_fast(*q, d_big, max_lg_n);
         gpu_inverse_ntt_fast(*q, d_big, max_lg_n);
+        q->wait();  // sycl::free does not wait for kernels using the buffer
         sycl::free(d_big, *q);
     }
+
+    q->wait();  // sycl::free does not wait for kernels using the buffer
 
     sycl::free(d, *q);
 }

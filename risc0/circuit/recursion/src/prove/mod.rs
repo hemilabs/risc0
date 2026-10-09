@@ -208,9 +208,33 @@ where
     circuit_hal: Arc<C>,
     // Cache ctrl PolyGroup by (code_rows, po2) to skip iNTT/expand/merkle on
     // repeated proofs with the same program (e.g. 43 lifts all use the same ZKR).
-    cached_ctrl_group: RefCell<HashMap<(usize, usize), PolyGroup<H>>>,
+    cached_ctrl_group: RefCell<HashMap<CtrlKey, PolyGroup<H>>>,
     // Cache ctrl GPU buffer by (code_rows, po2) to skip re-uploading ~24MB per proof.
-    cached_ctrl_buffer: RefCell<HashMap<(usize, usize), H::Buffer<H::Elem>>>,
+    cached_ctrl_buffer: RefCell<HashMap<CtrlKey, H::Buffer<H::Elem>>>,
+}
+
+/// (code_rows, po2, sampled code fingerprint). All recursion programs share
+/// RECURSION_PO2, so code_rows alone would be the only distinguishing field;
+/// two programs of equal length would silently reuse the wrong ctrl group and
+/// yield proofs that fail verification. The fingerprint samples the head,
+/// tail and a stride of the code so distinct programs get distinct keys
+/// without hashing the full ~24 MB on every proof.
+type CtrlKey = (usize, usize, u64);
+
+fn ctrl_cache_key(program: &Program) -> CtrlKey {
+    use std::hash::{Hash, Hasher};
+
+    const EDGE: usize = 1024;
+    const SAMPLES: usize = 256;
+    let code = &program.code;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    code.len().hash(&mut h);
+    let mut feed = |e: &BabyBearElem| e.as_u32_montgomery().hash(&mut h);
+    code.iter().take(EDGE).for_each(&mut feed);
+    code.iter().rev().take(EDGE).for_each(&mut feed);
+    let stride = (code.len() / SAMPLES).max(1);
+    code.iter().step_by(stride).for_each(&mut feed);
+    (program.code_rows(), program.po2, h.finish())
 }
 
 impl<H, C> RecursionProver for RecursionProverImpl<H, C>
@@ -236,7 +260,7 @@ where
         let preflight_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         let t0 = std::time::Instant::now();
-        let ctrl_key = (program.code_rows(), program.po2);
+        let ctrl_key = ctrl_cache_key(program);
         let cached_ctrl = self.cached_ctrl_buffer.borrow().get(&ctrl_key).cloned();
         let witgen = WitnessGenerator::new(
             self.hal.as_ref(),
@@ -287,7 +311,7 @@ where
                 // with the same program. Lift and join ZKRs have different code_rows,
                 // so we key by (code_rows, po2) to cache both independently.
                 let t0 = std::time::Instant::now();
-                let ctrl_key = (program.code_rows(), program.po2);
+                let ctrl_key = ctrl_cache_key(program);
                 let ctrl_cached;
                 {
                     let mut cache = self.cached_ctrl_group.borrow_mut();

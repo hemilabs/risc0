@@ -119,6 +119,46 @@ pub mod kernel {
         asm.program()
     }
 
+    /// Repeatedly drives the Poseidon2 host ecall in several modes (stateful
+    /// multi-block like the keccak batcher, single block, and stateless element
+    /// mode), `iters` times.
+    pub fn poseidon2(iters: u32) -> Program {
+        const IN_BYTES: u32 = 0x0050_0000;
+        const STATE_BYTES: u32 = 0x0051_0000;
+        const OUT_BYTES: u32 = 0x0052_0000;
+        const IN_WORDS: u32 = 6 * 16;
+
+        let mut asm = Assembler::new();
+        // Field-element-sized pseudo-random input (valid in both modes).
+        let mut x = 0x1234_5678u32;
+        for i in 0..IN_WORDS {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            asm.word(IN_BYTES + i * WORD_SIZE as u32, x % 0x7800_0001);
+        }
+
+        asm.li(REG_S2, 0);
+        asm.li(REG_S3, iters);
+        let loop_start = asm.text.len();
+        for (state, count) in [
+            (STATE_BYTES, 6),
+            (STATE_BYTES, 1),
+            (0, 2 | PFLAG_IS_ELEM),
+            (0, 1),
+        ] {
+            asm.li(REG_A7, HOST_ECALL_POSEIDON2);
+            asm.li(REG_A0, state);
+            asm.li(REG_A1, IN_BYTES);
+            asm.li(REG_A2, OUT_BYTES);
+            asm.li(REG_A3, count);
+            asm.ecall();
+        }
+        asm.addi(REG_S2, REG_S2, 1);
+        let offset = (loop_start as i32 - asm.text.len() as i32) * WORD_SIZE as i32;
+        asm.blt(REG_S2, REG_S3, offset);
+        asm.host_terminate(0, 0);
+        asm.program()
+    }
+
     pub fn multi_read() -> Program {
         const LENGTHS: &[u32] = &[0, 1, 2, 3, 4, 5, 7, 13, 19, 40, 101];
 

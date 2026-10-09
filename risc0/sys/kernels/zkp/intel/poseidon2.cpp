@@ -402,9 +402,33 @@ extern "C" {
 // Output: out[col * CELLS_OUT + c] for c=0..7
 // SIMD16: 16 columns processed per thread
 // ============================================================================
+static void poseidon2_rows_impl(sycl::queue& q,
+                                uint32_t* d_out, const uint32_t* d_in,
+                                uint32_t count, uint32_t col_size, bool allow_opencl);
+
 void esimd_poseidon2_rows(sycl::queue& q,
                            uint32_t* d_out, const uint32_t* d_in,
                            uint32_t count, uint32_t col_size) {
+    poseidon2_rows_impl(q, d_out, d_in, count, col_size, true);
+}
+
+// ESIMD-only variant for esimd_warmup. Launching the generic OpenCL rows
+// kernel during warmup (ahead of the twiddle/NTT warmup and the first rv32im
+// eval_check) leaves the monolithic eval_check kernel -- ~515 KB private
+// memory per thread -- computing garbage in ~30 random SIMD16 threads per
+// launch at po2=16, i.e. invalid segment proofs. The kernel itself is exact
+// (and the warmup fold's OpenCL launch is harmless); this looks like a driver
+// private-surface issue, found empirically. Keep warmup on the ESIMD path it
+// used before the generic OpenCL rows kernel existed.
+void esimd_poseidon2_rows_esimd(sycl::queue& q,
+                                uint32_t* d_out, const uint32_t* d_in,
+                                uint32_t count, uint32_t col_size) {
+    poseidon2_rows_impl(q, d_out, d_in, count, col_size, false);
+}
+
+static void poseidon2_rows_impl(sycl::queue& q,
+                                uint32_t* d_out, const uint32_t* d_in,
+                                uint32_t count, uint32_t col_size, bool allow_opencl) {
     // [gate0 OpenCL fast path]
     // - col_size == 24: bespoke `poseidon2_hash_rows_24_mont_io` (FRI commit width).
     // - col_size != 24: generic `poseidon2_hash_rows_mont_io` (loop variant of
@@ -415,7 +439,7 @@ void esimd_poseidon2_rows(sycl::queue& q,
     // Default: ON. Set RISC0_POSEIDON2_OPENCL_OFF=1 for emergency rollback.
     // Set RISC0_POSEIDON2_ROWS_GENERIC_OFF=1 to keep only the col_size==24
     // fast path lit (for bisection of the generic kernel).
-    bool opencl_ok = !std::getenv("RISC0_POSEIDON2_OPENCL_OFF");
+    bool opencl_ok = allow_opencl && !std::getenv("RISC0_POSEIDON2_OPENCL_OFF");
     bool generic_ok = opencl_ok && !std::getenv("RISC0_POSEIDON2_ROWS_GENERIC_OFF");
     if (opencl_ok && (col_size == 24 || generic_ok)) {
         ensure_poseidon2_opencl_kernels(q);

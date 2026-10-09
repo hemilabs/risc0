@@ -143,6 +143,27 @@ fn fwd_rev_ab_split() {
 #[test]
 #[ignore = "requires an Intel GPU; run explicitly"]
 fn intel_parallel_matches_cpu_seq() {
+    let iters = std::env::var("RISC0_WITGEN_AB_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300_000);
+    intel_ab(testutil::kernel::simple_loop(iters));
+}
+
+/// Same A/B check over a program that exercises the Poseidon2 accelerator.
+#[cfg(feature = "intel")]
+#[test]
+#[ignore = "requires an Intel GPU; run explicitly"]
+fn intel_poseidon2_matches_cpu_seq() {
+    let iters = std::env::var("RISC0_WITGEN_AB_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2_000);
+    intel_ab(testutil::kernel::poseidon2(iters));
+}
+
+#[cfg(feature = "intel")]
+fn intel_ab(program: Program) {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
@@ -153,11 +174,10 @@ fn intel_parallel_matches_cpu_seq() {
     fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
         std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
     }
-    let iters: u32 = env_or("RISC0_WITGEN_AB_ITERS", 300_000);
     let po2: usize = env_or("RISC0_WITGEN_AB_PO2", DEFAULT_SEGMENT_LIMIT_PO2);
     let reps: usize = env_or("RISC0_WITGEN_AB_REPS", 5);
 
-    let image = MemoryImage::new_kernel(testutil::kernel::simple_loop(iters));
+    let image = MemoryImage::new_kernel(program);
     let session = testutil::execute(
         image,
         po2,
@@ -178,7 +198,7 @@ fn intel_parallel_matches_cpu_seq() {
     let rand_z = ExtVal::random(&mut rng);
     let mut total_bad = 0usize;
 
-    eprintln!("[witgen-ab] {} segment(s), iters={iters}, po2 limit={po2}", session.segments.len());
+    eprintln!("[witgen-ab] {} segment(s), po2 limit={po2}", session.segments.len());
     for segment in session.segments {
         let pf = PreflightResults::new(&segment, rand_z).unwrap();
         let cycles = 1usize << segment.po2;

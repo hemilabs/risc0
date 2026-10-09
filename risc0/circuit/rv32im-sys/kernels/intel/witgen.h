@@ -68,7 +68,10 @@ struct MutableBufObj {
     if (zeroBack && col > zeroBack && back > 0) {
       return Val(0);
     }
-    size_t backRow = (buf.rows + ctx.cycle - back) % buf.rows;
+    // == (rows + cycle - back) % rows for back <= rows, without a 64-bit
+    // modulo (IGC emulates it via a builtin that crashes IGC 2.30.1 when
+    // inlined into the noinline step functions).
+    size_t backRow = ctx.cycle >= back ? ctx.cycle - back : buf.rows + ctx.cycle - back;
     if (back > 0 && preDataBuf.buf) {
       return preDataBuf.get(backRow, col);
     }
