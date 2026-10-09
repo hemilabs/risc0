@@ -794,6 +794,27 @@ fn intel_xs_options() -> String {
     parts.join(" ")
 }
 
+/// RISC0_INTEL_EVAL_FAST (default on; "0"/"off" disables): build the mono
+/// eval_check with the measured fast path (2319 -> 1510 ms per po2=20 kernel,
+/// bit-identical):
+/// - `-DRISC0_INTEL_EVAL_FAST`: 32-bit device Fp ops and an inlined
+///   lazy-reduction FpExt multiply (risc0/sys/cxx/fp.h, fpext.h), plus the
+///   host-supplied vanishing-quotient table (kernels/intel/eval_check.cpp).
+/// - kernels/intel/eval_nozero.py: no per-row zero-fill of poly_fp's private
+///   arrays, after statically proving every slot is written before it is read.
+/// - kernels/intel/eval_lazy_chain.py: lazy poly_mix accumulation chains.
+/// - IGC `DisableRecompilation=1`: mandatory with the above. Otherwise IGC's
+///   retry heuristic picks a recompiled kernel with ~2.5 MB of private memory
+///   per thread that runs ~2x slower than baseline.
+/// Only the mono eval_check is affected; multipass, witgen, accum and
+/// recursion keep the original arithmetic.
+fn intel_eval_fast_enabled() -> bool {
+    !matches!(
+        std::env::var("RISC0_INTEL_EVAL_FAST").as_deref(),
+        Ok("0") | Ok("false") | Ok("off") | Ok("OFF"),
+    )
+}
+
 /// Cache_dir helper that suffixes the variant name so each (GRF, SIMD)
 /// combination has its own .so + stamp set. Switching variants does NOT
 /// re-trigger a 30-min icpx compile if that variant is already cached.
@@ -893,11 +914,18 @@ fn compute_mono_hash(cxx_root: &str, icpx_version: &str) -> String {
         iex_raw.hash(&mut h);
         (h.finish() & 0xffffffff) as u32
     });
+    let fast_tag = if intel_eval_fast_enabled() {
+        in_tree.push(PathBuf::from("kernels/intel/eval_nozero.py"));
+        in_tree.push(PathBuf::from("kernels/intel/eval_lazy_chain.py"));
+        "fast1"
+    } else {
+        "fast0"
+    };
     let pairs = build_pairs(in_tree, cxx_root);
     let variant = intel_variant_tag();
     stamp::hash_labeled(
         &pairs,
-        &[icpx_version, INTEL_STAMP_VERSION, "mono", &variant, tree_reduce_tag, &iex_tag, &cse_tag],
+        &[icpx_version, INTEL_STAMP_VERSION, "mono", &variant, tree_reduce_tag, &iex_tag, &cse_tag, fast_tag],
     )
 }
 
@@ -1149,6 +1177,7 @@ fn build_intel_kernels() {
     println!("cargo:rerun-if-env-changed=RISC0_POLY_FP_CSE_TOP");
     println!("cargo:rerun-if-env-changed=RISC0_POLY_FP_CSE_MIN_SHARE");
     println!("cargo:rerun-if-env-changed=RISC0_LSC_HINTS");
+    println!("cargo:rerun-if-env-changed=RISC0_INTEL_EVAL_FAST");
     std::fs::create_dir_all(&cache_dir).unwrap();
 
     // Compute SHA-256 hashes of the inputs to each of the three icpx
@@ -1319,21 +1348,59 @@ fn build_intel_kernels() {
             + "} // namespace risc0::circuit::rv32im_v2\n".len()].to_string();
         std::fs::write(&mono_path, &mono_content).unwrap();
 
-        cmd.arg(&amalg_path)
+        // RISC0_INTEL_EVAL_FAST post-passes run on the mono build's copy only
+        // (the multipass generator keeps reading the untransformed mono_path).
+        let eval_fast = intel_eval_fast_enabled();
+        let mut xs_options = intel_xs_options();
+        let compile_src = if eval_fast {
+            let nozero_path = out_dir.join("intel_eval_check_amalg_nozero.cpp");
+            let fast_path = out_dir.join("intel_eval_check_amalg_fast.cpp");
+            for (script, input, output) in [
+                ("kernels/intel/eval_nozero.py", &amalg_path, &nozero_path),
+                ("kernels/intel/eval_lazy_chain.py", &nozero_path, &fast_path),
+            ] {
+                let status = Command::new("python3")
+                    .arg(script)
+                    .arg(input)
+                    .arg(output)
+                    .status()
+                    .unwrap_or_else(|e| panic!("failed to run {script}: {e}"));
+                if !status.success() {
+                    panic!("{script} failed");
+                }
+            }
+            cmd.arg("-DRISC0_INTEL_EVAL_FAST");
+            xs_options.push_str(" -igc_opts 'DisableRecompilation=1'");
+            eprintln!("  RISC0_INTEL_EVAL_FAST=1: compiling {}", fast_path.display());
+            fast_path
+        } else {
+            amalg_path.clone()
+        };
+
+        cmd.arg(&compile_src)
             .arg("-o")
             .arg(&so_path)
             .arg("-fsycl-targets=intel_gpu_bmg_g31") // AOT with noinline sub-functions
             // Force 256 GRF mode: doubles register file from 8KB to 16KB per thread,
             // dramatically reducing the 42KB spill overhead. Trades occupancy (8→4 threads/EU)
             // for fewer spills — net win since kernel is spill-bound, not compute-bound.
-            .arg("-Xs").arg(format!("-options \"{}\"", intel_xs_options()));
+            .arg("-Xs").arg(format!("-options \"{xs_options}\""));
 
         eprintln!("  Running: {:?}", cmd);
         let output = cmd.output().expect("Failed to run icpx");
+        let stderr = String::from_utf8_lossy(&output.stderr);
         if !output.status.success() {
             stamp::write(&stamp_path, &mono_hash, &icpx_version, "failed");
-            let stderr = String::from_utf8_lossy(&output.stderr);
             panic!("Intel eval_check compilation failed:\n{}", stderr);
+        }
+        // An unrecognised -igc_opts key is only a warning; with the fast path
+        // that silently means the ~2x slower recompiled kernel.
+        if stderr.contains("Invalid registry flag") {
+            stamp::write(&stamp_path, &mono_hash, &icpx_version, "failed");
+            panic!("IGC ignored an -igc_opts flag for eval_check:\n{}", stderr);
+        }
+        for line in stderr.lines().filter(|l| l.contains("spilled around")) {
+            eprintln!("  {}", line.trim());
         }
         stamp::write(&stamp_path, &mono_hash, &icpx_version, "ok");
         eprintln!("  Built {}", so_path.display());

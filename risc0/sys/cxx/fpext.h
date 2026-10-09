@@ -138,7 +138,60 @@ struct FpExt {
   // representations, and then reduce module x^4 - B, which means powers >= 4 get shifted back 4 and
   // multiplied by -beta.  We could write this as a double loops with some if's and hope it gets
   // unrolled properly, but it's small enough to just hand write.
+#if defined(__SYCL_DEVICE_ONLY__) && defined(RISC0_INTEL_EVAL_FAST)
+  // Inlined: as an out-of-line call (IGC's default for this size) every call
+  // passed operands through private memory and drained the pipeline; that
+  // calling convention, not the arithmetic, dominated the Intel eval_check.
+  __attribute__((always_inline))
+#endif
   constexpr FpExt operator*(FpExt rhs) const {
+#if defined(__SYCL_DEVICE_ONLY__) && defined(RISC0_INTEL_EVAL_FAST)
+    // Lazy reduction: fold NBETA into b (3 Montgomery muls), then each output
+    // coefficient is a 4-term dot product of raw Montgomery values summed
+    // exactly in 64 bits (as 32-bit lo/hi words with explicit carries; IGC
+    // emits add-with-carry) and reduced once. Bounds: each product < P^2, so
+    // a sum < 4P^2 < 2^64 and hi < 4P^2/2^32 < 1.875P; one conditional fold
+    // makes hi < P, so the subtraction-form REDC lands in (-P, P).
+    const uint32_t a0 = elems[0].asRaw(), a1 = elems[1].asRaw();
+    const uint32_t a2 = elems[2].asRaw(), a3 = elems[3].asRaw();
+    const uint32_t b0 = rhs.elems[0].asRaw(), b1 = rhs.elems[1].asRaw();
+    const uint32_t b2 = rhs.elems[2].asRaw(), b3 = rhs.elems[3].asRaw();
+    const uint32_t b1n = (rhs.elems[1] * NBETA).asRaw();
+    const uint32_t b2n = (rhs.elems[2] * NBETA).asRaw();
+    const uint32_t b3n = (rhs.elems[3] * NBETA).asRaw();
+    auto mulhi = [](uint32_t x, uint32_t y) { return uint32_t((uint64_t(x) * uint64_t(y)) >> 32); };
+    // dot4 returns the exact 64-bit sum packed into a uint64_t, and redc
+    // unpacks it: this is the measured-fastest form (v13). Reducing straight
+    // from the lo/hi words issues fewer instructions but measured ~10 ms slower.
+    auto dot4 = [&](uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1,
+                    uint32_t x2, uint32_t y2, uint32_t x3, uint32_t y3) -> uint64_t {
+      uint32_t lo = x0 * y0, hi = mulhi(x0, y0);
+      uint32_t p = x1 * y1, n = lo + p;
+      hi += mulhi(x1, y1) + (n < p ? 1u : 0u);
+      lo = n;
+      p = x2 * y2;
+      n = lo + p;
+      hi += mulhi(x2, y2) + (n < p ? 1u : 0u);
+      lo = n;
+      p = x3 * y3;
+      n = lo + p;
+      hi += mulhi(x3, y3) + (n < p ? 1u : 0u);
+      lo = n;
+      return (uint64_t(hi) << 32) | lo;
+    };
+    auto redc = [&](uint64_t s) -> Fp {
+      uint32_t lo = uint32_t(s), hi = uint32_t(s >> 32);
+      uint32_t hf = hi - Fp::P;
+      hi = hi < hf ? hi : hf;
+      uint32_t r = hi - mulhi(lo * Fp::M, Fp::P);
+      uint32_t t = r + Fp::P;
+      return Fp::fromRaw(r < t ? r : t);
+    };
+    return FpExt(redc(dot4(a0, b0, a1, b3n, a2, b2n, a3, b1n)),
+                 redc(dot4(a0, b1, a1, b0, a2, b3n, a3, b2n)),
+                 redc(dot4(a0, b2, a1, b1, a2, b0, a3, b3n)),
+                 redc(dot4(a0, b3, a1, b2, a2, b1, a3, b0)));
+#else
     // Rename the element arrays to something small for readability
 #define a elems
 #define b rhs.elems
@@ -148,6 +201,7 @@ struct FpExt {
                  a[0] * b[3] + a[1] * b[2] + a[2] * b[1] + a[3] * b[0]);
 #undef a
 #undef b
+#endif
   }
   constexpr FpExt operator*=(FpExt rhs) {
     *this = *this * rhs;

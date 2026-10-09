@@ -20,7 +20,7 @@ use parking_lot::Mutex;
 use risc0_core::scope;
 use risc0_zkp::{
     core::log2_ceil,
-    field::{map_pow, RootsOfUnity as _},
+    field::{map_pow, Elem as _, RootsOfUnity as _},
     hal::{
         intel::{
             BufferImpl as IntelBuffer, IntelHal, IntelHalPoseidon2, IntelHash, IntelHashPoseidon2,
@@ -193,20 +193,31 @@ impl<IH: IntelHash> CircuitHal<IntelHal<IH>> for IntelCircuitHal<IH> {
         const EXP_PO2: usize = log2_ceil(INV_RATE);
         let domain = steps * INV_RATE;
         let poly_mix_pows = map_pow(poly_mix, POLY_MIX_POWERS);
-
-        // Upload poly_mix_pows to GPU. Stored in the struct to keep it alive
-        // until eval_check_dep().
-        let poly_mix_buf: IntelBuffer<u32> = IntelBuffer::copy_from(
-            "poly_mix",
-            unsafe {
-                std::slice::from_raw_parts(
-                    poly_mix_pows.as_ptr() as *const u32,
-                    poly_mix_pows.len() * 4,
-                )
-            },
-        );
+        // eval_check.cpp hardcodes this count (POLY_MIX_COUNT) and, in the
+        // RISC0_INTEL_EVAL_FAST build, reads the quotient table right after it.
+        assert_eq!(poly_mix_pows.len(), 458);
 
         let rou = Val::ROU_FWD[po2 + EXP_PO2];
+
+        // Vanishing quotient table: the kernel's per-row
+        // 1 / ((3 * rou^cycle)^(2^po2) - 1) equals qtab[cycle % 4] with
+        // qtab[k] = 1 / (3^(2^po2) * w4^k - 1), w4 = rou^(2^po2) a primitive
+        // 4th root of unity. The fast kernel reads it; the other ignores it.
+        let y0 = Val::new(3).pow(1 << po2);
+        let w4 = rou.pow(1 << po2);
+        let qtab: Vec<Val> = (0..INV_RATE)
+            .map(|k| (y0 * w4.pow(k) - Val::ONE).inv())
+            .collect();
+
+        // Upload poly_mix_pows (+ qtab) to GPU. Stored in the struct to keep
+        // it alive until eval_check_dep(). Both are in device (Montgomery) form.
+        let mut poly_mix_words: Vec<u32> = unsafe {
+            std::slice::from_raw_parts(poly_mix_pows.as_ptr() as *const u32, poly_mix_pows.len() * 4)
+        }
+        .to_vec();
+        poly_mix_words.extend(qtab.iter().map(|q| q.as_u32_montgomery()));
+        let poly_mix_buf: IntelBuffer<u32> = IntelBuffer::copy_from("poly_mix", &poly_mix_words);
+
         let rou_raw: u32 = unsafe { std::mem::transmute(rou) };
 
         let queue = risc0_sys::intel::get_queue();

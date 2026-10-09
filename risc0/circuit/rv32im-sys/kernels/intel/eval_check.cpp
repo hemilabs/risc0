@@ -22,6 +22,12 @@ extern "C" const char* risc0_circuit_rv32im_intel_eval_check(
         auto* out = static_cast<Fp*>(const_cast<void*>(d_out));
         auto* mix = static_cast<Fp*>(const_cast<void*>(d_mix));
         auto* poly_mix = static_cast<FpExt*>(const_cast<void*>(d_poly_mix));
+#ifdef RISC0_INTEL_EVAL_FAST
+        // The vanishing quotient 1/((3*rou^cycle)^(2^po2) - 1) takes only 4
+        // values over the coset (rou^(2^po2) is a primitive 4th root), so the
+        // host appends them after the 458 poly_mix powers (see intel.rs).
+        const Fp* qtab = reinterpret_cast<const Fp*>(poly_mix + 458);
+#endif
         Fp rou_val;
         std::memcpy(&rou_val, &rou_raw, sizeof(uint32_t));
         // WG_SIZE=512 measured 11% E2E faster than WG=256 on B70 (BMG-G31)
@@ -52,9 +58,13 @@ extern "C" const char* risc0_circuit_rv32im_intel_eval_check(
                     FpExt* pm = slm.get_multi_ptr<sycl::access::decorated::no>().get();
                     FpExt tot = circuit::rv32im_v2::poly_fp(
                         (size_t)cycle, (size_t)domain, pm, args);
+#ifdef RISC0_INTEL_EVAL_FAST
+                    Fp quot = qtab[cycle & 3];
+#else
                     Fp x = Fp(3) * pow(rou_val, cycle);
                     Fp y = pow(x, uint32_t(1) << po2);
                     Fp quot = inv(y - Fp(1));
+#endif
                     for (uint32_t i = 0; i < 4; i++)
                         check[i * domain + cycle] = tot.elems[i] * quot;
                 });
