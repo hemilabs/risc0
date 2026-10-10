@@ -2990,13 +2990,18 @@ void gpu_inverse_ntt_fast(sycl::queue& q, uint32_t* d_data, uint32_t lg_n) {
     q.wait();
 }
 
+#include "nttc_insert.hpp"
+
 // Async variants: same as _fast but without q.wait() at the end.
 // Used by batch NTT wrappers to submit multiple NTTs on an in-order queue.
 void gpu_forward_ntt_no_wait(sycl::queue& q, uint32_t* d_data, uint32_t lg_n) {
     if (lg_n < 4) { abort(); }
     if (lg_n >= 26) { gpu_forward_ntt_multipass(q, d_data, lg_n); return; }
     const auto& tw = get_cached_twiddles(q, lg_n, true);
-    if (lg_n >= SLM_LG_BLOCK) {
+    if (lg_n >= SLM_LG_BLOCK && g_ntt_v3_on) {
+        ntt_ct_slm_v3<32, false>(q, d_data, d_data, lg_n, tw.d_buffer, tw);
+        ct_tail_passes(q, d_data, lg_n, tw);
+    } else if (lg_n >= SLM_LG_BLOCK) {
         ntt_ct_slm_combined(q, d_data, lg_n, tw.d_buffer, tw);
         uint32_t s = SLM_LG_BLOCK + 1;
         uint32_t remaining = lg_n - s + 1;
@@ -3014,6 +3019,14 @@ void gpu_forward_ntt_no_wait(sycl::queue& q, uint32_t* d_data, uint32_t lg_n) {
     // No q.wait() — caller batches multiple NTTs
 }
 
+// Fused LDE: out (2^lg_n) = forward NTT of coeffs (2^(lg_n-2)) expanded x4 with the
+// [c,0,0,0] stride pattern of esimd_batch_expand_ffi. Never reads `out`.
+void gpu_forward_ntt_expand4_no_wait(sycl::queue& q, uint32_t* d_out, const uint32_t* d_coeffs, uint32_t lg_n) {
+    const auto& tw = get_cached_twiddles(q, lg_n, true);
+    ntt_ct_slm_v3<32, true>(q, d_out, d_coeffs, lg_n, tw.d_buffer, tw);
+    ct_tail_passes(q, d_out, lg_n, tw);
+}
+
 void gpu_inverse_ntt_no_wait(sycl::queue& q, uint32_t* d_data, uint32_t lg_n) {
     if (lg_n < 4) { abort(); }
     if (lg_n >= 26) { gpu_inverse_ntt_multipass(q, d_data, lg_n); return; }
@@ -3021,10 +3034,12 @@ void gpu_inverse_ntt_no_wait(sycl::queue& q, uint32_t* d_data, uint32_t lg_n) {
     uint32_t inv_n = ntt::domain_inv[lg_n];
     if (lg_n >= SLM_LG_BLOCK) {
         uint32_t s = lg_n;
+        if (gs_tail_single(q, d_data, lg_n, tw)) s = SLM_LG_BLOCK;
         for (; s >= SLM_LG_BLOCK + 2; s -= 2)
             ntt_gs_fused_2stage(q, d_data, lg_n, s, tw.d_buffer+tw.offsets[s], tw.d_buffer+tw.offsets[s-1]);
         if (s == SLM_LG_BLOCK + 1) ntt_gs_stage_fast(q, d_data, lg_n, s, ntt::inverse_roots, tw.d_buffer+tw.offsets[s]);
-        ntt_gs_slm_combined(q, d_data, lg_n, tw.d_buffer, tw, inv_n);
+        if (g_ntt_v3_on) ntt_gs_slm_v3<32>(q, d_data, lg_n, tw.d_buffer, tw, inv_n, nullptr);
+        else ntt_gs_slm_combined(q, d_data, lg_n, tw.d_buffer, tw, inv_n);
     } else {
         for (uint32_t s = lg_n; s > 4; s--) ntt_gs_stage_fast(q, d_data, lg_n, s, ntt::inverse_roots, tw.d_buffer+tw.offsets[s]);
         ntt_gs_fused_small(q, d_data, lg_n, tw.d_buffer, tw, inv_n);
@@ -3050,11 +3065,13 @@ void gpu_inverse_ntt_zk_shift_no_wait(sycl::queue& q, uint32_t* d_data,
     uint32_t inv_n = ntt::domain_inv[lg_n];
     if (lg_n >= SLM_LG_BLOCK) {
         uint32_t s = lg_n;
+        if (gs_tail_single(q, d_data, lg_n, tw)) s = SLM_LG_BLOCK;
         for (; s >= SLM_LG_BLOCK + 2; s -= 2)
             ntt_gs_fused_2stage(q, d_data, lg_n, s, tw.d_buffer+tw.offsets[s], tw.d_buffer+tw.offsets[s-1]);
         if (s == SLM_LG_BLOCK + 1) ntt_gs_stage_fast(q, d_data, lg_n, s, ntt::inverse_roots, tw.d_buffer+tw.offsets[s]);
         // Fuse 1/N AND zk_shift into the SLM-combined final-store path
-        ntt_gs_slm_combined(q, d_data, lg_n, tw.d_buffer, tw, inv_n, /*total_elements=*/0, d_zk_powers);
+        if (g_ntt_v3_on) ntt_gs_slm_v3<32>(q, d_data, lg_n, tw.d_buffer, tw, inv_n, d_zk_powers);
+        else ntt_gs_slm_combined(q, d_data, lg_n, tw.d_buffer, tw, inv_n, /*total_elements=*/0, d_zk_powers);
     } else {
         for (uint32_t s = lg_n; s > 4; s--) ntt_gs_stage_fast(q, d_data, lg_n, s, ntt::inverse_roots, tw.d_buffer+tw.offsets[s]);
         ntt_gs_fused_small(q, d_data, lg_n, tw.d_buffer, tw, inv_n, d_zk_powers);

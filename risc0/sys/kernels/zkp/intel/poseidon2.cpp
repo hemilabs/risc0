@@ -123,6 +123,7 @@ static void ensure_poseidon2_device_constants(sycl::queue& q) {
 //   - inputs/outputs in NORMAL form (matching ESIMD's API contract).
 // ============================================================================
 #include "poseidon2_gate0_cl.inc"   // defines POSEIDON2_GATE0_CL_SRC
+#include "poseidon2_commit_cl.inc"  // defines POSEIDON2_COMMIT_CL_SRC
 
 static constexpr uint32_t POSEIDON2_R2_SQ = 1172168163u;  // R^2 mod P
 static constexpr uint32_t POSEIDON2_RC_PADDED = 696;       // gate0 padded layout
@@ -131,8 +132,14 @@ static uint32_t* g_d_rc_padded = nullptr;
 static std::optional<sycl::kernel> g_k_hash_fold;
 static std::optional<sycl::kernel> g_k_hash_rows_24;
 static std::optional<sycl::kernel> g_k_hash_rows_generic;  // any col_size, Mont-IO REPLACE sponge
+static std::optional<sycl::kernel> g_k_hash_rows_v6;       // commit-path: register-resident absorb + prefetch (SIMD16, WG 256)
+static std::optional<sycl::kernel> g_k_hash_fold_v3;       // commit-path: Shoup diag + literal RC
+static bool g_p2_v6 = false, g_p2_fold_v3 = false;  // set only once the kernels exist
+static size_t g_rows_lws = 1024;
 
 static void ensure_poseidon2_opencl_kernels(sycl::queue& q) {
+    // The commit-path kernels (v6 rows / v3 fold) are optional: if their
+    // bundle is switched off or fails to build, the gate0 kernels are used.
     if (g_k_hash_fold && g_k_hash_rows_24 && g_k_hash_rows_generic && g_d_rc_padded) return;
 
     ensure_poseidon2_host_constants();
@@ -191,6 +198,37 @@ static void ensure_poseidon2_opencl_kernels(sycl::queue& q) {
         g_k_hash_fold         = exe_kb.ext_oneapi_get_kernel("poseidon2_hash_fold_mont_io");
         g_k_hash_rows_24      = exe_kb.ext_oneapi_get_kernel("poseidon2_hash_rows_24_mont_io");
         g_k_hash_rows_generic = exe_kb.ext_oneapi_get_kernel("poseidon2_hash_rows_mont_io");
+        // Commit-path kernels: separate small bundle built in 128-GRF mode
+        // (SIMD16, 8 threads/EU; state fits without spill). Measured 185 -> 134 ms
+        // for 211 cols x 2^22 rows on B70, bit-identical.
+        const bool want_v6 = !std::getenv("RISC0_P2_ROWS_V6_OFF");
+        const bool want_fold_v3 = !std::getenv("RISC0_P2_FOLD_V3_OFF");
+        if (want_v6 || want_fold_v3) {
+            try {
+                auto src2 = sx::create_kernel_bundle_from_source(
+                    q.get_context(), sx::source_language::opencl,
+                    std::string(POSEIDON2_COMMIT_CL_SRC));
+                std::string log2;
+                std::vector<std::string> opts2 = {"-cl-std=CL3.0", "-cl-mad-enable"};
+                auto exe2 = sx::build(src2, sx::properties{sx::build_options(opts2), sx::save_log(&log2)});
+                if (!log2.empty()) std::fprintf(stderr, "[poseidon2-commit] build log:\n%s\n", log2.c_str());
+                // SIMD16 + madw(zero addend) + 1-block register prefetch. Robust to the
+                // GRF mode: 152 ms (IGC_TotalGRFNum=256 forced, as in the bench scripts) /
+                // 135 ms (128 GRF) vs 185 ms production, 211 cols x 2^22. The NEO persistent
+                // cache does not key on IGC_TotalGRFNum, so do not select kernels by env.
+                g_rows_lws = 256;
+                g_k_hash_rows_v6 = exe2.ext_oneapi_get_kernel("poseidon2_hash_rows_mont_io_v6");
+                g_k_hash_fold_v3 = exe2.ext_oneapi_get_kernel("poseidon2_hash_fold_mont_io_v3");
+                // fold v3 is launched with 1024-wide work-groups.
+                size_t fold_max = g_k_hash_fold_v3->get_info<
+                    sycl::info::kernel_device_specific::work_group_size>(q.get_device());
+                g_p2_v6 = want_v6;
+                g_p2_fold_v3 = want_fold_v3 && fold_max >= 1024;
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "[poseidon2-commit] disabled, using gate0 kernels: %s\n", e.what());
+                g_p2_v6 = g_p2_fold_v3 = false;
+            }
+        }
     }
 }
 
@@ -444,14 +482,15 @@ static void poseidon2_rows_impl(sycl::queue& q,
     if (opencl_ok && (col_size == 24 || generic_ok)) {
         ensure_poseidon2_opencl_kernels(q);
         const uint32_t r_sq = POSEIDON2_R2_SQ;
-        sycl::kernel k = (col_size == 24) ? *g_k_hash_rows_24 : *g_k_hash_rows_generic;
+        bool v6 = (col_size != 24) && g_p2_v6 && g_k_hash_rows_v6.has_value();
+        sycl::kernel k = (col_size == 24) ? *g_k_hash_rows_24 : (v6 ? *g_k_hash_rows_v6 : *g_k_hash_rows_generic);
         uint32_t* d_dst = d_out;
         const uint32_t* d_src = d_in;
         uint32_t* d_rc_pad = g_d_rc_padded;
         uint32_t* d_diag = g_d_diag;
         uint32_t cnt = count;
         uint32_t cs = col_size;
-        const size_t lws = 1024;
+        const size_t lws = v6 ? g_rows_lws : 1024;
         const size_t gws = ((size_t(count) + lws - 1) / lws) * lws;
         q.submit([&](sycl::handler& cgh) {
             cgh.set_arg(0, d_dst);
@@ -553,7 +592,10 @@ void esimd_poseidon2_fold(sycl::queue& q,
     if (!std::getenv("RISC0_POSEIDON2_OPENCL_OFF")) {
         ensure_poseidon2_opencl_kernels(q);
         const uint32_t r_sq = POSEIDON2_R2_SQ;
-        sycl::kernel k = *g_k_hash_fold;
+        // v3 only for real tree layers: esimd_warmup's 1-hash fold keeps the
+        // original kernel so the warmup launch sequence is unchanged.
+        sycl::kernel k = (g_p2_fold_v3 && g_k_hash_fold_v3.has_value() && num_hashes >= 1024)
+                             ? *g_k_hash_fold_v3 : *g_k_hash_fold;
         uint32_t* d_dst = d_out;
         const uint32_t* d_src = d_in;
         uint32_t* d_rc_pad = g_d_rc_padded;

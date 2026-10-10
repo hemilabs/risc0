@@ -1,3 +1,4 @@
+#include <cstdlib>
 // Element-wise HAL operations for Intel GPU STARK prover.
 // ESIMD implementations matching risc0's CUDA HAL kernels.
 // All kernels operate on device-resident data (no host-device transfer).
@@ -322,6 +323,43 @@ void esimd_scatter(sycl::queue& q,
 // swap element [batch*rowSize + idx] with [batch*rowSize + bit_rev(idx)]
 void esimd_batch_bit_reverse(sycl::queue& q, uint32_t* io,
                               uint32_t nBits, uint32_t count) {
+    // Commit-path: SLM-tiled in-place bit reversal with coalesced reads/writes.
+    // index = a<<(MB+5) | m<<5 | b  ->  rev5(b)<<(MB+5) | revMB(m)<<5 | rev5(a).
+    // One WG swaps tile m with tile rev(m). 7.56 -> 3.40 ms for 211 x 2^20 on B70.
+    static const bool tiled_on = !std::getenv("RISC0_BITREV_TILED_OFF");
+    if (tiled_on && nBits >= 12 && nBits <= 30 && (count & ((1u << nBits) - 1)) == 0) {
+        constexpr uint32_t LB = 5, TS = 1u << LB, TE = TS * TS, PITCH = TS + 1, WG = 256;
+        const uint32_t MB = nBits - 2 * LB;
+        const uint32_t nm = 1u << MB;
+        const uint32_t polys = count >> nBits;
+        uint32_t* p0 = io;
+        q.submit([&](sycl::handler& h) {
+            sycl::local_accessor<uint32_t, 1> T(TS * PITCH, h), U(TS * PITCH, h);
+            h.parallel_for(sycl::nd_range<1>(size_t(nm) * polys * WG, WG), [=](sycl::nd_item<1> it) {
+                uint32_t g = it.get_group(0);
+                uint32_t poly = g / nm, m = g % nm;
+                uint32_t mr = __builtin_bitreverse32(m) >> (32 - MB);
+                if (mr < m) return;  // uniform per WG
+                uint32_t lid = it.get_local_id(0);
+                uint32_t* p = p0 + (size_t)poly * (size_t(1) << nBits);
+                const uint32_t shA = MB + LB;
+                for (uint32_t e = lid; e < TE; e += WG) {
+                    uint32_t a = e >> LB, b = e & (TS - 1);
+                    T[a * PITCH + b] = p[(a << shA) | (m << LB) | b];
+                    if (mr != m) U[a * PITCH + b] = p[(a << shA) | (mr << LB) | b];
+                }
+                sycl::group_barrier(it.get_group());
+                for (uint32_t e = lid; e < TE; e += WG) {
+                    uint32_t A = e >> LB, B = e & (TS - 1);
+                    uint32_t ra = __builtin_bitreverse32(B) >> (32 - LB);
+                    uint32_t rb = __builtin_bitreverse32(A) >> (32 - LB);
+                    p[(A << shA) | (mr << LB) | B] = T[ra * PITCH + rb];
+                    if (mr != m) p[(A << shA) | (m << LB) | B] = U[ra * PITCH + rb];
+                }
+            });
+        });
+        return;
+    }
     auto* pd = io;
     // Removed [[intel::sycl_explicit_simd]] — with that attribute each
     // work-item ran SIMD1 (one lane). Plain SYCL lets the compiler pack

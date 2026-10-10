@@ -131,6 +131,22 @@ fn build_intel_kernels() {
 
     println!("cargo:rerun-if-changed={}", intel_dir.display());
 
+    // The OpenCL sources are embedded as raw-string .inc files (JIT-compiled
+    // at runtime); fail the build if an .inc no longer matches its .cl.
+    for name in ["poseidon2_gate0", "poseidon2_commit"] {
+        let cl = std::fs::read_to_string(intel_dir.join(format!("{name}.cl"))).unwrap();
+        let inc = std::fs::read_to_string(intel_dir.join(format!("{name}_cl.inc"))).unwrap();
+        let start = inc.find("R\"OPENCL(").map(|i| i + "R\"OPENCL(".len());
+        let end = inc.rfind(")OPENCL\"");
+        let embedded = match (start, end) {
+            (Some(s), Some(e)) if s <= e => &inc[s..e],
+            _ => panic!("{name}_cl.inc: no R\"OPENCL(...)OPENCL\" literal"),
+        };
+        if embedded.trim() != cl.trim() {
+            panic!("{name}_cl.inc is out of date with {name}.cl; regenerate it");
+        }
+    }
+
     // Find icpx compiler
     let icpx = which_icpx();
 

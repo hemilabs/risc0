@@ -311,6 +311,8 @@ impl IntelBufferPool {
 /// workload (e.g. a different po2) stay allocated, up to the pool cap, for the
 /// life of the process and can crowd out a later, larger session.
 pub fn release_idle_buffers() {
+    // esimd_free_device does not wait for queued work; drain the queue first.
+    unsafe { intel::esimd_sync(get_queue()) };
     let idle = BUFFER_POOL.lock().take_all();
     drop(idle);
 }
@@ -698,6 +700,29 @@ impl<IH: IntelHash + ?Sized> Hal for IntelHal<IH> {
         assert!(lg_out < Self::Elem::MAX_ROU_PO2);
 
         let queue = get_queue();
+
+        // Fused LDE for the x4 blowup: one pass per polynomial reads the
+        // coefficients and writes the evaluations, without materialising the
+        // zero-expanded buffer (same output). RISC0_FUSED_EXPAND_OFF=1 keeps
+        // the two-step path below.
+        // The fused pass is the v3 SLM kernel, so RISC0_NTT_V3_OFF disables it too.
+        static FUSED_EXPAND: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("RISC0_FUSED_EXPAND_OFF").is_none()
+                && std::env::var_os("RISC0_NTT_V3_OFF").is_none()
+        });
+        if expand_bits == 2 && (14..26).contains(&lg_out) && *FUSED_EXPAND {
+            esimd_check(unsafe {
+                intel::esimd_batch_expand_fwd_fused(
+                    queue,
+                    output.as_device_ptr().0 as *mut std::ffi::c_void,
+                    input.as_device_ptr().0 as *const std::ffi::c_void,
+                    ffi_u32(lg_out),
+                    ffi_u32(expand_bits),
+                    ffi_u32(poly_count),
+                )
+            });
+            return;
+        }
 
         // Step 1: GPU expand — fused zero+scatter in one pass.
         // Uses stride-scatter pattern matching the CPU's DIF expand_bits skip.
@@ -1398,7 +1423,30 @@ mod tests {
                 }
             }
         }
-        assert!(failures.is_empty(), "hash_rows mismatches: {failures:?}");
+        // Whole-tree fold: small layers, the CPU cutoff, and large layers
+        // that use the separate fold kernel (>= 1024 hashes per layer).
+        for layers in [1usize, 4, 9, 10, 11, 14, 18, 20] {
+            let n = 2usize << layers;
+            let digests: Vec<crate::core::digest::Digest> = (0..n)
+                .map(|_| {
+                    let w: Vec<u32> = (0..8).map(|_| Elem::random(&mut rng).as_u32_montgomery()).collect();
+                    crate::core::digest::Digest::try_from(w.as_slice()).unwrap()
+                })
+                .collect();
+            let g = gpu.copy_from_digest("tree", &digests);
+            let c = cpu.copy_from_digest("tree", &digests);
+            gpu.hash_fold_tree(&g, layers);
+            for i in (0..layers).rev() {
+                cpu.hash_fold(&c, 2 << i, 1 << i);
+            }
+            let (gv, cv) = (g.to_vec(), c.to_vec());
+            let bad = (1..(1usize << layers)).filter(|&i| gv[i] != cv[i]).count();
+            if bad > 0 {
+                eprintln!("[hash_fold] layers={layers}: {bad} interior nodes differ");
+                failures.push((0, layers));
+            }
+        }
+        assert!(failures.is_empty(), "hash_rows/hash_fold mismatches: {failures:?}");
     }
 
     #[test]
@@ -1520,21 +1568,29 @@ mod tests {
                 bad_total += bad.len();
             }
         }
-        // Commit path: coefficients at 2^(lg-2) expanded into the 2^lg domain.
+        // Commit path: coefficients at 2^(lg-bits) expanded into the 2^lg
+        // domain. Blowup x4 (bits=2) takes the fused expand+NTT pass for
+        // lg 14..25 (production: lg 22 at po2=20, 23 at po2=21); other blowups
+        // take expand + the regular forward NTT.
+        let mut lde_cases = vec![];
         for lg in 14..=21 {
             for count in [16usize, 103, 211] {
-                let n_in = count << (lg - 2);
-                let input: Vec<Elem> = (0..n_in).map(|_| Elem::random(&mut rng)).collect();
-                let (gi, ci) = (gpu.copy_from_elem("in", &input), cpu.copy_from_elem("in", &input));
-                let go = gpu.alloc_elem("out", count << lg);
-                let co = cpu.alloc_elem("out", count << lg);
-                gpu.batch_expand_into_evaluate_ntt(&go, &gi, count, 2);
-                cpu.batch_expand_into_evaluate_ntt(&co, &ci, count, 2);
-                let (gv, cv) = (go.to_vec(), co.to_vec());
-                let bad = gv.iter().zip(&cv).filter(|(a, b)| a != b).count();
-                eprintln!("[ntt] lg={lg} count={count} expand_evaluate: {bad} differ");
-                bad_total += bad;
+                lde_cases.push((lg, count, 2usize));
             }
+        }
+        lde_cases.extend([(22, 16, 2), (22, 211, 2), (23, 16, 2), (24, 4, 2), (16, 16, 1), (20, 16, 1), (19, 16, 3), (22, 8, 3)]);
+        for (lg, count, bits) in lde_cases {
+            let n_in = count << (lg - bits);
+            let input: Vec<Elem> = (0..n_in).map(|_| Elem::random(&mut rng)).collect();
+            let (gi, ci) = (gpu.copy_from_elem("in", &input), cpu.copy_from_elem("in", &input));
+            let go = gpu.alloc_elem("out", count << lg);
+            let co = cpu.alloc_elem("out", count << lg);
+            gpu.batch_expand_into_evaluate_ntt(&go, &gi, count, bits);
+            cpu.batch_expand_into_evaluate_ntt(&co, &ci, count, bits);
+            let (gv, cv) = (go.to_vec(), co.to_vec());
+            let bad = gv.iter().zip(&cv).filter(|(a, b)| a != b).count();
+            eprintln!("[ntt] lg={lg} count={count} bits={bits} expand_evaluate: {bad} differ");
+            bad_total += bad;
         }
         assert_eq!(bad_total, 0, "Intel NTT-family ops diverged from CPU");
     }

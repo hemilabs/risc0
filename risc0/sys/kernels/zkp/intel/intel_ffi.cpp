@@ -6,6 +6,8 @@
 #include <cstring>
 #include <cstdio>
 #include <vector>
+#include <stdexcept>
+#include <cstdlib>
 
 // Forward declarations for ESIMD kernel functions (defined in other .cpp files)
 extern "C" {
@@ -14,6 +16,7 @@ extern "C" {
     void gpu_inverse_ntt_fast(sycl::queue& q, uint32_t* d_data, uint32_t lg_n);
     void gpu_forward_ntt_no_wait(sycl::queue& q, uint32_t* d_data, uint32_t lg_n);
     void gpu_inverse_ntt_no_wait(sycl::queue& q, uint32_t* d_data, uint32_t lg_n);
+    void gpu_forward_ntt_expand4_no_wait(sycl::queue& q, uint32_t* d_out, const uint32_t* d_coeffs, uint32_t lg_n);
     void gpu_inverse_ntt_zk_shift_no_wait(sycl::queue& q, uint32_t* d_data,
                                           uint32_t lg_n, const uint32_t* d_zk_powers);
     void esimd_batch_bit_reverse(sycl::queue& q, uint32_t* io, uint32_t nBits, uint32_t count);
@@ -204,12 +207,12 @@ const char* esimd_batch_expand_ffi(void* queue, void* d_out, const void* d_in,
         if (stride == 4) {
             // Single-pass: each thread writes [coeff, 0, 0, 0] for one input element.
             // No separate memset needed — output is fully written in one pass.
-            uint32_t total = in_rows * cols;
+            size_t total = size_t(in_rows) * cols;
             q->parallel_for(sycl::range<1>(total), [=](sycl::id<1> gid) {
-                uint32_t idx = gid[0];
-                uint32_t r = idx % in_rows;
-                uint32_t c = idx / in_rows;
-                uint32_t out_base = r * 4 + c * out_rows;
+                size_t idx = gid[0];
+                size_t r = idx % in_rows;
+                size_t c = idx / in_rows;
+                size_t out_base = r * 4 + c * out_rows;
                 out[out_base]     = in_ptr[r + c * in_rows];
                 out[out_base + 1] = 0;
                 out[out_base + 2] = 0;
@@ -218,11 +221,11 @@ const char* esimd_batch_expand_ffi(void* queue, void* d_out, const void* d_in,
         } else {
             // Generic path for other strides
             q->memset(out, 0, (size_t)out_rows * cols * sizeof(uint32_t));
-            uint32_t total = in_rows * cols;
+            size_t total = size_t(in_rows) * cols;
             q->parallel_for(sycl::range<1>(total), [=](sycl::id<1> gid) {
-                uint32_t idx = gid[0];
-                uint32_t r = idx % in_rows;
-                uint32_t c = idx / in_rows;
+                size_t idx = gid[0];
+                size_t r = idx % in_rows;
+                size_t c = idx / in_rows;
                 out[r * stride + c * out_rows] = in_ptr[r + c * in_rows];
             });
         }
@@ -242,11 +245,27 @@ const char* esimd_batch_forward_ntt(void* queue, void* d_data,
         uint32_t n = 1u << lg_n;
         for (uint32_t c = 0; c < poly_count; c++) {
             // Submit NTT without intermediate q.wait() — queue is in-order
-            gpu_forward_ntt_no_wait(*q, data + c * stride, lg_n);
+            gpu_forward_ntt_no_wait(*q, data + size_t(c) * stride, lg_n);
         }
         // R2-A05: removed q->wait(). All `gpu_forward_ntt_no_wait` submits
         // are serialized by the in-order queue with whatever the caller
         // submits next (or with esimd_memcpy_dtoh for host reads).
+    )
+}
+
+// Fused LDE: x4 zero-expand + forward NTT in one pass per polynomial, reading
+// the 2^(lg_out-2) coefficients directly (no materialised expanded buffer).
+// Same result as esimd_batch_expand_ffi(stride 4) + esimd_batch_forward_ntt.
+const char* esimd_batch_expand_fwd_fused(void* queue, void* d_out, const void* d_in,
+                                         uint32_t lg_out, uint32_t lg_blowup, uint32_t cols) {
+    auto* q = static_cast<sycl::queue*>(queue);
+    FFI_WRAP(
+        if (lg_blowup != 2 || lg_out < 14 || lg_out >= 26) throw std::runtime_error("expand_fwd_fused: unsupported");
+        auto* out = static_cast<uint32_t*>(d_out);
+        auto* in = static_cast<const uint32_t*>(d_in);
+        size_t N = size_t(1) << lg_out; size_t n = N >> 2;
+        for (uint32_t c = 0; c < cols; c++)
+            gpu_forward_ntt_expand4_no_wait(*q, out + c * N, in + c * n, lg_out);
     )
 }
 
@@ -257,7 +276,7 @@ const char* esimd_batch_inverse_ntt(void* queue, void* d_data,
     FFI_WRAP(
         auto* data = static_cast<uint32_t*>(d_data);
         for (uint32_t c = 0; c < poly_count; c++) {
-            gpu_inverse_ntt_no_wait(*q, data + c * stride, lg_n);
+            gpu_inverse_ntt_no_wait(*q, data + size_t(c) * stride, lg_n);
         }
         // R2-A05: removed q->wait(). Symmetric with esimd_batch_forward_ntt
         // — the in-order queue serializes; host reads self-sync via
@@ -526,7 +545,7 @@ const char* esimd_batch_inverse_ntt_zk_shift(void* queue, void* d_data,
         auto* data = static_cast<uint32_t*>(d_data);
         auto* d_powers = ensure_zk_shift_powers(*q, lg_domain_size);
         for (uint32_t c = 0; c < poly_count; c++) {
-            gpu_inverse_ntt_zk_shift_no_wait(*q, data + c * stride,
+            gpu_inverse_ntt_zk_shift_no_wait(*q, data + size_t(c) * stride,
                                               lg_domain_size, d_powers);
         }
         // R2-A05: removed q->wait(). Symmetric with esimd_batch_inverse_ntt;

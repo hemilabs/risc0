@@ -51,6 +51,8 @@ extern "C" {
     pub fn esimd_batch_zk_shift(queue: *mut c_void, d_data: *mut c_void, lg_domain_size: u32, poly_count: u32) -> *const std::os::raw::c_char;
     pub fn esimd_batch_inverse_ntt_zk_shift(queue: *mut c_void, d_data: *mut c_void, lg_domain_size: u32, poly_count: u32, stride: u32) -> *const std::os::raw::c_char;
     pub fn esimd_batch_expand_ffi(queue: *mut c_void, d_out: *mut c_void, d_in: *const c_void, in_rows: u32, out_rows: u32, cols: u32, exp_po2: u32) -> *const std::os::raw::c_char;
+    /// Fused x4 LDE (expand + forward NTT); see intel_ffi.cpp.
+    pub fn esimd_batch_expand_fwd_fused(queue: *mut c_void, d_out: *mut c_void, d_in: *const c_void, lg_out: u32, lg_blowup: u32, cols: u32) -> *const std::os::raw::c_char;
 
     // Poseidon2
     pub fn esimd_poseidon2_hash_rows(queue: *mut c_void, d_out: *mut c_void, d_in: *const c_void, count: u32, col_size: u32) -> *const std::os::raw::c_char;
