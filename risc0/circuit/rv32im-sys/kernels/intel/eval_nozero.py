@@ -30,6 +30,20 @@ arrays = {m.group(3): (m.group(2), int(m.group(4))) for m in decl_re.finditer(fu
 if not arrays:
     sys.exit('eval_nozero: no private arrays found in poly_fp')
 
+# The proof below assumes straight-line code and plain `name[i] = v` stores.
+control_re = re.compile(r'\b(if|else|for|while|do|switch|case|goto)\b|\?|[{}]')
+for fn, (_, fbody) in funcs.items():
+    for ln in fbody.split('\n'):
+        code = re.sub(r'//.*', '', ln)
+        if control_re.search(code):
+            sys.exit('eval_nozero: control flow in %s (straight-line code expected): %s' % (fn, code.strip()[:100]))
+        if re.search(r'rv32im_v2_\d+\(', code) and not re.match(
+                r'^\s*auto \w+ = rv32im_v2_\d+\(cycle, steps, poly_mix, [\w\s,/*=\[\]]*\);\s*$', code):
+            sys.exit('eval_nozero: call inside a larger statement in %s: %s' % (fn, code.strip()[:100]))
+        for name in arrays:
+            if re.search(r'\b%s\[\d+\]\s*(\+\+|--|[-+*/%%&|^]=|<<=|>>=|\.|->)' % name, code):
+                sys.exit('eval_nozero: unsupported use of %s in %s: %s' % (name, fn, code.strip()[:100]))
+
 written, bad, reads = set(), [], 0
 callre = re.compile(r'(rv32im_v2_\d+)\(([^;]*)\)\s*$')
 idxre = re.compile(r'\b(\w+)\[(\d+)\]')

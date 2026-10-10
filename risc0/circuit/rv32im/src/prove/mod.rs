@@ -63,6 +63,18 @@ pub trait SegmentProver {
     fn reset_pipeline(&self) {}
 }
 
+/// Frees the Intel eval_check scratch slab (~1.4 GB at po2=20) between
+/// proving sessions; it is reallocated by the next eval_check. Best effort:
+/// a failure is logged, not returned, since the proof is already complete.
+#[cfg(feature = "intel")]
+pub fn release_intel_scratch() {
+    if let Err(e) = risc0_sys::ffi_wrap(|| unsafe {
+        risc0_circuit_rv32im_sys::risc0_circuit_rv32im_intel_eval_check_release()
+    }) {
+        tracing::warn!("releasing Intel eval_check scratch failed: {e}");
+    }
+}
+
 pub fn segment_prover() -> Result<Box<dyn SegmentProver>> {
     cfg_if! {
         if #[cfg(feature = "cuda")] {

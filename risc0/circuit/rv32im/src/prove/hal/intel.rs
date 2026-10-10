@@ -87,6 +87,10 @@ pub struct IntelCircuitHal<IH: IntelHash> {
     // for the finalize-overlap path that moves DeferredFinalize into the
     // receipt background thread.
     eval_check_poly_mix: Mutex<Option<IntelBuffer<u32>>>,
+    // Host source of the poly_mix upload: esimd_memcpy_htod does not wait, so
+    // the words must outlive the queued copy. Kept until the next eval_check
+    // replaces them (several host syncs later).
+    eval_check_poly_mix_host: Mutex<Option<Vec<u32>>>,
     eval_check_inter_fp: Mutex<Option<IntelBuffer<u32>>>,
     eval_check_inter_ext: Mutex<Option<IntelBuffer<u32>>>,
 }
@@ -96,6 +100,7 @@ impl<IH: IntelHash> IntelCircuitHal<IH> {
         Self {
             _hal,
             eval_check_poly_mix: Mutex::new(None),
+            eval_check_poly_mix_host: Mutex::new(None),
             eval_check_inter_fp: Mutex::new(None),
             eval_check_inter_ext: Mutex::new(None),
         }
@@ -217,6 +222,7 @@ impl<IH: IntelHash> CircuitHal<IntelHal<IH>> for IntelCircuitHal<IH> {
         .to_vec();
         poly_mix_words.extend(qtab.iter().map(|q| q.as_u32_montgomery()));
         let poly_mix_buf: IntelBuffer<u32> = IntelBuffer::copy_from("poly_mix", &poly_mix_words);
+        *self.eval_check_poly_mix_host.lock() = Some(poly_mix_words);
 
         let rou_raw: u32 = unsafe { std::mem::transmute(rou) };
 

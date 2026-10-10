@@ -803,6 +803,9 @@ fn intel_xs_options() -> String {
 /// - kernels/intel/eval_nozero.py: no per-row zero-fill of poly_fp's private
 ///   arrays, after statically proving every slot is written before it is read.
 /// - kernels/intel/eval_lazy_chain.py: lazy poly_mix accumulation chains.
+/// - kernels/intel/eval_slab.py: the per-row private arrays move to a
+///   liveness-renumbered, slot-major global slab (eval_check.cpp allocates it
+///   and tiles the launch); 1514 -> 620 ms per po2=20 kernel.
 /// - IGC `DisableRecompilation=1`: mandatory with the above. Otherwise IGC's
 ///   retry heuristic picks a recompiled kernel with ~2.5 MB of private memory
 ///   per thread that runs ~2x slower than baseline.
@@ -917,7 +920,8 @@ fn compute_mono_hash(cxx_root: &str, icpx_version: &str) -> String {
     let fast_tag = if intel_eval_fast_enabled() {
         in_tree.push(PathBuf::from("kernels/intel/eval_nozero.py"));
         in_tree.push(PathBuf::from("kernels/intel/eval_lazy_chain.py"));
-        "fast1"
+        in_tree.push(PathBuf::from("kernels/intel/eval_slab.py"));
+        "fast2"
     } else {
         "fast0"
     };
@@ -1139,6 +1143,12 @@ fn build_intel_kernels() {
 
     let cxx_root = env::var("DEP_RISC0_SYS_CXX_ROOT").unwrap();
     let out_dir = env::var("OUT_DIR").map(PathBuf::from).unwrap();
+    // The Intel kernels' field arithmetic (incl. the RISC0_INTEL_EVAL_FAST
+    // device paths) lives in these shared headers; the stamps hash them, but
+    // cargo must also re-run this script when they change.
+    for header in ["fp.h", "fpext.h"] {
+        println!("cargo:rerun-if-changed={cxx_root}/{header}");
+    }
 
     // Find icpx compiler
     let icpx = env::var("RISC0_ICPX")
@@ -1354,10 +1364,12 @@ fn build_intel_kernels() {
         let mut xs_options = intel_xs_options();
         let compile_src = if eval_fast {
             let nozero_path = out_dir.join("intel_eval_check_amalg_nozero.cpp");
+            let lazy_path = out_dir.join("intel_eval_check_amalg_lazy.cpp");
             let fast_path = out_dir.join("intel_eval_check_amalg_fast.cpp");
             for (script, input, output) in [
                 ("kernels/intel/eval_nozero.py", &amalg_path, &nozero_path),
-                ("kernels/intel/eval_lazy_chain.py", &nozero_path, &fast_path),
+                ("kernels/intel/eval_lazy_chain.py", &nozero_path, &lazy_path),
+                ("kernels/intel/eval_slab.py", &lazy_path, &fast_path),
             ] {
                 let status = Command::new("python3")
                     .arg(script)
@@ -1388,18 +1400,23 @@ fn build_intel_kernels() {
 
         eprintln!("  Running: {:?}", cmd);
         let output = cmd.output().expect("Failed to run icpx");
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        // IGC/ocloc report warnings on stdout, the compiler driver on stderr.
+        let log = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         if !output.status.success() {
             stamp::write(&stamp_path, &mono_hash, &icpx_version, "failed");
-            panic!("Intel eval_check compilation failed:\n{}", stderr);
+            panic!("Intel eval_check compilation failed:\n{}", log);
         }
         // An unrecognised -igc_opts key is only a warning; with the fast path
         // that silently means the ~2x slower recompiled kernel.
-        if stderr.contains("Invalid registry flag") {
+        if log.contains("Invalid registry flag") {
             stamp::write(&stamp_path, &mono_hash, &icpx_version, "failed");
-            panic!("IGC ignored an -igc_opts flag for eval_check:\n{}", stderr);
+            panic!("IGC ignored an -igc_opts flag for eval_check:\n{}", log);
         }
-        for line in stderr.lines().filter(|l| l.contains("spilled around")) {
+        for line in log.lines().filter(|l| l.contains("spilled around")) {
             eprintln!("  {}", line.trim());
         }
         stamp::write(&stamp_path, &mono_hash, &icpx_version, "ok");

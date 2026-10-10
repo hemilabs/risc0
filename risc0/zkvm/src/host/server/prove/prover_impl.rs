@@ -979,7 +979,10 @@ impl ProverServer for ProverImpl {
         // time, and stale sizes, e.g. from another po2, would crowd a later
         // session). Only on success: freeing after DEVICE_LOST never returns.
         #[cfg(feature = "intel")]
-        risc0_zkp::hal::intel::release_idle_buffers();
+        {
+            risc0_zkp::hal::intel::release_idle_buffers();
+            risc0_circuit_rv32im::prove::release_intel_scratch();
+        }
         Ok(info)
     }
 

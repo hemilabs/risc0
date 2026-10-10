@@ -164,6 +164,9 @@ extern "C" {
         queue: *mut std::os::raw::c_void,
     ) -> *const std::os::raw::c_char;
 
+    /// Frees eval_check's scratch slab (waits for the queue first).
+    pub fn risc0_circuit_rv32im_intel_eval_check_release() -> *const std::os::raw::c_char;
+
     // 2-way multi-pass eval_check (separate .so files per pass)
     pub fn risc0_circuit_rv32im_intel_eval_check_pass1(
         queue: *mut std::os::raw::c_void,
