@@ -78,6 +78,10 @@ extern "C" {
     pub fn esimd_batch_evaluate_any_ffi(queue: *mut c_void, d_out: *mut c_void, d_coeffs: *const c_void, d_which: *const c_void, d_xs: *const c_void, count: u32, deg: u32) -> *const std::os::raw::c_char;
     pub fn esimd_combos_prepare_ffi(queue: *mut c_void, d_combos: *mut c_void, d_coeff_u: *const c_void, combo_count: u32, cycles: u32, regs_count: u32, d_reg_sizes: *const c_void, d_reg_combo_ids: *const c_void, check_size: u32, d_mix: *const c_void) -> *const std::os::raw::c_char;
     pub fn esimd_combos_divide_ffi(queue: *mut c_void, d_combos: *mut c_void, rows: u32, combos_cols: u32, d_info: *const c_void, info_count: u32, d_remainders: *mut c_void) -> *const std::os::raw::c_char;
+    /// Device-side combos division (blocked synthetic division). `h_info`: host array of
+    /// `info_count` x {col, z[4] raw Montgomery}; `h_rem`: host array of `info_count` x 4 u32.
+    /// Synchronous; returns an error string if any remainder is nonzero.
+    pub fn esimd_combos_divide_v2_ffi(queue: *mut c_void, d_combos: *mut c_void, rows: u32, ncols: u32, h_info: *const c_void, info_count: u32, h_rem: *mut c_void) -> *const std::os::raw::c_char;
     pub fn esimd_combos_finalize_ffi(queue: *mut c_void, d_out: *mut c_void, d_combos: *const c_void, rows: u32, combos_cols: u32) -> *const std::os::raw::c_char;
 
     // GPU query (extract column + Merkle auth path on device)

@@ -1198,10 +1198,68 @@ impl<IH: IntelHash + ?Sized> Hal for IntelHal<IH> {
         });
     }
 
-    // combos_divide uses default CPU fallback. GPU implementation is sequential
-    // (4M iterations per division) and even when parallelized across combos via
-    // parallel_for, scalar GPU execution is much slower than vectorized CPU.
-    // Tested 7135ms GPU vs 234ms CPU (30x slower).
+    // combos_divide on the device: blocked synthetic division (B=64-element
+    // blocks, one Horner pass, a W<=1024-lane SLM suffix scan for the carries,
+    // one rewrite pass that also produces the next division's block values),
+    // batched per round over the columns. ~4 ms at po2=20 vs ~110 ms for the
+    // view_mut round trip + CPU divide. Results are bit-identical (exact field
+    // arithmetic). The remainder == 0 check is preserved: the FFI reads the
+    // remainders back and fails, and we re-check them here.
+    fn combos_divide(
+        &self,
+        combos: &Self::Buffer<Self::ExtElem>,
+        chunks: Vec<(usize, Vec<Self::ExtElem>)>,
+        cycles: usize,
+    ) {
+        scope!("combos_divide");
+        if cycles < (1 << 13) || std::env::var_os("RISC0_INTEL_CPU_COMBOS_DIVIDE").is_some() {
+            // Small domains (GPU path has ~1 ms fixed cost; CPU wins below 2^13 rows)
+            // and opt-out: CPU path, identical to the trait default.
+            use rayon::prelude::*;
+            combos.view_mut(|combos| {
+                combos
+                    .par_chunks_exact_mut(cycles)
+                    .zip(chunks)
+                    .for_each(|(combo_slice, (i, pows))| {
+                        for pow in pows {
+                            let remainder = crate::core::poly::poly_divide(combo_slice, pow);
+                            assert_eq!(remainder, <BabyBearExtElem as risc0_core::field::Elem>::ZERO, "i: {i}");
+                        }
+                    });
+            });
+            return;
+        }
+        assert!(cycles.is_power_of_two(), "combos_divide: cycles {cycles} not a power of two");
+        let ncols = combos.size() / cycles;
+        assert_eq!(ncols * cycles, combos.size());
+        let mut info: Vec<u32> = Vec::new();
+        for (col, pows) in &chunks {
+            assert!(*col < ncols, "combos_divide: column {col} >= {ncols}");
+            for pow in pows {
+                info.push(*col as u32);
+                info.extend_from_slice(unchecked_cast::<Self::ExtElem, u32>(std::slice::from_ref(pow)));
+            }
+        }
+        let count = info.len() / 5;
+        if count == 0 {
+            return;
+        }
+        let mut rems = vec![0u32; count * 4];
+        esimd_check(unsafe {
+            intel::esimd_combos_divide_v2_ffi(
+                get_queue(),
+                combos.as_device_ptr().0 as *mut std::ffi::c_void,
+                ffi_u32(cycles),
+                ffi_u32(ncols),
+                info.as_ptr() as *const std::ffi::c_void,
+                ffi_u32(count),
+                rems.as_mut_ptr() as *mut std::ffi::c_void,
+            )
+        });
+        for (k, r) in rems.chunks_exact(4).enumerate() {
+            assert!(r.iter().all(|&w| w == 0), "combos_divide: nonzero remainder (entry {k})");
+        }
+    }
 
     fn combos_prepare(
         &self,

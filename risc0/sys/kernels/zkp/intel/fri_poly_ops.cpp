@@ -6,6 +6,7 @@
 #include <sycl/ext/intel/esimd.hpp>
 #include "bb31_field.hpp"
 #include "bb31_fpext4.hpp"
+#include "combos_gpu.hpp"
 
 namespace esimd = sycl::ext::intel::esimd;
 using namespace fpext4;
@@ -139,74 +140,19 @@ void esimd_fri_fold(sycl::queue& q,
 // accumulating cur * in[count*i + idx] into out[count*combos[i] + idx]
 // ============================================================================
 void esimd_mix_poly_coeffs(sycl::queue& q,
-                            uint32_t* d_out,       // FpExt output (4 u32 per element)
-                            const uint32_t* d_in,  // Fp input coefficients
-                            const uint32_t* d_combos, // combo index per polynomial
-                            const uint32_t* d_mix_start, // 4 u32 = initial FpExt mix power
-                            const uint32_t* d_mix,       // 4 u32 = FpExt mix base
-                            uint32_t inputSize,
-                            uint32_t count) {
-    auto* pout = d_out;
-    auto* pin = d_in;
-    auto* pcombos = d_combos;
-    auto* pms = d_mix_start;
-    auto* pm = d_mix;
-
-    // SIMD16: each thread processes 16 consecutive coefficient indices
-    uint32_t num_threads = (count + 15) / 16;
-
-    q.parallel_for(sycl::range<1>(num_threads),
-        [=](sycl::id<1> idx) [[intel::sycl_explicit_simd]] {
-            uint32_t base = idx[0] * 16;
-
-            // Load mix parameters (broadcast — same for all 16 lanes)
-            FpExt4 cur(bb31::Vec16(*(pms+0)), bb31::Vec16(*(pms+1)),
-                       bb31::Vec16(*(pms+2)), bb31::Vec16(*(pms+3)));
-            FpExt4 mix(bb31::Vec16(*(pm+0)), bb31::Vec16(*(pm+1)),
-                       bb31::Vec16(*(pm+2)), bb31::Vec16(*(pm+3)));
-
-            for (uint32_t p = 0; p < inputSize; p++) {
-                uint32_t combo_id = *(pcombos + p);
-
-                // Load 16 consecutive Fp coefficients via block_load
-                bb31::Vec16 coeff;
-                if (base + 16 <= count) {
-                    coeff = esimd::block_load<uint32_t, 16>(pin + count * p + base);
-                } else {
-                    coeff = bb31::Vec16(0u);
-                    for (uint32_t lane = 0; lane < 16 && base + lane < count; lane++)
-                        coeff[lane] = *(pin + count * p + base + lane);
-                }
-
-                // cur * coeff (FpExt * Fp) — all 16 lanes compute independently
-                FpExt4 term = fpext_mul_fp(cur, coeff);
-
-                // Accumulate into out — AoS layout, scatter for non-contiguous FpExt elements
-                // Each lane writes to (count * combo_id + base + lane) * 4 + c
-                if (base + 16 <= count) {
-                    for (uint32_t c = 0; c < 4; c++) {
-                        // Gather old values
-                        esimd::simd<uint32_t, 16> lane(0u, 1u);
-                        auto byte_off = ((count * combo_id + base + lane) * 4 + c) * (uint32_t)sizeof(uint32_t);
-                        auto old = esimd::gather<uint32_t, 16>(pout, byte_off);
-                        auto sum = bb31::field_add(old, term.c[c]);
-                        esimd::scatter<uint32_t, 16>(pout, byte_off, sum);
-                    }
-                } else {
-                    for (uint32_t lane = 0; lane < 16 && base + lane < count; lane++) {
-                        uint32_t out_base = (count * combo_id + base + lane) * 4;
-                        for (uint32_t c = 0; c < 4; c++) {
-                            uint32_t old = *(pout + out_base + c);
-                            uint32_t s = old + term.c[c][lane];
-                            *(pout + out_base + c) = s >= bb31::MOD ? s - bb31::MOD : s;
-                        }
-                    }
-                }
-
-                cur = fpext_mul(cur, mix);
-            }
-        });
+                            uint32_t* d_out, const uint32_t* d_in, const uint32_t* d_combos,
+                            const uint32_t* d_mix_start, const uint32_t* d_mix,
+                            uint32_t inputSize, uint32_t count) {
+    // combos-v2: power table + register accumulation (one RMW per combo run).
+    if (inputSize == 0 || count == 0) return;
+    uint32_t* pw = sycl::malloc_device<uint32_t>(size_t(inputSize) * 4, q);
+    combos_gpu::mix_pw_table(q, pw, d_mix_start, d_mix, inputSize);
+    if (count % 4 == 0)
+        combos_gpu::mix_poly_coeffs_v3(q, d_out, d_in, d_combos, pw, inputSize, count, nullptr, 0);
+    else
+        combos_gpu::mix_poly_coeffs_v2(q, d_out, d_in, d_combos, pw, inputSize, count, nullptr, 0);
     q.wait();
+    sycl::free(pw, q);
 }
 
 // ============================================================================
@@ -216,95 +162,16 @@ void esimd_mix_poly_coeffs(sycl::queue& q,
 // combos_prepare: runs on HOST (single-threaded, same as CUDA <<<1,1>>>)
 // Uses USM shared memory so host can directly access device data
 void esimd_combos_prepare(sycl::queue& q,
-                           uint32_t* d_combos,
-                           const uint32_t* d_coeffU,
-                           uint32_t comboCount,
-                           uint32_t cycles,
-                           uint32_t regsCount,
-                           const uint32_t* d_regSizes,
-                           const uint32_t* d_regComboIds,
-                           uint32_t checkSize,
-                           const uint32_t* d_mix) {
-    // Copy small control data to host for scalar processing
-    auto* h_regSizes = sycl::malloc_host<uint32_t>(regsCount, q);
-    auto* h_regComboIds = sycl::malloc_host<uint32_t>(regsCount, q);
-    uint32_t h_mix[4];
-    q.memcpy(h_regSizes, d_regSizes, regsCount * 4);
-    q.memcpy(h_regComboIds, d_regComboIds, regsCount * 4);
-    q.memcpy(h_mix, d_mix, 16); q.wait();
-
-    // Compute total coeffU size
-    uint32_t total_u = 0;
-    for (uint32_t i = 0; i < regsCount; i++) total_u += h_regSizes[i];
-    total_u += checkSize;
-
-    // Copy combo and coeffU data to host
-    uint32_t combo_total = (comboCount + 1) * cycles * 4;
-    auto* h_combos = sycl::malloc_host<uint32_t>(combo_total, q);
-    auto* h_coeffU = sycl::malloc_host<uint32_t>(total_u * 4, q);
-    q.memcpy(h_combos, d_combos, combo_total * 4);
-    q.memcpy(h_coeffU, d_coeffU, total_u * 4 * 4); q.wait();
-
-    // Scalar Montgomery helpers
-    auto smul = [](uint32_t a, uint32_t b) -> uint32_t {
-        uint64_t prod = (uint64_t)a * b;
-        uint32_t lo = (uint32_t)prod, hi = (uint32_t)(prod >> 32);
-        uint32_t red = lo * 0x77ffffffu;
-        uint64_t rprod = (uint64_t)red * bb31::MOD;
-        uint32_t rlo = (uint32_t)rprod, rhi = (uint32_t)(rprod >> 32);
-        uint32_t carry = ((uint64_t)lo + rlo) >= (1ULL << 32) ? 1 : 0;
-        uint32_t res = hi + rhi + carry;
-        return res >= bb31::MOD ? res - bb31::MOD : res;
-    };
-    auto sadd = [](uint32_t a, uint32_t b) -> uint32_t {
-        uint32_t r = a + b; return r >= bb31::MOD ? r - bb31::MOD : r;
-    };
-    auto ssub = [](uint32_t a, uint32_t b) -> uint32_t {
-        return a >= b ? a - b : a + bb31::MOD - b;
-    };
-
-    uint32_t cur[4] = {bb31::ONE, 0, 0, 0};
-    uint32_t pos = 0;
-
-    auto ext_mul_mix = [&]() {
-        uint32_t nb = bb31::NBETA;
-        uint32_t r0 = sadd(smul(cur[0],h_mix[0]), smul(nb, sadd(sadd(smul(cur[1],h_mix[3]),smul(cur[2],h_mix[2])),smul(cur[3],h_mix[1]))));
-        uint32_t r1 = sadd(sadd(smul(cur[0],h_mix[1]),smul(cur[1],h_mix[0])), smul(nb, sadd(smul(cur[2],h_mix[3]),smul(cur[3],h_mix[2]))));
-        uint32_t r2 = sadd(sadd(sadd(smul(cur[0],h_mix[2]),smul(cur[1],h_mix[1])),smul(cur[2],h_mix[0])), smul(nb, smul(cur[3],h_mix[3])));
-        uint32_t r3 = sadd(sadd(sadd(smul(cur[0],h_mix[3]),smul(cur[1],h_mix[2])),smul(cur[2],h_mix[1])), smul(cur[3],h_mix[0]));
-        cur[0]=r0; cur[1]=r1; cur[2]=r2; cur[3]=r3;
-    };
-
-    auto process_coeff = [&](uint32_t combo_idx, uint32_t j) {
-        uint32_t u[4];
-        for (int c = 0; c < 4; c++) u[c] = h_coeffU[(pos+j)*4+c];
-        uint32_t nb = bb31::NBETA;
-        uint32_t p[4];
-        p[0] = sadd(smul(cur[0],u[0]), smul(nb, sadd(sadd(smul(cur[1],u[3]),smul(cur[2],u[2])),smul(cur[3],u[1]))));
-        p[1] = sadd(sadd(smul(cur[0],u[1]),smul(cur[1],u[0])), smul(nb, sadd(smul(cur[2],u[3]),smul(cur[3],u[2]))));
-        p[2] = sadd(sadd(sadd(smul(cur[0],u[2]),smul(cur[1],u[1])),smul(cur[2],u[0])), smul(nb, smul(cur[3],u[3])));
-        p[3] = sadd(sadd(sadd(smul(cur[0],u[3]),smul(cur[1],u[2])),smul(cur[2],u[1])), smul(cur[3],u[0]));
-        uint32_t base = (cycles * combo_idx + j) * 4;
-        for (int c = 0; c < 4; c++) h_combos[base+c] = ssub(h_combos[base+c], p[c]);
-    };
-
-    for (uint32_t rg = 0; rg < regsCount; rg++) {
-        uint32_t regSize = h_regSizes[rg];
-        uint32_t regComboId = h_regComboIds[rg];
-        for (uint32_t j = 0; j < regSize; j++) process_coeff(regComboId, j);
-        ext_mul_mix();
-        pos += regSize;
-    }
-    for (uint32_t ci = 0; ci < checkSize; ci++) {
-        process_coeff(comboCount, 0); // always j=0: CUDA subtracts from combos[cycles*comboCount] each time
-        pos++;
-        ext_mul_mix();
-    }
-
-    // Copy result back to device
-    q.memcpy(d_combos, h_combos, combo_total * 4); q.wait();
-    sycl::free(h_regSizes, q); sycl::free(h_regComboIds, q);
-    sycl::free(h_combos, q); sycl::free(h_coeffU, q);
+                           uint32_t* d_combos, const uint32_t* d_coeffU,
+                           uint32_t comboCount, uint32_t cycles, uint32_t regsCount,
+                           const uint32_t* d_regSizes, const uint32_t* d_regComboIds,
+                           uint32_t checkSize, const uint32_t* d_mix) {
+    // combos-v2: device-side U subtraction (no 2x(comboCount+1)*cycles*16 B host round trip).
+    // Async on the in-order queue: d_coeffU/d_regSizes/d_regComboIds/d_mix are pool
+    // buffers the caller drops on return, so keep the wait (cost: one queue drain).
+    combos_gpu::combos_prepare_v2(q, d_combos, d_coeffU, comboCount, cycles, regsCount,
+                                  d_regSizes, d_regComboIds, checkSize, d_mix, nullptr);
+    q.wait();
 }
 
 // ============================================================================

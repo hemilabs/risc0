@@ -292,6 +292,7 @@ const char* esimd_batch_inverse_ntt(void* queue, void* d_data,
 
 #include <sycl/ext/intel/esimd.hpp>
 #include "bb31_field.hpp"
+#include "combos_gpu.hpp"
 #include "ntt_twiddles.hpp"
 namespace esimd = sycl::ext::intel::esimd;
 
@@ -896,6 +897,30 @@ const char* esimd_combos_divide_ffi(void* queue, void* d_combos,
 // GPU combos finalize: sum FpExt columns per row, extract to Fp matrix.
 //   combos: FpExt[rows × combos_cols], layout combos(i,j).e[k] = raw[j*rows*4 + i*4 + k]
 //   out: Fp[rows × 4] column-major, out(i,j) = raw[j*rows + i]
+// combos_divide_v2: divide each combo column by (x - z) for every (col, z)
+// entry, in entry order per column, on the device (blocked synthetic
+// division, batched per round). h_info: host array of info_count x
+// {col, z0, z1, z2, z3} (z raw Montgomery words). h_rem: host array of
+// info_count x 4 words receiving the remainders. Synchronous. Returns an error
+// if any remainder is nonzero (same contract as the CPU path's assert_eq!).
+const char* esimd_combos_divide_v2_ffi(void* queue, void* d_combos, uint32_t rows, uint32_t ncols,
+                                       const void* h_info, uint32_t info_count, void* h_rem) {
+    auto* q = static_cast<sycl::queue*>(queue);
+    FFI_WRAP(
+        const uint32_t* in = static_cast<const uint32_t*>(h_info);
+        std::vector<combos_gpu::DivEntry> info(info_count);
+        for (uint32_t k = 0; k < info_count; k++) {
+            info[k].col = in[5 * k];
+            for (int c = 0; c < 4; c++) info[k].z.e[c] = in[5 * k + 1 + c];
+        }
+        std::vector<combos_gpu::E4> rem;
+        std::string err = combos_gpu::combos_divide_v2(*q, static_cast<uint32_t*>(d_combos), rows, ncols,
+                                                       info, rem, nullptr);
+        if (h_rem && !rem.empty()) std::memcpy(h_rem, rem.data(), rem.size() * sizeof(combos_gpu::E4));
+        if (!err.empty()) throw std::runtime_error(err);
+    )
+}
+
 const char* esimd_combos_finalize_ffi(void* queue, void* d_out, const void* d_combos,
                                        uint32_t rows, uint32_t combos_cols) {
     auto* q = static_cast<sycl::queue*>(queue);
