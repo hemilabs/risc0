@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Intel mono eval_check post-pass (RISC0_INTEL_EVAL_FAST), run after
-# eval_nozero.py and eval_lazy_chain.py: move poly_fp's per-row private arrays
+# eval_nozero.py and the lazy-chain pass: move poly_fp's per-row private arrays
 # (x33 Fp[1007], x34 FpExt[144]) into a slot-major global slab.
 #
 # Private memory is laid out per lane (lane-contiguous), so each SIMD16 access
@@ -30,6 +30,8 @@ STRIDE = 512  # rows per slab block == eval_check work-group size
 FDEF = re.compile(r'^(?:__attribute__\(\(noinline\)\) )?FpExt (rv32im_v2_\d+|poly_fp)\((.*)\) \{')
 CALL = re.compile(r'(rv32im_v2_\d+)\(cycle, steps, poly_mix, (.*)\);')
 CALL_STMT = re.compile(r'^\s*auto \w+ = rv32im_v2_\d+\(cycle, steps, poly_mix, [\w\s,/*=\[\]]*\);\s*$')
+# ec-stack extension: scalar FpExt args (scalarargs.py) pass `xN.elems[j]`.
+CALL_STMT_SARGS = re.compile(r'^\s*auto \w+ = rv32im_v2_\d+\(cycle, steps, poly_mix, (?:[\w/*=\[\]]+|\w+\.elems\[[0-3]\])(?:, (?:[\w/*=\[\]]+|\w+\.elems\[[0-3]\]))*\);\s*$')
 ACC = re.compile(r'\b(\w+)\[(\d+)\]')
 # The analysis treats each function body as straight-line code.
 CONTROL = re.compile(r'\b(if|else|for|while|do|switch|case|goto)\b|\?|[{}]')
@@ -97,7 +99,7 @@ def trace(src, funcs, arrays):
                     if rest.startswith('[') and not re.match(r'\[\d+\]', rest):
                         fail('non-literal index at line %d' % i)
             c = CALL.search(l)
-            if c and not CALL_STMT.match(l):
+            if c and not (CALL_STMT.match(l) or CALL_STMT_SARGS.match(l)):
                 # Reads/stores sharing a statement with a call are not ordered
                 # against the callee by this trace (C++ leaves it unspecified).
                 fail('call inside a larger statement at line %d: %s' % (i, l.strip()[:100]))

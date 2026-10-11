@@ -160,6 +160,35 @@ struct FpExt {
     const uint32_t b2n = (rhs.elems[2] * NBETA).asRaw();
     const uint32_t b3n = (rhs.elems[3] * NBETA).asRaw();
     auto mulhi = [](uint32_t x, uint32_t y) { return uint32_t((uint64_t(x) * uint64_t(y)) >> 32); };
+#if defined(RISC0_INTEL_EVAL_LOHI)
+    // Reduce straight from the lo/hi words (no uint64 pack/unpack). Fastest on
+    // the restructured eval_check (evalfast/ pipeline); only that build
+    // defines RISC0_INTEL_EVAL_LOHI.
+    auto redc4 = [&](uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1,
+                     uint32_t x2, uint32_t y2, uint32_t x3, uint32_t y3) -> Fp {
+      uint32_t lo = x0 * y0, hi = mulhi(x0, y0);
+      uint32_t p = x1 * y1, n = lo + p;
+      hi += mulhi(x1, y1) + (n < p ? 1u : 0u);
+      lo = n;
+      p = x2 * y2;
+      n = lo + p;
+      hi += mulhi(x2, y2) + (n < p ? 1u : 0u);
+      lo = n;
+      p = x3 * y3;
+      n = lo + p;
+      hi += mulhi(x3, y3) + (n < p ? 1u : 0u);
+      lo = n;
+      uint32_t hf = hi - Fp::P;
+      hi = hi < hf ? hi : hf;
+      uint32_t r = hi - mulhi(lo * Fp::M, Fp::P);
+      uint32_t t = r + Fp::P;
+      return Fp::fromRaw(r < t ? r : t);
+    };
+    return FpExt(redc4(a0, b0, a1, b3n, a2, b2n, a3, b1n),
+                 redc4(a0, b1, a1, b0, a2, b3n, a3, b2n),
+                 redc4(a0, b2, a1, b1, a2, b0, a3, b3n),
+                 redc4(a0, b3, a1, b2, a2, b1, a3, b0));
+#else
     // dot4 returns the exact 64-bit sum packed into a uint64_t, and redc
     // unpacks it: this is the measured-fastest form (v13). Reducing straight
     // from the lo/hi words issues fewer instructions but measured ~10 ms slower.
@@ -191,6 +220,7 @@ struct FpExt {
                  redc(dot4(a0, b1, a1, b0, a2, b3n, a3, b2n)),
                  redc(dot4(a0, b2, a1, b1, a2, b0, a3, b3n)),
                  redc(dot4(a0, b3, a1, b2, a2, b1, a3, b0)));
+#endif
 #else
     // Rename the element arrays to something small for readability
 #define a elems

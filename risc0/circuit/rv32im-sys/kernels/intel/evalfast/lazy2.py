@@ -37,10 +37,15 @@ for fi in range(len(starts)-1):
     # B-use map
     usedAsB=collections.Counter(m.group(3) for (_,m) in links.values())
     internal=set(x for x in links if uses[x]==1 and usedAsB[x]==1)
-    for x in links:
+    unfolded=set()   # internal RkAcc vars whose hi may be in [P, 2P)
+    for x in sorted(links, key=lambda v: links[v][0]):
         i,m=links[x]
         ind,X,B,C,k=m.groups()
-        e=f"rk_link({B}, {C}, poly_mix[{k}])"
+        # a no-fold link is allowed when the base is folded (hi < P) and the result stays internal
+        nofold = X in internal and B not in unfolded
+        fn = 'rk_link_nf' if nofold else 'rk_link'
+        if nofold: unfolded.add(X); stats['nofold']+=1
+        e=f"{fn}({B}, {C}, poly_mix[{k}])"
         if X in internal:
             F[i]=f"{ind}RkAcc {X} = {e};"; stats['internal']+=1
         else:
@@ -66,8 +71,23 @@ template <typename A> __attribute__((always_inline)) static inline RkAcc rk_link
 }
 template <typename A> __attribute__((always_inline)) static inline RkAcc rk_link(const A& base, FpExt c, const FpExt& pm) {
   RkAcc s = rk_acc(base); FpExt p = c * pm;
-  for (int j = 0; j < 4; j++) { uint32_t h = s.hi[j] + p.elems[j].asRaw(); s.hi[j] = rk_umin(h, h - Fp::P); }
+  for (int j = 0; j < 4; j++) { uint32_t h0 = rk_umin(s.hi[j], s.hi[j] - Fp::P); uint32_t h = h0 + p.elems[j].asRaw(); s.hi[j] = rk_umin(h, h - Fp::P); }
   return s;
+}
+// no-fold variant: input hi < P, output hi < P + 0.47P + 1 < 2P (fits u32); the next link must fold.
+template <typename A> __attribute__((always_inline)) static inline RkAcc rk_link_nf(const A& base, Fp c, const FpExt& pm) {
+  RkAcc s = rk_acc(base); uint32_t cr = c.asRaw();
+  for (int j = 0; j < 4; j++) {
+    uint32_t p = pm.elems[j].asRaw();
+    uint32_t pl = cr * p, ph = rk_mulhi(cr, p);
+    uint32_t n = s.lo[j] + pl;
+    s.hi[j] = s.hi[j] + ph + (n < pl ? 1u : 0u);
+    s.lo[j] = n;
+  }
+  return s;
+}
+template <typename A> __attribute__((always_inline)) static inline RkAcc rk_link_nf(const A& base, FpExt c, const FpExt& pm) {
+  return rk_link(base, c, pm);
 }
 __attribute__((always_inline)) static inline FpExt rk_fin(const RkAcc& s) {
   uint32_t r[4];

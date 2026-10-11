@@ -800,12 +800,14 @@ fn intel_xs_options() -> String {
 /// - `-DRISC0_INTEL_EVAL_FAST`: 32-bit device Fp ops and an inlined
 ///   lazy-reduction FpExt multiply (risc0/sys/cxx/fp.h, fpext.h), plus the
 ///   host-supplied vanishing-quotient table (kernels/intel/eval_check.cpp).
-/// - kernels/intel/eval_nozero.py: no per-row zero-fill of poly_fp's private
-///   arrays, after statically proving every slot is written before it is read.
-/// - kernels/intel/eval_lazy_chain.py: lazy poly_mix accumulation chains.
-/// - kernels/intel/eval_slab.py: the per-row private arrays move to a
-///   liveness-renumbered, slot-major global slab (eval_check.cpp allocates it
-///   and tiles the launch); 1514 -> 620 ms per po2=20 kernel.
+/// - kernels/intel/evalfast/pipeline.py: the source pipeline (exact,
+///   numerically verified algebraic rewrites; no per-row zero-fill, proven by
+///   eval_nozero.py; lazy poly_mix chains; scheduling + scalar FpExt args; the
+///   per-row arrays in a liveness-renumbered slot-major global slab via
+///   eval_slab.py, which eval_check.cpp allocates and tiles; 32-bit indexing,
+///   so po2 <= 22; lazy linear combinations). 2319 -> ~320 ms per po2=20 kernel.
+/// - `-DRISC0_INTEL_EVAL_LOHI`: the lo/hi-word FpExt reduction (fpext.h),
+///   fastest for this kernel only.
 /// - IGC `DisableRecompilation=1`: mandatory with the above. Otherwise IGC's
 ///   retry heuristic picks a recompiled kernel with ~2.5 MB of private memory
 ///   per thread that runs ~2x slower than baseline.
@@ -919,9 +921,15 @@ fn compute_mono_hash(cxx_root: &str, icpx_version: &str) -> String {
     });
     let fast_tag = if intel_eval_fast_enabled() {
         in_tree.push(PathBuf::from("kernels/intel/eval_nozero.py"));
-        in_tree.push(PathBuf::from("kernels/intel/eval_lazy_chain.py"));
         in_tree.push(PathBuf::from("kernels/intel/eval_slab.py"));
-        "fast2"
+        let mut scripts: Vec<PathBuf> = std::fs::read_dir("kernels/intel/evalfast")
+            .expect("kernels/intel/evalfast")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().map_or(false, |x| x == "py"))
+            .collect();
+        scripts.sort();
+        in_tree.extend(scripts);
+        "fast3"
     } else {
         "fast0"
     };
@@ -1364,25 +1372,20 @@ fn build_intel_kernels() {
         let eval_fast = intel_eval_fast_enabled();
         let mut xs_options = intel_xs_options();
         let compile_src = if eval_fast {
-            let nozero_path = out_dir.join("intel_eval_check_amalg_nozero.cpp");
-            let lazy_path = out_dir.join("intel_eval_check_amalg_lazy.cpp");
             let fast_path = out_dir.join("intel_eval_check_amalg_fast.cpp");
-            for (script, input, output) in [
-                ("kernels/intel/eval_nozero.py", &amalg_path, &nozero_path),
-                ("kernels/intel/eval_lazy_chain.py", &nozero_path, &lazy_path),
-                ("kernels/intel/eval_slab.py", &lazy_path, &fast_path),
-            ] {
-                let status = Command::new("python3")
-                    .arg(script)
-                    .arg(input)
-                    .arg(output)
-                    .status()
-                    .unwrap_or_else(|e| panic!("failed to run {script}: {e}"));
-                if !status.success() {
-                    panic!("{script} failed");
-                }
+            let work_dir = out_dir.join("evalfast_work");
+            let status = Command::new("python3")
+                .arg("kernels/intel/evalfast/pipeline.py")
+                .arg(&amalg_path)
+                .arg(&fast_path)
+                .arg(&work_dir)
+                .status()
+                .unwrap_or_else(|e| panic!("failed to run evalfast/pipeline.py: {e}"));
+            if !status.success() {
+                panic!("evalfast/pipeline.py failed (RISC0_INTEL_EVAL_FAST=0 builds the plain kernel)");
             }
             cmd.arg("-DRISC0_INTEL_EVAL_FAST");
+            cmd.arg("-DRISC0_INTEL_EVAL_LOHI");
             xs_options.push_str(" -igc_opts 'DisableRecompilation=1'");
             eprintln!("  RISC0_INTEL_EVAL_FAST=1: compiling {}", fast_path.display());
             fast_path
