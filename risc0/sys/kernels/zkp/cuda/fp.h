@@ -19,6 +19,11 @@
 
 #include <cstdint>
 
+#if defined(_MSC_VER)
+// The kernels use `uint`, which glibc's <sys/types.h> provides and MSVC does not.
+typedef unsigned int uint;
+#endif
+
 /// The Fp class is an element of the finite field F_p, where P is the prime number 15*2^27 + 1.
 /// Put another way, Fp is basically integer arithmetic modulo P.
 ///

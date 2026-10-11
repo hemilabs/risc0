@@ -33,10 +33,12 @@ fn generate_zkr_table() {
         let mut decoder = XzDecoder::new(std::fs::File::open(&zkr_path).unwrap());
         std::io::copy(&mut decoder, &mut std::io::sink()).unwrap();
         let size = decoder.total_out();
+        // `{:?}` writes a Rust string literal, escaping the backslashes of a Windows
+        // path (`\\?\C:\...` after canonicalize), which `"{}"` would leave as escapes.
         writeln!(
             &mut output,
-            "(include_bytes!(\"{}\"), {size}),",
-            zkr_path.display()
+            "(include_bytes!({:?}), {size}),",
+            zkr_path.display().to_string()
         )
         .unwrap();
     }

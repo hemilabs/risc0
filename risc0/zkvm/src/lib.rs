@@ -119,6 +119,10 @@ pub use self::host::{
 pub use self::host::client::prove::bonsai::BonsaiProver;
 
 #[cfg(not(target_os = "zkvm"))]
+#[cfg(all(feature = "client", unix))]
+pub use self::host::client::prove::default::DefaultProver;
+
+#[cfg(not(target_os = "zkvm"))]
 #[cfg(feature = "client")]
 pub use {
     self::host::{
@@ -129,7 +133,6 @@ pub use {
         client::{
             env::{ExecutorEnv, ExecutorEnvBuilder},
             prove::{
-                default::DefaultProver,
                 default_executor, default_prover,
                 external::ExternalProver,
                 opts::{ProverOpts, ReceiptKind},

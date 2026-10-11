@@ -783,7 +783,18 @@ pub unsafe extern "C" fn sys_argv(
 #[cfg_attr(feature = "export-syscalls", no_mangle)]
 #[deprecated]
 pub extern "C" fn sys_alloc_words(nwords: usize) -> *mut u32 {
-    unsafe { sys_alloc_aligned(WORD_SIZE * nwords, WORD_SIZE) as *mut u32 }
+    #[cfg(any(target_os = "zkvm", feature = "export-syscalls"))]
+    unsafe {
+        sys_alloc_aligned(WORD_SIZE * nwords, WORD_SIZE) as *mut u32
+    }
+    // On the host without `export-syscalls`, `sys_alloc_aligned` is a bare extern
+    // declaration with no definition. GNU ld drops this unused function before resolving
+    // it; MSVC's linker does not, and fails on the reference.
+    #[cfg(not(any(target_os = "zkvm", feature = "export-syscalls")))]
+    {
+        let _ = nwords;
+        unimplemented!("sys_alloc_words called outside of target_os = zkvm")
+    }
 }
 
 /// # Safety
