@@ -24,7 +24,6 @@ RISC0_SYS_OUT=$(ls -dt $(pwd)/target/release/build/risc0-sys-*/out 2>/dev/null |
 export LD_LIBRARY_PATH="$PATCHED_IGC:$SPIRV_TRANS:$LLVM16_LIB:$LLVM16_CORE:$(pwd)/target/release/intel_recursion_cache:$(pwd)/target/release/intel_rv32im_cache_default:$(pwd)/target/release/intel_rv32im_cache:${RISC0_SYS_OUT}:${LD_LIBRARY_PATH:-}"
 export NEO_CACHE_PERSISTENT=1
 export SYCL_CACHE_PERSISTENT=1
-export IGC_TotalGRFNum=256
 export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
 
 # Allow caller to override / add env vars by passing KEY=VAL pairs

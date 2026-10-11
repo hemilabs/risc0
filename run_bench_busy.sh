@@ -13,6 +13,5 @@ RISC0_SYS_OUT=$(ls -td "$(pwd)"/target/release/build/risc0-sys-*/out 2>/dev/null
 export LD_LIBRARY_PATH="$(pwd)/target/release/intel_recursion_cache:$(pwd)/target/release/intel_rv32im_cache_default:$(pwd)/target/intel-circuit-cache:${RISC0_SYS_OUT}:$LD_LIBRARY_PATH"
 export NEO_CACHE_PERSISTENT=1
 export SYCL_CACHE_PERSISTENT=1
-export IGC_TotalGRFNum=256
 for kv in "$@"; do export "$kv"; done
 ./target/release/examples/prove_busy "$ITERS" "$PO2" 2>&1

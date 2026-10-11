@@ -822,3 +822,39 @@ __kernel FOLD_SIG(poseidon2_hash_fold_mont_io_v3) { FOLD_BODY(PERM_V3(cells, add
 /* variant robust to a forced 256-GRF JIT (IGC_TotalGRFNum=256): SIMD16 + madw(0 addend) + 1-block prefetch */
 __attribute__((reqd_work_group_size(256, 1, 1))) __attribute__((intel_reqd_sub_group_size(16)))
 __kernel ROWS_SIG(poseidon2_hash_rows_mont_io_v6) { ROWS_BODY_PF(PERM_V3(cells, add_rc_sbox_lit_madw, bb_sbox_mont_madw)) }
+/* ===== commit-path2 variants (appended to poseidon2_commit.cl) ===== */
+inline uint x_mul_sub(uint a, uint b) {
+    const uint lo = a * b, hi = mul_hi(a, b);
+    const uint m = lo * 0x88000001u;           /* p^-1 mod 2^32 */
+    const uint r = hi - mul_hi(m, BABY_BEAR_P);
+    return min(r, r + BABY_BEAR_P);
+}
+inline uint x_sbox_sub(uint x) {
+    const uint x2 = x_mul_sub(x, x); const uint x4 = x_mul_sub(x2, x2);
+    const uint x6 = x_mul_sub(x4, x2); return x_mul_sub(x6, x);
+}
+inline void add_rc_sbox_lit_sub(uint *cells, const uint *rc) {
+    uint x[CELLS], x2[CELLS], x4[CELLS], x6[CELLS];
+    #pragma unroll
+    for (uint i = 0u; i < CELLS; ++i) x[i] = bb_add(cells[i], rc[i]);
+    #pragma unroll
+    for (uint i = 0u; i < CELLS; ++i) x2[i] = x_mul_sub(x[i], x[i]);
+    #pragma unroll
+    for (uint i = 0u; i < CELLS; ++i) x4[i] = x_mul_sub(x2[i], x2[i]);
+    #pragma unroll
+    for (uint i = 0u; i < CELLS; ++i) x6[i] = x_mul_sub(x4[i], x2[i]);
+    #pragma unroll
+    for (uint i = 0u; i < CELLS; ++i) cells[i] = x_mul_sub(x6[i], x[i]);
+}
+/* v7: v3 structure (literal RC, Shoup diag) with subtraction-form REDC; no madw */
+__attribute__((reqd_work_group_size(1024, 1, 1)))
+__kernel ROWS_SIG(poseidon2_hash_rows_mont_io_v7) { ROWS_BODY(PERM_V3(cells, add_rc_sbox_lit_sub, x_sbox_sub)) }
+__attribute__((reqd_work_group_size(256, 1, 1))) __attribute__((intel_reqd_sub_group_size(16)))
+__kernel ROWS_SIG(poseidon2_hash_rows_mont_io_v7s16) { ROWS_BODY(PERM_V3(cells, add_rc_sbox_lit_sub, x_sbox_sub)) }
+__attribute__((reqd_work_group_size(256, 1, 1))) __attribute__((intel_reqd_sub_group_size(16)))
+__kernel ROWS_SIG(poseidon2_hash_rows_mont_io_v7pf) { ROWS_BODY_PF(PERM_V3(cells, add_rc_sbox_lit_sub, x_sbox_sub)) }
+__attribute__((reqd_work_group_size(1024, 1, 1)))
+__kernel ROWS_SIG(poseidon2_hash_rows_mont_io_v7pfa) { ROWS_BODY_PF(PERM_V3(cells, add_rc_sbox_lit_sub, x_sbox_sub)) }
+__kernel FOLD_SIG(poseidon2_hash_fold_mont_io_v7) { FOLD_BODY(PERM_V3(cells, add_rc_sbox_lit_sub, x_sbox_sub)) }
+__attribute__((intel_reqd_sub_group_size(16)))
+__kernel FOLD_SIG(poseidon2_hash_fold_mont_io_v7s16) { FOLD_BODY(PERM_V3(cells, add_rc_sbox_lit_sub, x_sbox_sub)) }

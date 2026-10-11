@@ -119,14 +119,18 @@ void esimd_eltwise_copy_fp(sycl::queue& q, uint32_t* out,
                             const uint32_t* in, uint32_t count) {
     auto* po = out;
     auto* pi = in;
-    uint32_t num_threads = (count + 15) / 16;
+    // commit-path2: 64 elements per thread (thread-dispatch bound at 16).
+    uint32_t num_threads = (count + 63) / 64;
 
     q.parallel_for(sycl::range<1>(num_threads),
         [=](sycl::id<1> idx) [[intel::sycl_explicit_simd]] {
-            uint32_t base = idx[0] * 16;
-            if (base + 16 <= count) {
-                auto v = esimd::block_load<uint32_t, 16>(pi + base, ELT_LOAD);
-                esimd::block_store(po + base, v, ELT_STORE);
+            uint32_t base = idx[0] * 64;
+            if (base + 64 <= count) {
+                esimd::simd<uint32_t, 16> v[4];
+#pragma unroll
+                for (int b = 0; b < 4; b++) v[b] = esimd::block_load<uint32_t, 16>(pi + base + 16 * b, ELT_LOAD);
+#pragma unroll
+                for (int b = 0; b < 4; b++) esimd::block_store(po + base + 16 * b, v[b], ELT_STORE);
             } else {
                 for (uint32_t i = base; i < count; i++)
                     *(po + i) = *(pi + i);
@@ -223,18 +227,23 @@ void esimd_eltwise_sum_fpext(sycl::queue& q,
 // Replace INVALID (0xffffffff) sentinel values with 0
 void esimd_eltwise_zeroize_fp(sycl::queue& q, uint32_t* elems, uint32_t count) {
     auto* pe = elems;
-    uint32_t num_threads = (count + 15) / 16;
+    // commit-path2: 64 elements per thread (thread-dispatch bound at 16).
+    uint32_t num_threads = (count + 63) / 64;
 
     q.parallel_for(sycl::range<1>(num_threads),
         [=](sycl::id<1> idx) [[intel::sycl_explicit_simd]] {
-            uint32_t base = idx[0] * 16;
-            if (base + 16 <= count) {
-                auto v = esimd::block_load<uint32_t, 16>(pe + base, ELT_LOAD);
+            uint32_t base = idx[0] * 64;
+            if (base + 64 <= count) {
+                esimd::simd<uint32_t, 16> v[4];
+#pragma unroll
+                for (int b = 0; b < 4; b++) v[b] = esimd::block_load<uint32_t, 16>(pe + base + 16 * b, ELT_LOAD);
                 // Replace 0xffffffff with 0
-                esimd::simd<uint32_t, 16> invalid(0xffffffffu);
-                esimd::simd_mask<16> mask = (v == invalid);
-                v.merge(esimd::simd<uint32_t, 16>(0u), mask);
-                esimd::block_store(pe + base, v, ELT_STORE);
+#pragma unroll
+                for (int b = 0; b < 4; b++) {
+                    esimd::simd_mask<16> mask = (v[b] == esimd::simd<uint32_t, 16>(0xffffffffu));
+                    v[b].merge(esimd::simd<uint32_t, 16>(0u), mask);
+                    esimd::block_store(pe + base + 16 * b, v[b], ELT_STORE);
+                }
             } else {
                 for (uint32_t i = base; i < count; i++) {
                     if (*(pe + i) == 0xffffffffu)

@@ -216,9 +216,29 @@ static void ensure_poseidon2_opencl_kernels(sycl::queue& q) {
                 // GRF mode: 152 ms (IGC_TotalGRFNum=256 forced, as in the bench scripts) /
                 // 135 ms (128 GRF) vs 185 ms production, 211 cols x 2^22. The NEO persistent
                 // cache does not key on IGC_TotalGRFNum, so do not select kernels by env.
-                g_rows_lws = 256;
-                g_k_hash_rows_v6 = exe2.ext_oneapi_get_kernel("poseidon2_hash_rows_mont_io_v6");
-                g_k_hash_fold_v3 = exe2.ext_oneapi_get_kernel("poseidon2_hash_fold_mont_io_v3");
+                // v7: v3 structure (literal RC, Shoup diag) with subtraction-form REDC,
+                // no madw, 1024-wide WGs; IGC picks SIMD16 in the default 128-GRF mode.
+                // 211 cols x 2^22: 121 ms vs 135 (v6) / 151 (v6 under IGC_TotalGRFNum=256).
+                // Needs IGC_TotalGRFNum unset (it forces 256 GRF on this bundle: v7 -> 181 ms).
+                // RISC0_P2_ROWS / RISC0_P2_FOLD select another kernel by suffix (e.g. v6, v3).
+                const char* rsel = std::getenv("RISC0_P2_ROWS");
+                const char* fsel = std::getenv("RISC0_P2_FOLD");
+                std::string rname = rsel ? rsel : "v7";
+                std::string fname = fsel ? fsel : "v7";
+                g_rows_lws = (rname == "v6" || rname == "v7pf" || rname == "v7s16") ? 256 : 1024;
+                g_k_hash_rows_v6 = exe2.ext_oneapi_get_kernel("poseidon2_hash_rows_mont_io_" + rname);
+                g_k_hash_fold_v3 = exe2.ext_oneapi_get_kernel("poseidon2_hash_fold_mont_io_" + fname);
+                // v7 rows requires 1024-wide work-groups; if the JIT could not
+                // provide that (e.g. IGC_TotalGRFNum=256 forces 256-GRF mode),
+                // use v6 (256-wide).
+                size_t rows_max = g_k_hash_rows_v6->get_info<
+                    sycl::info::kernel_device_specific::work_group_size>(q.get_device());
+                if (rows_max < g_rows_lws) {
+                    std::fprintf(stderr, "[poseidon2-commit] %s rows kernel max WG %zu < %zu; using v6\n",
+                                 rname.c_str(), rows_max, g_rows_lws);
+                    g_k_hash_rows_v6 = exe2.ext_oneapi_get_kernel("poseidon2_hash_rows_mont_io_v6");
+                    g_rows_lws = 256;
+                }
                 // fold v3 is launched with 1024-wide work-groups.
                 size_t fold_max = g_k_hash_fold_v3->get_info<
                     sycl::info::kernel_device_specific::work_group_size>(q.get_device());
