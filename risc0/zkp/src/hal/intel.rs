@@ -1393,6 +1393,62 @@ mod tests {
     // it at that size and compare against the CPU HAL.
     #[test]
     #[ignore = "requires an Intel GPU; run explicitly"]
+    fn batch_evaluate_any_power_tables_match_cpu() {
+        // deg >= 2^14 takes the power-table path (eval_u). Taps share a few
+        // distinct points across polynomials, like the prover's back-taps.
+        use crate::{
+            core::hash::poseidon2::Poseidon2HashSuite,
+            field::{
+                baby_bear::{BabyBearElem as Elem, BabyBearExtElem as ExtElem},
+                Elem as _,
+            },
+            hal::{cpu::CpuHal, Buffer as _, Hal as _},
+        };
+        use rand::{rngs::StdRng, Rng as _, SeedableRng as _};
+
+        let gpu = IntelHalPoseidon2::new();
+        let cpu = CpuHal::new(Poseidon2HashSuite::new_suite());
+        let mut rng = StdRng::seed_from_u64(11);
+        let mut bad_total = 0;
+        for (lg, polys, npoints) in [(14usize, 40usize, 3usize), (16, 120, 9), (20, 64, 9), (21, 24, 5)] {
+            let deg = 1usize << lg;
+            let coeffs: Vec<Elem> = (0..polys * deg).map(|_| Elem::random(&mut rng)).collect();
+            let points: Vec<ExtElem> = (0..npoints).map(|_| ExtElem::random(&mut rng)).collect();
+            let mut which = vec![];
+            let mut xs = vec![];
+            for p in 0..polys {
+                // 1..=7 taps per poly, so classes of 1..6 points and a split class.
+                let taps = 1 + rng.random_range(0..7usize);
+                for t in 0..taps {
+                    which.push(p as u32);
+                    xs.push(points[(p + 2 * t) % npoints]);
+                }
+            }
+            let g_out = gpu.alloc_extelem("out", which.len());
+            gpu.batch_evaluate_any(
+                &gpu.copy_from_elem("coeffs", &coeffs),
+                polys,
+                &gpu.copy_from_u32("which", &which),
+                &gpu.copy_from_extelem("xs", &xs),
+                &g_out,
+            );
+            let c_out = cpu.alloc_extelem("out", which.len());
+            cpu.batch_evaluate_any(
+                &cpu.copy_from_elem("coeffs", &coeffs),
+                polys,
+                &cpu.copy_from_u32("which", &which),
+                &cpu.copy_from_extelem("xs", &xs),
+                &c_out,
+            );
+            let bad = g_out.to_vec().iter().zip(&c_out.to_vec()).filter(|(a, b)| a != b).count();
+            eprintln!("[eval_any] lg={lg} polys={polys} taps={}: {bad} differ", which.len());
+            bad_total += bad;
+        }
+        assert_eq!(bad_total, 0, "power-table batch_evaluate_any diverged from CPU");
+    }
+
+    #[test]
+    #[ignore = "requires an Intel GPU; run explicitly"]
     fn poseidon254_hash_ops_match_cpu() {
         use crate::{
             core::hash::poseidon_254::Poseidon254HashSuite,

@@ -7,6 +7,11 @@
 #include "bb31_field.hpp"
 #include "bb31_fpext4.hpp"
 #include "combos_gpu.hpp"
+#include <array>
+#include <map>
+#include <vector>
+#include <stdexcept>
+#include <mutex>
 
 namespace esimd = sycl::ext::intel::esimd;
 using namespace fpext4;
@@ -213,7 +218,7 @@ static inline void scalar_ext_pow(uint32_t* result, const uint32_t* base_in, uin
 // 64 threads per WG, each thread strides through coefficients.
 // SLM tree reduction across 64 threads, with FpExt4 (Vec16) values.
 // ============================================================================
-void esimd_batch_evaluate_any(sycl::queue& q,
+void esimd_batch_evaluate_any_orig(sycl::queue& q,
                                uint32_t* d_out,       // FpExt output (4 u32 per eval, AoS)
                                const uint32_t* d_coeffs, // Fp coefficients (flat)
                                const uint32_t* d_which,  // polynomial index per eval
@@ -520,4 +525,235 @@ int32_t validate_fri_poly_ops() {
     }
 }
 
+} // extern "C"
+
+// ============================================================================
+// eval_u power-table path (mb5/eval-u-deep). Drop-in for esimd_batch_evaluate_any.
+//  - D2H which/xs (tiny), group taps by polynomial, polys by their distinct-point set
+//    (split into chunks of <= 6 points), NP polys x NB points per job.
+//  - X[pt][c][i] = x_pt^i (planar FpExt) generated once per call (one table per distinct point).
+//  - job kernel: chunk-major split-K (S chunks), acc += coeff * X (4 mont per coeff-tap).
+//  - reduce: out[t] = sum over chunks (field addition is exact => bit-identical to the
+//    production kernel, whose result is the same field element).
+// All host tables are uploaded with an immediate wait (no pageable-source lifetime hazard).
+// Fallback to the original kernel for deg < 16384 (or not a power of two) or RISC0_EVAL_U_PT=0.
+// The static scratch below is guarded by g_mutex.
+// ============================================================================
+namespace evalu_pt {
+static uint32_t* g_X = nullptr; static size_t g_X_words = 0;
+static uint32_t* g_part = nullptr; static size_t g_part_words = 0;
+static uint32_t* g_tab = nullptr; static size_t g_tab_words = 0;
+static uint32_t* g_pts = nullptr; static size_t g_pts_words = 0;
+static std::mutex g_mutex;
+static uint32_t* grow(sycl::queue& q, uint32_t*& p, size_t& cap, size_t words) {
+    if (words > cap) {
+        if (p) { q.wait(); sycl::free(p, q); }  // sycl::free does not wait
+        p = nullptr;
+        cap = 0;
+        size_t want = words + words / 4 + 64;
+        p = sycl::malloc_device<uint32_t>(want, q);
+        if (!p) throw std::runtime_error("batch_evaluate_any: scratch allocation failed");
+        cap = want;
+    }
+    return p;
+}
+
+static sycl::event gen_xtable(sycl::queue& q, uint32_t* X, const uint32_t* pts, uint32_t npts, uint32_t n, uint32_t L) {
+    uint32_t nch = n / L, N = npts * nch;
+    uint32_t nthr = N == 0 ? 16 : (N + 15) / 16 * 16;
+    return q.parallel_for(sycl::nd_range<1>(nthr, 16), [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+        uint32_t g = it.get_global_id(0);
+        if (g >= N) return;
+        uint32_t pt = g / nch, ch = g % nch;
+        uint32_t i0 = ch * L;
+        FpExt4 x{Vec16(pts[pt * 4 + 0]), Vec16(pts[pt * 4 + 1]), Vec16(pts[pt * 4 + 2]), Vec16(pts[pt * 4 + 3])};
+        FpExt4 cur = fpext_pow(x, i0);
+        esimd::simd<uint32_t, 16> lane(0u, 1u);
+        FpExt4 pw = x;
+        for (int bit = 0; bit < 4; bit++) {
+            FpExt4 t = fpext_mul(cur, pw);
+            auto m = ((lane >> bit) & 1u) != 0u;
+            for (int c = 0; c < 4; c++) cur.c[c].merge(t.c[c], m);
+            pw = fpext_mul(pw, pw);
+        }
+        for (uint32_t i = i0; i < i0 + L; i += 16) {
+            for (int c = 0; c < 4; c++) esimd::block_store<uint32_t, 16>(X + ((size_t)(pt * 4 + c) * n + i), cur.c[c]);
+            cur = fpext_mul(cur, pw);
+        }
+    });
+}
+
+ESIMD_INLINE uint32_t lane_reduce(Vec16 v) {
+    esimd::simd<uint32_t, 8> v8 = v.select<8, 1>(0) + v.select<8, 1>(8); v8.merge(v8 - bb31::MOD, v8 >= bb31::MOD);
+    esimd::simd<uint32_t, 4> v4 = v8.select<4, 1>(0) + v8.select<4, 1>(4); v4.merge(v4 - bb31::MOD, v4 >= bb31::MOD);
+    esimd::simd<uint32_t, 2> v2 = v4.select<2, 1>(0) + v4.select<2, 1>(2); v2.merge(v2 - bb31::MOD, v2 >= bb31::MOD);
+    uint32_t s = v2[0] + v2[1];
+    return s >= bb31::MOD ? s - bb31::MOD : s;
+}
+
+// tables (u32, device): poff[njobs*NP], jpt[njobs*NB], jout[njobs*NP*NB] (0xffffffff = unused slot)
+template <int NP, int NB>
+static sycl::event eval_job(sycl::queue& q, const uint32_t* base, const uint32_t* poff, const uint32_t* jpt,
+                            const uint32_t* jout, uint32_t njobs, const uint32_t* X, uint32_t* partial,
+                            uint32_t n, uint32_t S) {
+    uint32_t L = n / S, N = njobs * S;
+    uint32_t nthr = N == 0 ? 16 : (N + 15) / 16 * 16;
+    return q.parallel_for(sycl::nd_range<1>(nthr, 16), [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+        uint32_t g = it.get_global_id(0);
+        if (g >= N) return;
+        uint32_t ch = g / njobs, job = g % njobs;
+        uint32_t i0 = ch * L;
+        FpExt4 acc[NP][NB];
+        const uint32_t* pp[NP];
+#pragma unroll
+        for (int p = 0; p < NP; p++) pp[p] = base + (size_t)poff[job * NP + p] * n;
+        const uint32_t* xp[NB];
+#pragma unroll
+        for (int b = 0; b < NB; b++) xp[b] = X + (size_t)jpt[job * NB + b] * 4 * n;
+        for (uint32_t i = i0; i < i0 + L; i += 16) {
+            FpExt4 xv[NB];
+#pragma unroll
+            for (int b = 0; b < NB; b++)
+#pragma unroll
+                for (int c = 0; c < 4; c++) xv[b].c[c] = esimd::block_load<uint32_t, 16>(xp[b] + (size_t)c * n + i);
+#pragma unroll
+            for (int p = 0; p < NP; p++) {
+                Vec16 cv = esimd::block_load<uint32_t, 16>(pp[p] + i);
+#pragma unroll
+                for (int b = 0; b < NB; b++)
+#pragma unroll
+                    for (int c = 0; c < 4; c++)
+                        acc[p][b].c[c] = bb31::field_add(acc[p][b].c[c], bb31::mont_mul(cv, xv[b].c[c]));
+            }
+        }
+#pragma unroll
+        for (int p = 0; p < NP; p++)
+#pragma unroll
+            for (int b = 0; b < NB; b++) {
+                uint32_t o = jout[(job * NP + p) * NB + b];
+                if (o != 0xffffffffu) {
+                    esimd::simd<uint32_t, 4> r;
+#pragma unroll
+                    for (int c = 0; c < 4; c++) r[c] = lane_reduce(acc[p][b].c[c]);
+                    esimd::block_store<uint32_t, 4>(partial + ((size_t)o * S + ch) * 4, r);
+                }
+            }
+    });
+}
+
+// out[t*4+c] = sum_k partial[(t*S + k)*4 + c], S % 4 == 0.
+static sycl::event reduce_partials(sycl::queue& q, uint32_t* out, const uint32_t* partial, uint32_t ntaps, uint32_t S) {
+    uint32_t nthr = ntaps == 0 ? 16 : (ntaps + 15) / 16 * 16;
+    return q.parallel_for(sycl::nd_range<1>(nthr, 16), [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+        uint32_t t = it.get_global_id(0);
+        if (t >= ntaps) return;
+        const uint32_t* p = partial + (size_t)t * S * 4;
+        Vec16 s(0u);
+        for (uint32_t j = 0; j < S * 4; j += 16) s = bb31::field_add(s, esimd::block_load<uint32_t, 16>(p + j));
+        esimd::simd<uint32_t, 8> a8 = s.select<8, 1>(0) + s.select<8, 1>(8);
+        a8.merge(a8 - bb31::MOD, a8 >= bb31::MOD);
+        esimd::simd<uint32_t, 4> a4 = a8.select<4, 1>(0) + a8.select<4, 1>(4);
+        a4.merge(a4 - bb31::MOD, a4 >= bb31::MOD);
+        esimd::block_store<uint32_t, 4>(out + (size_t)t * 4, a4);
+    });
+}
+
+static int np_for(int nb) { return nb == 1 ? 16 : nb == 2 ? 8 : nb <= 4 ? 4 : 2; }
+
+static void launch_job(sycl::queue& q, int NB, const uint32_t* base, const uint32_t* poff, const uint32_t* jpt,
+                       const uint32_t* jout, uint32_t njobs, const uint32_t* X, uint32_t* partial, uint32_t n, uint32_t S) {
+    switch (NB) {
+    case 1: eval_job<16, 1>(q, base, poff, jpt, jout, njobs, X, partial, n, S); break;
+    case 2: eval_job<8, 2>(q, base, poff, jpt, jout, njobs, X, partial, n, S); break;
+    case 3: eval_job<4, 3>(q, base, poff, jpt, jout, njobs, X, partial, n, S); break;
+    case 4: eval_job<4, 4>(q, base, poff, jpt, jout, njobs, X, partial, n, S); break;
+    case 5: eval_job<2, 5>(q, base, poff, jpt, jout, njobs, X, partial, n, S); break;
+    case 6: eval_job<2, 6>(q, base, poff, jpt, jout, njobs, X, partial, n, S); break;
+    default: throw std::runtime_error("evalu_pt: bad NB");
+    }
+}
+
+static bool enabled() {
+    static int v = -1;
+    if (v < 0) { const char* e = std::getenv("RISC0_EVAL_U_PT"); v = (e && e[0] == '0') ? 0 : 1; }
+    return v == 1;
+}
+} // namespace evalu_pt
+
+extern "C" {
+void esimd_batch_evaluate_any(sycl::queue& q, uint32_t* d_out, const uint32_t* d_coeffs, const uint32_t* d_which,
+                              const uint32_t* d_xs, uint32_t count, uint32_t deg) {
+    using namespace evalu_pt;
+    if (count == 0) return;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!enabled() || deg < 16384 || (deg & (deg - 1)) != 0) {
+        esimd_batch_evaluate_any_orig(q, d_out, d_coeffs, d_which, d_xs, count, deg);
+        if (enabled() && count == 1 && deg == 1) {
+            // warmup call from intel_ffi: JIT the power-table kernels with empty grids
+            uint32_t* tmp = grow(q, g_tab, g_tab_words, 64);
+            for (int nb = 1; nb <= 6; nb++) launch_job(q, nb, tmp, tmp, tmp, tmp, 0, tmp, tmp, 1024, 64);
+            reduce_partials(q, tmp, tmp, 0, 4);
+            gen_xtable(q, tmp, tmp, 0, 1024, 1024);
+            q.wait();
+        }
+        return;
+    }
+    // 1. host copies of which / xs
+    std::vector<uint32_t> which(count), xs((size_t)count * 4);
+    q.memcpy(which.data(), d_which, count * 4);
+    q.memcpy(xs.data(), d_xs, (size_t)count * 16);
+    q.wait();
+    // 2. distinct points, taps per poly (tap order preserved)
+    std::vector<std::array<uint32_t, 4>> pts;
+    std::map<std::array<uint32_t, 4>, uint32_t> pidx;
+    std::map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> by_poly;  // poly -> (tap, point)
+    for (uint32_t t = 0; t < count; t++) {
+        std::array<uint32_t, 4> k{xs[t * 4], xs[t * 4 + 1], xs[t * 4 + 2], xs[t * 4 + 3]};
+        auto it = pidx.find(k);
+        uint32_t pi;
+        if (it == pidx.end()) { pi = pts.size(); pidx[k] = pi; pts.push_back(k); } else pi = it->second;
+        by_poly[which[t]].push_back({t, pi});
+    }
+    // 3. classes keyed by point list (chunks of <= 6)
+    std::map<std::vector<uint32_t>, std::vector<std::pair<uint32_t, std::vector<uint32_t>>>> classes;
+    for (auto& [poly, tl] : by_poly) {
+        for (size_t s0 = 0; s0 < tl.size(); s0 += 6) {
+            size_t e = std::min(tl.size(), s0 + 6);
+            std::vector<uint32_t> key, taps;
+            for (size_t j = s0; j < e; j++) { key.push_back(tl[j].second); taps.push_back(tl[j].first); }
+            classes[key].push_back({poly, taps});
+        }
+    }
+    struct JobDesc { int NB; uint32_t njobs; size_t poff, jpt, jout; };
+    std::vector<JobDesc> jds;
+    std::vector<uint32_t> tab;
+    for (auto& [key, polys] : classes) {
+        int NB = key.size(), NP = np_for(NB);
+        uint32_t njobs = (polys.size() + NP - 1) / NP;
+        JobDesc jd{NB, njobs, 0, 0, 0};
+        jd.poff = tab.size();
+        for (uint32_t j = 0; j < njobs * NP; j++) tab.push_back(j < polys.size() ? polys[j].first : polys[0].first);
+        jd.jpt = tab.size();
+        for (uint32_t j = 0; j < njobs; j++) for (int b = 0; b < NB; b++) tab.push_back(key[b]);
+        jd.jout = tab.size();
+        for (uint32_t j = 0; j < njobs * NP; j++)
+            for (int b = 0; b < NB; b++) tab.push_back(j < polys.size() ? polys[j].second[b] : 0xffffffffu);
+        jds.push_back(jd);
+    }
+    const uint32_t npts = pts.size();
+    const uint32_t S = std::min<uint32_t>(1024, deg / 16);
+    const uint32_t XL = std::min<uint32_t>(4096, deg);
+    uint32_t* X = grow(q, g_X, g_X_words, (size_t)npts * 4 * deg);
+    uint32_t* part = grow(q, g_part, g_part_words, (size_t)count * S * 4);
+    uint32_t* dtab = grow(q, g_tab, g_tab_words, tab.size());
+    uint32_t* dpts = grow(q, g_pts, g_pts_words, (size_t)npts * 4);
+    q.memcpy(dtab, tab.data(), tab.size() * 4);
+    q.memcpy(dpts, pts.data(), (size_t)npts * 16);
+    q.wait();  // host vectors die at return; never leave an async copy from them in flight
+    gen_xtable(q, X, dpts, npts, deg, XL);
+    for (auto& jd : jds)
+        launch_job(q, jd.NB, d_coeffs, dtab + jd.poff, dtab + jd.jpt, dtab + jd.jout, jd.njobs, X, part, deg, S);
+    reduce_partials(q, d_out, part, count, S);
+    q.wait();
+}
 } // extern "C"
