@@ -84,6 +84,11 @@ pub struct Preflight {
 
     cur_iop_body: VecDeque<Vec<Fp>>,
     iop_idx: u32,
+
+    /// Host-computed witness (data, global) from `Prover::prepare` (Intel
+    /// RISC0_RECURSION_PREWITGEN): lets the CPU witgen run on the pipelining
+    /// thread instead of the GPU thread.
+    pub(crate) host_witness: std::sync::Mutex<Option<(Vec<Fp>, Vec<Fp>)>>,
 }
 
 impl Preflight {
@@ -105,6 +110,7 @@ impl Preflight {
 
             cur_iop_body: VecDeque::new(),
             iop_idx: 0,
+            host_witness: std::sync::Mutex::new(None),
         }
     }
 

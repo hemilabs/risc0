@@ -39,6 +39,17 @@ pub(crate) trait CircuitWitnessGenerator<H: Hal> {
         data: &H::Buffer<H::Elem>,
         global: &H::Buffer<H::Elem>,
     ) -> Result<()>;
+
+    /// Upload a witness that was generated on the host ahead of time.
+    fn upload_host_witness(
+        &self,
+        _data: &H::Buffer<H::Elem>,
+        _global: &H::Buffer<H::Elem>,
+        _host_data: Vec<H::Elem>,
+        _host_global: Vec<H::Elem>,
+    ) -> Result<()> {
+        anyhow::bail!("upload_host_witness not supported by this HAL")
+    }
 }
 
 pub(crate) trait CircuitAccumulator<H: Hal> {

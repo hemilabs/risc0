@@ -1230,7 +1230,58 @@ impl ProverServer for ProverImpl {
         // See memory: project_lift_join_overlap_invalid.md
         let mut pending_prepared_lift: Option<std::thread::JoinHandle<Result<RecursionProverJob>>> = None;
 
-        for step_idx in 0..num_segments {
+        // Run lift(k+1) on the GPU while a background thread prepares
+        // join(acc, lift(k)) (preflight + host witgen, see
+        // RISC0_RECURSION_PREWITGEN); then run the prepared join while the
+        // background thread prepares lift(k+2). The fold order (and therefore
+        // the receipt) is unchanged; only the GPU/CPU overlap differs.
+        // Default on; RISC0_RECURSION_REORDER=0 uses the sequential loop below.
+        let reorder = !matches!(std::env::var("RISC0_RECURSION_REORDER").as_deref(), Ok("0"));
+        if reorder && num_segments >= 2 {
+            let spawn_lift_prep = |idx: usize| -> Result<std::thread::JoinHandle<Result<RecursionProverJob>>> {
+                let p = RecursionProverJob::new_lift(&segments[idx], recursion_opts.clone())?;
+                Ok(std::thread::spawn(move || -> Result<RecursionProverJob> { let mut p = p; p.prepare()?; Ok(p) }))
+            };
+            let finish_lift = |h: std::thread::JoinHandle<Result<RecursionProverJob>>, idx: usize| -> Result<SuccinctReceipt<ReceiptClaim>> {
+                let mut prover = h.join().map_err(|_| anyhow!("lift prepare thread panicked"))??;
+                let receipt = prover.run()?;
+                let claim_decoded = ReceiptClaim::decode(&mut receipt.out_stream())?;
+                let claim = claim_decoded.merge(&segments[idx].claim)?;
+                make_succinct_receipt(prover, receipt, claim)
+            };
+            let t0 = std::time::Instant::now();
+            let mut acc = lift_with_opts(&segments[0], recursion_opts.clone())?;
+            let mut cur = finish_lift(spawn_lift_prep(1)?, 1)?;
+            if *VERBOSE { eprintln!("[composite_to_succinct] reorder: lift0+lift1={:.1}ms", t0.elapsed().as_secs_f64() * 1000.0); }
+            let mut pending: Option<std::thread::JoinHandle<Result<RecursionProverJob>>> =
+                if num_segments > 2 { Some(spawn_lift_prep(2)?) } else { None };
+            for k in 1..num_segments {
+                let t_step = std::time::Instant::now();
+                // background: prepare join(acc, cur)
+                let jp = RecursionProverJob::new_join(&acc, &cur, recursion_opts.clone())?;
+                let join_claim = acc.claim.join(&cur.claim)?.value()?;
+                let jh = std::thread::spawn(move || -> Result<RecursionProverJob> { let mut p = jp; p.prepare()?; Ok(p) });
+                // GPU: next lift (prepared during the previous join)
+                let next = match pending.take() { Some(h) => Some(finish_lift(h, k + 1)?), None => None };
+                let lift_ms = t_step.elapsed().as_secs_f64() * 1000.0;
+                let mut jprover = jh.join().map_err(|_| anyhow!("join prepare thread panicked"))??;
+                if k + 2 < num_segments { pending = Some(spawn_lift_prep(k + 2)?); }
+                let t_join = std::time::Instant::now();
+                let receipt = jprover.run()?;
+                let claim_decoded = ReceiptClaim::decode(&mut receipt.out_stream())?;
+                let claim = claim_decoded.merge(&join_claim)?;
+                acc = make_succinct_receipt(jprover, receipt, claim)?;
+                let join_ms = t_join.elapsed().as_secs_f64() * 1000.0;
+                if *VERBOSE {
+                    eprintln!("[composite_to_succinct] reorder step {k}/{num_segments}: next_lift={lift_ms:.1}ms join={join_ms:.1}ms total={:.1}ms",
+                        t_step.elapsed().as_secs_f64() * 1000.0);
+                }
+                match next { Some(n) => cur = n, None => break }
+            }
+            accumulator = Some(acc);
+        }
+
+        for step_idx in 0..(if reorder && num_segments >= 2 { 0 } else { num_segments }) {
             let t_step = std::time::Instant::now();
 
             // Get the lifted receipt.

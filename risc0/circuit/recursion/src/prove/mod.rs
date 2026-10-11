@@ -141,6 +141,14 @@ impl Prover {
         for (cycle, row) in self.program.code_by_row().enumerate() {
             preflight.step(cycle, row)?;
         }
+        #[cfg(feature = "intel")]
+        // Default on; RISC0_RECURSION_PREWITGEN=0 keeps witgen on the GPU thread.
+        if !matches!(std::env::var("RISC0_RECURSION_PREWITGEN").as_deref(), Ok("0")) {
+            let t0 = std::time::Instant::now();
+            let w = self::witgen::host_witgen(&self.program, &preflight)?;
+            *preflight.host_witness.lock().unwrap() = Some(w);
+            if *VERBOSE { eprintln!("[recursion_prewitgen] host witgen on prepare thread: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0); }
+        }
         self.prepared_preflight = Some(preflight);
         Ok(())
     }

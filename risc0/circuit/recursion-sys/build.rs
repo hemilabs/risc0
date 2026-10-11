@@ -193,7 +193,7 @@ mod stamp {
     }
 }
 
-const RECURSION_INTEL_STAMP_VERSION: &str = "recursion-v2";
+const RECURSION_INTEL_STAMP_VERSION: &str = "recursion-v3-fast";
 
 /// Glob `*.h`/`*.hpp`/`*.cuh` from an absolute external include root
 /// (`DEP_RISC0_SYS_CXX_ROOT`) so upstream `fp.h`/`fpext.h` content edits
@@ -225,6 +225,8 @@ fn compute_recursion_intel_hash(cxx_root: &str, icpx_version: &str) -> String {
         PathBuf::from("kernels/cxx/poly_fp.cpp"),
         PathBuf::from("build.rs"),
     ];
+    in_tree.push(PathBuf::from("kernels/intel/eval_lazy_chain.py"));
+    in_tree.push(PathBuf::from("kernels/intel/eval_remat_loads.py"));
     in_tree.extend(glob_paths("kernels/cxx/*.h"));
     in_tree.extend(glob_paths("kernels/cxx/*.h.inc"));
     in_tree.extend(glob_paths("kernels/cxx/*.cpp.inc"));
@@ -492,8 +494,16 @@ fn build_intel_kernels() {
             cmd.arg("-O2")
                 .arg("-Xs").arg(format!("-options \"-cl-intel-256-GRF-per-thread\""));
         } else {
-            cmd.arg("-O1") // -O1 with -cl-opt-disable for ocloc fast-compile default
-                .arg("-Xs").arg("-options -cl-opt-disable");
+            // Fast path (same recipe as rv32im eval_check): -Os, 256 GRF,
+            // RISC0_INTEL_EVAL_FAST device helpers (mandatory: without them the
+            // monolith never finishes compiling), DisableRecompilation=1, and the
+            // 4-entry vanishing-quotient table. Post-passes below: lazy poly_mix
+            // chains + volatile load rematerialisation (G=400). 730 -> ~42 ms.
+            cmd.arg("-Os")
+                .arg("-DRISC0_INTEL_EVAL_FAST")
+                .arg("-DRECURSION_QTABLE")
+                .arg("-Xs")
+                .arg("-options \"-cl-intel-256-GRF-per-thread -igc_opts 'DisableRecompilation=1'\"");
         }
         cmd.arg("-Wno-unused-parameter")
             .arg("-Wno-unused-function")
@@ -585,7 +595,29 @@ fn build_intel_kernels() {
         amalg.push_str("} // namespace risc0::circuit::recursion\n");
         // Append the kernel wrapper
         amalg.push_str(&std::fs::read_to_string("kernels/intel/eval_check.cpp").unwrap());
-        std::fs::write(&amalg_path, &amalg).unwrap();
+        if recursion_optimize || split_poly_fp {
+            std::fs::write(&amalg_path, &amalg).unwrap();
+        } else {
+            // Post-passes on the default (fast) path; both scripts assert when
+            // their patterns stop matching the generated code.
+            let raw_path = out_dir.join("intel_recursion_eval_check_amalg_raw.cpp");
+            let lazy_path = out_dir.join("intel_recursion_eval_check_amalg_lazy.cpp");
+            std::fs::write(&raw_path, &amalg).unwrap();
+            for (script, args) in [
+                ("kernels/intel/eval_lazy_chain.py", vec![raw_path.clone(), lazy_path.clone()]),
+                (
+                    "kernels/intel/eval_remat_loads.py",
+                    vec![lazy_path.clone(), amalg_path.clone(), PathBuf::from("400")],
+                ),
+            ] {
+                let status = Command::new("python3")
+                    .arg(script)
+                    .args(&args)
+                    .status()
+                    .unwrap_or_else(|e| panic!("failed to run {script}: {e}"));
+                assert!(status.success(), "{script} failed");
+            }
+        }
 
         cmd.arg(&amalg_path)
             .arg("-o")
