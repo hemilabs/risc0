@@ -29,6 +29,19 @@ thread_local! {
         std::mem::ManuallyDrop::new(RefCell::new(None));
 }
 
+/// Completes, and discards, whatever segment the cached prover still has pending when dropped.
+struct DrainSegmentProverOnExit;
+
+impl Drop for DrainSegmentProverOnExit {
+    fn drop(&mut self) {
+        // An error here means nothing was pending, or the GPU work failed; the slot is idle either
+        // way. Not while panicking: the prover's RefCell may be the thing that is borrowed.
+        if !std::thread::panicking() {
+            let _ = with_segment_prover(|sp| sp.prove_end());
+        }
+    }
+}
+
 fn with_segment_prover<R>(f: impl FnOnce(&dyn SegmentProver) -> Result<R>) -> Result<R> {
     let _gpu = super::exclusive_gpu();
     CACHED_SEGMENT_PROVER.with(|cell| {
@@ -743,6 +756,12 @@ impl ProverImpl {
             );
         }
 
+        // A session that leaves the pipeline early (an invalid segment, an error) leaves its last
+        // segment's finalize pending in the CACHED prover, and the next session's first
+        // prove_begin would hand that stale seal back as its own previous segment's. Complete it
+        // on the way out, so the next session starts with the prover idle.
+        let pipeline_guard = DrainSegmentProverOnExit;
+
         for (seg_idx, segment_ref) in session.segments.iter().enumerate() {
             let t_seg = std::time::Instant::now();
 
@@ -974,6 +993,11 @@ impl ProverImpl {
                 hook.on_post_prove_segment(&segment);
             }
         }
+
+        // The loop is done. The last segment's deferred finalize was completed by the early seals,
+        // or is completed just below, which empties the prover whether or not it succeeds: there is
+        // nothing left for the guard to drain.
+        std::mem::forget(pipeline_guard);
 
         if early_seal {
             // Every seal was taken in the loop: collect the last receipt (verified on its
