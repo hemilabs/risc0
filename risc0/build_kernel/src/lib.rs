@@ -138,13 +138,22 @@ impl KernelBuild {
 
         // It's *highly* recommended to install `sccache` and use this combined with
         // `RUSTC_WRAPPER=/path/to/sccache` to speed up rebuilds of C++ kernels
-        cc::Build::new()
+        let mut build = cc::Build::new();
+        if is_msvc_target() {
+            // The vendored NVTX headers include windows.h, whose min/max macros
+            // break std::min/std::max (e.g. in the vendored poolstl).
+            build.define("NOMINMAX", None);
+            // C++20 for the generated layouts' designated initializers; see
+            // `cuda_cxx_std_flag`.
+            build.flag("/std:c++20");
+        } else {
+            build.flag_if_supported("-std=c++17");
+        }
+        build
             .cpp(true)
             .debug(false)
             .files(&self.files)
             .includes(&self.inc_dirs)
-            .flag_if_supported("/std:c++17")
-            .flag_if_supported("-std=c++17")
             .flag_if_supported("-fno-var-tracking")
             .flag_if_supported("-fno-var-tracking-assignments")
             .flag_if_supported("-g0")
@@ -203,10 +212,17 @@ impl KernelBuild {
             .flag("-diag-suppress=177")
             .flag("-diag-suppress=2922")
             .flag("-Xcudafe")
-            .flag("--display_error_number")
-            .flag("-Xcompiler")
-            .flag("-Wno-missing-braces,-Wno-unused-function")
-            .compile(output);
+            .flag("--display_error_number");
+        if is_msvc_target() {
+            build.flag(cuda_cxx_std_flag());
+            msvc_cuda_build_setup(&mut build);
+        } else {
+            // GCC/Clang warning flags; cl.exe, nvcc's host compiler on MSVC, rejects them.
+            build
+                .flag("-Xcompiler")
+                .flag("-Wno-missing-braces,-Wno-unused-function");
+        }
+        build.compile(output);
     }
 
     fn compile_metal(&mut self, output: &str) {
@@ -371,6 +387,182 @@ impl Hasher {
 
 fn rerun_if_changed<P: AsRef<Path>>(path: P) {
     println!("cargo:rerun-if-changed={}", path.as_ref().display());
+}
+
+// ---------------------------------------------------------------------------
+// CUDA build utilities (cross-platform: Linux + Windows/MSVC)
+// ---------------------------------------------------------------------------
+
+/// Whether the target uses the MSVC toolchain, where nvcc's host compiler is
+/// cl.exe and static libraries are `<name>.lib` archives built with lib.exe.
+pub fn is_msvc_target() -> bool {
+    env::var("CARGO_CFG_TARGET_ENV").is_ok_and(|e| e == "msvc")
+}
+
+fn crt_static() -> bool {
+    env::var("CARGO_CFG_TARGET_FEATURE").is_ok_and(|f| f.split(',').any(|f| f == "crt-static"))
+}
+
+/// The nvcc for a direct invocation (one that bypasses `cc`): `NVCC` if set,
+/// else `nvcc` on PATH.
+pub fn find_nvcc() -> String {
+    env::var("NVCC").unwrap_or_else(|_| "nvcc".to_string())
+}
+
+/// A `Command` for a direct nvcc invocation (one that bypasses `cc`).
+///
+/// On MSVC it is set up the way `cc` sets up its own: nvcc is pointed at the
+/// cl.exe `cc` found and given that compiler's environment (`INCLUDE`, `LIB`,
+/// `PATH`), so it works outside a Visual Studio developer shell; the C runtime is
+/// the one rustc links (`/MD`, or `/MT` under `+crt-static`; cl.exe's own default
+/// is `/MT`, which does not link with a `/MD` binary); and it gets the setup in
+/// [`msvc_cuda_build_setup`]. Elsewhere it is a bare nvcc, for the caller's
+/// host-compiler flags.
+pub fn nvcc_command() -> Command {
+    let mut cmd = Command::new(find_nvcc());
+    if is_msvc_target() {
+        let cl = cc::Build::new().cpp(true).get_compiler();
+        for (key, value) in cl.env() {
+            cmd.env(key, value);
+        }
+        let crt = if crt_static() { "/MT" } else { "/MD" };
+        cmd.arg(format!("-ccbin={}", cl.path().display()))
+            .arg("-Xcompiler")
+            .arg(format!("{crt},/O2"))
+            .arg(format!("-I{}", msvc_toolkit_include_dir().display()))
+            .arg("-DNOMINMAX");
+    }
+    cmd
+}
+
+/// The C++ standard flag for nvcc. The generated circuit layouts (e.g.
+/// keccak-sys's `layout.cu.inc`) use designated initializers, a C++20 feature
+/// that GCC/Clang also accept in C++17 mode; MSVC, and nvcc's front end in MSVC
+/// mode, require C++20 for them.
+pub fn cuda_cxx_std_flag() -> &'static str {
+    if is_msvc_target() {
+        "-std=c++20"
+    } else {
+        "-std=c++17"
+    }
+}
+
+/// MSVC setup for a `cc` build of CUDA kernels: the toolkit forwarding headers
+/// (see [`msvc_toolkit_include_dir`]) and `NOMINMAX`, without which the
+/// `windows.h` the vendored NVTX headers include defines `min`/`max` macros that
+/// break `std::min`/`std::max`.
+pub fn msvc_cuda_build_setup(build: &mut cc::Build) {
+    build
+        .include(msvc_toolkit_include_dir())
+        .define("NOMINMAX", None);
+}
+
+/// On MSVC, a directory to add to the include path holding headers that include
+/// CUDA toolkit headers by absolute path:
+///
+/// * `risc0_toolkit_cuda.h` — the toolkit's `cuda.h`. risc0's kernels have a
+///   `cuda.h` of their own, which shadows the toolkit's wherever the kernel
+///   directory is on the include path, and reaches it with `#include_next`.
+/// * `risc0_toolkit_cuda_std_array.h` — the toolkit's `<cuda/std/array>`, which
+///   the hemilabs sppark fork's `cuda/std/array` (a HIP shim) shadows the same way.
+///
+/// `#include_next` is a GCC/Clang extension MSVC lacks; on MSVC those headers
+/// include these instead. The paths are written into files rather than passed as
+/// `-D` defines, so they need no shell quoting.
+pub fn msvc_toolkit_include_dir() -> PathBuf {
+    println!("cargo:rerun-if-env-changed=CUDA_PATH");
+    let include = cuda_toolkit_dir().join("include");
+    let cuda_h = include.join("cuda.h");
+    // CUDA 13 moved the CCCL headers (libcudacxx among them) under include/cccl.
+    let cuda_std_array = [include.join("cuda/std/array"), include.join("cccl/cuda/std/array")]
+        .into_iter()
+        .find(|p| p.is_file());
+    assert!(cuda_h.is_file(), "CUDA toolkit header not found at {}", cuda_h.display());
+    let cuda_std_array = cuda_std_array.unwrap_or_else(|| {
+        panic!("<cuda/std/array> not found under {}", include.display())
+    });
+
+    let dir = PathBuf::from(env::var("OUT_DIR").unwrap()).join("risc0_msvc_include");
+    fs::create_dir_all(&dir).unwrap();
+    for (name, target) in [
+        ("risc0_toolkit_cuda.h", &cuda_h),
+        ("risc0_toolkit_cuda_std_array.h", &cuda_std_array),
+    ] {
+        let path = target.to_string_lossy().replace('\\', "/");
+        fs::write(dir.join(name), format!("#pragma once\n#include \"{path}\"\n")).unwrap();
+    }
+    dir
+}
+
+/// The CUDA toolkit root: from `NVCC` when it is a full path to nvcc (which lives
+/// in `<root>/bin`), else `CUDA_PATH`, which the Windows installer sets.
+fn cuda_toolkit_dir() -> PathBuf {
+    if let Ok(nvcc) = env::var("NVCC") {
+        let nvcc = PathBuf::from(nvcc);
+        if nvcc.is_absolute() {
+            if let Some(root) = nvcc.parent().and_then(Path::parent) {
+                return root.to_path_buf();
+            }
+        }
+    }
+    env::var("CUDA_PATH").map(PathBuf::from).expect(
+        "cannot locate the CUDA toolkit: set CUDA_PATH, or NVCC to the full path of nvcc",
+    )
+}
+
+/// File extension for an object file on the target toolchain.
+pub fn object_extension() -> &'static str {
+    if is_msvc_target() {
+        "obj"
+    } else {
+        "o"
+    }
+}
+
+/// Add `objs` to the static library `name` in `out_dir`, creating it if absent.
+///
+/// The library is the one `cargo:rustc-link-lib=static=<name>` resolves to:
+/// `lib<name>.a` built with `ar` elsewhere, `<name>.lib` built with lib.exe on
+/// MSVC (which is also what `cc` names the libraries it compiles there).
+pub fn add_to_static_lib(out_dir: &Path, name: &str, objs: &[PathBuf]) {
+    if is_msvc_target() {
+        let lib = out_dir.join(format!("{name}.lib"));
+        let mut cmd = cc::Build::new().get_archiver();
+        cmd.arg("/NOLOGO").arg(format!("/OUT:{}", lib.display()));
+        if lib.exists() {
+            cmd.arg(&lib);
+        }
+        cmd.args(objs);
+        let status = cmd.status().expect("failed to run lib.exe");
+        assert!(status.success(), "lib.exe failed to build {}", lib.display());
+    } else {
+        let lib = out_dir.join(format!("lib{name}.a"));
+        let status = Command::new(find_ar_tool())
+            .arg("rcs")
+            .arg(&lib)
+            .args(objs)
+            .status()
+            .expect("failed to run ar");
+        assert!(status.success(), "ar failed to build {}", lib.display());
+    }
+}
+
+/// Everything outside a direct nvcc command's own arguments that changes what it
+/// produces: the `NVCC_{PREPEND,APPEND}_FLAGS` nvcc reads from the environment
+/// (where the GPU architecture list is usually set) and the nvcc version.
+/// For keying a cache of nvcc output.
+pub fn nvcc_environment_key() -> String {
+    let mut key = String::new();
+    for var in ["NVCC_PREPEND_FLAGS", "NVCC_APPEND_FLAGS"] {
+        key.push_str(&format!("{var}={}\n", env::var(var).unwrap_or_default()));
+    }
+    let version = Command::new(find_nvcc())
+        .arg("--version")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    key.push_str(&version);
+    key
 }
 
 // ---------------------------------------------------------------------------

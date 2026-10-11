@@ -80,6 +80,8 @@ fn build_cuda_kernels() {
         })
         .collect();
 
+    let msvc = risc0_build_kernel::is_msvc_target();
+
     let mut build = cc::Build::new();
     build
         .cuda(true)
@@ -88,11 +90,17 @@ fn build_cuda_kernels() {
         .flag("-diag-suppress=177")
         .flag("-diag-suppress=550")
         .flag("-diag-suppress=2922")
-        .flag("-std=c++17")
-        .flag("-Xcompiler")
-        .flag("-Wno-unused-function,-Wno-unused-parameter")
+        .flag(risc0_build_kernel::cuda_cxx_std_flag())
         .include(&cuda_root)
         .include(&sppark_root);
+    // GCC/Clang warning flags; cl.exe, nvcc's host compiler on MSVC, rejects them.
+    if msvc {
+        risc0_build_kernel::msvc_cuda_build_setup(&mut build);
+    } else {
+        build
+            .flag("-Xcompiler")
+            .flag("-Wno-unused-function,-Wno-unused-parameter");
+    }
     if env::var_os("NVCC_PREPEND_FLAGS").is_none() && env::var_os("NVCC_APPEND_FLAGS").is_none() {
         build.flag("-arch=native");
     }
@@ -101,15 +109,20 @@ fn build_cuda_kernels() {
     // Build 2: eval_check as a single TU WITHOUT --device-c (whole program mode).
     // This enables inlining of the deep poly_fp chain (keccak_0..keccak_47),
     // reducing per-thread stack from ~82KB to ~8KB and preventing CUDA OOM at po2=18.
-    let eval_check_obj = out_dir.join("eval_check_combined.o");
-    let mut nvcc = Command::new("nvcc");
-    nvcc.arg("-std=c++17")
+    let eval_check_obj = out_dir.join(format!(
+        "eval_check_combined.{}",
+        risc0_build_kernel::object_extension()
+    ));
+    let mut nvcc = risc0_build_kernel::nvcc_command();
+    if !msvc {
+        nvcc.arg("-Xcompiler").arg("-fPIC")
+            .arg("-Xcompiler").arg("-Wno-unused-function,-Wno-unused-parameter");
+    }
+    nvcc.arg(risc0_build_kernel::cuda_cxx_std_flag())
         .arg("-O3")
-        .arg("-Xcompiler").arg("-fPIC")
         .arg("-diag-suppress=177")
         .arg("-diag-suppress=550")
         .arg("-diag-suppress=2922")
-        .arg("-Xcompiler").arg("-Wno-unused-function,-Wno-unused-parameter")
         .arg(format!("-I{}", cuda_root))
         .arg(format!("-I{}", sppark_root))
         .arg(format!("-I{}", kernel_dir.display()));
@@ -124,12 +137,9 @@ fn build_cuda_kernels() {
     assert!(status.success(), "nvcc failed to compile eval_check_combined.cu");
 
     // Archive into static lib
-    let lib_path = out_dir.join(format!("lib{output}.a"));
-    let _ = std::fs::remove_file(&lib_path);
-    let mut ar = Command::new("ar");
-    ar.arg("rcs").arg(&lib_path).arg(&eval_check_obj);
-    let status = ar.status().expect("failed to run ar");
-    assert!(status.success(), "ar failed");
+    let lib_name = if msvc { format!("{output}.lib") } else { format!("lib{output}.a") };
+    let _ = std::fs::remove_file(out_dir.join(lib_name));
+    risc0_build_kernel::add_to_static_lib(&out_dir, output, &[eval_check_obj]);
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static={output}");

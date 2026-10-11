@@ -38,12 +38,14 @@ __global__ __launch_bounds__(512) void witness_into_poly(fr_t* out,
 // from https://github.com/iden3/rapidsnark/blob/main/src/random_generator.hpp
 static inline void randombytes_buf(void* buf, size_t size) {
   static std::random_device engine;
-  static std::uniform_int_distribution<uint8_t> distr;
+  // Uniform over every byte value. Not `uniform_int_distribution<uint8_t>`: the
+  // standard does not allow 8-bit types there, and MSVC's library rejects them.
+  static std::uniform_int_distribution<unsigned int> distr(0, 255);
 
   uint8_t* buffer = static_cast<uint8_t*>(buf);
 
   for (size_t i = 0; i < size; i++) {
-    buffer[i] = distr(engine);
+    buffer[i] = static_cast<uint8_t>(distr(engine));
   }
 }
 

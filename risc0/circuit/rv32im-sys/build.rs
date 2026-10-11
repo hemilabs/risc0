@@ -94,41 +94,51 @@ fn build_cuda_kernels() {
         .map(|p| p.join("eval_check_cache"))
         .unwrap_or_else(|| out_dir.join("eval_check_cache"));
     std::fs::create_dir_all(&cache_dir).unwrap();
-    let eval_check_cached = cache_dir.join("eval_check_combined_standalone.o");
+    let msvc = risc0_build_kernel::is_msvc_target();
+    let obj_ext = risc0_build_kernel::object_extension();
+    let eval_check_cached = cache_dir.join(format!("eval_check_combined_standalone.{obj_ext}"));
     let eval_check_stamp = cache_dir.join("eval_check_hash.stamp");
-    let eval_check_obj = out_dir.join("eval_check_combined_standalone.o");
-    let current_hash = eval_check_source_hash();
+    let eval_check_obj = out_dir.join(format!("eval_check_combined_standalone.{obj_ext}"));
+
+    let mut cmd = risc0_build_kernel::nvcc_command();
+    cmd.current_dir("kernels/cuda");
+    if !msvc {
+        cmd.arg("-ccbin=c++")
+            .arg("-Xcompiler")
+            .arg("-O3,-ffunction-sections,-fdata-sections,-fPIC")
+            .arg("-Xcompiler")
+            .arg("-Wno-unused-function,-Wno-unused-parameter");
+    }
+    cmd.arg(risc0_build_kernel::cuda_cxx_std_flag())
+        .arg("-m64")
+        .arg("-Xptxas")
+        .arg("-O3")
+        .arg("-diag-suppress=177")
+        .arg("-diag-suppress=550")
+        .arg("-diag-suppress=2922")
+        .arg("-I")
+        .arg(&cuda_root)
+        .arg("-I")
+        .arg(&cxx_root)
+        .arg("-I")
+        .arg(&sppark_root);
+    if use_native_arch {
+        cmd.arg("-arch=native");
+    }
+    cmd.arg("-c") // compile only, NO --device-c
+        .arg("eval_check_combined.cu")
+        .arg("-o")
+        .arg(&eval_check_cached);
+
+    // Key the cache on the whole command plus what nvcc reads from outside it (the
+    // NVCC_*_FLAGS that carry the GPU architecture list, and the nvcc version), so a
+    // changed architecture list or toolchain can never reuse an object built without it.
+    let nvcc_key = format!("{cmd:?}\n{}", risc0_build_kernel::nvcc_environment_key());
+    let current_hash = eval_check_source_hash(Some(&nvcc_key));
     let cached_hash = std::fs::read_to_string(&eval_check_stamp).unwrap_or_default();
     let need_rebuild = current_hash != cached_hash || !eval_check_cached.exists();
     if need_rebuild {
         eprintln!("eval_check: source changed (or first build), compiling standalone...");
-        let mut cmd = Command::new("nvcc");
-        cmd.current_dir("kernels/cuda")
-            .arg("-ccbin=c++")
-            .arg("-std=c++17")
-            .arg("-Xcompiler")
-            .arg("-O3,-ffunction-sections,-fdata-sections,-fPIC")
-            .arg("-Xcompiler")
-            .arg("-Wno-unused-function,-Wno-unused-parameter")
-            .arg("-m64")
-            .arg("-Xptxas")
-            .arg("-O3")
-            .arg("-diag-suppress=177")
-            .arg("-diag-suppress=550")
-            .arg("-diag-suppress=2922")
-            .arg("-I")
-            .arg(&cuda_root)
-            .arg("-I")
-            .arg(&cxx_root)
-            .arg("-I")
-            .arg(&sppark_root);
-        if use_native_arch {
-            cmd.arg("-arch=native");
-        }
-        cmd.arg("-c") // compile only, NO --device-c
-            .arg("eval_check_combined.cu")
-            .arg("-o")
-            .arg(&eval_check_cached);
         let status = cmd.status().expect("failed to run nvcc for eval_check_combined.cu");
         assert!(
             status.success(),
@@ -151,16 +161,22 @@ fn build_cuda_kernels() {
         .flag("-diag-suppress=177")
         .flag("-diag-suppress=550")
         .flag("-diag-suppress=2922")
-        .flag("-std=c++17")
-        .flag("-Xcompiler")
-        .flag("-Wno-unused-function,-Wno-unused-parameter")
-        .flag("-Xcompiler")
-        .flag("-O3")
+        .flag(risc0_build_kernel::cuda_cxx_std_flag())
         .flag("-Xptxas")
         .flag("-O3")
         .include(&cuda_root)
         .include(&cxx_root)
         .include(&sppark_root);
+    // GCC/Clang host flags; on MSVC `cc` already passes cl.exe its optimization level.
+    if msvc {
+        risc0_build_kernel::msvc_cuda_build_setup(&mut build);
+    } else {
+        build
+            .flag("-Xcompiler")
+            .flag("-Wno-unused-function,-Wno-unused-parameter")
+            .flag("-Xcompiler")
+            .flag("-O3");
+    }
     if use_native_arch {
         build.flag("-arch=native");
     }
@@ -183,15 +199,7 @@ fn build_cuda_kernels() {
     build.files(cuda_files).compile(output);
 
     // Step 3: Add standalone objects to the archive.
-    let archive = out_dir.join(format!("lib{output}.a"));
-    let ar = risc0_build_kernel::find_ar_tool();
-    let status = Command::new(&ar)
-        .arg("rcs")
-        .arg(&archive)
-        .arg(&eval_check_obj)
-        .status()
-        .expect("failed to run ar");
-    assert!(status.success(), "ar failed to add standalone objects");
+    risc0_build_kernel::add_to_static_lib(&out_dir, output, &[eval_check_obj]);
 }
 
 fn build_rocm_kernels() {
@@ -240,7 +248,7 @@ fn build_rocm_kernels() {
     let eval_check_cached = cache_dir.join("eval_check_combined_standalone.o");
     let eval_check_stamp = cache_dir.join("eval_check_hash_rocm.stamp");
     let eval_check_obj = out_dir.join("eval_check_combined_standalone.o");
-    let current_hash = eval_check_source_hash();
+    let current_hash = eval_check_source_hash(None);
     let cached_hash = std::fs::read_to_string(&eval_check_stamp).unwrap_or_default();
     let need_rebuild = current_hash != cached_hash || !eval_check_cached.exists();
     if need_rebuild {
@@ -442,9 +450,10 @@ fn glob_paths(pattern: &str) -> Vec<PathBuf> {
     glob::glob(pattern).unwrap().map(|x| x.unwrap()).collect()
 }
 
-/// Hash the contents of all files relevant to eval_check compilation.
-/// Returns a hex string that changes when any eval_check source changes.
-fn eval_check_source_hash() -> String {
+/// Hash the contents of all files relevant to eval_check compilation, plus
+/// `compiler_key` (everything about the compiler invocation that changes its output).
+/// Returns a hex string that changes when any of them changes.
+fn eval_check_source_hash(compiler_key: Option<&str>) -> String {
     let mut hasher = DefaultHasher::new();
     let files = [
         "kernels/cuda/eval_check_combined.cu",
@@ -472,5 +481,8 @@ fn eval_check_source_hash() -> String {
     }
     // Hash target architectures so cache invalidates when arch list changes
     risc0_build_kernel::hip_arches().hash(&mut hasher);
+    if let Some(key) = compiler_key {
+        key.hash(&mut hasher);
+    }
     format!("{:016x}", hasher.finish())
 }
