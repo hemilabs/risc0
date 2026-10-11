@@ -960,6 +960,7 @@ fn compute_multipass_hash(cxx_root: &str, icpx_version: &str) -> String {
 fn compute_witgen_hash(cxx_root: &str, icpx_version: &str) -> String {
     let mut in_tree: Vec<PathBuf> = vec![
         PathBuf::from("kernels/intel/ffi_witgen.cpp"),
+        PathBuf::from("kernels/intel/accum_batchinv.py"),
         PathBuf::from("kernels/cxx/steps.cpp"),
         PathBuf::from("build.rs"),
     ];
@@ -1588,6 +1589,22 @@ fn build_intel_kernels() {
             &std::fs::read_to_string("kernels/intel/ffi_witgen.cpp").unwrap()
         );
         std::fs::write(&witgen_amalg_path, &witgen_amalg).unwrap();
+        // Montgomery batch inversion of the FpExt inv_0 calls in each
+        // exec_TopAccum mux arm (chunks of 8; 64 miscompiled under IGC spill
+        // pressure, 8/16 verified bit-exact). Expect all but 4 of 411 batched.
+        let st = Command::new("python3")
+            .arg("kernels/intel/accum_batchinv.py")
+            .arg(&witgen_amalg_path)
+            .arg(&witgen_amalg_path)
+            .arg("8")
+            .output()
+            .expect("accum_batchinv.py");
+        let out = String::from_utf8_lossy(&st.stdout);
+        assert!(
+            st.status.success() && out.contains("remaining inv_0 in TopAccum 4"),
+            "accum_batchinv.py failed or changed shape: {out} {}",
+            String::from_utf8_lossy(&st.stderr)
+        );
 
         let mut cmd = Command::new(&icpx);
         cmd.arg("-shared")
@@ -1595,6 +1612,8 @@ fn build_intel_kernels() {
             .arg("-fsycl")
             .arg("-std=c++17")
             .arg("-Os") // -Os: different opt passes to avoid icpx -O1 accum miscompilation
+            // 32-bit Montgomery + inlined lazy FpExt mul (fp.h/fpext.h): accum 2x.
+            .arg("-DRISC0_INTEL_EVAL_FAST")
             // 2026-04-21: patched IGC + no cl-opt-disable + explicit 256 GRF (committed setup).
             // 2026-04-22: -Xfinalizer presched-rp/spillAllowed flags tested via -options nesting,
             // ocloc rejected with exit 226. Need different syntax — deferred.

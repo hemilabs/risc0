@@ -154,8 +154,43 @@ constexpr size_t EXT_SIZE = 4;
 // Built in field operations
 inline Val isz(Val x) { return Val(x == Val(0)); }
 inline Val neg_0(Val x) { return -x; }
-inline Val inv_0(Val x) { return inv(x); }
-inline ExtVal inv_0(ExtVal x) { return inv(x); }
+// Addition-chain Fp inverse: x^(P-2), P-2 = 0x77FFFFFF, 41 mul/sqr instead
+// of the 31-step square-and-multiply loop in fp.h (same value, incl. inv(0)=0).
+inline Fp inv_chain(Fp x) {
+  Fp x2 = x * x;
+  Fp x3 = x2 * x;
+  Fp x6 = x3 * x3;
+  Fp y3 = x6 * x;            // x^(2^3-1)
+  Fp t = y3;
+  for (int i = 0; i < 3; i++) t = t * t;
+  Fp y6 = t * y3;            // x^(2^6-1)
+  Fp z = y3;
+  for (int i = 0; i < 4; i++) z = z * z;
+  z = z * y3;                // x^0x77
+#pragma unroll
+  for (int k = 0; k < 4; k++) {
+#pragma unroll
+    for (int i = 0; i < 6; i++) z = z * z;
+    z = z * y6;
+  }
+  return z;
+}
+inline FpExt inv_ext_chain(FpExt in) {
+  const Fp* a = in.elems;
+  const Fp beta(11), nbeta(Fp::P - 11);
+  Fp b0 = a[0] * a[0] + beta * (a[1] * (a[3] + a[3]) - a[2] * a[2]);
+  Fp b2 = a[0] * (a[2] + a[2]) - a[1] * a[1] + beta * (a[3] * a[3]);
+  Fp c = b0 * b0 + beta * b2 * b2;
+  Fp ic = inv_chain(c);
+  b0 *= ic;
+  b2 *= ic;
+  return FpExt(a[0] * b0 + beta * a[2] * b2,
+               -a[1] * b0 + nbeta * a[3] * b2,
+               -a[0] * b2 + a[2] * b0,
+               a[1] * b2 - a[3] * b0);
+}
+inline Val inv_0(Val x) { return inv_chain(x); }
+inline ExtVal inv_0(ExtVal x) { return inv_ext_chain(x); }
 inline Val bitAnd(Val a, Val b) { return Val(a.asUInt32() & b.asUInt32()); }
 inline Val inRange(Val low, Val mid, Val high) { return Val(low <= mid && mid < high); }
 
