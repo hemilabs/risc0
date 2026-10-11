@@ -19,7 +19,8 @@ use risc0_zkp::field::Elem as _;
 
 use anyhow::{bail, Result};
 use risc0_circuit_recursion_sys::{
-    risc0_circuit_recursion_cpu_accum, risc0_circuit_recursion_cpu_witgen,
+    risc0_circuit_recursion_cpu_accum, risc0_circuit_recursion_cpu_eval_check,
+    risc0_circuit_recursion_cpu_witgen,
     RawAccumBuffers, RawExecBuffers, RawPreflightTrace,
     StepMode,
 };
@@ -378,6 +379,54 @@ impl<IH: IntelHash> CircuitHal<IntelHal<IH>> for IntelCircuitHal<IH> {
             )
         });
 
+        // RISC0_RECURSION_EVAL_CHECK_SHADOW=1: recompute on the CPU and
+        // compare bit-for-bit (debug only; seconds per proof).
+        if std::env::var_os("RISC0_RECURSION_EVAL_CHECK_SHADOW").is_some() {
+            let ctrl = dtoh_vec(groups[REGISTER_GROUP_CTRL]);
+            let data = dtoh_vec(groups[REGISTER_GROUP_DATA]);
+            let accum = dtoh_vec(groups[REGISTER_GROUP_ACCUM]);
+            let mix = dtoh_vec(globals[GLOBAL_MIX]);
+            let global = dtoh_vec(globals[GLOBAL_OUT]);
+            let gpu = dtoh_vec(check);
+            let cpu = vec_filled(check.size(), BabyBearElem::ZERO);
+            let buffers = RawAccumBuffers {
+                ctrl: ctrl.as_ptr(),
+                global: global.as_ptr(),
+                data: data.as_ptr(),
+                mix: mix.as_ptr(),
+                accum: accum.as_ptr(),
+            };
+            ffi_wrap(|| unsafe {
+                risc0_circuit_recursion_cpu_eval_check(
+                    &buffers,
+                    poly_mix_pows.as_ptr(),
+                    cpu.as_ptr(),
+                    rou,
+                    po2 as u32,
+                    domain as u32,
+                )
+            })
+            .unwrap();
+            let bad: Vec<usize> = gpu
+                .iter()
+                .zip(cpu.iter())
+                .enumerate()
+                .filter(|(_, (a, b))| a.as_u32_montgomery() != b.as_u32_montgomery())
+                .map(|(i, _)| i)
+                .collect();
+            if bad.is_empty() {
+                eprintln!("[recursion_eval_check_shadow] po2={po2} domain={domain}: {} elems identical", gpu.len());
+            } else {
+                let rows: std::collections::BTreeSet<usize> = bad.iter().map(|i| i % domain).collect();
+                panic!(
+                    "[recursion_eval_check_shadow] po2={po2} domain={domain}: {} of {} differ, {} distinct rows, first rows {:?}",
+                    bad.len(),
+                    gpu.len(),
+                    rows.len(),
+                    rows.iter().take(16).collect::<Vec<_>>()
+                );
+            }
+        }
     }
 
     #[allow(unused)]
