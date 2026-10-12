@@ -17,7 +17,7 @@ use std::sync::OnceLock;
 use anyhow::Result;
 use risc0_binfmt::{MemoryImage, PovwJobId, PovwLogId, PovwNonce};
 use risc0_circuit_rv32im::TerminateState;
-use risc0_zkp::{core::digest::Digest, verify::VerificationError};
+use risc0_zkp::{core::digest::Digest, digest, verify::VerificationError};
 use risc0_zkvm_methods::{multi_test::MultiTestSpec, MULTI_TEST_ELF, MULTI_TEST_ID};
 use risc0_zkvm_platform::{memory, WORD_SIZE};
 use rstest::rstest;
@@ -190,6 +190,17 @@ fn check_image_id() {
         receipt.verify_with_context(&ctx, image_id).unwrap_err(),
         VerificationError::ClaimDigestMismatch { .. }
     ));
+}
+
+#[test_log::test]
+fn p2_basic() {
+    let env = ExecutorEnv::builder()
+        .write(&MultiTestSpec::Poseidon2Basic)
+        .unwrap()
+        .build()
+        .unwrap();
+    let receipt = prove_elf(env, MULTI_TEST_ELF).unwrap();
+    receipt.verify(MULTI_TEST_ID).unwrap();
 }
 
 #[test_log::test]
@@ -565,7 +576,7 @@ fn sys_input() {
 #[case(ReceiptKind::Groth16, ReceiptKind::Succinct)]
 #[case(ReceiptKind::Groth16, ReceiptKind::Groth16)]
 #[test_log::test]
-#[cfg(any(feature = "cuda", feature = "docker"))]
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "docker"))]
 fn compress(#[case] from: ReceiptKind, #[case] into: ReceiptKind) {
     let from_receipt = prove_nothing(from).receipt;
     let opts = ProverOpts::default().with_receipt_kind(into);
@@ -597,7 +608,7 @@ fn compress(#[case] from: ReceiptKind, #[case] into: ReceiptKind) {
 #[case(ReceiptKind::Groth16, ReceiptKind::Succinct)]
 #[case(ReceiptKind::Groth16, ReceiptKind::Groth16)]
 #[test_log::test]
-#[cfg(any(feature = "cuda", feature = "docker"))]
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "docker"))]
 fn fake_compress(#[case] from: ReceiptKind, #[case] into: ReceiptKind) {
     use crate::{DevModeProver, FakeReceipt, ProverServer as _};
 
@@ -618,7 +629,7 @@ fn fake_compress(#[case] from: ReceiptKind, #[case] into: ReceiptKind) {
 }
 
 #[test_log::test]
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 fn shrink_wrap() {
     // Perform many proofs in parallel. The initial implementation of the
     // groth16 prover on CUDA had issues with this. Ensure that we got a groth16
@@ -639,7 +650,7 @@ fn shrink_wrap() {
 #[case(ReceiptKind::Succinct)]
 #[case(ReceiptKind::Groth16)]
 #[test_log::test]
-#[cfg(any(feature = "cuda", feature = "docker"))]
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "docker"))]
 fn verify_in_guest(#[case] kind: ReceiptKind) {
     use risc0_zkvm_methods::VERIFY_ELF;
 
@@ -1131,5 +1142,76 @@ mod soundness {
 
         let security = soundness::toy_model_security::<CpuHal<BabyBear>>(taps, coeffs_size);
         assert_eq!(security, 97.14198);
+    }
+}
+
+mod keccak {
+    use risc0_circuit_keccak::{
+        prove::zkr::get_keccak_zkr, KECCAK_CONTROL_IDS, KECCAK_CONTROL_ROOT, KECCAK_PO2_RANGE,
+    };
+    use risc0_zkp::core::hash::poseidon2::Poseidon2HashSuite;
+
+    use crate::recursion::MerkleGroup;
+
+    use super::*;
+
+    fn compute_control_ids() -> Vec<Digest> {
+        let mut ret = vec![];
+        for po2 in KECCAK_PO2_RANGE {
+            let program = get_keccak_zkr(po2).unwrap();
+            let hash_suite = Poseidon2HashSuite::new_suite();
+            ret.push(program.compute_control_id(hash_suite).unwrap())
+        }
+        ret
+    }
+
+    fn compute_control_root() -> Digest {
+        // KECCAK_CONTROL_ROOT is defined over the sorted IDs (see
+        // keccak::keccak_allowed_control_ids).
+        let mut control_ids = compute_control_ids();
+        control_ids.sort();
+        let hash_suite = Poseidon2HashSuite::new_suite();
+        let hashfn = hash_suite.hashfn.as_ref();
+        let group = MerkleGroup::new(control_ids).unwrap();
+        group.calc_root(hashfn)
+    }
+
+    // Makes sure our included control IDs are what we expect
+    #[test]
+    fn control_ids() {
+        assert_eq!(KECCAK_CONTROL_IDS, compute_control_ids());
+    }
+
+    #[test]
+    fn control_roots() {
+        assert_eq!(KECCAK_CONTROL_ROOT, compute_control_root());
+    }
+
+    #[rstest]
+    #[case(16, digest!("b5dc0b683d1e06601584752ad3d9404d8761f85fbfaa0a5b15999a27a2f79314"))]
+    #[case(17, digest!("1cc132224976f3626a94315c341efc232cff5e485da96144c908c9580e29c707"))]
+    #[test_log::test]
+    fn basic(#[case] po2: u32, #[case] claim_digest: Digest) {
+        let env = ExecutorEnv::builder()
+            .write(&MultiTestSpec::KeccakProve { claim_digest, po2 })
+            .unwrap()
+            .keccak_max_po2(po2)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let receipt = prove_elf(env, MULTI_TEST_ELF).unwrap();
+
+        // Make sure this receipt actually depends on the assumption;
+        // otherwise this test might give a false negative.
+        assert!(!receipt
+            .inner
+            .composite()
+            .unwrap()
+            .assumption_receipts
+            .is_empty());
+
+        // Make sure the receipt verifies OK
+        receipt.verify(MULTI_TEST_ID).unwrap();
     }
 }

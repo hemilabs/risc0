@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{cell::RefCell, fmt::Debug, marker::PhantomData, rc::Rc, sync::OnceLock};
+use std::{
+    cell::RefCell, collections::HashMap, fmt::Debug, marker::PhantomData, mem::ManuallyDrop,
+    rc::Rc, sync::OnceLock,
+};
 
 use anyhow::{bail, Context as _, Result};
 use cust::{
@@ -43,6 +46,50 @@ use crate::{
     FRI_FOLD,
 };
 
+/// Thread-local pool of CUDA device buffers, keyed by byte size.
+/// Reuses freed buffers to avoid cuMemAlloc/cuMemFree overhead (~20ms/proof).
+struct BufferPool {
+    cache: HashMap<usize, Vec<DeviceBuffer<u8>>>,
+    total_cached: usize,
+}
+
+const BUFFER_POOL_MAX_BYTES: usize = 16 << 30; // 16 GB
+const BUFFER_POOL_SMALL_THRESHOLD: usize = 64 << 10; // 64 KB - always pool small buffers
+
+impl BufferPool {
+    fn new() -> Self {
+        Self {
+            cache: HashMap::new(),
+            total_cached: 0,
+        }
+    }
+
+    fn pop(&mut self, size: usize) -> Option<DeviceBuffer<u8>> {
+        if let Some(bufs) = self.cache.get_mut(&size) {
+            if let Some(buf) = bufs.pop() {
+                self.total_cached -= size;
+                return Some(buf);
+            }
+        }
+        None
+    }
+
+    fn push(&mut self, size: usize, buf: DeviceBuffer<u8>) {
+        // Always pool small buffers (cuMemFree overhead > storage cost).
+        // Only enforce cap for large buffers.
+        if size >= BUFFER_POOL_SMALL_THRESHOLD && self.total_cached + size > BUFFER_POOL_MAX_BYTES {
+            drop(buf);
+            return;
+        }
+        self.total_cached += size;
+        self.cache.entry(size).or_default().push(buf);
+    }
+}
+
+thread_local! {
+    static BUFFER_POOL: RefCell<BufferPool> = RefCell::new(BufferPool::new());
+}
+
 // The GPU becomes unstable as the number of concurrent provers grow.
 pub fn singleton() -> &'static ReentrantMutex<()> {
     static ONCE: OnceLock<ReentrantMutex<()>> = OnceLock::new();
@@ -67,6 +114,15 @@ pub trait CudaHash {
 
     /// Run the hash_fold function
     fn hash_fold(&self, io: &BufferImpl<Digest>, output_size: usize);
+
+    /// Run the hash_fold_tree function (fold all layers in a single FFI call)
+    fn hash_fold_tree(&self, io: &BufferImpl<Digest>, layers: usize) {
+        // Default: fall back to per-level hash_fold
+        for i in (0..layers).rev() {
+            let layer_size = 1 << i;
+            self.hash_fold(io, layer_size);
+        }
+    }
 
     /// Run the hash_rows function
     fn hash_rows(&self, output: &BufferImpl<Digest>, matrix: &BufferImpl<BabyBearElem>);
@@ -153,6 +209,13 @@ impl CudaHash for CudaHashPoseidon2 {
         }
     }
 
+    fn hash_fold_tree(&self, io: &BufferImpl<Digest>, layers: usize) {
+        let err = unsafe { sppark_poseidon2_fold_tree(io.as_device_ptr(), layers as u32) };
+        if err.code != 0 {
+            panic!("Failure during hash_fold_tree: {err}");
+        }
+    }
+
     fn hash_rows(&self, output: &BufferImpl<Digest>, matrix: &BufferImpl<BabyBearElem>) {
         let row_size = output.size();
         let col_size = matrix.size() / output.size();
@@ -198,6 +261,13 @@ impl CudaHash for CudaHashPoseidon254 {
         }
     }
 
+    fn hash_fold_tree(&self, io: &BufferImpl<Digest>, layers: usize) {
+        let err = unsafe { sppark_poseidon254_fold_tree(io.as_device_ptr(), layers as u32) };
+        if err.code != 0 {
+            panic!("Failure during hash_fold_tree: {err}");
+        }
+    }
+
     fn hash_rows(&self, output: &BufferImpl<Digest>, matrix: &BufferImpl<BabyBearElem>) {
         let row_size = output.size();
         let col_size = matrix.size() / output.size();
@@ -224,7 +294,9 @@ impl CudaHash for CudaHashPoseidon254 {
 pub struct CudaHal<Hash: CudaHash + ?Sized> {
     pub max_threads: u32,
     hash: Option<Box<Hash>>,
-    _context: Context,
+    // Use primary context (None) to avoid per-instance CUDA module loading overhead.
+    // The primary context persists for the process lifetime, so modules load once.
+    _context: Option<Context>,
     _lock: ReentrantMutexGuard<'static, ()>,
 }
 
@@ -234,17 +306,24 @@ pub type CudaHalPoseidon254 = CudaHal<CudaHashPoseidon254>;
 
 struct RawBuffer {
     name: &'static str,
-    buf: DeviceBuffer<u8>,
+    buf: ManuallyDrop<DeviceBuffer<u8>>,
 }
 
 impl RawBuffer {
     pub fn new(name: &'static str, size: usize) -> Self {
         tracing::trace!("alloc: {size} bytes, {name}");
         tracker().lock().unwrap().alloc(size);
-        let buf = unsafe { DeviceBuffer::uninitialized(size) }
-            .context(format!("allocation failed on {name}: {size} bytes"))
-            .unwrap();
-        Self { name, buf }
+        let buf = BUFFER_POOL
+            .with(|pool| pool.borrow_mut().pop(size))
+            .unwrap_or_else(|| {
+                unsafe { DeviceBuffer::uninitialized(size) }
+                    .context(format!("allocation failed on {name}: {size} bytes"))
+                    .unwrap()
+            });
+        Self {
+            name,
+            buf: ManuallyDrop::new(buf),
+        }
     }
 
     pub fn set_u32(&mut self, value: u32) {
@@ -254,8 +333,14 @@ impl RawBuffer {
 
 impl Drop for RawBuffer {
     fn drop(&mut self) {
-        tracing::trace!("free: {} bytes, {}", self.buf.len(), self.name);
-        tracker().lock().unwrap().free(self.buf.len());
+        let size = self.buf.len();
+        tracing::trace!("free: {size} bytes, {}", self.name);
+        tracker().lock().unwrap().free(size);
+        // Cache the buffer for reuse instead of calling cuMemFree.
+        // Safety: self.buf is not accessed after take() since we're in Drop,
+        // and ManuallyDrop's own drop is a no-op.
+        let buf = unsafe { ManuallyDrop::take(&mut self.buf) };
+        BUFFER_POOL.with(|pool| pool.borrow_mut().push(size, buf));
     }
 }
 
@@ -407,12 +492,21 @@ impl<CH: CudaHash + ?Sized> CudaHal<CH> {
         let max_threads = device
             .get_attribute(DeviceAttribute::MaxThreadsPerBlock)
             .unwrap();
-        let context = Context::new(device).unwrap();
-        context.set_flags(ContextFlags::SCHED_AUTO).unwrap();
+        // Use the primary context (from sppark_init/cust::init) instead of creating
+        // a new context. This avoids per-instance CUDA module loading (~100ms for
+        // large rv32im kernels) since modules persist in the primary context.
+
+        // Warmup: create the persistent CUDA stream and load the risc0-zkp kernel
+        // module. This retains the primary CUDA context so that subsequent
+        // DeviceBuffer allocations don't fail with "invalid device context".
+        extern "C" {
+            fn risc0_zkp_cuda_warmup() -> *const std::os::raw::c_char;
+        }
+        let _ = ffi_wrap(|| unsafe { risc0_zkp_cuda_warmup() });
 
         let mut hal = Self {
             max_threads: max_threads as u32,
-            _context: context,
+            _context: None,
             hash: None,
             _lock,
         };
@@ -420,6 +514,17 @@ impl<CH: CudaHash + ?Sized> CudaHal<CH> {
         hal
     }
 
+    /// Synchronize the risc0 persistent CUDA stream.
+    /// Must be called before sppark operations that read from buffers
+    /// last written by risc0 kernels (which use a different CUDA stream).
+    fn sync_stream() {
+        extern "C" {
+            fn risc0_zkp_cuda_sync_stream() -> *const std::os::raw::c_char;
+        }
+        ffi_wrap(|| unsafe { risc0_zkp_cuda_sync_stream() }).unwrap();
+    }
+
+    #[allow(dead_code)]
     fn poly_divide(
         &self,
         polynomial: &BufferImpl<BabyBearExtElem>,
@@ -443,6 +548,35 @@ impl<CH: CudaHash + ?Sized> CudaHal<CH> {
         }
 
         remainder
+    }
+
+    #[allow(dead_code)]
+    fn poly_divide_batch(
+        &self,
+        polynomial: &BufferImpl<BabyBearExtElem>,
+        pows: &[BabyBearExtElem],
+    ) -> Vec<BabyBearExtElem> {
+        let num_divides = pows.len();
+        let poly_size = polynomial.size();
+        let mut remainders = vec![BabyBearExtElem::ZERO; num_divides];
+        let pows_words: Vec<u32> = pows.iter().flat_map(|p| p.to_u32_words()).collect();
+        Self::sync_stream();
+
+        let err = unsafe {
+            supra_poly_divide_batch(
+                polynomial.as_device_ptr(),
+                poly_size,
+                remainders.as_mut_ptr() as *mut u32,
+                pows_words.as_ptr(),
+                num_divides as u32,
+            )
+        };
+
+        if err.code != 0 {
+            panic!("Failure during supra_poly_divide_batch: {err}");
+        }
+
+        remainders
     }
 }
 
@@ -525,50 +659,35 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
         output: &Self::Buffer<Self::Elem>,
         input: &Self::Buffer<Self::Elem>,
         poly_count: usize,
-        expand_bits: usize,
+        _expand_bits: usize,
     ) {
-        // batch_expand
-        {
-            let out_size = output.size() / poly_count;
-            let in_size = input.size() / poly_count;
-            let expand_bits = log2_ceil(out_size / in_size);
-            assert_eq!(output.size(), out_size * poly_count);
-            assert_eq!(input.size(), in_size * poly_count);
-            assert_eq!(out_size, in_size * (1 << expand_bits));
-            let in_bits = log2_ceil(in_size);
-            let err = unsafe {
-                sppark_batch_expand(
-                    output.as_device_ptr(),
-                    input.as_device_ptr(),
-                    in_bits.try_into().unwrap(),
-                    expand_bits.try_into().unwrap(),
-                    poly_count.try_into().unwrap(),
-                )
-            };
-            if err.code != 0 {
-                panic!("Failure during batch_expand: {err}");
-            }
-        }
+        let out_size = output.size() / poly_count;
+        let in_size = input.size() / poly_count;
+        let expand_bits = log2_ceil(out_size / in_size);
+        assert_eq!(output.size(), out_size * poly_count);
+        assert_eq!(input.size(), in_size * poly_count);
+        assert_eq!(out_size, in_size * (1 << expand_bits));
+        let in_bits = log2_ceil(in_size);
 
-        // batch_evaluate_ntt
-        {
-            let row_size = output.size() / poly_count;
-            assert_eq!(row_size * poly_count, output.size());
-            let n_bits = log2_ceil(row_size);
-            assert_eq!(row_size, 1 << n_bits);
-            assert!(n_bits >= expand_bits);
-            assert!(n_bits < Self::Elem::MAX_ROU_PO2);
+        let row_size = output.size() / poly_count;
+        assert_eq!(row_size * poly_count, output.size());
+        let n_bits = log2_ceil(row_size);
+        assert_eq!(row_size, 1 << n_bits);
+        assert!(n_bits >= expand_bits);
+        assert!(n_bits < Self::Elem::MAX_ROU_PO2);
+        Self::sync_stream();
 
-            let err = unsafe {
-                sppark_batch_NTT(
-                    output.as_device_ptr(),
-                    n_bits.try_into().unwrap(),
-                    poly_count.try_into().unwrap(),
-                )
-            };
-            if err.code != 0 {
-                panic!("Failure during batch_evaluate_ntt: {err}");
-            }
+        let err = unsafe {
+            sppark_batch_expand_NTT(
+                output.as_device_ptr(),
+                input.as_device_ptr(),
+                in_bits.try_into().unwrap(),
+                expand_bits.try_into().unwrap(),
+                poly_count.try_into().unwrap(),
+            )
+        };
+        if err.code != 0 {
+            panic!("Failure during batch_expand_NTT: {err}");
         }
     }
 
@@ -578,6 +697,7 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
         let n_bits = log2_ceil(row_size);
         assert_eq!(row_size, 1 << n_bits);
         assert!(n_bits < Self::Elem::MAX_ROU_PO2);
+        Self::sync_stream();
 
         let err = unsafe {
             sppark_batch_iNTT(
@@ -693,6 +813,41 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
         false
     }
 
+    fn batch_get_digest_at(&self, buf: &Self::Buffer<Digest>, indices: &[usize]) -> Vec<Digest> {
+        if indices.is_empty() {
+            return Vec::new();
+        }
+        let count = indices.len();
+        let indices_u32: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
+        let indices_buf = self.copy_from_u32("gather_indices", &indices_u32);
+        let output_buf: BufferImpl<Digest> = BufferImpl::new("gather_output", count);
+
+        extern "C" {
+            fn risc0_zkp_cuda_gather_digests(
+                dst: DevicePointer<u8>,
+                src: DevicePointer<u8>,
+                indices: DevicePointer<u8>,
+                count: u32,
+            ) -> *const std::os::raw::c_char;
+        }
+
+        ffi_wrap(|| unsafe {
+            risc0_zkp_cuda_gather_digests(
+                output_buf.as_device_ptr(),
+                buf.as_device_ptr(),
+                indices_buf.as_device_ptr(),
+                count as u32,
+            )
+        })
+        .unwrap();
+
+        let mut result = Vec::new();
+        output_buf.view(|view| {
+            result = view.to_vec();
+        });
+        result
+    }
+
     fn zk_shift(&self, io: &Self::Buffer<Self::Elem>, poly_count: usize) {
         let bits = log2_ceil(io.size() / poly_count);
         assert_eq!(io.size(), poly_count * (1 << bits));
@@ -706,6 +861,26 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
         };
         if err.code != 0 {
             panic!("Failure during zk_shift: {err}");
+        }
+    }
+
+    fn batch_interpolate_ntt_zk_shift(&self, io: &Self::Buffer<Self::Elem>, count: usize) {
+        let row_size = io.size() / count;
+        assert_eq!(row_size * count, io.size());
+        let n_bits = log2_ceil(row_size);
+        assert_eq!(row_size, 1 << n_bits);
+        assert!(n_bits < Self::Elem::MAX_ROU_PO2);
+        Self::sync_stream();
+
+        let err = unsafe {
+            sppark_batch_iNTT_zk_shift(
+                io.as_device_ptr(),
+                n_bits.try_into().unwrap(),
+                count.try_into().unwrap(),
+            )
+        };
+        if err.code != 0 {
+            panic!("Failure during batch_iNTT_zk_shift: {err}");
         }
     }
 
@@ -864,27 +1039,55 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
             return;
         }
 
-        let index = self.copy_from_u32("index", index);
-        let offsets = self.copy_from_u32("offsets", offsets);
-        let values = self.copy_from_elem("values", values);
-
         extern "C" {
-            fn risc0_zkp_cuda_scatter(
+            fn risc0_zkp_cuda_scatter_from_host(
                 into: DevicePointer<u8>,
-                index: DevicePointer<u8>,
-                offsets: DevicePointer<u8>,
-                values: DevicePointer<u8>,
+                h_index: *const u32,
+                index_count: u32,
+                h_offsets: *const u32,
+                offsets_count: u32,
+                h_values: *const u8,
+                values_count: u32,
                 count: u32,
             ) -> *const std::os::raw::c_char;
         }
 
         ffi_wrap(|| unsafe {
-            risc0_zkp_cuda_scatter(
+            risc0_zkp_cuda_scatter_from_host(
                 into.as_device_ptr(),
-                index.as_device_ptr(),
-                offsets.as_device_ptr(),
-                values.as_device_ptr(),
+                index.as_ptr(),
+                index.len() as u32,
+                offsets.as_ptr(),
+                offsets.len() as u32,
+                values.as_ptr() as *const u8,
+                values.len() as u32,
                 count as u32,
+            )
+        })
+        .unwrap();
+    }
+
+    fn scatter_bits(&self, into: &Self::Buffer<Self::Elem>, bit_data: &[u32], cycles: u32) {
+        let count = bit_data.len() / 3;
+        if count == 0 {
+            return;
+        }
+
+        extern "C" {
+            fn risc0_zkp_cuda_scatter_bits_from_host(
+                into: DevicePointer<u8>,
+                h_data: *const u32,
+                triplet_count: u32,
+                cycles: u32,
+            ) -> *const std::os::raw::c_char;
+        }
+
+        ffi_wrap(|| unsafe {
+            risc0_zkp_cuda_scatter_bits_from_host(
+                into.as_device_ptr(),
+                bit_data.as_ptr(),
+                count as u32,
+                cycles,
             )
         })
         .unwrap();
@@ -967,6 +1170,10 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
         self.hash.as_ref().unwrap().hash_fold(io, output_size);
     }
 
+    fn hash_fold_tree(&self, io: &Self::Buffer<Digest>, layers: usize) {
+        self.hash.as_ref().unwrap().hash_fold_tree(io, layers);
+    }
+
     fn hash_rows(&self, output: &Self::Buffer<Digest>, matrix: &Self::Buffer<Self::Elem>) {
         self.hash.as_ref().unwrap().hash_rows(output, matrix);
     }
@@ -1038,12 +1245,26 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
         cycles: usize,
     ) {
         scope!("combos_divide");
-        for (i, pows) in chunks {
-            let combo_slice = combos.slice(i * cycles, cycles);
-            for pow in pows {
-                let remainder = self.poly_divide(&combo_slice, pow);
-                assert_eq!(remainder, Self::ExtElem::ZERO, "i: {i}");
-            }
+        let combo_indices: Vec<u32> = chunks.iter().map(|(i, _)| *i as u32).collect();
+        let pows_per_combo: Vec<u32> = chunks.iter().map(|(_, pows)| pows.len() as u32).collect();
+        let all_pows_flat: Vec<u32> = chunks
+            .iter()
+            .flat_map(|(_, pows)| pows.iter().flat_map(|p| p.to_u32_words()))
+            .collect();
+
+        Self::sync_stream();
+        let err = unsafe {
+            supra_poly_divide_multi(
+                combos.as_device_ptr(),
+                cycles,
+                combo_indices.as_ptr(),
+                pows_per_combo.as_ptr(),
+                all_pows_flat.as_ptr(),
+                chunks.len() as u32,
+            )
+        };
+        if err.code != 0 {
+            panic!("Failure during supra_poly_divide_multi: {err}");
         }
     }
 }

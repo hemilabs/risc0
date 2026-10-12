@@ -35,10 +35,13 @@
 #endif
 
 #include <algorithm>
+#include <cstdlib>
 #include <exception>
 #include <numeric>
+#include <stdexcept>
 #include <stdio.h>
 #include <string.h>
+#include <vector>
 
 using namespace risc0;
 using namespace risc0::circuit::recursion;
@@ -116,12 +119,90 @@ void MachineContext::doStepVerifyWom(uint32_t mode) {
   }
 }
 
+// Sort the write-once-memory rows by operator< (addr, then value). The
+// written rows of cycle c occupy slots [0, womIndex[c]) of that cycle; every
+// other slot is the identical invalid pattern (addr 0xffffffff), which sorts
+// last. A counting sort on addr over the written rows, with runs of equal
+// addr finished by operator<, therefore gives exactly the std::sort result.
+// The circuit makes valid addresses dense (step_verify_mem allows address
+// steps of 0 or 1 only), so the histogram is at most the number of written
+// rows; anything else (or RISC0_RECURSION_FAST_SORT=0) uses std::sort.
+// RISC0_RECURSION_FAST_SORT_CHECK=1 compares against std::sort.
+static bool sortWomFast(std::vector<WomArgumentRow>& womRows,
+                        const std::vector<uint32_t>& womIndex,
+                        uint32_t numCycles) {
+  size_t nv = 0;
+  uint32_t maxAddr = 0;
+  for (uint32_t c = 0; c < numCycles; c++) {
+    uint32_t n = womIndex[c];
+    if (n > kMaxWomRowsPerCycle) {
+      return false;
+    }
+    nv += n;
+    const WomArgumentRow* r = &womRows[size_t(c) * kMaxWomRowsPerCycle];
+    for (uint32_t i = 0; i < n; i++) {
+      maxAddr = std::max(maxAddr, r[i].addr);
+    }
+  }
+  if (size_t(maxAddr) >= nv) {
+    return false;
+  }
+  std::vector<uint32_t> cnt(size_t(maxAddr) + 2, 0);
+  for (uint32_t c = 0; c < numCycles; c++) {
+    const WomArgumentRow* r = &womRows[size_t(c) * kMaxWomRowsPerCycle];
+    for (uint32_t i = 0; i < womIndex[c]; i++) {
+      cnt[r[i].addr + 1]++;
+    }
+  }
+  for (size_t d = 1; d < cnt.size(); d++) {
+    cnt[d] += cnt[d - 1];
+  }
+  std::vector<WomArgumentRow> out(womRows.size(),
+                                  WomArgumentRow{kInvalidPattern, FpExt::invalid()});
+  for (uint32_t c = 0; c < numCycles; c++) {
+    const WomArgumentRow* r = &womRows[size_t(c) * kMaxWomRowsPerCycle];
+    for (uint32_t i = 0; i < womIndex[c]; i++) {
+      out[cnt[r[i].addr]++] = r[i];
+    }
+  }
+  for (size_t i = 0; i < nv;) {
+    size_t j = i + 1;
+    bool same = true;
+    while (j < nv && out[j].addr == out[i].addr) {
+      same = same && memcmp(&out[j], &out[i], sizeof(WomArgumentRow)) == 0;
+      j++;
+    }
+    if (j - i > 1 && !same) {
+      std::sort(out.begin() + i, out.begin() + j);
+    }
+    i = j;
+  }
+  womRows.swap(out);
+  return true;
+}
+
 void MachineContext::verifyWom(uint32_t mode) {
   nvtx3::scoped_range range("verifyWom");
 
   {
     nvtx3::scoped_range range("sortWom");
-    std::sort(poolstl::par, womRows.begin(), womRows.end());
+    static const bool fast = []() {
+      const char* e = std::getenv("RISC0_RECURSION_FAST_SORT");
+      return !(e && e[0] == '0');
+    }();
+    static const bool check = std::getenv("RISC0_RECURSION_FAST_SORT_CHECK") != nullptr;
+    std::vector<WomArgumentRow> ref;
+    if (fast && check) {
+      ref = womRows;
+      std::sort(poolstl::par, ref.begin(), ref.end());
+    }
+    if (!fast || !sortWomFast(womRows, womIndex, trace->numCycles)) {
+      std::sort(poolstl::par, womRows.begin(), womRows.end());
+    }
+    if (!ref.empty() &&
+        memcmp(ref.data(), womRows.data(), ref.size() * sizeof(WomArgumentRow)) != 0) {
+      throw std::runtime_error("recursion witgen: fast WOM sort differs from std::sort");
+    }
   }
 
   {

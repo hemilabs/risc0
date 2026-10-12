@@ -134,9 +134,9 @@ enum Command {
     Join,
     Succinct,
     Identity,
-    #[cfg(any(feature = "docker", feature = "cuda"))]
+    #[cfg(any(feature = "docker", feature = "cuda", feature = "rocm"))]
     StarkToSnark,
-    #[cfg(any(feature = "docker", feature = "cuda"))]
+    #[cfg(any(feature = "docker", feature = "cuda", feature = "rocm"))]
     Groth16,
     #[command(name = "bigint2")]
     BigInt2,
@@ -180,9 +180,9 @@ impl Datasheet {
             Command::Join => self.join(),
             Command::Succinct => self.succinct(),
             Command::Identity => self.identity_p254(),
-            #[cfg(any(feature = "docker", feature = "cuda"))]
+            #[cfg(any(feature = "docker", feature = "cuda", feature = "rocm"))]
             Command::StarkToSnark => self.shrink_wrap(),
-            #[cfg(any(feature = "docker", feature = "cuda"))]
+            #[cfg(any(feature = "docker", feature = "cuda", feature = "rocm"))]
             Command::Groth16 => self.groth16(),
             Command::BigInt2 => self.bigint2(),
         }
@@ -420,7 +420,7 @@ impl Datasheet {
         });
     }
 
-    #[cfg(any(feature = "docker", feature = "cuda"))]
+    #[cfg(any(feature = "docker", feature = "cuda", feature = "rocm"))]
     fn shrink_wrap(&mut self) {
         println!("shrink_wrap");
 
@@ -456,7 +456,7 @@ impl Datasheet {
         });
     }
 
-    #[cfg(any(feature = "docker", feature = "cuda"))]
+    #[cfg(any(feature = "docker", feature = "cuda", feature = "rocm"))]
     fn groth16(&mut self) {
         println!("groth16");
 
@@ -549,7 +549,7 @@ impl Datasheet {
     fn warmup(&self) {
         println!("warmup");
 
-        #[cfg(any(feature = "cuda", feature = "metal"))]
+        #[cfg(any(feature = "cuda", feature = "rocm", feature = "metal"))]
         {
             let opts = ProverOpts::all_po2s().with_receipt_kind(ReceiptKind::Succinct);
             let prover = get_prover_server(&opts).unwrap();

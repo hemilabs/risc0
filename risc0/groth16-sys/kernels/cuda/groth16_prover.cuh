@@ -3,6 +3,34 @@
 #include "groth16_coeffs.cuh"
 #include "groth16_srs.cuh"
 
+#if defined(__HIP_DEVICE_COMPILE__)
+// Device pass: only the __global__ kernel is needed
+__global__ __launch_bounds__(512) void witness_into_poly(fr_t* out,
+                                                         const coeff_t* coeffs,
+                                                         slice_t<uint32_t> indices,
+                                                         const fr_t* witness) {
+  size_t tid = threadIdx.x + (size_t)blockIdx.x * blockDim.x;
+
+  for (size_t i = tid; i < indices.size() - 1; i += (size_t)gridDim.x * blockDim.x) {
+    uint32_t start_idx = indices[i];
+    uint32_t coeff_count = indices[i + 1] - start_idx;
+
+    fr_t sum;
+    sum.zero();
+
+    coeff_t coeff;
+    for (size_t j = 0; j < coeff_count; j++) {
+      coeff = coeffs[start_idx + j];
+      fr_t val = witness[coeff.s];
+      fr_t aux = val * coeff.value;
+      sum += aux;
+    }
+    out[coeff.c] = sum;
+  }
+}
+
+#else // Host pass
+
 #include <cmath>
 #include <fstream>
 #include <random>
@@ -44,6 +72,16 @@ public:
   }
 };
 
+#ifdef __HIPCC__
+// HIP host pass: provide empty body to generate device launch stub.
+// Real kernel body is compiled in the device pass above.
+__global__ __launch_bounds__(512) void witness_into_poly(fr_t* out,
+                                                         const coeff_t* coeffs,
+                                                         slice_t<uint32_t> indices,
+                                                         const fr_t* witness) {}
+__global__ __launch_bounds__(64) void diag_g2_double(uint32_t* out,
+                                                      const uint32_t* inp) {}
+#else
 __global__ __launch_bounds__(512) void witness_into_poly(fr_t* out,
                                                          const coeff_t* coeffs,
                                                          slice_t<uint32_t> indices,
@@ -71,6 +109,7 @@ __global__ __launch_bounds__(512) void witness_into_poly(fr_t* out,
     out[coeff.c] = sum;
   }
 }
+#endif
 
 struct groth16_proof {
   affine_t a, c;
@@ -323,6 +362,7 @@ public:
 
       coeff_wise_add<<<gpu.sm_count(), 1024, 0, gpu>>>(&d_witness[0], &d_fuzz[0], witness_size);
       CUDA_OK(cudaGetLastError());
+      gpu.sync();
 
       msm_g1.invoke(results.a, srs.get_a(), srs.get_a_size(), d_witness, false);
       msm_g1.invoke(results.b_g1, srs.get_b_g1(), srs.get_b_g1_size(), d_witness, false);
@@ -394,3 +434,5 @@ public:
     coeffs.write_to_file(preprocessed_coeffs_path);
   }
 };
+
+#endif // !__HIP_DEVICE_COMPILE__  (outer guard from top of file)

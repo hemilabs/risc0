@@ -372,3 +372,357 @@ impl Hasher {
 fn rerun_if_changed<P: AsRef<Path>>(path: P) {
     println!("cargo:rerun-if-changed={}", path.as_ref().display());
 }
+
+// ---------------------------------------------------------------------------
+// HIP build utilities (cross-platform: Linux + Windows)
+// ---------------------------------------------------------------------------
+
+/// Find the hipcc compiler, handling Windows HIP SDK quirks.
+///
+/// On Windows, the HIP SDK ships `hipcc` as a Perl wrapper script and
+/// `hipcc.bin.exe` as the actual compiler driver. This function checks
+/// `HIPCC` env var first, then tries `hipcc.bin.exe` on Windows (avoids
+/// Perl dependency), then falls back to `hipcc` on PATH.
+pub fn find_hipcc() -> String {
+    if let Ok(hipcc) = env::var("HIPCC") {
+        return hipcc;
+    }
+
+    if cfg!(target_os = "windows") {
+        // Try hipcc.bin.exe from HIP_PATH (avoids Perl dependency)
+        if let Ok(hip_path) = env::var("HIP_PATH") {
+            let candidate = PathBuf::from(&hip_path).join("bin").join("hipcc.bin.exe");
+            if candidate.exists() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+        // Try standard Windows ROCm install paths
+        if let Some(candidate) = find_in_windows_rocm("bin", "hipcc.bin.exe") {
+            return candidate;
+        }
+    }
+
+    "hipcc".to_string()
+}
+
+/// Find a platform-appropriate static archive tool (`ar` / `llvm-ar`).
+///
+/// On Windows, GNU `ar` is typically not available. This function looks for
+/// `llvm-ar` in the HIP SDK installation and on PATH.
+/// On Unix, returns `ar`.
+///
+/// Respects the `AR` environment variable.
+pub fn find_ar_tool() -> String {
+    if let Ok(ar) = env::var("AR") {
+        return ar;
+    }
+
+    if cfg!(target_os = "windows") {
+        // Try llvm-ar from HIP SDK
+        if let Ok(hip_path) = env::var("HIP_PATH") {
+            for subdir in &["bin", "llvm/bin"] {
+                let candidate = PathBuf::from(&hip_path).join(subdir).join("llvm-ar.exe");
+                if candidate.exists() {
+                    return candidate.to_string_lossy().into_owned();
+                }
+            }
+        }
+        // Try standard Windows ROCm install paths
+        for subdir in &["bin", "llvm\\bin"] {
+            if let Some(candidate) = find_in_windows_rocm(subdir, "llvm-ar.exe") {
+                return candidate;
+            }
+        }
+        // Fall back to llvm-ar on PATH (better chance than ar on Windows)
+        return "llvm-ar".to_string();
+    }
+
+    "ar".to_string()
+}
+
+/// Emit `cargo:rustc-link-search` for the HIP runtime library directory.
+///
+/// Checks `HIP_PATH` env var first, then platform-specific default locations
+/// (`/opt/rocm/lib` on Linux, `C:\Program Files\AMD\ROCm\<ver>\lib` on Windows).
+pub fn emit_rocm_lib_link() {
+    if let Ok(hip_path) = env::var("HIP_PATH") {
+        println!("cargo:rustc-link-search=native={}/lib", hip_path);
+    } else if cfg!(target_os = "windows") {
+        if let Some(lib_path) = find_in_windows_rocm("lib", "amdhip64.lib") {
+            // Return the directory, not the file
+            let p = PathBuf::from(&lib_path);
+            if let Some(parent) = p.parent() {
+                println!("cargo:rustc-link-search=native={}", parent.display());
+            }
+        }
+    } else if Path::new("/opt/rocm/lib").exists() {
+        println!("cargo:rustc-link-search=native=/opt/rocm/lib");
+    }
+    println!("cargo:rustc-link-lib=amdhip64");
+}
+
+/// Search Windows standard ROCm install paths for a file.
+///
+/// Looks in `C:\Program Files\AMD\ROCm\<version>\<subdir>\<filename>`,
+/// trying the latest version first.
+fn find_in_windows_rocm(subdir: &str, filename: &str) -> Option<String> {
+    let program_files =
+        env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".to_string());
+    let rocm_dir = PathBuf::from(&program_files).join("AMD").join("ROCm");
+    if let Ok(entries) = fs::read_dir(&rocm_dir) {
+        let mut versions: Vec<PathBuf> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+        versions.sort();
+        // Try latest version first
+        for ver in versions.iter().rev() {
+            let candidate = ver.join(subdir).join(filename);
+            if candidate.exists() {
+                return Some(candidate.to_string_lossy().into_owned());
+            }
+        }
+    }
+    None
+}
+
+/// Resolve `RISC0_HIP_ARCH` from the environment, defaulting to `"native"`.
+pub fn hip_arches() -> String {
+    env::var("RISC0_HIP_ARCH").unwrap_or_else(|_| "native".to_string())
+}
+
+/// Compile a HIP source file to an object, potentially for multiple GPU
+/// architectures in parallel.
+///
+/// * `hipcc`    — path to the hipcc compiler.
+/// * `flags`    — all compiler flags **except** `--offload-arch`, `-c`, and `-o`.
+/// * `source`   — the `.cu` / `.hip` source file.
+/// * `output`   — destination object file.
+/// * `arches`   — comma-separated arch list (e.g. `"gfx1100,gfx1201"`) or `"native"`.
+/// * `work_dir` — optional working directory for hipcc.
+///
+/// When `arches` contains multiple targets, device code is compiled in parallel
+/// (one hipcc process per arch) and merged with `clang-offload-bundler`.
+/// Falls back to a single sequential hipcc invocation if the parallel pipeline
+/// encounters an error.
+pub fn hip_compile(
+    hipcc: &str,
+    flags: &[&str],
+    source: &Path,
+    output: &Path,
+    arches: &str,
+    work_dir: Option<&Path>,
+) {
+    // Always use single-invocation hipcc which correctly generates
+    // __hip_fatbin_* symbols. The host/device split + clang-offload-bundler
+    // approach doesn't produce proper fat binary symbols in ROCm 7.x.
+    hip_compile_single(hipcc, flags, source, output, arches, work_dir);
+}
+
+/// Single-invocation hipcc compilation (original behaviour).
+fn hip_compile_single(
+    hipcc: &str,
+    flags: &[&str],
+    source: &Path,
+    output: &Path,
+    arches: &str,
+    work_dir: Option<&Path>,
+) {
+    let mut cmd = Command::new(hipcc);
+    if let Some(dir) = work_dir {
+        cmd.current_dir(dir);
+    }
+    for flag in flags {
+        cmd.arg(flag);
+    }
+    cmd.arg(format!("--offload-arch={arches}"));
+    cmd.arg("-c").arg(source).arg("-o").arg(output);
+
+    let status = cmd
+        .status()
+        .unwrap_or_else(|e| panic!("hipcc failed to start: {e}"));
+    assert!(status.success(), "hipcc failed for {}", source.display());
+}
+
+/// Parallel multi-arch compilation:
+///   1. Host code compiled once (`--offload-host-only`).
+///   2. Device code compiled per-arch in parallel (`--offload-device-only`).
+///   3. Results merged with `clang-offload-bundler`.
+#[allow(dead_code)]
+fn hip_compile_parallel(
+    hipcc: &str,
+    flags: &[&str],
+    source: &Path,
+    output: &Path,
+    arch_list: &[&str],
+    work_dir: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let out_dir = output
+        .parent()
+        .ok_or("output path has no parent directory")?;
+    let stem = output
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("hip_kernel");
+
+    eprintln!(
+        "hip_compile: parallel build for {} ({} arches: {})",
+        source.display(),
+        arch_list.len(),
+        arch_list.join(", "),
+    );
+
+    // Collect flags into owned Strings so we can share across threads.
+    let flags_owned: Vec<String> = flags.iter().map(|s| s.to_string()).collect();
+    let hipcc_owned = hipcc.to_string();
+    let source_owned = source.to_path_buf();
+    let work_dir_owned = work_dir.map(|d| d.to_path_buf());
+
+    // 1. Host-only compilation (fast — no device codegen).
+    let host_obj = out_dir.join(format!("{stem}_host.o"));
+    {
+        let mut cmd = Command::new(hipcc);
+        if let Some(dir) = work_dir {
+            cmd.current_dir(dir);
+        }
+        for flag in flags {
+            cmd.arg(flag);
+        }
+        cmd.arg("--offload-host-only");
+        cmd.arg(format!("--offload-arch={}", arch_list[0]));
+        cmd.arg("-c").arg(source).arg("-o").arg(&host_obj);
+
+        let status = cmd.status()?;
+        if !status.success() {
+            return Err(
+                format!("hipcc --offload-host-only failed for {}", source.display()).into(),
+            );
+        }
+    }
+
+    // 2. Device-only compilation — one per arch, in parallel via rayon.
+    let dev_results: Vec<Result<PathBuf, String>> = arch_list
+        .par_iter()
+        .map(|arch| {
+            let dev_obj = out_dir.join(format!("{stem}_dev_{arch}.o"));
+            let mut cmd = Command::new(&hipcc_owned);
+            if let Some(ref dir) = work_dir_owned {
+                cmd.current_dir(dir);
+            }
+            for flag in &flags_owned {
+                cmd.arg(flag);
+            }
+            cmd.arg("--offload-device-only");
+            cmd.arg(format!("--offload-arch={arch}"));
+            cmd.arg("-c").arg(&source_owned).arg("-o").arg(&dev_obj);
+
+            let status = cmd
+                .status()
+                .map_err(|e| format!("hipcc device-only ({arch}) failed to start: {e}"))?;
+            if !status.success() {
+                return Err(format!(
+                    "hipcc --offload-device-only --offload-arch={arch} failed"
+                ));
+            }
+            Ok(dev_obj)
+        })
+        .collect();
+
+    // Collect results, bail on any failure.
+    let dev_objs: Vec<PathBuf> = dev_results
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
+    // 3. Bundle host + all device objects into one fat binary.
+    let bundler = find_offload_bundler(hipcc);
+    let mut cmd = Command::new(&bundler);
+    cmd.arg("-type=o");
+
+    // Host input first.
+    cmd.arg(format!("-input={}", host_obj.display()));
+    let host_triple = if cfg!(target_os = "windows") {
+        "host-x86_64-pc-windows-msvc"
+    } else if cfg!(target_os = "macos") {
+        "host-x86_64-apple-darwin"
+    } else {
+        "host-x86_64-unknown-linux-gnu"
+    };
+    let mut targets = host_triple.to_string();
+
+    // Device inputs.
+    for (arch, dev_obj) in arch_list.iter().zip(&dev_objs) {
+        cmd.arg(format!("-input={}", dev_obj.display()));
+        targets.push_str(&format!(",hipv4-amdgcn-amd-amdhsa--{arch}"));
+    }
+
+    cmd.arg(format!("-output={}", output.display()));
+    cmd.arg(format!("-targets={targets}"));
+
+    eprintln!(
+        "hip_compile: bundling {} arches → {}",
+        arch_list.len(),
+        output.display()
+    );
+    let status = cmd.status()?;
+    if !status.success() {
+        return Err("clang-offload-bundler failed".into());
+    }
+
+    // Cleanup intermediate files.
+    let _ = fs::remove_file(&host_obj);
+    for obj in &dev_objs {
+        let _ = fs::remove_file(obj);
+    }
+
+    Ok(())
+}
+
+/// Locate `clang-offload-bundler`, searching ROCm paths and hipcc's neighbourhood.
+#[allow(dead_code)]
+fn find_offload_bundler(hipcc: &str) -> String {
+    let exe_name = if cfg!(target_os = "windows") {
+        "clang-offload-bundler.exe"
+    } else {
+        "clang-offload-bundler"
+    };
+
+    // 1. Explicit env var.
+    if let Ok(path) = env::var("CLANG_OFFLOAD_BUNDLER") {
+        return path;
+    }
+
+    // 2. Platform-specific standard install paths.
+    if cfg!(target_os = "windows") {
+        // Windows: check HIP SDK paths
+        if let Ok(hip_path) = env::var("HIP_PATH") {
+            for subdir in &["bin", "llvm/bin"] {
+                let candidate = PathBuf::from(&hip_path).join(subdir).join(exe_name);
+                if candidate.is_file() {
+                    return candidate.to_string_lossy().into_owned();
+                }
+            }
+        }
+        if let Some(path) = find_in_windows_rocm("llvm\\bin", exe_name) {
+            return path;
+        }
+    } else {
+        let rocm_path = "/opt/rocm/llvm/bin/clang-offload-bundler";
+        if Path::new(rocm_path).is_file() {
+            return rocm_path.to_string();
+        }
+    }
+
+    // 3. Adjacent to hipcc.
+    if let Ok(resolved) = fs::canonicalize(hipcc) {
+        if let Some(bin_dir) = resolved.parent() {
+            // hipcc is usually in <rocm>/bin/ ; bundler in <rocm>/llvm/bin/
+            let candidate = bin_dir.join("../llvm/bin").join(exe_name);
+            if let Ok(canon) = fs::canonicalize(&candidate) {
+                if canon.is_file() {
+                    return canon.to_string_lossy().into_owned();
+                }
+            }
+        }
+    }
+
+    // 4. PATH fallback.
+    "clang-offload-bundler".to_string()
+}

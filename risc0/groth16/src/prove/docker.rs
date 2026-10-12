@@ -37,6 +37,17 @@ pub(crate) fn shrink_wrap(identity_p254_seal_bytes: &[u8]) -> Result<Seal> {
         bail!("Please install docker first.")
     }
 
+    // Intel builds: in-process witness + pre-started prover (same image).
+    #[cfg(feature = "intel")]
+    if fast_enabled() {
+        match super::fast::preload() {
+            Ok(()) => return super::fast::shrink_wrap(identity_p254_seal_bytes),
+            Err(e) => {
+                tracing::warn!("fast shrink_wrap unavailable, using the plain Docker path: {e:#}")
+            }
+        }
+    }
+
     let tmp_dir = tempdir()?;
     let work_dir = std::env::var("RISC0_WORK_DIR");
     let work_dir = work_dir.as_ref().map(Path::new).unwrap_or(tmp_dir.path());
@@ -54,7 +65,7 @@ pub(crate) fn shrink_wrap(identity_p254_seal_bytes: &[u8]) -> Result<Seal> {
         .arg("--rm")
         .arg("-v")
         .arg(format!("{}:/mnt", work_dir.to_string_lossy()))
-        .arg("risczero/risc0-groth16-prover:v2025-04-03.1")
+        .arg(IMAGE)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()?;
@@ -69,6 +80,14 @@ pub(crate) fn shrink_wrap(identity_p254_seal_bytes: &[u8]) -> Result<Seal> {
     let contents = std::fs::read_to_string(proof_path)?;
     let proof_json: ProofJson = serde_json::from_str(&contents)?;
     proof_json.try_into()
+}
+
+pub(crate) const IMAGE: &str = "risczero/risc0-groth16-prover:v2025-04-03.1";
+
+/// RISC0_GROTH16_FAST=0 disables the intel fast path.
+#[cfg(feature = "intel")]
+pub(crate) fn fast_enabled() -> bool {
+    std::env::var("RISC0_GROTH16_FAST").as_deref() != Ok("0")
 }
 
 fn is_docker_installed() -> bool {

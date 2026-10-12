@@ -17,10 +17,23 @@ void add_bb31_digit(fr_t& val, uint32_t digit)
   for (int i = 0; i < N; i++)
     temp[i].ul = val[i] * mod;
 
+#ifdef __CUDA_ARCH__
   asm("add.cc.u32      %0, %1, %2;" : "=r"(val[0]) : "r"(temp[0].u[0]), "r"(digit));
   for (int i = 1; i < N; i++)
     asm("addc.cc.u32 %0, %1, %2;" : "=r"(val[i]) : "r"(temp[i].u[0]), "r"(temp[i-1].u[1]));
   asm("addc.u32        %0, %1, 0;"  : "=r"(val[N]) : "r"(temp[N-1].u[1]));
+#else
+  // C++ fallback for HIP: manual carry chain
+  uint64_t carry = (uint64_t)temp[0].u[0] + digit;
+  val[0] = (uint32_t)carry;
+  carry >>= 32;
+  for (int i = 1; i < N; i++) {
+    carry += (uint64_t)temp[i].u[0] + temp[i-1].u[1];
+    val[i] = (uint32_t)carry;
+    carry >>= 32;
+  }
+  val[N] = temp[N-1].u[1] + (uint32_t)carry;
+#endif
 }
 
 template<typename fr_t>

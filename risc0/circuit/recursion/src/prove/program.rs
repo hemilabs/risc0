@@ -76,7 +76,11 @@ impl Program {
         let digest =
             self.compute_control_id_inner(&hal::cuda::CudaHal::new_from_hash_suite(hash_suite)?);
 
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(feature = "rocm")]
+        let digest =
+            self.compute_control_id_inner(&hal::hip::HipHal::new_from_hash_suite(hash_suite)?);
+
+        #[cfg(not(any(feature = "cuda", feature = "rocm")))]
         let digest = self.compute_control_id_inner(&hal::cpu::CpuHal::new(hash_suite));
 
         Ok(digest)

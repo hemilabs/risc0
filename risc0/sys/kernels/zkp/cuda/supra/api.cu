@@ -7,18 +7,95 @@
 #include <polynomial/prefix_op.cuh>
 
 #include "poseidon2.cuh"
+#if defined(__HIPCC__) && !defined(__HIP_DEVICE_COMPILE__)
+// HIP host pass: blst_256_t::operator[] is private, causing errors in
+// poseidon254.cuh's __device__ helpers. Provide empty __global__ kernel
+// bodies so hipcc can generate launch stubs; real implementations come
+// from the device pass which includes poseidon254.cuh with mont_t types.
+#include "poseidon254_constants.cuh"
+template<typename bn254_t>
+__global__ __launch_bounds__(512)
+void _poseidon254_fold(bn254_t*, const bn254_t*, size_t) {}
+template<typename bn254_t>
+__global__ __launch_bounds__(512)
+void _poseidon254_rows(bn254_t*, const fr_t*, size_t, uint32_t) {}
+#else
 #include "poseidon254.cuh"
+#endif
+
+// Workaround: cudaGetDeviceProperties returns multiProcessorCount=1
+// in some VM/passthrough setups, while cudaDeviceGetAttribute returns
+// the correct value. Cache the correct SM count for use in cooperative
+// kernel launches.
+static int get_real_sm_count() {
+    int device = 0;
+    cudaGetDevice(&device);
+    static int sm_counts[16] = {};
+    if (sm_counts[device] == 0) {
+        cudaDeviceGetAttribute(&sm_counts[device], cudaDevAttrMultiProcessorCount, device);
+    }
+    return sm_counts[device];
+}
+
+#ifdef __HIPCC__
+// Detect wavefront size: 32 = RDNA (gfx10/11/12), 64 = CDNA (gfx9xx).
+// Used to select Poseidon2 block size matching launch_bounds.
+static int get_warp_size() {
+    int device = 0;
+    hipGetDevice(&device);
+    static int ws[16] = {};
+    if (ws[device] == 0) {
+        hipDeviceGetAttribute(&ws[device], hipDeviceAttributeWarpSize, device);
+    }
+    return ws[device];
+}
+#endif
+
+extern "C" RustError::by_value sppark_poseidon2_init() {
+  int device = 0;
+  cudaGetDevice(&device);
+  static bool initialized[16] = {};
+  if (initialized[device])
+    return RustError{cudaSuccess};
+
+  const gpu_t& gpu = select_gpu(-1);
+  try {
+    // Allocate tiny device buffer and run 1-hash poseidon2_fold to trigger
+    // CUDA module loading for poseidon2 kernels (~5-10ms first-use overhead).
+    void* d_buf = nullptr;
+    CUDA_OK(cudaMalloc(&d_buf, 2048));
+    CUDA_OK(cudaMemset(d_buf, 0, 2048));
+    _poseidon2_fold<<<1, 1, 0, gpu>>>(
+        (poseidon_out_t*)d_buf,
+        (const poseidon_in_t*)((char*)d_buf + 1024),
+        1);
+    CUDA_OK(cudaGetLastError());
+    gpu.sync();
+    CUDA_OK(cudaFree(d_buf));
+  } catch (const cuda_error& e) {
+    gpu.sync();
+    return RustError{e.code(), e.what()};
+  }
+  initialized[device] = true;
+  return RustError{cudaSuccess};
+}
 
 extern "C" RustError::by_value
 sppark_poseidon2_fold(poseidon_out_t* d_out, const poseidon_in_t* d_in, size_t num_hashes) {
-  const gpu_t& gpu = select_gpu();
+  const gpu_t& gpu = select_gpu(-1);
 
-  size_t block_size = num_hashes < 256 ? num_hashes : 256;
-  size_t num_blocks = num_hashes < 256 ? 1 : num_hashes / 256;
+#ifdef __HIPCC__
+  // RDNA (gfx12xx, wave32): 256 threads matches launch_bounds(256,3)
+  // CDNA (gfx9xx, wave64):  512 threads matches launch_bounds(512,2)
+  const size_t P2_BLOCK = (get_warp_size() >= 64) ? 512 : 256;
+#else
+  const size_t P2_BLOCK = 256;
+#endif
+  size_t block_size = num_hashes < P2_BLOCK ? num_hashes : P2_BLOCK;
+  size_t num_blocks = num_hashes < P2_BLOCK ? 1 : num_hashes / P2_BLOCK;
 
   try {
-    CUDA_OK(cudaDeviceSynchronize());
-
+    (void)cudaGetLastError(); // consume any stale async errors
     _poseidon2_fold<<<num_blocks, block_size, 0, gpu>>>(d_out, d_in, num_hashes);
 
     CUDA_OK(cudaGetLastError());
@@ -33,15 +110,55 @@ sppark_poseidon2_fold(poseidon_out_t* d_out, const poseidon_in_t* d_in, size_t n
 }
 
 extern "C" RustError::by_value
-sppark_poseidon2_rows(poseidon_out_t* d_out, const fr_t* d_in, uint32_t count, uint32_t col_size) {
-  const gpu_t& gpu = select_gpu();
+sppark_poseidon2_fold_tree(poseidon_out_t* nodes, uint32_t layers) {
+  const gpu_t& gpu = select_gpu(-1);
 
-  size_t block_size = count < 256 ? count : 256;
+#ifdef __HIPCC__
+  // RDNA (gfx12xx, wave32): 256 threads matches launch_bounds(256,3)
+  // CDNA (gfx9xx, wave64):  512 threads matches launch_bounds(512,2)
+  const size_t P2_BLOCK = (get_warp_size() >= 64) ? 512 : 256;
+#else
+  const size_t P2_BLOCK = 256;
+#endif
+
+  try {
+    (void)cudaGetLastError(); // consume any stale async errors
+    for (int i = layers - 1; i >= 0; i--) {
+      uint32_t layer_size = 1u << i;
+      size_t block_size = layer_size < P2_BLOCK ? layer_size : P2_BLOCK;
+      size_t num_blocks = layer_size < P2_BLOCK ? 1 : layer_size / P2_BLOCK;
+
+      _poseidon2_fold<<<num_blocks, block_size, 0, gpu>>>(
+          nodes + layer_size,
+          (const poseidon_in_t*)(nodes + 2 * layer_size),
+          layer_size);
+      CUDA_OK(cudaGetLastError());
+    }
+    gpu.sync();
+  } catch (const cuda_error& e) {
+    gpu.sync();
+    return RustError{e.code(), e.what()};
+  }
+
+  return RustError{cudaSuccess};
+}
+
+extern "C" RustError::by_value
+sppark_poseidon2_rows(poseidon_out_t* d_out, const fr_t* d_in, uint32_t count, uint32_t col_size) {
+  const gpu_t& gpu = select_gpu(-1);
+
+#ifdef __HIPCC__
+  // RDNA (gfx12xx, wave32): 256 threads matches launch_bounds(256,3)
+  // CDNA (gfx9xx, wave64):  512 threads matches launch_bounds(512,2)
+  const size_t P2_BLOCK = (get_warp_size() >= 64) ? 512 : 256;
+#else
+  const size_t P2_BLOCK = 256;
+#endif
+  size_t block_size = count < P2_BLOCK ? count : P2_BLOCK;
   size_t num_blocks = (count + block_size - 1) / block_size;
 
   try {
-    CUDA_OK(cudaDeviceSynchronize());
-
+    (void)cudaGetLastError(); // consume any stale async errors
     _poseidon2_rows<<<num_blocks, block_size, 0, gpu>>>(d_out, d_in, count, col_size);
 
     CUDA_OK(cudaGetLastError());
@@ -88,7 +205,7 @@ static void compute_grid_block_size(size_t total_count, size_t& block_size, size
 
 extern "C" RustError::by_value
 sppark_poseidon254_fold(alt_bn128::fr_t* d_out, const alt_bn128::fr_t* d_in, size_t num_hashes) {
-  const gpu_t& gpu = select_gpu();
+  const gpu_t& gpu = select_gpu(-1);
 
   size_t block_size = 512;
   size_t num_blocks = gpu.sm_count();
@@ -96,6 +213,7 @@ sppark_poseidon254_fold(alt_bn128::fr_t* d_out, const alt_bn128::fr_t* d_in, siz
   compute_grid_block_size(num_hashes, block_size, num_blocks);
 
   try {
+    (void)cudaGetLastError(); // consume any stale async errors
     _poseidon254_fold<<<num_blocks, block_size, 0, gpu>>>(d_out, d_in, num_hashes);
 
     CUDA_OK(cudaGetLastError());
@@ -110,8 +228,38 @@ sppark_poseidon254_fold(alt_bn128::fr_t* d_out, const alt_bn128::fr_t* d_in, siz
 }
 
 extern "C" RustError::by_value
+sppark_poseidon254_fold_tree(alt_bn128::fr_t* nodes, uint32_t layers) {
+  const gpu_t& gpu = select_gpu(-1);
+
+  size_t block_size = 512;
+  size_t num_blocks = gpu.sm_count();
+
+  try {
+    (void)cudaGetLastError(); // consume any stale async errors
+    for (int i = layers - 1; i >= 0; i--) {
+      uint32_t layer_size = 1u << i;
+      size_t bs = block_size;
+      size_t nb = num_blocks;
+      compute_grid_block_size(layer_size, bs, nb);
+
+      _poseidon254_fold<<<nb, bs, 0, gpu>>>(
+          nodes + layer_size,
+          nodes + 2 * layer_size,
+          layer_size);
+      CUDA_OK(cudaGetLastError());
+    }
+    gpu.sync();
+  } catch (const cuda_error& e) {
+    gpu.sync();
+    return RustError{e.code(), e.what()};
+  }
+
+  return RustError{cudaSuccess};
+}
+
+extern "C" RustError::by_value
 sppark_poseidon254_rows(alt_bn128::fr_t* d_out, const fr_t* d_in, size_t count, uint32_t col_size) {
-  const gpu_t& gpu = select_gpu();
+  const gpu_t& gpu = select_gpu(-1);
 
   size_t block_size = 512;
   size_t num_blocks = gpu.sm_count();
@@ -119,6 +267,7 @@ sppark_poseidon254_rows(alt_bn128::fr_t* d_out, const fr_t* d_in, size_t count, 
   compute_grid_block_size(count, block_size, num_blocks);
 
   try {
+    (void)cudaGetLastError(); // consume any stale async errors
     _poseidon254_rows<<<num_blocks, block_size, 0, gpu>>>(d_out, d_in, count, col_size);
 
     CUDA_OK(cudaGetLastError());
@@ -133,7 +282,7 @@ sppark_poseidon254_rows(alt_bn128::fr_t* d_out, const fr_t* d_in, size_t count, 
 }
 
 extern "C" RustError::by_value sppark_prefix_product(fr4_t d_inout[/*count*/], uint32_t count) {
-  const gpu_t& gpu = select_gpu();
+  const gpu_t& gpu = select_gpu(-1);
 
   try {
     prefix_op<Multiply<fr4_t>>(d_inout, count, gpu);
@@ -148,11 +297,64 @@ extern "C" RustError::by_value sppark_prefix_product(fr4_t d_inout[/*count*/], u
 
 extern "C" RustError::by_value
 supra_poly_divide(fr4_t d_inout[/*len*/], size_t len, fr4_t* remainder, const fr4_t& pow) {
-  const gpu_t& gpu = select_gpu();
+  const gpu_t& gpu = select_gpu(-1);
 
   try {
-    div_by_x_minus_z<true>(d_inout, len, pow, gpu);
+    div_by_x_minus_z<true>(d_inout, len, pow, gpu, get_real_sm_count());
     gpu.DtoH(remainder, &d_inout[len - 1], 1);
+    gpu.sync();
+  } catch (const cuda_error& e) {
+    gpu.sync();
+    return RustError{e.code(), e.what()};
+  }
+
+  return RustError{cudaSuccess};
+}
+
+extern "C" RustError::by_value
+supra_poly_divide_batch(fr4_t d_inout[/*len*/], size_t len,
+                        fr4_t* remainders, const fr4_t pows[],
+                        uint32_t num_divides) {
+  const gpu_t& gpu = select_gpu(-1);
+  int sm_count = get_real_sm_count();
+
+  try {
+    for (uint32_t d = 0; d < num_divides; d++) {
+      div_by_x_minus_z<true>(d_inout, len, pows[d], gpu, sm_count);
+      gpu.DtoH(&remainders[d], &d_inout[len - 1], 1);
+    }
+    gpu.sync();
+  } catch (const cuda_error& e) {
+    gpu.sync();
+    return RustError{e.code(), e.what()};
+  }
+
+  return RustError{cudaSuccess};
+}
+
+// Batch polynomial division across multiple combo slices.
+// Each combo slice (at combos_base + combo_indices[c] * stride) is divided
+// by its respective roots in-place. No remainder check — all kernels are
+// pipelined with a single gpu.sync() at the end for better GPU utilization.
+extern "C" RustError::by_value
+supra_poly_divide_multi(fr4_t* combos_base, size_t stride,
+                        const uint32_t combo_indices[],
+                        const uint32_t pows_per_combo[],
+                        const uint32_t all_pows_raw[],
+                        uint32_t num_combos) {
+  const gpu_t& gpu = select_gpu(-1);
+  int sm_count = get_real_sm_count();
+  const fr4_t* all_pows = reinterpret_cast<const fr4_t*>(all_pows_raw);
+
+  try {
+    size_t pows_offset = 0;
+    for (uint32_t c = 0; c < num_combos; c++) {
+      fr4_t* slice = combos_base + combo_indices[c] * stride;
+      for (uint32_t d = 0; d < pows_per_combo[c]; d++) {
+        div_by_x_minus_z<true>(slice, stride, all_pows[pows_offset + d], gpu, sm_count);
+      }
+      pows_offset += pows_per_combo[c];
+    }
     gpu.sync();
   } catch (const cuda_error& e) {
     gpu.sync();

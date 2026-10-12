@@ -24,7 +24,13 @@ use cargo_metadata::MetadataCommand;
 use human_repr::{HumanCount, HumanDuration};
 use serde::{Deserialize, Serialize};
 
-const MAX_TIME: Duration = Duration::from_secs(10);
+fn max_time() -> Duration {
+    let secs = env::var("BENCH_DURATION")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10u64);
+    Duration::from_secs(secs)
+}
 
 #[derive(Clone)]
 pub struct BenchGroup {
@@ -127,7 +133,8 @@ impl Bencher<'_> {
         let mut min = Duration::MAX;
         let mut max = Duration::ZERO;
         let mut results = Vec::new();
-        while sum < MAX_TIME {
+        let max_time = max_time();
+        while sum < max_time {
             let mut input = black_box(setup());
 
             let time = Instant::now();

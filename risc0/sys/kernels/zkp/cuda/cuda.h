@@ -14,10 +14,25 @@
 
 #pragma once
 
+#ifndef __HIPCC__
+// CUDA 13.1's CCCL v2 headers need driver API types from system <cuda.h>
+#include_next <cuda.h>
+#endif
+
 #include <cstdint>
 #include <cstring>
+#ifndef __HIPCC__
 #include <cuda_runtime.h>
+#endif
 #include <stdexcept>
+
+// When cuda2hip.hpp is force-included (sppark builds), these are already defined.
+// Only provide them for standalone HIP compilation without cuda2hip.hpp.
+#if defined(__HIPCC__) && !defined(WARP_SZ)
+static const auto cudaStreamCreate         = hipStreamCreate;
+static const auto cudaDeviceGetAttribute   = hipDeviceGetAttribute;
+#define           cudaDevAttrMaxThreadsPerBlock hipDeviceAttributeMaxThreadsPerBlock
+#endif
 
 template <typename... Types> inline std::string fmt(const char* fmt, Types... args) {
   size_t len = std::snprintf(nullptr, 0, fmt, args...);
@@ -62,16 +77,46 @@ struct LaunchConfig {
   LaunchConfig(int grid, int block, size_t shared = 0) : grid(grid), block(block), shared(shared) {}
 };
 
+inline int getCachedDevice() {
+#ifdef __HIPCC__
+  // HIP multi-GPU: different threads may use different devices,
+  // so we must query each time (or use thread_local).
+  int dev = 0;
+  cudaGetDevice(&dev);
+  return dev;
+#else
+  static int cached = -1;
+  if (cached < 0) {
+    cudaGetDevice(&cached);
+  }
+  return cached;
+#endif
+}
+
+inline cudaStream_t getPersistentStream() {
+  int device = getCachedDevice();
+  static cudaStream_t streams[16] = {};
+  if (!streams[device]) {
+    CUDA_OK(cudaStreamCreate(&streams[device]));
+  }
+  return streams[device];
+}
+
+inline LaunchConfig getCachedSimpleConfig(uint32_t count) {
+  int device = getCachedDevice();
+  static int blocks[16] = {};
+  if (blocks[device] == 0) {
+    int maxThreads;
+    CUDA_OK(cudaDeviceGetAttribute(&maxThreads, cudaDevAttrMaxThreadsPerBlock, device));
+    blocks[device] = maxThreads / 4;
+  }
+  int grid = (count + blocks[device] - 1) / blocks[device];
+  return LaunchConfig{grid, blocks[device], 0};
+}
+
+// Backward-compat alias used by circuit ffi files
 inline LaunchConfig getSimpleConfig(uint32_t count) {
-  int device;
-  CUDA_OK(cudaGetDevice(&device));
-
-  int maxThreads;
-  CUDA_OK(cudaDeviceGetAttribute(&maxThreads, cudaDevAttrMaxThreadsPerBlock, device));
-
-  int block = maxThreads / 4;
-  int grid = (count + block - 1) / block;
-  return LaunchConfig{grid, block, 0};
+  return getCachedSimpleConfig(count);
 }
 
 template <typename... ExpTypes, typename... ActTypes>
@@ -80,8 +125,11 @@ const char* launchKernel(void (*kernel)(ExpTypes...),
                          uint32_t shared_size,
                          ActTypes&&... args) {
   try {
-    CudaStream stream;
-    LaunchConfig cfg = getSimpleConfig(count);
+    cudaStream_t stream = getPersistentStream();
+    LaunchConfig cfg = getCachedSimpleConfig(count);
+#ifdef __HIPCC__
+    kernel<<<cfg.grid, cfg.block, shared_size, stream>>>(std::forward<ActTypes>(args)...);
+#else
     cudaLaunchConfig_t config;
     config.attrs = nullptr;
     config.numAttrs = 0;
@@ -90,7 +138,7 @@ const char* launchKernel(void (*kernel)(ExpTypes...),
     config.dynamicSmemBytes = shared_size;
     config.stream = stream;
     CUDA_OK(cudaLaunchKernelEx(&config, kernel, std::forward<ActTypes>(args)...));
-    CUDA_OK(cudaStreamSynchronize(stream));
+#endif
   } catch (const std::exception& err) {
     return strdup(err.what());
   } catch (...) {

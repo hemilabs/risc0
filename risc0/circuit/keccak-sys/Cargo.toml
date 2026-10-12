@@ -23,3 +23,4 @@ risc0-build-kernel = { workspace = true }
 [features]
 default = []
 cuda = ["dep:cust", "dep:sppark", "risc0-sys/cuda"]
+rocm = ["dep:sppark", "risc0-sys/rocm"]

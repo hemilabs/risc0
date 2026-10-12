@@ -72,7 +72,7 @@ fn fwd_rev_ab_test(program: Program) {
     .unwrap();
 
     cfg_if::cfg_if! {
-        if #[cfg(feature = "cuda")] {
+        if #[cfg(any(feature = "cuda", feature = "rocm"))] {
             use risc0_zkp::hal::cuda::CudaHalPoseidon2;
             use crate::prove::hal::cuda::CudaCircuitHalPoseidon2;
             let hal = Rc::new(CudaHalPoseidon2::new());
@@ -132,4 +132,137 @@ fn fwd_rev_ab_basic() {
 #[test]
 fn fwd_rev_ab_split() {
     fwd_rev_ab_test(testutil::kernel::simple_loop(2000));
+}
+
+/// Intel parallel witgen must match canonical CPU sequential witgen bit-for-bit,
+/// and be deterministic across repeated runs. Knobs:
+///   RISC0_WITGEN_AB_ITERS (simple_loop count, default 300_000)
+///   RISC0_WITGEN_AB_PO2   (segment limit po2, default 20)
+///   RISC0_WITGEN_AB_REPS  (Intel repetitions per segment, default 5)
+#[cfg(feature = "intel")]
+#[test]
+#[ignore = "requires an Intel GPU; run explicitly"]
+fn intel_parallel_matches_cpu_seq() {
+    let iters = std::env::var("RISC0_WITGEN_AB_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300_000);
+    intel_ab(testutil::kernel::simple_loop(iters));
+}
+
+/// Same A/B check over a program that exercises the Poseidon2 accelerator.
+#[cfg(feature = "intel")]
+#[test]
+#[ignore = "requires an Intel GPU; run explicitly"]
+fn intel_poseidon2_matches_cpu_seq() {
+    let iters = std::env::var("RISC0_WITGEN_AB_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2_000);
+    intel_ab(testutil::kernel::poseidon2(iters));
+}
+
+#[cfg(feature = "intel")]
+fn intel_ab(program: Program) {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use risc0_zkp::hal::intel::IntelHalPoseidon2;
+
+    use crate::prove::hal::intel::IntelCircuitHalPoseidon2;
+
+    fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    }
+    let po2: usize = env_or("RISC0_WITGEN_AB_PO2", DEFAULT_SEGMENT_LIMIT_PO2);
+    let reps: usize = env_or("RISC0_WITGEN_AB_REPS", 5);
+
+    let image = MemoryImage::new_kernel(program);
+    let session = testutil::execute(
+        image,
+        po2,
+        MAX_INSN_CYCLES,
+        testutil::DEFAULT_SESSION_LIMIT,
+        &testutil::NullSyscall,
+        None,
+    )
+    .unwrap();
+
+    let intel_hal = Arc::new(IntelHalPoseidon2::new());
+    let intel_circuit = IntelCircuitHalPoseidon2::new(intel_hal.clone());
+    let suite = risc0_zkp::core::hash::poseidon2::Poseidon2HashSuite::new_suite();
+    let cpu_hal = Rc::new(risc0_zkp::hal::cpu::CpuHal::new(suite));
+    let cpu_circuit = crate::prove::hal::cpu::CpuCircuitHal;
+
+    let mut rng = rand::rng();
+    let rand_z = ExtVal::random(&mut rng);
+    let mut total_bad = 0usize;
+
+    eprintln!(
+        "[witgen-ab] {} segment(s), po2 limit={po2}",
+        session.segments.len()
+    );
+    for segment in session.segments {
+        let pf = PreflightResults::new(&segment, rand_z).unwrap();
+        let cycles = 1usize << segment.po2;
+        let cpu = WitnessGenerator::new(
+            cpu_hal.as_ref(),
+            &cpu_circuit,
+            pf.clone(),
+            StepMode::SeqForward,
+        )
+        .unwrap()
+        .data
+        .to_vec();
+
+        let mut first_intel: Option<Vec<_>> = None;
+        for rep in 0..reps {
+            let intel = WitnessGenerator::new(
+                intel_hal.as_ref(),
+                &intel_circuit,
+                pf.clone(),
+                StepMode::Parallel,
+            )
+            .unwrap()
+            .data
+            .to_vec();
+
+            let mut by_col: BTreeMap<usize, (usize, usize)> = BTreeMap::new();
+            let mut bad = 0usize;
+            for row in 0..cycles {
+                for col in 0..REGCOUNT_DATA {
+                    let i = row * REGCOUNT_DATA + col;
+                    if intel[i] != cpu[i] {
+                        bad += 1;
+                        by_col.entry(col).or_insert((0, row)).0 += 1;
+                    }
+                }
+            }
+            let run_to_run = first_intel
+                .as_ref()
+                .map(|f| f.iter().zip(&intel).filter(|(a, b)| a != b).count());
+            eprintln!(
+                "[witgen-ab] seg={} po2={} rep={rep}: {bad} cells differ from CPU across {} cols; \
+                 vs Intel rep0: {:?}",
+                segment.index,
+                segment.po2,
+                by_col.len(),
+                run_to_run
+            );
+            for (col, (n, first_row)) in by_col.iter().take(16) {
+                eprintln!("    col {col:4}: {n:8} rows differ (first row {first_row})");
+            }
+            total_bad += bad;
+            if first_intel.is_none() {
+                first_intel = Some(intel);
+            }
+        }
+    }
+    assert_eq!(
+        total_bad, 0,
+        "Intel parallel witgen diverged from CPU sequential witgen"
+    );
 }

@@ -15,6 +15,9 @@
 #[cfg(feature = "cuda")]
 use cust::memory::DevicePointer;
 
+#[cfg(feature = "rocm")]
+use risc0_sys::cuda::DevicePointer;
+
 use risc0_core::field::baby_bear::{BabyBearElem, BabyBearExtElem};
 
 #[derive(Debug)]
@@ -66,7 +69,7 @@ extern "C" {
     ) -> *const std::os::raw::c_char;
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 extern "C" {
     pub fn risc0_circuit_keccak_cuda_scatter(
         into: DevicePointer<u8>,

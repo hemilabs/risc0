@@ -6,15 +6,14 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#ifdef __CUDA_ARCH__
 typedef uint8_t byte;
-#endif
 
 struct coeff_t {
   uint32_t m, c, s;
   fr_t value;
 };
 
+#if !defined(__HIP_DEVICE_COMPILE__)
 class preprocessed_coeffs {
 private:
   const gpu_t& gpu;
@@ -237,3 +236,4 @@ public:
 
   const slice_t<uint32_t> get_indices_b() const { return d_ind_idx_b; }
 };
+#endif // !__HIP_DEVICE_COMPILE__

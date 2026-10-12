@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use risc0_circuit_recursion_sys::{
@@ -49,11 +49,11 @@ type CudaCircuitHalPoseidon2 = CudaCircuitHal<CudaHashPoseidon2>;
 type CudaCircuitHalPoseidon254 = CudaCircuitHal<CudaHashPoseidon254>;
 
 struct CudaCircuitHal<CH: CudaHash> {
-    _hal: Rc<CudaHal<CH>>, // retain a reference to ensure the context remains valid
+    _hal: Arc<CudaHal<CH>>, // retain a reference to ensure the context remains valid
 }
 
 impl<CH: CudaHash> CudaCircuitHal<CH> {
-    pub fn new(_hal: Rc<CudaHal<CH>>) -> Self {
+    pub fn new(_hal: Arc<CudaHal<CH>>) -> Self {
         Self { _hal }
     }
 }
@@ -187,18 +187,18 @@ impl<CH: CudaHash> CircuitHal<CudaHal<CH>> for CudaCircuitHal<CH> {
 pub(crate) fn recursion_prover(hashfn: &str) -> Result<Box<dyn RecursionProver>> {
     match hashfn {
         "poseidon2" => {
-            let hal = Rc::new(CudaHalPoseidon2::new());
-            let circuit_hal = Rc::new(CudaCircuitHalPoseidon2::new(hal.clone()));
+            let hal = Arc::new(CudaHalPoseidon2::new());
+            let circuit_hal = Arc::new(CudaCircuitHalPoseidon2::new(hal.clone()));
             Ok(Box::new(RecursionProverImpl::new(hal, circuit_hal)))
         }
         "poseidon_254" => {
-            let hal = Rc::new(CudaHalPoseidon254::new());
-            let circuit_hal = Rc::new(CudaCircuitHalPoseidon254::new(hal.clone()));
+            let hal = Arc::new(CudaHalPoseidon254::new());
+            let circuit_hal = Arc::new(CudaCircuitHalPoseidon254::new(hal.clone()));
             Ok(Box::new(RecursionProverImpl::new(hal, circuit_hal)))
         }
         "sha-256" => {
-            let hal = Rc::new(CudaHalSha256::new());
-            let circuit_hal = Rc::new(CudaCircuitHalSha256::new(hal.clone()));
+            let hal = Arc::new(CudaHalSha256::new());
+            let circuit_hal = Arc::new(CudaCircuitHalSha256::new(hal.clone()));
             Ok(Box::new(RecursionProverImpl::new(hal, circuit_hal)))
         }
         _ => bail!("Unsupported hashfn: {hashfn}"),
@@ -207,7 +207,7 @@ pub(crate) fn recursion_prover(hashfn: &str) -> Result<Box<dyn RecursionProver>>
 
 #[cfg(test)]
 mod tests {
-    use std::rc::Rc;
+    use std::sync::Arc;
 
     use risc0_core::field::baby_bear::BabyBear;
     use risc0_zkp::{
@@ -223,7 +223,7 @@ mod tests {
         const PO2: usize = 4;
         let cpu_hal: CpuHal<BabyBear> = CpuHal::new(Sha256HashSuite::new_suite());
         let cpu_eval = CpuCircuitHal;
-        let gpu_hal = Rc::new(CudaHalSha256::new());
+        let gpu_hal = Arc::new(CudaHalSha256::new());
         let gpu_eval = super::CudaCircuitHalSha256::new(gpu_hal.clone());
         crate::testutil::eval_check(&cpu_hal, cpu_eval, gpu_hal.as_ref(), gpu_eval, PO2);
     }

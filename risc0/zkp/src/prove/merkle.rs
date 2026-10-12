@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
+
+use parking_lot::Mutex;
 
 use risc0_core::scope;
 
@@ -26,8 +28,8 @@ use crate::{
 pub struct MerkleTreeProver<H: Hal> {
     params: MerkleTreeParams,
 
-    // The retained matrix of values
-    matrix: H::Buffer<H::Elem>,
+    // The retained matrix of values (Option to allow releasing for VRAM savings)
+    pub(crate) matrix: Option<H::Buffer<H::Elem>>,
 
     // A heap style array where node N has children 2*N and 2*N+1.  The size of
     // this buffer is (1 << (layers + 1)) and begins at offset 1 (zero is unused
@@ -36,6 +38,47 @@ pub struct MerkleTreeProver<H: Hal> {
 
     // The root value
     root: Digest,
+
+    // Pre-allocated buffer for gather_sample in prove(), avoids per-query alloc/free
+    sample_buf: Option<H::Buffer<H::Elem>>,
+
+    // Cached top nodes for commit() — shared across clones via Arc.
+    // Populated on first commit(), reused on subsequent commits to avoid GPU
+    // D2H. Arc+spin::Mutex (instead of Rc+RefCell) so MerkleTreeProver is
+    // Send — required for the finalize-overlap path that moves the prover
+    // state into a background thread.
+    cached_top_nodes: Arc<Mutex<Option<Vec<Digest>>>>,
+}
+
+impl<H: Hal> Clone for MerkleTreeProver<H> {
+    fn clone(&self) -> Self {
+        Self {
+            params: self.params,
+            matrix: self.matrix.clone(),
+            nodes: self.nodes.clone(),
+            root: self.root,
+            sample_buf: self.sample_buf.clone(),
+            cached_top_nodes: self.cached_top_nodes.clone(),
+        }
+    }
+}
+
+impl<H: Hal> MerkleTreeProver<H> {
+    /// Release the matrix buffer to free GPU memory.
+    /// After this, batch_prove will panic unless set_matrix() is called first.
+    pub fn release_matrix(&mut self) {
+        self.matrix = None;
+    }
+
+    /// Set the matrix buffer (e.g., after reconstructing evaluated from coefficients).
+    pub fn set_matrix(&mut self, matrix: H::Buffer<H::Elem>) {
+        self.matrix = Some(matrix);
+    }
+
+    /// Check if the matrix is present.
+    pub fn matrix_is_some(&self) -> bool {
+        self.matrix.is_some()
+    }
 }
 
 impl<H: Hal> MerkleTreeProver<H> {
@@ -66,17 +109,21 @@ impl<H: Hal> MerkleTreeProver<H> {
         hal.hash_rows(&nodes.slice(rows, rows), matrix);
         // For each layer, hash up the layer below
         scope!("hash_fold", {
-            for i in (0..params.layers).rev() {
-                let layer_size = 1 << i;
-                hal.hash_fold(&nodes, layer_size * 2, layer_size);
-            }
+            hal.hash_fold_tree(&nodes, params.layers);
         });
         let root = nodes.get_at(1);
+        let sample_buf = if !hal.has_unified_memory() && params.col_size > 0 {
+            Some(hal.alloc_elem("sample_reuse", params.col_size))
+        } else {
+            None
+        };
         MerkleTreeProver {
             params,
-            matrix: matrix.clone(),
+            matrix: Some(matrix.clone()),
             nodes,
             root,
+            sample_buf,
+            cached_top_nodes: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -84,10 +131,18 @@ impl<H: Hal> MerkleTreeProver<H> {
     pub fn commit(&self, iop: &mut WriteIOP<H::Field>) {
         scope!("commit");
         let top_size = self.params.top_size;
-        let slice = self.nodes.slice(top_size, top_size);
-        slice.view(|view| {
-            iop.write_pod_slice(view);
-        });
+        let cached = self.cached_top_nodes.lock();
+        if let Some(ref top_nodes) = *cached {
+            // Use cached CPU data — no GPU D2H needed.
+            iop.write_pod_slice(top_nodes);
+        } else {
+            drop(cached);
+            let slice = self.nodes.slice(top_size, top_size);
+            slice.view(|view| {
+                *self.cached_top_nodes.lock() = Some(view.to_vec());
+                iop.write_pod_slice(view);
+            });
+        }
         iop.commit(self.root());
     }
 
@@ -107,18 +162,21 @@ impl<H: Hal> MerkleTreeProver<H> {
     /// wrong row is specified.
     pub fn prove(&self, hal: &H, iop: &mut WriteIOP<H::Field>, idx: usize) -> Vec<H::Elem> {
         assert!(idx < self.params.row_size);
+        let matrix = self
+            .matrix
+            .as_ref()
+            .expect("matrix released; call set_matrix() first");
         let mut out = Vec::with_capacity(self.params.col_size);
         if hal.has_unified_memory() {
-            self.matrix.view(|view| {
+            matrix.view(|view| {
                 for i in 0..self.params.col_size {
                     out.push(view[idx + i * self.params.row_size]);
                 }
             });
-        } else {
-            let sample = hal.alloc_elem("sample", self.params.col_size);
+        } else if let Some(ref sample) = self.sample_buf {
             hal.gather_sample(
-                &sample,
-                &self.matrix,
+                sample,
+                matrix,
                 idx,
                 self.params.col_size,
                 self.params.row_size,
@@ -128,15 +186,99 @@ impl<H: Hal> MerkleTreeProver<H> {
             });
         }
         iop.write_field_elem_slice::<H::Elem>(out.as_slice());
-        let mut idx = idx + self.params.row_size;
-        while idx >= 2 * self.params.top_size {
-            let low_bit = idx % 2;
-            idx /= 2;
-            let other_idx = 2 * idx + (1 - low_bit);
-            let other = self.nodes.get_at(other_idx);
-            iop.write_pod_slice(&[other]);
+        // Collect all sibling indices for the proof path
+        let mut node_indices = Vec::new();
+        let mut cur_idx = idx + self.params.row_size;
+        while cur_idx >= 2 * self.params.top_size {
+            let low_bit = cur_idx % 2;
+            cur_idx /= 2;
+            node_indices.push(2 * cur_idx + (1 - low_bit));
+        }
+        // Batch-read all sibling digests (single D2H on CUDA)
+        let siblings = hal.batch_get_digest_at(&self.nodes, &node_indices);
+        for digest in &siblings {
+            iop.write_pod_slice(&[*digest]);
         }
         out
+    }
+
+    /// Batch-prove multiple indices at once, returning data without writing to IOP.
+    /// GPU work is batched: N gather_sample kernels + 1 D2H, 1 batch digest read + 1 D2H.
+    /// The caller is responsible for writing to IOP in the correct order.
+    pub fn batch_prove(&self, hal: &H, indices: &[usize]) -> Vec<(Vec<H::Elem>, Vec<Digest>)> {
+        let n = indices.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let matrix = self
+            .matrix
+            .as_ref()
+            .expect("matrix released; call set_matrix() first");
+        let col_size = self.params.col_size;
+
+        // Collect column data for all queries
+        let mut all_col_data: Vec<Vec<H::Elem>> = Vec::with_capacity(n);
+        if hal.has_unified_memory() {
+            matrix.view(|view| {
+                for &idx in indices {
+                    assert!(idx < self.params.row_size);
+                    let mut out = Vec::with_capacity(col_size);
+                    for i in 0..col_size {
+                        out.push(view[idx + i * self.params.row_size]);
+                    }
+                    all_col_data.push(out);
+                }
+            });
+        } else if col_size > 0 {
+            // GPU path: batch all gather_sample kernels (async), single D2H via view()
+            let batch_buf = hal.alloc_elem("batch_samples", n * col_size);
+            for (i, &idx) in indices.iter().enumerate() {
+                assert!(idx < self.params.row_size);
+                hal.gather_sample(
+                    &batch_buf.slice(i * col_size, col_size),
+                    matrix,
+                    idx,
+                    col_size,
+                    self.params.row_size,
+                );
+            }
+            batch_buf.view(|view| {
+                for i in 0..n {
+                    all_col_data.push(view[i * col_size..(i + 1) * col_size].to_vec());
+                }
+            });
+        } else {
+            all_col_data.resize_with(n, Vec::new);
+        }
+
+        // Compute all sibling node indices across all queries
+        let mut all_node_indices = Vec::new();
+        let mut per_query_digest_count = Vec::new();
+        for &idx in indices {
+            let mut count = 0;
+            let mut cur_idx = idx + self.params.row_size;
+            while cur_idx >= 2 * self.params.top_size {
+                let low_bit = cur_idx % 2;
+                cur_idx /= 2;
+                all_node_indices.push(2 * cur_idx + (1 - low_bit));
+                count += 1;
+            }
+            per_query_digest_count.push(count);
+        }
+
+        // Single batch digest read (1 H2D + 1 kernel + 1 D2H on CUDA)
+        let all_digests = hal.batch_get_digest_at(&self.nodes, &all_node_indices);
+
+        // Assemble per-query results
+        let mut results = Vec::with_capacity(n);
+        let mut digest_offset = 0;
+        for (i, &count) in per_query_digest_count.iter().enumerate() {
+            let digests = all_digests[digest_offset..digest_offset + count].to_vec();
+            digest_offset += count;
+            results.push((core::mem::take(&mut all_col_data[i]), digests));
+        }
+
+        results
     }
 }
 

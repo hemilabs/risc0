@@ -48,12 +48,18 @@ __global__ void batch_evaluate_any(
   const Fp* cur_poly = coeffs + which[blockIdx.x] * deg;
   FpExt x = xs[blockIdx.x];
   FpExt stepx = pow(x, blockDim.x);
-  FpExt powx = pow(x, threadIdx.x);
+  // Horner's method: evaluate each thread's strided subsequence from high to low degree.
+  // Each iteration: tot *= stepx (FpExt*FpExt = 16 Fp muls) + tot += coeff (1 Fp add).
+  // Original was 20 Fp muls/iter (16 for powx*=stepx + 4 for powx*coeff). Saves 20%.
+  uint32_t K = (deg + blockDim.x - 1) / blockDim.x;
   FpExt tot;
-  for (size_t i = threadIdx.x; i < deg; i += blockDim.x) {
-    tot += powx * cur_poly[i];
-    powx *= stepx;
+  for (int k = K - 1; k >= 0; k--) {
+    tot *= stepx;
+    size_t i = threadIdx.x + (size_t)k * blockDim.x;
+    if (i < deg)
+      tot += cur_poly[i];
   }
+  tot *= pow(x, threadIdx.x);
   extern __shared__ uint32_t totsBuf[];
   FpExt* tots = reinterpret_cast<FpExt*>(totsBuf);
   tots[threadIdx.x] = tot;
@@ -71,24 +77,31 @@ __global__ void batch_evaluate_any(
   }
 }
 
-__global__ void fri_fold(Fp* out, const Fp* in, const FpExt* mix, const uint32_t count) {
+__global__ void fri_fold(Fp* __restrict__ out,
+                         const Fp* __restrict__ in_ptr,
+                         const FpExt* __restrict__ mix,
+                         const uint32_t count) {
   uint idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < count) {
+    // Cache mix value in register to avoid repeated global memory reads
+    const FpExt mixVal = *mix;
     FpExt tot;
     FpExt curMix(1);
+    #pragma unroll
     for (uint32_t i = 0; i < kFriFold; i++) {
       size_t rev_i = __brev(i) >> (32 - log2Ceil(kFriFold));
       size_t rev_idx = rev_i * count + idx;
-      FpExt factor(in[0 * count * kFriFold + rev_idx],
-                   in[1 * count * kFriFold + rev_idx],
-                   in[2 * count * kFriFold + rev_idx],
-                   in[3 * count * kFriFold + rev_idx]);
+      FpExt factor(in_ptr[0 * count * kFriFold + rev_idx],
+                   in_ptr[1 * count * kFriFold + rev_idx],
+                   in_ptr[2 * count * kFriFold + rev_idx],
+                   in_ptr[3 * count * kFriFold + rev_idx]);
       tot += curMix * factor;
-      curMix *= *mix;
+      curMix *= mixVal;
     }
-    for (size_t i = 0; i < 4; i++) {
-      out[count * i + idx] = tot.elems[i];
-    }
+    out[count * 0 + idx] = tot.elems[0];
+    out[count * 1 + idx] = tot.elems[1];
+    out[count * 2 + idx] = tot.elems[2];
+    out[count * 3 + idx] = tot.elems[3];
   }
 }
 
@@ -113,6 +126,35 @@ __global__ void scatter(Fp* into,
   }
 }
 
+// GPU-side u32→bits decomposition. Each thread reads one packed (row, base_col, value)
+// triple and writes 32 bit values into the data buffer.
+__global__ void scatter_bits(Fp* into,
+                             const uint32_t* data, // packed [row, base_col, value] triples
+                             const uint32_t cycles,
+                             const uint32_t count) {
+  uint gid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (gid < count) {
+    uint32_t row = data[gid * 3];
+    uint32_t base = data[gid * 3 + 1];
+    uint32_t val = data[gid * 3 + 2];
+    for (uint32_t i = 0; i < 32; i++) {
+      into[(base + i) * cycles + row] = Fp((val >> i) & 1);
+    }
+  }
+}
+
+__global__ void gather_digests(
+    uint32_t* dst, const uint32_t* src, const uint32_t* indices, uint32_t count) {
+  uint gid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (gid < count) {
+    uint32_t src_idx = indices[gid];
+    // Copy 8 uint32_t words (32 bytes = 1 Digest)
+    for (int w = 0; w < 8; w++) {
+      dst[gid * 8 + w] = src[src_idx * 8 + w];
+    }
+  }
+}
+
 __global__ void mix_poly_coeffs(FpExt* out,
                                 const Fp* in,
                                 const uint32_t* combos,
@@ -120,13 +162,24 @@ __global__ void mix_poly_coeffs(FpExt* out,
                                 const FpExt* mix,
                                 const uint32_t inputSize,
                                 const uint32_t count) {
+  // Precompute mix powers in shared memory: thread 0 computes all powers once,
+  // then all threads read from shared. Eliminates per-thread FpExt*FpExt multiply
+  // (16 Fp muls/iter) — each thread only does FpExt*Fp (4 muls/iter).
+  extern __shared__ FpExt mixPows[];
+  if (threadIdx.x == 0) {
+    FpExt cur = *mixStart;
+    FpExt m = *mix;
+    for (uint32_t i = 0; i < inputSize; i++) {
+      mixPows[i] = cur;
+      cur *= m;
+    }
+  }
+  __syncthreads();
   uint idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < count) {
-    FpExt cur = *mixStart;
     for (size_t i = 0; i < inputSize; i++) {
       size_t id = combos[i];
-      out[count * id + idx] += cur * in[count * i + idx];
-      cur *= *mix;
+      out[count * id + idx] += mixPows[i] * in[count * i + idx];
     }
   }
 }

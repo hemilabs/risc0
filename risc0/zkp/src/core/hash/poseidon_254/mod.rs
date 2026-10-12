@@ -17,7 +17,7 @@
 
 mod consts;
 
-use std::rc::Rc;
+use alloc::sync::Arc;
 
 use ff::{Field, PrimeField};
 use risc0_core::field::{
@@ -99,6 +99,16 @@ pub fn digest_to_fr(digest: &Digest) -> Fr {
     let mut repr: FrRepr = FrRepr::default();
     repr.as_mut().clone_from_slice(digest.as_bytes());
     Fr::from_repr_vartime(repr).unwrap()
+}
+
+/// Returns the canonical little-endian byte representation of a digest as a BN254 Fr element.
+/// This is equivalent to `digest_to_fr(digest).to_repr()` but avoids exposing the `Fr` type.
+pub fn digest_to_fr_bytes(digest: &Digest) -> [u8; 32] {
+    let fr = digest_to_fr(digest);
+    let repr = fr.to_repr();
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(repr.as_ref());
+    bytes
 }
 
 fn fr_to_digest(fr: &Fr) -> Digest {
@@ -222,7 +232,7 @@ impl Rng<BabyBear> for Poseidon254Rng {
 struct PoseidonRngFactory;
 
 impl RngFactory<BabyBear> for PoseidonRngFactory {
-    fn new_rng(&self) -> Box<dyn Rng<BabyBear>> {
+    fn new_rng(&self) -> Box<dyn Rng<BabyBear> + Send> {
         Box::new(Poseidon254Rng::new())
     }
 }
@@ -235,8 +245,8 @@ impl Poseidon254HashSuite {
     pub fn new_suite() -> HashSuite<BabyBear> {
         HashSuite {
             name: "poseidon254".into(),
-            hashfn: Rc::new(Poseidon254HashFn {}),
-            rng: Rc::new(PoseidonRngFactory {}),
+            hashfn: Arc::new(Poseidon254HashFn {}),
+            rng: Arc::new(PoseidonRngFactory {}),
         }
     }
 }

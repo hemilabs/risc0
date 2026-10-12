@@ -65,9 +65,17 @@ __global__ void scatter(Fp* into,
                         const Fp* values,
                         const uint32_t count);
 
+__global__ void scatter_bits(Fp* into,
+                             const uint32_t* data,
+                             const uint32_t cycles,
+                             const uint32_t count);
+
 __global__ void sha_rows(ShaDigest* out, const Fp* matrix, uint32_t count, uint32_t colSize);
 
 __global__ void sha_fold(ShaDigest* out, const ShaDigest* in, uint32_t count);
+
+__global__ void gather_digests(
+    uint32_t* dst, const uint32_t* src, const uint32_t* indices, uint32_t count);
 
 __global__ void combos_prepare(FpExt* combos,
                                const FpExt* coeffU,

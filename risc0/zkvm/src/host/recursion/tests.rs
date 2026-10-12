@@ -577,3 +577,154 @@ fn union() {
     }
     let _ = mmr.root().unwrap();
 }
+
+#[test_log::test]
+fn bench_prove_segment_po2_20() {
+    // Benchmark: prove a single segment at po2=20 (~1M cycles)
+    let segment_limit_po2 = 20;
+    let cycles: u64 = 1 << segment_limit_po2;
+    let env = ExecutorEnv::builder()
+        .write(&MultiTestSpec::BusyLoop { cycles })
+        .unwrap()
+        .segment_limit_po2(segment_limit_po2)
+        .build()
+        .unwrap();
+
+    tracing::info!("Executing rv32im at po2={segment_limit_po2} ({cycles} cycles)");
+    let session = execute_elf(env, MULTI_TEST_ELF).unwrap();
+    let n_segments = session.segments.len();
+    tracing::info!("Got {n_segments} segment(s)");
+
+    let opts = ProverOpts::composite().with_hashfn("poseidon2".to_string());
+    let prover = get_prover_server(&opts).unwrap();
+    let ctx = VerifierContext::default();
+
+    // Warmup: prove segment once to trigger JIT compilation
+    let segment = session.segments[0].resolve().unwrap();
+    tracing::info!("Warmup: proving segment 0 (po2={segment_limit_po2})...");
+    let _warmup = prover.prove_segment(&ctx, &segment).unwrap();
+    tracing::info!("Warmup done, now timing...");
+
+    // Timed run: prove again (JIT cached, hal initialized)
+    let segment = session.segments[0].resolve().unwrap();
+    tracing::info!("Proving segment 0 (po2={segment_limit_po2})...");
+    let start = std::time::Instant::now();
+    let receipt = prover.prove_segment(&ctx, &segment).unwrap();
+    let elapsed = start.elapsed();
+    tracing::info!(
+        "Segment proved in {:.3}s (po2={}, seal_size={})",
+        elapsed.as_secs_f64(),
+        segment_limit_po2,
+        receipt.seal.len() * 4,
+    );
+}
+
+#[test_log::test]
+fn bench_prove_multi_segment_po2_20() {
+    // Benchmark: prove 10+ segments at po2=20 sequentially using prove_segment.
+    let segment_limit_po2 = 20;
+    let cycles: u64 = 12 * (1 << segment_limit_po2);
+    let env = ExecutorEnv::builder()
+        .write(&MultiTestSpec::BusyLoop { cycles })
+        .unwrap()
+        .segment_limit_po2(segment_limit_po2)
+        .build()
+        .unwrap();
+
+    tracing::info!("Executing rv32im at po2={segment_limit_po2} ({cycles} total cycles)");
+    let session = execute_elf(env, MULTI_TEST_ELF).unwrap();
+    let n_segments = session.segments.len();
+    tracing::info!("Got {n_segments} segment(s)");
+
+    let opts = ProverOpts::composite().with_hashfn("poseidon2".to_string());
+    let prover = get_prover_server(&opts).unwrap();
+    let ctx = VerifierContext::default();
+
+    // Warmup
+    {
+        let segment = session.segments[0].resolve().unwrap();
+        tracing::info!("Warmup: proving segment 0...");
+        let _ = prover.prove_segment(&ctx, &segment).unwrap();
+        tracing::info!("Warmup done");
+    }
+
+    // Timed run
+    tracing::info!("BENCHMARK: proving {n_segments} segments at po2={segment_limit_po2}...");
+    let start = std::time::Instant::now();
+    let mut segment_times = Vec::new();
+    for (i, segment_ref) in session.segments.iter().enumerate() {
+        let segment = segment_ref.resolve().unwrap();
+        let t = std::time::Instant::now();
+        let receipt = prover.prove_segment(&ctx, &segment).unwrap();
+        let seg_elapsed = t.elapsed().as_secs_f64();
+        segment_times.push(seg_elapsed);
+        if std::env::var_os("RISC0_VERBOSE").is_some() {
+            eprintln!(
+                "[multi_bench] seg {i}: {seg_elapsed:.3}s (po2={}, seal={})",
+                segment.inner.po2,
+                receipt.seal.len() * 4
+            );
+        }
+    }
+    let elapsed = start.elapsed();
+    let total_secs = elapsed.as_secs_f64();
+
+    let warm_times: Vec<f64> = if segment_times.len() > 1 {
+        segment_times[1..].to_vec()
+    } else {
+        segment_times.clone()
+    };
+    let warm_avg = warm_times.iter().sum::<f64>() / warm_times.len() as f64;
+    let warm_min = warm_times.iter().cloned().reduce(f64::min).unwrap_or(0.0);
+    let warm_max = warm_times.iter().cloned().reduce(f64::max).unwrap_or(0.0);
+
+    tracing::info!(
+        "RESULT: {n_segments} segments in {total_secs:.3}s ({:.3}s/seg, {:.1} seg/s)",
+        total_secs / n_segments as f64,
+        n_segments as f64 / total_secs,
+    );
+    tracing::info!(
+        "  Warm stats (excl first): avg={warm_avg:.3}s min={warm_min:.3}s max={warm_max:.3}s"
+    );
+}
+
+#[test_log::test]
+fn bench_prove_session_pipelined_po2_20() {
+    // Benchmark: prove via prove_session (pipelined path) to test cross-segment overlap.
+    let segment_limit_po2 = 20;
+    let cycles: u64 = 5 * (1 << segment_limit_po2);
+    let env = ExecutorEnv::builder()
+        .write(&MultiTestSpec::BusyLoop { cycles })
+        .unwrap()
+        .segment_limit_po2(segment_limit_po2)
+        .build()
+        .unwrap();
+
+    tracing::info!("Executing rv32im at po2={segment_limit_po2} ({cycles} total cycles)");
+    let session = execute_elf(env, MULTI_TEST_ELF).unwrap();
+    let n_segments = session.segments.len();
+    tracing::info!("Got {n_segments} segment(s)");
+
+    let opts = ProverOpts::composite().with_hashfn("poseidon2".to_string());
+    let prover = get_prover_server(&opts).unwrap();
+    let ctx = VerifierContext::default();
+
+    // Warmup with prove_segment (known working)
+    {
+        let segment = session.segments[0].resolve().unwrap();
+        tracing::info!("Warmup...");
+        let _ = prover.prove_segment(&ctx, &segment).unwrap();
+    }
+
+    // Timed run via prove_session (pipelined)
+    tracing::info!("PIPELINED BENCHMARK: {n_segments} segments via prove_session...");
+    let start = std::time::Instant::now();
+    let _info = prover.prove_session(&ctx, &session).unwrap();
+    let elapsed = start.elapsed();
+    let total_secs = elapsed.as_secs_f64();
+    tracing::info!(
+        "PIPELINED RESULT: {n_segments} segments in {total_secs:.3}s ({:.3}s/seg, {:.1} seg/s)",
+        total_secs / n_segments as f64,
+        n_segments as f64 / total_secs,
+    );
+}

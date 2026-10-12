@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
+
 use anyhow::{anyhow, bail, Result};
 use risc0_circuit_recursion::{
     control_id::{BN254_IDENTITY_CONTROL_ID, POSEIDON2_CONTROL_IDS, SHA256_CONTROL_IDS},
@@ -21,7 +23,7 @@ use risc0_zkp::{core::digest::Digest, MAX_CYCLES_PO2, MIN_CYCLES_PO2};
 
 use crate::RECURSION_PO2;
 
-fn get_zkr(name: &str, hashfn: &str) -> Result<(Program, Digest)> {
+fn get_zkr(name: &str, hashfn: &str) -> Result<(Arc<Program>, Digest)> {
     let control_ids: &[(&str, Digest)] = match hashfn {
         "poseidon2" => &POSEIDON2_CONTROL_IDS,
         "sha-256" => &SHA256_CONTROL_IDS,
@@ -39,11 +41,11 @@ fn get_zkr(name: &str, hashfn: &str) -> Result<(Program, Digest)> {
     ))
 }
 
-pub fn test_recursion_circuit(hashfn: &str) -> Result<(Program, Digest)> {
+pub fn test_recursion_circuit(hashfn: &str) -> Result<(Arc<Program>, Digest)> {
     get_zkr("test_recursion_circuit.zkr", hashfn)
 }
 
-pub fn lift(po2: usize, hashfn: &str) -> Result<(Program, Digest)> {
+pub fn lift(po2: usize, hashfn: &str) -> Result<(Arc<Program>, Digest)> {
     if (MIN_CYCLES_PO2..MAX_CYCLES_PO2).contains(&po2) {
         get_zkr(&format!("lift_rv32im_v2_{po2}.zkr"), hashfn)
     } else {
@@ -51,23 +53,23 @@ pub fn lift(po2: usize, hashfn: &str) -> Result<(Program, Digest)> {
     }
 }
 
-pub fn join(hashfn: &str) -> Result<(Program, Digest)> {
+pub fn join(hashfn: &str) -> Result<(Arc<Program>, Digest)> {
     get_zkr("join.zkr", hashfn)
 }
 
-pub fn resolve(hashfn: &str) -> Result<(Program, Digest)> {
+pub fn resolve(hashfn: &str) -> Result<(Arc<Program>, Digest)> {
     get_zkr("resolve.zkr", hashfn)
 }
 
-pub fn identity(hashfn: &str) -> Result<(Program, Digest)> {
+pub fn identity(hashfn: &str) -> Result<(Arc<Program>, Digest)> {
     get_zkr("identity.zkr", hashfn)
 }
 
-pub fn union(hashfn: &str) -> Result<(Program, Digest)> {
+pub fn union(hashfn: &str) -> Result<(Arc<Program>, Digest)> {
     get_zkr("union.zkr", hashfn)
 }
 
-pub fn lift_povw(po2: usize, hashfn: &str) -> Result<(Program, Digest)> {
+pub fn lift_povw(po2: usize, hashfn: &str) -> Result<(Arc<Program>, Digest)> {
     if (MIN_CYCLES_PO2..MAX_CYCLES_PO2).contains(&po2) {
         get_zkr(&format!("lift_rv32im_v2_povw_{po2}.zkr"), hashfn)
     } else {
@@ -75,22 +77,22 @@ pub fn lift_povw(po2: usize, hashfn: &str) -> Result<(Program, Digest)> {
     }
 }
 
-pub fn join_povw(hashfn: &str) -> Result<(Program, Digest)> {
+pub fn join_povw(hashfn: &str) -> Result<(Arc<Program>, Digest)> {
     get_zkr("join_povw.zkr", hashfn)
 }
 
-pub fn join_unwrap_povw(hashfn: &str) -> Result<(Program, Digest)> {
+pub fn join_unwrap_povw(hashfn: &str) -> Result<(Arc<Program>, Digest)> {
     get_zkr("join_unwrap_povw.zkr", hashfn)
 }
 
-pub fn resolve_povw(hashfn: &str) -> Result<(Program, Digest)> {
+pub fn resolve_povw(hashfn: &str) -> Result<(Arc<Program>, Digest)> {
     get_zkr("resolve_povw.zkr", hashfn)
 }
 
-pub fn resolve_unwrap_povw(hashfn: &str) -> Result<(Program, Digest)> {
+pub fn resolve_unwrap_povw(hashfn: &str) -> Result<(Arc<Program>, Digest)> {
     get_zkr("resolve_unwrap_povw.zkr", hashfn)
 }
 
-pub fn unwrap_povw(hashfn: &str) -> Result<(Program, Digest)> {
+pub fn unwrap_povw(hashfn: &str) -> Result<(Arc<Program>, Digest)> {
     get_zkr("unwrap_povw.zkr", hashfn)
 }

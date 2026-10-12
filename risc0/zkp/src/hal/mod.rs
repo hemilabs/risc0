@@ -18,6 +18,10 @@ pub mod cpu;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 pub mod dual;
+#[cfg(feature = "rocm")]
+pub mod hip;
+#[cfg(feature = "intel")]
+pub mod intel;
 #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), target_os = "ios"))]
 pub mod metal;
 
@@ -61,6 +65,18 @@ pub trait Hal {
     const CHECK_SIZE: usize = INV_RATE * Self::ExtElem::EXT_SIZE;
 
     fn has_unified_memory(&self) -> bool;
+
+    /// Returns the amount of free GPU memory in bytes.
+    /// Returns `usize::MAX` for CPU HALs or when the information is unavailable.
+    fn gpu_free_memory(&self) -> usize {
+        usize::MAX
+    }
+
+    /// Returns the total GPU memory in bytes.
+    /// Returns `usize::MAX` for CPU HALs or when the information is unavailable.
+    fn gpu_total_memory(&self) -> usize {
+        usize::MAX
+    }
 
     fn get_hash_suite(&self) -> &HashSuite<Self::Field>;
 
@@ -122,6 +138,22 @@ pub trait Hal {
 
     fn zk_shift(&self, io: &Self::Buffer<Self::Elem>, count: usize);
 
+    fn batch_interpolate_ntt_zk_shift(&self, io: &Self::Buffer<Self::Elem>, count: usize) {
+        self.batch_interpolate_ntt(io, count);
+        self.zk_shift(io, count);
+    }
+
+    /// `dst = interpolate_zk_shift(src)`, leaving `src` unchanged.
+    fn batch_interpolate_ntt_zk_shift_from(
+        &self,
+        dst: &Self::Buffer<Self::Elem>,
+        src: &Self::Buffer<Self::Elem>,
+        count: usize,
+    ) {
+        self.eltwise_copy_elem(dst, src);
+        self.batch_interpolate_ntt_zk_shift(dst, count);
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn mix_poly_coeffs(
         &self,
@@ -179,6 +211,13 @@ pub trait Hal {
 
     fn hash_fold(&self, io: &Self::Buffer<Digest>, input_size: usize, output_size: usize);
 
+    fn hash_fold_tree(&self, io: &Self::Buffer<Digest>, layers: usize) {
+        for i in (0..layers).rev() {
+            let layer_size = 1 << i;
+            self.hash_fold(io, layer_size * 2, layer_size);
+        }
+    }
+
     fn gather_sample(
         &self,
         dst: &Self::Buffer<Self::Elem>,
@@ -188,6 +227,12 @@ pub trait Hal {
         stride: usize,
     );
 
+    /// Batch-read digests at scattered indices. Default impl uses individual get_at() calls.
+    /// CUDA overrides this with a gather kernel + single D2H transfer.
+    fn batch_get_digest_at(&self, buf: &Self::Buffer<Digest>, indices: &[usize]) -> Vec<Digest> {
+        indices.iter().map(|&idx| buf.get_at(idx)).collect()
+    }
+
     fn scatter(
         &self,
         into: &Self::Buffer<Self::Elem>,
@@ -195,6 +240,31 @@ pub trait Hal {
         offsets: &[u32],
         values: &[Self::Elem],
     );
+
+    /// Scatter u32 values as 32-bit decompositions into the data buffer.
+    /// `bit_data` contains packed (row, base_col, value) triples. Each triple
+    /// writes 32 field elements: data[(base_col+i)*cycles + row] = (value>>i)&1.
+    fn scatter_bits(&self, into: &Self::Buffer<Self::Elem>, bit_data: &[u32], cycles: u32) {
+        let n = bit_data.len() / 3;
+        if n == 0 {
+            return;
+        }
+        let mut index = Vec::with_capacity(n + 1);
+        let mut offsets = Vec::with_capacity(n * 32);
+        let mut vals: Vec<Self::Elem> = Vec::with_capacity(n * 32);
+        for i in 0..n {
+            index.push((i * 32) as u32);
+            let row = bit_data[i * 3];
+            let base = bit_data[i * 3 + 1];
+            let value = bit_data[i * 3 + 2];
+            for bit in 0..32u32 {
+                offsets.push((base + bit) * cycles + row);
+                vals.push(Self::Elem::from_u64(((value >> bit) & 1) as u64));
+            }
+        }
+        index.push((n * 32) as u32);
+        self.scatter(into, &index, &offsets, &vals);
+    }
 
     fn prefix_products(&self, io: &Self::Buffer<Self::ExtElem>);
 
@@ -287,6 +357,11 @@ pub trait CircuitHal<H: Hal> {
         po2: usize,
         steps: usize,
     );
+
+    /// Insert a GPU-side dependency so that subsequent operations on the main
+    /// stream wait for eval_check (running on a separate stream) to complete.
+    /// Default is no-op (for CPU HAL or when eval_check uses the same stream).
+    fn eval_check_dep(&self) {}
 }
 
 pub fn tracker() -> &'static Mutex<MemoryTracker> {

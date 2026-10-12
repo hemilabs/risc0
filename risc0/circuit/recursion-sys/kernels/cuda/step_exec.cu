@@ -16,9 +16,107 @@
 
 #include "extern.cuh"
 
+__device__ __noinline__ void step_exec_micro_ops(
+    void* ctx, uint32_t steps, uint32_t cycle, uint32_t mask,
+    Fp* arg0, Fp* arg1, Fp* arg2);
+
+__device__ __noinline__ void step_exec_micro_inst0(
+    void* ctx, uint32_t steps, uint32_t cycle, uint32_t mask,
+    Fp* arg0, Fp* arg1, Fp* arg2);
+
+__device__ __noinline__ void step_exec_micro_inst1(
+    void* ctx, uint32_t steps, uint32_t cycle, uint32_t mask,
+    Fp* arg0, Fp* arg1, Fp* arg2);
+
+__device__ __noinline__ void step_exec_micro_inst2(
+    void* ctx, uint32_t steps, uint32_t cycle, uint32_t mask,
+    Fp* arg0, Fp* arg1, Fp* arg2);
+
+
+__device__ __noinline__ void step_exec_macro_ops(
+    void* ctx, uint32_t steps, uint32_t cycle, uint32_t mask,
+    Fp* arg0, Fp* arg1, Fp* arg2);
+
+__device__ __noinline__ void step_exec_macro_wom_init(
+    void* ctx, uint32_t steps, uint32_t cycle, uint32_t mask,
+    Fp* arg0, Fp* arg1, Fp* arg2);
+
+__device__ __noinline__ void step_exec_macro_wom_fini(
+    void* ctx, uint32_t steps, uint32_t cycle, uint32_t mask,
+    Fp* arg0, Fp* arg1, Fp* arg2);
+
+__device__ __noinline__ void step_exec_macro_bit_and_elem(
+    void* ctx, uint32_t steps, uint32_t cycle, uint32_t mask,
+    Fp* arg0, Fp* arg1, Fp* arg2);
+
+__device__ __noinline__ void step_exec_macro_bit_op_shorts(
+    void* ctx, uint32_t steps, uint32_t cycle, uint32_t mask,
+    Fp* arg0, Fp* arg1, Fp* arg2);
+
+__device__ __noinline__ void step_exec_macro_sha_init(
+    void* ctx, uint32_t steps, uint32_t cycle, uint32_t mask,
+    Fp* arg0, Fp* arg1, Fp* arg2);
+
+__device__ __noinline__ void step_exec_macro_sha_fini(
+    void* ctx, uint32_t steps, uint32_t cycle, uint32_t mask,
+    Fp* arg0, Fp* arg1, Fp* arg2);
+
+__device__ __noinline__ void step_exec_macro_sha_load(
+    void* ctx, uint32_t steps, uint32_t cycle, uint32_t mask,
+    Fp* arg0, Fp* arg1, Fp* arg2);
+
+__device__ __noinline__ void step_exec_macro_sha_mix(
+    void* ctx, uint32_t steps, uint32_t cycle, uint32_t mask,
+    Fp* arg0, Fp* arg1, Fp* arg2);
+
+__device__ __noinline__ void step_exec_macro_set_global(
+    void* ctx, uint32_t steps, uint32_t cycle, uint32_t mask,
+    Fp* arg0, Fp* arg1, Fp* arg2);
+
+
+__device__ __noinline__ void step_exec_poseidon2_load(
+    void* ctx, uint32_t steps, uint32_t cycle, uint32_t mask,
+    Fp* arg0, Fp* arg1, Fp* arg2);
+
+__device__ __noinline__ void step_exec_poseidon2_full(
+    void* ctx, uint32_t steps, uint32_t cycle, uint32_t mask,
+    Fp* arg0, Fp* arg1, Fp* arg2);
+
+__device__ __noinline__ void step_exec_poseidon2_partial(
+    void* ctx, uint32_t steps, uint32_t cycle, uint32_t mask,
+    Fp* arg0, Fp* arg1, Fp* arg2);
+
+__device__ __noinline__ void step_exec_poseidon2_store(
+    void* ctx, uint32_t steps, uint32_t cycle, uint32_t mask,
+    Fp* arg0, Fp* arg1, Fp* arg2);
+
+__device__ __noinline__ void step_exec_checked_bytes(
+    void* ctx, uint32_t steps, uint32_t cycle, uint32_t mask,
+    Fp* arg0, Fp* arg1, Fp* arg2);
+
 __device__ void step_exec(
     void* ctx, uint32_t steps, uint32_t cycle, Fp* arg0, Fp* arg1, Fp* arg2, Fp* arg3, Fp* arg4) {
   uint32_t mask = steps - 1;
+
+  if (arg0[1 * steps + ((cycle - 0) & mask)] != 0)
+    step_exec_micro_ops(ctx, steps, cycle, mask, arg0, arg1, arg2);
+  if (arg0[2 * steps + ((cycle - 0) & mask)] != 0)
+    step_exec_macro_ops(ctx, steps, cycle, mask, arg0, arg1, arg2);
+  if (arg0[3 * steps + ((cycle - 0) & mask)] != 0)
+    step_exec_poseidon2_load(ctx, steps, cycle, mask, arg0, arg1, arg2);
+  if (arg0[4 * steps + ((cycle - 0) & mask)] != 0)
+    step_exec_poseidon2_full(ctx, steps, cycle, mask, arg0, arg1, arg2);
+  if (arg0[5 * steps + ((cycle - 0) & mask)] != 0)
+    step_exec_poseidon2_partial(ctx, steps, cycle, mask, arg0, arg1, arg2);
+  if (arg0[6 * steps + ((cycle - 0) & mask)] != 0)
+    step_exec_poseidon2_store(ctx, steps, cycle, mask, arg0, arg1, arg2);
+  if (arg0[7 * steps + ((cycle - 0) & mask)] != 0)
+    step_exec_checked_bytes(ctx, steps, cycle, mask, arg0, arg1, arg2);
+}
+
+__device__ __noinline__ void step_exec_micro_ops(
+    void* ctx, uint32_t steps, uint32_t cycle, uint32_t mask,
+    Fp* arg0, Fp* arg1, Fp* arg2) {
   Fp extern_args[96];
   Fp extern_outs[32];
   // loc(unknown)
@@ -645,10 +743,835 @@ __device__ void step_exec(
   Fp x310(1);
   // loc(unknown)
   Fp x311(0);
-  // loc("top(recursion::Top)/code(recursion::Code)/select(OneHot)/micro_ops(Reg)"("./zirgen/components/mux.h":59:25))
-  auto x312 = arg0[1 * steps + ((cycle - 0) & mask)];
-  assert(x312 != Fp::invalid());
-  if (x312 != 0) {
+
+  step_exec_micro_inst0(ctx, steps, cycle, mask, arg0, arg1, arg2);
+  step_exec_micro_inst1(ctx, steps, cycle, mask, arg0, arg1, arg2);
+  step_exec_micro_inst2(ctx, steps, cycle, mask, arg0, arg1, arg2);
+
+  // tail section
+    {
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+      auto x12914 = arg2[5 * steps + ((cycle - 0) & mask)];
+      assert(x12914 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x12915 = arg2[6 * steps + ((cycle - 0) & mask)];
+      assert(x12915 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x12916 = arg2[7 * steps + ((cycle - 0) & mask)];
+      assert(x12916 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x12917 = arg2[8 * steps + ((cycle - 0) & mask)];
+      assert(x12917 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x12918 = arg2[9 * steps + ((cycle - 0) & mask)];
+      assert(x12918 != Fp::invalid());
+      extern_args[0] = x12914;
+      extern_args[1] = x12915;
+      extern_args[2] = x12916;
+      extern_args[3] = x12917;
+      extern_args[4] = x12918;
+      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+      auto x12919 = arg2[10 * steps + ((cycle - 0) & mask)];
+      assert(x12919 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x12920 = arg2[11 * steps + ((cycle - 0) & mask)];
+      assert(x12920 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x12921 = arg2[12 * steps + ((cycle - 0) & mask)];
+      assert(x12921 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x12922 = arg2[13 * steps + ((cycle - 0) & mask)];
+      assert(x12922 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x12923 = arg2[14 * steps + ((cycle - 0) & mask)];
+      assert(x12923 != Fp::invalid());
+      extern_args[0] = x12919;
+      extern_args[1] = x12920;
+      extern_args[2] = x12921;
+      extern_args[3] = x12922;
+      extern_args[4] = x12923;
+      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+      auto x12924 = arg2[15 * steps + ((cycle - 0) & mask)];
+      assert(x12924 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x12925 = arg2[16 * steps + ((cycle - 0) & mask)];
+      assert(x12925 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x12926 = arg2[17 * steps + ((cycle - 0) & mask)];
+      assert(x12926 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x12927 = arg2[18 * steps + ((cycle - 0) & mask)];
+      assert(x12927 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x12928 = arg2[19 * steps + ((cycle - 0) & mask)];
+      assert(x12928 != Fp::invalid());
+      extern_args[0] = x12924;
+      extern_args[1] = x12925;
+      extern_args[2] = x12926;
+      extern_args[3] = x12927;
+      extern_args[4] = x12928;
+      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+      auto x12929 = arg2[20 * steps + ((cycle - 0) & mask)];
+      assert(x12929 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x12930 = arg2[21 * steps + ((cycle - 0) & mask)];
+      assert(x12930 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x12931 = arg2[22 * steps + ((cycle - 0) & mask)];
+      assert(x12931 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x12932 = arg2[23 * steps + ((cycle - 0) & mask)];
+      assert(x12932 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x12933 = arg2[24 * steps + ((cycle - 0) & mask)];
+      assert(x12933 != Fp::invalid());
+      extern_args[0] = x12929;
+      extern_args[1] = x12930;
+      extern_args[2] = x12931;
+      extern_args[3] = x12932;
+      extern_args[4] = x12933;
+      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+      auto x12934 = arg2[25 * steps + ((cycle - 0) & mask)];
+      assert(x12934 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x12935 = arg2[26 * steps + ((cycle - 0) & mask)];
+      assert(x12935 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x12936 = arg2[27 * steps + ((cycle - 0) & mask)];
+      assert(x12936 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x12937 = arg2[28 * steps + ((cycle - 0) & mask)];
+      assert(x12937 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x12938 = arg2[29 * steps + ((cycle - 0) & mask)];
+      assert(x12938 != Fp::invalid());
+      extern_args[0] = x12934;
+      extern_args[1] = x12935;
+      extern_args[2] = x12936;
+      extern_args[3] = x12937;
+      extern_args[4] = x12938;
+      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+      auto x12939 = arg2[30 * steps + ((cycle - 0) & mask)];
+      assert(x12939 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x12940 = arg2[31 * steps + ((cycle - 0) & mask)];
+      assert(x12940 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x12941 = arg2[32 * steps + ((cycle - 0) & mask)];
+      assert(x12941 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x12942 = arg2[33 * steps + ((cycle - 0) & mask)];
+      assert(x12942 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x12943 = arg2[34 * steps + ((cycle - 0) & mask)];
+      assert(x12943 != Fp::invalid());
+      extern_args[0] = x12939;
+      extern_args[1] = x12940;
+      extern_args[2] = x12941;
+      extern_args[3] = x12942;
+      extern_args[4] = x12943;
+      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+      auto x12944 = arg2[35 * steps + ((cycle - 0) & mask)];
+      assert(x12944 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x12945 = arg2[36 * steps + ((cycle - 0) & mask)];
+      assert(x12945 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x12946 = arg2[37 * steps + ((cycle - 0) & mask)];
+      assert(x12946 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x12947 = arg2[38 * steps + ((cycle - 0) & mask)];
+      assert(x12947 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x12948 = arg2[39 * steps + ((cycle - 0) & mask)];
+      assert(x12948 != Fp::invalid());
+      extern_args[0] = x12944;
+      extern_args[1] = x12945;
+      extern_args[2] = x12946;
+      extern_args[3] = x12947;
+      extern_args[4] = x12948;
+      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+      auto x12949 = arg2[40 * steps + ((cycle - 0) & mask)];
+      assert(x12949 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x12950 = arg2[41 * steps + ((cycle - 0) & mask)];
+      assert(x12950 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x12951 = arg2[42 * steps + ((cycle - 0) & mask)];
+      assert(x12951 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x12952 = arg2[43 * steps + ((cycle - 0) & mask)];
+      assert(x12952 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x12953 = arg2[44 * steps + ((cycle - 0) & mask)];
+      assert(x12953 != Fp::invalid());
+      extern_args[0] = x12949;
+      extern_args[1] = x12950;
+      extern_args[2] = x12951;
+      extern_args[3] = x12952;
+      extern_args[4] = x12953;
+      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+      auto x12954 = arg2[45 * steps + ((cycle - 0) & mask)];
+      assert(x12954 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x12955 = arg2[46 * steps + ((cycle - 0) & mask)];
+      assert(x12955 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x12956 = arg2[47 * steps + ((cycle - 0) & mask)];
+      assert(x12956 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x12957 = arg2[48 * steps + ((cycle - 0) & mask)];
+      assert(x12957 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x12958 = arg2[49 * steps + ((cycle - 0) & mask)];
+      assert(x12958 != Fp::invalid());
+      extern_args[0] = x12954;
+      extern_args[1] = x12955;
+      extern_args[2] = x12956;
+      extern_args[3] = x12957;
+      extern_args[4] = x12958;
+      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+    }
+}
+
+__device__ __noinline__ void step_exec_micro_inst0(
+    void* ctx, uint32_t steps, uint32_t cycle, uint32_t mask,
+    Fp* arg0, Fp* arg1, Fp* arg2) {
+  Fp extern_args[96];
+  Fp extern_outs[32];
+  // loc(unknown)
+  Fp x0(192);
+  // loc(unknown)
+  Fp x1(48);
+  // loc(unknown)
+  Fp x2(12);
+  // loc(unknown)
+  Fp x3(1040977421);
+  // loc(unknown)
+  Fp x4(1792450386);
+  // loc(unknown)
+  Fp x5(1470845646);
+  // loc(unknown)
+  Fp x6(1363837384);
+  // loc(unknown)
+  Fp x7(1878280202);
+  // loc(unknown)
+  Fp x8(434078361);
+  // loc(unknown)
+  Fp x9(1946596189);
+  // loc(unknown)
+  Fp x10(875839332);
+  // loc(unknown)
+  Fp x11(463976218);
+  // loc(unknown)
+  Fp x12(976057819);
+  // loc(unknown)
+  Fp x13(48375137);
+  // loc(unknown)
+  Fp x14(1549779579);
+  // loc(unknown)
+  Fp x15(1679178250);
+  // loc(unknown)
+  Fp x16(530151394);
+  // loc(unknown)
+  Fp x17(1629316321);
+  // loc(unknown)
+  Fp x18(1854174607);
+  // loc(unknown)
+  Fp x19(720724951);
+  // loc(unknown)
+  Fp x20(14387587);
+  // loc(unknown)
+  Fp x21(1883820770);
+  // loc(unknown)
+  Fp x22(205609311);
+  // loc(unknown)
+  Fp x23(1136469704);
+  // loc(unknown)
+  Fp x24(1439947916);
+  // loc(unknown)
+  Fp x25(723038058);
+  // loc(unknown)
+  Fp x26(53041581);
+  // loc(unknown)
+  Fp x27(1810596765);
+  // loc(unknown)
+  Fp x28(1210751726);
+  // loc(unknown)
+  Fp x29(1327682690);
+  // loc(unknown)
+  Fp x30(1886977120);
+  // loc(unknown)
+  Fp x31(1551596046);
+  // loc(unknown)
+  Fp x32(1186174623);
+  // loc(unknown)
+  Fp x33(1199068823);
+  // loc(unknown)
+  Fp x34(1240419708);
+  // loc(unknown)
+  Fp x35(1708681573);
+  // loc(unknown)
+  Fp x36(308575117);
+  // loc(unknown)
+  Fp x37(1111544260);
+  // loc(unknown)
+  Fp x38(822033215);
+  // loc(unknown)
+  Fp x39(1891545577);
+  // loc(unknown)
+  Fp x40(440300254);
+  // loc(unknown)
+  Fp x41(1726563304);
+  // loc(unknown)
+  Fp x42(1365519753);
+  // loc(unknown)
+  Fp x43(924863639);
+  // loc(unknown)
+  Fp x44(1540960371);
+  // loc(unknown)
+  Fp x45(1052077299);
+  // loc(unknown)
+  Fp x46(1930103076);
+  // loc(unknown)
+  Fp x47(98371040);
+  // loc(unknown)
+  Fp x48(918610824);
+  // loc(unknown)
+  Fp x49(801504236);
+  // loc(unknown)
+  Fp x50(65998480);
+  // loc(unknown)
+  Fp x51(658182609);
+  // loc(unknown)
+  Fp x52(606789471);
+  // loc(unknown)
+  Fp x53(51866717);
+  // loc(unknown)
+  Fp x54(375892129);
+  // loc(unknown)
+  Fp x55(20525701);
+  // loc(unknown)
+  Fp x56(1997365680);
+  // loc(unknown)
+  Fp x57(1974912880);
+  // loc(unknown)
+  Fp x58(1942928017);
+  // loc(unknown)
+  Fp x59(1928969209);
+  // loc(unknown)
+  Fp x60(1867716110);
+  // loc(unknown)
+  Fp x61(1792686146);
+  // loc(unknown)
+  Fp x62(1558116381);
+  // loc(unknown)
+  Fp x63(1461037801);
+  // loc(unknown)
+  Fp x64(1389833583);
+  // loc(unknown)
+  Fp x65(13683276);
+  // loc(unknown)
+  Fp x66(1188752902);
+  // loc(unknown)
+  Fp x67(111593398);
+  // loc(unknown)
+  Fp x68(1083257840);
+  // loc(unknown)
+  Fp x69(106789798);
+  // loc(unknown)
+  Fp x70(1001081699);
+  // loc(unknown)
+  Fp x71(497520322);
+  // loc(unknown)
+  Fp x72(946500736);
+  // loc(unknown)
+  Fp x73(890243564);
+  // loc(unknown)
+  Fp x74(862495875);
+  // loc(unknown)
+  Fp x75(855276054);
+  // loc(unknown)
+  Fp x76(76770019);
+  // loc(unknown)
+  Fp x77(760115692);
+  // loc(unknown)
+  Fp x78(623051854);
+  // loc(unknown)
+  Fp x79(59510015);
+  // loc(unknown)
+  Fp x80(552696906);
+  // loc(unknown)
+  Fp x81(538103555);
+  // loc(unknown)
+  Fp x82(457372011);
+  // loc(unknown)
+  Fp x83(447555988);
+  // loc(unknown)
+  Fp x84(27129487);
+  // loc(unknown)
+  Fp x85(217046702);
+  // loc(unknown)
+  Fp x86(1950429111);
+  // loc(unknown)
+  Fp x87(192082241);
+  // loc(unknown)
+  Fp x88(1910423126);
+  // loc(unknown)
+  Fp x89(1908416316);
+  // loc(unknown)
+  Fp x90(1891637550);
+  // loc(unknown)
+  Fp x91(1841795381);
+  // loc(unknown)
+  Fp x92(1827572010);
+  // loc(unknown)
+  Fp x93(1748789933);
+  // loc(unknown)
+  Fp x94(1664590951);
+  // loc(unknown)
+  Fp x95(1663353317);
+  // loc(unknown)
+  Fp x96(162510541);
+  // loc(unknown)
+  Fp x97(1622328571);
+  // loc(unknown)
+  Fp x98(1608853840);
+  // loc(unknown)
+  Fp x99(158646617);
+  // loc(unknown)
+  Fp x100(1584033957);
+  // loc(unknown)
+  Fp x101(1567618575);
+  // loc(unknown)
+  Fp x102(1549062383);
+  // loc(unknown)
+  Fp x103(1507649755);
+  // loc(unknown)
+  Fp x104(1478577620);
+  // loc(unknown)
+  Fp x105(1463323727);
+  // loc(unknown)
+  Fp x106(1424297384);
+  // loc(unknown)
+  Fp x107(142102402);
+  // loc(unknown)
+  Fp x108(1402624179);
+  // loc(unknown)
+  Fp x109(1293938517);
+  // loc(unknown)
+  Fp x110(1257820264);
+  // loc(unknown)
+  Fp x111(1215259350);
+  // loc(unknown)
+  Fp x112(1198261138);
+  // loc(unknown)
+  Fp x113(1150410028);
+  // loc(unknown)
+  Fp x114(1147522062);
+  // loc(unknown)
+  Fp x115(1099252725);
+  // loc(unknown)
+  Fp x116(1080533265);
+  // loc(unknown)
+  Fp x117(1079030649);
+  // loc(unknown)
+  Fp x118(1065075039);
+  // loc(unknown)
+  Fp x119(1042892522);
+  // loc(unknown)
+  Fp x120(993455846);
+  // loc(unknown)
+  Fp x121(989618631);
+  // loc(unknown)
+  Fp x122(989176635);
+  // loc(unknown)
+  Fp x123(942439428);
+  // loc(unknown)
+  Fp x124(930036496);
+  // loc(unknown)
+  Fp x125(925018226);
+  // loc(unknown)
+  Fp x126(897025192);
+  // loc(unknown)
+  Fp x127(825405577);
+  // loc(unknown)
+  Fp x128(813674331);
+  // loc(unknown)
+  Fp x129(809508074);
+  // loc(unknown)
+  Fp x130(790726260);
+  // loc(unknown)
+  Fp x131(78845751);
+  // loc(unknown)
+  Fp x132(781141772);
+  // loc(unknown)
+  Fp x133(755691969);
+  // loc(unknown)
+  Fp x134(738091882);
+  // loc(unknown)
+  Fp x135(716894289);
+  // loc(unknown)
+  Fp x136(714957516);
+  // loc(unknown)
+  Fp x137(708123747);
+  // loc(unknown)
+  Fp x138(695835963);
+  // loc(unknown)
+  Fp x139(686842369);
+  // loc(unknown)
+  Fp x140(641665156);
+  // loc(unknown)
+  Fp x141(622609176);
+  // loc(unknown)
+  Fp x142(608401422);
+  // loc(unknown)
+  Fp x143(588764636);
+  // loc(unknown)
+  Fp x144(540703332);
+  // loc(unknown)
+  Fp x145(53007114);
+  // loc(unknown)
+  Fp x146(51256176);
+  // loc(unknown)
+  Fp x147(459826664);
+  // loc(unknown)
+  Fp x148(427731030);
+  // loc(unknown)
+  Fp x149(395622276);
+  // loc(unknown)
+  Fp x150(390340387);
+  // loc(unknown)
+  Fp x151(342857858);
+  // loc(unknown)
+  Fp x152(306391314);
+  // loc(unknown)
+  Fp x153(273790406);
+  // loc(unknown)
+  Fp x154(241306552);
+  // loc(unknown)
+  Fp x155(238616145);
+  // loc(unknown)
+  Fp x156(228520958);
+  // loc(unknown)
+  Fp x157(204228775);
+  // loc(unknown)
+  Fp x158(202271745);
+  // loc(unknown)
+  Fp x159(1997503974);
+  // loc(unknown)
+  Fp x160(1989924532);
+  // loc(unknown)
+  Fp x161(1917861751);
+  // loc(unknown)
+  Fp x162(1917549072);
+  // loc(unknown)
+  Fp x163(1896271507);
+  // loc(unknown)
+  Fp x164(1889898);
+  // loc(unknown)
+  Fp x165(1889603648);
+  // loc(unknown)
+  Fp x166(1845603984);
+  // loc(unknown)
+  Fp x167(1832911930);
+  // loc(unknown)
+  Fp x168(1781980094);
+  // loc(unknown)
+  Fp x169(1740472809);
+  // loc(unknown)
+  Fp x170(1737016378);
+  // loc(unknown)
+  Fp x171(172614232);
+  // loc(unknown)
+  Fp x172(1718628547);
+  // loc(unknown)
+  Fp x173(1715719711);
+  // loc(unknown)
+  Fp x174(1687379185);
+  // loc(unknown)
+  Fp x175(1672219447);
+  // loc(unknown)
+  Fp x176(1649953458);
+  // loc(unknown)
+  Fp x177(1647670797);
+  // loc(unknown)
+  Fp x178(1647665372);
+  // loc(unknown)
+  Fp x179(162506101);
+  // loc(unknown)
+  Fp x180(1608891156);
+  // loc(unknown)
+  Fp x181(1587822577);
+  // loc(unknown)
+  Fp x182(1545325389);
+  // loc(unknown)
+  Fp x183(1518763784);
+  // loc(unknown)
+  Fp x184(1507936940);
+  // loc(unknown)
+  Fp x185(150307788);
+  // loc(unknown)
+  Fp x186(1454563174);
+  // loc(unknown)
+  Fp x187(140621810);
+  // loc(unknown)
+  Fp x188(1401020792);
+  // loc(unknown)
+  Fp x189(1393671120);
+  // loc(unknown)
+  Fp x190(1380248020);
+  // loc(unknown)
+  Fp x191(1339793538);
+  // loc(unknown)
+  Fp x192(1338899225);
+  // loc(unknown)
+  Fp x193(1333667262);
+  // loc(unknown)
+  Fp x194(1303271640);
+  // loc(unknown)
+  Fp x195(1296144415);
+  // loc(unknown)
+  Fp x196(1291790245);
+  // loc(unknown)
+  Fp x197(1290028279);
+  // loc(unknown)
+  Fp x198(128479034);
+  // loc(unknown)
+  Fp x199(1282239129);
+  // loc(unknown)
+  Fp x200(1269493554);
+  // loc(unknown)
+  Fp x201(1262312258);
+  // loc(unknown)
+  Fp x202(1239734761);
+  // loc(unknown)
+  Fp x203(1221257987);
+  // loc(unknown)
+  Fp x204(1213686459);
+  // loc(unknown)
+  Fp x205(1209164052);
+  // loc(unknown)
+  Fp x206(1206940496);
+  // loc(unknown)
+  Fp x207(1201063290);
+  // loc(unknown)
+  Fp x208(117294666);
+  // loc(unknown)
+  Fp x209(1170029417);
+  // loc(unknown)
+  Fp x210(1150912935);
+  // loc(unknown)
+  Fp x211(1124078057);
+  // loc(unknown)
+  Fp x212(1111203133);
+  // loc(unknown)
+  Fp x213(1090783436);
+  // loc(unknown)
+  Fp x214(1006235079);
+  // loc(unknown)
+  Fp x215(1003792297);
+  // loc(unknown)
+  Fp x216(831813382);
+  // loc(unknown)
+  Fp x217(1421525369);
+  // loc(unknown)
+  Fp x218(1751797115);
+  // loc(unknown)
+  Fp x219(1964135730);
+  // loc(unknown)
+  Fp x220(525458520);
+  // loc(unknown)
+  Fp x221(638242172);
+  // loc(unknown)
+  Fp x222(1307439985);
+  // loc(unknown)
+  Fp x223(343354132);
+  // loc(unknown)
+  Fp x224(1389166148);
+  // loc(unknown)
+  Fp x225(1660766320);
+  // loc(unknown)
+  Fp x226(1464793095);
+  // loc(unknown)
+  Fp x227(1180307149);
+  // loc(unknown)
+  Fp x228(1930780904);
+  // loc(unknown)
+  Fp x229(1066694495);
+  // loc(unknown)
+  Fp x230(1773108264);
+  // loc(unknown)
+  Fp x231(1004040026);
+  // loc(unknown)
+  Fp x232(815798990);
+  // loc(unknown)
+  Fp x233(454905424);
+  // loc(unknown)
+  Fp x234(118043943);
+  // loc(unknown)
+  Fp x235(157582794);
+  // loc(unknown)
+  Fp x236(246143118);
+  // loc(unknown)
+  Fp x237(314968988);
+  // loc(unknown)
+  Fp x238(127253399);
+  // loc(unknown)
+  Fp x239(262278199);
+  // loc(unknown)
+  Fp x240(943718400);
+  // loc(unknown)
+  Fp x241(268435454);
+  // loc(unknown)
+  Fp x242(1761607679);
+  // loc(unknown)
+  Fp x243(1073741824);
+  // loc(unknown)
+  Fp x244(536870912);
+  // loc(unknown)
+  Fp x245(1509949437);
+  // loc(unknown)
+  Fp x246(268435456);
+  // loc(unknown)
+  Fp x247(1006632953);
+  // loc(unknown)
+  Fp x248(2013265906);
+  // loc(unknown)
+  Fp x249(134217728);
+  // loc(unknown)
+  Fp x250(67108864);
+  // loc(unknown)
+  Fp x251(2013265891);
+  // loc(unknown)
+  Fp x252(33554432);
+  // loc(unknown)
+  Fp x253(2013265861);
+  // loc(unknown)
+  Fp x254(2013265801);
+  // loc(unknown)
+  Fp x255(16777216);
+  // loc(unknown)
+  Fp x256(8388608);
+  // loc(unknown)
+  Fp x257(2013265681);
+  // loc(unknown)
+  Fp x258(4194304);
+  // loc(unknown)
+  Fp x259(2013265441);
+  // loc(unknown)
+  Fp x260(2097152);
+  // loc(unknown)
+  Fp x261(2013264961);
+  // loc(unknown)
+  Fp x262(2013264001);
+  // loc(unknown)
+  Fp x263(1048576);
+  // loc(unknown)
+  Fp x264(524288);
+  // loc(unknown)
+  Fp x265(2013262081);
+  // loc(unknown)
+  Fp x266(262144);
+  // loc(unknown)
+  Fp x267(2013258241);
+  // loc(unknown)
+  Fp x268(2013250561);
+  // loc(unknown)
+  Fp x269(131072);
+  // loc(unknown)
+  Fp x270(2013235201);
+  // loc(unknown)
+  Fp x271(32768);
+  // loc(unknown)
+  Fp x272(2013204481);
+  // loc(unknown)
+  Fp x273(2013143041);
+  // loc(unknown)
+  Fp x274(16384);
+  // loc(unknown)
+  Fp x275(8192);
+  // loc(unknown)
+  Fp x276(2013020161);
+  // loc(unknown)
+  Fp x277(4096);
+  // loc(unknown)
+  Fp x278(2012774401);
+  // loc(unknown)
+  Fp x279(2048);
+  // loc(unknown)
+  Fp x280(2012282881);
+  // loc(unknown)
+  Fp x281(2011299841);
+  // loc(unknown)
+  Fp x282(1024);
+  // loc(unknown)
+  Fp x283(512);
+  // loc(unknown)
+  Fp x284(2009333761);
+  // loc(unknown)
+  Fp x285(256);
+  // loc(unknown)
+  Fp x286(2005401601);
+  // loc(unknown)
+  Fp x287(1997537281);
+  // loc(unknown)
+  Fp x288(128);
+  // loc(unknown)
+  Fp x289(64);
+  // loc(unknown)
+  Fp x290(1981808641);
+  // loc(unknown)
+  Fp x291(32);
+  // loc(unknown)
+  Fp x292(1950351361);
+  // loc(unknown)
+  Fp x293(1887436801);
+  // loc(unknown)
+  Fp x294(16);
+  // loc(unknown)
+  Fp x295(1761607681);
+  // loc(unknown)
+  Fp x296(1509949441);
+  // loc(unknown)
+  Fp x297(1006632961);
+  // loc(unknown)
+  Fp x298(65536);
+  // loc(unknown)
+  Fp x299(2013265910);
+  // loc(unknown)
+  Fp x300(11);
+  // loc(unknown)
+  Fp x301(10);
+  // loc(unknown)
+  Fp x302(9);
+  // loc(unknown)
+  Fp x303(8);
+  // loc(unknown)
+  Fp x304(7);
+  // loc(unknown)
+  Fp x305(6);
+  // loc(unknown)
+  Fp x306(5);
+  // loc(unknown)
+  Fp x307(4);
+  // loc(unknown)
+  Fp x308(3);
+  // loc(unknown)
+  Fp x309(2);
+  // loc(unknown)
+  Fp x310(1);
+  // loc(unknown)
+  Fp x311(0);
+
     // loc("top(recursion::Top)/code(recursion::Code)/inst(Mux)/micro_ops(recursion::MicroInsts)/inst[0](recursion::MicroInst)/opcode(Reg)"("./zirgen/compiler/edsl/component.h":164:27))
     auto x313 = arg0[8 * steps + ((cycle - 0) & mask)];
     assert(x313 != Fp::invalid());
@@ -2919,6 +3842,641 @@ __device__ void step_exec(
       }
     }
     // loc("zirgen/circuit/recursion/micro.cpp":163:34)
+}
+
+__device__ __noinline__ void step_exec_micro_inst1(
+    void* ctx, uint32_t steps, uint32_t cycle, uint32_t mask,
+    Fp* arg0, Fp* arg1, Fp* arg2) {
+  Fp extern_args[96];
+  Fp extern_outs[32];
+  // loc(unknown)
+  Fp x0(192);
+  // loc(unknown)
+  Fp x1(48);
+  // loc(unknown)
+  Fp x2(12);
+  // loc(unknown)
+  Fp x3(1040977421);
+  // loc(unknown)
+  Fp x4(1792450386);
+  // loc(unknown)
+  Fp x5(1470845646);
+  // loc(unknown)
+  Fp x6(1363837384);
+  // loc(unknown)
+  Fp x7(1878280202);
+  // loc(unknown)
+  Fp x8(434078361);
+  // loc(unknown)
+  Fp x9(1946596189);
+  // loc(unknown)
+  Fp x10(875839332);
+  // loc(unknown)
+  Fp x11(463976218);
+  // loc(unknown)
+  Fp x12(976057819);
+  // loc(unknown)
+  Fp x13(48375137);
+  // loc(unknown)
+  Fp x14(1549779579);
+  // loc(unknown)
+  Fp x15(1679178250);
+  // loc(unknown)
+  Fp x16(530151394);
+  // loc(unknown)
+  Fp x17(1629316321);
+  // loc(unknown)
+  Fp x18(1854174607);
+  // loc(unknown)
+  Fp x19(720724951);
+  // loc(unknown)
+  Fp x20(14387587);
+  // loc(unknown)
+  Fp x21(1883820770);
+  // loc(unknown)
+  Fp x22(205609311);
+  // loc(unknown)
+  Fp x23(1136469704);
+  // loc(unknown)
+  Fp x24(1439947916);
+  // loc(unknown)
+  Fp x25(723038058);
+  // loc(unknown)
+  Fp x26(53041581);
+  // loc(unknown)
+  Fp x27(1810596765);
+  // loc(unknown)
+  Fp x28(1210751726);
+  // loc(unknown)
+  Fp x29(1327682690);
+  // loc(unknown)
+  Fp x30(1886977120);
+  // loc(unknown)
+  Fp x31(1551596046);
+  // loc(unknown)
+  Fp x32(1186174623);
+  // loc(unknown)
+  Fp x33(1199068823);
+  // loc(unknown)
+  Fp x34(1240419708);
+  // loc(unknown)
+  Fp x35(1708681573);
+  // loc(unknown)
+  Fp x36(308575117);
+  // loc(unknown)
+  Fp x37(1111544260);
+  // loc(unknown)
+  Fp x38(822033215);
+  // loc(unknown)
+  Fp x39(1891545577);
+  // loc(unknown)
+  Fp x40(440300254);
+  // loc(unknown)
+  Fp x41(1726563304);
+  // loc(unknown)
+  Fp x42(1365519753);
+  // loc(unknown)
+  Fp x43(924863639);
+  // loc(unknown)
+  Fp x44(1540960371);
+  // loc(unknown)
+  Fp x45(1052077299);
+  // loc(unknown)
+  Fp x46(1930103076);
+  // loc(unknown)
+  Fp x47(98371040);
+  // loc(unknown)
+  Fp x48(918610824);
+  // loc(unknown)
+  Fp x49(801504236);
+  // loc(unknown)
+  Fp x50(65998480);
+  // loc(unknown)
+  Fp x51(658182609);
+  // loc(unknown)
+  Fp x52(606789471);
+  // loc(unknown)
+  Fp x53(51866717);
+  // loc(unknown)
+  Fp x54(375892129);
+  // loc(unknown)
+  Fp x55(20525701);
+  // loc(unknown)
+  Fp x56(1997365680);
+  // loc(unknown)
+  Fp x57(1974912880);
+  // loc(unknown)
+  Fp x58(1942928017);
+  // loc(unknown)
+  Fp x59(1928969209);
+  // loc(unknown)
+  Fp x60(1867716110);
+  // loc(unknown)
+  Fp x61(1792686146);
+  // loc(unknown)
+  Fp x62(1558116381);
+  // loc(unknown)
+  Fp x63(1461037801);
+  // loc(unknown)
+  Fp x64(1389833583);
+  // loc(unknown)
+  Fp x65(13683276);
+  // loc(unknown)
+  Fp x66(1188752902);
+  // loc(unknown)
+  Fp x67(111593398);
+  // loc(unknown)
+  Fp x68(1083257840);
+  // loc(unknown)
+  Fp x69(106789798);
+  // loc(unknown)
+  Fp x70(1001081699);
+  // loc(unknown)
+  Fp x71(497520322);
+  // loc(unknown)
+  Fp x72(946500736);
+  // loc(unknown)
+  Fp x73(890243564);
+  // loc(unknown)
+  Fp x74(862495875);
+  // loc(unknown)
+  Fp x75(855276054);
+  // loc(unknown)
+  Fp x76(76770019);
+  // loc(unknown)
+  Fp x77(760115692);
+  // loc(unknown)
+  Fp x78(623051854);
+  // loc(unknown)
+  Fp x79(59510015);
+  // loc(unknown)
+  Fp x80(552696906);
+  // loc(unknown)
+  Fp x81(538103555);
+  // loc(unknown)
+  Fp x82(457372011);
+  // loc(unknown)
+  Fp x83(447555988);
+  // loc(unknown)
+  Fp x84(27129487);
+  // loc(unknown)
+  Fp x85(217046702);
+  // loc(unknown)
+  Fp x86(1950429111);
+  // loc(unknown)
+  Fp x87(192082241);
+  // loc(unknown)
+  Fp x88(1910423126);
+  // loc(unknown)
+  Fp x89(1908416316);
+  // loc(unknown)
+  Fp x90(1891637550);
+  // loc(unknown)
+  Fp x91(1841795381);
+  // loc(unknown)
+  Fp x92(1827572010);
+  // loc(unknown)
+  Fp x93(1748789933);
+  // loc(unknown)
+  Fp x94(1664590951);
+  // loc(unknown)
+  Fp x95(1663353317);
+  // loc(unknown)
+  Fp x96(162510541);
+  // loc(unknown)
+  Fp x97(1622328571);
+  // loc(unknown)
+  Fp x98(1608853840);
+  // loc(unknown)
+  Fp x99(158646617);
+  // loc(unknown)
+  Fp x100(1584033957);
+  // loc(unknown)
+  Fp x101(1567618575);
+  // loc(unknown)
+  Fp x102(1549062383);
+  // loc(unknown)
+  Fp x103(1507649755);
+  // loc(unknown)
+  Fp x104(1478577620);
+  // loc(unknown)
+  Fp x105(1463323727);
+  // loc(unknown)
+  Fp x106(1424297384);
+  // loc(unknown)
+  Fp x107(142102402);
+  // loc(unknown)
+  Fp x108(1402624179);
+  // loc(unknown)
+  Fp x109(1293938517);
+  // loc(unknown)
+  Fp x110(1257820264);
+  // loc(unknown)
+  Fp x111(1215259350);
+  // loc(unknown)
+  Fp x112(1198261138);
+  // loc(unknown)
+  Fp x113(1150410028);
+  // loc(unknown)
+  Fp x114(1147522062);
+  // loc(unknown)
+  Fp x115(1099252725);
+  // loc(unknown)
+  Fp x116(1080533265);
+  // loc(unknown)
+  Fp x117(1079030649);
+  // loc(unknown)
+  Fp x118(1065075039);
+  // loc(unknown)
+  Fp x119(1042892522);
+  // loc(unknown)
+  Fp x120(993455846);
+  // loc(unknown)
+  Fp x121(989618631);
+  // loc(unknown)
+  Fp x122(989176635);
+  // loc(unknown)
+  Fp x123(942439428);
+  // loc(unknown)
+  Fp x124(930036496);
+  // loc(unknown)
+  Fp x125(925018226);
+  // loc(unknown)
+  Fp x126(897025192);
+  // loc(unknown)
+  Fp x127(825405577);
+  // loc(unknown)
+  Fp x128(813674331);
+  // loc(unknown)
+  Fp x129(809508074);
+  // loc(unknown)
+  Fp x130(790726260);
+  // loc(unknown)
+  Fp x131(78845751);
+  // loc(unknown)
+  Fp x132(781141772);
+  // loc(unknown)
+  Fp x133(755691969);
+  // loc(unknown)
+  Fp x134(738091882);
+  // loc(unknown)
+  Fp x135(716894289);
+  // loc(unknown)
+  Fp x136(714957516);
+  // loc(unknown)
+  Fp x137(708123747);
+  // loc(unknown)
+  Fp x138(695835963);
+  // loc(unknown)
+  Fp x139(686842369);
+  // loc(unknown)
+  Fp x140(641665156);
+  // loc(unknown)
+  Fp x141(622609176);
+  // loc(unknown)
+  Fp x142(608401422);
+  // loc(unknown)
+  Fp x143(588764636);
+  // loc(unknown)
+  Fp x144(540703332);
+  // loc(unknown)
+  Fp x145(53007114);
+  // loc(unknown)
+  Fp x146(51256176);
+  // loc(unknown)
+  Fp x147(459826664);
+  // loc(unknown)
+  Fp x148(427731030);
+  // loc(unknown)
+  Fp x149(395622276);
+  // loc(unknown)
+  Fp x150(390340387);
+  // loc(unknown)
+  Fp x151(342857858);
+  // loc(unknown)
+  Fp x152(306391314);
+  // loc(unknown)
+  Fp x153(273790406);
+  // loc(unknown)
+  Fp x154(241306552);
+  // loc(unknown)
+  Fp x155(238616145);
+  // loc(unknown)
+  Fp x156(228520958);
+  // loc(unknown)
+  Fp x157(204228775);
+  // loc(unknown)
+  Fp x158(202271745);
+  // loc(unknown)
+  Fp x159(1997503974);
+  // loc(unknown)
+  Fp x160(1989924532);
+  // loc(unknown)
+  Fp x161(1917861751);
+  // loc(unknown)
+  Fp x162(1917549072);
+  // loc(unknown)
+  Fp x163(1896271507);
+  // loc(unknown)
+  Fp x164(1889898);
+  // loc(unknown)
+  Fp x165(1889603648);
+  // loc(unknown)
+  Fp x166(1845603984);
+  // loc(unknown)
+  Fp x167(1832911930);
+  // loc(unknown)
+  Fp x168(1781980094);
+  // loc(unknown)
+  Fp x169(1740472809);
+  // loc(unknown)
+  Fp x170(1737016378);
+  // loc(unknown)
+  Fp x171(172614232);
+  // loc(unknown)
+  Fp x172(1718628547);
+  // loc(unknown)
+  Fp x173(1715719711);
+  // loc(unknown)
+  Fp x174(1687379185);
+  // loc(unknown)
+  Fp x175(1672219447);
+  // loc(unknown)
+  Fp x176(1649953458);
+  // loc(unknown)
+  Fp x177(1647670797);
+  // loc(unknown)
+  Fp x178(1647665372);
+  // loc(unknown)
+  Fp x179(162506101);
+  // loc(unknown)
+  Fp x180(1608891156);
+  // loc(unknown)
+  Fp x181(1587822577);
+  // loc(unknown)
+  Fp x182(1545325389);
+  // loc(unknown)
+  Fp x183(1518763784);
+  // loc(unknown)
+  Fp x184(1507936940);
+  // loc(unknown)
+  Fp x185(150307788);
+  // loc(unknown)
+  Fp x186(1454563174);
+  // loc(unknown)
+  Fp x187(140621810);
+  // loc(unknown)
+  Fp x188(1401020792);
+  // loc(unknown)
+  Fp x189(1393671120);
+  // loc(unknown)
+  Fp x190(1380248020);
+  // loc(unknown)
+  Fp x191(1339793538);
+  // loc(unknown)
+  Fp x192(1338899225);
+  // loc(unknown)
+  Fp x193(1333667262);
+  // loc(unknown)
+  Fp x194(1303271640);
+  // loc(unknown)
+  Fp x195(1296144415);
+  // loc(unknown)
+  Fp x196(1291790245);
+  // loc(unknown)
+  Fp x197(1290028279);
+  // loc(unknown)
+  Fp x198(128479034);
+  // loc(unknown)
+  Fp x199(1282239129);
+  // loc(unknown)
+  Fp x200(1269493554);
+  // loc(unknown)
+  Fp x201(1262312258);
+  // loc(unknown)
+  Fp x202(1239734761);
+  // loc(unknown)
+  Fp x203(1221257987);
+  // loc(unknown)
+  Fp x204(1213686459);
+  // loc(unknown)
+  Fp x205(1209164052);
+  // loc(unknown)
+  Fp x206(1206940496);
+  // loc(unknown)
+  Fp x207(1201063290);
+  // loc(unknown)
+  Fp x208(117294666);
+  // loc(unknown)
+  Fp x209(1170029417);
+  // loc(unknown)
+  Fp x210(1150912935);
+  // loc(unknown)
+  Fp x211(1124078057);
+  // loc(unknown)
+  Fp x212(1111203133);
+  // loc(unknown)
+  Fp x213(1090783436);
+  // loc(unknown)
+  Fp x214(1006235079);
+  // loc(unknown)
+  Fp x215(1003792297);
+  // loc(unknown)
+  Fp x216(831813382);
+  // loc(unknown)
+  Fp x217(1421525369);
+  // loc(unknown)
+  Fp x218(1751797115);
+  // loc(unknown)
+  Fp x219(1964135730);
+  // loc(unknown)
+  Fp x220(525458520);
+  // loc(unknown)
+  Fp x221(638242172);
+  // loc(unknown)
+  Fp x222(1307439985);
+  // loc(unknown)
+  Fp x223(343354132);
+  // loc(unknown)
+  Fp x224(1389166148);
+  // loc(unknown)
+  Fp x225(1660766320);
+  // loc(unknown)
+  Fp x226(1464793095);
+  // loc(unknown)
+  Fp x227(1180307149);
+  // loc(unknown)
+  Fp x228(1930780904);
+  // loc(unknown)
+  Fp x229(1066694495);
+  // loc(unknown)
+  Fp x230(1773108264);
+  // loc(unknown)
+  Fp x231(1004040026);
+  // loc(unknown)
+  Fp x232(815798990);
+  // loc(unknown)
+  Fp x233(454905424);
+  // loc(unknown)
+  Fp x234(118043943);
+  // loc(unknown)
+  Fp x235(157582794);
+  // loc(unknown)
+  Fp x236(246143118);
+  // loc(unknown)
+  Fp x237(314968988);
+  // loc(unknown)
+  Fp x238(127253399);
+  // loc(unknown)
+  Fp x239(262278199);
+  // loc(unknown)
+  Fp x240(943718400);
+  // loc(unknown)
+  Fp x241(268435454);
+  // loc(unknown)
+  Fp x242(1761607679);
+  // loc(unknown)
+  Fp x243(1073741824);
+  // loc(unknown)
+  Fp x244(536870912);
+  // loc(unknown)
+  Fp x245(1509949437);
+  // loc(unknown)
+  Fp x246(268435456);
+  // loc(unknown)
+  Fp x247(1006632953);
+  // loc(unknown)
+  Fp x248(2013265906);
+  // loc(unknown)
+  Fp x249(134217728);
+  // loc(unknown)
+  Fp x250(67108864);
+  // loc(unknown)
+  Fp x251(2013265891);
+  // loc(unknown)
+  Fp x252(33554432);
+  // loc(unknown)
+  Fp x253(2013265861);
+  // loc(unknown)
+  Fp x254(2013265801);
+  // loc(unknown)
+  Fp x255(16777216);
+  // loc(unknown)
+  Fp x256(8388608);
+  // loc(unknown)
+  Fp x257(2013265681);
+  // loc(unknown)
+  Fp x258(4194304);
+  // loc(unknown)
+  Fp x259(2013265441);
+  // loc(unknown)
+  Fp x260(2097152);
+  // loc(unknown)
+  Fp x261(2013264961);
+  // loc(unknown)
+  Fp x262(2013264001);
+  // loc(unknown)
+  Fp x263(1048576);
+  // loc(unknown)
+  Fp x264(524288);
+  // loc(unknown)
+  Fp x265(2013262081);
+  // loc(unknown)
+  Fp x266(262144);
+  // loc(unknown)
+  Fp x267(2013258241);
+  // loc(unknown)
+  Fp x268(2013250561);
+  // loc(unknown)
+  Fp x269(131072);
+  // loc(unknown)
+  Fp x270(2013235201);
+  // loc(unknown)
+  Fp x271(32768);
+  // loc(unknown)
+  Fp x272(2013204481);
+  // loc(unknown)
+  Fp x273(2013143041);
+  // loc(unknown)
+  Fp x274(16384);
+  // loc(unknown)
+  Fp x275(8192);
+  // loc(unknown)
+  Fp x276(2013020161);
+  // loc(unknown)
+  Fp x277(4096);
+  // loc(unknown)
+  Fp x278(2012774401);
+  // loc(unknown)
+  Fp x279(2048);
+  // loc(unknown)
+  Fp x280(2012282881);
+  // loc(unknown)
+  Fp x281(2011299841);
+  // loc(unknown)
+  Fp x282(1024);
+  // loc(unknown)
+  Fp x283(512);
+  // loc(unknown)
+  Fp x284(2009333761);
+  // loc(unknown)
+  Fp x285(256);
+  // loc(unknown)
+  Fp x286(2005401601);
+  // loc(unknown)
+  Fp x287(1997537281);
+  // loc(unknown)
+  Fp x288(128);
+  // loc(unknown)
+  Fp x289(64);
+  // loc(unknown)
+  Fp x290(1981808641);
+  // loc(unknown)
+  Fp x291(32);
+  // loc(unknown)
+  Fp x292(1950351361);
+  // loc(unknown)
+  Fp x293(1887436801);
+  // loc(unknown)
+  Fp x294(16);
+  // loc(unknown)
+  Fp x295(1761607681);
+  // loc(unknown)
+  Fp x296(1509949441);
+  // loc(unknown)
+  Fp x297(1006632961);
+  // loc(unknown)
+  Fp x298(65536);
+  // loc(unknown)
+  Fp x299(2013265910);
+  // loc(unknown)
+  Fp x300(11);
+  // loc(unknown)
+  Fp x301(10);
+  // loc(unknown)
+  Fp x302(9);
+  // loc(unknown)
+  Fp x303(8);
+  // loc(unknown)
+  Fp x304(7);
+  // loc(unknown)
+  Fp x305(6);
+  // loc(unknown)
+  Fp x306(5);
+  // loc(unknown)
+  Fp x307(4);
+  // loc(unknown)
+  Fp x308(3);
+  // loc(unknown)
+  Fp x309(2);
+  // loc(unknown)
+  Fp x310(1);
+  // loc(unknown)
+  Fp x311(0);
+
+    auto x314 = arg0[0 * steps + ((cycle - 0) & mask)];
+    assert(x314 != Fp::invalid());
+    // loc("zirgen/circuit/recursion/micro.cpp":163:34)
     auto x662 = x314 + x310;
     // loc("top(recursion::Top)/code(recursion::Code)/inst(Mux)/micro_ops(recursion::MicroInsts)/inst[1](recursion::MicroInst)/opcode(Reg)"("./zirgen/compiler/edsl/component.h":164:27))
     auto x663 = arg0[12 * steps + ((cycle - 0) & mask)];
@@ -5187,6 +6745,641 @@ __device__ void step_exec(
       }
     }
     // loc("zirgen/circuit/recursion/micro.cpp":163:34)
+}
+
+__device__ __noinline__ void step_exec_micro_inst2(
+    void* ctx, uint32_t steps, uint32_t cycle, uint32_t mask,
+    Fp* arg0, Fp* arg1, Fp* arg2) {
+  Fp extern_args[96];
+  Fp extern_outs[32];
+  // loc(unknown)
+  Fp x0(192);
+  // loc(unknown)
+  Fp x1(48);
+  // loc(unknown)
+  Fp x2(12);
+  // loc(unknown)
+  Fp x3(1040977421);
+  // loc(unknown)
+  Fp x4(1792450386);
+  // loc(unknown)
+  Fp x5(1470845646);
+  // loc(unknown)
+  Fp x6(1363837384);
+  // loc(unknown)
+  Fp x7(1878280202);
+  // loc(unknown)
+  Fp x8(434078361);
+  // loc(unknown)
+  Fp x9(1946596189);
+  // loc(unknown)
+  Fp x10(875839332);
+  // loc(unknown)
+  Fp x11(463976218);
+  // loc(unknown)
+  Fp x12(976057819);
+  // loc(unknown)
+  Fp x13(48375137);
+  // loc(unknown)
+  Fp x14(1549779579);
+  // loc(unknown)
+  Fp x15(1679178250);
+  // loc(unknown)
+  Fp x16(530151394);
+  // loc(unknown)
+  Fp x17(1629316321);
+  // loc(unknown)
+  Fp x18(1854174607);
+  // loc(unknown)
+  Fp x19(720724951);
+  // loc(unknown)
+  Fp x20(14387587);
+  // loc(unknown)
+  Fp x21(1883820770);
+  // loc(unknown)
+  Fp x22(205609311);
+  // loc(unknown)
+  Fp x23(1136469704);
+  // loc(unknown)
+  Fp x24(1439947916);
+  // loc(unknown)
+  Fp x25(723038058);
+  // loc(unknown)
+  Fp x26(53041581);
+  // loc(unknown)
+  Fp x27(1810596765);
+  // loc(unknown)
+  Fp x28(1210751726);
+  // loc(unknown)
+  Fp x29(1327682690);
+  // loc(unknown)
+  Fp x30(1886977120);
+  // loc(unknown)
+  Fp x31(1551596046);
+  // loc(unknown)
+  Fp x32(1186174623);
+  // loc(unknown)
+  Fp x33(1199068823);
+  // loc(unknown)
+  Fp x34(1240419708);
+  // loc(unknown)
+  Fp x35(1708681573);
+  // loc(unknown)
+  Fp x36(308575117);
+  // loc(unknown)
+  Fp x37(1111544260);
+  // loc(unknown)
+  Fp x38(822033215);
+  // loc(unknown)
+  Fp x39(1891545577);
+  // loc(unknown)
+  Fp x40(440300254);
+  // loc(unknown)
+  Fp x41(1726563304);
+  // loc(unknown)
+  Fp x42(1365519753);
+  // loc(unknown)
+  Fp x43(924863639);
+  // loc(unknown)
+  Fp x44(1540960371);
+  // loc(unknown)
+  Fp x45(1052077299);
+  // loc(unknown)
+  Fp x46(1930103076);
+  // loc(unknown)
+  Fp x47(98371040);
+  // loc(unknown)
+  Fp x48(918610824);
+  // loc(unknown)
+  Fp x49(801504236);
+  // loc(unknown)
+  Fp x50(65998480);
+  // loc(unknown)
+  Fp x51(658182609);
+  // loc(unknown)
+  Fp x52(606789471);
+  // loc(unknown)
+  Fp x53(51866717);
+  // loc(unknown)
+  Fp x54(375892129);
+  // loc(unknown)
+  Fp x55(20525701);
+  // loc(unknown)
+  Fp x56(1997365680);
+  // loc(unknown)
+  Fp x57(1974912880);
+  // loc(unknown)
+  Fp x58(1942928017);
+  // loc(unknown)
+  Fp x59(1928969209);
+  // loc(unknown)
+  Fp x60(1867716110);
+  // loc(unknown)
+  Fp x61(1792686146);
+  // loc(unknown)
+  Fp x62(1558116381);
+  // loc(unknown)
+  Fp x63(1461037801);
+  // loc(unknown)
+  Fp x64(1389833583);
+  // loc(unknown)
+  Fp x65(13683276);
+  // loc(unknown)
+  Fp x66(1188752902);
+  // loc(unknown)
+  Fp x67(111593398);
+  // loc(unknown)
+  Fp x68(1083257840);
+  // loc(unknown)
+  Fp x69(106789798);
+  // loc(unknown)
+  Fp x70(1001081699);
+  // loc(unknown)
+  Fp x71(497520322);
+  // loc(unknown)
+  Fp x72(946500736);
+  // loc(unknown)
+  Fp x73(890243564);
+  // loc(unknown)
+  Fp x74(862495875);
+  // loc(unknown)
+  Fp x75(855276054);
+  // loc(unknown)
+  Fp x76(76770019);
+  // loc(unknown)
+  Fp x77(760115692);
+  // loc(unknown)
+  Fp x78(623051854);
+  // loc(unknown)
+  Fp x79(59510015);
+  // loc(unknown)
+  Fp x80(552696906);
+  // loc(unknown)
+  Fp x81(538103555);
+  // loc(unknown)
+  Fp x82(457372011);
+  // loc(unknown)
+  Fp x83(447555988);
+  // loc(unknown)
+  Fp x84(27129487);
+  // loc(unknown)
+  Fp x85(217046702);
+  // loc(unknown)
+  Fp x86(1950429111);
+  // loc(unknown)
+  Fp x87(192082241);
+  // loc(unknown)
+  Fp x88(1910423126);
+  // loc(unknown)
+  Fp x89(1908416316);
+  // loc(unknown)
+  Fp x90(1891637550);
+  // loc(unknown)
+  Fp x91(1841795381);
+  // loc(unknown)
+  Fp x92(1827572010);
+  // loc(unknown)
+  Fp x93(1748789933);
+  // loc(unknown)
+  Fp x94(1664590951);
+  // loc(unknown)
+  Fp x95(1663353317);
+  // loc(unknown)
+  Fp x96(162510541);
+  // loc(unknown)
+  Fp x97(1622328571);
+  // loc(unknown)
+  Fp x98(1608853840);
+  // loc(unknown)
+  Fp x99(158646617);
+  // loc(unknown)
+  Fp x100(1584033957);
+  // loc(unknown)
+  Fp x101(1567618575);
+  // loc(unknown)
+  Fp x102(1549062383);
+  // loc(unknown)
+  Fp x103(1507649755);
+  // loc(unknown)
+  Fp x104(1478577620);
+  // loc(unknown)
+  Fp x105(1463323727);
+  // loc(unknown)
+  Fp x106(1424297384);
+  // loc(unknown)
+  Fp x107(142102402);
+  // loc(unknown)
+  Fp x108(1402624179);
+  // loc(unknown)
+  Fp x109(1293938517);
+  // loc(unknown)
+  Fp x110(1257820264);
+  // loc(unknown)
+  Fp x111(1215259350);
+  // loc(unknown)
+  Fp x112(1198261138);
+  // loc(unknown)
+  Fp x113(1150410028);
+  // loc(unknown)
+  Fp x114(1147522062);
+  // loc(unknown)
+  Fp x115(1099252725);
+  // loc(unknown)
+  Fp x116(1080533265);
+  // loc(unknown)
+  Fp x117(1079030649);
+  // loc(unknown)
+  Fp x118(1065075039);
+  // loc(unknown)
+  Fp x119(1042892522);
+  // loc(unknown)
+  Fp x120(993455846);
+  // loc(unknown)
+  Fp x121(989618631);
+  // loc(unknown)
+  Fp x122(989176635);
+  // loc(unknown)
+  Fp x123(942439428);
+  // loc(unknown)
+  Fp x124(930036496);
+  // loc(unknown)
+  Fp x125(925018226);
+  // loc(unknown)
+  Fp x126(897025192);
+  // loc(unknown)
+  Fp x127(825405577);
+  // loc(unknown)
+  Fp x128(813674331);
+  // loc(unknown)
+  Fp x129(809508074);
+  // loc(unknown)
+  Fp x130(790726260);
+  // loc(unknown)
+  Fp x131(78845751);
+  // loc(unknown)
+  Fp x132(781141772);
+  // loc(unknown)
+  Fp x133(755691969);
+  // loc(unknown)
+  Fp x134(738091882);
+  // loc(unknown)
+  Fp x135(716894289);
+  // loc(unknown)
+  Fp x136(714957516);
+  // loc(unknown)
+  Fp x137(708123747);
+  // loc(unknown)
+  Fp x138(695835963);
+  // loc(unknown)
+  Fp x139(686842369);
+  // loc(unknown)
+  Fp x140(641665156);
+  // loc(unknown)
+  Fp x141(622609176);
+  // loc(unknown)
+  Fp x142(608401422);
+  // loc(unknown)
+  Fp x143(588764636);
+  // loc(unknown)
+  Fp x144(540703332);
+  // loc(unknown)
+  Fp x145(53007114);
+  // loc(unknown)
+  Fp x146(51256176);
+  // loc(unknown)
+  Fp x147(459826664);
+  // loc(unknown)
+  Fp x148(427731030);
+  // loc(unknown)
+  Fp x149(395622276);
+  // loc(unknown)
+  Fp x150(390340387);
+  // loc(unknown)
+  Fp x151(342857858);
+  // loc(unknown)
+  Fp x152(306391314);
+  // loc(unknown)
+  Fp x153(273790406);
+  // loc(unknown)
+  Fp x154(241306552);
+  // loc(unknown)
+  Fp x155(238616145);
+  // loc(unknown)
+  Fp x156(228520958);
+  // loc(unknown)
+  Fp x157(204228775);
+  // loc(unknown)
+  Fp x158(202271745);
+  // loc(unknown)
+  Fp x159(1997503974);
+  // loc(unknown)
+  Fp x160(1989924532);
+  // loc(unknown)
+  Fp x161(1917861751);
+  // loc(unknown)
+  Fp x162(1917549072);
+  // loc(unknown)
+  Fp x163(1896271507);
+  // loc(unknown)
+  Fp x164(1889898);
+  // loc(unknown)
+  Fp x165(1889603648);
+  // loc(unknown)
+  Fp x166(1845603984);
+  // loc(unknown)
+  Fp x167(1832911930);
+  // loc(unknown)
+  Fp x168(1781980094);
+  // loc(unknown)
+  Fp x169(1740472809);
+  // loc(unknown)
+  Fp x170(1737016378);
+  // loc(unknown)
+  Fp x171(172614232);
+  // loc(unknown)
+  Fp x172(1718628547);
+  // loc(unknown)
+  Fp x173(1715719711);
+  // loc(unknown)
+  Fp x174(1687379185);
+  // loc(unknown)
+  Fp x175(1672219447);
+  // loc(unknown)
+  Fp x176(1649953458);
+  // loc(unknown)
+  Fp x177(1647670797);
+  // loc(unknown)
+  Fp x178(1647665372);
+  // loc(unknown)
+  Fp x179(162506101);
+  // loc(unknown)
+  Fp x180(1608891156);
+  // loc(unknown)
+  Fp x181(1587822577);
+  // loc(unknown)
+  Fp x182(1545325389);
+  // loc(unknown)
+  Fp x183(1518763784);
+  // loc(unknown)
+  Fp x184(1507936940);
+  // loc(unknown)
+  Fp x185(150307788);
+  // loc(unknown)
+  Fp x186(1454563174);
+  // loc(unknown)
+  Fp x187(140621810);
+  // loc(unknown)
+  Fp x188(1401020792);
+  // loc(unknown)
+  Fp x189(1393671120);
+  // loc(unknown)
+  Fp x190(1380248020);
+  // loc(unknown)
+  Fp x191(1339793538);
+  // loc(unknown)
+  Fp x192(1338899225);
+  // loc(unknown)
+  Fp x193(1333667262);
+  // loc(unknown)
+  Fp x194(1303271640);
+  // loc(unknown)
+  Fp x195(1296144415);
+  // loc(unknown)
+  Fp x196(1291790245);
+  // loc(unknown)
+  Fp x197(1290028279);
+  // loc(unknown)
+  Fp x198(128479034);
+  // loc(unknown)
+  Fp x199(1282239129);
+  // loc(unknown)
+  Fp x200(1269493554);
+  // loc(unknown)
+  Fp x201(1262312258);
+  // loc(unknown)
+  Fp x202(1239734761);
+  // loc(unknown)
+  Fp x203(1221257987);
+  // loc(unknown)
+  Fp x204(1213686459);
+  // loc(unknown)
+  Fp x205(1209164052);
+  // loc(unknown)
+  Fp x206(1206940496);
+  // loc(unknown)
+  Fp x207(1201063290);
+  // loc(unknown)
+  Fp x208(117294666);
+  // loc(unknown)
+  Fp x209(1170029417);
+  // loc(unknown)
+  Fp x210(1150912935);
+  // loc(unknown)
+  Fp x211(1124078057);
+  // loc(unknown)
+  Fp x212(1111203133);
+  // loc(unknown)
+  Fp x213(1090783436);
+  // loc(unknown)
+  Fp x214(1006235079);
+  // loc(unknown)
+  Fp x215(1003792297);
+  // loc(unknown)
+  Fp x216(831813382);
+  // loc(unknown)
+  Fp x217(1421525369);
+  // loc(unknown)
+  Fp x218(1751797115);
+  // loc(unknown)
+  Fp x219(1964135730);
+  // loc(unknown)
+  Fp x220(525458520);
+  // loc(unknown)
+  Fp x221(638242172);
+  // loc(unknown)
+  Fp x222(1307439985);
+  // loc(unknown)
+  Fp x223(343354132);
+  // loc(unknown)
+  Fp x224(1389166148);
+  // loc(unknown)
+  Fp x225(1660766320);
+  // loc(unknown)
+  Fp x226(1464793095);
+  // loc(unknown)
+  Fp x227(1180307149);
+  // loc(unknown)
+  Fp x228(1930780904);
+  // loc(unknown)
+  Fp x229(1066694495);
+  // loc(unknown)
+  Fp x230(1773108264);
+  // loc(unknown)
+  Fp x231(1004040026);
+  // loc(unknown)
+  Fp x232(815798990);
+  // loc(unknown)
+  Fp x233(454905424);
+  // loc(unknown)
+  Fp x234(118043943);
+  // loc(unknown)
+  Fp x235(157582794);
+  // loc(unknown)
+  Fp x236(246143118);
+  // loc(unknown)
+  Fp x237(314968988);
+  // loc(unknown)
+  Fp x238(127253399);
+  // loc(unknown)
+  Fp x239(262278199);
+  // loc(unknown)
+  Fp x240(943718400);
+  // loc(unknown)
+  Fp x241(268435454);
+  // loc(unknown)
+  Fp x242(1761607679);
+  // loc(unknown)
+  Fp x243(1073741824);
+  // loc(unknown)
+  Fp x244(536870912);
+  // loc(unknown)
+  Fp x245(1509949437);
+  // loc(unknown)
+  Fp x246(268435456);
+  // loc(unknown)
+  Fp x247(1006632953);
+  // loc(unknown)
+  Fp x248(2013265906);
+  // loc(unknown)
+  Fp x249(134217728);
+  // loc(unknown)
+  Fp x250(67108864);
+  // loc(unknown)
+  Fp x251(2013265891);
+  // loc(unknown)
+  Fp x252(33554432);
+  // loc(unknown)
+  Fp x253(2013265861);
+  // loc(unknown)
+  Fp x254(2013265801);
+  // loc(unknown)
+  Fp x255(16777216);
+  // loc(unknown)
+  Fp x256(8388608);
+  // loc(unknown)
+  Fp x257(2013265681);
+  // loc(unknown)
+  Fp x258(4194304);
+  // loc(unknown)
+  Fp x259(2013265441);
+  // loc(unknown)
+  Fp x260(2097152);
+  // loc(unknown)
+  Fp x261(2013264961);
+  // loc(unknown)
+  Fp x262(2013264001);
+  // loc(unknown)
+  Fp x263(1048576);
+  // loc(unknown)
+  Fp x264(524288);
+  // loc(unknown)
+  Fp x265(2013262081);
+  // loc(unknown)
+  Fp x266(262144);
+  // loc(unknown)
+  Fp x267(2013258241);
+  // loc(unknown)
+  Fp x268(2013250561);
+  // loc(unknown)
+  Fp x269(131072);
+  // loc(unknown)
+  Fp x270(2013235201);
+  // loc(unknown)
+  Fp x271(32768);
+  // loc(unknown)
+  Fp x272(2013204481);
+  // loc(unknown)
+  Fp x273(2013143041);
+  // loc(unknown)
+  Fp x274(16384);
+  // loc(unknown)
+  Fp x275(8192);
+  // loc(unknown)
+  Fp x276(2013020161);
+  // loc(unknown)
+  Fp x277(4096);
+  // loc(unknown)
+  Fp x278(2012774401);
+  // loc(unknown)
+  Fp x279(2048);
+  // loc(unknown)
+  Fp x280(2012282881);
+  // loc(unknown)
+  Fp x281(2011299841);
+  // loc(unknown)
+  Fp x282(1024);
+  // loc(unknown)
+  Fp x283(512);
+  // loc(unknown)
+  Fp x284(2009333761);
+  // loc(unknown)
+  Fp x285(256);
+  // loc(unknown)
+  Fp x286(2005401601);
+  // loc(unknown)
+  Fp x287(1997537281);
+  // loc(unknown)
+  Fp x288(128);
+  // loc(unknown)
+  Fp x289(64);
+  // loc(unknown)
+  Fp x290(1981808641);
+  // loc(unknown)
+  Fp x291(32);
+  // loc(unknown)
+  Fp x292(1950351361);
+  // loc(unknown)
+  Fp x293(1887436801);
+  // loc(unknown)
+  Fp x294(16);
+  // loc(unknown)
+  Fp x295(1761607681);
+  // loc(unknown)
+  Fp x296(1509949441);
+  // loc(unknown)
+  Fp x297(1006632961);
+  // loc(unknown)
+  Fp x298(65536);
+  // loc(unknown)
+  Fp x299(2013265910);
+  // loc(unknown)
+  Fp x300(11);
+  // loc(unknown)
+  Fp x301(10);
+  // loc(unknown)
+  Fp x302(9);
+  // loc(unknown)
+  Fp x303(8);
+  // loc(unknown)
+  Fp x304(7);
+  // loc(unknown)
+  Fp x305(6);
+  // loc(unknown)
+  Fp x306(5);
+  // loc(unknown)
+  Fp x307(4);
+  // loc(unknown)
+  Fp x308(3);
+  // loc(unknown)
+  Fp x309(2);
+  // loc(unknown)
+  Fp x310(1);
+  // loc(unknown)
+  Fp x311(0);
+
+    auto x314 = arg0[0 * steps + ((cycle - 0) & mask)];
+    assert(x314 != Fp::invalid());
+    // loc("zirgen/circuit/recursion/micro.cpp":163:34)
     auto x1011 = x314 + x309;
     // loc("top(recursion::Top)/code(recursion::Code)/inst(Mux)/micro_ops(recursion::MicroInsts)/inst[2](recursion::MicroInst)/opcode(Reg)"("./zirgen/compiler/edsl/component.h":164:27))
     auto x1012 = arg0[16 * steps + ((cycle - 0) & mask)];
@@ -7454,24 +9647,2629 @@ __device__ void step_exec(
         extern_womWrite(ctx, cycle, "", extern_args, extern_outs);
       }
     }
-  }
-  // loc("top(recursion::Top)/code(recursion::Code)/select(OneHot)/macro_ops(Reg)"("./zirgen/components/mux.h":59:25))
-  auto x1360 = arg0[2 * steps + ((cycle - 0) & mask)];
-  assert(x1360 != Fp::invalid());
-  if (x1360 != 0) {
+}
+
+
+__device__ __noinline__ void step_exec_macro_ops(
+    void* ctx, uint32_t steps, uint32_t cycle, uint32_t mask,
+    Fp* arg0, Fp* arg1, Fp* arg2) {
+  Fp extern_args[96];
+  Fp extern_outs[32];
+  // loc(unknown)
+  Fp x0(192);
+  // loc(unknown)
+  Fp x1(48);
+  // loc(unknown)
+  Fp x2(12);
+  // loc(unknown)
+  Fp x3(1040977421);
+  // loc(unknown)
+  Fp x4(1792450386);
+  // loc(unknown)
+  Fp x5(1470845646);
+  // loc(unknown)
+  Fp x6(1363837384);
+  // loc(unknown)
+  Fp x7(1878280202);
+  // loc(unknown)
+  Fp x8(434078361);
+  // loc(unknown)
+  Fp x9(1946596189);
+  // loc(unknown)
+  Fp x10(875839332);
+  // loc(unknown)
+  Fp x11(463976218);
+  // loc(unknown)
+  Fp x12(976057819);
+  // loc(unknown)
+  Fp x13(48375137);
+  // loc(unknown)
+  Fp x14(1549779579);
+  // loc(unknown)
+  Fp x15(1679178250);
+  // loc(unknown)
+  Fp x16(530151394);
+  // loc(unknown)
+  Fp x17(1629316321);
+  // loc(unknown)
+  Fp x18(1854174607);
+  // loc(unknown)
+  Fp x19(720724951);
+  // loc(unknown)
+  Fp x20(14387587);
+  // loc(unknown)
+  Fp x21(1883820770);
+  // loc(unknown)
+  Fp x22(205609311);
+  // loc(unknown)
+  Fp x23(1136469704);
+  // loc(unknown)
+  Fp x24(1439947916);
+  // loc(unknown)
+  Fp x25(723038058);
+  // loc(unknown)
+  Fp x26(53041581);
+  // loc(unknown)
+  Fp x27(1810596765);
+  // loc(unknown)
+  Fp x28(1210751726);
+  // loc(unknown)
+  Fp x29(1327682690);
+  // loc(unknown)
+  Fp x30(1886977120);
+  // loc(unknown)
+  Fp x31(1551596046);
+  // loc(unknown)
+  Fp x32(1186174623);
+  // loc(unknown)
+  Fp x33(1199068823);
+  // loc(unknown)
+  Fp x34(1240419708);
+  // loc(unknown)
+  Fp x35(1708681573);
+  // loc(unknown)
+  Fp x36(308575117);
+  // loc(unknown)
+  Fp x37(1111544260);
+  // loc(unknown)
+  Fp x38(822033215);
+  // loc(unknown)
+  Fp x39(1891545577);
+  // loc(unknown)
+  Fp x40(440300254);
+  // loc(unknown)
+  Fp x41(1726563304);
+  // loc(unknown)
+  Fp x42(1365519753);
+  // loc(unknown)
+  Fp x43(924863639);
+  // loc(unknown)
+  Fp x44(1540960371);
+  // loc(unknown)
+  Fp x45(1052077299);
+  // loc(unknown)
+  Fp x46(1930103076);
+  // loc(unknown)
+  Fp x47(98371040);
+  // loc(unknown)
+  Fp x48(918610824);
+  // loc(unknown)
+  Fp x49(801504236);
+  // loc(unknown)
+  Fp x50(65998480);
+  // loc(unknown)
+  Fp x51(658182609);
+  // loc(unknown)
+  Fp x52(606789471);
+  // loc(unknown)
+  Fp x53(51866717);
+  // loc(unknown)
+  Fp x54(375892129);
+  // loc(unknown)
+  Fp x55(20525701);
+  // loc(unknown)
+  Fp x56(1997365680);
+  // loc(unknown)
+  Fp x57(1974912880);
+  // loc(unknown)
+  Fp x58(1942928017);
+  // loc(unknown)
+  Fp x59(1928969209);
+  // loc(unknown)
+  Fp x60(1867716110);
+  // loc(unknown)
+  Fp x61(1792686146);
+  // loc(unknown)
+  Fp x62(1558116381);
+  // loc(unknown)
+  Fp x63(1461037801);
+  // loc(unknown)
+  Fp x64(1389833583);
+  // loc(unknown)
+  Fp x65(13683276);
+  // loc(unknown)
+  Fp x66(1188752902);
+  // loc(unknown)
+  Fp x67(111593398);
+  // loc(unknown)
+  Fp x68(1083257840);
+  // loc(unknown)
+  Fp x69(106789798);
+  // loc(unknown)
+  Fp x70(1001081699);
+  // loc(unknown)
+  Fp x71(497520322);
+  // loc(unknown)
+  Fp x72(946500736);
+  // loc(unknown)
+  Fp x73(890243564);
+  // loc(unknown)
+  Fp x74(862495875);
+  // loc(unknown)
+  Fp x75(855276054);
+  // loc(unknown)
+  Fp x76(76770019);
+  // loc(unknown)
+  Fp x77(760115692);
+  // loc(unknown)
+  Fp x78(623051854);
+  // loc(unknown)
+  Fp x79(59510015);
+  // loc(unknown)
+  Fp x80(552696906);
+  // loc(unknown)
+  Fp x81(538103555);
+  // loc(unknown)
+  Fp x82(457372011);
+  // loc(unknown)
+  Fp x83(447555988);
+  // loc(unknown)
+  Fp x84(27129487);
+  // loc(unknown)
+  Fp x85(217046702);
+  // loc(unknown)
+  Fp x86(1950429111);
+  // loc(unknown)
+  Fp x87(192082241);
+  // loc(unknown)
+  Fp x88(1910423126);
+  // loc(unknown)
+  Fp x89(1908416316);
+  // loc(unknown)
+  Fp x90(1891637550);
+  // loc(unknown)
+  Fp x91(1841795381);
+  // loc(unknown)
+  Fp x92(1827572010);
+  // loc(unknown)
+  Fp x93(1748789933);
+  // loc(unknown)
+  Fp x94(1664590951);
+  // loc(unknown)
+  Fp x95(1663353317);
+  // loc(unknown)
+  Fp x96(162510541);
+  // loc(unknown)
+  Fp x97(1622328571);
+  // loc(unknown)
+  Fp x98(1608853840);
+  // loc(unknown)
+  Fp x99(158646617);
+  // loc(unknown)
+  Fp x100(1584033957);
+  // loc(unknown)
+  Fp x101(1567618575);
+  // loc(unknown)
+  Fp x102(1549062383);
+  // loc(unknown)
+  Fp x103(1507649755);
+  // loc(unknown)
+  Fp x104(1478577620);
+  // loc(unknown)
+  Fp x105(1463323727);
+  // loc(unknown)
+  Fp x106(1424297384);
+  // loc(unknown)
+  Fp x107(142102402);
+  // loc(unknown)
+  Fp x108(1402624179);
+  // loc(unknown)
+  Fp x109(1293938517);
+  // loc(unknown)
+  Fp x110(1257820264);
+  // loc(unknown)
+  Fp x111(1215259350);
+  // loc(unknown)
+  Fp x112(1198261138);
+  // loc(unknown)
+  Fp x113(1150410028);
+  // loc(unknown)
+  Fp x114(1147522062);
+  // loc(unknown)
+  Fp x115(1099252725);
+  // loc(unknown)
+  Fp x116(1080533265);
+  // loc(unknown)
+  Fp x117(1079030649);
+  // loc(unknown)
+  Fp x118(1065075039);
+  // loc(unknown)
+  Fp x119(1042892522);
+  // loc(unknown)
+  Fp x120(993455846);
+  // loc(unknown)
+  Fp x121(989618631);
+  // loc(unknown)
+  Fp x122(989176635);
+  // loc(unknown)
+  Fp x123(942439428);
+  // loc(unknown)
+  Fp x124(930036496);
+  // loc(unknown)
+  Fp x125(925018226);
+  // loc(unknown)
+  Fp x126(897025192);
+  // loc(unknown)
+  Fp x127(825405577);
+  // loc(unknown)
+  Fp x128(813674331);
+  // loc(unknown)
+  Fp x129(809508074);
+  // loc(unknown)
+  Fp x130(790726260);
+  // loc(unknown)
+  Fp x131(78845751);
+  // loc(unknown)
+  Fp x132(781141772);
+  // loc(unknown)
+  Fp x133(755691969);
+  // loc(unknown)
+  Fp x134(738091882);
+  // loc(unknown)
+  Fp x135(716894289);
+  // loc(unknown)
+  Fp x136(714957516);
+  // loc(unknown)
+  Fp x137(708123747);
+  // loc(unknown)
+  Fp x138(695835963);
+  // loc(unknown)
+  Fp x139(686842369);
+  // loc(unknown)
+  Fp x140(641665156);
+  // loc(unknown)
+  Fp x141(622609176);
+  // loc(unknown)
+  Fp x142(608401422);
+  // loc(unknown)
+  Fp x143(588764636);
+  // loc(unknown)
+  Fp x144(540703332);
+  // loc(unknown)
+  Fp x145(53007114);
+  // loc(unknown)
+  Fp x146(51256176);
+  // loc(unknown)
+  Fp x147(459826664);
+  // loc(unknown)
+  Fp x148(427731030);
+  // loc(unknown)
+  Fp x149(395622276);
+  // loc(unknown)
+  Fp x150(390340387);
+  // loc(unknown)
+  Fp x151(342857858);
+  // loc(unknown)
+  Fp x152(306391314);
+  // loc(unknown)
+  Fp x153(273790406);
+  // loc(unknown)
+  Fp x154(241306552);
+  // loc(unknown)
+  Fp x155(238616145);
+  // loc(unknown)
+  Fp x156(228520958);
+  // loc(unknown)
+  Fp x157(204228775);
+  // loc(unknown)
+  Fp x158(202271745);
+  // loc(unknown)
+  Fp x159(1997503974);
+  // loc(unknown)
+  Fp x160(1989924532);
+  // loc(unknown)
+  Fp x161(1917861751);
+  // loc(unknown)
+  Fp x162(1917549072);
+  // loc(unknown)
+  Fp x163(1896271507);
+  // loc(unknown)
+  Fp x164(1889898);
+  // loc(unknown)
+  Fp x165(1889603648);
+  // loc(unknown)
+  Fp x166(1845603984);
+  // loc(unknown)
+  Fp x167(1832911930);
+  // loc(unknown)
+  Fp x168(1781980094);
+  // loc(unknown)
+  Fp x169(1740472809);
+  // loc(unknown)
+  Fp x170(1737016378);
+  // loc(unknown)
+  Fp x171(172614232);
+  // loc(unknown)
+  Fp x172(1718628547);
+  // loc(unknown)
+  Fp x173(1715719711);
+  // loc(unknown)
+  Fp x174(1687379185);
+  // loc(unknown)
+  Fp x175(1672219447);
+  // loc(unknown)
+  Fp x176(1649953458);
+  // loc(unknown)
+  Fp x177(1647670797);
+  // loc(unknown)
+  Fp x178(1647665372);
+  // loc(unknown)
+  Fp x179(162506101);
+  // loc(unknown)
+  Fp x180(1608891156);
+  // loc(unknown)
+  Fp x181(1587822577);
+  // loc(unknown)
+  Fp x182(1545325389);
+  // loc(unknown)
+  Fp x183(1518763784);
+  // loc(unknown)
+  Fp x184(1507936940);
+  // loc(unknown)
+  Fp x185(150307788);
+  // loc(unknown)
+  Fp x186(1454563174);
+  // loc(unknown)
+  Fp x187(140621810);
+  // loc(unknown)
+  Fp x188(1401020792);
+  // loc(unknown)
+  Fp x189(1393671120);
+  // loc(unknown)
+  Fp x190(1380248020);
+  // loc(unknown)
+  Fp x191(1339793538);
+  // loc(unknown)
+  Fp x192(1338899225);
+  // loc(unknown)
+  Fp x193(1333667262);
+  // loc(unknown)
+  Fp x194(1303271640);
+  // loc(unknown)
+  Fp x195(1296144415);
+  // loc(unknown)
+  Fp x196(1291790245);
+  // loc(unknown)
+  Fp x197(1290028279);
+  // loc(unknown)
+  Fp x198(128479034);
+  // loc(unknown)
+  Fp x199(1282239129);
+  // loc(unknown)
+  Fp x200(1269493554);
+  // loc(unknown)
+  Fp x201(1262312258);
+  // loc(unknown)
+  Fp x202(1239734761);
+  // loc(unknown)
+  Fp x203(1221257987);
+  // loc(unknown)
+  Fp x204(1213686459);
+  // loc(unknown)
+  Fp x205(1209164052);
+  // loc(unknown)
+  Fp x206(1206940496);
+  // loc(unknown)
+  Fp x207(1201063290);
+  // loc(unknown)
+  Fp x208(117294666);
+  // loc(unknown)
+  Fp x209(1170029417);
+  // loc(unknown)
+  Fp x210(1150912935);
+  // loc(unknown)
+  Fp x211(1124078057);
+  // loc(unknown)
+  Fp x212(1111203133);
+  // loc(unknown)
+  Fp x213(1090783436);
+  // loc(unknown)
+  Fp x214(1006235079);
+  // loc(unknown)
+  Fp x215(1003792297);
+  // loc(unknown)
+  Fp x216(831813382);
+  // loc(unknown)
+  Fp x217(1421525369);
+  // loc(unknown)
+  Fp x218(1751797115);
+  // loc(unknown)
+  Fp x219(1964135730);
+  // loc(unknown)
+  Fp x220(525458520);
+  // loc(unknown)
+  Fp x221(638242172);
+  // loc(unknown)
+  Fp x222(1307439985);
+  // loc(unknown)
+  Fp x223(343354132);
+  // loc(unknown)
+  Fp x224(1389166148);
+  // loc(unknown)
+  Fp x225(1660766320);
+  // loc(unknown)
+  Fp x226(1464793095);
+  // loc(unknown)
+  Fp x227(1180307149);
+  // loc(unknown)
+  Fp x228(1930780904);
+  // loc(unknown)
+  Fp x229(1066694495);
+  // loc(unknown)
+  Fp x230(1773108264);
+  // loc(unknown)
+  Fp x231(1004040026);
+  // loc(unknown)
+  Fp x232(815798990);
+  // loc(unknown)
+  Fp x233(454905424);
+  // loc(unknown)
+  Fp x234(118043943);
+  // loc(unknown)
+  Fp x235(157582794);
+  // loc(unknown)
+  Fp x236(246143118);
+  // loc(unknown)
+  Fp x237(314968988);
+  // loc(unknown)
+  Fp x238(127253399);
+  // loc(unknown)
+  Fp x239(262278199);
+  // loc(unknown)
+  Fp x240(943718400);
+  // loc(unknown)
+  Fp x241(268435454);
+  // loc(unknown)
+  Fp x242(1761607679);
+  // loc(unknown)
+  Fp x243(1073741824);
+  // loc(unknown)
+  Fp x244(536870912);
+  // loc(unknown)
+  Fp x245(1509949437);
+  // loc(unknown)
+  Fp x246(268435456);
+  // loc(unknown)
+  Fp x247(1006632953);
+  // loc(unknown)
+  Fp x248(2013265906);
+  // loc(unknown)
+  Fp x249(134217728);
+  // loc(unknown)
+  Fp x250(67108864);
+  // loc(unknown)
+  Fp x251(2013265891);
+  // loc(unknown)
+  Fp x252(33554432);
+  // loc(unknown)
+  Fp x253(2013265861);
+  // loc(unknown)
+  Fp x254(2013265801);
+  // loc(unknown)
+  Fp x255(16777216);
+  // loc(unknown)
+  Fp x256(8388608);
+  // loc(unknown)
+  Fp x257(2013265681);
+  // loc(unknown)
+  Fp x258(4194304);
+  // loc(unknown)
+  Fp x259(2013265441);
+  // loc(unknown)
+  Fp x260(2097152);
+  // loc(unknown)
+  Fp x261(2013264961);
+  // loc(unknown)
+  Fp x262(2013264001);
+  // loc(unknown)
+  Fp x263(1048576);
+  // loc(unknown)
+  Fp x264(524288);
+  // loc(unknown)
+  Fp x265(2013262081);
+  // loc(unknown)
+  Fp x266(262144);
+  // loc(unknown)
+  Fp x267(2013258241);
+  // loc(unknown)
+  Fp x268(2013250561);
+  // loc(unknown)
+  Fp x269(131072);
+  // loc(unknown)
+  Fp x270(2013235201);
+  // loc(unknown)
+  Fp x271(32768);
+  // loc(unknown)
+  Fp x272(2013204481);
+  // loc(unknown)
+  Fp x273(2013143041);
+  // loc(unknown)
+  Fp x274(16384);
+  // loc(unknown)
+  Fp x275(8192);
+  // loc(unknown)
+  Fp x276(2013020161);
+  // loc(unknown)
+  Fp x277(4096);
+  // loc(unknown)
+  Fp x278(2012774401);
+  // loc(unknown)
+  Fp x279(2048);
+  // loc(unknown)
+  Fp x280(2012282881);
+  // loc(unknown)
+  Fp x281(2011299841);
+  // loc(unknown)
+  Fp x282(1024);
+  // loc(unknown)
+  Fp x283(512);
+  // loc(unknown)
+  Fp x284(2009333761);
+  // loc(unknown)
+  Fp x285(256);
+  // loc(unknown)
+  Fp x286(2005401601);
+  // loc(unknown)
+  Fp x287(1997537281);
+  // loc(unknown)
+  Fp x288(128);
+  // loc(unknown)
+  Fp x289(64);
+  // loc(unknown)
+  Fp x290(1981808641);
+  // loc(unknown)
+  Fp x291(32);
+  // loc(unknown)
+  Fp x292(1950351361);
+  // loc(unknown)
+  Fp x293(1887436801);
+  // loc(unknown)
+  Fp x294(16);
+  // loc(unknown)
+  Fp x295(1761607681);
+  // loc(unknown)
+  Fp x296(1509949441);
+  // loc(unknown)
+  Fp x297(1006632961);
+  // loc(unknown)
+  Fp x298(65536);
+  // loc(unknown)
+  Fp x299(2013265910);
+  // loc(unknown)
+  Fp x300(11);
+  // loc(unknown)
+  Fp x301(10);
+  // loc(unknown)
+  Fp x302(9);
+  // loc(unknown)
+  Fp x303(8);
+  // loc(unknown)
+  Fp x304(7);
+  // loc(unknown)
+  Fp x305(6);
+  // loc(unknown)
+  Fp x306(5);
+  // loc(unknown)
+  Fp x307(4);
+  // loc(unknown)
+  Fp x308(3);
+  // loc(unknown)
+  Fp x309(2);
+  // loc(unknown)
+  Fp x310(1);
+  // loc(unknown)
+  Fp x311(0);
+
+
     // loc("top(recursion::Top)/code(recursion::Code)/write_addr(Reg)"("zirgen/circuit/recursion/top.cpp":33:49))
     auto x1361 = arg0[0 * steps + ((cycle - 0) & mask)];
     assert(x1361 != Fp::invalid());
     // loc("top(recursion::Top)/code(recursion::Code)/inst(Mux)/macro_ops(recursion::MacroInst)/opcode(OneHot)/wom_init(Reg)"("./zirgen/components/mux.h":59:25))
-    auto x1362 = arg0[9 * steps + ((cycle - 0) & mask)];
-    assert(x1362 != Fp::invalid());
-    if (x1362 != 0) {
-      extern_log(ctx, cycle, "WOM_INIT", extern_args, extern_outs);
+
+  if (arg0[9 * steps + ((cycle - 0) & mask)] != 0)
+    step_exec_macro_wom_init(ctx, steps, cycle, mask, arg0, arg1, arg2);
+  if (arg0[10 * steps + ((cycle - 0) & mask)] != 0)
+    step_exec_macro_wom_fini(ctx, steps, cycle, mask, arg0, arg1, arg2);
+  if (arg0[11 * steps + ((cycle - 0) & mask)] != 0)
+    step_exec_macro_bit_and_elem(ctx, steps, cycle, mask, arg0, arg1, arg2);
+  if (arg0[12 * steps + ((cycle - 0) & mask)] != 0)
+    step_exec_macro_bit_op_shorts(ctx, steps, cycle, mask, arg0, arg1, arg2);
+  if (arg0[13 * steps + ((cycle - 0) & mask)] != 0)
+    step_exec_macro_sha_init(ctx, steps, cycle, mask, arg0, arg1, arg2);
+  if (arg0[14 * steps + ((cycle - 0) & mask)] != 0)
+    step_exec_macro_sha_fini(ctx, steps, cycle, mask, arg0, arg1, arg2);
+  if (arg0[15 * steps + ((cycle - 0) & mask)] != 0)
+    step_exec_macro_sha_load(ctx, steps, cycle, mask, arg0, arg1, arg2);
+  if (arg0[16 * steps + ((cycle - 0) & mask)] != 0)
+    step_exec_macro_sha_mix(ctx, steps, cycle, mask, arg0, arg1, arg2);
+  if (arg0[17 * steps + ((cycle - 0) & mask)] != 0)
+    step_exec_macro_set_global(ctx, steps, cycle, mask, arg0, arg1, arg2);
+
+  // tail section
+
+  // tail section
+    // loc("zirgen/compiler/edsl/component.cpp":49:15)
+    auto x12908 = arg0[8 * steps + ((cycle - 0) & mask)];
+    assert(x12908 != Fp::invalid());
+    if (x12908 != 0) {
+      {
+        // loc("./zirgen/components/bits.h":47:46)
+        {
+          auto& reg = arg2[5 * steps + cycle];
+          assert(reg == Fp::invalid() || reg == x311);
+          reg = x311;
+        }
+        // loc("./zirgen/components/bits.h":47:46)
+        {
+          auto& reg = arg2[6 * steps + cycle];
+          assert(reg == Fp::invalid() || reg == x311);
+          reg = x311;
+        }
+        // loc("./zirgen/components/bits.h":47:46)
+        {
+          auto& reg = arg2[7 * steps + cycle];
+          assert(reg == Fp::invalid() || reg == x311);
+          reg = x311;
+        }
+        // loc("./zirgen/components/bits.h":47:46)
+        {
+          auto& reg = arg2[8 * steps + cycle];
+          assert(reg == Fp::invalid() || reg == x311);
+          reg = x311;
+        }
+        // loc("./zirgen/components/bits.h":47:46)
+        {
+          auto& reg = arg2[9 * steps + cycle];
+          assert(reg == Fp::invalid() || reg == x311);
+          reg = x311;
+        }
+        // loc("./zirgen/components/bits.h":47:46)
+        {
+          auto& reg = arg2[10 * steps + cycle];
+          assert(reg == Fp::invalid() || reg == x311);
+          reg = x311;
+        }
+      }
     }
-    // loc("top(recursion::Top)/code(recursion::Code)/inst(Mux)/macro_ops(recursion::MacroInst)/opcode(OneHot)/wom_fini(Reg)"("./zirgen/components/mux.h":59:25))
-    auto x1363 = arg0[10 * steps + ((cycle - 0) & mask)];
-    assert(x1363 != Fp::invalid());
-    if (x1363 != 0) {
+    // loc("zirgen/compiler/edsl/component.cpp":49:15)
+    auto x12909 = arg0[9 * steps + ((cycle - 0) & mask)];
+    assert(x12909 != Fp::invalid());
+    if (x12909 != 0) {
+      {
+        // loc("./zirgen/components/bits.h":47:46)
+        {
+          auto& reg = arg2[5 * steps + cycle];
+          assert(reg == Fp::invalid() || reg == x311);
+          reg = x311;
+        }
+        // loc("./zirgen/components/bits.h":47:46)
+        {
+          auto& reg = arg2[6 * steps + cycle];
+          assert(reg == Fp::invalid() || reg == x311);
+          reg = x311;
+        }
+        // loc("./zirgen/components/bits.h":47:46)
+        {
+          auto& reg = arg2[7 * steps + cycle];
+          assert(reg == Fp::invalid() || reg == x311);
+          reg = x311;
+        }
+        // loc("./zirgen/components/bits.h":47:46)
+        {
+          auto& reg = arg2[8 * steps + cycle];
+          assert(reg == Fp::invalid() || reg == x311);
+          reg = x311;
+        }
+        // loc("./zirgen/components/bits.h":47:46)
+        {
+          auto& reg = arg2[9 * steps + cycle];
+          assert(reg == Fp::invalid() || reg == x311);
+          reg = x311;
+        }
+        // loc("./zirgen/components/bits.h":47:46)
+        {
+          auto& reg = arg2[10 * steps + cycle];
+          assert(reg == Fp::invalid() || reg == x311);
+          reg = x311;
+        }
+      }
+    }
+    // loc("zirgen/compiler/edsl/component.cpp":49:15)
+    auto x12910 = arg0[10 * steps + ((cycle - 0) & mask)];
+    assert(x12910 != Fp::invalid());
+    if (x12910 != 0) {
+      {
+        // loc("./zirgen/components/bits.h":47:46)
+        {
+          auto& reg = arg2[5 * steps + cycle];
+          assert(reg == Fp::invalid() || reg == x311);
+          reg = x311;
+        }
+        // loc("./zirgen/components/bits.h":47:46)
+        {
+          auto& reg = arg2[6 * steps + cycle];
+          assert(reg == Fp::invalid() || reg == x311);
+          reg = x311;
+        }
+        // loc("./zirgen/components/bits.h":47:46)
+        {
+          auto& reg = arg2[7 * steps + cycle];
+          assert(reg == Fp::invalid() || reg == x311);
+          reg = x311;
+        }
+        // loc("./zirgen/components/bits.h":47:46)
+        {
+          auto& reg = arg2[8 * steps + cycle];
+          assert(reg == Fp::invalid() || reg == x311);
+          reg = x311;
+        }
+        // loc("./zirgen/components/bits.h":47:46)
+        {
+          auto& reg = arg2[9 * steps + cycle];
+          assert(reg == Fp::invalid() || reg == x311);
+          reg = x311;
+        }
+        // loc("./zirgen/components/bits.h":47:46)
+        {
+          auto& reg = arg2[10 * steps + cycle];
+          assert(reg == Fp::invalid() || reg == x311);
+          reg = x311;
+        }
+      }
+    }
+    // loc("zirgen/compiler/edsl/component.cpp":49:15)
+    auto x12911 = arg0[11 * steps + ((cycle - 0) & mask)];
+    assert(x12911 != Fp::invalid());
+    if (x12911 != 0) {
+      {
+        // loc("./zirgen/components/bits.h":47:46)
+        {
+          auto& reg = arg2[5 * steps + cycle];
+          assert(reg == Fp::invalid() || reg == x311);
+          reg = x311;
+        }
+        // loc("./zirgen/components/bits.h":47:46)
+        {
+          auto& reg = arg2[6 * steps + cycle];
+          assert(reg == Fp::invalid() || reg == x311);
+          reg = x311;
+        }
+        // loc("./zirgen/components/bits.h":47:46)
+        {
+          auto& reg = arg2[7 * steps + cycle];
+          assert(reg == Fp::invalid() || reg == x311);
+          reg = x311;
+        }
+        // loc("./zirgen/components/bits.h":47:46)
+        {
+          auto& reg = arg2[8 * steps + cycle];
+          assert(reg == Fp::invalid() || reg == x311);
+          reg = x311;
+        }
+        // loc("./zirgen/components/bits.h":47:46)
+        {
+          auto& reg = arg2[9 * steps + cycle];
+          assert(reg == Fp::invalid() || reg == x311);
+          reg = x311;
+        }
+        // loc("./zirgen/components/bits.h":47:46)
+        {
+          auto& reg = arg2[10 * steps + cycle];
+          assert(reg == Fp::invalid() || reg == x311);
+          reg = x311;
+        }
+      }
+    }
+    // loc("zirgen/compiler/edsl/component.cpp":49:15)
+    auto x12912 = arg0[12 * steps + ((cycle - 0) & mask)];
+    assert(x12912 != Fp::invalid());
+    if (x12912 != 0) {
+      {
+        // loc("./zirgen/components/bits.h":47:46)
+        {
+          auto& reg = arg2[5 * steps + cycle];
+          assert(reg == Fp::invalid() || reg == x311);
+          reg = x311;
+        }
+        // loc("./zirgen/components/bits.h":47:46)
+        {
+          auto& reg = arg2[6 * steps + cycle];
+          assert(reg == Fp::invalid() || reg == x311);
+          reg = x311;
+        }
+        // loc("./zirgen/components/bits.h":47:46)
+        {
+          auto& reg = arg2[7 * steps + cycle];
+          assert(reg == Fp::invalid() || reg == x311);
+          reg = x311;
+        }
+        // loc("./zirgen/components/bits.h":47:46)
+        {
+          auto& reg = arg2[8 * steps + cycle];
+          assert(reg == Fp::invalid() || reg == x311);
+          reg = x311;
+        }
+        // loc("./zirgen/components/bits.h":47:46)
+        {
+          auto& reg = arg2[9 * steps + cycle];
+          assert(reg == Fp::invalid() || reg == x311);
+          reg = x311;
+        }
+        // loc("./zirgen/components/bits.h":47:46)
+        {
+          auto& reg = arg2[10 * steps + cycle];
+          assert(reg == Fp::invalid() || reg == x311);
+          reg = x311;
+        }
+      }
+    }
+    // loc("zirgen/compiler/edsl/component.cpp":49:15)
+    auto x12913 = arg0[17 * steps + ((cycle - 0) & mask)];
+    assert(x12913 != Fp::invalid());
+    if (x12913 != 0) {
+      {
+        // loc("./zirgen/components/bits.h":47:46)
+        {
+          auto& reg = arg2[5 * steps + cycle];
+          assert(reg == Fp::invalid() || reg == x311);
+          reg = x311;
+        }
+        // loc("./zirgen/components/bits.h":47:46)
+        {
+          auto& reg = arg2[6 * steps + cycle];
+          assert(reg == Fp::invalid() || reg == x311);
+          reg = x311;
+        }
+        // loc("./zirgen/components/bits.h":47:46)
+        {
+          auto& reg = arg2[7 * steps + cycle];
+          assert(reg == Fp::invalid() || reg == x311);
+          reg = x311;
+        }
+        // loc("./zirgen/components/bits.h":47:46)
+        {
+          auto& reg = arg2[8 * steps + cycle];
+          assert(reg == Fp::invalid() || reg == x311);
+          reg = x311;
+        }
+        // loc("./zirgen/components/bits.h":47:46)
+        {
+          auto& reg = arg2[9 * steps + cycle];
+          assert(reg == Fp::invalid() || reg == x311);
+          reg = x311;
+        }
+        // loc("./zirgen/components/bits.h":47:46)
+        {
+          auto& reg = arg2[10 * steps + cycle];
+          assert(reg == Fp::invalid() || reg == x311);
+          reg = x311;
+        }
+      }
+    }
+    // loc("zirgen/compiler/edsl/component.cpp":49:15)
+    auto x12959 = arg0[11 * steps + ((cycle - 0) & mask)];
+    assert(x12959 != Fp::invalid());
+    if (x12959 != 0) {
+      {
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_and_elem(recursion::BitAndElem)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+        auto x12960 = arg2[11 * steps + ((cycle - 0) & mask)];
+        assert(x12960 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_and_elem(recursion::BitAndElem)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x12961 = arg2[12 * steps + ((cycle - 0) & mask)];
+        assert(x12961 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_and_elem(recursion::BitAndElem)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x12962 = arg2[13 * steps + ((cycle - 0) & mask)];
+        assert(x12962 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_and_elem(recursion::BitAndElem)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x12963 = arg2[14 * steps + ((cycle - 0) & mask)];
+        assert(x12963 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_and_elem(recursion::BitAndElem)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x12964 = arg2[15 * steps + ((cycle - 0) & mask)];
+        assert(x12964 != Fp::invalid());
+        extern_args[0] = x12960;
+        extern_args[1] = x12961;
+        extern_args[2] = x12962;
+        extern_args[3] = x12963;
+        extern_args[4] = x12964;
+        extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_and_elem(recursion::BitAndElem)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+        auto x12965 = arg2[16 * steps + ((cycle - 0) & mask)];
+        assert(x12965 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_and_elem(recursion::BitAndElem)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x12966 = arg2[17 * steps + ((cycle - 0) & mask)];
+        assert(x12966 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_and_elem(recursion::BitAndElem)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x12967 = arg2[18 * steps + ((cycle - 0) & mask)];
+        assert(x12967 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_and_elem(recursion::BitAndElem)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x12968 = arg2[19 * steps + ((cycle - 0) & mask)];
+        assert(x12968 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_and_elem(recursion::BitAndElem)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x12969 = arg2[20 * steps + ((cycle - 0) & mask)];
+        assert(x12969 != Fp::invalid());
+        extern_args[0] = x12965;
+        extern_args[1] = x12966;
+        extern_args[2] = x12967;
+        extern_args[3] = x12968;
+        extern_args[4] = x12969;
+        extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_and_elem(recursion::BitAndElem)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+        auto x12970 = arg2[21 * steps + ((cycle - 0) & mask)];
+        assert(x12970 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_and_elem(recursion::BitAndElem)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x12971 = arg2[22 * steps + ((cycle - 0) & mask)];
+        assert(x12971 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_and_elem(recursion::BitAndElem)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x12972 = arg2[23 * steps + ((cycle - 0) & mask)];
+        assert(x12972 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_and_elem(recursion::BitAndElem)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x12973 = arg2[24 * steps + ((cycle - 0) & mask)];
+        assert(x12973 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_and_elem(recursion::BitAndElem)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x12974 = arg2[25 * steps + ((cycle - 0) & mask)];
+        assert(x12974 != Fp::invalid());
+        extern_args[0] = x12970;
+        extern_args[1] = x12971;
+        extern_args[2] = x12972;
+        extern_args[3] = x12973;
+        extern_args[4] = x12974;
+        extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+      }
+    }
+    // loc("zirgen/compiler/edsl/component.cpp":49:15)
+    auto x12975 = arg0[12 * steps + ((cycle - 0) & mask)];
+    assert(x12975 != Fp::invalid());
+    if (x12975 != 0) {
+      {
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_op_shorts(recursion::BitOpShorts)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+        auto x12976 = arg2[11 * steps + ((cycle - 0) & mask)];
+        assert(x12976 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_op_shorts(recursion::BitOpShorts)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x12977 = arg2[12 * steps + ((cycle - 0) & mask)];
+        assert(x12977 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_op_shorts(recursion::BitOpShorts)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x12978 = arg2[13 * steps + ((cycle - 0) & mask)];
+        assert(x12978 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_op_shorts(recursion::BitOpShorts)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x12979 = arg2[14 * steps + ((cycle - 0) & mask)];
+        assert(x12979 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_op_shorts(recursion::BitOpShorts)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x12980 = arg2[15 * steps + ((cycle - 0) & mask)];
+        assert(x12980 != Fp::invalid());
+        extern_args[0] = x12976;
+        extern_args[1] = x12977;
+        extern_args[2] = x12978;
+        extern_args[3] = x12979;
+        extern_args[4] = x12980;
+        extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_op_shorts(recursion::BitOpShorts)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+        auto x12981 = arg2[16 * steps + ((cycle - 0) & mask)];
+        assert(x12981 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_op_shorts(recursion::BitOpShorts)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x12982 = arg2[17 * steps + ((cycle - 0) & mask)];
+        assert(x12982 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_op_shorts(recursion::BitOpShorts)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x12983 = arg2[18 * steps + ((cycle - 0) & mask)];
+        assert(x12983 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_op_shorts(recursion::BitOpShorts)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x12984 = arg2[19 * steps + ((cycle - 0) & mask)];
+        assert(x12984 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_op_shorts(recursion::BitOpShorts)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x12985 = arg2[20 * steps + ((cycle - 0) & mask)];
+        assert(x12985 != Fp::invalid());
+        extern_args[0] = x12981;
+        extern_args[1] = x12982;
+        extern_args[2] = x12983;
+        extern_args[3] = x12984;
+        extern_args[4] = x12985;
+        extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_op_shorts(recursion::BitOpShorts)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+        auto x12986 = arg2[21 * steps + ((cycle - 0) & mask)];
+        assert(x12986 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_op_shorts(recursion::BitOpShorts)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x12987 = arg2[22 * steps + ((cycle - 0) & mask)];
+        assert(x12987 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_op_shorts(recursion::BitOpShorts)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x12988 = arg2[23 * steps + ((cycle - 0) & mask)];
+        assert(x12988 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_op_shorts(recursion::BitOpShorts)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x12989 = arg2[24 * steps + ((cycle - 0) & mask)];
+        assert(x12989 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_op_shorts(recursion::BitOpShorts)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x12990 = arg2[25 * steps + ((cycle - 0) & mask)];
+        assert(x12990 != Fp::invalid());
+        extern_args[0] = x12986;
+        extern_args[1] = x12987;
+        extern_args[2] = x12988;
+        extern_args[3] = x12989;
+        extern_args[4] = x12990;
+        extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+      }
+    }
+    // loc("zirgen/compiler/edsl/component.cpp":49:15)
+    auto x12991 = arg0[13 * steps + ((cycle - 0) & mask)];
+    assert(x12991 != Fp::invalid());
+    if (x12991 != 0) {
+      {
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_init(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+        auto x12992 = arg2[11 * steps + ((cycle - 0) & mask)];
+        assert(x12992 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_init(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x12993 = arg2[12 * steps + ((cycle - 0) & mask)];
+        assert(x12993 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_init(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x12994 = arg2[13 * steps + ((cycle - 0) & mask)];
+        assert(x12994 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_init(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x12995 = arg2[14 * steps + ((cycle - 0) & mask)];
+        assert(x12995 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_init(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x12996 = arg2[15 * steps + ((cycle - 0) & mask)];
+        assert(x12996 != Fp::invalid());
+        extern_args[0] = x12992;
+        extern_args[1] = x12993;
+        extern_args[2] = x12994;
+        extern_args[3] = x12995;
+        extern_args[4] = x12996;
+        extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_init(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+        auto x12997 = arg2[16 * steps + ((cycle - 0) & mask)];
+        assert(x12997 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_init(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x12998 = arg2[17 * steps + ((cycle - 0) & mask)];
+        assert(x12998 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_init(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x12999 = arg2[18 * steps + ((cycle - 0) & mask)];
+        assert(x12999 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_init(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13000 = arg2[19 * steps + ((cycle - 0) & mask)];
+        assert(x13000 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_init(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13001 = arg2[20 * steps + ((cycle - 0) & mask)];
+        assert(x13001 != Fp::invalid());
+        extern_args[0] = x12997;
+        extern_args[1] = x12998;
+        extern_args[2] = x12999;
+        extern_args[3] = x13000;
+        extern_args[4] = x13001;
+        extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+      }
+    }
+    // loc("zirgen/compiler/edsl/component.cpp":49:15)
+    auto x13002 = arg0[14 * steps + ((cycle - 0) & mask)];
+    assert(x13002 != Fp::invalid());
+    if (x13002 != 0) {
+      {
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_fini(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+        auto x13003 = arg2[11 * steps + ((cycle - 0) & mask)];
+        assert(x13003 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_fini(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13004 = arg2[12 * steps + ((cycle - 0) & mask)];
+        assert(x13004 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_fini(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13005 = arg2[13 * steps + ((cycle - 0) & mask)];
+        assert(x13005 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_fini(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13006 = arg2[14 * steps + ((cycle - 0) & mask)];
+        assert(x13006 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_fini(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13007 = arg2[15 * steps + ((cycle - 0) & mask)];
+        assert(x13007 != Fp::invalid());
+        extern_args[0] = x13003;
+        extern_args[1] = x13004;
+        extern_args[2] = x13005;
+        extern_args[3] = x13006;
+        extern_args[4] = x13007;
+        extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_fini(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+        auto x13008 = arg2[16 * steps + ((cycle - 0) & mask)];
+        assert(x13008 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_fini(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13009 = arg2[17 * steps + ((cycle - 0) & mask)];
+        assert(x13009 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_fini(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13010 = arg2[18 * steps + ((cycle - 0) & mask)];
+        assert(x13010 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_fini(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13011 = arg2[19 * steps + ((cycle - 0) & mask)];
+        assert(x13011 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_fini(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13012 = arg2[20 * steps + ((cycle - 0) & mask)];
+        assert(x13012 != Fp::invalid());
+        extern_args[0] = x13008;
+        extern_args[1] = x13009;
+        extern_args[2] = x13010;
+        extern_args[3] = x13011;
+        extern_args[4] = x13012;
+        extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+      }
+    }
+    // loc("zirgen/compiler/edsl/component.cpp":49:15)
+    auto x13013 = arg0[15 * steps + ((cycle - 0) & mask)];
+    assert(x13013 != Fp::invalid());
+    if (x13013 != 0) {
+      {
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_load(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+        auto x13014 = arg2[11 * steps + ((cycle - 0) & mask)];
+        assert(x13014 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_load(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13015 = arg2[12 * steps + ((cycle - 0) & mask)];
+        assert(x13015 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_load(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13016 = arg2[13 * steps + ((cycle - 0) & mask)];
+        assert(x13016 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_load(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13017 = arg2[14 * steps + ((cycle - 0) & mask)];
+        assert(x13017 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_load(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13018 = arg2[15 * steps + ((cycle - 0) & mask)];
+        assert(x13018 != Fp::invalid());
+        extern_args[0] = x13014;
+        extern_args[1] = x13015;
+        extern_args[2] = x13016;
+        extern_args[3] = x13017;
+        extern_args[4] = x13018;
+        extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_load(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+        auto x13019 = arg2[16 * steps + ((cycle - 0) & mask)];
+        assert(x13019 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_load(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13020 = arg2[17 * steps + ((cycle - 0) & mask)];
+        assert(x13020 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_load(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13021 = arg2[18 * steps + ((cycle - 0) & mask)];
+        assert(x13021 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_load(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13022 = arg2[19 * steps + ((cycle - 0) & mask)];
+        assert(x13022 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_load(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13023 = arg2[20 * steps + ((cycle - 0) & mask)];
+        assert(x13023 != Fp::invalid());
+        extern_args[0] = x13019;
+        extern_args[1] = x13020;
+        extern_args[2] = x13021;
+        extern_args[3] = x13022;
+        extern_args[4] = x13023;
+        extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+      }
+    }
+    // loc("zirgen/compiler/edsl/component.cpp":49:15)
+    auto x13024 = arg0[16 * steps + ((cycle - 0) & mask)];
+    assert(x13024 != Fp::invalid());
+    if (x13024 != 0) {
+      {
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_mix(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+        auto x13025 = arg2[11 * steps + ((cycle - 0) & mask)];
+        assert(x13025 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_mix(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13026 = arg2[12 * steps + ((cycle - 0) & mask)];
+        assert(x13026 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_mix(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13027 = arg2[13 * steps + ((cycle - 0) & mask)];
+        assert(x13027 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_mix(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13028 = arg2[14 * steps + ((cycle - 0) & mask)];
+        assert(x13028 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_mix(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13029 = arg2[15 * steps + ((cycle - 0) & mask)];
+        assert(x13029 != Fp::invalid());
+        extern_args[0] = x13025;
+        extern_args[1] = x13026;
+        extern_args[2] = x13027;
+        extern_args[3] = x13028;
+        extern_args[4] = x13029;
+        extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_mix(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+        auto x13030 = arg2[16 * steps + ((cycle - 0) & mask)];
+        assert(x13030 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_mix(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13031 = arg2[17 * steps + ((cycle - 0) & mask)];
+        assert(x13031 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_mix(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13032 = arg2[18 * steps + ((cycle - 0) & mask)];
+        assert(x13032 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_mix(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13033 = arg2[19 * steps + ((cycle - 0) & mask)];
+        assert(x13033 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_mix(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13034 = arg2[20 * steps + ((cycle - 0) & mask)];
+        assert(x13034 != Fp::invalid());
+        extern_args[0] = x13030;
+        extern_args[1] = x13031;
+        extern_args[2] = x13032;
+        extern_args[3] = x13033;
+        extern_args[4] = x13034;
+        extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+      }
+    }
+    // loc("zirgen/compiler/edsl/component.cpp":49:15)
+    auto x13035 = arg0[17 * steps + ((cycle - 0) & mask)];
+    assert(x13035 != Fp::invalid());
+    if (x13035 != 0) {
+      {
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+        auto x13036 = arg2[15 * steps + ((cycle - 0) & mask)];
+        assert(x13036 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13037 = arg2[16 * steps + ((cycle - 0) & mask)];
+        assert(x13037 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13038 = arg2[17 * steps + ((cycle - 0) & mask)];
+        assert(x13038 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13039 = arg2[18 * steps + ((cycle - 0) & mask)];
+        assert(x13039 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13040 = arg2[19 * steps + ((cycle - 0) & mask)];
+        assert(x13040 != Fp::invalid());
+        extern_args[0] = x13036;
+        extern_args[1] = x13037;
+        extern_args[2] = x13038;
+        extern_args[3] = x13039;
+        extern_args[4] = x13040;
+        extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+        auto x13041 = arg2[20 * steps + ((cycle - 0) & mask)];
+        assert(x13041 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13042 = arg2[21 * steps + ((cycle - 0) & mask)];
+        assert(x13042 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13043 = arg2[22 * steps + ((cycle - 0) & mask)];
+        assert(x13043 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13044 = arg2[23 * steps + ((cycle - 0) & mask)];
+        assert(x13044 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13045 = arg2[24 * steps + ((cycle - 0) & mask)];
+        assert(x13045 != Fp::invalid());
+        extern_args[0] = x13041;
+        extern_args[1] = x13042;
+        extern_args[2] = x13043;
+        extern_args[3] = x13044;
+        extern_args[4] = x13045;
+        extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+        auto x13046 = arg2[25 * steps + ((cycle - 0) & mask)];
+        assert(x13046 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13047 = arg2[26 * steps + ((cycle - 0) & mask)];
+        assert(x13047 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13048 = arg2[27 * steps + ((cycle - 0) & mask)];
+        assert(x13048 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13049 = arg2[28 * steps + ((cycle - 0) & mask)];
+        assert(x13049 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13050 = arg2[29 * steps + ((cycle - 0) & mask)];
+        assert(x13050 != Fp::invalid());
+        extern_args[0] = x13046;
+        extern_args[1] = x13047;
+        extern_args[2] = x13048;
+        extern_args[3] = x13049;
+        extern_args[4] = x13050;
+        extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+        auto x13051 = arg2[30 * steps + ((cycle - 0) & mask)];
+        assert(x13051 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13052 = arg2[31 * steps + ((cycle - 0) & mask)];
+        assert(x13052 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13053 = arg2[32 * steps + ((cycle - 0) & mask)];
+        assert(x13053 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13054 = arg2[33 * steps + ((cycle - 0) & mask)];
+        assert(x13054 != Fp::invalid());
+        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+        auto x13055 = arg2[34 * steps + ((cycle - 0) & mask)];
+        assert(x13055 != Fp::invalid());
+        extern_args[0] = x13051;
+        extern_args[1] = x13052;
+        extern_args[2] = x13053;
+        extern_args[3] = x13054;
+        extern_args[4] = x13055;
+        extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+      }
+    }
+}
+
+__device__ __noinline__ void step_exec_macro_wom_init(
+    void* ctx, uint32_t steps, uint32_t cycle, uint32_t mask,
+    Fp* arg0, Fp* arg1, Fp* arg2) {
+  Fp extern_args[96];
+  Fp extern_outs[32];
+  // loc(unknown)
+  Fp x0(192);
+  // loc(unknown)
+  Fp x1(48);
+  // loc(unknown)
+  Fp x2(12);
+  // loc(unknown)
+  Fp x3(1040977421);
+  // loc(unknown)
+  Fp x4(1792450386);
+  // loc(unknown)
+  Fp x5(1470845646);
+  // loc(unknown)
+  Fp x6(1363837384);
+  // loc(unknown)
+  Fp x7(1878280202);
+  // loc(unknown)
+  Fp x8(434078361);
+  // loc(unknown)
+  Fp x9(1946596189);
+  // loc(unknown)
+  Fp x10(875839332);
+  // loc(unknown)
+  Fp x11(463976218);
+  // loc(unknown)
+  Fp x12(976057819);
+  // loc(unknown)
+  Fp x13(48375137);
+  // loc(unknown)
+  Fp x14(1549779579);
+  // loc(unknown)
+  Fp x15(1679178250);
+  // loc(unknown)
+  Fp x16(530151394);
+  // loc(unknown)
+  Fp x17(1629316321);
+  // loc(unknown)
+  Fp x18(1854174607);
+  // loc(unknown)
+  Fp x19(720724951);
+  // loc(unknown)
+  Fp x20(14387587);
+  // loc(unknown)
+  Fp x21(1883820770);
+  // loc(unknown)
+  Fp x22(205609311);
+  // loc(unknown)
+  Fp x23(1136469704);
+  // loc(unknown)
+  Fp x24(1439947916);
+  // loc(unknown)
+  Fp x25(723038058);
+  // loc(unknown)
+  Fp x26(53041581);
+  // loc(unknown)
+  Fp x27(1810596765);
+  // loc(unknown)
+  Fp x28(1210751726);
+  // loc(unknown)
+  Fp x29(1327682690);
+  // loc(unknown)
+  Fp x30(1886977120);
+  // loc(unknown)
+  Fp x31(1551596046);
+  // loc(unknown)
+  Fp x32(1186174623);
+  // loc(unknown)
+  Fp x33(1199068823);
+  // loc(unknown)
+  Fp x34(1240419708);
+  // loc(unknown)
+  Fp x35(1708681573);
+  // loc(unknown)
+  Fp x36(308575117);
+  // loc(unknown)
+  Fp x37(1111544260);
+  // loc(unknown)
+  Fp x38(822033215);
+  // loc(unknown)
+  Fp x39(1891545577);
+  // loc(unknown)
+  Fp x40(440300254);
+  // loc(unknown)
+  Fp x41(1726563304);
+  // loc(unknown)
+  Fp x42(1365519753);
+  // loc(unknown)
+  Fp x43(924863639);
+  // loc(unknown)
+  Fp x44(1540960371);
+  // loc(unknown)
+  Fp x45(1052077299);
+  // loc(unknown)
+  Fp x46(1930103076);
+  // loc(unknown)
+  Fp x47(98371040);
+  // loc(unknown)
+  Fp x48(918610824);
+  // loc(unknown)
+  Fp x49(801504236);
+  // loc(unknown)
+  Fp x50(65998480);
+  // loc(unknown)
+  Fp x51(658182609);
+  // loc(unknown)
+  Fp x52(606789471);
+  // loc(unknown)
+  Fp x53(51866717);
+  // loc(unknown)
+  Fp x54(375892129);
+  // loc(unknown)
+  Fp x55(20525701);
+  // loc(unknown)
+  Fp x56(1997365680);
+  // loc(unknown)
+  Fp x57(1974912880);
+  // loc(unknown)
+  Fp x58(1942928017);
+  // loc(unknown)
+  Fp x59(1928969209);
+  // loc(unknown)
+  Fp x60(1867716110);
+  // loc(unknown)
+  Fp x61(1792686146);
+  // loc(unknown)
+  Fp x62(1558116381);
+  // loc(unknown)
+  Fp x63(1461037801);
+  // loc(unknown)
+  Fp x64(1389833583);
+  // loc(unknown)
+  Fp x65(13683276);
+  // loc(unknown)
+  Fp x66(1188752902);
+  // loc(unknown)
+  Fp x67(111593398);
+  // loc(unknown)
+  Fp x68(1083257840);
+  // loc(unknown)
+  Fp x69(106789798);
+  // loc(unknown)
+  Fp x70(1001081699);
+  // loc(unknown)
+  Fp x71(497520322);
+  // loc(unknown)
+  Fp x72(946500736);
+  // loc(unknown)
+  Fp x73(890243564);
+  // loc(unknown)
+  Fp x74(862495875);
+  // loc(unknown)
+  Fp x75(855276054);
+  // loc(unknown)
+  Fp x76(76770019);
+  // loc(unknown)
+  Fp x77(760115692);
+  // loc(unknown)
+  Fp x78(623051854);
+  // loc(unknown)
+  Fp x79(59510015);
+  // loc(unknown)
+  Fp x80(552696906);
+  // loc(unknown)
+  Fp x81(538103555);
+  // loc(unknown)
+  Fp x82(457372011);
+  // loc(unknown)
+  Fp x83(447555988);
+  // loc(unknown)
+  Fp x84(27129487);
+  // loc(unknown)
+  Fp x85(217046702);
+  // loc(unknown)
+  Fp x86(1950429111);
+  // loc(unknown)
+  Fp x87(192082241);
+  // loc(unknown)
+  Fp x88(1910423126);
+  // loc(unknown)
+  Fp x89(1908416316);
+  // loc(unknown)
+  Fp x90(1891637550);
+  // loc(unknown)
+  Fp x91(1841795381);
+  // loc(unknown)
+  Fp x92(1827572010);
+  // loc(unknown)
+  Fp x93(1748789933);
+  // loc(unknown)
+  Fp x94(1664590951);
+  // loc(unknown)
+  Fp x95(1663353317);
+  // loc(unknown)
+  Fp x96(162510541);
+  // loc(unknown)
+  Fp x97(1622328571);
+  // loc(unknown)
+  Fp x98(1608853840);
+  // loc(unknown)
+  Fp x99(158646617);
+  // loc(unknown)
+  Fp x100(1584033957);
+  // loc(unknown)
+  Fp x101(1567618575);
+  // loc(unknown)
+  Fp x102(1549062383);
+  // loc(unknown)
+  Fp x103(1507649755);
+  // loc(unknown)
+  Fp x104(1478577620);
+  // loc(unknown)
+  Fp x105(1463323727);
+  // loc(unknown)
+  Fp x106(1424297384);
+  // loc(unknown)
+  Fp x107(142102402);
+  // loc(unknown)
+  Fp x108(1402624179);
+  // loc(unknown)
+  Fp x109(1293938517);
+  // loc(unknown)
+  Fp x110(1257820264);
+  // loc(unknown)
+  Fp x111(1215259350);
+  // loc(unknown)
+  Fp x112(1198261138);
+  // loc(unknown)
+  Fp x113(1150410028);
+  // loc(unknown)
+  Fp x114(1147522062);
+  // loc(unknown)
+  Fp x115(1099252725);
+  // loc(unknown)
+  Fp x116(1080533265);
+  // loc(unknown)
+  Fp x117(1079030649);
+  // loc(unknown)
+  Fp x118(1065075039);
+  // loc(unknown)
+  Fp x119(1042892522);
+  // loc(unknown)
+  Fp x120(993455846);
+  // loc(unknown)
+  Fp x121(989618631);
+  // loc(unknown)
+  Fp x122(989176635);
+  // loc(unknown)
+  Fp x123(942439428);
+  // loc(unknown)
+  Fp x124(930036496);
+  // loc(unknown)
+  Fp x125(925018226);
+  // loc(unknown)
+  Fp x126(897025192);
+  // loc(unknown)
+  Fp x127(825405577);
+  // loc(unknown)
+  Fp x128(813674331);
+  // loc(unknown)
+  Fp x129(809508074);
+  // loc(unknown)
+  Fp x130(790726260);
+  // loc(unknown)
+  Fp x131(78845751);
+  // loc(unknown)
+  Fp x132(781141772);
+  // loc(unknown)
+  Fp x133(755691969);
+  // loc(unknown)
+  Fp x134(738091882);
+  // loc(unknown)
+  Fp x135(716894289);
+  // loc(unknown)
+  Fp x136(714957516);
+  // loc(unknown)
+  Fp x137(708123747);
+  // loc(unknown)
+  Fp x138(695835963);
+  // loc(unknown)
+  Fp x139(686842369);
+  // loc(unknown)
+  Fp x140(641665156);
+  // loc(unknown)
+  Fp x141(622609176);
+  // loc(unknown)
+  Fp x142(608401422);
+  // loc(unknown)
+  Fp x143(588764636);
+  // loc(unknown)
+  Fp x144(540703332);
+  // loc(unknown)
+  Fp x145(53007114);
+  // loc(unknown)
+  Fp x146(51256176);
+  // loc(unknown)
+  Fp x147(459826664);
+  // loc(unknown)
+  Fp x148(427731030);
+  // loc(unknown)
+  Fp x149(395622276);
+  // loc(unknown)
+  Fp x150(390340387);
+  // loc(unknown)
+  Fp x151(342857858);
+  // loc(unknown)
+  Fp x152(306391314);
+  // loc(unknown)
+  Fp x153(273790406);
+  // loc(unknown)
+  Fp x154(241306552);
+  // loc(unknown)
+  Fp x155(238616145);
+  // loc(unknown)
+  Fp x156(228520958);
+  // loc(unknown)
+  Fp x157(204228775);
+  // loc(unknown)
+  Fp x158(202271745);
+  // loc(unknown)
+  Fp x159(1997503974);
+  // loc(unknown)
+  Fp x160(1989924532);
+  // loc(unknown)
+  Fp x161(1917861751);
+  // loc(unknown)
+  Fp x162(1917549072);
+  // loc(unknown)
+  Fp x163(1896271507);
+  // loc(unknown)
+  Fp x164(1889898);
+  // loc(unknown)
+  Fp x165(1889603648);
+  // loc(unknown)
+  Fp x166(1845603984);
+  // loc(unknown)
+  Fp x167(1832911930);
+  // loc(unknown)
+  Fp x168(1781980094);
+  // loc(unknown)
+  Fp x169(1740472809);
+  // loc(unknown)
+  Fp x170(1737016378);
+  // loc(unknown)
+  Fp x171(172614232);
+  // loc(unknown)
+  Fp x172(1718628547);
+  // loc(unknown)
+  Fp x173(1715719711);
+  // loc(unknown)
+  Fp x174(1687379185);
+  // loc(unknown)
+  Fp x175(1672219447);
+  // loc(unknown)
+  Fp x176(1649953458);
+  // loc(unknown)
+  Fp x177(1647670797);
+  // loc(unknown)
+  Fp x178(1647665372);
+  // loc(unknown)
+  Fp x179(162506101);
+  // loc(unknown)
+  Fp x180(1608891156);
+  // loc(unknown)
+  Fp x181(1587822577);
+  // loc(unknown)
+  Fp x182(1545325389);
+  // loc(unknown)
+  Fp x183(1518763784);
+  // loc(unknown)
+  Fp x184(1507936940);
+  // loc(unknown)
+  Fp x185(150307788);
+  // loc(unknown)
+  Fp x186(1454563174);
+  // loc(unknown)
+  Fp x187(140621810);
+  // loc(unknown)
+  Fp x188(1401020792);
+  // loc(unknown)
+  Fp x189(1393671120);
+  // loc(unknown)
+  Fp x190(1380248020);
+  // loc(unknown)
+  Fp x191(1339793538);
+  // loc(unknown)
+  Fp x192(1338899225);
+  // loc(unknown)
+  Fp x193(1333667262);
+  // loc(unknown)
+  Fp x194(1303271640);
+  // loc(unknown)
+  Fp x195(1296144415);
+  // loc(unknown)
+  Fp x196(1291790245);
+  // loc(unknown)
+  Fp x197(1290028279);
+  // loc(unknown)
+  Fp x198(128479034);
+  // loc(unknown)
+  Fp x199(1282239129);
+  // loc(unknown)
+  Fp x200(1269493554);
+  // loc(unknown)
+  Fp x201(1262312258);
+  // loc(unknown)
+  Fp x202(1239734761);
+  // loc(unknown)
+  Fp x203(1221257987);
+  // loc(unknown)
+  Fp x204(1213686459);
+  // loc(unknown)
+  Fp x205(1209164052);
+  // loc(unknown)
+  Fp x206(1206940496);
+  // loc(unknown)
+  Fp x207(1201063290);
+  // loc(unknown)
+  Fp x208(117294666);
+  // loc(unknown)
+  Fp x209(1170029417);
+  // loc(unknown)
+  Fp x210(1150912935);
+  // loc(unknown)
+  Fp x211(1124078057);
+  // loc(unknown)
+  Fp x212(1111203133);
+  // loc(unknown)
+  Fp x213(1090783436);
+  // loc(unknown)
+  Fp x214(1006235079);
+  // loc(unknown)
+  Fp x215(1003792297);
+  // loc(unknown)
+  Fp x216(831813382);
+  // loc(unknown)
+  Fp x217(1421525369);
+  // loc(unknown)
+  Fp x218(1751797115);
+  // loc(unknown)
+  Fp x219(1964135730);
+  // loc(unknown)
+  Fp x220(525458520);
+  // loc(unknown)
+  Fp x221(638242172);
+  // loc(unknown)
+  Fp x222(1307439985);
+  // loc(unknown)
+  Fp x223(343354132);
+  // loc(unknown)
+  Fp x224(1389166148);
+  // loc(unknown)
+  Fp x225(1660766320);
+  // loc(unknown)
+  Fp x226(1464793095);
+  // loc(unknown)
+  Fp x227(1180307149);
+  // loc(unknown)
+  Fp x228(1930780904);
+  // loc(unknown)
+  Fp x229(1066694495);
+  // loc(unknown)
+  Fp x230(1773108264);
+  // loc(unknown)
+  Fp x231(1004040026);
+  // loc(unknown)
+  Fp x232(815798990);
+  // loc(unknown)
+  Fp x233(454905424);
+  // loc(unknown)
+  Fp x234(118043943);
+  // loc(unknown)
+  Fp x235(157582794);
+  // loc(unknown)
+  Fp x236(246143118);
+  // loc(unknown)
+  Fp x237(314968988);
+  // loc(unknown)
+  Fp x238(127253399);
+  // loc(unknown)
+  Fp x239(262278199);
+  // loc(unknown)
+  Fp x240(943718400);
+  // loc(unknown)
+  Fp x241(268435454);
+  // loc(unknown)
+  Fp x242(1761607679);
+  // loc(unknown)
+  Fp x243(1073741824);
+  // loc(unknown)
+  Fp x244(536870912);
+  // loc(unknown)
+  Fp x245(1509949437);
+  // loc(unknown)
+  Fp x246(268435456);
+  // loc(unknown)
+  Fp x247(1006632953);
+  // loc(unknown)
+  Fp x248(2013265906);
+  // loc(unknown)
+  Fp x249(134217728);
+  // loc(unknown)
+  Fp x250(67108864);
+  // loc(unknown)
+  Fp x251(2013265891);
+  // loc(unknown)
+  Fp x252(33554432);
+  // loc(unknown)
+  Fp x253(2013265861);
+  // loc(unknown)
+  Fp x254(2013265801);
+  // loc(unknown)
+  Fp x255(16777216);
+  // loc(unknown)
+  Fp x256(8388608);
+  // loc(unknown)
+  Fp x257(2013265681);
+  // loc(unknown)
+  Fp x258(4194304);
+  // loc(unknown)
+  Fp x259(2013265441);
+  // loc(unknown)
+  Fp x260(2097152);
+  // loc(unknown)
+  Fp x261(2013264961);
+  // loc(unknown)
+  Fp x262(2013264001);
+  // loc(unknown)
+  Fp x263(1048576);
+  // loc(unknown)
+  Fp x264(524288);
+  // loc(unknown)
+  Fp x265(2013262081);
+  // loc(unknown)
+  Fp x266(262144);
+  // loc(unknown)
+  Fp x267(2013258241);
+  // loc(unknown)
+  Fp x268(2013250561);
+  // loc(unknown)
+  Fp x269(131072);
+  // loc(unknown)
+  Fp x270(2013235201);
+  // loc(unknown)
+  Fp x271(32768);
+  // loc(unknown)
+  Fp x272(2013204481);
+  // loc(unknown)
+  Fp x273(2013143041);
+  // loc(unknown)
+  Fp x274(16384);
+  // loc(unknown)
+  Fp x275(8192);
+  // loc(unknown)
+  Fp x276(2013020161);
+  // loc(unknown)
+  Fp x277(4096);
+  // loc(unknown)
+  Fp x278(2012774401);
+  // loc(unknown)
+  Fp x279(2048);
+  // loc(unknown)
+  Fp x280(2012282881);
+  // loc(unknown)
+  Fp x281(2011299841);
+  // loc(unknown)
+  Fp x282(1024);
+  // loc(unknown)
+  Fp x283(512);
+  // loc(unknown)
+  Fp x284(2009333761);
+  // loc(unknown)
+  Fp x285(256);
+  // loc(unknown)
+  Fp x286(2005401601);
+  // loc(unknown)
+  Fp x287(1997537281);
+  // loc(unknown)
+  Fp x288(128);
+  // loc(unknown)
+  Fp x289(64);
+  // loc(unknown)
+  Fp x290(1981808641);
+  // loc(unknown)
+  Fp x291(32);
+  // loc(unknown)
+  Fp x292(1950351361);
+  // loc(unknown)
+  Fp x293(1887436801);
+  // loc(unknown)
+  Fp x294(16);
+  // loc(unknown)
+  Fp x295(1761607681);
+  // loc(unknown)
+  Fp x296(1509949441);
+  // loc(unknown)
+  Fp x297(1006632961);
+  // loc(unknown)
+  Fp x298(65536);
+  // loc(unknown)
+  Fp x299(2013265910);
+  // loc(unknown)
+  Fp x300(11);
+  // loc(unknown)
+  Fp x301(10);
+  // loc(unknown)
+  Fp x302(9);
+  // loc(unknown)
+  Fp x303(8);
+  // loc(unknown)
+  Fp x304(7);
+  // loc(unknown)
+  Fp x305(6);
+  // loc(unknown)
+  Fp x306(5);
+  // loc(unknown)
+  Fp x307(4);
+  // loc(unknown)
+  Fp x308(3);
+  // loc(unknown)
+  Fp x309(2);
+  // loc(unknown)
+  Fp x310(1);
+  // loc(unknown)
+  Fp x311(0);
+
+
+    // loc("top(recursion::Top)/code(recursion::Code)/write_addr(Reg)"("zirgen/circuit/recursion/top.cpp":33:49))
+    auto x1361 = arg0[0 * steps + ((cycle - 0) & mask)];
+    assert(x1361 != Fp::invalid());
+    // loc("top(recursion::Top)/code(recursion::Code)/inst(Mux)/macro_ops(recursion::MacroInst)/opcode(OneHot)/wom_init(Reg)"("./zirgen/components/mux.h":59:25))
+
+      extern_log(ctx, cycle, "WOM_INIT", extern_args, extern_outs);
+}
+
+__device__ __noinline__ void step_exec_macro_wom_fini(
+    void* ctx, uint32_t steps, uint32_t cycle, uint32_t mask,
+    Fp* arg0, Fp* arg1, Fp* arg2) {
+  Fp extern_args[96];
+  Fp extern_outs[32];
+  // loc(unknown)
+  Fp x0(192);
+  // loc(unknown)
+  Fp x1(48);
+  // loc(unknown)
+  Fp x2(12);
+  // loc(unknown)
+  Fp x3(1040977421);
+  // loc(unknown)
+  Fp x4(1792450386);
+  // loc(unknown)
+  Fp x5(1470845646);
+  // loc(unknown)
+  Fp x6(1363837384);
+  // loc(unknown)
+  Fp x7(1878280202);
+  // loc(unknown)
+  Fp x8(434078361);
+  // loc(unknown)
+  Fp x9(1946596189);
+  // loc(unknown)
+  Fp x10(875839332);
+  // loc(unknown)
+  Fp x11(463976218);
+  // loc(unknown)
+  Fp x12(976057819);
+  // loc(unknown)
+  Fp x13(48375137);
+  // loc(unknown)
+  Fp x14(1549779579);
+  // loc(unknown)
+  Fp x15(1679178250);
+  // loc(unknown)
+  Fp x16(530151394);
+  // loc(unknown)
+  Fp x17(1629316321);
+  // loc(unknown)
+  Fp x18(1854174607);
+  // loc(unknown)
+  Fp x19(720724951);
+  // loc(unknown)
+  Fp x20(14387587);
+  // loc(unknown)
+  Fp x21(1883820770);
+  // loc(unknown)
+  Fp x22(205609311);
+  // loc(unknown)
+  Fp x23(1136469704);
+  // loc(unknown)
+  Fp x24(1439947916);
+  // loc(unknown)
+  Fp x25(723038058);
+  // loc(unknown)
+  Fp x26(53041581);
+  // loc(unknown)
+  Fp x27(1810596765);
+  // loc(unknown)
+  Fp x28(1210751726);
+  // loc(unknown)
+  Fp x29(1327682690);
+  // loc(unknown)
+  Fp x30(1886977120);
+  // loc(unknown)
+  Fp x31(1551596046);
+  // loc(unknown)
+  Fp x32(1186174623);
+  // loc(unknown)
+  Fp x33(1199068823);
+  // loc(unknown)
+  Fp x34(1240419708);
+  // loc(unknown)
+  Fp x35(1708681573);
+  // loc(unknown)
+  Fp x36(308575117);
+  // loc(unknown)
+  Fp x37(1111544260);
+  // loc(unknown)
+  Fp x38(822033215);
+  // loc(unknown)
+  Fp x39(1891545577);
+  // loc(unknown)
+  Fp x40(440300254);
+  // loc(unknown)
+  Fp x41(1726563304);
+  // loc(unknown)
+  Fp x42(1365519753);
+  // loc(unknown)
+  Fp x43(924863639);
+  // loc(unknown)
+  Fp x44(1540960371);
+  // loc(unknown)
+  Fp x45(1052077299);
+  // loc(unknown)
+  Fp x46(1930103076);
+  // loc(unknown)
+  Fp x47(98371040);
+  // loc(unknown)
+  Fp x48(918610824);
+  // loc(unknown)
+  Fp x49(801504236);
+  // loc(unknown)
+  Fp x50(65998480);
+  // loc(unknown)
+  Fp x51(658182609);
+  // loc(unknown)
+  Fp x52(606789471);
+  // loc(unknown)
+  Fp x53(51866717);
+  // loc(unknown)
+  Fp x54(375892129);
+  // loc(unknown)
+  Fp x55(20525701);
+  // loc(unknown)
+  Fp x56(1997365680);
+  // loc(unknown)
+  Fp x57(1974912880);
+  // loc(unknown)
+  Fp x58(1942928017);
+  // loc(unknown)
+  Fp x59(1928969209);
+  // loc(unknown)
+  Fp x60(1867716110);
+  // loc(unknown)
+  Fp x61(1792686146);
+  // loc(unknown)
+  Fp x62(1558116381);
+  // loc(unknown)
+  Fp x63(1461037801);
+  // loc(unknown)
+  Fp x64(1389833583);
+  // loc(unknown)
+  Fp x65(13683276);
+  // loc(unknown)
+  Fp x66(1188752902);
+  // loc(unknown)
+  Fp x67(111593398);
+  // loc(unknown)
+  Fp x68(1083257840);
+  // loc(unknown)
+  Fp x69(106789798);
+  // loc(unknown)
+  Fp x70(1001081699);
+  // loc(unknown)
+  Fp x71(497520322);
+  // loc(unknown)
+  Fp x72(946500736);
+  // loc(unknown)
+  Fp x73(890243564);
+  // loc(unknown)
+  Fp x74(862495875);
+  // loc(unknown)
+  Fp x75(855276054);
+  // loc(unknown)
+  Fp x76(76770019);
+  // loc(unknown)
+  Fp x77(760115692);
+  // loc(unknown)
+  Fp x78(623051854);
+  // loc(unknown)
+  Fp x79(59510015);
+  // loc(unknown)
+  Fp x80(552696906);
+  // loc(unknown)
+  Fp x81(538103555);
+  // loc(unknown)
+  Fp x82(457372011);
+  // loc(unknown)
+  Fp x83(447555988);
+  // loc(unknown)
+  Fp x84(27129487);
+  // loc(unknown)
+  Fp x85(217046702);
+  // loc(unknown)
+  Fp x86(1950429111);
+  // loc(unknown)
+  Fp x87(192082241);
+  // loc(unknown)
+  Fp x88(1910423126);
+  // loc(unknown)
+  Fp x89(1908416316);
+  // loc(unknown)
+  Fp x90(1891637550);
+  // loc(unknown)
+  Fp x91(1841795381);
+  // loc(unknown)
+  Fp x92(1827572010);
+  // loc(unknown)
+  Fp x93(1748789933);
+  // loc(unknown)
+  Fp x94(1664590951);
+  // loc(unknown)
+  Fp x95(1663353317);
+  // loc(unknown)
+  Fp x96(162510541);
+  // loc(unknown)
+  Fp x97(1622328571);
+  // loc(unknown)
+  Fp x98(1608853840);
+  // loc(unknown)
+  Fp x99(158646617);
+  // loc(unknown)
+  Fp x100(1584033957);
+  // loc(unknown)
+  Fp x101(1567618575);
+  // loc(unknown)
+  Fp x102(1549062383);
+  // loc(unknown)
+  Fp x103(1507649755);
+  // loc(unknown)
+  Fp x104(1478577620);
+  // loc(unknown)
+  Fp x105(1463323727);
+  // loc(unknown)
+  Fp x106(1424297384);
+  // loc(unknown)
+  Fp x107(142102402);
+  // loc(unknown)
+  Fp x108(1402624179);
+  // loc(unknown)
+  Fp x109(1293938517);
+  // loc(unknown)
+  Fp x110(1257820264);
+  // loc(unknown)
+  Fp x111(1215259350);
+  // loc(unknown)
+  Fp x112(1198261138);
+  // loc(unknown)
+  Fp x113(1150410028);
+  // loc(unknown)
+  Fp x114(1147522062);
+  // loc(unknown)
+  Fp x115(1099252725);
+  // loc(unknown)
+  Fp x116(1080533265);
+  // loc(unknown)
+  Fp x117(1079030649);
+  // loc(unknown)
+  Fp x118(1065075039);
+  // loc(unknown)
+  Fp x119(1042892522);
+  // loc(unknown)
+  Fp x120(993455846);
+  // loc(unknown)
+  Fp x121(989618631);
+  // loc(unknown)
+  Fp x122(989176635);
+  // loc(unknown)
+  Fp x123(942439428);
+  // loc(unknown)
+  Fp x124(930036496);
+  // loc(unknown)
+  Fp x125(925018226);
+  // loc(unknown)
+  Fp x126(897025192);
+  // loc(unknown)
+  Fp x127(825405577);
+  // loc(unknown)
+  Fp x128(813674331);
+  // loc(unknown)
+  Fp x129(809508074);
+  // loc(unknown)
+  Fp x130(790726260);
+  // loc(unknown)
+  Fp x131(78845751);
+  // loc(unknown)
+  Fp x132(781141772);
+  // loc(unknown)
+  Fp x133(755691969);
+  // loc(unknown)
+  Fp x134(738091882);
+  // loc(unknown)
+  Fp x135(716894289);
+  // loc(unknown)
+  Fp x136(714957516);
+  // loc(unknown)
+  Fp x137(708123747);
+  // loc(unknown)
+  Fp x138(695835963);
+  // loc(unknown)
+  Fp x139(686842369);
+  // loc(unknown)
+  Fp x140(641665156);
+  // loc(unknown)
+  Fp x141(622609176);
+  // loc(unknown)
+  Fp x142(608401422);
+  // loc(unknown)
+  Fp x143(588764636);
+  // loc(unknown)
+  Fp x144(540703332);
+  // loc(unknown)
+  Fp x145(53007114);
+  // loc(unknown)
+  Fp x146(51256176);
+  // loc(unknown)
+  Fp x147(459826664);
+  // loc(unknown)
+  Fp x148(427731030);
+  // loc(unknown)
+  Fp x149(395622276);
+  // loc(unknown)
+  Fp x150(390340387);
+  // loc(unknown)
+  Fp x151(342857858);
+  // loc(unknown)
+  Fp x152(306391314);
+  // loc(unknown)
+  Fp x153(273790406);
+  // loc(unknown)
+  Fp x154(241306552);
+  // loc(unknown)
+  Fp x155(238616145);
+  // loc(unknown)
+  Fp x156(228520958);
+  // loc(unknown)
+  Fp x157(204228775);
+  // loc(unknown)
+  Fp x158(202271745);
+  // loc(unknown)
+  Fp x159(1997503974);
+  // loc(unknown)
+  Fp x160(1989924532);
+  // loc(unknown)
+  Fp x161(1917861751);
+  // loc(unknown)
+  Fp x162(1917549072);
+  // loc(unknown)
+  Fp x163(1896271507);
+  // loc(unknown)
+  Fp x164(1889898);
+  // loc(unknown)
+  Fp x165(1889603648);
+  // loc(unknown)
+  Fp x166(1845603984);
+  // loc(unknown)
+  Fp x167(1832911930);
+  // loc(unknown)
+  Fp x168(1781980094);
+  // loc(unknown)
+  Fp x169(1740472809);
+  // loc(unknown)
+  Fp x170(1737016378);
+  // loc(unknown)
+  Fp x171(172614232);
+  // loc(unknown)
+  Fp x172(1718628547);
+  // loc(unknown)
+  Fp x173(1715719711);
+  // loc(unknown)
+  Fp x174(1687379185);
+  // loc(unknown)
+  Fp x175(1672219447);
+  // loc(unknown)
+  Fp x176(1649953458);
+  // loc(unknown)
+  Fp x177(1647670797);
+  // loc(unknown)
+  Fp x178(1647665372);
+  // loc(unknown)
+  Fp x179(162506101);
+  // loc(unknown)
+  Fp x180(1608891156);
+  // loc(unknown)
+  Fp x181(1587822577);
+  // loc(unknown)
+  Fp x182(1545325389);
+  // loc(unknown)
+  Fp x183(1518763784);
+  // loc(unknown)
+  Fp x184(1507936940);
+  // loc(unknown)
+  Fp x185(150307788);
+  // loc(unknown)
+  Fp x186(1454563174);
+  // loc(unknown)
+  Fp x187(140621810);
+  // loc(unknown)
+  Fp x188(1401020792);
+  // loc(unknown)
+  Fp x189(1393671120);
+  // loc(unknown)
+  Fp x190(1380248020);
+  // loc(unknown)
+  Fp x191(1339793538);
+  // loc(unknown)
+  Fp x192(1338899225);
+  // loc(unknown)
+  Fp x193(1333667262);
+  // loc(unknown)
+  Fp x194(1303271640);
+  // loc(unknown)
+  Fp x195(1296144415);
+  // loc(unknown)
+  Fp x196(1291790245);
+  // loc(unknown)
+  Fp x197(1290028279);
+  // loc(unknown)
+  Fp x198(128479034);
+  // loc(unknown)
+  Fp x199(1282239129);
+  // loc(unknown)
+  Fp x200(1269493554);
+  // loc(unknown)
+  Fp x201(1262312258);
+  // loc(unknown)
+  Fp x202(1239734761);
+  // loc(unknown)
+  Fp x203(1221257987);
+  // loc(unknown)
+  Fp x204(1213686459);
+  // loc(unknown)
+  Fp x205(1209164052);
+  // loc(unknown)
+  Fp x206(1206940496);
+  // loc(unknown)
+  Fp x207(1201063290);
+  // loc(unknown)
+  Fp x208(117294666);
+  // loc(unknown)
+  Fp x209(1170029417);
+  // loc(unknown)
+  Fp x210(1150912935);
+  // loc(unknown)
+  Fp x211(1124078057);
+  // loc(unknown)
+  Fp x212(1111203133);
+  // loc(unknown)
+  Fp x213(1090783436);
+  // loc(unknown)
+  Fp x214(1006235079);
+  // loc(unknown)
+  Fp x215(1003792297);
+  // loc(unknown)
+  Fp x216(831813382);
+  // loc(unknown)
+  Fp x217(1421525369);
+  // loc(unknown)
+  Fp x218(1751797115);
+  // loc(unknown)
+  Fp x219(1964135730);
+  // loc(unknown)
+  Fp x220(525458520);
+  // loc(unknown)
+  Fp x221(638242172);
+  // loc(unknown)
+  Fp x222(1307439985);
+  // loc(unknown)
+  Fp x223(343354132);
+  // loc(unknown)
+  Fp x224(1389166148);
+  // loc(unknown)
+  Fp x225(1660766320);
+  // loc(unknown)
+  Fp x226(1464793095);
+  // loc(unknown)
+  Fp x227(1180307149);
+  // loc(unknown)
+  Fp x228(1930780904);
+  // loc(unknown)
+  Fp x229(1066694495);
+  // loc(unknown)
+  Fp x230(1773108264);
+  // loc(unknown)
+  Fp x231(1004040026);
+  // loc(unknown)
+  Fp x232(815798990);
+  // loc(unknown)
+  Fp x233(454905424);
+  // loc(unknown)
+  Fp x234(118043943);
+  // loc(unknown)
+  Fp x235(157582794);
+  // loc(unknown)
+  Fp x236(246143118);
+  // loc(unknown)
+  Fp x237(314968988);
+  // loc(unknown)
+  Fp x238(127253399);
+  // loc(unknown)
+  Fp x239(262278199);
+  // loc(unknown)
+  Fp x240(943718400);
+  // loc(unknown)
+  Fp x241(268435454);
+  // loc(unknown)
+  Fp x242(1761607679);
+  // loc(unknown)
+  Fp x243(1073741824);
+  // loc(unknown)
+  Fp x244(536870912);
+  // loc(unknown)
+  Fp x245(1509949437);
+  // loc(unknown)
+  Fp x246(268435456);
+  // loc(unknown)
+  Fp x247(1006632953);
+  // loc(unknown)
+  Fp x248(2013265906);
+  // loc(unknown)
+  Fp x249(134217728);
+  // loc(unknown)
+  Fp x250(67108864);
+  // loc(unknown)
+  Fp x251(2013265891);
+  // loc(unknown)
+  Fp x252(33554432);
+  // loc(unknown)
+  Fp x253(2013265861);
+  // loc(unknown)
+  Fp x254(2013265801);
+  // loc(unknown)
+  Fp x255(16777216);
+  // loc(unknown)
+  Fp x256(8388608);
+  // loc(unknown)
+  Fp x257(2013265681);
+  // loc(unknown)
+  Fp x258(4194304);
+  // loc(unknown)
+  Fp x259(2013265441);
+  // loc(unknown)
+  Fp x260(2097152);
+  // loc(unknown)
+  Fp x261(2013264961);
+  // loc(unknown)
+  Fp x262(2013264001);
+  // loc(unknown)
+  Fp x263(1048576);
+  // loc(unknown)
+  Fp x264(524288);
+  // loc(unknown)
+  Fp x265(2013262081);
+  // loc(unknown)
+  Fp x266(262144);
+  // loc(unknown)
+  Fp x267(2013258241);
+  // loc(unknown)
+  Fp x268(2013250561);
+  // loc(unknown)
+  Fp x269(131072);
+  // loc(unknown)
+  Fp x270(2013235201);
+  // loc(unknown)
+  Fp x271(32768);
+  // loc(unknown)
+  Fp x272(2013204481);
+  // loc(unknown)
+  Fp x273(2013143041);
+  // loc(unknown)
+  Fp x274(16384);
+  // loc(unknown)
+  Fp x275(8192);
+  // loc(unknown)
+  Fp x276(2013020161);
+  // loc(unknown)
+  Fp x277(4096);
+  // loc(unknown)
+  Fp x278(2012774401);
+  // loc(unknown)
+  Fp x279(2048);
+  // loc(unknown)
+  Fp x280(2012282881);
+  // loc(unknown)
+  Fp x281(2011299841);
+  // loc(unknown)
+  Fp x282(1024);
+  // loc(unknown)
+  Fp x283(512);
+  // loc(unknown)
+  Fp x284(2009333761);
+  // loc(unknown)
+  Fp x285(256);
+  // loc(unknown)
+  Fp x286(2005401601);
+  // loc(unknown)
+  Fp x287(1997537281);
+  // loc(unknown)
+  Fp x288(128);
+  // loc(unknown)
+  Fp x289(64);
+  // loc(unknown)
+  Fp x290(1981808641);
+  // loc(unknown)
+  Fp x291(32);
+  // loc(unknown)
+  Fp x292(1950351361);
+  // loc(unknown)
+  Fp x293(1887436801);
+  // loc(unknown)
+  Fp x294(16);
+  // loc(unknown)
+  Fp x295(1761607681);
+  // loc(unknown)
+  Fp x296(1509949441);
+  // loc(unknown)
+  Fp x297(1006632961);
+  // loc(unknown)
+  Fp x298(65536);
+  // loc(unknown)
+  Fp x299(2013265910);
+  // loc(unknown)
+  Fp x300(11);
+  // loc(unknown)
+  Fp x301(10);
+  // loc(unknown)
+  Fp x302(9);
+  // loc(unknown)
+  Fp x303(8);
+  // loc(unknown)
+  Fp x304(7);
+  // loc(unknown)
+  Fp x305(6);
+  // loc(unknown)
+  Fp x306(5);
+  // loc(unknown)
+  Fp x307(4);
+  // loc(unknown)
+  Fp x308(3);
+  // loc(unknown)
+  Fp x309(2);
+  // loc(unknown)
+  Fp x310(1);
+  // loc(unknown)
+  Fp x311(0);
+
+
+    // loc("top(recursion::Top)/code(recursion::Code)/write_addr(Reg)"("zirgen/circuit/recursion/top.cpp":33:49))
+    auto x1361 = arg0[0 * steps + ((cycle - 0) & mask)];
+    assert(x1361 != Fp::invalid());
+    // loc("top(recursion::Top)/code(recursion::Code)/inst(Mux)/macro_ops(recursion::MacroInst)/opcode(OneHot)/wom_init(Reg)"("./zirgen/components/mux.h":59:25))
+
       extern_log(ctx, cycle, "WOM_FINI", extern_args, extern_outs);
       // loc("zirgen/circuit/recursion/wom.cpp":27:3)
       {
@@ -7503,11 +12301,644 @@ __device__ void step_exec(
         assert(reg == Fp::invalid() || reg == x311);
         reg = x311;
       }
-    }
-    // loc("top(recursion::Top)/code(recursion::Code)/inst(Mux)/macro_ops(recursion::MacroInst)/opcode(OneHot)/bit_and_elem(Reg)"("./zirgen/components/mux.h":59:25))
-    auto x1364 = arg0[11 * steps + ((cycle - 0) & mask)];
-    assert(x1364 != Fp::invalid());
-    if (x1364 != 0) {
+}
+
+__device__ __noinline__ void step_exec_macro_bit_and_elem(
+    void* ctx, uint32_t steps, uint32_t cycle, uint32_t mask,
+    Fp* arg0, Fp* arg1, Fp* arg2) {
+  Fp extern_args[96];
+  Fp extern_outs[32];
+  // loc(unknown)
+  Fp x0(192);
+  // loc(unknown)
+  Fp x1(48);
+  // loc(unknown)
+  Fp x2(12);
+  // loc(unknown)
+  Fp x3(1040977421);
+  // loc(unknown)
+  Fp x4(1792450386);
+  // loc(unknown)
+  Fp x5(1470845646);
+  // loc(unknown)
+  Fp x6(1363837384);
+  // loc(unknown)
+  Fp x7(1878280202);
+  // loc(unknown)
+  Fp x8(434078361);
+  // loc(unknown)
+  Fp x9(1946596189);
+  // loc(unknown)
+  Fp x10(875839332);
+  // loc(unknown)
+  Fp x11(463976218);
+  // loc(unknown)
+  Fp x12(976057819);
+  // loc(unknown)
+  Fp x13(48375137);
+  // loc(unknown)
+  Fp x14(1549779579);
+  // loc(unknown)
+  Fp x15(1679178250);
+  // loc(unknown)
+  Fp x16(530151394);
+  // loc(unknown)
+  Fp x17(1629316321);
+  // loc(unknown)
+  Fp x18(1854174607);
+  // loc(unknown)
+  Fp x19(720724951);
+  // loc(unknown)
+  Fp x20(14387587);
+  // loc(unknown)
+  Fp x21(1883820770);
+  // loc(unknown)
+  Fp x22(205609311);
+  // loc(unknown)
+  Fp x23(1136469704);
+  // loc(unknown)
+  Fp x24(1439947916);
+  // loc(unknown)
+  Fp x25(723038058);
+  // loc(unknown)
+  Fp x26(53041581);
+  // loc(unknown)
+  Fp x27(1810596765);
+  // loc(unknown)
+  Fp x28(1210751726);
+  // loc(unknown)
+  Fp x29(1327682690);
+  // loc(unknown)
+  Fp x30(1886977120);
+  // loc(unknown)
+  Fp x31(1551596046);
+  // loc(unknown)
+  Fp x32(1186174623);
+  // loc(unknown)
+  Fp x33(1199068823);
+  // loc(unknown)
+  Fp x34(1240419708);
+  // loc(unknown)
+  Fp x35(1708681573);
+  // loc(unknown)
+  Fp x36(308575117);
+  // loc(unknown)
+  Fp x37(1111544260);
+  // loc(unknown)
+  Fp x38(822033215);
+  // loc(unknown)
+  Fp x39(1891545577);
+  // loc(unknown)
+  Fp x40(440300254);
+  // loc(unknown)
+  Fp x41(1726563304);
+  // loc(unknown)
+  Fp x42(1365519753);
+  // loc(unknown)
+  Fp x43(924863639);
+  // loc(unknown)
+  Fp x44(1540960371);
+  // loc(unknown)
+  Fp x45(1052077299);
+  // loc(unknown)
+  Fp x46(1930103076);
+  // loc(unknown)
+  Fp x47(98371040);
+  // loc(unknown)
+  Fp x48(918610824);
+  // loc(unknown)
+  Fp x49(801504236);
+  // loc(unknown)
+  Fp x50(65998480);
+  // loc(unknown)
+  Fp x51(658182609);
+  // loc(unknown)
+  Fp x52(606789471);
+  // loc(unknown)
+  Fp x53(51866717);
+  // loc(unknown)
+  Fp x54(375892129);
+  // loc(unknown)
+  Fp x55(20525701);
+  // loc(unknown)
+  Fp x56(1997365680);
+  // loc(unknown)
+  Fp x57(1974912880);
+  // loc(unknown)
+  Fp x58(1942928017);
+  // loc(unknown)
+  Fp x59(1928969209);
+  // loc(unknown)
+  Fp x60(1867716110);
+  // loc(unknown)
+  Fp x61(1792686146);
+  // loc(unknown)
+  Fp x62(1558116381);
+  // loc(unknown)
+  Fp x63(1461037801);
+  // loc(unknown)
+  Fp x64(1389833583);
+  // loc(unknown)
+  Fp x65(13683276);
+  // loc(unknown)
+  Fp x66(1188752902);
+  // loc(unknown)
+  Fp x67(111593398);
+  // loc(unknown)
+  Fp x68(1083257840);
+  // loc(unknown)
+  Fp x69(106789798);
+  // loc(unknown)
+  Fp x70(1001081699);
+  // loc(unknown)
+  Fp x71(497520322);
+  // loc(unknown)
+  Fp x72(946500736);
+  // loc(unknown)
+  Fp x73(890243564);
+  // loc(unknown)
+  Fp x74(862495875);
+  // loc(unknown)
+  Fp x75(855276054);
+  // loc(unknown)
+  Fp x76(76770019);
+  // loc(unknown)
+  Fp x77(760115692);
+  // loc(unknown)
+  Fp x78(623051854);
+  // loc(unknown)
+  Fp x79(59510015);
+  // loc(unknown)
+  Fp x80(552696906);
+  // loc(unknown)
+  Fp x81(538103555);
+  // loc(unknown)
+  Fp x82(457372011);
+  // loc(unknown)
+  Fp x83(447555988);
+  // loc(unknown)
+  Fp x84(27129487);
+  // loc(unknown)
+  Fp x85(217046702);
+  // loc(unknown)
+  Fp x86(1950429111);
+  // loc(unknown)
+  Fp x87(192082241);
+  // loc(unknown)
+  Fp x88(1910423126);
+  // loc(unknown)
+  Fp x89(1908416316);
+  // loc(unknown)
+  Fp x90(1891637550);
+  // loc(unknown)
+  Fp x91(1841795381);
+  // loc(unknown)
+  Fp x92(1827572010);
+  // loc(unknown)
+  Fp x93(1748789933);
+  // loc(unknown)
+  Fp x94(1664590951);
+  // loc(unknown)
+  Fp x95(1663353317);
+  // loc(unknown)
+  Fp x96(162510541);
+  // loc(unknown)
+  Fp x97(1622328571);
+  // loc(unknown)
+  Fp x98(1608853840);
+  // loc(unknown)
+  Fp x99(158646617);
+  // loc(unknown)
+  Fp x100(1584033957);
+  // loc(unknown)
+  Fp x101(1567618575);
+  // loc(unknown)
+  Fp x102(1549062383);
+  // loc(unknown)
+  Fp x103(1507649755);
+  // loc(unknown)
+  Fp x104(1478577620);
+  // loc(unknown)
+  Fp x105(1463323727);
+  // loc(unknown)
+  Fp x106(1424297384);
+  // loc(unknown)
+  Fp x107(142102402);
+  // loc(unknown)
+  Fp x108(1402624179);
+  // loc(unknown)
+  Fp x109(1293938517);
+  // loc(unknown)
+  Fp x110(1257820264);
+  // loc(unknown)
+  Fp x111(1215259350);
+  // loc(unknown)
+  Fp x112(1198261138);
+  // loc(unknown)
+  Fp x113(1150410028);
+  // loc(unknown)
+  Fp x114(1147522062);
+  // loc(unknown)
+  Fp x115(1099252725);
+  // loc(unknown)
+  Fp x116(1080533265);
+  // loc(unknown)
+  Fp x117(1079030649);
+  // loc(unknown)
+  Fp x118(1065075039);
+  // loc(unknown)
+  Fp x119(1042892522);
+  // loc(unknown)
+  Fp x120(993455846);
+  // loc(unknown)
+  Fp x121(989618631);
+  // loc(unknown)
+  Fp x122(989176635);
+  // loc(unknown)
+  Fp x123(942439428);
+  // loc(unknown)
+  Fp x124(930036496);
+  // loc(unknown)
+  Fp x125(925018226);
+  // loc(unknown)
+  Fp x126(897025192);
+  // loc(unknown)
+  Fp x127(825405577);
+  // loc(unknown)
+  Fp x128(813674331);
+  // loc(unknown)
+  Fp x129(809508074);
+  // loc(unknown)
+  Fp x130(790726260);
+  // loc(unknown)
+  Fp x131(78845751);
+  // loc(unknown)
+  Fp x132(781141772);
+  // loc(unknown)
+  Fp x133(755691969);
+  // loc(unknown)
+  Fp x134(738091882);
+  // loc(unknown)
+  Fp x135(716894289);
+  // loc(unknown)
+  Fp x136(714957516);
+  // loc(unknown)
+  Fp x137(708123747);
+  // loc(unknown)
+  Fp x138(695835963);
+  // loc(unknown)
+  Fp x139(686842369);
+  // loc(unknown)
+  Fp x140(641665156);
+  // loc(unknown)
+  Fp x141(622609176);
+  // loc(unknown)
+  Fp x142(608401422);
+  // loc(unknown)
+  Fp x143(588764636);
+  // loc(unknown)
+  Fp x144(540703332);
+  // loc(unknown)
+  Fp x145(53007114);
+  // loc(unknown)
+  Fp x146(51256176);
+  // loc(unknown)
+  Fp x147(459826664);
+  // loc(unknown)
+  Fp x148(427731030);
+  // loc(unknown)
+  Fp x149(395622276);
+  // loc(unknown)
+  Fp x150(390340387);
+  // loc(unknown)
+  Fp x151(342857858);
+  // loc(unknown)
+  Fp x152(306391314);
+  // loc(unknown)
+  Fp x153(273790406);
+  // loc(unknown)
+  Fp x154(241306552);
+  // loc(unknown)
+  Fp x155(238616145);
+  // loc(unknown)
+  Fp x156(228520958);
+  // loc(unknown)
+  Fp x157(204228775);
+  // loc(unknown)
+  Fp x158(202271745);
+  // loc(unknown)
+  Fp x159(1997503974);
+  // loc(unknown)
+  Fp x160(1989924532);
+  // loc(unknown)
+  Fp x161(1917861751);
+  // loc(unknown)
+  Fp x162(1917549072);
+  // loc(unknown)
+  Fp x163(1896271507);
+  // loc(unknown)
+  Fp x164(1889898);
+  // loc(unknown)
+  Fp x165(1889603648);
+  // loc(unknown)
+  Fp x166(1845603984);
+  // loc(unknown)
+  Fp x167(1832911930);
+  // loc(unknown)
+  Fp x168(1781980094);
+  // loc(unknown)
+  Fp x169(1740472809);
+  // loc(unknown)
+  Fp x170(1737016378);
+  // loc(unknown)
+  Fp x171(172614232);
+  // loc(unknown)
+  Fp x172(1718628547);
+  // loc(unknown)
+  Fp x173(1715719711);
+  // loc(unknown)
+  Fp x174(1687379185);
+  // loc(unknown)
+  Fp x175(1672219447);
+  // loc(unknown)
+  Fp x176(1649953458);
+  // loc(unknown)
+  Fp x177(1647670797);
+  // loc(unknown)
+  Fp x178(1647665372);
+  // loc(unknown)
+  Fp x179(162506101);
+  // loc(unknown)
+  Fp x180(1608891156);
+  // loc(unknown)
+  Fp x181(1587822577);
+  // loc(unknown)
+  Fp x182(1545325389);
+  // loc(unknown)
+  Fp x183(1518763784);
+  // loc(unknown)
+  Fp x184(1507936940);
+  // loc(unknown)
+  Fp x185(150307788);
+  // loc(unknown)
+  Fp x186(1454563174);
+  // loc(unknown)
+  Fp x187(140621810);
+  // loc(unknown)
+  Fp x188(1401020792);
+  // loc(unknown)
+  Fp x189(1393671120);
+  // loc(unknown)
+  Fp x190(1380248020);
+  // loc(unknown)
+  Fp x191(1339793538);
+  // loc(unknown)
+  Fp x192(1338899225);
+  // loc(unknown)
+  Fp x193(1333667262);
+  // loc(unknown)
+  Fp x194(1303271640);
+  // loc(unknown)
+  Fp x195(1296144415);
+  // loc(unknown)
+  Fp x196(1291790245);
+  // loc(unknown)
+  Fp x197(1290028279);
+  // loc(unknown)
+  Fp x198(128479034);
+  // loc(unknown)
+  Fp x199(1282239129);
+  // loc(unknown)
+  Fp x200(1269493554);
+  // loc(unknown)
+  Fp x201(1262312258);
+  // loc(unknown)
+  Fp x202(1239734761);
+  // loc(unknown)
+  Fp x203(1221257987);
+  // loc(unknown)
+  Fp x204(1213686459);
+  // loc(unknown)
+  Fp x205(1209164052);
+  // loc(unknown)
+  Fp x206(1206940496);
+  // loc(unknown)
+  Fp x207(1201063290);
+  // loc(unknown)
+  Fp x208(117294666);
+  // loc(unknown)
+  Fp x209(1170029417);
+  // loc(unknown)
+  Fp x210(1150912935);
+  // loc(unknown)
+  Fp x211(1124078057);
+  // loc(unknown)
+  Fp x212(1111203133);
+  // loc(unknown)
+  Fp x213(1090783436);
+  // loc(unknown)
+  Fp x214(1006235079);
+  // loc(unknown)
+  Fp x215(1003792297);
+  // loc(unknown)
+  Fp x216(831813382);
+  // loc(unknown)
+  Fp x217(1421525369);
+  // loc(unknown)
+  Fp x218(1751797115);
+  // loc(unknown)
+  Fp x219(1964135730);
+  // loc(unknown)
+  Fp x220(525458520);
+  // loc(unknown)
+  Fp x221(638242172);
+  // loc(unknown)
+  Fp x222(1307439985);
+  // loc(unknown)
+  Fp x223(343354132);
+  // loc(unknown)
+  Fp x224(1389166148);
+  // loc(unknown)
+  Fp x225(1660766320);
+  // loc(unknown)
+  Fp x226(1464793095);
+  // loc(unknown)
+  Fp x227(1180307149);
+  // loc(unknown)
+  Fp x228(1930780904);
+  // loc(unknown)
+  Fp x229(1066694495);
+  // loc(unknown)
+  Fp x230(1773108264);
+  // loc(unknown)
+  Fp x231(1004040026);
+  // loc(unknown)
+  Fp x232(815798990);
+  // loc(unknown)
+  Fp x233(454905424);
+  // loc(unknown)
+  Fp x234(118043943);
+  // loc(unknown)
+  Fp x235(157582794);
+  // loc(unknown)
+  Fp x236(246143118);
+  // loc(unknown)
+  Fp x237(314968988);
+  // loc(unknown)
+  Fp x238(127253399);
+  // loc(unknown)
+  Fp x239(262278199);
+  // loc(unknown)
+  Fp x240(943718400);
+  // loc(unknown)
+  Fp x241(268435454);
+  // loc(unknown)
+  Fp x242(1761607679);
+  // loc(unknown)
+  Fp x243(1073741824);
+  // loc(unknown)
+  Fp x244(536870912);
+  // loc(unknown)
+  Fp x245(1509949437);
+  // loc(unknown)
+  Fp x246(268435456);
+  // loc(unknown)
+  Fp x247(1006632953);
+  // loc(unknown)
+  Fp x248(2013265906);
+  // loc(unknown)
+  Fp x249(134217728);
+  // loc(unknown)
+  Fp x250(67108864);
+  // loc(unknown)
+  Fp x251(2013265891);
+  // loc(unknown)
+  Fp x252(33554432);
+  // loc(unknown)
+  Fp x253(2013265861);
+  // loc(unknown)
+  Fp x254(2013265801);
+  // loc(unknown)
+  Fp x255(16777216);
+  // loc(unknown)
+  Fp x256(8388608);
+  // loc(unknown)
+  Fp x257(2013265681);
+  // loc(unknown)
+  Fp x258(4194304);
+  // loc(unknown)
+  Fp x259(2013265441);
+  // loc(unknown)
+  Fp x260(2097152);
+  // loc(unknown)
+  Fp x261(2013264961);
+  // loc(unknown)
+  Fp x262(2013264001);
+  // loc(unknown)
+  Fp x263(1048576);
+  // loc(unknown)
+  Fp x264(524288);
+  // loc(unknown)
+  Fp x265(2013262081);
+  // loc(unknown)
+  Fp x266(262144);
+  // loc(unknown)
+  Fp x267(2013258241);
+  // loc(unknown)
+  Fp x268(2013250561);
+  // loc(unknown)
+  Fp x269(131072);
+  // loc(unknown)
+  Fp x270(2013235201);
+  // loc(unknown)
+  Fp x271(32768);
+  // loc(unknown)
+  Fp x272(2013204481);
+  // loc(unknown)
+  Fp x273(2013143041);
+  // loc(unknown)
+  Fp x274(16384);
+  // loc(unknown)
+  Fp x275(8192);
+  // loc(unknown)
+  Fp x276(2013020161);
+  // loc(unknown)
+  Fp x277(4096);
+  // loc(unknown)
+  Fp x278(2012774401);
+  // loc(unknown)
+  Fp x279(2048);
+  // loc(unknown)
+  Fp x280(2012282881);
+  // loc(unknown)
+  Fp x281(2011299841);
+  // loc(unknown)
+  Fp x282(1024);
+  // loc(unknown)
+  Fp x283(512);
+  // loc(unknown)
+  Fp x284(2009333761);
+  // loc(unknown)
+  Fp x285(256);
+  // loc(unknown)
+  Fp x286(2005401601);
+  // loc(unknown)
+  Fp x287(1997537281);
+  // loc(unknown)
+  Fp x288(128);
+  // loc(unknown)
+  Fp x289(64);
+  // loc(unknown)
+  Fp x290(1981808641);
+  // loc(unknown)
+  Fp x291(32);
+  // loc(unknown)
+  Fp x292(1950351361);
+  // loc(unknown)
+  Fp x293(1887436801);
+  // loc(unknown)
+  Fp x294(16);
+  // loc(unknown)
+  Fp x295(1761607681);
+  // loc(unknown)
+  Fp x296(1509949441);
+  // loc(unknown)
+  Fp x297(1006632961);
+  // loc(unknown)
+  Fp x298(65536);
+  // loc(unknown)
+  Fp x299(2013265910);
+  // loc(unknown)
+  Fp x300(11);
+  // loc(unknown)
+  Fp x301(10);
+  // loc(unknown)
+  Fp x302(9);
+  // loc(unknown)
+  Fp x303(8);
+  // loc(unknown)
+  Fp x304(7);
+  // loc(unknown)
+  Fp x305(6);
+  // loc(unknown)
+  Fp x306(5);
+  // loc(unknown)
+  Fp x307(4);
+  // loc(unknown)
+  Fp x308(3);
+  // loc(unknown)
+  Fp x309(2);
+  // loc(unknown)
+  Fp x310(1);
+  // loc(unknown)
+  Fp x311(0);
+
+
+    // loc("top(recursion::Top)/code(recursion::Code)/write_addr(Reg)"("zirgen/circuit/recursion/top.cpp":33:49))
+    auto x1361 = arg0[0 * steps + ((cycle - 0) & mask)];
+    assert(x1361 != Fp::invalid());
+    // loc("top(recursion::Top)/code(recursion::Code)/inst(Mux)/macro_ops(recursion::MacroInst)/opcode(OneHot)/wom_init(Reg)"("./zirgen/components/mux.h":59:25))
+
       // loc("top(recursion::Top)/code(recursion::Code)/inst(Mux)/macro_ops(recursion::MacroInst)/operand[0](Reg)"("./zirgen/compiler/edsl/component.h":164:27))
       auto x1365 = arg0[18 * steps + ((cycle - 0) & mask)];
       assert(x1365 != Fp::invalid());
@@ -8920,11 +14351,644 @@ __device__ void step_exec(
                  "Out=%x, Result=%e",
                  extern_args,
                  extern_outs);
-    }
-    // loc("top(recursion::Top)/code(recursion::Code)/inst(Mux)/macro_ops(recursion::MacroInst)/opcode(OneHot)/bit_op_shorts(Reg)"("./zirgen/components/mux.h":59:25))
-    auto x1726 = arg0[12 * steps + ((cycle - 0) & mask)];
-    assert(x1726 != Fp::invalid());
-    if (x1726 != 0) {
+}
+
+__device__ __noinline__ void step_exec_macro_bit_op_shorts(
+    void* ctx, uint32_t steps, uint32_t cycle, uint32_t mask,
+    Fp* arg0, Fp* arg1, Fp* arg2) {
+  Fp extern_args[96];
+  Fp extern_outs[32];
+  // loc(unknown)
+  Fp x0(192);
+  // loc(unknown)
+  Fp x1(48);
+  // loc(unknown)
+  Fp x2(12);
+  // loc(unknown)
+  Fp x3(1040977421);
+  // loc(unknown)
+  Fp x4(1792450386);
+  // loc(unknown)
+  Fp x5(1470845646);
+  // loc(unknown)
+  Fp x6(1363837384);
+  // loc(unknown)
+  Fp x7(1878280202);
+  // loc(unknown)
+  Fp x8(434078361);
+  // loc(unknown)
+  Fp x9(1946596189);
+  // loc(unknown)
+  Fp x10(875839332);
+  // loc(unknown)
+  Fp x11(463976218);
+  // loc(unknown)
+  Fp x12(976057819);
+  // loc(unknown)
+  Fp x13(48375137);
+  // loc(unknown)
+  Fp x14(1549779579);
+  // loc(unknown)
+  Fp x15(1679178250);
+  // loc(unknown)
+  Fp x16(530151394);
+  // loc(unknown)
+  Fp x17(1629316321);
+  // loc(unknown)
+  Fp x18(1854174607);
+  // loc(unknown)
+  Fp x19(720724951);
+  // loc(unknown)
+  Fp x20(14387587);
+  // loc(unknown)
+  Fp x21(1883820770);
+  // loc(unknown)
+  Fp x22(205609311);
+  // loc(unknown)
+  Fp x23(1136469704);
+  // loc(unknown)
+  Fp x24(1439947916);
+  // loc(unknown)
+  Fp x25(723038058);
+  // loc(unknown)
+  Fp x26(53041581);
+  // loc(unknown)
+  Fp x27(1810596765);
+  // loc(unknown)
+  Fp x28(1210751726);
+  // loc(unknown)
+  Fp x29(1327682690);
+  // loc(unknown)
+  Fp x30(1886977120);
+  // loc(unknown)
+  Fp x31(1551596046);
+  // loc(unknown)
+  Fp x32(1186174623);
+  // loc(unknown)
+  Fp x33(1199068823);
+  // loc(unknown)
+  Fp x34(1240419708);
+  // loc(unknown)
+  Fp x35(1708681573);
+  // loc(unknown)
+  Fp x36(308575117);
+  // loc(unknown)
+  Fp x37(1111544260);
+  // loc(unknown)
+  Fp x38(822033215);
+  // loc(unknown)
+  Fp x39(1891545577);
+  // loc(unknown)
+  Fp x40(440300254);
+  // loc(unknown)
+  Fp x41(1726563304);
+  // loc(unknown)
+  Fp x42(1365519753);
+  // loc(unknown)
+  Fp x43(924863639);
+  // loc(unknown)
+  Fp x44(1540960371);
+  // loc(unknown)
+  Fp x45(1052077299);
+  // loc(unknown)
+  Fp x46(1930103076);
+  // loc(unknown)
+  Fp x47(98371040);
+  // loc(unknown)
+  Fp x48(918610824);
+  // loc(unknown)
+  Fp x49(801504236);
+  // loc(unknown)
+  Fp x50(65998480);
+  // loc(unknown)
+  Fp x51(658182609);
+  // loc(unknown)
+  Fp x52(606789471);
+  // loc(unknown)
+  Fp x53(51866717);
+  // loc(unknown)
+  Fp x54(375892129);
+  // loc(unknown)
+  Fp x55(20525701);
+  // loc(unknown)
+  Fp x56(1997365680);
+  // loc(unknown)
+  Fp x57(1974912880);
+  // loc(unknown)
+  Fp x58(1942928017);
+  // loc(unknown)
+  Fp x59(1928969209);
+  // loc(unknown)
+  Fp x60(1867716110);
+  // loc(unknown)
+  Fp x61(1792686146);
+  // loc(unknown)
+  Fp x62(1558116381);
+  // loc(unknown)
+  Fp x63(1461037801);
+  // loc(unknown)
+  Fp x64(1389833583);
+  // loc(unknown)
+  Fp x65(13683276);
+  // loc(unknown)
+  Fp x66(1188752902);
+  // loc(unknown)
+  Fp x67(111593398);
+  // loc(unknown)
+  Fp x68(1083257840);
+  // loc(unknown)
+  Fp x69(106789798);
+  // loc(unknown)
+  Fp x70(1001081699);
+  // loc(unknown)
+  Fp x71(497520322);
+  // loc(unknown)
+  Fp x72(946500736);
+  // loc(unknown)
+  Fp x73(890243564);
+  // loc(unknown)
+  Fp x74(862495875);
+  // loc(unknown)
+  Fp x75(855276054);
+  // loc(unknown)
+  Fp x76(76770019);
+  // loc(unknown)
+  Fp x77(760115692);
+  // loc(unknown)
+  Fp x78(623051854);
+  // loc(unknown)
+  Fp x79(59510015);
+  // loc(unknown)
+  Fp x80(552696906);
+  // loc(unknown)
+  Fp x81(538103555);
+  // loc(unknown)
+  Fp x82(457372011);
+  // loc(unknown)
+  Fp x83(447555988);
+  // loc(unknown)
+  Fp x84(27129487);
+  // loc(unknown)
+  Fp x85(217046702);
+  // loc(unknown)
+  Fp x86(1950429111);
+  // loc(unknown)
+  Fp x87(192082241);
+  // loc(unknown)
+  Fp x88(1910423126);
+  // loc(unknown)
+  Fp x89(1908416316);
+  // loc(unknown)
+  Fp x90(1891637550);
+  // loc(unknown)
+  Fp x91(1841795381);
+  // loc(unknown)
+  Fp x92(1827572010);
+  // loc(unknown)
+  Fp x93(1748789933);
+  // loc(unknown)
+  Fp x94(1664590951);
+  // loc(unknown)
+  Fp x95(1663353317);
+  // loc(unknown)
+  Fp x96(162510541);
+  // loc(unknown)
+  Fp x97(1622328571);
+  // loc(unknown)
+  Fp x98(1608853840);
+  // loc(unknown)
+  Fp x99(158646617);
+  // loc(unknown)
+  Fp x100(1584033957);
+  // loc(unknown)
+  Fp x101(1567618575);
+  // loc(unknown)
+  Fp x102(1549062383);
+  // loc(unknown)
+  Fp x103(1507649755);
+  // loc(unknown)
+  Fp x104(1478577620);
+  // loc(unknown)
+  Fp x105(1463323727);
+  // loc(unknown)
+  Fp x106(1424297384);
+  // loc(unknown)
+  Fp x107(142102402);
+  // loc(unknown)
+  Fp x108(1402624179);
+  // loc(unknown)
+  Fp x109(1293938517);
+  // loc(unknown)
+  Fp x110(1257820264);
+  // loc(unknown)
+  Fp x111(1215259350);
+  // loc(unknown)
+  Fp x112(1198261138);
+  // loc(unknown)
+  Fp x113(1150410028);
+  // loc(unknown)
+  Fp x114(1147522062);
+  // loc(unknown)
+  Fp x115(1099252725);
+  // loc(unknown)
+  Fp x116(1080533265);
+  // loc(unknown)
+  Fp x117(1079030649);
+  // loc(unknown)
+  Fp x118(1065075039);
+  // loc(unknown)
+  Fp x119(1042892522);
+  // loc(unknown)
+  Fp x120(993455846);
+  // loc(unknown)
+  Fp x121(989618631);
+  // loc(unknown)
+  Fp x122(989176635);
+  // loc(unknown)
+  Fp x123(942439428);
+  // loc(unknown)
+  Fp x124(930036496);
+  // loc(unknown)
+  Fp x125(925018226);
+  // loc(unknown)
+  Fp x126(897025192);
+  // loc(unknown)
+  Fp x127(825405577);
+  // loc(unknown)
+  Fp x128(813674331);
+  // loc(unknown)
+  Fp x129(809508074);
+  // loc(unknown)
+  Fp x130(790726260);
+  // loc(unknown)
+  Fp x131(78845751);
+  // loc(unknown)
+  Fp x132(781141772);
+  // loc(unknown)
+  Fp x133(755691969);
+  // loc(unknown)
+  Fp x134(738091882);
+  // loc(unknown)
+  Fp x135(716894289);
+  // loc(unknown)
+  Fp x136(714957516);
+  // loc(unknown)
+  Fp x137(708123747);
+  // loc(unknown)
+  Fp x138(695835963);
+  // loc(unknown)
+  Fp x139(686842369);
+  // loc(unknown)
+  Fp x140(641665156);
+  // loc(unknown)
+  Fp x141(622609176);
+  // loc(unknown)
+  Fp x142(608401422);
+  // loc(unknown)
+  Fp x143(588764636);
+  // loc(unknown)
+  Fp x144(540703332);
+  // loc(unknown)
+  Fp x145(53007114);
+  // loc(unknown)
+  Fp x146(51256176);
+  // loc(unknown)
+  Fp x147(459826664);
+  // loc(unknown)
+  Fp x148(427731030);
+  // loc(unknown)
+  Fp x149(395622276);
+  // loc(unknown)
+  Fp x150(390340387);
+  // loc(unknown)
+  Fp x151(342857858);
+  // loc(unknown)
+  Fp x152(306391314);
+  // loc(unknown)
+  Fp x153(273790406);
+  // loc(unknown)
+  Fp x154(241306552);
+  // loc(unknown)
+  Fp x155(238616145);
+  // loc(unknown)
+  Fp x156(228520958);
+  // loc(unknown)
+  Fp x157(204228775);
+  // loc(unknown)
+  Fp x158(202271745);
+  // loc(unknown)
+  Fp x159(1997503974);
+  // loc(unknown)
+  Fp x160(1989924532);
+  // loc(unknown)
+  Fp x161(1917861751);
+  // loc(unknown)
+  Fp x162(1917549072);
+  // loc(unknown)
+  Fp x163(1896271507);
+  // loc(unknown)
+  Fp x164(1889898);
+  // loc(unknown)
+  Fp x165(1889603648);
+  // loc(unknown)
+  Fp x166(1845603984);
+  // loc(unknown)
+  Fp x167(1832911930);
+  // loc(unknown)
+  Fp x168(1781980094);
+  // loc(unknown)
+  Fp x169(1740472809);
+  // loc(unknown)
+  Fp x170(1737016378);
+  // loc(unknown)
+  Fp x171(172614232);
+  // loc(unknown)
+  Fp x172(1718628547);
+  // loc(unknown)
+  Fp x173(1715719711);
+  // loc(unknown)
+  Fp x174(1687379185);
+  // loc(unknown)
+  Fp x175(1672219447);
+  // loc(unknown)
+  Fp x176(1649953458);
+  // loc(unknown)
+  Fp x177(1647670797);
+  // loc(unknown)
+  Fp x178(1647665372);
+  // loc(unknown)
+  Fp x179(162506101);
+  // loc(unknown)
+  Fp x180(1608891156);
+  // loc(unknown)
+  Fp x181(1587822577);
+  // loc(unknown)
+  Fp x182(1545325389);
+  // loc(unknown)
+  Fp x183(1518763784);
+  // loc(unknown)
+  Fp x184(1507936940);
+  // loc(unknown)
+  Fp x185(150307788);
+  // loc(unknown)
+  Fp x186(1454563174);
+  // loc(unknown)
+  Fp x187(140621810);
+  // loc(unknown)
+  Fp x188(1401020792);
+  // loc(unknown)
+  Fp x189(1393671120);
+  // loc(unknown)
+  Fp x190(1380248020);
+  // loc(unknown)
+  Fp x191(1339793538);
+  // loc(unknown)
+  Fp x192(1338899225);
+  // loc(unknown)
+  Fp x193(1333667262);
+  // loc(unknown)
+  Fp x194(1303271640);
+  // loc(unknown)
+  Fp x195(1296144415);
+  // loc(unknown)
+  Fp x196(1291790245);
+  // loc(unknown)
+  Fp x197(1290028279);
+  // loc(unknown)
+  Fp x198(128479034);
+  // loc(unknown)
+  Fp x199(1282239129);
+  // loc(unknown)
+  Fp x200(1269493554);
+  // loc(unknown)
+  Fp x201(1262312258);
+  // loc(unknown)
+  Fp x202(1239734761);
+  // loc(unknown)
+  Fp x203(1221257987);
+  // loc(unknown)
+  Fp x204(1213686459);
+  // loc(unknown)
+  Fp x205(1209164052);
+  // loc(unknown)
+  Fp x206(1206940496);
+  // loc(unknown)
+  Fp x207(1201063290);
+  // loc(unknown)
+  Fp x208(117294666);
+  // loc(unknown)
+  Fp x209(1170029417);
+  // loc(unknown)
+  Fp x210(1150912935);
+  // loc(unknown)
+  Fp x211(1124078057);
+  // loc(unknown)
+  Fp x212(1111203133);
+  // loc(unknown)
+  Fp x213(1090783436);
+  // loc(unknown)
+  Fp x214(1006235079);
+  // loc(unknown)
+  Fp x215(1003792297);
+  // loc(unknown)
+  Fp x216(831813382);
+  // loc(unknown)
+  Fp x217(1421525369);
+  // loc(unknown)
+  Fp x218(1751797115);
+  // loc(unknown)
+  Fp x219(1964135730);
+  // loc(unknown)
+  Fp x220(525458520);
+  // loc(unknown)
+  Fp x221(638242172);
+  // loc(unknown)
+  Fp x222(1307439985);
+  // loc(unknown)
+  Fp x223(343354132);
+  // loc(unknown)
+  Fp x224(1389166148);
+  // loc(unknown)
+  Fp x225(1660766320);
+  // loc(unknown)
+  Fp x226(1464793095);
+  // loc(unknown)
+  Fp x227(1180307149);
+  // loc(unknown)
+  Fp x228(1930780904);
+  // loc(unknown)
+  Fp x229(1066694495);
+  // loc(unknown)
+  Fp x230(1773108264);
+  // loc(unknown)
+  Fp x231(1004040026);
+  // loc(unknown)
+  Fp x232(815798990);
+  // loc(unknown)
+  Fp x233(454905424);
+  // loc(unknown)
+  Fp x234(118043943);
+  // loc(unknown)
+  Fp x235(157582794);
+  // loc(unknown)
+  Fp x236(246143118);
+  // loc(unknown)
+  Fp x237(314968988);
+  // loc(unknown)
+  Fp x238(127253399);
+  // loc(unknown)
+  Fp x239(262278199);
+  // loc(unknown)
+  Fp x240(943718400);
+  // loc(unknown)
+  Fp x241(268435454);
+  // loc(unknown)
+  Fp x242(1761607679);
+  // loc(unknown)
+  Fp x243(1073741824);
+  // loc(unknown)
+  Fp x244(536870912);
+  // loc(unknown)
+  Fp x245(1509949437);
+  // loc(unknown)
+  Fp x246(268435456);
+  // loc(unknown)
+  Fp x247(1006632953);
+  // loc(unknown)
+  Fp x248(2013265906);
+  // loc(unknown)
+  Fp x249(134217728);
+  // loc(unknown)
+  Fp x250(67108864);
+  // loc(unknown)
+  Fp x251(2013265891);
+  // loc(unknown)
+  Fp x252(33554432);
+  // loc(unknown)
+  Fp x253(2013265861);
+  // loc(unknown)
+  Fp x254(2013265801);
+  // loc(unknown)
+  Fp x255(16777216);
+  // loc(unknown)
+  Fp x256(8388608);
+  // loc(unknown)
+  Fp x257(2013265681);
+  // loc(unknown)
+  Fp x258(4194304);
+  // loc(unknown)
+  Fp x259(2013265441);
+  // loc(unknown)
+  Fp x260(2097152);
+  // loc(unknown)
+  Fp x261(2013264961);
+  // loc(unknown)
+  Fp x262(2013264001);
+  // loc(unknown)
+  Fp x263(1048576);
+  // loc(unknown)
+  Fp x264(524288);
+  // loc(unknown)
+  Fp x265(2013262081);
+  // loc(unknown)
+  Fp x266(262144);
+  // loc(unknown)
+  Fp x267(2013258241);
+  // loc(unknown)
+  Fp x268(2013250561);
+  // loc(unknown)
+  Fp x269(131072);
+  // loc(unknown)
+  Fp x270(2013235201);
+  // loc(unknown)
+  Fp x271(32768);
+  // loc(unknown)
+  Fp x272(2013204481);
+  // loc(unknown)
+  Fp x273(2013143041);
+  // loc(unknown)
+  Fp x274(16384);
+  // loc(unknown)
+  Fp x275(8192);
+  // loc(unknown)
+  Fp x276(2013020161);
+  // loc(unknown)
+  Fp x277(4096);
+  // loc(unknown)
+  Fp x278(2012774401);
+  // loc(unknown)
+  Fp x279(2048);
+  // loc(unknown)
+  Fp x280(2012282881);
+  // loc(unknown)
+  Fp x281(2011299841);
+  // loc(unknown)
+  Fp x282(1024);
+  // loc(unknown)
+  Fp x283(512);
+  // loc(unknown)
+  Fp x284(2009333761);
+  // loc(unknown)
+  Fp x285(256);
+  // loc(unknown)
+  Fp x286(2005401601);
+  // loc(unknown)
+  Fp x287(1997537281);
+  // loc(unknown)
+  Fp x288(128);
+  // loc(unknown)
+  Fp x289(64);
+  // loc(unknown)
+  Fp x290(1981808641);
+  // loc(unknown)
+  Fp x291(32);
+  // loc(unknown)
+  Fp x292(1950351361);
+  // loc(unknown)
+  Fp x293(1887436801);
+  // loc(unknown)
+  Fp x294(16);
+  // loc(unknown)
+  Fp x295(1761607681);
+  // loc(unknown)
+  Fp x296(1509949441);
+  // loc(unknown)
+  Fp x297(1006632961);
+  // loc(unknown)
+  Fp x298(65536);
+  // loc(unknown)
+  Fp x299(2013265910);
+  // loc(unknown)
+  Fp x300(11);
+  // loc(unknown)
+  Fp x301(10);
+  // loc(unknown)
+  Fp x302(9);
+  // loc(unknown)
+  Fp x303(8);
+  // loc(unknown)
+  Fp x304(7);
+  // loc(unknown)
+  Fp x305(6);
+  // loc(unknown)
+  Fp x306(5);
+  // loc(unknown)
+  Fp x307(4);
+  // loc(unknown)
+  Fp x308(3);
+  // loc(unknown)
+  Fp x309(2);
+  // loc(unknown)
+  Fp x310(1);
+  // loc(unknown)
+  Fp x311(0);
+
+
+    // loc("top(recursion::Top)/code(recursion::Code)/write_addr(Reg)"("zirgen/circuit/recursion/top.cpp":33:49))
+    auto x1361 = arg0[0 * steps + ((cycle - 0) & mask)];
+    assert(x1361 != Fp::invalid());
+    // loc("top(recursion::Top)/code(recursion::Code)/inst(Mux)/macro_ops(recursion::MacroInst)/opcode(OneHot)/wom_init(Reg)"("./zirgen/components/mux.h":59:25))
+
       // loc("top(recursion::Top)/code(recursion::Code)/inst(Mux)/macro_ops(recursion::MacroInst)/operand[0](Reg)"("./zirgen/compiler/edsl/component.h":164:27))
       auto x1727 = arg0[18 * steps + ((cycle - 0) & mask)];
       assert(x1727 != Fp::invalid());
@@ -10266,11 +16330,644 @@ __device__ void step_exec(
         extern_args[3] = x2048;
         extern_log(ctx, cycle, "  XOR Result = %e", extern_args, extern_outs);
       }
-    }
-    // loc("top(recursion::Top)/code(recursion::Code)/inst(Mux)/macro_ops(recursion::MacroInst)/opcode(OneHot)/sha_init(Reg)"("./zirgen/components/mux.h":59:25))
-    auto x2049 = arg0[13 * steps + ((cycle - 0) & mask)];
-    assert(x2049 != Fp::invalid());
-    if (x2049 != 0) {
+}
+
+__device__ __noinline__ void step_exec_macro_sha_init(
+    void* ctx, uint32_t steps, uint32_t cycle, uint32_t mask,
+    Fp* arg0, Fp* arg1, Fp* arg2) {
+  Fp extern_args[96];
+  Fp extern_outs[32];
+  // loc(unknown)
+  Fp x0(192);
+  // loc(unknown)
+  Fp x1(48);
+  // loc(unknown)
+  Fp x2(12);
+  // loc(unknown)
+  Fp x3(1040977421);
+  // loc(unknown)
+  Fp x4(1792450386);
+  // loc(unknown)
+  Fp x5(1470845646);
+  // loc(unknown)
+  Fp x6(1363837384);
+  // loc(unknown)
+  Fp x7(1878280202);
+  // loc(unknown)
+  Fp x8(434078361);
+  // loc(unknown)
+  Fp x9(1946596189);
+  // loc(unknown)
+  Fp x10(875839332);
+  // loc(unknown)
+  Fp x11(463976218);
+  // loc(unknown)
+  Fp x12(976057819);
+  // loc(unknown)
+  Fp x13(48375137);
+  // loc(unknown)
+  Fp x14(1549779579);
+  // loc(unknown)
+  Fp x15(1679178250);
+  // loc(unknown)
+  Fp x16(530151394);
+  // loc(unknown)
+  Fp x17(1629316321);
+  // loc(unknown)
+  Fp x18(1854174607);
+  // loc(unknown)
+  Fp x19(720724951);
+  // loc(unknown)
+  Fp x20(14387587);
+  // loc(unknown)
+  Fp x21(1883820770);
+  // loc(unknown)
+  Fp x22(205609311);
+  // loc(unknown)
+  Fp x23(1136469704);
+  // loc(unknown)
+  Fp x24(1439947916);
+  // loc(unknown)
+  Fp x25(723038058);
+  // loc(unknown)
+  Fp x26(53041581);
+  // loc(unknown)
+  Fp x27(1810596765);
+  // loc(unknown)
+  Fp x28(1210751726);
+  // loc(unknown)
+  Fp x29(1327682690);
+  // loc(unknown)
+  Fp x30(1886977120);
+  // loc(unknown)
+  Fp x31(1551596046);
+  // loc(unknown)
+  Fp x32(1186174623);
+  // loc(unknown)
+  Fp x33(1199068823);
+  // loc(unknown)
+  Fp x34(1240419708);
+  // loc(unknown)
+  Fp x35(1708681573);
+  // loc(unknown)
+  Fp x36(308575117);
+  // loc(unknown)
+  Fp x37(1111544260);
+  // loc(unknown)
+  Fp x38(822033215);
+  // loc(unknown)
+  Fp x39(1891545577);
+  // loc(unknown)
+  Fp x40(440300254);
+  // loc(unknown)
+  Fp x41(1726563304);
+  // loc(unknown)
+  Fp x42(1365519753);
+  // loc(unknown)
+  Fp x43(924863639);
+  // loc(unknown)
+  Fp x44(1540960371);
+  // loc(unknown)
+  Fp x45(1052077299);
+  // loc(unknown)
+  Fp x46(1930103076);
+  // loc(unknown)
+  Fp x47(98371040);
+  // loc(unknown)
+  Fp x48(918610824);
+  // loc(unknown)
+  Fp x49(801504236);
+  // loc(unknown)
+  Fp x50(65998480);
+  // loc(unknown)
+  Fp x51(658182609);
+  // loc(unknown)
+  Fp x52(606789471);
+  // loc(unknown)
+  Fp x53(51866717);
+  // loc(unknown)
+  Fp x54(375892129);
+  // loc(unknown)
+  Fp x55(20525701);
+  // loc(unknown)
+  Fp x56(1997365680);
+  // loc(unknown)
+  Fp x57(1974912880);
+  // loc(unknown)
+  Fp x58(1942928017);
+  // loc(unknown)
+  Fp x59(1928969209);
+  // loc(unknown)
+  Fp x60(1867716110);
+  // loc(unknown)
+  Fp x61(1792686146);
+  // loc(unknown)
+  Fp x62(1558116381);
+  // loc(unknown)
+  Fp x63(1461037801);
+  // loc(unknown)
+  Fp x64(1389833583);
+  // loc(unknown)
+  Fp x65(13683276);
+  // loc(unknown)
+  Fp x66(1188752902);
+  // loc(unknown)
+  Fp x67(111593398);
+  // loc(unknown)
+  Fp x68(1083257840);
+  // loc(unknown)
+  Fp x69(106789798);
+  // loc(unknown)
+  Fp x70(1001081699);
+  // loc(unknown)
+  Fp x71(497520322);
+  // loc(unknown)
+  Fp x72(946500736);
+  // loc(unknown)
+  Fp x73(890243564);
+  // loc(unknown)
+  Fp x74(862495875);
+  // loc(unknown)
+  Fp x75(855276054);
+  // loc(unknown)
+  Fp x76(76770019);
+  // loc(unknown)
+  Fp x77(760115692);
+  // loc(unknown)
+  Fp x78(623051854);
+  // loc(unknown)
+  Fp x79(59510015);
+  // loc(unknown)
+  Fp x80(552696906);
+  // loc(unknown)
+  Fp x81(538103555);
+  // loc(unknown)
+  Fp x82(457372011);
+  // loc(unknown)
+  Fp x83(447555988);
+  // loc(unknown)
+  Fp x84(27129487);
+  // loc(unknown)
+  Fp x85(217046702);
+  // loc(unknown)
+  Fp x86(1950429111);
+  // loc(unknown)
+  Fp x87(192082241);
+  // loc(unknown)
+  Fp x88(1910423126);
+  // loc(unknown)
+  Fp x89(1908416316);
+  // loc(unknown)
+  Fp x90(1891637550);
+  // loc(unknown)
+  Fp x91(1841795381);
+  // loc(unknown)
+  Fp x92(1827572010);
+  // loc(unknown)
+  Fp x93(1748789933);
+  // loc(unknown)
+  Fp x94(1664590951);
+  // loc(unknown)
+  Fp x95(1663353317);
+  // loc(unknown)
+  Fp x96(162510541);
+  // loc(unknown)
+  Fp x97(1622328571);
+  // loc(unknown)
+  Fp x98(1608853840);
+  // loc(unknown)
+  Fp x99(158646617);
+  // loc(unknown)
+  Fp x100(1584033957);
+  // loc(unknown)
+  Fp x101(1567618575);
+  // loc(unknown)
+  Fp x102(1549062383);
+  // loc(unknown)
+  Fp x103(1507649755);
+  // loc(unknown)
+  Fp x104(1478577620);
+  // loc(unknown)
+  Fp x105(1463323727);
+  // loc(unknown)
+  Fp x106(1424297384);
+  // loc(unknown)
+  Fp x107(142102402);
+  // loc(unknown)
+  Fp x108(1402624179);
+  // loc(unknown)
+  Fp x109(1293938517);
+  // loc(unknown)
+  Fp x110(1257820264);
+  // loc(unknown)
+  Fp x111(1215259350);
+  // loc(unknown)
+  Fp x112(1198261138);
+  // loc(unknown)
+  Fp x113(1150410028);
+  // loc(unknown)
+  Fp x114(1147522062);
+  // loc(unknown)
+  Fp x115(1099252725);
+  // loc(unknown)
+  Fp x116(1080533265);
+  // loc(unknown)
+  Fp x117(1079030649);
+  // loc(unknown)
+  Fp x118(1065075039);
+  // loc(unknown)
+  Fp x119(1042892522);
+  // loc(unknown)
+  Fp x120(993455846);
+  // loc(unknown)
+  Fp x121(989618631);
+  // loc(unknown)
+  Fp x122(989176635);
+  // loc(unknown)
+  Fp x123(942439428);
+  // loc(unknown)
+  Fp x124(930036496);
+  // loc(unknown)
+  Fp x125(925018226);
+  // loc(unknown)
+  Fp x126(897025192);
+  // loc(unknown)
+  Fp x127(825405577);
+  // loc(unknown)
+  Fp x128(813674331);
+  // loc(unknown)
+  Fp x129(809508074);
+  // loc(unknown)
+  Fp x130(790726260);
+  // loc(unknown)
+  Fp x131(78845751);
+  // loc(unknown)
+  Fp x132(781141772);
+  // loc(unknown)
+  Fp x133(755691969);
+  // loc(unknown)
+  Fp x134(738091882);
+  // loc(unknown)
+  Fp x135(716894289);
+  // loc(unknown)
+  Fp x136(714957516);
+  // loc(unknown)
+  Fp x137(708123747);
+  // loc(unknown)
+  Fp x138(695835963);
+  // loc(unknown)
+  Fp x139(686842369);
+  // loc(unknown)
+  Fp x140(641665156);
+  // loc(unknown)
+  Fp x141(622609176);
+  // loc(unknown)
+  Fp x142(608401422);
+  // loc(unknown)
+  Fp x143(588764636);
+  // loc(unknown)
+  Fp x144(540703332);
+  // loc(unknown)
+  Fp x145(53007114);
+  // loc(unknown)
+  Fp x146(51256176);
+  // loc(unknown)
+  Fp x147(459826664);
+  // loc(unknown)
+  Fp x148(427731030);
+  // loc(unknown)
+  Fp x149(395622276);
+  // loc(unknown)
+  Fp x150(390340387);
+  // loc(unknown)
+  Fp x151(342857858);
+  // loc(unknown)
+  Fp x152(306391314);
+  // loc(unknown)
+  Fp x153(273790406);
+  // loc(unknown)
+  Fp x154(241306552);
+  // loc(unknown)
+  Fp x155(238616145);
+  // loc(unknown)
+  Fp x156(228520958);
+  // loc(unknown)
+  Fp x157(204228775);
+  // loc(unknown)
+  Fp x158(202271745);
+  // loc(unknown)
+  Fp x159(1997503974);
+  // loc(unknown)
+  Fp x160(1989924532);
+  // loc(unknown)
+  Fp x161(1917861751);
+  // loc(unknown)
+  Fp x162(1917549072);
+  // loc(unknown)
+  Fp x163(1896271507);
+  // loc(unknown)
+  Fp x164(1889898);
+  // loc(unknown)
+  Fp x165(1889603648);
+  // loc(unknown)
+  Fp x166(1845603984);
+  // loc(unknown)
+  Fp x167(1832911930);
+  // loc(unknown)
+  Fp x168(1781980094);
+  // loc(unknown)
+  Fp x169(1740472809);
+  // loc(unknown)
+  Fp x170(1737016378);
+  // loc(unknown)
+  Fp x171(172614232);
+  // loc(unknown)
+  Fp x172(1718628547);
+  // loc(unknown)
+  Fp x173(1715719711);
+  // loc(unknown)
+  Fp x174(1687379185);
+  // loc(unknown)
+  Fp x175(1672219447);
+  // loc(unknown)
+  Fp x176(1649953458);
+  // loc(unknown)
+  Fp x177(1647670797);
+  // loc(unknown)
+  Fp x178(1647665372);
+  // loc(unknown)
+  Fp x179(162506101);
+  // loc(unknown)
+  Fp x180(1608891156);
+  // loc(unknown)
+  Fp x181(1587822577);
+  // loc(unknown)
+  Fp x182(1545325389);
+  // loc(unknown)
+  Fp x183(1518763784);
+  // loc(unknown)
+  Fp x184(1507936940);
+  // loc(unknown)
+  Fp x185(150307788);
+  // loc(unknown)
+  Fp x186(1454563174);
+  // loc(unknown)
+  Fp x187(140621810);
+  // loc(unknown)
+  Fp x188(1401020792);
+  // loc(unknown)
+  Fp x189(1393671120);
+  // loc(unknown)
+  Fp x190(1380248020);
+  // loc(unknown)
+  Fp x191(1339793538);
+  // loc(unknown)
+  Fp x192(1338899225);
+  // loc(unknown)
+  Fp x193(1333667262);
+  // loc(unknown)
+  Fp x194(1303271640);
+  // loc(unknown)
+  Fp x195(1296144415);
+  // loc(unknown)
+  Fp x196(1291790245);
+  // loc(unknown)
+  Fp x197(1290028279);
+  // loc(unknown)
+  Fp x198(128479034);
+  // loc(unknown)
+  Fp x199(1282239129);
+  // loc(unknown)
+  Fp x200(1269493554);
+  // loc(unknown)
+  Fp x201(1262312258);
+  // loc(unknown)
+  Fp x202(1239734761);
+  // loc(unknown)
+  Fp x203(1221257987);
+  // loc(unknown)
+  Fp x204(1213686459);
+  // loc(unknown)
+  Fp x205(1209164052);
+  // loc(unknown)
+  Fp x206(1206940496);
+  // loc(unknown)
+  Fp x207(1201063290);
+  // loc(unknown)
+  Fp x208(117294666);
+  // loc(unknown)
+  Fp x209(1170029417);
+  // loc(unknown)
+  Fp x210(1150912935);
+  // loc(unknown)
+  Fp x211(1124078057);
+  // loc(unknown)
+  Fp x212(1111203133);
+  // loc(unknown)
+  Fp x213(1090783436);
+  // loc(unknown)
+  Fp x214(1006235079);
+  // loc(unknown)
+  Fp x215(1003792297);
+  // loc(unknown)
+  Fp x216(831813382);
+  // loc(unknown)
+  Fp x217(1421525369);
+  // loc(unknown)
+  Fp x218(1751797115);
+  // loc(unknown)
+  Fp x219(1964135730);
+  // loc(unknown)
+  Fp x220(525458520);
+  // loc(unknown)
+  Fp x221(638242172);
+  // loc(unknown)
+  Fp x222(1307439985);
+  // loc(unknown)
+  Fp x223(343354132);
+  // loc(unknown)
+  Fp x224(1389166148);
+  // loc(unknown)
+  Fp x225(1660766320);
+  // loc(unknown)
+  Fp x226(1464793095);
+  // loc(unknown)
+  Fp x227(1180307149);
+  // loc(unknown)
+  Fp x228(1930780904);
+  // loc(unknown)
+  Fp x229(1066694495);
+  // loc(unknown)
+  Fp x230(1773108264);
+  // loc(unknown)
+  Fp x231(1004040026);
+  // loc(unknown)
+  Fp x232(815798990);
+  // loc(unknown)
+  Fp x233(454905424);
+  // loc(unknown)
+  Fp x234(118043943);
+  // loc(unknown)
+  Fp x235(157582794);
+  // loc(unknown)
+  Fp x236(246143118);
+  // loc(unknown)
+  Fp x237(314968988);
+  // loc(unknown)
+  Fp x238(127253399);
+  // loc(unknown)
+  Fp x239(262278199);
+  // loc(unknown)
+  Fp x240(943718400);
+  // loc(unknown)
+  Fp x241(268435454);
+  // loc(unknown)
+  Fp x242(1761607679);
+  // loc(unknown)
+  Fp x243(1073741824);
+  // loc(unknown)
+  Fp x244(536870912);
+  // loc(unknown)
+  Fp x245(1509949437);
+  // loc(unknown)
+  Fp x246(268435456);
+  // loc(unknown)
+  Fp x247(1006632953);
+  // loc(unknown)
+  Fp x248(2013265906);
+  // loc(unknown)
+  Fp x249(134217728);
+  // loc(unknown)
+  Fp x250(67108864);
+  // loc(unknown)
+  Fp x251(2013265891);
+  // loc(unknown)
+  Fp x252(33554432);
+  // loc(unknown)
+  Fp x253(2013265861);
+  // loc(unknown)
+  Fp x254(2013265801);
+  // loc(unknown)
+  Fp x255(16777216);
+  // loc(unknown)
+  Fp x256(8388608);
+  // loc(unknown)
+  Fp x257(2013265681);
+  // loc(unknown)
+  Fp x258(4194304);
+  // loc(unknown)
+  Fp x259(2013265441);
+  // loc(unknown)
+  Fp x260(2097152);
+  // loc(unknown)
+  Fp x261(2013264961);
+  // loc(unknown)
+  Fp x262(2013264001);
+  // loc(unknown)
+  Fp x263(1048576);
+  // loc(unknown)
+  Fp x264(524288);
+  // loc(unknown)
+  Fp x265(2013262081);
+  // loc(unknown)
+  Fp x266(262144);
+  // loc(unknown)
+  Fp x267(2013258241);
+  // loc(unknown)
+  Fp x268(2013250561);
+  // loc(unknown)
+  Fp x269(131072);
+  // loc(unknown)
+  Fp x270(2013235201);
+  // loc(unknown)
+  Fp x271(32768);
+  // loc(unknown)
+  Fp x272(2013204481);
+  // loc(unknown)
+  Fp x273(2013143041);
+  // loc(unknown)
+  Fp x274(16384);
+  // loc(unknown)
+  Fp x275(8192);
+  // loc(unknown)
+  Fp x276(2013020161);
+  // loc(unknown)
+  Fp x277(4096);
+  // loc(unknown)
+  Fp x278(2012774401);
+  // loc(unknown)
+  Fp x279(2048);
+  // loc(unknown)
+  Fp x280(2012282881);
+  // loc(unknown)
+  Fp x281(2011299841);
+  // loc(unknown)
+  Fp x282(1024);
+  // loc(unknown)
+  Fp x283(512);
+  // loc(unknown)
+  Fp x284(2009333761);
+  // loc(unknown)
+  Fp x285(256);
+  // loc(unknown)
+  Fp x286(2005401601);
+  // loc(unknown)
+  Fp x287(1997537281);
+  // loc(unknown)
+  Fp x288(128);
+  // loc(unknown)
+  Fp x289(64);
+  // loc(unknown)
+  Fp x290(1981808641);
+  // loc(unknown)
+  Fp x291(32);
+  // loc(unknown)
+  Fp x292(1950351361);
+  // loc(unknown)
+  Fp x293(1887436801);
+  // loc(unknown)
+  Fp x294(16);
+  // loc(unknown)
+  Fp x295(1761607681);
+  // loc(unknown)
+  Fp x296(1509949441);
+  // loc(unknown)
+  Fp x297(1006632961);
+  // loc(unknown)
+  Fp x298(65536);
+  // loc(unknown)
+  Fp x299(2013265910);
+  // loc(unknown)
+  Fp x300(11);
+  // loc(unknown)
+  Fp x301(10);
+  // loc(unknown)
+  Fp x302(9);
+  // loc(unknown)
+  Fp x303(8);
+  // loc(unknown)
+  Fp x304(7);
+  // loc(unknown)
+  Fp x305(6);
+  // loc(unknown)
+  Fp x306(5);
+  // loc(unknown)
+  Fp x307(4);
+  // loc(unknown)
+  Fp x308(3);
+  // loc(unknown)
+  Fp x309(2);
+  // loc(unknown)
+  Fp x310(1);
+  // loc(unknown)
+  Fp x311(0);
+
+
+    // loc("top(recursion::Top)/code(recursion::Code)/write_addr(Reg)"("zirgen/circuit/recursion/top.cpp":33:49))
+    auto x1361 = arg0[0 * steps + ((cycle - 0) & mask)];
+    assert(x1361 != Fp::invalid());
+    // loc("top(recursion::Top)/code(recursion::Code)/inst(Mux)/macro_ops(recursion::MacroInst)/opcode(OneHot)/wom_init(Reg)"("./zirgen/components/mux.h":59:25))
+
       // loc("top(recursion::Top)/code(recursion::Code)/inst(Mux)/macro_ops(recursion::MacroInst)/operand[0](Reg)"("./zirgen/compiler/edsl/component.h":164:27))
       auto x2050 = arg0[18 * steps + ((cycle - 0) & mask)];
       assert(x2050 != Fp::invalid());
@@ -11999,11 +18696,644 @@ __device__ void step_exec(
           reg = x2514;
         }
       }
-    }
-    // loc("top(recursion::Top)/code(recursion::Code)/inst(Mux)/macro_ops(recursion::MacroInst)/opcode(OneHot)/sha_fini(Reg)"("./zirgen/components/mux.h":59:25))
-    auto x2515 = arg0[14 * steps + ((cycle - 0) & mask)];
-    assert(x2515 != Fp::invalid());
-    if (x2515 != 0) {
+}
+
+__device__ __noinline__ void step_exec_macro_sha_fini(
+    void* ctx, uint32_t steps, uint32_t cycle, uint32_t mask,
+    Fp* arg0, Fp* arg1, Fp* arg2) {
+  Fp extern_args[96];
+  Fp extern_outs[32];
+  // loc(unknown)
+  Fp x0(192);
+  // loc(unknown)
+  Fp x1(48);
+  // loc(unknown)
+  Fp x2(12);
+  // loc(unknown)
+  Fp x3(1040977421);
+  // loc(unknown)
+  Fp x4(1792450386);
+  // loc(unknown)
+  Fp x5(1470845646);
+  // loc(unknown)
+  Fp x6(1363837384);
+  // loc(unknown)
+  Fp x7(1878280202);
+  // loc(unknown)
+  Fp x8(434078361);
+  // loc(unknown)
+  Fp x9(1946596189);
+  // loc(unknown)
+  Fp x10(875839332);
+  // loc(unknown)
+  Fp x11(463976218);
+  // loc(unknown)
+  Fp x12(976057819);
+  // loc(unknown)
+  Fp x13(48375137);
+  // loc(unknown)
+  Fp x14(1549779579);
+  // loc(unknown)
+  Fp x15(1679178250);
+  // loc(unknown)
+  Fp x16(530151394);
+  // loc(unknown)
+  Fp x17(1629316321);
+  // loc(unknown)
+  Fp x18(1854174607);
+  // loc(unknown)
+  Fp x19(720724951);
+  // loc(unknown)
+  Fp x20(14387587);
+  // loc(unknown)
+  Fp x21(1883820770);
+  // loc(unknown)
+  Fp x22(205609311);
+  // loc(unknown)
+  Fp x23(1136469704);
+  // loc(unknown)
+  Fp x24(1439947916);
+  // loc(unknown)
+  Fp x25(723038058);
+  // loc(unknown)
+  Fp x26(53041581);
+  // loc(unknown)
+  Fp x27(1810596765);
+  // loc(unknown)
+  Fp x28(1210751726);
+  // loc(unknown)
+  Fp x29(1327682690);
+  // loc(unknown)
+  Fp x30(1886977120);
+  // loc(unknown)
+  Fp x31(1551596046);
+  // loc(unknown)
+  Fp x32(1186174623);
+  // loc(unknown)
+  Fp x33(1199068823);
+  // loc(unknown)
+  Fp x34(1240419708);
+  // loc(unknown)
+  Fp x35(1708681573);
+  // loc(unknown)
+  Fp x36(308575117);
+  // loc(unknown)
+  Fp x37(1111544260);
+  // loc(unknown)
+  Fp x38(822033215);
+  // loc(unknown)
+  Fp x39(1891545577);
+  // loc(unknown)
+  Fp x40(440300254);
+  // loc(unknown)
+  Fp x41(1726563304);
+  // loc(unknown)
+  Fp x42(1365519753);
+  // loc(unknown)
+  Fp x43(924863639);
+  // loc(unknown)
+  Fp x44(1540960371);
+  // loc(unknown)
+  Fp x45(1052077299);
+  // loc(unknown)
+  Fp x46(1930103076);
+  // loc(unknown)
+  Fp x47(98371040);
+  // loc(unknown)
+  Fp x48(918610824);
+  // loc(unknown)
+  Fp x49(801504236);
+  // loc(unknown)
+  Fp x50(65998480);
+  // loc(unknown)
+  Fp x51(658182609);
+  // loc(unknown)
+  Fp x52(606789471);
+  // loc(unknown)
+  Fp x53(51866717);
+  // loc(unknown)
+  Fp x54(375892129);
+  // loc(unknown)
+  Fp x55(20525701);
+  // loc(unknown)
+  Fp x56(1997365680);
+  // loc(unknown)
+  Fp x57(1974912880);
+  // loc(unknown)
+  Fp x58(1942928017);
+  // loc(unknown)
+  Fp x59(1928969209);
+  // loc(unknown)
+  Fp x60(1867716110);
+  // loc(unknown)
+  Fp x61(1792686146);
+  // loc(unknown)
+  Fp x62(1558116381);
+  // loc(unknown)
+  Fp x63(1461037801);
+  // loc(unknown)
+  Fp x64(1389833583);
+  // loc(unknown)
+  Fp x65(13683276);
+  // loc(unknown)
+  Fp x66(1188752902);
+  // loc(unknown)
+  Fp x67(111593398);
+  // loc(unknown)
+  Fp x68(1083257840);
+  // loc(unknown)
+  Fp x69(106789798);
+  // loc(unknown)
+  Fp x70(1001081699);
+  // loc(unknown)
+  Fp x71(497520322);
+  // loc(unknown)
+  Fp x72(946500736);
+  // loc(unknown)
+  Fp x73(890243564);
+  // loc(unknown)
+  Fp x74(862495875);
+  // loc(unknown)
+  Fp x75(855276054);
+  // loc(unknown)
+  Fp x76(76770019);
+  // loc(unknown)
+  Fp x77(760115692);
+  // loc(unknown)
+  Fp x78(623051854);
+  // loc(unknown)
+  Fp x79(59510015);
+  // loc(unknown)
+  Fp x80(552696906);
+  // loc(unknown)
+  Fp x81(538103555);
+  // loc(unknown)
+  Fp x82(457372011);
+  // loc(unknown)
+  Fp x83(447555988);
+  // loc(unknown)
+  Fp x84(27129487);
+  // loc(unknown)
+  Fp x85(217046702);
+  // loc(unknown)
+  Fp x86(1950429111);
+  // loc(unknown)
+  Fp x87(192082241);
+  // loc(unknown)
+  Fp x88(1910423126);
+  // loc(unknown)
+  Fp x89(1908416316);
+  // loc(unknown)
+  Fp x90(1891637550);
+  // loc(unknown)
+  Fp x91(1841795381);
+  // loc(unknown)
+  Fp x92(1827572010);
+  // loc(unknown)
+  Fp x93(1748789933);
+  // loc(unknown)
+  Fp x94(1664590951);
+  // loc(unknown)
+  Fp x95(1663353317);
+  // loc(unknown)
+  Fp x96(162510541);
+  // loc(unknown)
+  Fp x97(1622328571);
+  // loc(unknown)
+  Fp x98(1608853840);
+  // loc(unknown)
+  Fp x99(158646617);
+  // loc(unknown)
+  Fp x100(1584033957);
+  // loc(unknown)
+  Fp x101(1567618575);
+  // loc(unknown)
+  Fp x102(1549062383);
+  // loc(unknown)
+  Fp x103(1507649755);
+  // loc(unknown)
+  Fp x104(1478577620);
+  // loc(unknown)
+  Fp x105(1463323727);
+  // loc(unknown)
+  Fp x106(1424297384);
+  // loc(unknown)
+  Fp x107(142102402);
+  // loc(unknown)
+  Fp x108(1402624179);
+  // loc(unknown)
+  Fp x109(1293938517);
+  // loc(unknown)
+  Fp x110(1257820264);
+  // loc(unknown)
+  Fp x111(1215259350);
+  // loc(unknown)
+  Fp x112(1198261138);
+  // loc(unknown)
+  Fp x113(1150410028);
+  // loc(unknown)
+  Fp x114(1147522062);
+  // loc(unknown)
+  Fp x115(1099252725);
+  // loc(unknown)
+  Fp x116(1080533265);
+  // loc(unknown)
+  Fp x117(1079030649);
+  // loc(unknown)
+  Fp x118(1065075039);
+  // loc(unknown)
+  Fp x119(1042892522);
+  // loc(unknown)
+  Fp x120(993455846);
+  // loc(unknown)
+  Fp x121(989618631);
+  // loc(unknown)
+  Fp x122(989176635);
+  // loc(unknown)
+  Fp x123(942439428);
+  // loc(unknown)
+  Fp x124(930036496);
+  // loc(unknown)
+  Fp x125(925018226);
+  // loc(unknown)
+  Fp x126(897025192);
+  // loc(unknown)
+  Fp x127(825405577);
+  // loc(unknown)
+  Fp x128(813674331);
+  // loc(unknown)
+  Fp x129(809508074);
+  // loc(unknown)
+  Fp x130(790726260);
+  // loc(unknown)
+  Fp x131(78845751);
+  // loc(unknown)
+  Fp x132(781141772);
+  // loc(unknown)
+  Fp x133(755691969);
+  // loc(unknown)
+  Fp x134(738091882);
+  // loc(unknown)
+  Fp x135(716894289);
+  // loc(unknown)
+  Fp x136(714957516);
+  // loc(unknown)
+  Fp x137(708123747);
+  // loc(unknown)
+  Fp x138(695835963);
+  // loc(unknown)
+  Fp x139(686842369);
+  // loc(unknown)
+  Fp x140(641665156);
+  // loc(unknown)
+  Fp x141(622609176);
+  // loc(unknown)
+  Fp x142(608401422);
+  // loc(unknown)
+  Fp x143(588764636);
+  // loc(unknown)
+  Fp x144(540703332);
+  // loc(unknown)
+  Fp x145(53007114);
+  // loc(unknown)
+  Fp x146(51256176);
+  // loc(unknown)
+  Fp x147(459826664);
+  // loc(unknown)
+  Fp x148(427731030);
+  // loc(unknown)
+  Fp x149(395622276);
+  // loc(unknown)
+  Fp x150(390340387);
+  // loc(unknown)
+  Fp x151(342857858);
+  // loc(unknown)
+  Fp x152(306391314);
+  // loc(unknown)
+  Fp x153(273790406);
+  // loc(unknown)
+  Fp x154(241306552);
+  // loc(unknown)
+  Fp x155(238616145);
+  // loc(unknown)
+  Fp x156(228520958);
+  // loc(unknown)
+  Fp x157(204228775);
+  // loc(unknown)
+  Fp x158(202271745);
+  // loc(unknown)
+  Fp x159(1997503974);
+  // loc(unknown)
+  Fp x160(1989924532);
+  // loc(unknown)
+  Fp x161(1917861751);
+  // loc(unknown)
+  Fp x162(1917549072);
+  // loc(unknown)
+  Fp x163(1896271507);
+  // loc(unknown)
+  Fp x164(1889898);
+  // loc(unknown)
+  Fp x165(1889603648);
+  // loc(unknown)
+  Fp x166(1845603984);
+  // loc(unknown)
+  Fp x167(1832911930);
+  // loc(unknown)
+  Fp x168(1781980094);
+  // loc(unknown)
+  Fp x169(1740472809);
+  // loc(unknown)
+  Fp x170(1737016378);
+  // loc(unknown)
+  Fp x171(172614232);
+  // loc(unknown)
+  Fp x172(1718628547);
+  // loc(unknown)
+  Fp x173(1715719711);
+  // loc(unknown)
+  Fp x174(1687379185);
+  // loc(unknown)
+  Fp x175(1672219447);
+  // loc(unknown)
+  Fp x176(1649953458);
+  // loc(unknown)
+  Fp x177(1647670797);
+  // loc(unknown)
+  Fp x178(1647665372);
+  // loc(unknown)
+  Fp x179(162506101);
+  // loc(unknown)
+  Fp x180(1608891156);
+  // loc(unknown)
+  Fp x181(1587822577);
+  // loc(unknown)
+  Fp x182(1545325389);
+  // loc(unknown)
+  Fp x183(1518763784);
+  // loc(unknown)
+  Fp x184(1507936940);
+  // loc(unknown)
+  Fp x185(150307788);
+  // loc(unknown)
+  Fp x186(1454563174);
+  // loc(unknown)
+  Fp x187(140621810);
+  // loc(unknown)
+  Fp x188(1401020792);
+  // loc(unknown)
+  Fp x189(1393671120);
+  // loc(unknown)
+  Fp x190(1380248020);
+  // loc(unknown)
+  Fp x191(1339793538);
+  // loc(unknown)
+  Fp x192(1338899225);
+  // loc(unknown)
+  Fp x193(1333667262);
+  // loc(unknown)
+  Fp x194(1303271640);
+  // loc(unknown)
+  Fp x195(1296144415);
+  // loc(unknown)
+  Fp x196(1291790245);
+  // loc(unknown)
+  Fp x197(1290028279);
+  // loc(unknown)
+  Fp x198(128479034);
+  // loc(unknown)
+  Fp x199(1282239129);
+  // loc(unknown)
+  Fp x200(1269493554);
+  // loc(unknown)
+  Fp x201(1262312258);
+  // loc(unknown)
+  Fp x202(1239734761);
+  // loc(unknown)
+  Fp x203(1221257987);
+  // loc(unknown)
+  Fp x204(1213686459);
+  // loc(unknown)
+  Fp x205(1209164052);
+  // loc(unknown)
+  Fp x206(1206940496);
+  // loc(unknown)
+  Fp x207(1201063290);
+  // loc(unknown)
+  Fp x208(117294666);
+  // loc(unknown)
+  Fp x209(1170029417);
+  // loc(unknown)
+  Fp x210(1150912935);
+  // loc(unknown)
+  Fp x211(1124078057);
+  // loc(unknown)
+  Fp x212(1111203133);
+  // loc(unknown)
+  Fp x213(1090783436);
+  // loc(unknown)
+  Fp x214(1006235079);
+  // loc(unknown)
+  Fp x215(1003792297);
+  // loc(unknown)
+  Fp x216(831813382);
+  // loc(unknown)
+  Fp x217(1421525369);
+  // loc(unknown)
+  Fp x218(1751797115);
+  // loc(unknown)
+  Fp x219(1964135730);
+  // loc(unknown)
+  Fp x220(525458520);
+  // loc(unknown)
+  Fp x221(638242172);
+  // loc(unknown)
+  Fp x222(1307439985);
+  // loc(unknown)
+  Fp x223(343354132);
+  // loc(unknown)
+  Fp x224(1389166148);
+  // loc(unknown)
+  Fp x225(1660766320);
+  // loc(unknown)
+  Fp x226(1464793095);
+  // loc(unknown)
+  Fp x227(1180307149);
+  // loc(unknown)
+  Fp x228(1930780904);
+  // loc(unknown)
+  Fp x229(1066694495);
+  // loc(unknown)
+  Fp x230(1773108264);
+  // loc(unknown)
+  Fp x231(1004040026);
+  // loc(unknown)
+  Fp x232(815798990);
+  // loc(unknown)
+  Fp x233(454905424);
+  // loc(unknown)
+  Fp x234(118043943);
+  // loc(unknown)
+  Fp x235(157582794);
+  // loc(unknown)
+  Fp x236(246143118);
+  // loc(unknown)
+  Fp x237(314968988);
+  // loc(unknown)
+  Fp x238(127253399);
+  // loc(unknown)
+  Fp x239(262278199);
+  // loc(unknown)
+  Fp x240(943718400);
+  // loc(unknown)
+  Fp x241(268435454);
+  // loc(unknown)
+  Fp x242(1761607679);
+  // loc(unknown)
+  Fp x243(1073741824);
+  // loc(unknown)
+  Fp x244(536870912);
+  // loc(unknown)
+  Fp x245(1509949437);
+  // loc(unknown)
+  Fp x246(268435456);
+  // loc(unknown)
+  Fp x247(1006632953);
+  // loc(unknown)
+  Fp x248(2013265906);
+  // loc(unknown)
+  Fp x249(134217728);
+  // loc(unknown)
+  Fp x250(67108864);
+  // loc(unknown)
+  Fp x251(2013265891);
+  // loc(unknown)
+  Fp x252(33554432);
+  // loc(unknown)
+  Fp x253(2013265861);
+  // loc(unknown)
+  Fp x254(2013265801);
+  // loc(unknown)
+  Fp x255(16777216);
+  // loc(unknown)
+  Fp x256(8388608);
+  // loc(unknown)
+  Fp x257(2013265681);
+  // loc(unknown)
+  Fp x258(4194304);
+  // loc(unknown)
+  Fp x259(2013265441);
+  // loc(unknown)
+  Fp x260(2097152);
+  // loc(unknown)
+  Fp x261(2013264961);
+  // loc(unknown)
+  Fp x262(2013264001);
+  // loc(unknown)
+  Fp x263(1048576);
+  // loc(unknown)
+  Fp x264(524288);
+  // loc(unknown)
+  Fp x265(2013262081);
+  // loc(unknown)
+  Fp x266(262144);
+  // loc(unknown)
+  Fp x267(2013258241);
+  // loc(unknown)
+  Fp x268(2013250561);
+  // loc(unknown)
+  Fp x269(131072);
+  // loc(unknown)
+  Fp x270(2013235201);
+  // loc(unknown)
+  Fp x271(32768);
+  // loc(unknown)
+  Fp x272(2013204481);
+  // loc(unknown)
+  Fp x273(2013143041);
+  // loc(unknown)
+  Fp x274(16384);
+  // loc(unknown)
+  Fp x275(8192);
+  // loc(unknown)
+  Fp x276(2013020161);
+  // loc(unknown)
+  Fp x277(4096);
+  // loc(unknown)
+  Fp x278(2012774401);
+  // loc(unknown)
+  Fp x279(2048);
+  // loc(unknown)
+  Fp x280(2012282881);
+  // loc(unknown)
+  Fp x281(2011299841);
+  // loc(unknown)
+  Fp x282(1024);
+  // loc(unknown)
+  Fp x283(512);
+  // loc(unknown)
+  Fp x284(2009333761);
+  // loc(unknown)
+  Fp x285(256);
+  // loc(unknown)
+  Fp x286(2005401601);
+  // loc(unknown)
+  Fp x287(1997537281);
+  // loc(unknown)
+  Fp x288(128);
+  // loc(unknown)
+  Fp x289(64);
+  // loc(unknown)
+  Fp x290(1981808641);
+  // loc(unknown)
+  Fp x291(32);
+  // loc(unknown)
+  Fp x292(1950351361);
+  // loc(unknown)
+  Fp x293(1887436801);
+  // loc(unknown)
+  Fp x294(16);
+  // loc(unknown)
+  Fp x295(1761607681);
+  // loc(unknown)
+  Fp x296(1509949441);
+  // loc(unknown)
+  Fp x297(1006632961);
+  // loc(unknown)
+  Fp x298(65536);
+  // loc(unknown)
+  Fp x299(2013265910);
+  // loc(unknown)
+  Fp x300(11);
+  // loc(unknown)
+  Fp x301(10);
+  // loc(unknown)
+  Fp x302(9);
+  // loc(unknown)
+  Fp x303(8);
+  // loc(unknown)
+  Fp x304(7);
+  // loc(unknown)
+  Fp x305(6);
+  // loc(unknown)
+  Fp x306(5);
+  // loc(unknown)
+  Fp x307(4);
+  // loc(unknown)
+  Fp x308(3);
+  // loc(unknown)
+  Fp x309(2);
+  // loc(unknown)
+  Fp x310(1);
+  // loc(unknown)
+  Fp x311(0);
+
+
+    // loc("top(recursion::Top)/code(recursion::Code)/write_addr(Reg)"("zirgen/circuit/recursion/top.cpp":33:49))
+    auto x1361 = arg0[0 * steps + ((cycle - 0) & mask)];
+    assert(x1361 != Fp::invalid());
+    // loc("top(recursion::Top)/code(recursion::Code)/inst(Mux)/macro_ops(recursion::MacroInst)/opcode(OneHot)/wom_init(Reg)"("./zirgen/components/mux.h":59:25))
+
       {
         // loc("./zirgen/components/bits.h":37:23)
         {
@@ -14760,11 +22090,644 @@ __device__ void step_exec(
         extern_args[4] = x3414;
         extern_womWrite(ctx, cycle, "", extern_args, extern_outs);
       }
-    }
-    // loc("top(recursion::Top)/code(recursion::Code)/inst(Mux)/macro_ops(recursion::MacroInst)/opcode(OneHot)/sha_load(Reg)"("./zirgen/components/mux.h":59:25))
-    auto x3415 = arg0[15 * steps + ((cycle - 0) & mask)];
-    assert(x3415 != Fp::invalid());
-    if (x3415 != 0) {
+}
+
+__device__ __noinline__ void step_exec_macro_sha_load(
+    void* ctx, uint32_t steps, uint32_t cycle, uint32_t mask,
+    Fp* arg0, Fp* arg1, Fp* arg2) {
+  Fp extern_args[96];
+  Fp extern_outs[32];
+  // loc(unknown)
+  Fp x0(192);
+  // loc(unknown)
+  Fp x1(48);
+  // loc(unknown)
+  Fp x2(12);
+  // loc(unknown)
+  Fp x3(1040977421);
+  // loc(unknown)
+  Fp x4(1792450386);
+  // loc(unknown)
+  Fp x5(1470845646);
+  // loc(unknown)
+  Fp x6(1363837384);
+  // loc(unknown)
+  Fp x7(1878280202);
+  // loc(unknown)
+  Fp x8(434078361);
+  // loc(unknown)
+  Fp x9(1946596189);
+  // loc(unknown)
+  Fp x10(875839332);
+  // loc(unknown)
+  Fp x11(463976218);
+  // loc(unknown)
+  Fp x12(976057819);
+  // loc(unknown)
+  Fp x13(48375137);
+  // loc(unknown)
+  Fp x14(1549779579);
+  // loc(unknown)
+  Fp x15(1679178250);
+  // loc(unknown)
+  Fp x16(530151394);
+  // loc(unknown)
+  Fp x17(1629316321);
+  // loc(unknown)
+  Fp x18(1854174607);
+  // loc(unknown)
+  Fp x19(720724951);
+  // loc(unknown)
+  Fp x20(14387587);
+  // loc(unknown)
+  Fp x21(1883820770);
+  // loc(unknown)
+  Fp x22(205609311);
+  // loc(unknown)
+  Fp x23(1136469704);
+  // loc(unknown)
+  Fp x24(1439947916);
+  // loc(unknown)
+  Fp x25(723038058);
+  // loc(unknown)
+  Fp x26(53041581);
+  // loc(unknown)
+  Fp x27(1810596765);
+  // loc(unknown)
+  Fp x28(1210751726);
+  // loc(unknown)
+  Fp x29(1327682690);
+  // loc(unknown)
+  Fp x30(1886977120);
+  // loc(unknown)
+  Fp x31(1551596046);
+  // loc(unknown)
+  Fp x32(1186174623);
+  // loc(unknown)
+  Fp x33(1199068823);
+  // loc(unknown)
+  Fp x34(1240419708);
+  // loc(unknown)
+  Fp x35(1708681573);
+  // loc(unknown)
+  Fp x36(308575117);
+  // loc(unknown)
+  Fp x37(1111544260);
+  // loc(unknown)
+  Fp x38(822033215);
+  // loc(unknown)
+  Fp x39(1891545577);
+  // loc(unknown)
+  Fp x40(440300254);
+  // loc(unknown)
+  Fp x41(1726563304);
+  // loc(unknown)
+  Fp x42(1365519753);
+  // loc(unknown)
+  Fp x43(924863639);
+  // loc(unknown)
+  Fp x44(1540960371);
+  // loc(unknown)
+  Fp x45(1052077299);
+  // loc(unknown)
+  Fp x46(1930103076);
+  // loc(unknown)
+  Fp x47(98371040);
+  // loc(unknown)
+  Fp x48(918610824);
+  // loc(unknown)
+  Fp x49(801504236);
+  // loc(unknown)
+  Fp x50(65998480);
+  // loc(unknown)
+  Fp x51(658182609);
+  // loc(unknown)
+  Fp x52(606789471);
+  // loc(unknown)
+  Fp x53(51866717);
+  // loc(unknown)
+  Fp x54(375892129);
+  // loc(unknown)
+  Fp x55(20525701);
+  // loc(unknown)
+  Fp x56(1997365680);
+  // loc(unknown)
+  Fp x57(1974912880);
+  // loc(unknown)
+  Fp x58(1942928017);
+  // loc(unknown)
+  Fp x59(1928969209);
+  // loc(unknown)
+  Fp x60(1867716110);
+  // loc(unknown)
+  Fp x61(1792686146);
+  // loc(unknown)
+  Fp x62(1558116381);
+  // loc(unknown)
+  Fp x63(1461037801);
+  // loc(unknown)
+  Fp x64(1389833583);
+  // loc(unknown)
+  Fp x65(13683276);
+  // loc(unknown)
+  Fp x66(1188752902);
+  // loc(unknown)
+  Fp x67(111593398);
+  // loc(unknown)
+  Fp x68(1083257840);
+  // loc(unknown)
+  Fp x69(106789798);
+  // loc(unknown)
+  Fp x70(1001081699);
+  // loc(unknown)
+  Fp x71(497520322);
+  // loc(unknown)
+  Fp x72(946500736);
+  // loc(unknown)
+  Fp x73(890243564);
+  // loc(unknown)
+  Fp x74(862495875);
+  // loc(unknown)
+  Fp x75(855276054);
+  // loc(unknown)
+  Fp x76(76770019);
+  // loc(unknown)
+  Fp x77(760115692);
+  // loc(unknown)
+  Fp x78(623051854);
+  // loc(unknown)
+  Fp x79(59510015);
+  // loc(unknown)
+  Fp x80(552696906);
+  // loc(unknown)
+  Fp x81(538103555);
+  // loc(unknown)
+  Fp x82(457372011);
+  // loc(unknown)
+  Fp x83(447555988);
+  // loc(unknown)
+  Fp x84(27129487);
+  // loc(unknown)
+  Fp x85(217046702);
+  // loc(unknown)
+  Fp x86(1950429111);
+  // loc(unknown)
+  Fp x87(192082241);
+  // loc(unknown)
+  Fp x88(1910423126);
+  // loc(unknown)
+  Fp x89(1908416316);
+  // loc(unknown)
+  Fp x90(1891637550);
+  // loc(unknown)
+  Fp x91(1841795381);
+  // loc(unknown)
+  Fp x92(1827572010);
+  // loc(unknown)
+  Fp x93(1748789933);
+  // loc(unknown)
+  Fp x94(1664590951);
+  // loc(unknown)
+  Fp x95(1663353317);
+  // loc(unknown)
+  Fp x96(162510541);
+  // loc(unknown)
+  Fp x97(1622328571);
+  // loc(unknown)
+  Fp x98(1608853840);
+  // loc(unknown)
+  Fp x99(158646617);
+  // loc(unknown)
+  Fp x100(1584033957);
+  // loc(unknown)
+  Fp x101(1567618575);
+  // loc(unknown)
+  Fp x102(1549062383);
+  // loc(unknown)
+  Fp x103(1507649755);
+  // loc(unknown)
+  Fp x104(1478577620);
+  // loc(unknown)
+  Fp x105(1463323727);
+  // loc(unknown)
+  Fp x106(1424297384);
+  // loc(unknown)
+  Fp x107(142102402);
+  // loc(unknown)
+  Fp x108(1402624179);
+  // loc(unknown)
+  Fp x109(1293938517);
+  // loc(unknown)
+  Fp x110(1257820264);
+  // loc(unknown)
+  Fp x111(1215259350);
+  // loc(unknown)
+  Fp x112(1198261138);
+  // loc(unknown)
+  Fp x113(1150410028);
+  // loc(unknown)
+  Fp x114(1147522062);
+  // loc(unknown)
+  Fp x115(1099252725);
+  // loc(unknown)
+  Fp x116(1080533265);
+  // loc(unknown)
+  Fp x117(1079030649);
+  // loc(unknown)
+  Fp x118(1065075039);
+  // loc(unknown)
+  Fp x119(1042892522);
+  // loc(unknown)
+  Fp x120(993455846);
+  // loc(unknown)
+  Fp x121(989618631);
+  // loc(unknown)
+  Fp x122(989176635);
+  // loc(unknown)
+  Fp x123(942439428);
+  // loc(unknown)
+  Fp x124(930036496);
+  // loc(unknown)
+  Fp x125(925018226);
+  // loc(unknown)
+  Fp x126(897025192);
+  // loc(unknown)
+  Fp x127(825405577);
+  // loc(unknown)
+  Fp x128(813674331);
+  // loc(unknown)
+  Fp x129(809508074);
+  // loc(unknown)
+  Fp x130(790726260);
+  // loc(unknown)
+  Fp x131(78845751);
+  // loc(unknown)
+  Fp x132(781141772);
+  // loc(unknown)
+  Fp x133(755691969);
+  // loc(unknown)
+  Fp x134(738091882);
+  // loc(unknown)
+  Fp x135(716894289);
+  // loc(unknown)
+  Fp x136(714957516);
+  // loc(unknown)
+  Fp x137(708123747);
+  // loc(unknown)
+  Fp x138(695835963);
+  // loc(unknown)
+  Fp x139(686842369);
+  // loc(unknown)
+  Fp x140(641665156);
+  // loc(unknown)
+  Fp x141(622609176);
+  // loc(unknown)
+  Fp x142(608401422);
+  // loc(unknown)
+  Fp x143(588764636);
+  // loc(unknown)
+  Fp x144(540703332);
+  // loc(unknown)
+  Fp x145(53007114);
+  // loc(unknown)
+  Fp x146(51256176);
+  // loc(unknown)
+  Fp x147(459826664);
+  // loc(unknown)
+  Fp x148(427731030);
+  // loc(unknown)
+  Fp x149(395622276);
+  // loc(unknown)
+  Fp x150(390340387);
+  // loc(unknown)
+  Fp x151(342857858);
+  // loc(unknown)
+  Fp x152(306391314);
+  // loc(unknown)
+  Fp x153(273790406);
+  // loc(unknown)
+  Fp x154(241306552);
+  // loc(unknown)
+  Fp x155(238616145);
+  // loc(unknown)
+  Fp x156(228520958);
+  // loc(unknown)
+  Fp x157(204228775);
+  // loc(unknown)
+  Fp x158(202271745);
+  // loc(unknown)
+  Fp x159(1997503974);
+  // loc(unknown)
+  Fp x160(1989924532);
+  // loc(unknown)
+  Fp x161(1917861751);
+  // loc(unknown)
+  Fp x162(1917549072);
+  // loc(unknown)
+  Fp x163(1896271507);
+  // loc(unknown)
+  Fp x164(1889898);
+  // loc(unknown)
+  Fp x165(1889603648);
+  // loc(unknown)
+  Fp x166(1845603984);
+  // loc(unknown)
+  Fp x167(1832911930);
+  // loc(unknown)
+  Fp x168(1781980094);
+  // loc(unknown)
+  Fp x169(1740472809);
+  // loc(unknown)
+  Fp x170(1737016378);
+  // loc(unknown)
+  Fp x171(172614232);
+  // loc(unknown)
+  Fp x172(1718628547);
+  // loc(unknown)
+  Fp x173(1715719711);
+  // loc(unknown)
+  Fp x174(1687379185);
+  // loc(unknown)
+  Fp x175(1672219447);
+  // loc(unknown)
+  Fp x176(1649953458);
+  // loc(unknown)
+  Fp x177(1647670797);
+  // loc(unknown)
+  Fp x178(1647665372);
+  // loc(unknown)
+  Fp x179(162506101);
+  // loc(unknown)
+  Fp x180(1608891156);
+  // loc(unknown)
+  Fp x181(1587822577);
+  // loc(unknown)
+  Fp x182(1545325389);
+  // loc(unknown)
+  Fp x183(1518763784);
+  // loc(unknown)
+  Fp x184(1507936940);
+  // loc(unknown)
+  Fp x185(150307788);
+  // loc(unknown)
+  Fp x186(1454563174);
+  // loc(unknown)
+  Fp x187(140621810);
+  // loc(unknown)
+  Fp x188(1401020792);
+  // loc(unknown)
+  Fp x189(1393671120);
+  // loc(unknown)
+  Fp x190(1380248020);
+  // loc(unknown)
+  Fp x191(1339793538);
+  // loc(unknown)
+  Fp x192(1338899225);
+  // loc(unknown)
+  Fp x193(1333667262);
+  // loc(unknown)
+  Fp x194(1303271640);
+  // loc(unknown)
+  Fp x195(1296144415);
+  // loc(unknown)
+  Fp x196(1291790245);
+  // loc(unknown)
+  Fp x197(1290028279);
+  // loc(unknown)
+  Fp x198(128479034);
+  // loc(unknown)
+  Fp x199(1282239129);
+  // loc(unknown)
+  Fp x200(1269493554);
+  // loc(unknown)
+  Fp x201(1262312258);
+  // loc(unknown)
+  Fp x202(1239734761);
+  // loc(unknown)
+  Fp x203(1221257987);
+  // loc(unknown)
+  Fp x204(1213686459);
+  // loc(unknown)
+  Fp x205(1209164052);
+  // loc(unknown)
+  Fp x206(1206940496);
+  // loc(unknown)
+  Fp x207(1201063290);
+  // loc(unknown)
+  Fp x208(117294666);
+  // loc(unknown)
+  Fp x209(1170029417);
+  // loc(unknown)
+  Fp x210(1150912935);
+  // loc(unknown)
+  Fp x211(1124078057);
+  // loc(unknown)
+  Fp x212(1111203133);
+  // loc(unknown)
+  Fp x213(1090783436);
+  // loc(unknown)
+  Fp x214(1006235079);
+  // loc(unknown)
+  Fp x215(1003792297);
+  // loc(unknown)
+  Fp x216(831813382);
+  // loc(unknown)
+  Fp x217(1421525369);
+  // loc(unknown)
+  Fp x218(1751797115);
+  // loc(unknown)
+  Fp x219(1964135730);
+  // loc(unknown)
+  Fp x220(525458520);
+  // loc(unknown)
+  Fp x221(638242172);
+  // loc(unknown)
+  Fp x222(1307439985);
+  // loc(unknown)
+  Fp x223(343354132);
+  // loc(unknown)
+  Fp x224(1389166148);
+  // loc(unknown)
+  Fp x225(1660766320);
+  // loc(unknown)
+  Fp x226(1464793095);
+  // loc(unknown)
+  Fp x227(1180307149);
+  // loc(unknown)
+  Fp x228(1930780904);
+  // loc(unknown)
+  Fp x229(1066694495);
+  // loc(unknown)
+  Fp x230(1773108264);
+  // loc(unknown)
+  Fp x231(1004040026);
+  // loc(unknown)
+  Fp x232(815798990);
+  // loc(unknown)
+  Fp x233(454905424);
+  // loc(unknown)
+  Fp x234(118043943);
+  // loc(unknown)
+  Fp x235(157582794);
+  // loc(unknown)
+  Fp x236(246143118);
+  // loc(unknown)
+  Fp x237(314968988);
+  // loc(unknown)
+  Fp x238(127253399);
+  // loc(unknown)
+  Fp x239(262278199);
+  // loc(unknown)
+  Fp x240(943718400);
+  // loc(unknown)
+  Fp x241(268435454);
+  // loc(unknown)
+  Fp x242(1761607679);
+  // loc(unknown)
+  Fp x243(1073741824);
+  // loc(unknown)
+  Fp x244(536870912);
+  // loc(unknown)
+  Fp x245(1509949437);
+  // loc(unknown)
+  Fp x246(268435456);
+  // loc(unknown)
+  Fp x247(1006632953);
+  // loc(unknown)
+  Fp x248(2013265906);
+  // loc(unknown)
+  Fp x249(134217728);
+  // loc(unknown)
+  Fp x250(67108864);
+  // loc(unknown)
+  Fp x251(2013265891);
+  // loc(unknown)
+  Fp x252(33554432);
+  // loc(unknown)
+  Fp x253(2013265861);
+  // loc(unknown)
+  Fp x254(2013265801);
+  // loc(unknown)
+  Fp x255(16777216);
+  // loc(unknown)
+  Fp x256(8388608);
+  // loc(unknown)
+  Fp x257(2013265681);
+  // loc(unknown)
+  Fp x258(4194304);
+  // loc(unknown)
+  Fp x259(2013265441);
+  // loc(unknown)
+  Fp x260(2097152);
+  // loc(unknown)
+  Fp x261(2013264961);
+  // loc(unknown)
+  Fp x262(2013264001);
+  // loc(unknown)
+  Fp x263(1048576);
+  // loc(unknown)
+  Fp x264(524288);
+  // loc(unknown)
+  Fp x265(2013262081);
+  // loc(unknown)
+  Fp x266(262144);
+  // loc(unknown)
+  Fp x267(2013258241);
+  // loc(unknown)
+  Fp x268(2013250561);
+  // loc(unknown)
+  Fp x269(131072);
+  // loc(unknown)
+  Fp x270(2013235201);
+  // loc(unknown)
+  Fp x271(32768);
+  // loc(unknown)
+  Fp x272(2013204481);
+  // loc(unknown)
+  Fp x273(2013143041);
+  // loc(unknown)
+  Fp x274(16384);
+  // loc(unknown)
+  Fp x275(8192);
+  // loc(unknown)
+  Fp x276(2013020161);
+  // loc(unknown)
+  Fp x277(4096);
+  // loc(unknown)
+  Fp x278(2012774401);
+  // loc(unknown)
+  Fp x279(2048);
+  // loc(unknown)
+  Fp x280(2012282881);
+  // loc(unknown)
+  Fp x281(2011299841);
+  // loc(unknown)
+  Fp x282(1024);
+  // loc(unknown)
+  Fp x283(512);
+  // loc(unknown)
+  Fp x284(2009333761);
+  // loc(unknown)
+  Fp x285(256);
+  // loc(unknown)
+  Fp x286(2005401601);
+  // loc(unknown)
+  Fp x287(1997537281);
+  // loc(unknown)
+  Fp x288(128);
+  // loc(unknown)
+  Fp x289(64);
+  // loc(unknown)
+  Fp x290(1981808641);
+  // loc(unknown)
+  Fp x291(32);
+  // loc(unknown)
+  Fp x292(1950351361);
+  // loc(unknown)
+  Fp x293(1887436801);
+  // loc(unknown)
+  Fp x294(16);
+  // loc(unknown)
+  Fp x295(1761607681);
+  // loc(unknown)
+  Fp x296(1509949441);
+  // loc(unknown)
+  Fp x297(1006632961);
+  // loc(unknown)
+  Fp x298(65536);
+  // loc(unknown)
+  Fp x299(2013265910);
+  // loc(unknown)
+  Fp x300(11);
+  // loc(unknown)
+  Fp x301(10);
+  // loc(unknown)
+  Fp x302(9);
+  // loc(unknown)
+  Fp x303(8);
+  // loc(unknown)
+  Fp x304(7);
+  // loc(unknown)
+  Fp x305(6);
+  // loc(unknown)
+  Fp x306(5);
+  // loc(unknown)
+  Fp x307(4);
+  // loc(unknown)
+  Fp x308(3);
+  // loc(unknown)
+  Fp x309(2);
+  // loc(unknown)
+  Fp x310(1);
+  // loc(unknown)
+  Fp x311(0);
+
+
+    // loc("top(recursion::Top)/code(recursion::Code)/write_addr(Reg)"("zirgen/circuit/recursion/top.cpp":33:49))
+    auto x1361 = arg0[0 * steps + ((cycle - 0) & mask)];
+    assert(x1361 != Fp::invalid());
+    // loc("top(recursion::Top)/code(recursion::Code)/inst(Mux)/macro_ops(recursion::MacroInst)/opcode(OneHot)/wom_init(Reg)"("./zirgen/components/mux.h":59:25))
+
       // loc("top(recursion::Top)/code(recursion::Code)/inst(Mux)/macro_ops(recursion::MacroInst)/operand[0](Reg)"("./zirgen/compiler/edsl/component.h":164:27))
       auto x3416 = arg0[18 * steps + ((cycle - 0) & mask)];
       assert(x3416 != Fp::invalid());
@@ -20793,11 +28756,644 @@ __device__ void step_exec(
           reg = x5751;
         }
       }
-    }
-    // loc("top(recursion::Top)/code(recursion::Code)/inst(Mux)/macro_ops(recursion::MacroInst)/opcode(OneHot)/sha_mix(Reg)"("./zirgen/components/mux.h":59:25))
-    auto x5752 = arg0[16 * steps + ((cycle - 0) & mask)];
-    assert(x5752 != Fp::invalid());
-    if (x5752 != 0) {
+}
+
+__device__ __noinline__ void step_exec_macro_sha_mix(
+    void* ctx, uint32_t steps, uint32_t cycle, uint32_t mask,
+    Fp* arg0, Fp* arg1, Fp* arg2) {
+  Fp extern_args[96];
+  Fp extern_outs[32];
+  // loc(unknown)
+  Fp x0(192);
+  // loc(unknown)
+  Fp x1(48);
+  // loc(unknown)
+  Fp x2(12);
+  // loc(unknown)
+  Fp x3(1040977421);
+  // loc(unknown)
+  Fp x4(1792450386);
+  // loc(unknown)
+  Fp x5(1470845646);
+  // loc(unknown)
+  Fp x6(1363837384);
+  // loc(unknown)
+  Fp x7(1878280202);
+  // loc(unknown)
+  Fp x8(434078361);
+  // loc(unknown)
+  Fp x9(1946596189);
+  // loc(unknown)
+  Fp x10(875839332);
+  // loc(unknown)
+  Fp x11(463976218);
+  // loc(unknown)
+  Fp x12(976057819);
+  // loc(unknown)
+  Fp x13(48375137);
+  // loc(unknown)
+  Fp x14(1549779579);
+  // loc(unknown)
+  Fp x15(1679178250);
+  // loc(unknown)
+  Fp x16(530151394);
+  // loc(unknown)
+  Fp x17(1629316321);
+  // loc(unknown)
+  Fp x18(1854174607);
+  // loc(unknown)
+  Fp x19(720724951);
+  // loc(unknown)
+  Fp x20(14387587);
+  // loc(unknown)
+  Fp x21(1883820770);
+  // loc(unknown)
+  Fp x22(205609311);
+  // loc(unknown)
+  Fp x23(1136469704);
+  // loc(unknown)
+  Fp x24(1439947916);
+  // loc(unknown)
+  Fp x25(723038058);
+  // loc(unknown)
+  Fp x26(53041581);
+  // loc(unknown)
+  Fp x27(1810596765);
+  // loc(unknown)
+  Fp x28(1210751726);
+  // loc(unknown)
+  Fp x29(1327682690);
+  // loc(unknown)
+  Fp x30(1886977120);
+  // loc(unknown)
+  Fp x31(1551596046);
+  // loc(unknown)
+  Fp x32(1186174623);
+  // loc(unknown)
+  Fp x33(1199068823);
+  // loc(unknown)
+  Fp x34(1240419708);
+  // loc(unknown)
+  Fp x35(1708681573);
+  // loc(unknown)
+  Fp x36(308575117);
+  // loc(unknown)
+  Fp x37(1111544260);
+  // loc(unknown)
+  Fp x38(822033215);
+  // loc(unknown)
+  Fp x39(1891545577);
+  // loc(unknown)
+  Fp x40(440300254);
+  // loc(unknown)
+  Fp x41(1726563304);
+  // loc(unknown)
+  Fp x42(1365519753);
+  // loc(unknown)
+  Fp x43(924863639);
+  // loc(unknown)
+  Fp x44(1540960371);
+  // loc(unknown)
+  Fp x45(1052077299);
+  // loc(unknown)
+  Fp x46(1930103076);
+  // loc(unknown)
+  Fp x47(98371040);
+  // loc(unknown)
+  Fp x48(918610824);
+  // loc(unknown)
+  Fp x49(801504236);
+  // loc(unknown)
+  Fp x50(65998480);
+  // loc(unknown)
+  Fp x51(658182609);
+  // loc(unknown)
+  Fp x52(606789471);
+  // loc(unknown)
+  Fp x53(51866717);
+  // loc(unknown)
+  Fp x54(375892129);
+  // loc(unknown)
+  Fp x55(20525701);
+  // loc(unknown)
+  Fp x56(1997365680);
+  // loc(unknown)
+  Fp x57(1974912880);
+  // loc(unknown)
+  Fp x58(1942928017);
+  // loc(unknown)
+  Fp x59(1928969209);
+  // loc(unknown)
+  Fp x60(1867716110);
+  // loc(unknown)
+  Fp x61(1792686146);
+  // loc(unknown)
+  Fp x62(1558116381);
+  // loc(unknown)
+  Fp x63(1461037801);
+  // loc(unknown)
+  Fp x64(1389833583);
+  // loc(unknown)
+  Fp x65(13683276);
+  // loc(unknown)
+  Fp x66(1188752902);
+  // loc(unknown)
+  Fp x67(111593398);
+  // loc(unknown)
+  Fp x68(1083257840);
+  // loc(unknown)
+  Fp x69(106789798);
+  // loc(unknown)
+  Fp x70(1001081699);
+  // loc(unknown)
+  Fp x71(497520322);
+  // loc(unknown)
+  Fp x72(946500736);
+  // loc(unknown)
+  Fp x73(890243564);
+  // loc(unknown)
+  Fp x74(862495875);
+  // loc(unknown)
+  Fp x75(855276054);
+  // loc(unknown)
+  Fp x76(76770019);
+  // loc(unknown)
+  Fp x77(760115692);
+  // loc(unknown)
+  Fp x78(623051854);
+  // loc(unknown)
+  Fp x79(59510015);
+  // loc(unknown)
+  Fp x80(552696906);
+  // loc(unknown)
+  Fp x81(538103555);
+  // loc(unknown)
+  Fp x82(457372011);
+  // loc(unknown)
+  Fp x83(447555988);
+  // loc(unknown)
+  Fp x84(27129487);
+  // loc(unknown)
+  Fp x85(217046702);
+  // loc(unknown)
+  Fp x86(1950429111);
+  // loc(unknown)
+  Fp x87(192082241);
+  // loc(unknown)
+  Fp x88(1910423126);
+  // loc(unknown)
+  Fp x89(1908416316);
+  // loc(unknown)
+  Fp x90(1891637550);
+  // loc(unknown)
+  Fp x91(1841795381);
+  // loc(unknown)
+  Fp x92(1827572010);
+  // loc(unknown)
+  Fp x93(1748789933);
+  // loc(unknown)
+  Fp x94(1664590951);
+  // loc(unknown)
+  Fp x95(1663353317);
+  // loc(unknown)
+  Fp x96(162510541);
+  // loc(unknown)
+  Fp x97(1622328571);
+  // loc(unknown)
+  Fp x98(1608853840);
+  // loc(unknown)
+  Fp x99(158646617);
+  // loc(unknown)
+  Fp x100(1584033957);
+  // loc(unknown)
+  Fp x101(1567618575);
+  // loc(unknown)
+  Fp x102(1549062383);
+  // loc(unknown)
+  Fp x103(1507649755);
+  // loc(unknown)
+  Fp x104(1478577620);
+  // loc(unknown)
+  Fp x105(1463323727);
+  // loc(unknown)
+  Fp x106(1424297384);
+  // loc(unknown)
+  Fp x107(142102402);
+  // loc(unknown)
+  Fp x108(1402624179);
+  // loc(unknown)
+  Fp x109(1293938517);
+  // loc(unknown)
+  Fp x110(1257820264);
+  // loc(unknown)
+  Fp x111(1215259350);
+  // loc(unknown)
+  Fp x112(1198261138);
+  // loc(unknown)
+  Fp x113(1150410028);
+  // loc(unknown)
+  Fp x114(1147522062);
+  // loc(unknown)
+  Fp x115(1099252725);
+  // loc(unknown)
+  Fp x116(1080533265);
+  // loc(unknown)
+  Fp x117(1079030649);
+  // loc(unknown)
+  Fp x118(1065075039);
+  // loc(unknown)
+  Fp x119(1042892522);
+  // loc(unknown)
+  Fp x120(993455846);
+  // loc(unknown)
+  Fp x121(989618631);
+  // loc(unknown)
+  Fp x122(989176635);
+  // loc(unknown)
+  Fp x123(942439428);
+  // loc(unknown)
+  Fp x124(930036496);
+  // loc(unknown)
+  Fp x125(925018226);
+  // loc(unknown)
+  Fp x126(897025192);
+  // loc(unknown)
+  Fp x127(825405577);
+  // loc(unknown)
+  Fp x128(813674331);
+  // loc(unknown)
+  Fp x129(809508074);
+  // loc(unknown)
+  Fp x130(790726260);
+  // loc(unknown)
+  Fp x131(78845751);
+  // loc(unknown)
+  Fp x132(781141772);
+  // loc(unknown)
+  Fp x133(755691969);
+  // loc(unknown)
+  Fp x134(738091882);
+  // loc(unknown)
+  Fp x135(716894289);
+  // loc(unknown)
+  Fp x136(714957516);
+  // loc(unknown)
+  Fp x137(708123747);
+  // loc(unknown)
+  Fp x138(695835963);
+  // loc(unknown)
+  Fp x139(686842369);
+  // loc(unknown)
+  Fp x140(641665156);
+  // loc(unknown)
+  Fp x141(622609176);
+  // loc(unknown)
+  Fp x142(608401422);
+  // loc(unknown)
+  Fp x143(588764636);
+  // loc(unknown)
+  Fp x144(540703332);
+  // loc(unknown)
+  Fp x145(53007114);
+  // loc(unknown)
+  Fp x146(51256176);
+  // loc(unknown)
+  Fp x147(459826664);
+  // loc(unknown)
+  Fp x148(427731030);
+  // loc(unknown)
+  Fp x149(395622276);
+  // loc(unknown)
+  Fp x150(390340387);
+  // loc(unknown)
+  Fp x151(342857858);
+  // loc(unknown)
+  Fp x152(306391314);
+  // loc(unknown)
+  Fp x153(273790406);
+  // loc(unknown)
+  Fp x154(241306552);
+  // loc(unknown)
+  Fp x155(238616145);
+  // loc(unknown)
+  Fp x156(228520958);
+  // loc(unknown)
+  Fp x157(204228775);
+  // loc(unknown)
+  Fp x158(202271745);
+  // loc(unknown)
+  Fp x159(1997503974);
+  // loc(unknown)
+  Fp x160(1989924532);
+  // loc(unknown)
+  Fp x161(1917861751);
+  // loc(unknown)
+  Fp x162(1917549072);
+  // loc(unknown)
+  Fp x163(1896271507);
+  // loc(unknown)
+  Fp x164(1889898);
+  // loc(unknown)
+  Fp x165(1889603648);
+  // loc(unknown)
+  Fp x166(1845603984);
+  // loc(unknown)
+  Fp x167(1832911930);
+  // loc(unknown)
+  Fp x168(1781980094);
+  // loc(unknown)
+  Fp x169(1740472809);
+  // loc(unknown)
+  Fp x170(1737016378);
+  // loc(unknown)
+  Fp x171(172614232);
+  // loc(unknown)
+  Fp x172(1718628547);
+  // loc(unknown)
+  Fp x173(1715719711);
+  // loc(unknown)
+  Fp x174(1687379185);
+  // loc(unknown)
+  Fp x175(1672219447);
+  // loc(unknown)
+  Fp x176(1649953458);
+  // loc(unknown)
+  Fp x177(1647670797);
+  // loc(unknown)
+  Fp x178(1647665372);
+  // loc(unknown)
+  Fp x179(162506101);
+  // loc(unknown)
+  Fp x180(1608891156);
+  // loc(unknown)
+  Fp x181(1587822577);
+  // loc(unknown)
+  Fp x182(1545325389);
+  // loc(unknown)
+  Fp x183(1518763784);
+  // loc(unknown)
+  Fp x184(1507936940);
+  // loc(unknown)
+  Fp x185(150307788);
+  // loc(unknown)
+  Fp x186(1454563174);
+  // loc(unknown)
+  Fp x187(140621810);
+  // loc(unknown)
+  Fp x188(1401020792);
+  // loc(unknown)
+  Fp x189(1393671120);
+  // loc(unknown)
+  Fp x190(1380248020);
+  // loc(unknown)
+  Fp x191(1339793538);
+  // loc(unknown)
+  Fp x192(1338899225);
+  // loc(unknown)
+  Fp x193(1333667262);
+  // loc(unknown)
+  Fp x194(1303271640);
+  // loc(unknown)
+  Fp x195(1296144415);
+  // loc(unknown)
+  Fp x196(1291790245);
+  // loc(unknown)
+  Fp x197(1290028279);
+  // loc(unknown)
+  Fp x198(128479034);
+  // loc(unknown)
+  Fp x199(1282239129);
+  // loc(unknown)
+  Fp x200(1269493554);
+  // loc(unknown)
+  Fp x201(1262312258);
+  // loc(unknown)
+  Fp x202(1239734761);
+  // loc(unknown)
+  Fp x203(1221257987);
+  // loc(unknown)
+  Fp x204(1213686459);
+  // loc(unknown)
+  Fp x205(1209164052);
+  // loc(unknown)
+  Fp x206(1206940496);
+  // loc(unknown)
+  Fp x207(1201063290);
+  // loc(unknown)
+  Fp x208(117294666);
+  // loc(unknown)
+  Fp x209(1170029417);
+  // loc(unknown)
+  Fp x210(1150912935);
+  // loc(unknown)
+  Fp x211(1124078057);
+  // loc(unknown)
+  Fp x212(1111203133);
+  // loc(unknown)
+  Fp x213(1090783436);
+  // loc(unknown)
+  Fp x214(1006235079);
+  // loc(unknown)
+  Fp x215(1003792297);
+  // loc(unknown)
+  Fp x216(831813382);
+  // loc(unknown)
+  Fp x217(1421525369);
+  // loc(unknown)
+  Fp x218(1751797115);
+  // loc(unknown)
+  Fp x219(1964135730);
+  // loc(unknown)
+  Fp x220(525458520);
+  // loc(unknown)
+  Fp x221(638242172);
+  // loc(unknown)
+  Fp x222(1307439985);
+  // loc(unknown)
+  Fp x223(343354132);
+  // loc(unknown)
+  Fp x224(1389166148);
+  // loc(unknown)
+  Fp x225(1660766320);
+  // loc(unknown)
+  Fp x226(1464793095);
+  // loc(unknown)
+  Fp x227(1180307149);
+  // loc(unknown)
+  Fp x228(1930780904);
+  // loc(unknown)
+  Fp x229(1066694495);
+  // loc(unknown)
+  Fp x230(1773108264);
+  // loc(unknown)
+  Fp x231(1004040026);
+  // loc(unknown)
+  Fp x232(815798990);
+  // loc(unknown)
+  Fp x233(454905424);
+  // loc(unknown)
+  Fp x234(118043943);
+  // loc(unknown)
+  Fp x235(157582794);
+  // loc(unknown)
+  Fp x236(246143118);
+  // loc(unknown)
+  Fp x237(314968988);
+  // loc(unknown)
+  Fp x238(127253399);
+  // loc(unknown)
+  Fp x239(262278199);
+  // loc(unknown)
+  Fp x240(943718400);
+  // loc(unknown)
+  Fp x241(268435454);
+  // loc(unknown)
+  Fp x242(1761607679);
+  // loc(unknown)
+  Fp x243(1073741824);
+  // loc(unknown)
+  Fp x244(536870912);
+  // loc(unknown)
+  Fp x245(1509949437);
+  // loc(unknown)
+  Fp x246(268435456);
+  // loc(unknown)
+  Fp x247(1006632953);
+  // loc(unknown)
+  Fp x248(2013265906);
+  // loc(unknown)
+  Fp x249(134217728);
+  // loc(unknown)
+  Fp x250(67108864);
+  // loc(unknown)
+  Fp x251(2013265891);
+  // loc(unknown)
+  Fp x252(33554432);
+  // loc(unknown)
+  Fp x253(2013265861);
+  // loc(unknown)
+  Fp x254(2013265801);
+  // loc(unknown)
+  Fp x255(16777216);
+  // loc(unknown)
+  Fp x256(8388608);
+  // loc(unknown)
+  Fp x257(2013265681);
+  // loc(unknown)
+  Fp x258(4194304);
+  // loc(unknown)
+  Fp x259(2013265441);
+  // loc(unknown)
+  Fp x260(2097152);
+  // loc(unknown)
+  Fp x261(2013264961);
+  // loc(unknown)
+  Fp x262(2013264001);
+  // loc(unknown)
+  Fp x263(1048576);
+  // loc(unknown)
+  Fp x264(524288);
+  // loc(unknown)
+  Fp x265(2013262081);
+  // loc(unknown)
+  Fp x266(262144);
+  // loc(unknown)
+  Fp x267(2013258241);
+  // loc(unknown)
+  Fp x268(2013250561);
+  // loc(unknown)
+  Fp x269(131072);
+  // loc(unknown)
+  Fp x270(2013235201);
+  // loc(unknown)
+  Fp x271(32768);
+  // loc(unknown)
+  Fp x272(2013204481);
+  // loc(unknown)
+  Fp x273(2013143041);
+  // loc(unknown)
+  Fp x274(16384);
+  // loc(unknown)
+  Fp x275(8192);
+  // loc(unknown)
+  Fp x276(2013020161);
+  // loc(unknown)
+  Fp x277(4096);
+  // loc(unknown)
+  Fp x278(2012774401);
+  // loc(unknown)
+  Fp x279(2048);
+  // loc(unknown)
+  Fp x280(2012282881);
+  // loc(unknown)
+  Fp x281(2011299841);
+  // loc(unknown)
+  Fp x282(1024);
+  // loc(unknown)
+  Fp x283(512);
+  // loc(unknown)
+  Fp x284(2009333761);
+  // loc(unknown)
+  Fp x285(256);
+  // loc(unknown)
+  Fp x286(2005401601);
+  // loc(unknown)
+  Fp x287(1997537281);
+  // loc(unknown)
+  Fp x288(128);
+  // loc(unknown)
+  Fp x289(64);
+  // loc(unknown)
+  Fp x290(1981808641);
+  // loc(unknown)
+  Fp x291(32);
+  // loc(unknown)
+  Fp x292(1950351361);
+  // loc(unknown)
+  Fp x293(1887436801);
+  // loc(unknown)
+  Fp x294(16);
+  // loc(unknown)
+  Fp x295(1761607681);
+  // loc(unknown)
+  Fp x296(1509949441);
+  // loc(unknown)
+  Fp x297(1006632961);
+  // loc(unknown)
+  Fp x298(65536);
+  // loc(unknown)
+  Fp x299(2013265910);
+  // loc(unknown)
+  Fp x300(11);
+  // loc(unknown)
+  Fp x301(10);
+  // loc(unknown)
+  Fp x302(9);
+  // loc(unknown)
+  Fp x303(8);
+  // loc(unknown)
+  Fp x304(7);
+  // loc(unknown)
+  Fp x305(6);
+  // loc(unknown)
+  Fp x306(5);
+  // loc(unknown)
+  Fp x307(4);
+  // loc(unknown)
+  Fp x308(3);
+  // loc(unknown)
+  Fp x309(2);
+  // loc(unknown)
+  Fp x310(1);
+  // loc(unknown)
+  Fp x311(0);
+
+
+    // loc("top(recursion::Top)/code(recursion::Code)/write_addr(Reg)"("zirgen/circuit/recursion/top.cpp":33:49))
+    auto x1361 = arg0[0 * steps + ((cycle - 0) & mask)];
+    assert(x1361 != Fp::invalid());
+    // loc("top(recursion::Top)/code(recursion::Code)/inst(Mux)/macro_ops(recursion::MacroInst)/opcode(OneHot)/wom_init(Reg)"("./zirgen/components/mux.h":59:25))
+
       // loc("zirgen/circuit/recursion/wom.cpp":22:3)
       {
         auto& reg = arg2[11 * steps + cycle];
@@ -27821,11 +36417,644 @@ __device__ void step_exec(
           reg = x8653;
         }
       }
-    }
-    // loc("top(recursion::Top)/code(recursion::Code)/inst(Mux)/macro_ops(recursion::MacroInst)/opcode(OneHot)/set_global(Reg)"("./zirgen/components/mux.h":59:25))
-    auto x8654 = arg0[17 * steps + ((cycle - 0) & mask)];
-    assert(x8654 != Fp::invalid());
-    if (x8654 != 0) {
+}
+
+__device__ __noinline__ void step_exec_macro_set_global(
+    void* ctx, uint32_t steps, uint32_t cycle, uint32_t mask,
+    Fp* arg0, Fp* arg1, Fp* arg2) {
+  Fp extern_args[96];
+  Fp extern_outs[32];
+  // loc(unknown)
+  Fp x0(192);
+  // loc(unknown)
+  Fp x1(48);
+  // loc(unknown)
+  Fp x2(12);
+  // loc(unknown)
+  Fp x3(1040977421);
+  // loc(unknown)
+  Fp x4(1792450386);
+  // loc(unknown)
+  Fp x5(1470845646);
+  // loc(unknown)
+  Fp x6(1363837384);
+  // loc(unknown)
+  Fp x7(1878280202);
+  // loc(unknown)
+  Fp x8(434078361);
+  // loc(unknown)
+  Fp x9(1946596189);
+  // loc(unknown)
+  Fp x10(875839332);
+  // loc(unknown)
+  Fp x11(463976218);
+  // loc(unknown)
+  Fp x12(976057819);
+  // loc(unknown)
+  Fp x13(48375137);
+  // loc(unknown)
+  Fp x14(1549779579);
+  // loc(unknown)
+  Fp x15(1679178250);
+  // loc(unknown)
+  Fp x16(530151394);
+  // loc(unknown)
+  Fp x17(1629316321);
+  // loc(unknown)
+  Fp x18(1854174607);
+  // loc(unknown)
+  Fp x19(720724951);
+  // loc(unknown)
+  Fp x20(14387587);
+  // loc(unknown)
+  Fp x21(1883820770);
+  // loc(unknown)
+  Fp x22(205609311);
+  // loc(unknown)
+  Fp x23(1136469704);
+  // loc(unknown)
+  Fp x24(1439947916);
+  // loc(unknown)
+  Fp x25(723038058);
+  // loc(unknown)
+  Fp x26(53041581);
+  // loc(unknown)
+  Fp x27(1810596765);
+  // loc(unknown)
+  Fp x28(1210751726);
+  // loc(unknown)
+  Fp x29(1327682690);
+  // loc(unknown)
+  Fp x30(1886977120);
+  // loc(unknown)
+  Fp x31(1551596046);
+  // loc(unknown)
+  Fp x32(1186174623);
+  // loc(unknown)
+  Fp x33(1199068823);
+  // loc(unknown)
+  Fp x34(1240419708);
+  // loc(unknown)
+  Fp x35(1708681573);
+  // loc(unknown)
+  Fp x36(308575117);
+  // loc(unknown)
+  Fp x37(1111544260);
+  // loc(unknown)
+  Fp x38(822033215);
+  // loc(unknown)
+  Fp x39(1891545577);
+  // loc(unknown)
+  Fp x40(440300254);
+  // loc(unknown)
+  Fp x41(1726563304);
+  // loc(unknown)
+  Fp x42(1365519753);
+  // loc(unknown)
+  Fp x43(924863639);
+  // loc(unknown)
+  Fp x44(1540960371);
+  // loc(unknown)
+  Fp x45(1052077299);
+  // loc(unknown)
+  Fp x46(1930103076);
+  // loc(unknown)
+  Fp x47(98371040);
+  // loc(unknown)
+  Fp x48(918610824);
+  // loc(unknown)
+  Fp x49(801504236);
+  // loc(unknown)
+  Fp x50(65998480);
+  // loc(unknown)
+  Fp x51(658182609);
+  // loc(unknown)
+  Fp x52(606789471);
+  // loc(unknown)
+  Fp x53(51866717);
+  // loc(unknown)
+  Fp x54(375892129);
+  // loc(unknown)
+  Fp x55(20525701);
+  // loc(unknown)
+  Fp x56(1997365680);
+  // loc(unknown)
+  Fp x57(1974912880);
+  // loc(unknown)
+  Fp x58(1942928017);
+  // loc(unknown)
+  Fp x59(1928969209);
+  // loc(unknown)
+  Fp x60(1867716110);
+  // loc(unknown)
+  Fp x61(1792686146);
+  // loc(unknown)
+  Fp x62(1558116381);
+  // loc(unknown)
+  Fp x63(1461037801);
+  // loc(unknown)
+  Fp x64(1389833583);
+  // loc(unknown)
+  Fp x65(13683276);
+  // loc(unknown)
+  Fp x66(1188752902);
+  // loc(unknown)
+  Fp x67(111593398);
+  // loc(unknown)
+  Fp x68(1083257840);
+  // loc(unknown)
+  Fp x69(106789798);
+  // loc(unknown)
+  Fp x70(1001081699);
+  // loc(unknown)
+  Fp x71(497520322);
+  // loc(unknown)
+  Fp x72(946500736);
+  // loc(unknown)
+  Fp x73(890243564);
+  // loc(unknown)
+  Fp x74(862495875);
+  // loc(unknown)
+  Fp x75(855276054);
+  // loc(unknown)
+  Fp x76(76770019);
+  // loc(unknown)
+  Fp x77(760115692);
+  // loc(unknown)
+  Fp x78(623051854);
+  // loc(unknown)
+  Fp x79(59510015);
+  // loc(unknown)
+  Fp x80(552696906);
+  // loc(unknown)
+  Fp x81(538103555);
+  // loc(unknown)
+  Fp x82(457372011);
+  // loc(unknown)
+  Fp x83(447555988);
+  // loc(unknown)
+  Fp x84(27129487);
+  // loc(unknown)
+  Fp x85(217046702);
+  // loc(unknown)
+  Fp x86(1950429111);
+  // loc(unknown)
+  Fp x87(192082241);
+  // loc(unknown)
+  Fp x88(1910423126);
+  // loc(unknown)
+  Fp x89(1908416316);
+  // loc(unknown)
+  Fp x90(1891637550);
+  // loc(unknown)
+  Fp x91(1841795381);
+  // loc(unknown)
+  Fp x92(1827572010);
+  // loc(unknown)
+  Fp x93(1748789933);
+  // loc(unknown)
+  Fp x94(1664590951);
+  // loc(unknown)
+  Fp x95(1663353317);
+  // loc(unknown)
+  Fp x96(162510541);
+  // loc(unknown)
+  Fp x97(1622328571);
+  // loc(unknown)
+  Fp x98(1608853840);
+  // loc(unknown)
+  Fp x99(158646617);
+  // loc(unknown)
+  Fp x100(1584033957);
+  // loc(unknown)
+  Fp x101(1567618575);
+  // loc(unknown)
+  Fp x102(1549062383);
+  // loc(unknown)
+  Fp x103(1507649755);
+  // loc(unknown)
+  Fp x104(1478577620);
+  // loc(unknown)
+  Fp x105(1463323727);
+  // loc(unknown)
+  Fp x106(1424297384);
+  // loc(unknown)
+  Fp x107(142102402);
+  // loc(unknown)
+  Fp x108(1402624179);
+  // loc(unknown)
+  Fp x109(1293938517);
+  // loc(unknown)
+  Fp x110(1257820264);
+  // loc(unknown)
+  Fp x111(1215259350);
+  // loc(unknown)
+  Fp x112(1198261138);
+  // loc(unknown)
+  Fp x113(1150410028);
+  // loc(unknown)
+  Fp x114(1147522062);
+  // loc(unknown)
+  Fp x115(1099252725);
+  // loc(unknown)
+  Fp x116(1080533265);
+  // loc(unknown)
+  Fp x117(1079030649);
+  // loc(unknown)
+  Fp x118(1065075039);
+  // loc(unknown)
+  Fp x119(1042892522);
+  // loc(unknown)
+  Fp x120(993455846);
+  // loc(unknown)
+  Fp x121(989618631);
+  // loc(unknown)
+  Fp x122(989176635);
+  // loc(unknown)
+  Fp x123(942439428);
+  // loc(unknown)
+  Fp x124(930036496);
+  // loc(unknown)
+  Fp x125(925018226);
+  // loc(unknown)
+  Fp x126(897025192);
+  // loc(unknown)
+  Fp x127(825405577);
+  // loc(unknown)
+  Fp x128(813674331);
+  // loc(unknown)
+  Fp x129(809508074);
+  // loc(unknown)
+  Fp x130(790726260);
+  // loc(unknown)
+  Fp x131(78845751);
+  // loc(unknown)
+  Fp x132(781141772);
+  // loc(unknown)
+  Fp x133(755691969);
+  // loc(unknown)
+  Fp x134(738091882);
+  // loc(unknown)
+  Fp x135(716894289);
+  // loc(unknown)
+  Fp x136(714957516);
+  // loc(unknown)
+  Fp x137(708123747);
+  // loc(unknown)
+  Fp x138(695835963);
+  // loc(unknown)
+  Fp x139(686842369);
+  // loc(unknown)
+  Fp x140(641665156);
+  // loc(unknown)
+  Fp x141(622609176);
+  // loc(unknown)
+  Fp x142(608401422);
+  // loc(unknown)
+  Fp x143(588764636);
+  // loc(unknown)
+  Fp x144(540703332);
+  // loc(unknown)
+  Fp x145(53007114);
+  // loc(unknown)
+  Fp x146(51256176);
+  // loc(unknown)
+  Fp x147(459826664);
+  // loc(unknown)
+  Fp x148(427731030);
+  // loc(unknown)
+  Fp x149(395622276);
+  // loc(unknown)
+  Fp x150(390340387);
+  // loc(unknown)
+  Fp x151(342857858);
+  // loc(unknown)
+  Fp x152(306391314);
+  // loc(unknown)
+  Fp x153(273790406);
+  // loc(unknown)
+  Fp x154(241306552);
+  // loc(unknown)
+  Fp x155(238616145);
+  // loc(unknown)
+  Fp x156(228520958);
+  // loc(unknown)
+  Fp x157(204228775);
+  // loc(unknown)
+  Fp x158(202271745);
+  // loc(unknown)
+  Fp x159(1997503974);
+  // loc(unknown)
+  Fp x160(1989924532);
+  // loc(unknown)
+  Fp x161(1917861751);
+  // loc(unknown)
+  Fp x162(1917549072);
+  // loc(unknown)
+  Fp x163(1896271507);
+  // loc(unknown)
+  Fp x164(1889898);
+  // loc(unknown)
+  Fp x165(1889603648);
+  // loc(unknown)
+  Fp x166(1845603984);
+  // loc(unknown)
+  Fp x167(1832911930);
+  // loc(unknown)
+  Fp x168(1781980094);
+  // loc(unknown)
+  Fp x169(1740472809);
+  // loc(unknown)
+  Fp x170(1737016378);
+  // loc(unknown)
+  Fp x171(172614232);
+  // loc(unknown)
+  Fp x172(1718628547);
+  // loc(unknown)
+  Fp x173(1715719711);
+  // loc(unknown)
+  Fp x174(1687379185);
+  // loc(unknown)
+  Fp x175(1672219447);
+  // loc(unknown)
+  Fp x176(1649953458);
+  // loc(unknown)
+  Fp x177(1647670797);
+  // loc(unknown)
+  Fp x178(1647665372);
+  // loc(unknown)
+  Fp x179(162506101);
+  // loc(unknown)
+  Fp x180(1608891156);
+  // loc(unknown)
+  Fp x181(1587822577);
+  // loc(unknown)
+  Fp x182(1545325389);
+  // loc(unknown)
+  Fp x183(1518763784);
+  // loc(unknown)
+  Fp x184(1507936940);
+  // loc(unknown)
+  Fp x185(150307788);
+  // loc(unknown)
+  Fp x186(1454563174);
+  // loc(unknown)
+  Fp x187(140621810);
+  // loc(unknown)
+  Fp x188(1401020792);
+  // loc(unknown)
+  Fp x189(1393671120);
+  // loc(unknown)
+  Fp x190(1380248020);
+  // loc(unknown)
+  Fp x191(1339793538);
+  // loc(unknown)
+  Fp x192(1338899225);
+  // loc(unknown)
+  Fp x193(1333667262);
+  // loc(unknown)
+  Fp x194(1303271640);
+  // loc(unknown)
+  Fp x195(1296144415);
+  // loc(unknown)
+  Fp x196(1291790245);
+  // loc(unknown)
+  Fp x197(1290028279);
+  // loc(unknown)
+  Fp x198(128479034);
+  // loc(unknown)
+  Fp x199(1282239129);
+  // loc(unknown)
+  Fp x200(1269493554);
+  // loc(unknown)
+  Fp x201(1262312258);
+  // loc(unknown)
+  Fp x202(1239734761);
+  // loc(unknown)
+  Fp x203(1221257987);
+  // loc(unknown)
+  Fp x204(1213686459);
+  // loc(unknown)
+  Fp x205(1209164052);
+  // loc(unknown)
+  Fp x206(1206940496);
+  // loc(unknown)
+  Fp x207(1201063290);
+  // loc(unknown)
+  Fp x208(117294666);
+  // loc(unknown)
+  Fp x209(1170029417);
+  // loc(unknown)
+  Fp x210(1150912935);
+  // loc(unknown)
+  Fp x211(1124078057);
+  // loc(unknown)
+  Fp x212(1111203133);
+  // loc(unknown)
+  Fp x213(1090783436);
+  // loc(unknown)
+  Fp x214(1006235079);
+  // loc(unknown)
+  Fp x215(1003792297);
+  // loc(unknown)
+  Fp x216(831813382);
+  // loc(unknown)
+  Fp x217(1421525369);
+  // loc(unknown)
+  Fp x218(1751797115);
+  // loc(unknown)
+  Fp x219(1964135730);
+  // loc(unknown)
+  Fp x220(525458520);
+  // loc(unknown)
+  Fp x221(638242172);
+  // loc(unknown)
+  Fp x222(1307439985);
+  // loc(unknown)
+  Fp x223(343354132);
+  // loc(unknown)
+  Fp x224(1389166148);
+  // loc(unknown)
+  Fp x225(1660766320);
+  // loc(unknown)
+  Fp x226(1464793095);
+  // loc(unknown)
+  Fp x227(1180307149);
+  // loc(unknown)
+  Fp x228(1930780904);
+  // loc(unknown)
+  Fp x229(1066694495);
+  // loc(unknown)
+  Fp x230(1773108264);
+  // loc(unknown)
+  Fp x231(1004040026);
+  // loc(unknown)
+  Fp x232(815798990);
+  // loc(unknown)
+  Fp x233(454905424);
+  // loc(unknown)
+  Fp x234(118043943);
+  // loc(unknown)
+  Fp x235(157582794);
+  // loc(unknown)
+  Fp x236(246143118);
+  // loc(unknown)
+  Fp x237(314968988);
+  // loc(unknown)
+  Fp x238(127253399);
+  // loc(unknown)
+  Fp x239(262278199);
+  // loc(unknown)
+  Fp x240(943718400);
+  // loc(unknown)
+  Fp x241(268435454);
+  // loc(unknown)
+  Fp x242(1761607679);
+  // loc(unknown)
+  Fp x243(1073741824);
+  // loc(unknown)
+  Fp x244(536870912);
+  // loc(unknown)
+  Fp x245(1509949437);
+  // loc(unknown)
+  Fp x246(268435456);
+  // loc(unknown)
+  Fp x247(1006632953);
+  // loc(unknown)
+  Fp x248(2013265906);
+  // loc(unknown)
+  Fp x249(134217728);
+  // loc(unknown)
+  Fp x250(67108864);
+  // loc(unknown)
+  Fp x251(2013265891);
+  // loc(unknown)
+  Fp x252(33554432);
+  // loc(unknown)
+  Fp x253(2013265861);
+  // loc(unknown)
+  Fp x254(2013265801);
+  // loc(unknown)
+  Fp x255(16777216);
+  // loc(unknown)
+  Fp x256(8388608);
+  // loc(unknown)
+  Fp x257(2013265681);
+  // loc(unknown)
+  Fp x258(4194304);
+  // loc(unknown)
+  Fp x259(2013265441);
+  // loc(unknown)
+  Fp x260(2097152);
+  // loc(unknown)
+  Fp x261(2013264961);
+  // loc(unknown)
+  Fp x262(2013264001);
+  // loc(unknown)
+  Fp x263(1048576);
+  // loc(unknown)
+  Fp x264(524288);
+  // loc(unknown)
+  Fp x265(2013262081);
+  // loc(unknown)
+  Fp x266(262144);
+  // loc(unknown)
+  Fp x267(2013258241);
+  // loc(unknown)
+  Fp x268(2013250561);
+  // loc(unknown)
+  Fp x269(131072);
+  // loc(unknown)
+  Fp x270(2013235201);
+  // loc(unknown)
+  Fp x271(32768);
+  // loc(unknown)
+  Fp x272(2013204481);
+  // loc(unknown)
+  Fp x273(2013143041);
+  // loc(unknown)
+  Fp x274(16384);
+  // loc(unknown)
+  Fp x275(8192);
+  // loc(unknown)
+  Fp x276(2013020161);
+  // loc(unknown)
+  Fp x277(4096);
+  // loc(unknown)
+  Fp x278(2012774401);
+  // loc(unknown)
+  Fp x279(2048);
+  // loc(unknown)
+  Fp x280(2012282881);
+  // loc(unknown)
+  Fp x281(2011299841);
+  // loc(unknown)
+  Fp x282(1024);
+  // loc(unknown)
+  Fp x283(512);
+  // loc(unknown)
+  Fp x284(2009333761);
+  // loc(unknown)
+  Fp x285(256);
+  // loc(unknown)
+  Fp x286(2005401601);
+  // loc(unknown)
+  Fp x287(1997537281);
+  // loc(unknown)
+  Fp x288(128);
+  // loc(unknown)
+  Fp x289(64);
+  // loc(unknown)
+  Fp x290(1981808641);
+  // loc(unknown)
+  Fp x291(32);
+  // loc(unknown)
+  Fp x292(1950351361);
+  // loc(unknown)
+  Fp x293(1887436801);
+  // loc(unknown)
+  Fp x294(16);
+  // loc(unknown)
+  Fp x295(1761607681);
+  // loc(unknown)
+  Fp x296(1509949441);
+  // loc(unknown)
+  Fp x297(1006632961);
+  // loc(unknown)
+  Fp x298(65536);
+  // loc(unknown)
+  Fp x299(2013265910);
+  // loc(unknown)
+  Fp x300(11);
+  // loc(unknown)
+  Fp x301(10);
+  // loc(unknown)
+  Fp x302(9);
+  // loc(unknown)
+  Fp x303(8);
+  // loc(unknown)
+  Fp x304(7);
+  // loc(unknown)
+  Fp x305(6);
+  // loc(unknown)
+  Fp x306(5);
+  // loc(unknown)
+  Fp x307(4);
+  // loc(unknown)
+  Fp x308(3);
+  // loc(unknown)
+  Fp x309(2);
+  // loc(unknown)
+  Fp x310(1);
+  // loc(unknown)
+  Fp x311(0);
+
+
+    // loc("top(recursion::Top)/code(recursion::Code)/write_addr(Reg)"("zirgen/circuit/recursion/top.cpp":33:49))
+    auto x1361 = arg0[0 * steps + ((cycle - 0) & mask)];
+    assert(x1361 != Fp::invalid());
+    // loc("top(recursion::Top)/code(recursion::Code)/inst(Mux)/macro_ops(recursion::MacroInst)/opcode(OneHot)/wom_init(Reg)"("./zirgen/components/mux.h":59:25))
+
       // loc("top(recursion::Top)/code(recursion::Code)/inst(Mux)/macro_ops(recursion::MacroInst)/operand[1](Reg)"("./zirgen/compiler/edsl/component.h":164:27))
       auto x8655 = arg0[19 * steps + ((cycle - 0) & mask)];
       assert(x8655 != Fp::invalid());
@@ -29081,12 +38310,639 @@ __device__ void step_exec(
         // loc("zirgen/circuit/recursion/macro.cpp":50:11)
         arg1[31] = x8809;
       }
-    }
-  }
-  // loc("top(recursion::Top)/code(recursion::Code)/select(OneHot)/poseidon2_load(Reg)"("./zirgen/components/mux.h":59:25))
-  auto x8811 = arg0[3 * steps + ((cycle - 0) & mask)];
-  assert(x8811 != Fp::invalid());
-  if (x8811 != 0) {
+}
+
+
+__device__ __noinline__ void step_exec_poseidon2_load(
+    void* ctx, uint32_t steps, uint32_t cycle, uint32_t mask,
+    Fp* arg0, Fp* arg1, Fp* arg2) {
+  Fp extern_args[96];
+  Fp extern_outs[32];
+  // loc(unknown)
+  Fp x0(192);
+  // loc(unknown)
+  Fp x1(48);
+  // loc(unknown)
+  Fp x2(12);
+  // loc(unknown)
+  Fp x3(1040977421);
+  // loc(unknown)
+  Fp x4(1792450386);
+  // loc(unknown)
+  Fp x5(1470845646);
+  // loc(unknown)
+  Fp x6(1363837384);
+  // loc(unknown)
+  Fp x7(1878280202);
+  // loc(unknown)
+  Fp x8(434078361);
+  // loc(unknown)
+  Fp x9(1946596189);
+  // loc(unknown)
+  Fp x10(875839332);
+  // loc(unknown)
+  Fp x11(463976218);
+  // loc(unknown)
+  Fp x12(976057819);
+  // loc(unknown)
+  Fp x13(48375137);
+  // loc(unknown)
+  Fp x14(1549779579);
+  // loc(unknown)
+  Fp x15(1679178250);
+  // loc(unknown)
+  Fp x16(530151394);
+  // loc(unknown)
+  Fp x17(1629316321);
+  // loc(unknown)
+  Fp x18(1854174607);
+  // loc(unknown)
+  Fp x19(720724951);
+  // loc(unknown)
+  Fp x20(14387587);
+  // loc(unknown)
+  Fp x21(1883820770);
+  // loc(unknown)
+  Fp x22(205609311);
+  // loc(unknown)
+  Fp x23(1136469704);
+  // loc(unknown)
+  Fp x24(1439947916);
+  // loc(unknown)
+  Fp x25(723038058);
+  // loc(unknown)
+  Fp x26(53041581);
+  // loc(unknown)
+  Fp x27(1810596765);
+  // loc(unknown)
+  Fp x28(1210751726);
+  // loc(unknown)
+  Fp x29(1327682690);
+  // loc(unknown)
+  Fp x30(1886977120);
+  // loc(unknown)
+  Fp x31(1551596046);
+  // loc(unknown)
+  Fp x32(1186174623);
+  // loc(unknown)
+  Fp x33(1199068823);
+  // loc(unknown)
+  Fp x34(1240419708);
+  // loc(unknown)
+  Fp x35(1708681573);
+  // loc(unknown)
+  Fp x36(308575117);
+  // loc(unknown)
+  Fp x37(1111544260);
+  // loc(unknown)
+  Fp x38(822033215);
+  // loc(unknown)
+  Fp x39(1891545577);
+  // loc(unknown)
+  Fp x40(440300254);
+  // loc(unknown)
+  Fp x41(1726563304);
+  // loc(unknown)
+  Fp x42(1365519753);
+  // loc(unknown)
+  Fp x43(924863639);
+  // loc(unknown)
+  Fp x44(1540960371);
+  // loc(unknown)
+  Fp x45(1052077299);
+  // loc(unknown)
+  Fp x46(1930103076);
+  // loc(unknown)
+  Fp x47(98371040);
+  // loc(unknown)
+  Fp x48(918610824);
+  // loc(unknown)
+  Fp x49(801504236);
+  // loc(unknown)
+  Fp x50(65998480);
+  // loc(unknown)
+  Fp x51(658182609);
+  // loc(unknown)
+  Fp x52(606789471);
+  // loc(unknown)
+  Fp x53(51866717);
+  // loc(unknown)
+  Fp x54(375892129);
+  // loc(unknown)
+  Fp x55(20525701);
+  // loc(unknown)
+  Fp x56(1997365680);
+  // loc(unknown)
+  Fp x57(1974912880);
+  // loc(unknown)
+  Fp x58(1942928017);
+  // loc(unknown)
+  Fp x59(1928969209);
+  // loc(unknown)
+  Fp x60(1867716110);
+  // loc(unknown)
+  Fp x61(1792686146);
+  // loc(unknown)
+  Fp x62(1558116381);
+  // loc(unknown)
+  Fp x63(1461037801);
+  // loc(unknown)
+  Fp x64(1389833583);
+  // loc(unknown)
+  Fp x65(13683276);
+  // loc(unknown)
+  Fp x66(1188752902);
+  // loc(unknown)
+  Fp x67(111593398);
+  // loc(unknown)
+  Fp x68(1083257840);
+  // loc(unknown)
+  Fp x69(106789798);
+  // loc(unknown)
+  Fp x70(1001081699);
+  // loc(unknown)
+  Fp x71(497520322);
+  // loc(unknown)
+  Fp x72(946500736);
+  // loc(unknown)
+  Fp x73(890243564);
+  // loc(unknown)
+  Fp x74(862495875);
+  // loc(unknown)
+  Fp x75(855276054);
+  // loc(unknown)
+  Fp x76(76770019);
+  // loc(unknown)
+  Fp x77(760115692);
+  // loc(unknown)
+  Fp x78(623051854);
+  // loc(unknown)
+  Fp x79(59510015);
+  // loc(unknown)
+  Fp x80(552696906);
+  // loc(unknown)
+  Fp x81(538103555);
+  // loc(unknown)
+  Fp x82(457372011);
+  // loc(unknown)
+  Fp x83(447555988);
+  // loc(unknown)
+  Fp x84(27129487);
+  // loc(unknown)
+  Fp x85(217046702);
+  // loc(unknown)
+  Fp x86(1950429111);
+  // loc(unknown)
+  Fp x87(192082241);
+  // loc(unknown)
+  Fp x88(1910423126);
+  // loc(unknown)
+  Fp x89(1908416316);
+  // loc(unknown)
+  Fp x90(1891637550);
+  // loc(unknown)
+  Fp x91(1841795381);
+  // loc(unknown)
+  Fp x92(1827572010);
+  // loc(unknown)
+  Fp x93(1748789933);
+  // loc(unknown)
+  Fp x94(1664590951);
+  // loc(unknown)
+  Fp x95(1663353317);
+  // loc(unknown)
+  Fp x96(162510541);
+  // loc(unknown)
+  Fp x97(1622328571);
+  // loc(unknown)
+  Fp x98(1608853840);
+  // loc(unknown)
+  Fp x99(158646617);
+  // loc(unknown)
+  Fp x100(1584033957);
+  // loc(unknown)
+  Fp x101(1567618575);
+  // loc(unknown)
+  Fp x102(1549062383);
+  // loc(unknown)
+  Fp x103(1507649755);
+  // loc(unknown)
+  Fp x104(1478577620);
+  // loc(unknown)
+  Fp x105(1463323727);
+  // loc(unknown)
+  Fp x106(1424297384);
+  // loc(unknown)
+  Fp x107(142102402);
+  // loc(unknown)
+  Fp x108(1402624179);
+  // loc(unknown)
+  Fp x109(1293938517);
+  // loc(unknown)
+  Fp x110(1257820264);
+  // loc(unknown)
+  Fp x111(1215259350);
+  // loc(unknown)
+  Fp x112(1198261138);
+  // loc(unknown)
+  Fp x113(1150410028);
+  // loc(unknown)
+  Fp x114(1147522062);
+  // loc(unknown)
+  Fp x115(1099252725);
+  // loc(unknown)
+  Fp x116(1080533265);
+  // loc(unknown)
+  Fp x117(1079030649);
+  // loc(unknown)
+  Fp x118(1065075039);
+  // loc(unknown)
+  Fp x119(1042892522);
+  // loc(unknown)
+  Fp x120(993455846);
+  // loc(unknown)
+  Fp x121(989618631);
+  // loc(unknown)
+  Fp x122(989176635);
+  // loc(unknown)
+  Fp x123(942439428);
+  // loc(unknown)
+  Fp x124(930036496);
+  // loc(unknown)
+  Fp x125(925018226);
+  // loc(unknown)
+  Fp x126(897025192);
+  // loc(unknown)
+  Fp x127(825405577);
+  // loc(unknown)
+  Fp x128(813674331);
+  // loc(unknown)
+  Fp x129(809508074);
+  // loc(unknown)
+  Fp x130(790726260);
+  // loc(unknown)
+  Fp x131(78845751);
+  // loc(unknown)
+  Fp x132(781141772);
+  // loc(unknown)
+  Fp x133(755691969);
+  // loc(unknown)
+  Fp x134(738091882);
+  // loc(unknown)
+  Fp x135(716894289);
+  // loc(unknown)
+  Fp x136(714957516);
+  // loc(unknown)
+  Fp x137(708123747);
+  // loc(unknown)
+  Fp x138(695835963);
+  // loc(unknown)
+  Fp x139(686842369);
+  // loc(unknown)
+  Fp x140(641665156);
+  // loc(unknown)
+  Fp x141(622609176);
+  // loc(unknown)
+  Fp x142(608401422);
+  // loc(unknown)
+  Fp x143(588764636);
+  // loc(unknown)
+  Fp x144(540703332);
+  // loc(unknown)
+  Fp x145(53007114);
+  // loc(unknown)
+  Fp x146(51256176);
+  // loc(unknown)
+  Fp x147(459826664);
+  // loc(unknown)
+  Fp x148(427731030);
+  // loc(unknown)
+  Fp x149(395622276);
+  // loc(unknown)
+  Fp x150(390340387);
+  // loc(unknown)
+  Fp x151(342857858);
+  // loc(unknown)
+  Fp x152(306391314);
+  // loc(unknown)
+  Fp x153(273790406);
+  // loc(unknown)
+  Fp x154(241306552);
+  // loc(unknown)
+  Fp x155(238616145);
+  // loc(unknown)
+  Fp x156(228520958);
+  // loc(unknown)
+  Fp x157(204228775);
+  // loc(unknown)
+  Fp x158(202271745);
+  // loc(unknown)
+  Fp x159(1997503974);
+  // loc(unknown)
+  Fp x160(1989924532);
+  // loc(unknown)
+  Fp x161(1917861751);
+  // loc(unknown)
+  Fp x162(1917549072);
+  // loc(unknown)
+  Fp x163(1896271507);
+  // loc(unknown)
+  Fp x164(1889898);
+  // loc(unknown)
+  Fp x165(1889603648);
+  // loc(unknown)
+  Fp x166(1845603984);
+  // loc(unknown)
+  Fp x167(1832911930);
+  // loc(unknown)
+  Fp x168(1781980094);
+  // loc(unknown)
+  Fp x169(1740472809);
+  // loc(unknown)
+  Fp x170(1737016378);
+  // loc(unknown)
+  Fp x171(172614232);
+  // loc(unknown)
+  Fp x172(1718628547);
+  // loc(unknown)
+  Fp x173(1715719711);
+  // loc(unknown)
+  Fp x174(1687379185);
+  // loc(unknown)
+  Fp x175(1672219447);
+  // loc(unknown)
+  Fp x176(1649953458);
+  // loc(unknown)
+  Fp x177(1647670797);
+  // loc(unknown)
+  Fp x178(1647665372);
+  // loc(unknown)
+  Fp x179(162506101);
+  // loc(unknown)
+  Fp x180(1608891156);
+  // loc(unknown)
+  Fp x181(1587822577);
+  // loc(unknown)
+  Fp x182(1545325389);
+  // loc(unknown)
+  Fp x183(1518763784);
+  // loc(unknown)
+  Fp x184(1507936940);
+  // loc(unknown)
+  Fp x185(150307788);
+  // loc(unknown)
+  Fp x186(1454563174);
+  // loc(unknown)
+  Fp x187(140621810);
+  // loc(unknown)
+  Fp x188(1401020792);
+  // loc(unknown)
+  Fp x189(1393671120);
+  // loc(unknown)
+  Fp x190(1380248020);
+  // loc(unknown)
+  Fp x191(1339793538);
+  // loc(unknown)
+  Fp x192(1338899225);
+  // loc(unknown)
+  Fp x193(1333667262);
+  // loc(unknown)
+  Fp x194(1303271640);
+  // loc(unknown)
+  Fp x195(1296144415);
+  // loc(unknown)
+  Fp x196(1291790245);
+  // loc(unknown)
+  Fp x197(1290028279);
+  // loc(unknown)
+  Fp x198(128479034);
+  // loc(unknown)
+  Fp x199(1282239129);
+  // loc(unknown)
+  Fp x200(1269493554);
+  // loc(unknown)
+  Fp x201(1262312258);
+  // loc(unknown)
+  Fp x202(1239734761);
+  // loc(unknown)
+  Fp x203(1221257987);
+  // loc(unknown)
+  Fp x204(1213686459);
+  // loc(unknown)
+  Fp x205(1209164052);
+  // loc(unknown)
+  Fp x206(1206940496);
+  // loc(unknown)
+  Fp x207(1201063290);
+  // loc(unknown)
+  Fp x208(117294666);
+  // loc(unknown)
+  Fp x209(1170029417);
+  // loc(unknown)
+  Fp x210(1150912935);
+  // loc(unknown)
+  Fp x211(1124078057);
+  // loc(unknown)
+  Fp x212(1111203133);
+  // loc(unknown)
+  Fp x213(1090783436);
+  // loc(unknown)
+  Fp x214(1006235079);
+  // loc(unknown)
+  Fp x215(1003792297);
+  // loc(unknown)
+  Fp x216(831813382);
+  // loc(unknown)
+  Fp x217(1421525369);
+  // loc(unknown)
+  Fp x218(1751797115);
+  // loc(unknown)
+  Fp x219(1964135730);
+  // loc(unknown)
+  Fp x220(525458520);
+  // loc(unknown)
+  Fp x221(638242172);
+  // loc(unknown)
+  Fp x222(1307439985);
+  // loc(unknown)
+  Fp x223(343354132);
+  // loc(unknown)
+  Fp x224(1389166148);
+  // loc(unknown)
+  Fp x225(1660766320);
+  // loc(unknown)
+  Fp x226(1464793095);
+  // loc(unknown)
+  Fp x227(1180307149);
+  // loc(unknown)
+  Fp x228(1930780904);
+  // loc(unknown)
+  Fp x229(1066694495);
+  // loc(unknown)
+  Fp x230(1773108264);
+  // loc(unknown)
+  Fp x231(1004040026);
+  // loc(unknown)
+  Fp x232(815798990);
+  // loc(unknown)
+  Fp x233(454905424);
+  // loc(unknown)
+  Fp x234(118043943);
+  // loc(unknown)
+  Fp x235(157582794);
+  // loc(unknown)
+  Fp x236(246143118);
+  // loc(unknown)
+  Fp x237(314968988);
+  // loc(unknown)
+  Fp x238(127253399);
+  // loc(unknown)
+  Fp x239(262278199);
+  // loc(unknown)
+  Fp x240(943718400);
+  // loc(unknown)
+  Fp x241(268435454);
+  // loc(unknown)
+  Fp x242(1761607679);
+  // loc(unknown)
+  Fp x243(1073741824);
+  // loc(unknown)
+  Fp x244(536870912);
+  // loc(unknown)
+  Fp x245(1509949437);
+  // loc(unknown)
+  Fp x246(268435456);
+  // loc(unknown)
+  Fp x247(1006632953);
+  // loc(unknown)
+  Fp x248(2013265906);
+  // loc(unknown)
+  Fp x249(134217728);
+  // loc(unknown)
+  Fp x250(67108864);
+  // loc(unknown)
+  Fp x251(2013265891);
+  // loc(unknown)
+  Fp x252(33554432);
+  // loc(unknown)
+  Fp x253(2013265861);
+  // loc(unknown)
+  Fp x254(2013265801);
+  // loc(unknown)
+  Fp x255(16777216);
+  // loc(unknown)
+  Fp x256(8388608);
+  // loc(unknown)
+  Fp x257(2013265681);
+  // loc(unknown)
+  Fp x258(4194304);
+  // loc(unknown)
+  Fp x259(2013265441);
+  // loc(unknown)
+  Fp x260(2097152);
+  // loc(unknown)
+  Fp x261(2013264961);
+  // loc(unknown)
+  Fp x262(2013264001);
+  // loc(unknown)
+  Fp x263(1048576);
+  // loc(unknown)
+  Fp x264(524288);
+  // loc(unknown)
+  Fp x265(2013262081);
+  // loc(unknown)
+  Fp x266(262144);
+  // loc(unknown)
+  Fp x267(2013258241);
+  // loc(unknown)
+  Fp x268(2013250561);
+  // loc(unknown)
+  Fp x269(131072);
+  // loc(unknown)
+  Fp x270(2013235201);
+  // loc(unknown)
+  Fp x271(32768);
+  // loc(unknown)
+  Fp x272(2013204481);
+  // loc(unknown)
+  Fp x273(2013143041);
+  // loc(unknown)
+  Fp x274(16384);
+  // loc(unknown)
+  Fp x275(8192);
+  // loc(unknown)
+  Fp x276(2013020161);
+  // loc(unknown)
+  Fp x277(4096);
+  // loc(unknown)
+  Fp x278(2012774401);
+  // loc(unknown)
+  Fp x279(2048);
+  // loc(unknown)
+  Fp x280(2012282881);
+  // loc(unknown)
+  Fp x281(2011299841);
+  // loc(unknown)
+  Fp x282(1024);
+  // loc(unknown)
+  Fp x283(512);
+  // loc(unknown)
+  Fp x284(2009333761);
+  // loc(unknown)
+  Fp x285(256);
+  // loc(unknown)
+  Fp x286(2005401601);
+  // loc(unknown)
+  Fp x287(1997537281);
+  // loc(unknown)
+  Fp x288(128);
+  // loc(unknown)
+  Fp x289(64);
+  // loc(unknown)
+  Fp x290(1981808641);
+  // loc(unknown)
+  Fp x291(32);
+  // loc(unknown)
+  Fp x292(1950351361);
+  // loc(unknown)
+  Fp x293(1887436801);
+  // loc(unknown)
+  Fp x294(16);
+  // loc(unknown)
+  Fp x295(1761607681);
+  // loc(unknown)
+  Fp x296(1509949441);
+  // loc(unknown)
+  Fp x297(1006632961);
+  // loc(unknown)
+  Fp x298(65536);
+  // loc(unknown)
+  Fp x299(2013265910);
+  // loc(unknown)
+  Fp x300(11);
+  // loc(unknown)
+  Fp x301(10);
+  // loc(unknown)
+  Fp x302(9);
+  // loc(unknown)
+  Fp x303(8);
+  // loc(unknown)
+  Fp x304(7);
+  // loc(unknown)
+  Fp x305(6);
+  // loc(unknown)
+  Fp x306(5);
+  // loc(unknown)
+  Fp x307(4);
+  // loc(unknown)
+  Fp x308(3);
+  // loc(unknown)
+  Fp x309(2);
+  // loc(unknown)
+  Fp x310(1);
+  // loc(unknown)
+  Fp x311(0);
+
     // loc("top(recursion::Top)/code(recursion::Code)/inst(Mux)/poseidon2_load(recursion::Poseidon2MemInst)/do_mont(Reg)"("./zirgen/compiler/edsl/edsl.h":129:61))
     auto x8812 = arg0[8 * steps + ((cycle - 0) & mask)];
     assert(x8812 != Fp::invalid());
@@ -30361,11 +40217,863 @@ __device__ void step_exec(
         "POSEIDON2_LOAD: keepState(%u), keepUpperState(%u) prepFull(%u), group(%u), doMont(%u)",
         extern_args,
         extern_outs);
-  }
-  // loc("top(recursion::Top)/code(recursion::Code)/select(OneHot)/poseidon2_full(Reg)"("./zirgen/components/mux.h":59:25))
-  auto x9216 = arg0[4 * steps + ((cycle - 0) & mask)];
-  assert(x9216 != Fp::invalid());
-  if (x9216 != 0) {
+
+  // tail section
+    {
+      // loc("zirgen/circuit/recursion/wom.cpp":22:3)
+      {
+        auto& reg = arg2[45 * steps + cycle];
+        assert(reg == Fp::invalid() || reg == x311);
+        reg = x311;
+      }
+      // loc("zirgen/circuit/recursion/wom.cpp":61:5)
+      {
+        auto& reg = arg2[46 * steps + cycle];
+        assert(reg == Fp::invalid() || reg == x311);
+        reg = x311;
+      }
+      // loc("zirgen/circuit/recursion/wom.cpp":61:5)
+      {
+        auto& reg = arg2[47 * steps + cycle];
+        assert(reg == Fp::invalid() || reg == x311);
+        reg = x311;
+      }
+      // loc("zirgen/circuit/recursion/wom.cpp":61:5)
+      {
+        auto& reg = arg2[48 * steps + cycle];
+        assert(reg == Fp::invalid() || reg == x311);
+        reg = x311;
+      }
+      // loc("zirgen/circuit/recursion/wom.cpp":61:5)
+      {
+        auto& reg = arg2[49 * steps + cycle];
+        assert(reg == Fp::invalid() || reg == x311);
+        reg = x311;
+      }
+    }
+    {
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+      auto x13056 = arg2[5 * steps + ((cycle - 0) & mask)];
+      assert(x13056 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13057 = arg2[6 * steps + ((cycle - 0) & mask)];
+      assert(x13057 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13058 = arg2[7 * steps + ((cycle - 0) & mask)];
+      assert(x13058 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13059 = arg2[8 * steps + ((cycle - 0) & mask)];
+      assert(x13059 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13060 = arg2[9 * steps + ((cycle - 0) & mask)];
+      assert(x13060 != Fp::invalid());
+      extern_args[0] = x13056;
+      extern_args[1] = x13057;
+      extern_args[2] = x13058;
+      extern_args[3] = x13059;
+      extern_args[4] = x13060;
+      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+      auto x13061 = arg2[10 * steps + ((cycle - 0) & mask)];
+      assert(x13061 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13062 = arg2[11 * steps + ((cycle - 0) & mask)];
+      assert(x13062 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13063 = arg2[12 * steps + ((cycle - 0) & mask)];
+      assert(x13063 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13064 = arg2[13 * steps + ((cycle - 0) & mask)];
+      assert(x13064 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13065 = arg2[14 * steps + ((cycle - 0) & mask)];
+      assert(x13065 != Fp::invalid());
+      extern_args[0] = x13061;
+      extern_args[1] = x13062;
+      extern_args[2] = x13063;
+      extern_args[3] = x13064;
+      extern_args[4] = x13065;
+      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+      auto x13066 = arg2[15 * steps + ((cycle - 0) & mask)];
+      assert(x13066 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13067 = arg2[16 * steps + ((cycle - 0) & mask)];
+      assert(x13067 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13068 = arg2[17 * steps + ((cycle - 0) & mask)];
+      assert(x13068 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13069 = arg2[18 * steps + ((cycle - 0) & mask)];
+      assert(x13069 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13070 = arg2[19 * steps + ((cycle - 0) & mask)];
+      assert(x13070 != Fp::invalid());
+      extern_args[0] = x13066;
+      extern_args[1] = x13067;
+      extern_args[2] = x13068;
+      extern_args[3] = x13069;
+      extern_args[4] = x13070;
+      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+      auto x13071 = arg2[20 * steps + ((cycle - 0) & mask)];
+      assert(x13071 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13072 = arg2[21 * steps + ((cycle - 0) & mask)];
+      assert(x13072 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13073 = arg2[22 * steps + ((cycle - 0) & mask)];
+      assert(x13073 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13074 = arg2[23 * steps + ((cycle - 0) & mask)];
+      assert(x13074 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13075 = arg2[24 * steps + ((cycle - 0) & mask)];
+      assert(x13075 != Fp::invalid());
+      extern_args[0] = x13071;
+      extern_args[1] = x13072;
+      extern_args[2] = x13073;
+      extern_args[3] = x13074;
+      extern_args[4] = x13075;
+      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+      auto x13076 = arg2[25 * steps + ((cycle - 0) & mask)];
+      assert(x13076 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13077 = arg2[26 * steps + ((cycle - 0) & mask)];
+      assert(x13077 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13078 = arg2[27 * steps + ((cycle - 0) & mask)];
+      assert(x13078 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13079 = arg2[28 * steps + ((cycle - 0) & mask)];
+      assert(x13079 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13080 = arg2[29 * steps + ((cycle - 0) & mask)];
+      assert(x13080 != Fp::invalid());
+      extern_args[0] = x13076;
+      extern_args[1] = x13077;
+      extern_args[2] = x13078;
+      extern_args[3] = x13079;
+      extern_args[4] = x13080;
+      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+      auto x13081 = arg2[30 * steps + ((cycle - 0) & mask)];
+      assert(x13081 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13082 = arg2[31 * steps + ((cycle - 0) & mask)];
+      assert(x13082 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13083 = arg2[32 * steps + ((cycle - 0) & mask)];
+      assert(x13083 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13084 = arg2[33 * steps + ((cycle - 0) & mask)];
+      assert(x13084 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13085 = arg2[34 * steps + ((cycle - 0) & mask)];
+      assert(x13085 != Fp::invalid());
+      extern_args[0] = x13081;
+      extern_args[1] = x13082;
+      extern_args[2] = x13083;
+      extern_args[3] = x13084;
+      extern_args[4] = x13085;
+      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+      auto x13086 = arg2[35 * steps + ((cycle - 0) & mask)];
+      assert(x13086 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13087 = arg2[36 * steps + ((cycle - 0) & mask)];
+      assert(x13087 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13088 = arg2[37 * steps + ((cycle - 0) & mask)];
+      assert(x13088 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13089 = arg2[38 * steps + ((cycle - 0) & mask)];
+      assert(x13089 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13090 = arg2[39 * steps + ((cycle - 0) & mask)];
+      assert(x13090 != Fp::invalid());
+      extern_args[0] = x13086;
+      extern_args[1] = x13087;
+      extern_args[2] = x13088;
+      extern_args[3] = x13089;
+      extern_args[4] = x13090;
+      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+      auto x13091 = arg2[40 * steps + ((cycle - 0) & mask)];
+      assert(x13091 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13092 = arg2[41 * steps + ((cycle - 0) & mask)];
+      assert(x13092 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13093 = arg2[42 * steps + ((cycle - 0) & mask)];
+      assert(x13093 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13094 = arg2[43 * steps + ((cycle - 0) & mask)];
+      assert(x13094 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13095 = arg2[44 * steps + ((cycle - 0) & mask)];
+      assert(x13095 != Fp::invalid());
+      extern_args[0] = x13091;
+      extern_args[1] = x13092;
+      extern_args[2] = x13093;
+      extern_args[3] = x13094;
+      extern_args[4] = x13095;
+      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+      auto x13096 = arg2[45 * steps + ((cycle - 0) & mask)];
+      assert(x13096 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13097 = arg2[46 * steps + ((cycle - 0) & mask)];
+      assert(x13097 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13098 = arg2[47 * steps + ((cycle - 0) & mask)];
+      assert(x13098 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13099 = arg2[48 * steps + ((cycle - 0) & mask)];
+      assert(x13099 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13100 = arg2[49 * steps + ((cycle - 0) & mask)];
+      assert(x13100 != Fp::invalid());
+      extern_args[0] = x13096;
+      extern_args[1] = x13097;
+      extern_args[2] = x13098;
+      extern_args[3] = x13099;
+      extern_args[4] = x13100;
+      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+    }
+}
+
+__device__ __noinline__ void step_exec_poseidon2_full(
+    void* ctx, uint32_t steps, uint32_t cycle, uint32_t mask,
+    Fp* arg0, Fp* arg1, Fp* arg2) {
+  Fp extern_args[96];
+  Fp extern_outs[32];
+  // loc(unknown)
+  Fp x0(192);
+  // loc(unknown)
+  Fp x1(48);
+  // loc(unknown)
+  Fp x2(12);
+  // loc(unknown)
+  Fp x3(1040977421);
+  // loc(unknown)
+  Fp x4(1792450386);
+  // loc(unknown)
+  Fp x5(1470845646);
+  // loc(unknown)
+  Fp x6(1363837384);
+  // loc(unknown)
+  Fp x7(1878280202);
+  // loc(unknown)
+  Fp x8(434078361);
+  // loc(unknown)
+  Fp x9(1946596189);
+  // loc(unknown)
+  Fp x10(875839332);
+  // loc(unknown)
+  Fp x11(463976218);
+  // loc(unknown)
+  Fp x12(976057819);
+  // loc(unknown)
+  Fp x13(48375137);
+  // loc(unknown)
+  Fp x14(1549779579);
+  // loc(unknown)
+  Fp x15(1679178250);
+  // loc(unknown)
+  Fp x16(530151394);
+  // loc(unknown)
+  Fp x17(1629316321);
+  // loc(unknown)
+  Fp x18(1854174607);
+  // loc(unknown)
+  Fp x19(720724951);
+  // loc(unknown)
+  Fp x20(14387587);
+  // loc(unknown)
+  Fp x21(1883820770);
+  // loc(unknown)
+  Fp x22(205609311);
+  // loc(unknown)
+  Fp x23(1136469704);
+  // loc(unknown)
+  Fp x24(1439947916);
+  // loc(unknown)
+  Fp x25(723038058);
+  // loc(unknown)
+  Fp x26(53041581);
+  // loc(unknown)
+  Fp x27(1810596765);
+  // loc(unknown)
+  Fp x28(1210751726);
+  // loc(unknown)
+  Fp x29(1327682690);
+  // loc(unknown)
+  Fp x30(1886977120);
+  // loc(unknown)
+  Fp x31(1551596046);
+  // loc(unknown)
+  Fp x32(1186174623);
+  // loc(unknown)
+  Fp x33(1199068823);
+  // loc(unknown)
+  Fp x34(1240419708);
+  // loc(unknown)
+  Fp x35(1708681573);
+  // loc(unknown)
+  Fp x36(308575117);
+  // loc(unknown)
+  Fp x37(1111544260);
+  // loc(unknown)
+  Fp x38(822033215);
+  // loc(unknown)
+  Fp x39(1891545577);
+  // loc(unknown)
+  Fp x40(440300254);
+  // loc(unknown)
+  Fp x41(1726563304);
+  // loc(unknown)
+  Fp x42(1365519753);
+  // loc(unknown)
+  Fp x43(924863639);
+  // loc(unknown)
+  Fp x44(1540960371);
+  // loc(unknown)
+  Fp x45(1052077299);
+  // loc(unknown)
+  Fp x46(1930103076);
+  // loc(unknown)
+  Fp x47(98371040);
+  // loc(unknown)
+  Fp x48(918610824);
+  // loc(unknown)
+  Fp x49(801504236);
+  // loc(unknown)
+  Fp x50(65998480);
+  // loc(unknown)
+  Fp x51(658182609);
+  // loc(unknown)
+  Fp x52(606789471);
+  // loc(unknown)
+  Fp x53(51866717);
+  // loc(unknown)
+  Fp x54(375892129);
+  // loc(unknown)
+  Fp x55(20525701);
+  // loc(unknown)
+  Fp x56(1997365680);
+  // loc(unknown)
+  Fp x57(1974912880);
+  // loc(unknown)
+  Fp x58(1942928017);
+  // loc(unknown)
+  Fp x59(1928969209);
+  // loc(unknown)
+  Fp x60(1867716110);
+  // loc(unknown)
+  Fp x61(1792686146);
+  // loc(unknown)
+  Fp x62(1558116381);
+  // loc(unknown)
+  Fp x63(1461037801);
+  // loc(unknown)
+  Fp x64(1389833583);
+  // loc(unknown)
+  Fp x65(13683276);
+  // loc(unknown)
+  Fp x66(1188752902);
+  // loc(unknown)
+  Fp x67(111593398);
+  // loc(unknown)
+  Fp x68(1083257840);
+  // loc(unknown)
+  Fp x69(106789798);
+  // loc(unknown)
+  Fp x70(1001081699);
+  // loc(unknown)
+  Fp x71(497520322);
+  // loc(unknown)
+  Fp x72(946500736);
+  // loc(unknown)
+  Fp x73(890243564);
+  // loc(unknown)
+  Fp x74(862495875);
+  // loc(unknown)
+  Fp x75(855276054);
+  // loc(unknown)
+  Fp x76(76770019);
+  // loc(unknown)
+  Fp x77(760115692);
+  // loc(unknown)
+  Fp x78(623051854);
+  // loc(unknown)
+  Fp x79(59510015);
+  // loc(unknown)
+  Fp x80(552696906);
+  // loc(unknown)
+  Fp x81(538103555);
+  // loc(unknown)
+  Fp x82(457372011);
+  // loc(unknown)
+  Fp x83(447555988);
+  // loc(unknown)
+  Fp x84(27129487);
+  // loc(unknown)
+  Fp x85(217046702);
+  // loc(unknown)
+  Fp x86(1950429111);
+  // loc(unknown)
+  Fp x87(192082241);
+  // loc(unknown)
+  Fp x88(1910423126);
+  // loc(unknown)
+  Fp x89(1908416316);
+  // loc(unknown)
+  Fp x90(1891637550);
+  // loc(unknown)
+  Fp x91(1841795381);
+  // loc(unknown)
+  Fp x92(1827572010);
+  // loc(unknown)
+  Fp x93(1748789933);
+  // loc(unknown)
+  Fp x94(1664590951);
+  // loc(unknown)
+  Fp x95(1663353317);
+  // loc(unknown)
+  Fp x96(162510541);
+  // loc(unknown)
+  Fp x97(1622328571);
+  // loc(unknown)
+  Fp x98(1608853840);
+  // loc(unknown)
+  Fp x99(158646617);
+  // loc(unknown)
+  Fp x100(1584033957);
+  // loc(unknown)
+  Fp x101(1567618575);
+  // loc(unknown)
+  Fp x102(1549062383);
+  // loc(unknown)
+  Fp x103(1507649755);
+  // loc(unknown)
+  Fp x104(1478577620);
+  // loc(unknown)
+  Fp x105(1463323727);
+  // loc(unknown)
+  Fp x106(1424297384);
+  // loc(unknown)
+  Fp x107(142102402);
+  // loc(unknown)
+  Fp x108(1402624179);
+  // loc(unknown)
+  Fp x109(1293938517);
+  // loc(unknown)
+  Fp x110(1257820264);
+  // loc(unknown)
+  Fp x111(1215259350);
+  // loc(unknown)
+  Fp x112(1198261138);
+  // loc(unknown)
+  Fp x113(1150410028);
+  // loc(unknown)
+  Fp x114(1147522062);
+  // loc(unknown)
+  Fp x115(1099252725);
+  // loc(unknown)
+  Fp x116(1080533265);
+  // loc(unknown)
+  Fp x117(1079030649);
+  // loc(unknown)
+  Fp x118(1065075039);
+  // loc(unknown)
+  Fp x119(1042892522);
+  // loc(unknown)
+  Fp x120(993455846);
+  // loc(unknown)
+  Fp x121(989618631);
+  // loc(unknown)
+  Fp x122(989176635);
+  // loc(unknown)
+  Fp x123(942439428);
+  // loc(unknown)
+  Fp x124(930036496);
+  // loc(unknown)
+  Fp x125(925018226);
+  // loc(unknown)
+  Fp x126(897025192);
+  // loc(unknown)
+  Fp x127(825405577);
+  // loc(unknown)
+  Fp x128(813674331);
+  // loc(unknown)
+  Fp x129(809508074);
+  // loc(unknown)
+  Fp x130(790726260);
+  // loc(unknown)
+  Fp x131(78845751);
+  // loc(unknown)
+  Fp x132(781141772);
+  // loc(unknown)
+  Fp x133(755691969);
+  // loc(unknown)
+  Fp x134(738091882);
+  // loc(unknown)
+  Fp x135(716894289);
+  // loc(unknown)
+  Fp x136(714957516);
+  // loc(unknown)
+  Fp x137(708123747);
+  // loc(unknown)
+  Fp x138(695835963);
+  // loc(unknown)
+  Fp x139(686842369);
+  // loc(unknown)
+  Fp x140(641665156);
+  // loc(unknown)
+  Fp x141(622609176);
+  // loc(unknown)
+  Fp x142(608401422);
+  // loc(unknown)
+  Fp x143(588764636);
+  // loc(unknown)
+  Fp x144(540703332);
+  // loc(unknown)
+  Fp x145(53007114);
+  // loc(unknown)
+  Fp x146(51256176);
+  // loc(unknown)
+  Fp x147(459826664);
+  // loc(unknown)
+  Fp x148(427731030);
+  // loc(unknown)
+  Fp x149(395622276);
+  // loc(unknown)
+  Fp x150(390340387);
+  // loc(unknown)
+  Fp x151(342857858);
+  // loc(unknown)
+  Fp x152(306391314);
+  // loc(unknown)
+  Fp x153(273790406);
+  // loc(unknown)
+  Fp x154(241306552);
+  // loc(unknown)
+  Fp x155(238616145);
+  // loc(unknown)
+  Fp x156(228520958);
+  // loc(unknown)
+  Fp x157(204228775);
+  // loc(unknown)
+  Fp x158(202271745);
+  // loc(unknown)
+  Fp x159(1997503974);
+  // loc(unknown)
+  Fp x160(1989924532);
+  // loc(unknown)
+  Fp x161(1917861751);
+  // loc(unknown)
+  Fp x162(1917549072);
+  // loc(unknown)
+  Fp x163(1896271507);
+  // loc(unknown)
+  Fp x164(1889898);
+  // loc(unknown)
+  Fp x165(1889603648);
+  // loc(unknown)
+  Fp x166(1845603984);
+  // loc(unknown)
+  Fp x167(1832911930);
+  // loc(unknown)
+  Fp x168(1781980094);
+  // loc(unknown)
+  Fp x169(1740472809);
+  // loc(unknown)
+  Fp x170(1737016378);
+  // loc(unknown)
+  Fp x171(172614232);
+  // loc(unknown)
+  Fp x172(1718628547);
+  // loc(unknown)
+  Fp x173(1715719711);
+  // loc(unknown)
+  Fp x174(1687379185);
+  // loc(unknown)
+  Fp x175(1672219447);
+  // loc(unknown)
+  Fp x176(1649953458);
+  // loc(unknown)
+  Fp x177(1647670797);
+  // loc(unknown)
+  Fp x178(1647665372);
+  // loc(unknown)
+  Fp x179(162506101);
+  // loc(unknown)
+  Fp x180(1608891156);
+  // loc(unknown)
+  Fp x181(1587822577);
+  // loc(unknown)
+  Fp x182(1545325389);
+  // loc(unknown)
+  Fp x183(1518763784);
+  // loc(unknown)
+  Fp x184(1507936940);
+  // loc(unknown)
+  Fp x185(150307788);
+  // loc(unknown)
+  Fp x186(1454563174);
+  // loc(unknown)
+  Fp x187(140621810);
+  // loc(unknown)
+  Fp x188(1401020792);
+  // loc(unknown)
+  Fp x189(1393671120);
+  // loc(unknown)
+  Fp x190(1380248020);
+  // loc(unknown)
+  Fp x191(1339793538);
+  // loc(unknown)
+  Fp x192(1338899225);
+  // loc(unknown)
+  Fp x193(1333667262);
+  // loc(unknown)
+  Fp x194(1303271640);
+  // loc(unknown)
+  Fp x195(1296144415);
+  // loc(unknown)
+  Fp x196(1291790245);
+  // loc(unknown)
+  Fp x197(1290028279);
+  // loc(unknown)
+  Fp x198(128479034);
+  // loc(unknown)
+  Fp x199(1282239129);
+  // loc(unknown)
+  Fp x200(1269493554);
+  // loc(unknown)
+  Fp x201(1262312258);
+  // loc(unknown)
+  Fp x202(1239734761);
+  // loc(unknown)
+  Fp x203(1221257987);
+  // loc(unknown)
+  Fp x204(1213686459);
+  // loc(unknown)
+  Fp x205(1209164052);
+  // loc(unknown)
+  Fp x206(1206940496);
+  // loc(unknown)
+  Fp x207(1201063290);
+  // loc(unknown)
+  Fp x208(117294666);
+  // loc(unknown)
+  Fp x209(1170029417);
+  // loc(unknown)
+  Fp x210(1150912935);
+  // loc(unknown)
+  Fp x211(1124078057);
+  // loc(unknown)
+  Fp x212(1111203133);
+  // loc(unknown)
+  Fp x213(1090783436);
+  // loc(unknown)
+  Fp x214(1006235079);
+  // loc(unknown)
+  Fp x215(1003792297);
+  // loc(unknown)
+  Fp x216(831813382);
+  // loc(unknown)
+  Fp x217(1421525369);
+  // loc(unknown)
+  Fp x218(1751797115);
+  // loc(unknown)
+  Fp x219(1964135730);
+  // loc(unknown)
+  Fp x220(525458520);
+  // loc(unknown)
+  Fp x221(638242172);
+  // loc(unknown)
+  Fp x222(1307439985);
+  // loc(unknown)
+  Fp x223(343354132);
+  // loc(unknown)
+  Fp x224(1389166148);
+  // loc(unknown)
+  Fp x225(1660766320);
+  // loc(unknown)
+  Fp x226(1464793095);
+  // loc(unknown)
+  Fp x227(1180307149);
+  // loc(unknown)
+  Fp x228(1930780904);
+  // loc(unknown)
+  Fp x229(1066694495);
+  // loc(unknown)
+  Fp x230(1773108264);
+  // loc(unknown)
+  Fp x231(1004040026);
+  // loc(unknown)
+  Fp x232(815798990);
+  // loc(unknown)
+  Fp x233(454905424);
+  // loc(unknown)
+  Fp x234(118043943);
+  // loc(unknown)
+  Fp x235(157582794);
+  // loc(unknown)
+  Fp x236(246143118);
+  // loc(unknown)
+  Fp x237(314968988);
+  // loc(unknown)
+  Fp x238(127253399);
+  // loc(unknown)
+  Fp x239(262278199);
+  // loc(unknown)
+  Fp x240(943718400);
+  // loc(unknown)
+  Fp x241(268435454);
+  // loc(unknown)
+  Fp x242(1761607679);
+  // loc(unknown)
+  Fp x243(1073741824);
+  // loc(unknown)
+  Fp x244(536870912);
+  // loc(unknown)
+  Fp x245(1509949437);
+  // loc(unknown)
+  Fp x246(268435456);
+  // loc(unknown)
+  Fp x247(1006632953);
+  // loc(unknown)
+  Fp x248(2013265906);
+  // loc(unknown)
+  Fp x249(134217728);
+  // loc(unknown)
+  Fp x250(67108864);
+  // loc(unknown)
+  Fp x251(2013265891);
+  // loc(unknown)
+  Fp x252(33554432);
+  // loc(unknown)
+  Fp x253(2013265861);
+  // loc(unknown)
+  Fp x254(2013265801);
+  // loc(unknown)
+  Fp x255(16777216);
+  // loc(unknown)
+  Fp x256(8388608);
+  // loc(unknown)
+  Fp x257(2013265681);
+  // loc(unknown)
+  Fp x258(4194304);
+  // loc(unknown)
+  Fp x259(2013265441);
+  // loc(unknown)
+  Fp x260(2097152);
+  // loc(unknown)
+  Fp x261(2013264961);
+  // loc(unknown)
+  Fp x262(2013264001);
+  // loc(unknown)
+  Fp x263(1048576);
+  // loc(unknown)
+  Fp x264(524288);
+  // loc(unknown)
+  Fp x265(2013262081);
+  // loc(unknown)
+  Fp x266(262144);
+  // loc(unknown)
+  Fp x267(2013258241);
+  // loc(unknown)
+  Fp x268(2013250561);
+  // loc(unknown)
+  Fp x269(131072);
+  // loc(unknown)
+  Fp x270(2013235201);
+  // loc(unknown)
+  Fp x271(32768);
+  // loc(unknown)
+  Fp x272(2013204481);
+  // loc(unknown)
+  Fp x273(2013143041);
+  // loc(unknown)
+  Fp x274(16384);
+  // loc(unknown)
+  Fp x275(8192);
+  // loc(unknown)
+  Fp x276(2013020161);
+  // loc(unknown)
+  Fp x277(4096);
+  // loc(unknown)
+  Fp x278(2012774401);
+  // loc(unknown)
+  Fp x279(2048);
+  // loc(unknown)
+  Fp x280(2012282881);
+  // loc(unknown)
+  Fp x281(2011299841);
+  // loc(unknown)
+  Fp x282(1024);
+  // loc(unknown)
+  Fp x283(512);
+  // loc(unknown)
+  Fp x284(2009333761);
+  // loc(unknown)
+  Fp x285(256);
+  // loc(unknown)
+  Fp x286(2005401601);
+  // loc(unknown)
+  Fp x287(1997537281);
+  // loc(unknown)
+  Fp x288(128);
+  // loc(unknown)
+  Fp x289(64);
+  // loc(unknown)
+  Fp x290(1981808641);
+  // loc(unknown)
+  Fp x291(32);
+  // loc(unknown)
+  Fp x292(1950351361);
+  // loc(unknown)
+  Fp x293(1887436801);
+  // loc(unknown)
+  Fp x294(16);
+  // loc(unknown)
+  Fp x295(1761607681);
+  // loc(unknown)
+  Fp x296(1509949441);
+  // loc(unknown)
+  Fp x297(1006632961);
+  // loc(unknown)
+  Fp x298(65536);
+  // loc(unknown)
+  Fp x299(2013265910);
+  // loc(unknown)
+  Fp x300(11);
+  // loc(unknown)
+  Fp x301(10);
+  // loc(unknown)
+  Fp x302(9);
+  // loc(unknown)
+  Fp x303(8);
+  // loc(unknown)
+  Fp x304(7);
+  // loc(unknown)
+  Fp x305(6);
+  // loc(unknown)
+  Fp x306(5);
+  // loc(unknown)
+  Fp x307(4);
+  // loc(unknown)
+  Fp x308(3);
+  // loc(unknown)
+  Fp x309(2);
+  // loc(unknown)
+  Fp x310(1);
+  // loc(unknown)
+  Fp x311(0);
+
     // loc("top(recursion::Top)/code(recursion::Code)/inst(Mux)/poseidon2_full(recursion::Poseidon2FullInst)/cycle(OneHot)/c2(Reg)"("./zirgen/compiler/edsl/edsl.h":129:61))
     auto x9217 = arg0[10 * steps + ((cycle - 0) & mask)];
     assert(x9217 != Fp::invalid());
@@ -32676,11 +43384,638 @@ __device__ void step_exec(
       assert(reg == Fp::invalid() || reg == x10032);
       reg = x10032;
     }
-  }
-  // loc("top(recursion::Top)/code(recursion::Code)/select(OneHot)/poseidon2_partial(Reg)"("./zirgen/components/mux.h":59:25))
-  auto x10033 = arg0[5 * steps + ((cycle - 0) & mask)];
-  assert(x10033 != Fp::invalid());
-  if (x10033 != 0) {
+}
+
+__device__ __noinline__ void step_exec_poseidon2_partial(
+    void* ctx, uint32_t steps, uint32_t cycle, uint32_t mask,
+    Fp* arg0, Fp* arg1, Fp* arg2) {
+  Fp extern_args[96];
+  Fp extern_outs[32];
+  // loc(unknown)
+  Fp x0(192);
+  // loc(unknown)
+  Fp x1(48);
+  // loc(unknown)
+  Fp x2(12);
+  // loc(unknown)
+  Fp x3(1040977421);
+  // loc(unknown)
+  Fp x4(1792450386);
+  // loc(unknown)
+  Fp x5(1470845646);
+  // loc(unknown)
+  Fp x6(1363837384);
+  // loc(unknown)
+  Fp x7(1878280202);
+  // loc(unknown)
+  Fp x8(434078361);
+  // loc(unknown)
+  Fp x9(1946596189);
+  // loc(unknown)
+  Fp x10(875839332);
+  // loc(unknown)
+  Fp x11(463976218);
+  // loc(unknown)
+  Fp x12(976057819);
+  // loc(unknown)
+  Fp x13(48375137);
+  // loc(unknown)
+  Fp x14(1549779579);
+  // loc(unknown)
+  Fp x15(1679178250);
+  // loc(unknown)
+  Fp x16(530151394);
+  // loc(unknown)
+  Fp x17(1629316321);
+  // loc(unknown)
+  Fp x18(1854174607);
+  // loc(unknown)
+  Fp x19(720724951);
+  // loc(unknown)
+  Fp x20(14387587);
+  // loc(unknown)
+  Fp x21(1883820770);
+  // loc(unknown)
+  Fp x22(205609311);
+  // loc(unknown)
+  Fp x23(1136469704);
+  // loc(unknown)
+  Fp x24(1439947916);
+  // loc(unknown)
+  Fp x25(723038058);
+  // loc(unknown)
+  Fp x26(53041581);
+  // loc(unknown)
+  Fp x27(1810596765);
+  // loc(unknown)
+  Fp x28(1210751726);
+  // loc(unknown)
+  Fp x29(1327682690);
+  // loc(unknown)
+  Fp x30(1886977120);
+  // loc(unknown)
+  Fp x31(1551596046);
+  // loc(unknown)
+  Fp x32(1186174623);
+  // loc(unknown)
+  Fp x33(1199068823);
+  // loc(unknown)
+  Fp x34(1240419708);
+  // loc(unknown)
+  Fp x35(1708681573);
+  // loc(unknown)
+  Fp x36(308575117);
+  // loc(unknown)
+  Fp x37(1111544260);
+  // loc(unknown)
+  Fp x38(822033215);
+  // loc(unknown)
+  Fp x39(1891545577);
+  // loc(unknown)
+  Fp x40(440300254);
+  // loc(unknown)
+  Fp x41(1726563304);
+  // loc(unknown)
+  Fp x42(1365519753);
+  // loc(unknown)
+  Fp x43(924863639);
+  // loc(unknown)
+  Fp x44(1540960371);
+  // loc(unknown)
+  Fp x45(1052077299);
+  // loc(unknown)
+  Fp x46(1930103076);
+  // loc(unknown)
+  Fp x47(98371040);
+  // loc(unknown)
+  Fp x48(918610824);
+  // loc(unknown)
+  Fp x49(801504236);
+  // loc(unknown)
+  Fp x50(65998480);
+  // loc(unknown)
+  Fp x51(658182609);
+  // loc(unknown)
+  Fp x52(606789471);
+  // loc(unknown)
+  Fp x53(51866717);
+  // loc(unknown)
+  Fp x54(375892129);
+  // loc(unknown)
+  Fp x55(20525701);
+  // loc(unknown)
+  Fp x56(1997365680);
+  // loc(unknown)
+  Fp x57(1974912880);
+  // loc(unknown)
+  Fp x58(1942928017);
+  // loc(unknown)
+  Fp x59(1928969209);
+  // loc(unknown)
+  Fp x60(1867716110);
+  // loc(unknown)
+  Fp x61(1792686146);
+  // loc(unknown)
+  Fp x62(1558116381);
+  // loc(unknown)
+  Fp x63(1461037801);
+  // loc(unknown)
+  Fp x64(1389833583);
+  // loc(unknown)
+  Fp x65(13683276);
+  // loc(unknown)
+  Fp x66(1188752902);
+  // loc(unknown)
+  Fp x67(111593398);
+  // loc(unknown)
+  Fp x68(1083257840);
+  // loc(unknown)
+  Fp x69(106789798);
+  // loc(unknown)
+  Fp x70(1001081699);
+  // loc(unknown)
+  Fp x71(497520322);
+  // loc(unknown)
+  Fp x72(946500736);
+  // loc(unknown)
+  Fp x73(890243564);
+  // loc(unknown)
+  Fp x74(862495875);
+  // loc(unknown)
+  Fp x75(855276054);
+  // loc(unknown)
+  Fp x76(76770019);
+  // loc(unknown)
+  Fp x77(760115692);
+  // loc(unknown)
+  Fp x78(623051854);
+  // loc(unknown)
+  Fp x79(59510015);
+  // loc(unknown)
+  Fp x80(552696906);
+  // loc(unknown)
+  Fp x81(538103555);
+  // loc(unknown)
+  Fp x82(457372011);
+  // loc(unknown)
+  Fp x83(447555988);
+  // loc(unknown)
+  Fp x84(27129487);
+  // loc(unknown)
+  Fp x85(217046702);
+  // loc(unknown)
+  Fp x86(1950429111);
+  // loc(unknown)
+  Fp x87(192082241);
+  // loc(unknown)
+  Fp x88(1910423126);
+  // loc(unknown)
+  Fp x89(1908416316);
+  // loc(unknown)
+  Fp x90(1891637550);
+  // loc(unknown)
+  Fp x91(1841795381);
+  // loc(unknown)
+  Fp x92(1827572010);
+  // loc(unknown)
+  Fp x93(1748789933);
+  // loc(unknown)
+  Fp x94(1664590951);
+  // loc(unknown)
+  Fp x95(1663353317);
+  // loc(unknown)
+  Fp x96(162510541);
+  // loc(unknown)
+  Fp x97(1622328571);
+  // loc(unknown)
+  Fp x98(1608853840);
+  // loc(unknown)
+  Fp x99(158646617);
+  // loc(unknown)
+  Fp x100(1584033957);
+  // loc(unknown)
+  Fp x101(1567618575);
+  // loc(unknown)
+  Fp x102(1549062383);
+  // loc(unknown)
+  Fp x103(1507649755);
+  // loc(unknown)
+  Fp x104(1478577620);
+  // loc(unknown)
+  Fp x105(1463323727);
+  // loc(unknown)
+  Fp x106(1424297384);
+  // loc(unknown)
+  Fp x107(142102402);
+  // loc(unknown)
+  Fp x108(1402624179);
+  // loc(unknown)
+  Fp x109(1293938517);
+  // loc(unknown)
+  Fp x110(1257820264);
+  // loc(unknown)
+  Fp x111(1215259350);
+  // loc(unknown)
+  Fp x112(1198261138);
+  // loc(unknown)
+  Fp x113(1150410028);
+  // loc(unknown)
+  Fp x114(1147522062);
+  // loc(unknown)
+  Fp x115(1099252725);
+  // loc(unknown)
+  Fp x116(1080533265);
+  // loc(unknown)
+  Fp x117(1079030649);
+  // loc(unknown)
+  Fp x118(1065075039);
+  // loc(unknown)
+  Fp x119(1042892522);
+  // loc(unknown)
+  Fp x120(993455846);
+  // loc(unknown)
+  Fp x121(989618631);
+  // loc(unknown)
+  Fp x122(989176635);
+  // loc(unknown)
+  Fp x123(942439428);
+  // loc(unknown)
+  Fp x124(930036496);
+  // loc(unknown)
+  Fp x125(925018226);
+  // loc(unknown)
+  Fp x126(897025192);
+  // loc(unknown)
+  Fp x127(825405577);
+  // loc(unknown)
+  Fp x128(813674331);
+  // loc(unknown)
+  Fp x129(809508074);
+  // loc(unknown)
+  Fp x130(790726260);
+  // loc(unknown)
+  Fp x131(78845751);
+  // loc(unknown)
+  Fp x132(781141772);
+  // loc(unknown)
+  Fp x133(755691969);
+  // loc(unknown)
+  Fp x134(738091882);
+  // loc(unknown)
+  Fp x135(716894289);
+  // loc(unknown)
+  Fp x136(714957516);
+  // loc(unknown)
+  Fp x137(708123747);
+  // loc(unknown)
+  Fp x138(695835963);
+  // loc(unknown)
+  Fp x139(686842369);
+  // loc(unknown)
+  Fp x140(641665156);
+  // loc(unknown)
+  Fp x141(622609176);
+  // loc(unknown)
+  Fp x142(608401422);
+  // loc(unknown)
+  Fp x143(588764636);
+  // loc(unknown)
+  Fp x144(540703332);
+  // loc(unknown)
+  Fp x145(53007114);
+  // loc(unknown)
+  Fp x146(51256176);
+  // loc(unknown)
+  Fp x147(459826664);
+  // loc(unknown)
+  Fp x148(427731030);
+  // loc(unknown)
+  Fp x149(395622276);
+  // loc(unknown)
+  Fp x150(390340387);
+  // loc(unknown)
+  Fp x151(342857858);
+  // loc(unknown)
+  Fp x152(306391314);
+  // loc(unknown)
+  Fp x153(273790406);
+  // loc(unknown)
+  Fp x154(241306552);
+  // loc(unknown)
+  Fp x155(238616145);
+  // loc(unknown)
+  Fp x156(228520958);
+  // loc(unknown)
+  Fp x157(204228775);
+  // loc(unknown)
+  Fp x158(202271745);
+  // loc(unknown)
+  Fp x159(1997503974);
+  // loc(unknown)
+  Fp x160(1989924532);
+  // loc(unknown)
+  Fp x161(1917861751);
+  // loc(unknown)
+  Fp x162(1917549072);
+  // loc(unknown)
+  Fp x163(1896271507);
+  // loc(unknown)
+  Fp x164(1889898);
+  // loc(unknown)
+  Fp x165(1889603648);
+  // loc(unknown)
+  Fp x166(1845603984);
+  // loc(unknown)
+  Fp x167(1832911930);
+  // loc(unknown)
+  Fp x168(1781980094);
+  // loc(unknown)
+  Fp x169(1740472809);
+  // loc(unknown)
+  Fp x170(1737016378);
+  // loc(unknown)
+  Fp x171(172614232);
+  // loc(unknown)
+  Fp x172(1718628547);
+  // loc(unknown)
+  Fp x173(1715719711);
+  // loc(unknown)
+  Fp x174(1687379185);
+  // loc(unknown)
+  Fp x175(1672219447);
+  // loc(unknown)
+  Fp x176(1649953458);
+  // loc(unknown)
+  Fp x177(1647670797);
+  // loc(unknown)
+  Fp x178(1647665372);
+  // loc(unknown)
+  Fp x179(162506101);
+  // loc(unknown)
+  Fp x180(1608891156);
+  // loc(unknown)
+  Fp x181(1587822577);
+  // loc(unknown)
+  Fp x182(1545325389);
+  // loc(unknown)
+  Fp x183(1518763784);
+  // loc(unknown)
+  Fp x184(1507936940);
+  // loc(unknown)
+  Fp x185(150307788);
+  // loc(unknown)
+  Fp x186(1454563174);
+  // loc(unknown)
+  Fp x187(140621810);
+  // loc(unknown)
+  Fp x188(1401020792);
+  // loc(unknown)
+  Fp x189(1393671120);
+  // loc(unknown)
+  Fp x190(1380248020);
+  // loc(unknown)
+  Fp x191(1339793538);
+  // loc(unknown)
+  Fp x192(1338899225);
+  // loc(unknown)
+  Fp x193(1333667262);
+  // loc(unknown)
+  Fp x194(1303271640);
+  // loc(unknown)
+  Fp x195(1296144415);
+  // loc(unknown)
+  Fp x196(1291790245);
+  // loc(unknown)
+  Fp x197(1290028279);
+  // loc(unknown)
+  Fp x198(128479034);
+  // loc(unknown)
+  Fp x199(1282239129);
+  // loc(unknown)
+  Fp x200(1269493554);
+  // loc(unknown)
+  Fp x201(1262312258);
+  // loc(unknown)
+  Fp x202(1239734761);
+  // loc(unknown)
+  Fp x203(1221257987);
+  // loc(unknown)
+  Fp x204(1213686459);
+  // loc(unknown)
+  Fp x205(1209164052);
+  // loc(unknown)
+  Fp x206(1206940496);
+  // loc(unknown)
+  Fp x207(1201063290);
+  // loc(unknown)
+  Fp x208(117294666);
+  // loc(unknown)
+  Fp x209(1170029417);
+  // loc(unknown)
+  Fp x210(1150912935);
+  // loc(unknown)
+  Fp x211(1124078057);
+  // loc(unknown)
+  Fp x212(1111203133);
+  // loc(unknown)
+  Fp x213(1090783436);
+  // loc(unknown)
+  Fp x214(1006235079);
+  // loc(unknown)
+  Fp x215(1003792297);
+  // loc(unknown)
+  Fp x216(831813382);
+  // loc(unknown)
+  Fp x217(1421525369);
+  // loc(unknown)
+  Fp x218(1751797115);
+  // loc(unknown)
+  Fp x219(1964135730);
+  // loc(unknown)
+  Fp x220(525458520);
+  // loc(unknown)
+  Fp x221(638242172);
+  // loc(unknown)
+  Fp x222(1307439985);
+  // loc(unknown)
+  Fp x223(343354132);
+  // loc(unknown)
+  Fp x224(1389166148);
+  // loc(unknown)
+  Fp x225(1660766320);
+  // loc(unknown)
+  Fp x226(1464793095);
+  // loc(unknown)
+  Fp x227(1180307149);
+  // loc(unknown)
+  Fp x228(1930780904);
+  // loc(unknown)
+  Fp x229(1066694495);
+  // loc(unknown)
+  Fp x230(1773108264);
+  // loc(unknown)
+  Fp x231(1004040026);
+  // loc(unknown)
+  Fp x232(815798990);
+  // loc(unknown)
+  Fp x233(454905424);
+  // loc(unknown)
+  Fp x234(118043943);
+  // loc(unknown)
+  Fp x235(157582794);
+  // loc(unknown)
+  Fp x236(246143118);
+  // loc(unknown)
+  Fp x237(314968988);
+  // loc(unknown)
+  Fp x238(127253399);
+  // loc(unknown)
+  Fp x239(262278199);
+  // loc(unknown)
+  Fp x240(943718400);
+  // loc(unknown)
+  Fp x241(268435454);
+  // loc(unknown)
+  Fp x242(1761607679);
+  // loc(unknown)
+  Fp x243(1073741824);
+  // loc(unknown)
+  Fp x244(536870912);
+  // loc(unknown)
+  Fp x245(1509949437);
+  // loc(unknown)
+  Fp x246(268435456);
+  // loc(unknown)
+  Fp x247(1006632953);
+  // loc(unknown)
+  Fp x248(2013265906);
+  // loc(unknown)
+  Fp x249(134217728);
+  // loc(unknown)
+  Fp x250(67108864);
+  // loc(unknown)
+  Fp x251(2013265891);
+  // loc(unknown)
+  Fp x252(33554432);
+  // loc(unknown)
+  Fp x253(2013265861);
+  // loc(unknown)
+  Fp x254(2013265801);
+  // loc(unknown)
+  Fp x255(16777216);
+  // loc(unknown)
+  Fp x256(8388608);
+  // loc(unknown)
+  Fp x257(2013265681);
+  // loc(unknown)
+  Fp x258(4194304);
+  // loc(unknown)
+  Fp x259(2013265441);
+  // loc(unknown)
+  Fp x260(2097152);
+  // loc(unknown)
+  Fp x261(2013264961);
+  // loc(unknown)
+  Fp x262(2013264001);
+  // loc(unknown)
+  Fp x263(1048576);
+  // loc(unknown)
+  Fp x264(524288);
+  // loc(unknown)
+  Fp x265(2013262081);
+  // loc(unknown)
+  Fp x266(262144);
+  // loc(unknown)
+  Fp x267(2013258241);
+  // loc(unknown)
+  Fp x268(2013250561);
+  // loc(unknown)
+  Fp x269(131072);
+  // loc(unknown)
+  Fp x270(2013235201);
+  // loc(unknown)
+  Fp x271(32768);
+  // loc(unknown)
+  Fp x272(2013204481);
+  // loc(unknown)
+  Fp x273(2013143041);
+  // loc(unknown)
+  Fp x274(16384);
+  // loc(unknown)
+  Fp x275(8192);
+  // loc(unknown)
+  Fp x276(2013020161);
+  // loc(unknown)
+  Fp x277(4096);
+  // loc(unknown)
+  Fp x278(2012774401);
+  // loc(unknown)
+  Fp x279(2048);
+  // loc(unknown)
+  Fp x280(2012282881);
+  // loc(unknown)
+  Fp x281(2011299841);
+  // loc(unknown)
+  Fp x282(1024);
+  // loc(unknown)
+  Fp x283(512);
+  // loc(unknown)
+  Fp x284(2009333761);
+  // loc(unknown)
+  Fp x285(256);
+  // loc(unknown)
+  Fp x286(2005401601);
+  // loc(unknown)
+  Fp x287(1997537281);
+  // loc(unknown)
+  Fp x288(128);
+  // loc(unknown)
+  Fp x289(64);
+  // loc(unknown)
+  Fp x290(1981808641);
+  // loc(unknown)
+  Fp x291(32);
+  // loc(unknown)
+  Fp x292(1950351361);
+  // loc(unknown)
+  Fp x293(1887436801);
+  // loc(unknown)
+  Fp x294(16);
+  // loc(unknown)
+  Fp x295(1761607681);
+  // loc(unknown)
+  Fp x296(1509949441);
+  // loc(unknown)
+  Fp x297(1006632961);
+  // loc(unknown)
+  Fp x298(65536);
+  // loc(unknown)
+  Fp x299(2013265910);
+  // loc(unknown)
+  Fp x300(11);
+  // loc(unknown)
+  Fp x301(10);
+  // loc(unknown)
+  Fp x302(9);
+  // loc(unknown)
+  Fp x303(8);
+  // loc(unknown)
+  Fp x304(7);
+  // loc(unknown)
+  Fp x305(6);
+  // loc(unknown)
+  Fp x306(5);
+  // loc(unknown)
+  Fp x307(4);
+  // loc(unknown)
+  Fp x308(3);
+  // loc(unknown)
+  Fp x309(2);
+  // loc(unknown)
+  Fp x310(1);
+  // loc(unknown)
+  Fp x311(0);
+
     extern_log(ctx, cycle, "POSEIDON2_PARTIAL", extern_args, extern_outs);
     // loc("top(recursion::Top)/mux(Mux)/poseidon2_partial(recursion::Poseidon2Partial)/Reg"("zirgen/circuit/recursion/poseidon2.cpp":299:37))
     auto x10034 = arg2[100 * steps + ((cycle - 1) & mask)];
@@ -36522,11 +47857,638 @@ __device__ void step_exec(
       assert(reg == Fp::invalid() || reg == x11719);
       reg = x11719;
     }
-  }
-  // loc("top(recursion::Top)/code(recursion::Code)/select(OneHot)/poseidon2_store(Reg)"("./zirgen/components/mux.h":59:25))
-  auto x11720 = arg0[6 * steps + ((cycle - 0) & mask)];
-  assert(x11720 != Fp::invalid());
-  if (x11720 != 0) {
+}
+
+__device__ __noinline__ void step_exec_poseidon2_store(
+    void* ctx, uint32_t steps, uint32_t cycle, uint32_t mask,
+    Fp* arg0, Fp* arg1, Fp* arg2) {
+  Fp extern_args[96];
+  Fp extern_outs[32];
+  // loc(unknown)
+  Fp x0(192);
+  // loc(unknown)
+  Fp x1(48);
+  // loc(unknown)
+  Fp x2(12);
+  // loc(unknown)
+  Fp x3(1040977421);
+  // loc(unknown)
+  Fp x4(1792450386);
+  // loc(unknown)
+  Fp x5(1470845646);
+  // loc(unknown)
+  Fp x6(1363837384);
+  // loc(unknown)
+  Fp x7(1878280202);
+  // loc(unknown)
+  Fp x8(434078361);
+  // loc(unknown)
+  Fp x9(1946596189);
+  // loc(unknown)
+  Fp x10(875839332);
+  // loc(unknown)
+  Fp x11(463976218);
+  // loc(unknown)
+  Fp x12(976057819);
+  // loc(unknown)
+  Fp x13(48375137);
+  // loc(unknown)
+  Fp x14(1549779579);
+  // loc(unknown)
+  Fp x15(1679178250);
+  // loc(unknown)
+  Fp x16(530151394);
+  // loc(unknown)
+  Fp x17(1629316321);
+  // loc(unknown)
+  Fp x18(1854174607);
+  // loc(unknown)
+  Fp x19(720724951);
+  // loc(unknown)
+  Fp x20(14387587);
+  // loc(unknown)
+  Fp x21(1883820770);
+  // loc(unknown)
+  Fp x22(205609311);
+  // loc(unknown)
+  Fp x23(1136469704);
+  // loc(unknown)
+  Fp x24(1439947916);
+  // loc(unknown)
+  Fp x25(723038058);
+  // loc(unknown)
+  Fp x26(53041581);
+  // loc(unknown)
+  Fp x27(1810596765);
+  // loc(unknown)
+  Fp x28(1210751726);
+  // loc(unknown)
+  Fp x29(1327682690);
+  // loc(unknown)
+  Fp x30(1886977120);
+  // loc(unknown)
+  Fp x31(1551596046);
+  // loc(unknown)
+  Fp x32(1186174623);
+  // loc(unknown)
+  Fp x33(1199068823);
+  // loc(unknown)
+  Fp x34(1240419708);
+  // loc(unknown)
+  Fp x35(1708681573);
+  // loc(unknown)
+  Fp x36(308575117);
+  // loc(unknown)
+  Fp x37(1111544260);
+  // loc(unknown)
+  Fp x38(822033215);
+  // loc(unknown)
+  Fp x39(1891545577);
+  // loc(unknown)
+  Fp x40(440300254);
+  // loc(unknown)
+  Fp x41(1726563304);
+  // loc(unknown)
+  Fp x42(1365519753);
+  // loc(unknown)
+  Fp x43(924863639);
+  // loc(unknown)
+  Fp x44(1540960371);
+  // loc(unknown)
+  Fp x45(1052077299);
+  // loc(unknown)
+  Fp x46(1930103076);
+  // loc(unknown)
+  Fp x47(98371040);
+  // loc(unknown)
+  Fp x48(918610824);
+  // loc(unknown)
+  Fp x49(801504236);
+  // loc(unknown)
+  Fp x50(65998480);
+  // loc(unknown)
+  Fp x51(658182609);
+  // loc(unknown)
+  Fp x52(606789471);
+  // loc(unknown)
+  Fp x53(51866717);
+  // loc(unknown)
+  Fp x54(375892129);
+  // loc(unknown)
+  Fp x55(20525701);
+  // loc(unknown)
+  Fp x56(1997365680);
+  // loc(unknown)
+  Fp x57(1974912880);
+  // loc(unknown)
+  Fp x58(1942928017);
+  // loc(unknown)
+  Fp x59(1928969209);
+  // loc(unknown)
+  Fp x60(1867716110);
+  // loc(unknown)
+  Fp x61(1792686146);
+  // loc(unknown)
+  Fp x62(1558116381);
+  // loc(unknown)
+  Fp x63(1461037801);
+  // loc(unknown)
+  Fp x64(1389833583);
+  // loc(unknown)
+  Fp x65(13683276);
+  // loc(unknown)
+  Fp x66(1188752902);
+  // loc(unknown)
+  Fp x67(111593398);
+  // loc(unknown)
+  Fp x68(1083257840);
+  // loc(unknown)
+  Fp x69(106789798);
+  // loc(unknown)
+  Fp x70(1001081699);
+  // loc(unknown)
+  Fp x71(497520322);
+  // loc(unknown)
+  Fp x72(946500736);
+  // loc(unknown)
+  Fp x73(890243564);
+  // loc(unknown)
+  Fp x74(862495875);
+  // loc(unknown)
+  Fp x75(855276054);
+  // loc(unknown)
+  Fp x76(76770019);
+  // loc(unknown)
+  Fp x77(760115692);
+  // loc(unknown)
+  Fp x78(623051854);
+  // loc(unknown)
+  Fp x79(59510015);
+  // loc(unknown)
+  Fp x80(552696906);
+  // loc(unknown)
+  Fp x81(538103555);
+  // loc(unknown)
+  Fp x82(457372011);
+  // loc(unknown)
+  Fp x83(447555988);
+  // loc(unknown)
+  Fp x84(27129487);
+  // loc(unknown)
+  Fp x85(217046702);
+  // loc(unknown)
+  Fp x86(1950429111);
+  // loc(unknown)
+  Fp x87(192082241);
+  // loc(unknown)
+  Fp x88(1910423126);
+  // loc(unknown)
+  Fp x89(1908416316);
+  // loc(unknown)
+  Fp x90(1891637550);
+  // loc(unknown)
+  Fp x91(1841795381);
+  // loc(unknown)
+  Fp x92(1827572010);
+  // loc(unknown)
+  Fp x93(1748789933);
+  // loc(unknown)
+  Fp x94(1664590951);
+  // loc(unknown)
+  Fp x95(1663353317);
+  // loc(unknown)
+  Fp x96(162510541);
+  // loc(unknown)
+  Fp x97(1622328571);
+  // loc(unknown)
+  Fp x98(1608853840);
+  // loc(unknown)
+  Fp x99(158646617);
+  // loc(unknown)
+  Fp x100(1584033957);
+  // loc(unknown)
+  Fp x101(1567618575);
+  // loc(unknown)
+  Fp x102(1549062383);
+  // loc(unknown)
+  Fp x103(1507649755);
+  // loc(unknown)
+  Fp x104(1478577620);
+  // loc(unknown)
+  Fp x105(1463323727);
+  // loc(unknown)
+  Fp x106(1424297384);
+  // loc(unknown)
+  Fp x107(142102402);
+  // loc(unknown)
+  Fp x108(1402624179);
+  // loc(unknown)
+  Fp x109(1293938517);
+  // loc(unknown)
+  Fp x110(1257820264);
+  // loc(unknown)
+  Fp x111(1215259350);
+  // loc(unknown)
+  Fp x112(1198261138);
+  // loc(unknown)
+  Fp x113(1150410028);
+  // loc(unknown)
+  Fp x114(1147522062);
+  // loc(unknown)
+  Fp x115(1099252725);
+  // loc(unknown)
+  Fp x116(1080533265);
+  // loc(unknown)
+  Fp x117(1079030649);
+  // loc(unknown)
+  Fp x118(1065075039);
+  // loc(unknown)
+  Fp x119(1042892522);
+  // loc(unknown)
+  Fp x120(993455846);
+  // loc(unknown)
+  Fp x121(989618631);
+  // loc(unknown)
+  Fp x122(989176635);
+  // loc(unknown)
+  Fp x123(942439428);
+  // loc(unknown)
+  Fp x124(930036496);
+  // loc(unknown)
+  Fp x125(925018226);
+  // loc(unknown)
+  Fp x126(897025192);
+  // loc(unknown)
+  Fp x127(825405577);
+  // loc(unknown)
+  Fp x128(813674331);
+  // loc(unknown)
+  Fp x129(809508074);
+  // loc(unknown)
+  Fp x130(790726260);
+  // loc(unknown)
+  Fp x131(78845751);
+  // loc(unknown)
+  Fp x132(781141772);
+  // loc(unknown)
+  Fp x133(755691969);
+  // loc(unknown)
+  Fp x134(738091882);
+  // loc(unknown)
+  Fp x135(716894289);
+  // loc(unknown)
+  Fp x136(714957516);
+  // loc(unknown)
+  Fp x137(708123747);
+  // loc(unknown)
+  Fp x138(695835963);
+  // loc(unknown)
+  Fp x139(686842369);
+  // loc(unknown)
+  Fp x140(641665156);
+  // loc(unknown)
+  Fp x141(622609176);
+  // loc(unknown)
+  Fp x142(608401422);
+  // loc(unknown)
+  Fp x143(588764636);
+  // loc(unknown)
+  Fp x144(540703332);
+  // loc(unknown)
+  Fp x145(53007114);
+  // loc(unknown)
+  Fp x146(51256176);
+  // loc(unknown)
+  Fp x147(459826664);
+  // loc(unknown)
+  Fp x148(427731030);
+  // loc(unknown)
+  Fp x149(395622276);
+  // loc(unknown)
+  Fp x150(390340387);
+  // loc(unknown)
+  Fp x151(342857858);
+  // loc(unknown)
+  Fp x152(306391314);
+  // loc(unknown)
+  Fp x153(273790406);
+  // loc(unknown)
+  Fp x154(241306552);
+  // loc(unknown)
+  Fp x155(238616145);
+  // loc(unknown)
+  Fp x156(228520958);
+  // loc(unknown)
+  Fp x157(204228775);
+  // loc(unknown)
+  Fp x158(202271745);
+  // loc(unknown)
+  Fp x159(1997503974);
+  // loc(unknown)
+  Fp x160(1989924532);
+  // loc(unknown)
+  Fp x161(1917861751);
+  // loc(unknown)
+  Fp x162(1917549072);
+  // loc(unknown)
+  Fp x163(1896271507);
+  // loc(unknown)
+  Fp x164(1889898);
+  // loc(unknown)
+  Fp x165(1889603648);
+  // loc(unknown)
+  Fp x166(1845603984);
+  // loc(unknown)
+  Fp x167(1832911930);
+  // loc(unknown)
+  Fp x168(1781980094);
+  // loc(unknown)
+  Fp x169(1740472809);
+  // loc(unknown)
+  Fp x170(1737016378);
+  // loc(unknown)
+  Fp x171(172614232);
+  // loc(unknown)
+  Fp x172(1718628547);
+  // loc(unknown)
+  Fp x173(1715719711);
+  // loc(unknown)
+  Fp x174(1687379185);
+  // loc(unknown)
+  Fp x175(1672219447);
+  // loc(unknown)
+  Fp x176(1649953458);
+  // loc(unknown)
+  Fp x177(1647670797);
+  // loc(unknown)
+  Fp x178(1647665372);
+  // loc(unknown)
+  Fp x179(162506101);
+  // loc(unknown)
+  Fp x180(1608891156);
+  // loc(unknown)
+  Fp x181(1587822577);
+  // loc(unknown)
+  Fp x182(1545325389);
+  // loc(unknown)
+  Fp x183(1518763784);
+  // loc(unknown)
+  Fp x184(1507936940);
+  // loc(unknown)
+  Fp x185(150307788);
+  // loc(unknown)
+  Fp x186(1454563174);
+  // loc(unknown)
+  Fp x187(140621810);
+  // loc(unknown)
+  Fp x188(1401020792);
+  // loc(unknown)
+  Fp x189(1393671120);
+  // loc(unknown)
+  Fp x190(1380248020);
+  // loc(unknown)
+  Fp x191(1339793538);
+  // loc(unknown)
+  Fp x192(1338899225);
+  // loc(unknown)
+  Fp x193(1333667262);
+  // loc(unknown)
+  Fp x194(1303271640);
+  // loc(unknown)
+  Fp x195(1296144415);
+  // loc(unknown)
+  Fp x196(1291790245);
+  // loc(unknown)
+  Fp x197(1290028279);
+  // loc(unknown)
+  Fp x198(128479034);
+  // loc(unknown)
+  Fp x199(1282239129);
+  // loc(unknown)
+  Fp x200(1269493554);
+  // loc(unknown)
+  Fp x201(1262312258);
+  // loc(unknown)
+  Fp x202(1239734761);
+  // loc(unknown)
+  Fp x203(1221257987);
+  // loc(unknown)
+  Fp x204(1213686459);
+  // loc(unknown)
+  Fp x205(1209164052);
+  // loc(unknown)
+  Fp x206(1206940496);
+  // loc(unknown)
+  Fp x207(1201063290);
+  // loc(unknown)
+  Fp x208(117294666);
+  // loc(unknown)
+  Fp x209(1170029417);
+  // loc(unknown)
+  Fp x210(1150912935);
+  // loc(unknown)
+  Fp x211(1124078057);
+  // loc(unknown)
+  Fp x212(1111203133);
+  // loc(unknown)
+  Fp x213(1090783436);
+  // loc(unknown)
+  Fp x214(1006235079);
+  // loc(unknown)
+  Fp x215(1003792297);
+  // loc(unknown)
+  Fp x216(831813382);
+  // loc(unknown)
+  Fp x217(1421525369);
+  // loc(unknown)
+  Fp x218(1751797115);
+  // loc(unknown)
+  Fp x219(1964135730);
+  // loc(unknown)
+  Fp x220(525458520);
+  // loc(unknown)
+  Fp x221(638242172);
+  // loc(unknown)
+  Fp x222(1307439985);
+  // loc(unknown)
+  Fp x223(343354132);
+  // loc(unknown)
+  Fp x224(1389166148);
+  // loc(unknown)
+  Fp x225(1660766320);
+  // loc(unknown)
+  Fp x226(1464793095);
+  // loc(unknown)
+  Fp x227(1180307149);
+  // loc(unknown)
+  Fp x228(1930780904);
+  // loc(unknown)
+  Fp x229(1066694495);
+  // loc(unknown)
+  Fp x230(1773108264);
+  // loc(unknown)
+  Fp x231(1004040026);
+  // loc(unknown)
+  Fp x232(815798990);
+  // loc(unknown)
+  Fp x233(454905424);
+  // loc(unknown)
+  Fp x234(118043943);
+  // loc(unknown)
+  Fp x235(157582794);
+  // loc(unknown)
+  Fp x236(246143118);
+  // loc(unknown)
+  Fp x237(314968988);
+  // loc(unknown)
+  Fp x238(127253399);
+  // loc(unknown)
+  Fp x239(262278199);
+  // loc(unknown)
+  Fp x240(943718400);
+  // loc(unknown)
+  Fp x241(268435454);
+  // loc(unknown)
+  Fp x242(1761607679);
+  // loc(unknown)
+  Fp x243(1073741824);
+  // loc(unknown)
+  Fp x244(536870912);
+  // loc(unknown)
+  Fp x245(1509949437);
+  // loc(unknown)
+  Fp x246(268435456);
+  // loc(unknown)
+  Fp x247(1006632953);
+  // loc(unknown)
+  Fp x248(2013265906);
+  // loc(unknown)
+  Fp x249(134217728);
+  // loc(unknown)
+  Fp x250(67108864);
+  // loc(unknown)
+  Fp x251(2013265891);
+  // loc(unknown)
+  Fp x252(33554432);
+  // loc(unknown)
+  Fp x253(2013265861);
+  // loc(unknown)
+  Fp x254(2013265801);
+  // loc(unknown)
+  Fp x255(16777216);
+  // loc(unknown)
+  Fp x256(8388608);
+  // loc(unknown)
+  Fp x257(2013265681);
+  // loc(unknown)
+  Fp x258(4194304);
+  // loc(unknown)
+  Fp x259(2013265441);
+  // loc(unknown)
+  Fp x260(2097152);
+  // loc(unknown)
+  Fp x261(2013264961);
+  // loc(unknown)
+  Fp x262(2013264001);
+  // loc(unknown)
+  Fp x263(1048576);
+  // loc(unknown)
+  Fp x264(524288);
+  // loc(unknown)
+  Fp x265(2013262081);
+  // loc(unknown)
+  Fp x266(262144);
+  // loc(unknown)
+  Fp x267(2013258241);
+  // loc(unknown)
+  Fp x268(2013250561);
+  // loc(unknown)
+  Fp x269(131072);
+  // loc(unknown)
+  Fp x270(2013235201);
+  // loc(unknown)
+  Fp x271(32768);
+  // loc(unknown)
+  Fp x272(2013204481);
+  // loc(unknown)
+  Fp x273(2013143041);
+  // loc(unknown)
+  Fp x274(16384);
+  // loc(unknown)
+  Fp x275(8192);
+  // loc(unknown)
+  Fp x276(2013020161);
+  // loc(unknown)
+  Fp x277(4096);
+  // loc(unknown)
+  Fp x278(2012774401);
+  // loc(unknown)
+  Fp x279(2048);
+  // loc(unknown)
+  Fp x280(2012282881);
+  // loc(unknown)
+  Fp x281(2011299841);
+  // loc(unknown)
+  Fp x282(1024);
+  // loc(unknown)
+  Fp x283(512);
+  // loc(unknown)
+  Fp x284(2009333761);
+  // loc(unknown)
+  Fp x285(256);
+  // loc(unknown)
+  Fp x286(2005401601);
+  // loc(unknown)
+  Fp x287(1997537281);
+  // loc(unknown)
+  Fp x288(128);
+  // loc(unknown)
+  Fp x289(64);
+  // loc(unknown)
+  Fp x290(1981808641);
+  // loc(unknown)
+  Fp x291(32);
+  // loc(unknown)
+  Fp x292(1950351361);
+  // loc(unknown)
+  Fp x293(1887436801);
+  // loc(unknown)
+  Fp x294(16);
+  // loc(unknown)
+  Fp x295(1761607681);
+  // loc(unknown)
+  Fp x296(1509949441);
+  // loc(unknown)
+  Fp x297(1006632961);
+  // loc(unknown)
+  Fp x298(65536);
+  // loc(unknown)
+  Fp x299(2013265910);
+  // loc(unknown)
+  Fp x300(11);
+  // loc(unknown)
+  Fp x301(10);
+  // loc(unknown)
+  Fp x302(9);
+  // loc(unknown)
+  Fp x303(8);
+  // loc(unknown)
+  Fp x304(7);
+  // loc(unknown)
+  Fp x305(6);
+  // loc(unknown)
+  Fp x306(5);
+  // loc(unknown)
+  Fp x307(4);
+  // loc(unknown)
+  Fp x308(3);
+  // loc(unknown)
+  Fp x309(2);
+  // loc(unknown)
+  Fp x310(1);
+  // loc(unknown)
+  Fp x311(0);
+
     // loc("top(recursion::Top)/code(recursion::Code)/inst(Mux)/poseidon2_store(recursion::Poseidon2MemInst)/group(OneHot)/g0(Reg)"("zirgen/circuit/recursion/poseidon2.cpp":364:39))
     auto x11721 = arg0[12 * steps + ((cycle - 0) & mask)];
     assert(x11721 != Fp::invalid());
@@ -37305,11 +49267,863 @@ __device__ void step_exec(
     extern_args[0] = x11849;
     extern_args[1] = x11724;
     extern_log(ctx, cycle, "POSEIDON2_OUTPUT: group(%u), doMont(%u)", extern_args, extern_outs);
-  }
-  // loc("top(recursion::Top)/code(recursion::Code)/select(OneHot)/checked_bytes(Reg)"("./zirgen/components/mux.h":59:25))
-  auto x11850 = arg0[7 * steps + ((cycle - 0) & mask)];
-  assert(x11850 != Fp::invalid());
-  if (x11850 != 0) {
+
+  // tail section
+    {
+      // loc("zirgen/circuit/recursion/wom.cpp":22:3)
+      {
+        auto& reg = arg2[45 * steps + cycle];
+        assert(reg == Fp::invalid() || reg == x311);
+        reg = x311;
+      }
+      // loc("zirgen/circuit/recursion/wom.cpp":61:5)
+      {
+        auto& reg = arg2[46 * steps + cycle];
+        assert(reg == Fp::invalid() || reg == x311);
+        reg = x311;
+      }
+      // loc("zirgen/circuit/recursion/wom.cpp":61:5)
+      {
+        auto& reg = arg2[47 * steps + cycle];
+        assert(reg == Fp::invalid() || reg == x311);
+        reg = x311;
+      }
+      // loc("zirgen/circuit/recursion/wom.cpp":61:5)
+      {
+        auto& reg = arg2[48 * steps + cycle];
+        assert(reg == Fp::invalid() || reg == x311);
+        reg = x311;
+      }
+      // loc("zirgen/circuit/recursion/wom.cpp":61:5)
+      {
+        auto& reg = arg2[49 * steps + cycle];
+        assert(reg == Fp::invalid() || reg == x311);
+        reg = x311;
+      }
+    }
+    {
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+      auto x13101 = arg2[5 * steps + ((cycle - 0) & mask)];
+      assert(x13101 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13102 = arg2[6 * steps + ((cycle - 0) & mask)];
+      assert(x13102 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13103 = arg2[7 * steps + ((cycle - 0) & mask)];
+      assert(x13103 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13104 = arg2[8 * steps + ((cycle - 0) & mask)];
+      assert(x13104 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13105 = arg2[9 * steps + ((cycle - 0) & mask)];
+      assert(x13105 != Fp::invalid());
+      extern_args[0] = x13101;
+      extern_args[1] = x13102;
+      extern_args[2] = x13103;
+      extern_args[3] = x13104;
+      extern_args[4] = x13105;
+      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+      auto x13106 = arg2[10 * steps + ((cycle - 0) & mask)];
+      assert(x13106 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13107 = arg2[11 * steps + ((cycle - 0) & mask)];
+      assert(x13107 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13108 = arg2[12 * steps + ((cycle - 0) & mask)];
+      assert(x13108 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13109 = arg2[13 * steps + ((cycle - 0) & mask)];
+      assert(x13109 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13110 = arg2[14 * steps + ((cycle - 0) & mask)];
+      assert(x13110 != Fp::invalid());
+      extern_args[0] = x13106;
+      extern_args[1] = x13107;
+      extern_args[2] = x13108;
+      extern_args[3] = x13109;
+      extern_args[4] = x13110;
+      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+      auto x13111 = arg2[15 * steps + ((cycle - 0) & mask)];
+      assert(x13111 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13112 = arg2[16 * steps + ((cycle - 0) & mask)];
+      assert(x13112 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13113 = arg2[17 * steps + ((cycle - 0) & mask)];
+      assert(x13113 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13114 = arg2[18 * steps + ((cycle - 0) & mask)];
+      assert(x13114 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13115 = arg2[19 * steps + ((cycle - 0) & mask)];
+      assert(x13115 != Fp::invalid());
+      extern_args[0] = x13111;
+      extern_args[1] = x13112;
+      extern_args[2] = x13113;
+      extern_args[3] = x13114;
+      extern_args[4] = x13115;
+      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+      auto x13116 = arg2[20 * steps + ((cycle - 0) & mask)];
+      assert(x13116 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13117 = arg2[21 * steps + ((cycle - 0) & mask)];
+      assert(x13117 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13118 = arg2[22 * steps + ((cycle - 0) & mask)];
+      assert(x13118 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13119 = arg2[23 * steps + ((cycle - 0) & mask)];
+      assert(x13119 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13120 = arg2[24 * steps + ((cycle - 0) & mask)];
+      assert(x13120 != Fp::invalid());
+      extern_args[0] = x13116;
+      extern_args[1] = x13117;
+      extern_args[2] = x13118;
+      extern_args[3] = x13119;
+      extern_args[4] = x13120;
+      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+      auto x13121 = arg2[25 * steps + ((cycle - 0) & mask)];
+      assert(x13121 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13122 = arg2[26 * steps + ((cycle - 0) & mask)];
+      assert(x13122 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13123 = arg2[27 * steps + ((cycle - 0) & mask)];
+      assert(x13123 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13124 = arg2[28 * steps + ((cycle - 0) & mask)];
+      assert(x13124 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13125 = arg2[29 * steps + ((cycle - 0) & mask)];
+      assert(x13125 != Fp::invalid());
+      extern_args[0] = x13121;
+      extern_args[1] = x13122;
+      extern_args[2] = x13123;
+      extern_args[3] = x13124;
+      extern_args[4] = x13125;
+      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+      auto x13126 = arg2[30 * steps + ((cycle - 0) & mask)];
+      assert(x13126 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13127 = arg2[31 * steps + ((cycle - 0) & mask)];
+      assert(x13127 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13128 = arg2[32 * steps + ((cycle - 0) & mask)];
+      assert(x13128 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13129 = arg2[33 * steps + ((cycle - 0) & mask)];
+      assert(x13129 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13130 = arg2[34 * steps + ((cycle - 0) & mask)];
+      assert(x13130 != Fp::invalid());
+      extern_args[0] = x13126;
+      extern_args[1] = x13127;
+      extern_args[2] = x13128;
+      extern_args[3] = x13129;
+      extern_args[4] = x13130;
+      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+      auto x13131 = arg2[35 * steps + ((cycle - 0) & mask)];
+      assert(x13131 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13132 = arg2[36 * steps + ((cycle - 0) & mask)];
+      assert(x13132 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13133 = arg2[37 * steps + ((cycle - 0) & mask)];
+      assert(x13133 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13134 = arg2[38 * steps + ((cycle - 0) & mask)];
+      assert(x13134 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13135 = arg2[39 * steps + ((cycle - 0) & mask)];
+      assert(x13135 != Fp::invalid());
+      extern_args[0] = x13131;
+      extern_args[1] = x13132;
+      extern_args[2] = x13133;
+      extern_args[3] = x13134;
+      extern_args[4] = x13135;
+      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+      auto x13136 = arg2[40 * steps + ((cycle - 0) & mask)];
+      assert(x13136 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13137 = arg2[41 * steps + ((cycle - 0) & mask)];
+      assert(x13137 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13138 = arg2[42 * steps + ((cycle - 0) & mask)];
+      assert(x13138 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13139 = arg2[43 * steps + ((cycle - 0) & mask)];
+      assert(x13139 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13140 = arg2[44 * steps + ((cycle - 0) & mask)];
+      assert(x13140 != Fp::invalid());
+      extern_args[0] = x13136;
+      extern_args[1] = x13137;
+      extern_args[2] = x13138;
+      extern_args[3] = x13139;
+      extern_args[4] = x13140;
+      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
+      auto x13141 = arg2[45 * steps + ((cycle - 0) & mask)];
+      assert(x13141 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13142 = arg2[46 * steps + ((cycle - 0) & mask)];
+      assert(x13142 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13143 = arg2[47 * steps + ((cycle - 0) & mask)];
+      assert(x13143 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13144 = arg2[48 * steps + ((cycle - 0) & mask)];
+      assert(x13144 != Fp::invalid());
+      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
+      auto x13145 = arg2[49 * steps + ((cycle - 0) & mask)];
+      assert(x13145 != Fp::invalid());
+      extern_args[0] = x13141;
+      extern_args[1] = x13142;
+      extern_args[2] = x13143;
+      extern_args[3] = x13144;
+      extern_args[4] = x13145;
+      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
+    }
+}
+
+__device__ __noinline__ void step_exec_checked_bytes(
+    void* ctx, uint32_t steps, uint32_t cycle, uint32_t mask,
+    Fp* arg0, Fp* arg1, Fp* arg2) {
+  Fp extern_args[96];
+  Fp extern_outs[32];
+  // loc(unknown)
+  Fp x0(192);
+  // loc(unknown)
+  Fp x1(48);
+  // loc(unknown)
+  Fp x2(12);
+  // loc(unknown)
+  Fp x3(1040977421);
+  // loc(unknown)
+  Fp x4(1792450386);
+  // loc(unknown)
+  Fp x5(1470845646);
+  // loc(unknown)
+  Fp x6(1363837384);
+  // loc(unknown)
+  Fp x7(1878280202);
+  // loc(unknown)
+  Fp x8(434078361);
+  // loc(unknown)
+  Fp x9(1946596189);
+  // loc(unknown)
+  Fp x10(875839332);
+  // loc(unknown)
+  Fp x11(463976218);
+  // loc(unknown)
+  Fp x12(976057819);
+  // loc(unknown)
+  Fp x13(48375137);
+  // loc(unknown)
+  Fp x14(1549779579);
+  // loc(unknown)
+  Fp x15(1679178250);
+  // loc(unknown)
+  Fp x16(530151394);
+  // loc(unknown)
+  Fp x17(1629316321);
+  // loc(unknown)
+  Fp x18(1854174607);
+  // loc(unknown)
+  Fp x19(720724951);
+  // loc(unknown)
+  Fp x20(14387587);
+  // loc(unknown)
+  Fp x21(1883820770);
+  // loc(unknown)
+  Fp x22(205609311);
+  // loc(unknown)
+  Fp x23(1136469704);
+  // loc(unknown)
+  Fp x24(1439947916);
+  // loc(unknown)
+  Fp x25(723038058);
+  // loc(unknown)
+  Fp x26(53041581);
+  // loc(unknown)
+  Fp x27(1810596765);
+  // loc(unknown)
+  Fp x28(1210751726);
+  // loc(unknown)
+  Fp x29(1327682690);
+  // loc(unknown)
+  Fp x30(1886977120);
+  // loc(unknown)
+  Fp x31(1551596046);
+  // loc(unknown)
+  Fp x32(1186174623);
+  // loc(unknown)
+  Fp x33(1199068823);
+  // loc(unknown)
+  Fp x34(1240419708);
+  // loc(unknown)
+  Fp x35(1708681573);
+  // loc(unknown)
+  Fp x36(308575117);
+  // loc(unknown)
+  Fp x37(1111544260);
+  // loc(unknown)
+  Fp x38(822033215);
+  // loc(unknown)
+  Fp x39(1891545577);
+  // loc(unknown)
+  Fp x40(440300254);
+  // loc(unknown)
+  Fp x41(1726563304);
+  // loc(unknown)
+  Fp x42(1365519753);
+  // loc(unknown)
+  Fp x43(924863639);
+  // loc(unknown)
+  Fp x44(1540960371);
+  // loc(unknown)
+  Fp x45(1052077299);
+  // loc(unknown)
+  Fp x46(1930103076);
+  // loc(unknown)
+  Fp x47(98371040);
+  // loc(unknown)
+  Fp x48(918610824);
+  // loc(unknown)
+  Fp x49(801504236);
+  // loc(unknown)
+  Fp x50(65998480);
+  // loc(unknown)
+  Fp x51(658182609);
+  // loc(unknown)
+  Fp x52(606789471);
+  // loc(unknown)
+  Fp x53(51866717);
+  // loc(unknown)
+  Fp x54(375892129);
+  // loc(unknown)
+  Fp x55(20525701);
+  // loc(unknown)
+  Fp x56(1997365680);
+  // loc(unknown)
+  Fp x57(1974912880);
+  // loc(unknown)
+  Fp x58(1942928017);
+  // loc(unknown)
+  Fp x59(1928969209);
+  // loc(unknown)
+  Fp x60(1867716110);
+  // loc(unknown)
+  Fp x61(1792686146);
+  // loc(unknown)
+  Fp x62(1558116381);
+  // loc(unknown)
+  Fp x63(1461037801);
+  // loc(unknown)
+  Fp x64(1389833583);
+  // loc(unknown)
+  Fp x65(13683276);
+  // loc(unknown)
+  Fp x66(1188752902);
+  // loc(unknown)
+  Fp x67(111593398);
+  // loc(unknown)
+  Fp x68(1083257840);
+  // loc(unknown)
+  Fp x69(106789798);
+  // loc(unknown)
+  Fp x70(1001081699);
+  // loc(unknown)
+  Fp x71(497520322);
+  // loc(unknown)
+  Fp x72(946500736);
+  // loc(unknown)
+  Fp x73(890243564);
+  // loc(unknown)
+  Fp x74(862495875);
+  // loc(unknown)
+  Fp x75(855276054);
+  // loc(unknown)
+  Fp x76(76770019);
+  // loc(unknown)
+  Fp x77(760115692);
+  // loc(unknown)
+  Fp x78(623051854);
+  // loc(unknown)
+  Fp x79(59510015);
+  // loc(unknown)
+  Fp x80(552696906);
+  // loc(unknown)
+  Fp x81(538103555);
+  // loc(unknown)
+  Fp x82(457372011);
+  // loc(unknown)
+  Fp x83(447555988);
+  // loc(unknown)
+  Fp x84(27129487);
+  // loc(unknown)
+  Fp x85(217046702);
+  // loc(unknown)
+  Fp x86(1950429111);
+  // loc(unknown)
+  Fp x87(192082241);
+  // loc(unknown)
+  Fp x88(1910423126);
+  // loc(unknown)
+  Fp x89(1908416316);
+  // loc(unknown)
+  Fp x90(1891637550);
+  // loc(unknown)
+  Fp x91(1841795381);
+  // loc(unknown)
+  Fp x92(1827572010);
+  // loc(unknown)
+  Fp x93(1748789933);
+  // loc(unknown)
+  Fp x94(1664590951);
+  // loc(unknown)
+  Fp x95(1663353317);
+  // loc(unknown)
+  Fp x96(162510541);
+  // loc(unknown)
+  Fp x97(1622328571);
+  // loc(unknown)
+  Fp x98(1608853840);
+  // loc(unknown)
+  Fp x99(158646617);
+  // loc(unknown)
+  Fp x100(1584033957);
+  // loc(unknown)
+  Fp x101(1567618575);
+  // loc(unknown)
+  Fp x102(1549062383);
+  // loc(unknown)
+  Fp x103(1507649755);
+  // loc(unknown)
+  Fp x104(1478577620);
+  // loc(unknown)
+  Fp x105(1463323727);
+  // loc(unknown)
+  Fp x106(1424297384);
+  // loc(unknown)
+  Fp x107(142102402);
+  // loc(unknown)
+  Fp x108(1402624179);
+  // loc(unknown)
+  Fp x109(1293938517);
+  // loc(unknown)
+  Fp x110(1257820264);
+  // loc(unknown)
+  Fp x111(1215259350);
+  // loc(unknown)
+  Fp x112(1198261138);
+  // loc(unknown)
+  Fp x113(1150410028);
+  // loc(unknown)
+  Fp x114(1147522062);
+  // loc(unknown)
+  Fp x115(1099252725);
+  // loc(unknown)
+  Fp x116(1080533265);
+  // loc(unknown)
+  Fp x117(1079030649);
+  // loc(unknown)
+  Fp x118(1065075039);
+  // loc(unknown)
+  Fp x119(1042892522);
+  // loc(unknown)
+  Fp x120(993455846);
+  // loc(unknown)
+  Fp x121(989618631);
+  // loc(unknown)
+  Fp x122(989176635);
+  // loc(unknown)
+  Fp x123(942439428);
+  // loc(unknown)
+  Fp x124(930036496);
+  // loc(unknown)
+  Fp x125(925018226);
+  // loc(unknown)
+  Fp x126(897025192);
+  // loc(unknown)
+  Fp x127(825405577);
+  // loc(unknown)
+  Fp x128(813674331);
+  // loc(unknown)
+  Fp x129(809508074);
+  // loc(unknown)
+  Fp x130(790726260);
+  // loc(unknown)
+  Fp x131(78845751);
+  // loc(unknown)
+  Fp x132(781141772);
+  // loc(unknown)
+  Fp x133(755691969);
+  // loc(unknown)
+  Fp x134(738091882);
+  // loc(unknown)
+  Fp x135(716894289);
+  // loc(unknown)
+  Fp x136(714957516);
+  // loc(unknown)
+  Fp x137(708123747);
+  // loc(unknown)
+  Fp x138(695835963);
+  // loc(unknown)
+  Fp x139(686842369);
+  // loc(unknown)
+  Fp x140(641665156);
+  // loc(unknown)
+  Fp x141(622609176);
+  // loc(unknown)
+  Fp x142(608401422);
+  // loc(unknown)
+  Fp x143(588764636);
+  // loc(unknown)
+  Fp x144(540703332);
+  // loc(unknown)
+  Fp x145(53007114);
+  // loc(unknown)
+  Fp x146(51256176);
+  // loc(unknown)
+  Fp x147(459826664);
+  // loc(unknown)
+  Fp x148(427731030);
+  // loc(unknown)
+  Fp x149(395622276);
+  // loc(unknown)
+  Fp x150(390340387);
+  // loc(unknown)
+  Fp x151(342857858);
+  // loc(unknown)
+  Fp x152(306391314);
+  // loc(unknown)
+  Fp x153(273790406);
+  // loc(unknown)
+  Fp x154(241306552);
+  // loc(unknown)
+  Fp x155(238616145);
+  // loc(unknown)
+  Fp x156(228520958);
+  // loc(unknown)
+  Fp x157(204228775);
+  // loc(unknown)
+  Fp x158(202271745);
+  // loc(unknown)
+  Fp x159(1997503974);
+  // loc(unknown)
+  Fp x160(1989924532);
+  // loc(unknown)
+  Fp x161(1917861751);
+  // loc(unknown)
+  Fp x162(1917549072);
+  // loc(unknown)
+  Fp x163(1896271507);
+  // loc(unknown)
+  Fp x164(1889898);
+  // loc(unknown)
+  Fp x165(1889603648);
+  // loc(unknown)
+  Fp x166(1845603984);
+  // loc(unknown)
+  Fp x167(1832911930);
+  // loc(unknown)
+  Fp x168(1781980094);
+  // loc(unknown)
+  Fp x169(1740472809);
+  // loc(unknown)
+  Fp x170(1737016378);
+  // loc(unknown)
+  Fp x171(172614232);
+  // loc(unknown)
+  Fp x172(1718628547);
+  // loc(unknown)
+  Fp x173(1715719711);
+  // loc(unknown)
+  Fp x174(1687379185);
+  // loc(unknown)
+  Fp x175(1672219447);
+  // loc(unknown)
+  Fp x176(1649953458);
+  // loc(unknown)
+  Fp x177(1647670797);
+  // loc(unknown)
+  Fp x178(1647665372);
+  // loc(unknown)
+  Fp x179(162506101);
+  // loc(unknown)
+  Fp x180(1608891156);
+  // loc(unknown)
+  Fp x181(1587822577);
+  // loc(unknown)
+  Fp x182(1545325389);
+  // loc(unknown)
+  Fp x183(1518763784);
+  // loc(unknown)
+  Fp x184(1507936940);
+  // loc(unknown)
+  Fp x185(150307788);
+  // loc(unknown)
+  Fp x186(1454563174);
+  // loc(unknown)
+  Fp x187(140621810);
+  // loc(unknown)
+  Fp x188(1401020792);
+  // loc(unknown)
+  Fp x189(1393671120);
+  // loc(unknown)
+  Fp x190(1380248020);
+  // loc(unknown)
+  Fp x191(1339793538);
+  // loc(unknown)
+  Fp x192(1338899225);
+  // loc(unknown)
+  Fp x193(1333667262);
+  // loc(unknown)
+  Fp x194(1303271640);
+  // loc(unknown)
+  Fp x195(1296144415);
+  // loc(unknown)
+  Fp x196(1291790245);
+  // loc(unknown)
+  Fp x197(1290028279);
+  // loc(unknown)
+  Fp x198(128479034);
+  // loc(unknown)
+  Fp x199(1282239129);
+  // loc(unknown)
+  Fp x200(1269493554);
+  // loc(unknown)
+  Fp x201(1262312258);
+  // loc(unknown)
+  Fp x202(1239734761);
+  // loc(unknown)
+  Fp x203(1221257987);
+  // loc(unknown)
+  Fp x204(1213686459);
+  // loc(unknown)
+  Fp x205(1209164052);
+  // loc(unknown)
+  Fp x206(1206940496);
+  // loc(unknown)
+  Fp x207(1201063290);
+  // loc(unknown)
+  Fp x208(117294666);
+  // loc(unknown)
+  Fp x209(1170029417);
+  // loc(unknown)
+  Fp x210(1150912935);
+  // loc(unknown)
+  Fp x211(1124078057);
+  // loc(unknown)
+  Fp x212(1111203133);
+  // loc(unknown)
+  Fp x213(1090783436);
+  // loc(unknown)
+  Fp x214(1006235079);
+  // loc(unknown)
+  Fp x215(1003792297);
+  // loc(unknown)
+  Fp x216(831813382);
+  // loc(unknown)
+  Fp x217(1421525369);
+  // loc(unknown)
+  Fp x218(1751797115);
+  // loc(unknown)
+  Fp x219(1964135730);
+  // loc(unknown)
+  Fp x220(525458520);
+  // loc(unknown)
+  Fp x221(638242172);
+  // loc(unknown)
+  Fp x222(1307439985);
+  // loc(unknown)
+  Fp x223(343354132);
+  // loc(unknown)
+  Fp x224(1389166148);
+  // loc(unknown)
+  Fp x225(1660766320);
+  // loc(unknown)
+  Fp x226(1464793095);
+  // loc(unknown)
+  Fp x227(1180307149);
+  // loc(unknown)
+  Fp x228(1930780904);
+  // loc(unknown)
+  Fp x229(1066694495);
+  // loc(unknown)
+  Fp x230(1773108264);
+  // loc(unknown)
+  Fp x231(1004040026);
+  // loc(unknown)
+  Fp x232(815798990);
+  // loc(unknown)
+  Fp x233(454905424);
+  // loc(unknown)
+  Fp x234(118043943);
+  // loc(unknown)
+  Fp x235(157582794);
+  // loc(unknown)
+  Fp x236(246143118);
+  // loc(unknown)
+  Fp x237(314968988);
+  // loc(unknown)
+  Fp x238(127253399);
+  // loc(unknown)
+  Fp x239(262278199);
+  // loc(unknown)
+  Fp x240(943718400);
+  // loc(unknown)
+  Fp x241(268435454);
+  // loc(unknown)
+  Fp x242(1761607679);
+  // loc(unknown)
+  Fp x243(1073741824);
+  // loc(unknown)
+  Fp x244(536870912);
+  // loc(unknown)
+  Fp x245(1509949437);
+  // loc(unknown)
+  Fp x246(268435456);
+  // loc(unknown)
+  Fp x247(1006632953);
+  // loc(unknown)
+  Fp x248(2013265906);
+  // loc(unknown)
+  Fp x249(134217728);
+  // loc(unknown)
+  Fp x250(67108864);
+  // loc(unknown)
+  Fp x251(2013265891);
+  // loc(unknown)
+  Fp x252(33554432);
+  // loc(unknown)
+  Fp x253(2013265861);
+  // loc(unknown)
+  Fp x254(2013265801);
+  // loc(unknown)
+  Fp x255(16777216);
+  // loc(unknown)
+  Fp x256(8388608);
+  // loc(unknown)
+  Fp x257(2013265681);
+  // loc(unknown)
+  Fp x258(4194304);
+  // loc(unknown)
+  Fp x259(2013265441);
+  // loc(unknown)
+  Fp x260(2097152);
+  // loc(unknown)
+  Fp x261(2013264961);
+  // loc(unknown)
+  Fp x262(2013264001);
+  // loc(unknown)
+  Fp x263(1048576);
+  // loc(unknown)
+  Fp x264(524288);
+  // loc(unknown)
+  Fp x265(2013262081);
+  // loc(unknown)
+  Fp x266(262144);
+  // loc(unknown)
+  Fp x267(2013258241);
+  // loc(unknown)
+  Fp x268(2013250561);
+  // loc(unknown)
+  Fp x269(131072);
+  // loc(unknown)
+  Fp x270(2013235201);
+  // loc(unknown)
+  Fp x271(32768);
+  // loc(unknown)
+  Fp x272(2013204481);
+  // loc(unknown)
+  Fp x273(2013143041);
+  // loc(unknown)
+  Fp x274(16384);
+  // loc(unknown)
+  Fp x275(8192);
+  // loc(unknown)
+  Fp x276(2013020161);
+  // loc(unknown)
+  Fp x277(4096);
+  // loc(unknown)
+  Fp x278(2012774401);
+  // loc(unknown)
+  Fp x279(2048);
+  // loc(unknown)
+  Fp x280(2012282881);
+  // loc(unknown)
+  Fp x281(2011299841);
+  // loc(unknown)
+  Fp x282(1024);
+  // loc(unknown)
+  Fp x283(512);
+  // loc(unknown)
+  Fp x284(2009333761);
+  // loc(unknown)
+  Fp x285(256);
+  // loc(unknown)
+  Fp x286(2005401601);
+  // loc(unknown)
+  Fp x287(1997537281);
+  // loc(unknown)
+  Fp x288(128);
+  // loc(unknown)
+  Fp x289(64);
+  // loc(unknown)
+  Fp x290(1981808641);
+  // loc(unknown)
+  Fp x291(32);
+  // loc(unknown)
+  Fp x292(1950351361);
+  // loc(unknown)
+  Fp x293(1887436801);
+  // loc(unknown)
+  Fp x294(16);
+  // loc(unknown)
+  Fp x295(1761607681);
+  // loc(unknown)
+  Fp x296(1509949441);
+  // loc(unknown)
+  Fp x297(1006632961);
+  // loc(unknown)
+  Fp x298(65536);
+  // loc(unknown)
+  Fp x299(2013265910);
+  // loc(unknown)
+  Fp x300(11);
+  // loc(unknown)
+  Fp x301(10);
+  // loc(unknown)
+  Fp x302(9);
+  // loc(unknown)
+  Fp x303(8);
+  // loc(unknown)
+  Fp x304(7);
+  // loc(unknown)
+  Fp x305(6);
+  // loc(unknown)
+  Fp x306(5);
+  // loc(unknown)
+  Fp x307(4);
+  // loc(unknown)
+  Fp x308(3);
+  // loc(unknown)
+  Fp x309(2);
+  // loc(unknown)
+  Fp x310(1);
+  // loc(unknown)
+  Fp x311(0);
+
     // loc("top(recursion::Top)/code(recursion::Code)/write_addr(Reg)"("zirgen/circuit/recursion/top.cpp":33:49))
     auto x11851 = arg0[0 * steps + ((cycle - 0) & mask)];
     assert(x11851 != Fp::invalid());
@@ -40228,1344 +53042,8 @@ __device__ void step_exec(
       assert(reg == Fp::invalid() || reg == x12907);
       reg = x12907;
     }
-  }
-  if (x1360 != 0) {
-    // loc("zirgen/compiler/edsl/component.cpp":49:15)
-    auto x12908 = arg0[8 * steps + ((cycle - 0) & mask)];
-    assert(x12908 != Fp::invalid());
-    if (x12908 != 0) {
-      {
-        // loc("./zirgen/components/bits.h":47:46)
-        {
-          auto& reg = arg2[5 * steps + cycle];
-          assert(reg == Fp::invalid() || reg == x311);
-          reg = x311;
-        }
-        // loc("./zirgen/components/bits.h":47:46)
-        {
-          auto& reg = arg2[6 * steps + cycle];
-          assert(reg == Fp::invalid() || reg == x311);
-          reg = x311;
-        }
-        // loc("./zirgen/components/bits.h":47:46)
-        {
-          auto& reg = arg2[7 * steps + cycle];
-          assert(reg == Fp::invalid() || reg == x311);
-          reg = x311;
-        }
-        // loc("./zirgen/components/bits.h":47:46)
-        {
-          auto& reg = arg2[8 * steps + cycle];
-          assert(reg == Fp::invalid() || reg == x311);
-          reg = x311;
-        }
-        // loc("./zirgen/components/bits.h":47:46)
-        {
-          auto& reg = arg2[9 * steps + cycle];
-          assert(reg == Fp::invalid() || reg == x311);
-          reg = x311;
-        }
-        // loc("./zirgen/components/bits.h":47:46)
-        {
-          auto& reg = arg2[10 * steps + cycle];
-          assert(reg == Fp::invalid() || reg == x311);
-          reg = x311;
-        }
-      }
-    }
-    // loc("zirgen/compiler/edsl/component.cpp":49:15)
-    auto x12909 = arg0[9 * steps + ((cycle - 0) & mask)];
-    assert(x12909 != Fp::invalid());
-    if (x12909 != 0) {
-      {
-        // loc("./zirgen/components/bits.h":47:46)
-        {
-          auto& reg = arg2[5 * steps + cycle];
-          assert(reg == Fp::invalid() || reg == x311);
-          reg = x311;
-        }
-        // loc("./zirgen/components/bits.h":47:46)
-        {
-          auto& reg = arg2[6 * steps + cycle];
-          assert(reg == Fp::invalid() || reg == x311);
-          reg = x311;
-        }
-        // loc("./zirgen/components/bits.h":47:46)
-        {
-          auto& reg = arg2[7 * steps + cycle];
-          assert(reg == Fp::invalid() || reg == x311);
-          reg = x311;
-        }
-        // loc("./zirgen/components/bits.h":47:46)
-        {
-          auto& reg = arg2[8 * steps + cycle];
-          assert(reg == Fp::invalid() || reg == x311);
-          reg = x311;
-        }
-        // loc("./zirgen/components/bits.h":47:46)
-        {
-          auto& reg = arg2[9 * steps + cycle];
-          assert(reg == Fp::invalid() || reg == x311);
-          reg = x311;
-        }
-        // loc("./zirgen/components/bits.h":47:46)
-        {
-          auto& reg = arg2[10 * steps + cycle];
-          assert(reg == Fp::invalid() || reg == x311);
-          reg = x311;
-        }
-      }
-    }
-    // loc("zirgen/compiler/edsl/component.cpp":49:15)
-    auto x12910 = arg0[10 * steps + ((cycle - 0) & mask)];
-    assert(x12910 != Fp::invalid());
-    if (x12910 != 0) {
-      {
-        // loc("./zirgen/components/bits.h":47:46)
-        {
-          auto& reg = arg2[5 * steps + cycle];
-          assert(reg == Fp::invalid() || reg == x311);
-          reg = x311;
-        }
-        // loc("./zirgen/components/bits.h":47:46)
-        {
-          auto& reg = arg2[6 * steps + cycle];
-          assert(reg == Fp::invalid() || reg == x311);
-          reg = x311;
-        }
-        // loc("./zirgen/components/bits.h":47:46)
-        {
-          auto& reg = arg2[7 * steps + cycle];
-          assert(reg == Fp::invalid() || reg == x311);
-          reg = x311;
-        }
-        // loc("./zirgen/components/bits.h":47:46)
-        {
-          auto& reg = arg2[8 * steps + cycle];
-          assert(reg == Fp::invalid() || reg == x311);
-          reg = x311;
-        }
-        // loc("./zirgen/components/bits.h":47:46)
-        {
-          auto& reg = arg2[9 * steps + cycle];
-          assert(reg == Fp::invalid() || reg == x311);
-          reg = x311;
-        }
-        // loc("./zirgen/components/bits.h":47:46)
-        {
-          auto& reg = arg2[10 * steps + cycle];
-          assert(reg == Fp::invalid() || reg == x311);
-          reg = x311;
-        }
-      }
-    }
-    // loc("zirgen/compiler/edsl/component.cpp":49:15)
-    auto x12911 = arg0[11 * steps + ((cycle - 0) & mask)];
-    assert(x12911 != Fp::invalid());
-    if (x12911 != 0) {
-      {
-        // loc("./zirgen/components/bits.h":47:46)
-        {
-          auto& reg = arg2[5 * steps + cycle];
-          assert(reg == Fp::invalid() || reg == x311);
-          reg = x311;
-        }
-        // loc("./zirgen/components/bits.h":47:46)
-        {
-          auto& reg = arg2[6 * steps + cycle];
-          assert(reg == Fp::invalid() || reg == x311);
-          reg = x311;
-        }
-        // loc("./zirgen/components/bits.h":47:46)
-        {
-          auto& reg = arg2[7 * steps + cycle];
-          assert(reg == Fp::invalid() || reg == x311);
-          reg = x311;
-        }
-        // loc("./zirgen/components/bits.h":47:46)
-        {
-          auto& reg = arg2[8 * steps + cycle];
-          assert(reg == Fp::invalid() || reg == x311);
-          reg = x311;
-        }
-        // loc("./zirgen/components/bits.h":47:46)
-        {
-          auto& reg = arg2[9 * steps + cycle];
-          assert(reg == Fp::invalid() || reg == x311);
-          reg = x311;
-        }
-        // loc("./zirgen/components/bits.h":47:46)
-        {
-          auto& reg = arg2[10 * steps + cycle];
-          assert(reg == Fp::invalid() || reg == x311);
-          reg = x311;
-        }
-      }
-    }
-    // loc("zirgen/compiler/edsl/component.cpp":49:15)
-    auto x12912 = arg0[12 * steps + ((cycle - 0) & mask)];
-    assert(x12912 != Fp::invalid());
-    if (x12912 != 0) {
-      {
-        // loc("./zirgen/components/bits.h":47:46)
-        {
-          auto& reg = arg2[5 * steps + cycle];
-          assert(reg == Fp::invalid() || reg == x311);
-          reg = x311;
-        }
-        // loc("./zirgen/components/bits.h":47:46)
-        {
-          auto& reg = arg2[6 * steps + cycle];
-          assert(reg == Fp::invalid() || reg == x311);
-          reg = x311;
-        }
-        // loc("./zirgen/components/bits.h":47:46)
-        {
-          auto& reg = arg2[7 * steps + cycle];
-          assert(reg == Fp::invalid() || reg == x311);
-          reg = x311;
-        }
-        // loc("./zirgen/components/bits.h":47:46)
-        {
-          auto& reg = arg2[8 * steps + cycle];
-          assert(reg == Fp::invalid() || reg == x311);
-          reg = x311;
-        }
-        // loc("./zirgen/components/bits.h":47:46)
-        {
-          auto& reg = arg2[9 * steps + cycle];
-          assert(reg == Fp::invalid() || reg == x311);
-          reg = x311;
-        }
-        // loc("./zirgen/components/bits.h":47:46)
-        {
-          auto& reg = arg2[10 * steps + cycle];
-          assert(reg == Fp::invalid() || reg == x311);
-          reg = x311;
-        }
-      }
-    }
-    // loc("zirgen/compiler/edsl/component.cpp":49:15)
-    auto x12913 = arg0[17 * steps + ((cycle - 0) & mask)];
-    assert(x12913 != Fp::invalid());
-    if (x12913 != 0) {
-      {
-        // loc("./zirgen/components/bits.h":47:46)
-        {
-          auto& reg = arg2[5 * steps + cycle];
-          assert(reg == Fp::invalid() || reg == x311);
-          reg = x311;
-        }
-        // loc("./zirgen/components/bits.h":47:46)
-        {
-          auto& reg = arg2[6 * steps + cycle];
-          assert(reg == Fp::invalid() || reg == x311);
-          reg = x311;
-        }
-        // loc("./zirgen/components/bits.h":47:46)
-        {
-          auto& reg = arg2[7 * steps + cycle];
-          assert(reg == Fp::invalid() || reg == x311);
-          reg = x311;
-        }
-        // loc("./zirgen/components/bits.h":47:46)
-        {
-          auto& reg = arg2[8 * steps + cycle];
-          assert(reg == Fp::invalid() || reg == x311);
-          reg = x311;
-        }
-        // loc("./zirgen/components/bits.h":47:46)
-        {
-          auto& reg = arg2[9 * steps + cycle];
-          assert(reg == Fp::invalid() || reg == x311);
-          reg = x311;
-        }
-        // loc("./zirgen/components/bits.h":47:46)
-        {
-          auto& reg = arg2[10 * steps + cycle];
-          assert(reg == Fp::invalid() || reg == x311);
-          reg = x311;
-        }
-      }
-    }
-  }
-  if (x8811 != 0) {
-    {
-      // loc("zirgen/circuit/recursion/wom.cpp":22:3)
-      {
-        auto& reg = arg2[45 * steps + cycle];
-        assert(reg == Fp::invalid() || reg == x311);
-        reg = x311;
-      }
-      // loc("zirgen/circuit/recursion/wom.cpp":61:5)
-      {
-        auto& reg = arg2[46 * steps + cycle];
-        assert(reg == Fp::invalid() || reg == x311);
-        reg = x311;
-      }
-      // loc("zirgen/circuit/recursion/wom.cpp":61:5)
-      {
-        auto& reg = arg2[47 * steps + cycle];
-        assert(reg == Fp::invalid() || reg == x311);
-        reg = x311;
-      }
-      // loc("zirgen/circuit/recursion/wom.cpp":61:5)
-      {
-        auto& reg = arg2[48 * steps + cycle];
-        assert(reg == Fp::invalid() || reg == x311);
-        reg = x311;
-      }
-      // loc("zirgen/circuit/recursion/wom.cpp":61:5)
-      {
-        auto& reg = arg2[49 * steps + cycle];
-        assert(reg == Fp::invalid() || reg == x311);
-        reg = x311;
-      }
-    }
-  }
-  if (x11720 != 0) {
-    {
-      // loc("zirgen/circuit/recursion/wom.cpp":22:3)
-      {
-        auto& reg = arg2[45 * steps + cycle];
-        assert(reg == Fp::invalid() || reg == x311);
-        reg = x311;
-      }
-      // loc("zirgen/circuit/recursion/wom.cpp":61:5)
-      {
-        auto& reg = arg2[46 * steps + cycle];
-        assert(reg == Fp::invalid() || reg == x311);
-        reg = x311;
-      }
-      // loc("zirgen/circuit/recursion/wom.cpp":61:5)
-      {
-        auto& reg = arg2[47 * steps + cycle];
-        assert(reg == Fp::invalid() || reg == x311);
-        reg = x311;
-      }
-      // loc("zirgen/circuit/recursion/wom.cpp":61:5)
-      {
-        auto& reg = arg2[48 * steps + cycle];
-        assert(reg == Fp::invalid() || reg == x311);
-        reg = x311;
-      }
-      // loc("zirgen/circuit/recursion/wom.cpp":61:5)
-      {
-        auto& reg = arg2[49 * steps + cycle];
-        assert(reg == Fp::invalid() || reg == x311);
-        reg = x311;
-      }
-    }
-  }
-  if (x312 != 0) {
-    {
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-      auto x12914 = arg2[5 * steps + ((cycle - 0) & mask)];
-      assert(x12914 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x12915 = arg2[6 * steps + ((cycle - 0) & mask)];
-      assert(x12915 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x12916 = arg2[7 * steps + ((cycle - 0) & mask)];
-      assert(x12916 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x12917 = arg2[8 * steps + ((cycle - 0) & mask)];
-      assert(x12917 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x12918 = arg2[9 * steps + ((cycle - 0) & mask)];
-      assert(x12918 != Fp::invalid());
-      extern_args[0] = x12914;
-      extern_args[1] = x12915;
-      extern_args[2] = x12916;
-      extern_args[3] = x12917;
-      extern_args[4] = x12918;
-      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-      auto x12919 = arg2[10 * steps + ((cycle - 0) & mask)];
-      assert(x12919 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x12920 = arg2[11 * steps + ((cycle - 0) & mask)];
-      assert(x12920 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x12921 = arg2[12 * steps + ((cycle - 0) & mask)];
-      assert(x12921 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x12922 = arg2[13 * steps + ((cycle - 0) & mask)];
-      assert(x12922 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x12923 = arg2[14 * steps + ((cycle - 0) & mask)];
-      assert(x12923 != Fp::invalid());
-      extern_args[0] = x12919;
-      extern_args[1] = x12920;
-      extern_args[2] = x12921;
-      extern_args[3] = x12922;
-      extern_args[4] = x12923;
-      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-      auto x12924 = arg2[15 * steps + ((cycle - 0) & mask)];
-      assert(x12924 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x12925 = arg2[16 * steps + ((cycle - 0) & mask)];
-      assert(x12925 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x12926 = arg2[17 * steps + ((cycle - 0) & mask)];
-      assert(x12926 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x12927 = arg2[18 * steps + ((cycle - 0) & mask)];
-      assert(x12927 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x12928 = arg2[19 * steps + ((cycle - 0) & mask)];
-      assert(x12928 != Fp::invalid());
-      extern_args[0] = x12924;
-      extern_args[1] = x12925;
-      extern_args[2] = x12926;
-      extern_args[3] = x12927;
-      extern_args[4] = x12928;
-      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-      auto x12929 = arg2[20 * steps + ((cycle - 0) & mask)];
-      assert(x12929 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x12930 = arg2[21 * steps + ((cycle - 0) & mask)];
-      assert(x12930 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x12931 = arg2[22 * steps + ((cycle - 0) & mask)];
-      assert(x12931 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x12932 = arg2[23 * steps + ((cycle - 0) & mask)];
-      assert(x12932 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x12933 = arg2[24 * steps + ((cycle - 0) & mask)];
-      assert(x12933 != Fp::invalid());
-      extern_args[0] = x12929;
-      extern_args[1] = x12930;
-      extern_args[2] = x12931;
-      extern_args[3] = x12932;
-      extern_args[4] = x12933;
-      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-      auto x12934 = arg2[25 * steps + ((cycle - 0) & mask)];
-      assert(x12934 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x12935 = arg2[26 * steps + ((cycle - 0) & mask)];
-      assert(x12935 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x12936 = arg2[27 * steps + ((cycle - 0) & mask)];
-      assert(x12936 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x12937 = arg2[28 * steps + ((cycle - 0) & mask)];
-      assert(x12937 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x12938 = arg2[29 * steps + ((cycle - 0) & mask)];
-      assert(x12938 != Fp::invalid());
-      extern_args[0] = x12934;
-      extern_args[1] = x12935;
-      extern_args[2] = x12936;
-      extern_args[3] = x12937;
-      extern_args[4] = x12938;
-      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-      auto x12939 = arg2[30 * steps + ((cycle - 0) & mask)];
-      assert(x12939 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x12940 = arg2[31 * steps + ((cycle - 0) & mask)];
-      assert(x12940 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x12941 = arg2[32 * steps + ((cycle - 0) & mask)];
-      assert(x12941 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x12942 = arg2[33 * steps + ((cycle - 0) & mask)];
-      assert(x12942 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x12943 = arg2[34 * steps + ((cycle - 0) & mask)];
-      assert(x12943 != Fp::invalid());
-      extern_args[0] = x12939;
-      extern_args[1] = x12940;
-      extern_args[2] = x12941;
-      extern_args[3] = x12942;
-      extern_args[4] = x12943;
-      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-      auto x12944 = arg2[35 * steps + ((cycle - 0) & mask)];
-      assert(x12944 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x12945 = arg2[36 * steps + ((cycle - 0) & mask)];
-      assert(x12945 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x12946 = arg2[37 * steps + ((cycle - 0) & mask)];
-      assert(x12946 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x12947 = arg2[38 * steps + ((cycle - 0) & mask)];
-      assert(x12947 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x12948 = arg2[39 * steps + ((cycle - 0) & mask)];
-      assert(x12948 != Fp::invalid());
-      extern_args[0] = x12944;
-      extern_args[1] = x12945;
-      extern_args[2] = x12946;
-      extern_args[3] = x12947;
-      extern_args[4] = x12948;
-      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-      auto x12949 = arg2[40 * steps + ((cycle - 0) & mask)];
-      assert(x12949 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x12950 = arg2[41 * steps + ((cycle - 0) & mask)];
-      assert(x12950 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x12951 = arg2[42 * steps + ((cycle - 0) & mask)];
-      assert(x12951 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x12952 = arg2[43 * steps + ((cycle - 0) & mask)];
-      assert(x12952 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x12953 = arg2[44 * steps + ((cycle - 0) & mask)];
-      assert(x12953 != Fp::invalid());
-      extern_args[0] = x12949;
-      extern_args[1] = x12950;
-      extern_args[2] = x12951;
-      extern_args[3] = x12952;
-      extern_args[4] = x12953;
-      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-      auto x12954 = arg2[45 * steps + ((cycle - 0) & mask)];
-      assert(x12954 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x12955 = arg2[46 * steps + ((cycle - 0) & mask)];
-      assert(x12955 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x12956 = arg2[47 * steps + ((cycle - 0) & mask)];
-      assert(x12956 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x12957 = arg2[48 * steps + ((cycle - 0) & mask)];
-      assert(x12957 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/micro_ops(recursion::MicroOps)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x12958 = arg2[49 * steps + ((cycle - 0) & mask)];
-      assert(x12958 != Fp::invalid());
-      extern_args[0] = x12954;
-      extern_args[1] = x12955;
-      extern_args[2] = x12956;
-      extern_args[3] = x12957;
-      extern_args[4] = x12958;
-      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-    }
-  }
-  if (x1360 != 0) {
-    // loc("zirgen/compiler/edsl/component.cpp":49:15)
-    auto x12959 = arg0[11 * steps + ((cycle - 0) & mask)];
-    assert(x12959 != Fp::invalid());
-    if (x12959 != 0) {
-      {
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_and_elem(recursion::BitAndElem)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-        auto x12960 = arg2[11 * steps + ((cycle - 0) & mask)];
-        assert(x12960 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_and_elem(recursion::BitAndElem)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x12961 = arg2[12 * steps + ((cycle - 0) & mask)];
-        assert(x12961 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_and_elem(recursion::BitAndElem)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x12962 = arg2[13 * steps + ((cycle - 0) & mask)];
-        assert(x12962 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_and_elem(recursion::BitAndElem)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x12963 = arg2[14 * steps + ((cycle - 0) & mask)];
-        assert(x12963 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_and_elem(recursion::BitAndElem)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x12964 = arg2[15 * steps + ((cycle - 0) & mask)];
-        assert(x12964 != Fp::invalid());
-        extern_args[0] = x12960;
-        extern_args[1] = x12961;
-        extern_args[2] = x12962;
-        extern_args[3] = x12963;
-        extern_args[4] = x12964;
-        extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_and_elem(recursion::BitAndElem)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-        auto x12965 = arg2[16 * steps + ((cycle - 0) & mask)];
-        assert(x12965 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_and_elem(recursion::BitAndElem)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x12966 = arg2[17 * steps + ((cycle - 0) & mask)];
-        assert(x12966 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_and_elem(recursion::BitAndElem)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x12967 = arg2[18 * steps + ((cycle - 0) & mask)];
-        assert(x12967 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_and_elem(recursion::BitAndElem)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x12968 = arg2[19 * steps + ((cycle - 0) & mask)];
-        assert(x12968 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_and_elem(recursion::BitAndElem)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x12969 = arg2[20 * steps + ((cycle - 0) & mask)];
-        assert(x12969 != Fp::invalid());
-        extern_args[0] = x12965;
-        extern_args[1] = x12966;
-        extern_args[2] = x12967;
-        extern_args[3] = x12968;
-        extern_args[4] = x12969;
-        extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_and_elem(recursion::BitAndElem)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-        auto x12970 = arg2[21 * steps + ((cycle - 0) & mask)];
-        assert(x12970 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_and_elem(recursion::BitAndElem)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x12971 = arg2[22 * steps + ((cycle - 0) & mask)];
-        assert(x12971 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_and_elem(recursion::BitAndElem)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x12972 = arg2[23 * steps + ((cycle - 0) & mask)];
-        assert(x12972 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_and_elem(recursion::BitAndElem)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x12973 = arg2[24 * steps + ((cycle - 0) & mask)];
-        assert(x12973 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_and_elem(recursion::BitAndElem)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x12974 = arg2[25 * steps + ((cycle - 0) & mask)];
-        assert(x12974 != Fp::invalid());
-        extern_args[0] = x12970;
-        extern_args[1] = x12971;
-        extern_args[2] = x12972;
-        extern_args[3] = x12973;
-        extern_args[4] = x12974;
-        extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-      }
-    }
-    // loc("zirgen/compiler/edsl/component.cpp":49:15)
-    auto x12975 = arg0[12 * steps + ((cycle - 0) & mask)];
-    assert(x12975 != Fp::invalid());
-    if (x12975 != 0) {
-      {
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_op_shorts(recursion::BitOpShorts)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-        auto x12976 = arg2[11 * steps + ((cycle - 0) & mask)];
-        assert(x12976 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_op_shorts(recursion::BitOpShorts)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x12977 = arg2[12 * steps + ((cycle - 0) & mask)];
-        assert(x12977 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_op_shorts(recursion::BitOpShorts)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x12978 = arg2[13 * steps + ((cycle - 0) & mask)];
-        assert(x12978 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_op_shorts(recursion::BitOpShorts)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x12979 = arg2[14 * steps + ((cycle - 0) & mask)];
-        assert(x12979 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_op_shorts(recursion::BitOpShorts)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x12980 = arg2[15 * steps + ((cycle - 0) & mask)];
-        assert(x12980 != Fp::invalid());
-        extern_args[0] = x12976;
-        extern_args[1] = x12977;
-        extern_args[2] = x12978;
-        extern_args[3] = x12979;
-        extern_args[4] = x12980;
-        extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_op_shorts(recursion::BitOpShorts)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-        auto x12981 = arg2[16 * steps + ((cycle - 0) & mask)];
-        assert(x12981 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_op_shorts(recursion::BitOpShorts)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x12982 = arg2[17 * steps + ((cycle - 0) & mask)];
-        assert(x12982 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_op_shorts(recursion::BitOpShorts)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x12983 = arg2[18 * steps + ((cycle - 0) & mask)];
-        assert(x12983 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_op_shorts(recursion::BitOpShorts)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x12984 = arg2[19 * steps + ((cycle - 0) & mask)];
-        assert(x12984 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_op_shorts(recursion::BitOpShorts)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x12985 = arg2[20 * steps + ((cycle - 0) & mask)];
-        assert(x12985 != Fp::invalid());
-        extern_args[0] = x12981;
-        extern_args[1] = x12982;
-        extern_args[2] = x12983;
-        extern_args[3] = x12984;
-        extern_args[4] = x12985;
-        extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_op_shorts(recursion::BitOpShorts)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-        auto x12986 = arg2[21 * steps + ((cycle - 0) & mask)];
-        assert(x12986 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_op_shorts(recursion::BitOpShorts)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x12987 = arg2[22 * steps + ((cycle - 0) & mask)];
-        assert(x12987 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_op_shorts(recursion::BitOpShorts)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x12988 = arg2[23 * steps + ((cycle - 0) & mask)];
-        assert(x12988 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_op_shorts(recursion::BitOpShorts)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x12989 = arg2[24 * steps + ((cycle - 0) & mask)];
-        assert(x12989 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/bit_op_shorts(recursion::BitOpShorts)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x12990 = arg2[25 * steps + ((cycle - 0) & mask)];
-        assert(x12990 != Fp::invalid());
-        extern_args[0] = x12986;
-        extern_args[1] = x12987;
-        extern_args[2] = x12988;
-        extern_args[3] = x12989;
-        extern_args[4] = x12990;
-        extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-      }
-    }
-    // loc("zirgen/compiler/edsl/component.cpp":49:15)
-    auto x12991 = arg0[13 * steps + ((cycle - 0) & mask)];
-    assert(x12991 != Fp::invalid());
-    if (x12991 != 0) {
-      {
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_init(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-        auto x12992 = arg2[11 * steps + ((cycle - 0) & mask)];
-        assert(x12992 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_init(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x12993 = arg2[12 * steps + ((cycle - 0) & mask)];
-        assert(x12993 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_init(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x12994 = arg2[13 * steps + ((cycle - 0) & mask)];
-        assert(x12994 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_init(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x12995 = arg2[14 * steps + ((cycle - 0) & mask)];
-        assert(x12995 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_init(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x12996 = arg2[15 * steps + ((cycle - 0) & mask)];
-        assert(x12996 != Fp::invalid());
-        extern_args[0] = x12992;
-        extern_args[1] = x12993;
-        extern_args[2] = x12994;
-        extern_args[3] = x12995;
-        extern_args[4] = x12996;
-        extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_init(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-        auto x12997 = arg2[16 * steps + ((cycle - 0) & mask)];
-        assert(x12997 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_init(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x12998 = arg2[17 * steps + ((cycle - 0) & mask)];
-        assert(x12998 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_init(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x12999 = arg2[18 * steps + ((cycle - 0) & mask)];
-        assert(x12999 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_init(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13000 = arg2[19 * steps + ((cycle - 0) & mask)];
-        assert(x13000 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_init(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13001 = arg2[20 * steps + ((cycle - 0) & mask)];
-        assert(x13001 != Fp::invalid());
-        extern_args[0] = x12997;
-        extern_args[1] = x12998;
-        extern_args[2] = x12999;
-        extern_args[3] = x13000;
-        extern_args[4] = x13001;
-        extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-      }
-    }
-    // loc("zirgen/compiler/edsl/component.cpp":49:15)
-    auto x13002 = arg0[14 * steps + ((cycle - 0) & mask)];
-    assert(x13002 != Fp::invalid());
-    if (x13002 != 0) {
-      {
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_fini(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-        auto x13003 = arg2[11 * steps + ((cycle - 0) & mask)];
-        assert(x13003 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_fini(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13004 = arg2[12 * steps + ((cycle - 0) & mask)];
-        assert(x13004 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_fini(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13005 = arg2[13 * steps + ((cycle - 0) & mask)];
-        assert(x13005 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_fini(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13006 = arg2[14 * steps + ((cycle - 0) & mask)];
-        assert(x13006 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_fini(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13007 = arg2[15 * steps + ((cycle - 0) & mask)];
-        assert(x13007 != Fp::invalid());
-        extern_args[0] = x13003;
-        extern_args[1] = x13004;
-        extern_args[2] = x13005;
-        extern_args[3] = x13006;
-        extern_args[4] = x13007;
-        extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_fini(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-        auto x13008 = arg2[16 * steps + ((cycle - 0) & mask)];
-        assert(x13008 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_fini(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13009 = arg2[17 * steps + ((cycle - 0) & mask)];
-        assert(x13009 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_fini(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13010 = arg2[18 * steps + ((cycle - 0) & mask)];
-        assert(x13010 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_fini(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13011 = arg2[19 * steps + ((cycle - 0) & mask)];
-        assert(x13011 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_fini(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13012 = arg2[20 * steps + ((cycle - 0) & mask)];
-        assert(x13012 != Fp::invalid());
-        extern_args[0] = x13008;
-        extern_args[1] = x13009;
-        extern_args[2] = x13010;
-        extern_args[3] = x13011;
-        extern_args[4] = x13012;
-        extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-      }
-    }
-    // loc("zirgen/compiler/edsl/component.cpp":49:15)
-    auto x13013 = arg0[15 * steps + ((cycle - 0) & mask)];
-    assert(x13013 != Fp::invalid());
-    if (x13013 != 0) {
-      {
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_load(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-        auto x13014 = arg2[11 * steps + ((cycle - 0) & mask)];
-        assert(x13014 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_load(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13015 = arg2[12 * steps + ((cycle - 0) & mask)];
-        assert(x13015 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_load(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13016 = arg2[13 * steps + ((cycle - 0) & mask)];
-        assert(x13016 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_load(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13017 = arg2[14 * steps + ((cycle - 0) & mask)];
-        assert(x13017 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_load(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13018 = arg2[15 * steps + ((cycle - 0) & mask)];
-        assert(x13018 != Fp::invalid());
-        extern_args[0] = x13014;
-        extern_args[1] = x13015;
-        extern_args[2] = x13016;
-        extern_args[3] = x13017;
-        extern_args[4] = x13018;
-        extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_load(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-        auto x13019 = arg2[16 * steps + ((cycle - 0) & mask)];
-        assert(x13019 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_load(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13020 = arg2[17 * steps + ((cycle - 0) & mask)];
-        assert(x13020 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_load(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13021 = arg2[18 * steps + ((cycle - 0) & mask)];
-        assert(x13021 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_load(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13022 = arg2[19 * steps + ((cycle - 0) & mask)];
-        assert(x13022 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_load(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13023 = arg2[20 * steps + ((cycle - 0) & mask)];
-        assert(x13023 != Fp::invalid());
-        extern_args[0] = x13019;
-        extern_args[1] = x13020;
-        extern_args[2] = x13021;
-        extern_args[3] = x13022;
-        extern_args[4] = x13023;
-        extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-      }
-    }
-    // loc("zirgen/compiler/edsl/component.cpp":49:15)
-    auto x13024 = arg0[16 * steps + ((cycle - 0) & mask)];
-    assert(x13024 != Fp::invalid());
-    if (x13024 != 0) {
-      {
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_mix(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-        auto x13025 = arg2[11 * steps + ((cycle - 0) & mask)];
-        assert(x13025 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_mix(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13026 = arg2[12 * steps + ((cycle - 0) & mask)];
-        assert(x13026 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_mix(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13027 = arg2[13 * steps + ((cycle - 0) & mask)];
-        assert(x13027 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_mix(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13028 = arg2[14 * steps + ((cycle - 0) & mask)];
-        assert(x13028 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_mix(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13029 = arg2[15 * steps + ((cycle - 0) & mask)];
-        assert(x13029 != Fp::invalid());
-        extern_args[0] = x13025;
-        extern_args[1] = x13026;
-        extern_args[2] = x13027;
-        extern_args[3] = x13028;
-        extern_args[4] = x13029;
-        extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_mix(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-        auto x13030 = arg2[16 * steps + ((cycle - 0) & mask)];
-        assert(x13030 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_mix(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13031 = arg2[17 * steps + ((cycle - 0) & mask)];
-        assert(x13031 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_mix(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13032 = arg2[18 * steps + ((cycle - 0) & mask)];
-        assert(x13032 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_mix(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13033 = arg2[19 * steps + ((cycle - 0) & mask)];
-        assert(x13033 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/sha_mix(recursion::ShaWrap)/sha_cycle(recursion::ShaCycle)/recursion::WomBody/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13034 = arg2[20 * steps + ((cycle - 0) & mask)];
-        assert(x13034 != Fp::invalid());
-        extern_args[0] = x13030;
-        extern_args[1] = x13031;
-        extern_args[2] = x13032;
-        extern_args[3] = x13033;
-        extern_args[4] = x13034;
-        extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-      }
-    }
-    // loc("zirgen/compiler/edsl/component.cpp":49:15)
-    auto x13035 = arg0[17 * steps + ((cycle - 0) & mask)];
-    assert(x13035 != Fp::invalid());
-    if (x13035 != 0) {
-      {
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-        auto x13036 = arg2[15 * steps + ((cycle - 0) & mask)];
-        assert(x13036 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13037 = arg2[16 * steps + ((cycle - 0) & mask)];
-        assert(x13037 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13038 = arg2[17 * steps + ((cycle - 0) & mask)];
-        assert(x13038 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13039 = arg2[18 * steps + ((cycle - 0) & mask)];
-        assert(x13039 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13040 = arg2[19 * steps + ((cycle - 0) & mask)];
-        assert(x13040 != Fp::invalid());
-        extern_args[0] = x13036;
-        extern_args[1] = x13037;
-        extern_args[2] = x13038;
-        extern_args[3] = x13039;
-        extern_args[4] = x13040;
-        extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-        auto x13041 = arg2[20 * steps + ((cycle - 0) & mask)];
-        assert(x13041 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13042 = arg2[21 * steps + ((cycle - 0) & mask)];
-        assert(x13042 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13043 = arg2[22 * steps + ((cycle - 0) & mask)];
-        assert(x13043 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13044 = arg2[23 * steps + ((cycle - 0) & mask)];
-        assert(x13044 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13045 = arg2[24 * steps + ((cycle - 0) & mask)];
-        assert(x13045 != Fp::invalid());
-        extern_args[0] = x13041;
-        extern_args[1] = x13042;
-        extern_args[2] = x13043;
-        extern_args[3] = x13044;
-        extern_args[4] = x13045;
-        extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-        auto x13046 = arg2[25 * steps + ((cycle - 0) & mask)];
-        assert(x13046 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13047 = arg2[26 * steps + ((cycle - 0) & mask)];
-        assert(x13047 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13048 = arg2[27 * steps + ((cycle - 0) & mask)];
-        assert(x13048 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13049 = arg2[28 * steps + ((cycle - 0) & mask)];
-        assert(x13049 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13050 = arg2[29 * steps + ((cycle - 0) & mask)];
-        assert(x13050 != Fp::invalid());
-        extern_args[0] = x13046;
-        extern_args[1] = x13047;
-        extern_args[2] = x13048;
-        extern_args[3] = x13049;
-        extern_args[4] = x13050;
-        extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-        auto x13051 = arg2[30 * steps + ((cycle - 0) & mask)];
-        assert(x13051 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13052 = arg2[31 * steps + ((cycle - 0) & mask)];
-        assert(x13052 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13053 = arg2[32 * steps + ((cycle - 0) & mask)];
-        assert(x13053 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13054 = arg2[33 * steps + ((cycle - 0) & mask)];
-        assert(x13054 != Fp::invalid());
-        // loc("top(recursion::Top)/mux(Mux)/macro_ops(recursion::MacroOp)/mux(Mux)/set_global(recursion::SetGlobal)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-        auto x13055 = arg2[34 * steps + ((cycle - 0) & mask)];
-        assert(x13055 != Fp::invalid());
-        extern_args[0] = x13051;
-        extern_args[1] = x13052;
-        extern_args[2] = x13053;
-        extern_args[3] = x13054;
-        extern_args[4] = x13055;
-        extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-      }
-    }
-  }
-  if (x8811 != 0) {
-    {
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-      auto x13056 = arg2[5 * steps + ((cycle - 0) & mask)];
-      assert(x13056 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13057 = arg2[6 * steps + ((cycle - 0) & mask)];
-      assert(x13057 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13058 = arg2[7 * steps + ((cycle - 0) & mask)];
-      assert(x13058 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13059 = arg2[8 * steps + ((cycle - 0) & mask)];
-      assert(x13059 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13060 = arg2[9 * steps + ((cycle - 0) & mask)];
-      assert(x13060 != Fp::invalid());
-      extern_args[0] = x13056;
-      extern_args[1] = x13057;
-      extern_args[2] = x13058;
-      extern_args[3] = x13059;
-      extern_args[4] = x13060;
-      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-      auto x13061 = arg2[10 * steps + ((cycle - 0) & mask)];
-      assert(x13061 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13062 = arg2[11 * steps + ((cycle - 0) & mask)];
-      assert(x13062 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13063 = arg2[12 * steps + ((cycle - 0) & mask)];
-      assert(x13063 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13064 = arg2[13 * steps + ((cycle - 0) & mask)];
-      assert(x13064 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13065 = arg2[14 * steps + ((cycle - 0) & mask)];
-      assert(x13065 != Fp::invalid());
-      extern_args[0] = x13061;
-      extern_args[1] = x13062;
-      extern_args[2] = x13063;
-      extern_args[3] = x13064;
-      extern_args[4] = x13065;
-      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-      auto x13066 = arg2[15 * steps + ((cycle - 0) & mask)];
-      assert(x13066 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13067 = arg2[16 * steps + ((cycle - 0) & mask)];
-      assert(x13067 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13068 = arg2[17 * steps + ((cycle - 0) & mask)];
-      assert(x13068 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13069 = arg2[18 * steps + ((cycle - 0) & mask)];
-      assert(x13069 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13070 = arg2[19 * steps + ((cycle - 0) & mask)];
-      assert(x13070 != Fp::invalid());
-      extern_args[0] = x13066;
-      extern_args[1] = x13067;
-      extern_args[2] = x13068;
-      extern_args[3] = x13069;
-      extern_args[4] = x13070;
-      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-      auto x13071 = arg2[20 * steps + ((cycle - 0) & mask)];
-      assert(x13071 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13072 = arg2[21 * steps + ((cycle - 0) & mask)];
-      assert(x13072 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13073 = arg2[22 * steps + ((cycle - 0) & mask)];
-      assert(x13073 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13074 = arg2[23 * steps + ((cycle - 0) & mask)];
-      assert(x13074 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13075 = arg2[24 * steps + ((cycle - 0) & mask)];
-      assert(x13075 != Fp::invalid());
-      extern_args[0] = x13071;
-      extern_args[1] = x13072;
-      extern_args[2] = x13073;
-      extern_args[3] = x13074;
-      extern_args[4] = x13075;
-      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-      auto x13076 = arg2[25 * steps + ((cycle - 0) & mask)];
-      assert(x13076 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13077 = arg2[26 * steps + ((cycle - 0) & mask)];
-      assert(x13077 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13078 = arg2[27 * steps + ((cycle - 0) & mask)];
-      assert(x13078 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13079 = arg2[28 * steps + ((cycle - 0) & mask)];
-      assert(x13079 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13080 = arg2[29 * steps + ((cycle - 0) & mask)];
-      assert(x13080 != Fp::invalid());
-      extern_args[0] = x13076;
-      extern_args[1] = x13077;
-      extern_args[2] = x13078;
-      extern_args[3] = x13079;
-      extern_args[4] = x13080;
-      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-      auto x13081 = arg2[30 * steps + ((cycle - 0) & mask)];
-      assert(x13081 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13082 = arg2[31 * steps + ((cycle - 0) & mask)];
-      assert(x13082 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13083 = arg2[32 * steps + ((cycle - 0) & mask)];
-      assert(x13083 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13084 = arg2[33 * steps + ((cycle - 0) & mask)];
-      assert(x13084 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13085 = arg2[34 * steps + ((cycle - 0) & mask)];
-      assert(x13085 != Fp::invalid());
-      extern_args[0] = x13081;
-      extern_args[1] = x13082;
-      extern_args[2] = x13083;
-      extern_args[3] = x13084;
-      extern_args[4] = x13085;
-      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-      auto x13086 = arg2[35 * steps + ((cycle - 0) & mask)];
-      assert(x13086 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13087 = arg2[36 * steps + ((cycle - 0) & mask)];
-      assert(x13087 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13088 = arg2[37 * steps + ((cycle - 0) & mask)];
-      assert(x13088 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13089 = arg2[38 * steps + ((cycle - 0) & mask)];
-      assert(x13089 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13090 = arg2[39 * steps + ((cycle - 0) & mask)];
-      assert(x13090 != Fp::invalid());
-      extern_args[0] = x13086;
-      extern_args[1] = x13087;
-      extern_args[2] = x13088;
-      extern_args[3] = x13089;
-      extern_args[4] = x13090;
-      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-      auto x13091 = arg2[40 * steps + ((cycle - 0) & mask)];
-      assert(x13091 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13092 = arg2[41 * steps + ((cycle - 0) & mask)];
-      assert(x13092 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13093 = arg2[42 * steps + ((cycle - 0) & mask)];
-      assert(x13093 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13094 = arg2[43 * steps + ((cycle - 0) & mask)];
-      assert(x13094 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13095 = arg2[44 * steps + ((cycle - 0) & mask)];
-      assert(x13095 != Fp::invalid());
-      extern_args[0] = x13091;
-      extern_args[1] = x13092;
-      extern_args[2] = x13093;
-      extern_args[3] = x13094;
-      extern_args[4] = x13095;
-      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-      auto x13096 = arg2[45 * steps + ((cycle - 0) & mask)];
-      assert(x13096 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13097 = arg2[46 * steps + ((cycle - 0) & mask)];
-      assert(x13097 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13098 = arg2[47 * steps + ((cycle - 0) & mask)];
-      assert(x13098 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13099 = arg2[48 * steps + ((cycle - 0) & mask)];
-      assert(x13099 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_load(recursion::Poseidon2Load)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13100 = arg2[49 * steps + ((cycle - 0) & mask)];
-      assert(x13100 != Fp::invalid());
-      extern_args[0] = x13096;
-      extern_args[1] = x13097;
-      extern_args[2] = x13098;
-      extern_args[3] = x13099;
-      extern_args[4] = x13100;
-      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-    }
-  }
-  if (x11720 != 0) {
-    {
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-      auto x13101 = arg2[5 * steps + ((cycle - 0) & mask)];
-      assert(x13101 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13102 = arg2[6 * steps + ((cycle - 0) & mask)];
-      assert(x13102 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13103 = arg2[7 * steps + ((cycle - 0) & mask)];
-      assert(x13103 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13104 = arg2[8 * steps + ((cycle - 0) & mask)];
-      assert(x13104 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13105 = arg2[9 * steps + ((cycle - 0) & mask)];
-      assert(x13105 != Fp::invalid());
-      extern_args[0] = x13101;
-      extern_args[1] = x13102;
-      extern_args[2] = x13103;
-      extern_args[3] = x13104;
-      extern_args[4] = x13105;
-      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-      auto x13106 = arg2[10 * steps + ((cycle - 0) & mask)];
-      assert(x13106 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13107 = arg2[11 * steps + ((cycle - 0) & mask)];
-      assert(x13107 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13108 = arg2[12 * steps + ((cycle - 0) & mask)];
-      assert(x13108 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13109 = arg2[13 * steps + ((cycle - 0) & mask)];
-      assert(x13109 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13110 = arg2[14 * steps + ((cycle - 0) & mask)];
-      assert(x13110 != Fp::invalid());
-      extern_args[0] = x13106;
-      extern_args[1] = x13107;
-      extern_args[2] = x13108;
-      extern_args[3] = x13109;
-      extern_args[4] = x13110;
-      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-      auto x13111 = arg2[15 * steps + ((cycle - 0) & mask)];
-      assert(x13111 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13112 = arg2[16 * steps + ((cycle - 0) & mask)];
-      assert(x13112 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13113 = arg2[17 * steps + ((cycle - 0) & mask)];
-      assert(x13113 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13114 = arg2[18 * steps + ((cycle - 0) & mask)];
-      assert(x13114 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13115 = arg2[19 * steps + ((cycle - 0) & mask)];
-      assert(x13115 != Fp::invalid());
-      extern_args[0] = x13111;
-      extern_args[1] = x13112;
-      extern_args[2] = x13113;
-      extern_args[3] = x13114;
-      extern_args[4] = x13115;
-      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-      auto x13116 = arg2[20 * steps + ((cycle - 0) & mask)];
-      assert(x13116 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13117 = arg2[21 * steps + ((cycle - 0) & mask)];
-      assert(x13117 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13118 = arg2[22 * steps + ((cycle - 0) & mask)];
-      assert(x13118 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13119 = arg2[23 * steps + ((cycle - 0) & mask)];
-      assert(x13119 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13120 = arg2[24 * steps + ((cycle - 0) & mask)];
-      assert(x13120 != Fp::invalid());
-      extern_args[0] = x13116;
-      extern_args[1] = x13117;
-      extern_args[2] = x13118;
-      extern_args[3] = x13119;
-      extern_args[4] = x13120;
-      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-      auto x13121 = arg2[25 * steps + ((cycle - 0) & mask)];
-      assert(x13121 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13122 = arg2[26 * steps + ((cycle - 0) & mask)];
-      assert(x13122 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13123 = arg2[27 * steps + ((cycle - 0) & mask)];
-      assert(x13123 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13124 = arg2[28 * steps + ((cycle - 0) & mask)];
-      assert(x13124 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13125 = arg2[29 * steps + ((cycle - 0) & mask)];
-      assert(x13125 != Fp::invalid());
-      extern_args[0] = x13121;
-      extern_args[1] = x13122;
-      extern_args[2] = x13123;
-      extern_args[3] = x13124;
-      extern_args[4] = x13125;
-      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-      auto x13126 = arg2[30 * steps + ((cycle - 0) & mask)];
-      assert(x13126 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13127 = arg2[31 * steps + ((cycle - 0) & mask)];
-      assert(x13127 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13128 = arg2[32 * steps + ((cycle - 0) & mask)];
-      assert(x13128 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13129 = arg2[33 * steps + ((cycle - 0) & mask)];
-      assert(x13129 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13130 = arg2[34 * steps + ((cycle - 0) & mask)];
-      assert(x13130 != Fp::invalid());
-      extern_args[0] = x13126;
-      extern_args[1] = x13127;
-      extern_args[2] = x13128;
-      extern_args[3] = x13129;
-      extern_args[4] = x13130;
-      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-      auto x13131 = arg2[35 * steps + ((cycle - 0) & mask)];
-      assert(x13131 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13132 = arg2[36 * steps + ((cycle - 0) & mask)];
-      assert(x13132 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13133 = arg2[37 * steps + ((cycle - 0) & mask)];
-      assert(x13133 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13134 = arg2[38 * steps + ((cycle - 0) & mask)];
-      assert(x13134 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13135 = arg2[39 * steps + ((cycle - 0) & mask)];
-      assert(x13135 != Fp::invalid());
-      extern_args[0] = x13131;
-      extern_args[1] = x13132;
-      extern_args[2] = x13133;
-      extern_args[3] = x13134;
-      extern_args[4] = x13135;
-      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-      auto x13136 = arg2[40 * steps + ((cycle - 0) & mask)];
-      assert(x13136 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13137 = arg2[41 * steps + ((cycle - 0) & mask)];
-      assert(x13137 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13138 = arg2[42 * steps + ((cycle - 0) & mask)];
-      assert(x13138 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13139 = arg2[43 * steps + ((cycle - 0) & mask)];
-      assert(x13139 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13140 = arg2[44 * steps + ((cycle - 0) & mask)];
-      assert(x13140 != Fp::invalid());
-      extern_args[0] = x13136;
-      extern_args[1] = x13137;
-      extern_args[2] = x13138;
-      extern_args[3] = x13139;
-      extern_args[4] = x13140;
-      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
-      auto x13141 = arg2[45 * steps + ((cycle - 0) & mask)];
-      assert(x13141 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[0](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13142 = arg2[46 * steps + ((cycle - 0) & mask)];
-      assert(x13142 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[1](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13143 = arg2[47 * steps + ((cycle - 0) & mask)];
-      assert(x13143 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[2](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13144 = arg2[48 * steps + ((cycle - 0) & mask)];
-      assert(x13144 != Fp::invalid());
-      // loc("top(recursion::Top)/mux(Mux)/poseidon2_store(recursion::Poseidon2Store)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/data[3](Reg)"("zirgen/circuit/recursion/wom.cpp":54:14))
-      auto x13145 = arg2[49 * steps + ((cycle - 0) & mask)];
-      assert(x13145 != Fp::invalid());
-      extern_args[0] = x13141;
-      extern_args[1] = x13142;
-      extern_args[2] = x13143;
-      extern_args[3] = x13144;
-      extern_args[4] = x13145;
-      extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
-    }
-  }
-  if (x11850 != 0) {
+
+  // tail section
     {
       // loc("top(recursion::Top)/mux(Mux)/checked_bytes(recursion::CheckedBytes)/wom_body(recursion::WomBody)/plonk_body(PlonkBody)/recursion::impl::WomPlonkElement/addr(Reg)"("zirgen/circuit/recursion/wom.cpp":32:27))
       auto x13146 = arg2[5 * steps + ((cycle - 0) & mask)];
@@ -41610,5 +53088,5 @@ __device__ void step_exec(
       extern_args[4] = x13155;
       extern_plonkWrite_wom(ctx, cycle, "wom", extern_args, extern_outs);
     }
-  }
 }
+

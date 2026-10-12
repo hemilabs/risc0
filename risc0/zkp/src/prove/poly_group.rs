@@ -55,8 +55,52 @@ use crate::{
 pub struct PolyGroup<H: Hal> {
     pub coeffs: H::Buffer<H::Elem>,
     pub count: usize,
-    pub evaluated: H::Buffer<H::Elem>,
+    pub evaluated: Option<H::Buffer<H::Elem>>,
     pub merkle: MerkleTreeProver<H>,
+}
+
+impl<H: Hal> Clone for PolyGroup<H> {
+    fn clone(&self) -> Self {
+        Self {
+            coeffs: self.coeffs.clone(),
+            count: self.count,
+            evaluated: self.evaluated.clone(),
+            merkle: self.merkle.clone(),
+        }
+    }
+}
+
+impl<H: Hal> PolyGroup<H> {
+    /// Release evaluated buffers (both PolyGroup.evaluated and merkle.matrix)
+    /// to free GPU memory. On 16GB GPUs at po2=21, this frees ~10.5 GB.
+    /// Call restore_evaluated() before FRI batch_prove to reconstruct.
+    pub fn release_evaluated(&mut self) {
+        self.evaluated = None;
+        self.merkle.release_matrix();
+    }
+
+    /// Reconstruct the evaluated buffer from coefficients and restore it
+    /// into merkle.matrix for batch_prove. Costs 2× batch_bit_reverse +
+    /// 1× batch_expand_into_evaluate_ntt.
+    pub fn restore_evaluated(&mut self, hal: &H) {
+        if self.merkle.matrix_is_some() {
+            return; // Already restored or never released
+        }
+        let size = self.coeffs.size() / self.count;
+        let domain = size * INV_RATE;
+        let evaluated = hal.alloc_elem("evaluated", self.count * domain);
+        // Coefficients are bit-reversed; undo before expand+NTT
+        hal.batch_bit_reverse(&self.coeffs, self.count);
+        hal.batch_expand_into_evaluate_ntt(
+            &evaluated,
+            &self.coeffs,
+            self.count,
+            log2_ceil(INV_RATE),
+        );
+        // Re-bit-reverse coefficients (other code expects them bit-reversed)
+        hal.batch_bit_reverse(&self.coeffs, self.count);
+        self.merkle.set_matrix(evaluated);
+    }
 }
 
 impl<H: Hal> PolyGroup<H> {
@@ -71,13 +115,26 @@ impl<H: Hal> PolyGroup<H> {
         assert_eq!(coeffs.size(), count * size);
         let domain = size * INV_RATE;
         let evaluated = hal.alloc_elem("evaluated", count * domain);
+        let t0 = std::time::Instant::now();
         hal.batch_expand_into_evaluate_ntt(&evaluated, &coeffs, count, log2_ceil(INV_RATE));
+        let t_ntt = t0.elapsed();
         hal.batch_bit_reverse(&coeffs, count);
+        let t_bitrev = t0.elapsed();
         let merkle = MerkleTreeProver::new(hal, &evaluated, domain, count, QUERIES);
+        let t_merkle = t0.elapsed();
+        if std::env::var_os("RISC0_VERBOSE").is_some() {
+            eprintln!(
+                "[poly_group({name})] count={count} size={size} domain={domain} ntt={:.1}ms bitrev={:.1}ms merkle={:.1}ms total={:.1}ms",
+                t_ntt.as_secs_f64() * 1000.0,
+                (t_bitrev - t_ntt).as_secs_f64() * 1000.0,
+                (t_merkle - t_bitrev).as_secs_f64() * 1000.0,
+                t_merkle.as_secs_f64() * 1000.0,
+            );
+        }
         PolyGroup {
             coeffs,
             count,
-            evaluated,
+            evaluated: Some(evaluated),
             merkle,
         }
     }

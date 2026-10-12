@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 use anyhow::{bail, Result};
 use risc0_circuit_recursion_sys::RawPreflightCycle;
@@ -61,8 +61,8 @@ pub(crate) struct PreflightTrace {
     pub iops: Vec<FpExt>,
 }
 
-pub(crate) struct Preflight {
-    pub trace: PreflightTrace,
+pub struct Preflight {
+    pub(crate) trace: PreflightTrace,
     input: VecDeque<u32>,
 
     poseidon2_state: [Fp; CELLS],
@@ -73,17 +73,22 @@ pub(crate) struct Preflight {
     sha_fini_pos: usize,
 
     // Cycles, and what checked byte inputs were read during them (stored in u32s in little endian order)
-    byte_reads: BTreeMap<usize, Vec<u32>>,
+    byte_reads: HashMap<usize, Vec<u32>>,
 
     // All the data written by the program
-    pub output: Vec<u32>,
+    pub(crate) output: Vec<u32>,
 
     // Cached powers of evaluation point for checked bytes.  Index is the WOM address of the evaluation
     // point.
-    eval_pts: BTreeMap<u32, [FpExt; CHECKED_COEFFS_PER_POLY]>,
+    eval_pts: HashMap<u32, [FpExt; CHECKED_COEFFS_PER_POLY]>,
 
     cur_iop_body: VecDeque<Vec<Fp>>,
     iop_idx: u32,
+
+    /// Host-computed witness (data, global) from `Prover::prepare` (Intel
+    /// RISC0_RECURSION_PREWITGEN): lets the CPU witgen run on the pipelining
+    /// thread instead of the GPU thread.
+    pub(crate) host_witness: std::sync::Mutex<Option<(Vec<Fp>, Vec<Fp>)>>,
 }
 
 impl Preflight {
@@ -99,12 +104,13 @@ impl Preflight {
             sha_load_pos: 0,
             sha_fini_pos: 0,
 
-            byte_reads: BTreeMap::new(),
+            byte_reads: HashMap::new(),
             output: Vec::new(),
-            eval_pts: BTreeMap::new(),
+            eval_pts: HashMap::new(),
 
             cur_iop_body: VecDeque::new(),
             iop_idx: 0,
+            host_witness: std::sync::Mutex::new(None),
         }
     }
 

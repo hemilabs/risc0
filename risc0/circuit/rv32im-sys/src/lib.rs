@@ -14,8 +14,11 @@
 
 #[cfg(feature = "cuda")]
 use cust::memory::DevicePointer;
+
 use derive_more::Debug;
 use risc0_core::field::baby_bear::{BabyBearElem, BabyBearExtElem};
+#[cfg(feature = "rocm")]
+use risc0_sys::cuda::DevicePointer;
 
 #[derive(Clone, Debug, PartialEq)]
 #[repr(C)]
@@ -70,6 +73,7 @@ pub struct RawBuffer {
 pub struct RawExecBuffers {
     pub global: RawBuffer,
     pub data: RawBuffer,
+    pub pre_data: RawBuffer,
 }
 
 #[repr(C)]
@@ -103,7 +107,7 @@ extern "C" {
     ) -> *const std::os::raw::c_char;
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 extern "C" {
     pub fn risc0_circuit_rv32im_cuda_witgen(
         mode: u32,
@@ -129,5 +133,106 @@ extern "C" {
         po2: u32,
         domain: u32,
         poly_mix_pows: *const u32,
+    ) -> *const std::os::raw::c_char;
+
+    pub fn risc0_circuit_rv32im_cuda_warmup() -> *const std::os::raw::c_char;
+    pub fn risc0_circuit_rv32im_cuda_warmup_eval_check() -> *const std::os::raw::c_char;
+
+    /// Make the persistent stream wait for the eval_check stream to complete.
+    /// Call this before operations on the persistent stream that read eval_check
+    /// output (e.g., iNTT on check_poly). GPU-side dependency only — CPU returns
+    /// immediately.
+    pub fn risc0_circuit_rv32im_cuda_eval_check_dep() -> *const std::os::raw::c_char;
+}
+
+#[cfg(feature = "intel")]
+extern "C" {
+    pub fn risc0_circuit_rv32im_intel_eval_check(
+        queue: *mut std::os::raw::c_void,
+        check: *mut std::os::raw::c_void,
+        data: *const std::os::raw::c_void,
+        accum: *const std::os::raw::c_void,
+        out: *const std::os::raw::c_void,
+        mix: *const std::os::raw::c_void,
+        poly_mix: *const std::os::raw::c_void,
+        rou: u32,
+        po2: u32,
+        domain: u32,
+    ) -> *const std::os::raw::c_char;
+
+    pub fn risc0_circuit_rv32im_intel_eval_check_sync(
+        queue: *mut std::os::raw::c_void,
+    ) -> *const std::os::raw::c_char;
+
+    /// Frees eval_check's scratch slab (waits for the queue first).
+    pub fn risc0_circuit_rv32im_intel_eval_check_release() -> *const std::os::raw::c_char;
+
+    // 2-way multi-pass eval_check (separate .so files per pass)
+    pub fn risc0_circuit_rv32im_intel_eval_check_pass1(
+        queue: *mut std::os::raw::c_void,
+        inter_fp: *mut std::os::raw::c_void,
+        inter_ext: *mut std::os::raw::c_void,
+        data: *const std::os::raw::c_void,
+        accum: *const std::os::raw::c_void,
+        out: *const std::os::raw::c_void,
+        mix: *const std::os::raw::c_void,
+        poly_mix: *const std::os::raw::c_void,
+        domain: u32,
+    ) -> *const std::os::raw::c_char;
+
+    pub fn risc0_circuit_rv32im_intel_eval_check_pass2(
+        queue: *mut std::os::raw::c_void,
+        check: *mut std::os::raw::c_void,
+        inter_fp: *const std::os::raw::c_void,
+        inter_ext: *const std::os::raw::c_void,
+        data: *const std::os::raw::c_void,
+        accum: *const std::os::raw::c_void,
+        out: *const std::os::raw::c_void,
+        mix: *const std::os::raw::c_void,
+        poly_mix: *const std::os::raw::c_void,
+        rou: u32,
+        po2: u32,
+        domain: u32,
+    ) -> *const std::os::raw::c_char;
+
+    pub fn risc0_circuit_rv32im_intel_witgen(
+        queue: *mut std::os::raw::c_void,
+        mode: u32,
+        d_data: *mut std::os::raw::c_void,
+        data_rows: u32,
+        data_cols: u32,
+        d_pre_data: *mut std::os::raw::c_void,
+        d_global: *mut std::os::raw::c_void,
+        global_cols: u32,
+        h_cycles: *const RawPreflightCycle,
+        cycles_len: u32,
+        h_txns: *const RawMemoryTransaction,
+        txns_len: u32,
+        h_bigint: *const u8,
+        bigint_len: u32,
+        table_split_cycle: u32,
+        last_cycle: u32,
+    ) -> *const std::os::raw::c_char;
+
+    pub fn risc0_circuit_rv32im_intel_accum(
+        queue: *mut std::os::raw::c_void,
+        d_data: *mut std::os::raw::c_void,
+        data_rows: u32,
+        data_cols: u32,
+        d_accum: *mut std::os::raw::c_void,
+        accum_rows: u32,
+        accum_cols: u32,
+        d_global: *mut std::os::raw::c_void,
+        global_cols: u32,
+        d_mix: *mut std::os::raw::c_void,
+        mix_cols: u32,
+        h_cycles: *const RawPreflightCycle,
+        cycles_len: u32,
+        h_txns: *const RawMemoryTransaction,
+        txns_len: u32,
+        h_bigint: *const u8,
+        bigint_len: u32,
+        table_split_cycle: u32,
+        last_cycle: u32,
     ) -> *const std::os::raw::c_char;
 }

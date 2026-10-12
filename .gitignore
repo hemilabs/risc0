@@ -19,3 +19,14 @@ compile_commands.json
 .vercel
 node_modules
 *.code-workspace
+
+# icpx leftovers from intel witgen / eval_check device-code compilation
+risc0/circuit/rv32im-sys/intel_*_amalg-*
+risc0/circuit/rv32im-sys/intel_*_amalg.cpp
+risc0/circuit/rv32im-sys/intel_*_amalg.bc
+risc0/circuit/rv32im-sys/intel_*_amalg.ii
+risc0/circuit/rv32im-sys/intel_*_amalg.o
+risc0/circuit/rv32im-sys/intel_*_amalg.s
+risc0/circuit/rv32im-sys/intel_*_amalg.out
+risc0/circuit/rv32im-sys/intel_*_amalg.table
+risc0/circuit/rv32im-sys/intel_*_amalg.txt
