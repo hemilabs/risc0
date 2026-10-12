@@ -941,9 +941,12 @@ impl ProverImpl {
             let max_po2 = self.opts.max_segment_po2;
             let wide_ctx;
             let succinct_ctx = if max_po2 > crate::receipt::DEFAULT_MAX_PO2 {
-                wide_ctx = ctx.clone().with_succinct_verifier_parameters(
-                    SuccinctReceiptVerifierParameters::from_max_po2(max_po2),
-                );
+                wide_ctx = VerifierContext::default()
+                    .with_dev_mode(ctx.dev_mode())
+                    .with_suites(ctx.suites.clone())
+                    .with_succinct_verifier_parameters(
+                        SuccinctReceiptVerifierParameters::from_max_po2(max_po2),
+                    );
                 &wide_ctx
             } else {
                 ctx
