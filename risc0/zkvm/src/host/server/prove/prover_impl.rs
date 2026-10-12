@@ -977,6 +977,22 @@ impl ProverServer for ProverImpl {
         ctx: &VerifierContext,
         elf: &[u8],
     ) -> Result<ProveInfo> {
+        #[allow(unused_mut)]
+        let mut env = env;
+        // Intel: succinct/groth16 receipts are faster with po2=21 segments
+        // (half the lifts and joins; composite proving costs ~8% more per
+        // cycle at po2=21, a net -0.4 s for a 12M-cycle guest). Only when the
+        // caller did not choose a segment size; RISC0_INTEL_SUCCINCT_SEGMENT_PO2
+        // overrides (e.g. 20 keeps the executor default).
+        #[cfg(feature = "intel")]
+        if self.opts.receipt_kind != ReceiptKind::Composite && env.segment_limit_po2.is_none() {
+            let po2 = std::env::var("RISC0_INTEL_SUCCINCT_SEGMENT_PO2")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(21)
+                .min(self.opts.max_segment_po2 as u32);
+            env.segment_limit_po2 = Some(po2);
+        }
         let session = ExecutorImpl::from_elf(env, elf)?.run()?;
         self.prove_session(ctx, &session)
     }
