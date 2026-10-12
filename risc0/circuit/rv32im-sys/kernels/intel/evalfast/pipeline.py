@@ -13,6 +13,7 @@
 #  6. hfix.py, ec_sched_pass.py (un-hoist, sink, scalar FpExt args)
 #  7. pmfwd.py, ../eval_slab.py   per-row arrays -> slot-major global slab
 #  8. swapuni.py, idx32.py, lincomb.py (3), lincombF.py (2)   final peepholes
+#  9. xmxlink.py       poly_mix linking chains on XMX (DPAS); RISC0_INTEL_EVAL_XMX=0 skips
 #
 # usage: pipeline.py <in amalgamation> <out amalgamation> <work dir>
 import os
@@ -70,7 +71,13 @@ run(os.path.join(PARENT, 'eval_slab.py'), w('pre_pmf.cpp'), w('slab.cpp'))
 run(os.path.join(HERE, 'swapuni.py'), w('slab.cpp'), w('sw.cpp'))
 run(os.path.join(HERE, 'idx32.py'), w('sw.cpp'), w('i32.cpp'))
 run(os.path.join(HERE, 'lincomb.py'), w('i32.cpp'), w('lc.cpp'), '3')
-run(os.path.join(HERE, 'lincombF.py'), w('lc.cpp'), out, '2')
+XMX = os.environ.get('RISC0_INTEL_EVAL_XMX', '1') not in ('0', 'false', 'off', 'OFF')
+if XMX:
+    run(os.path.join(HERE, 'lincombF.py'), w('lc.cpp'), w('lcf.cpp'), '2')
+    run(os.path.join(HERE, 'xmxlink.py'), w('lcf.cpp'), out)
+    EXPECT.append('xmxlink: 166 chains (>= 4 terms) of 282, 773 blocks')
+else:
+    run(os.path.join(HERE, 'lincombF.py'), w('lc.cpp'), out, '2')
 log = ''.join(LOG)
 for e in EXPECT:
     if e not in log:

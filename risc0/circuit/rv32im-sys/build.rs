@@ -820,6 +820,17 @@ fn intel_eval_fast_enabled() -> bool {
     )
 }
 
+/// RISC0_INTEL_EVAL_XMX (default on; "0"/"off" disables): evalfast/xmxlink.py
+/// moves the lazy poly_mix linking chains onto the XMX units (u8 DPAS, exact;
+/// ~-52 ms per po2=20 segment). Needs the cl_intel_subgroup_matrix_multiply_
+/// accumulate builtins, which IGC resolves when the AOT build is finalized.
+fn intel_eval_xmx_enabled() -> bool {
+    !matches!(
+        std::env::var("RISC0_INTEL_EVAL_XMX").as_deref(),
+        Ok("0") | Ok("false") | Ok("off") | Ok("OFF"),
+    )
+}
+
 /// Cache_dir helper that suffixes the variant name so each (GRF, SIMD)
 /// combination has its own .so + stamp set. Switching variants does NOT
 /// re-trigger a 30-min icpx compile if that variant is already cached.
@@ -929,7 +940,7 @@ fn compute_mono_hash(cxx_root: &str, icpx_version: &str) -> String {
             .collect();
         scripts.sort();
         in_tree.extend(scripts);
-        "fast3"
+        if intel_eval_xmx_enabled() { "fast3-xmx" } else { "fast3" }
     } else {
         "fast0"
     };
@@ -1197,6 +1208,7 @@ fn build_intel_kernels() {
     println!("cargo:rerun-if-env-changed=RISC0_POLY_FP_CSE_MIN_SHARE");
     println!("cargo:rerun-if-env-changed=RISC0_LSC_HINTS");
     println!("cargo:rerun-if-env-changed=RISC0_INTEL_EVAL_FAST");
+    println!("cargo:rerun-if-env-changed=RISC0_INTEL_EVAL_XMX");
     std::fs::create_dir_all(&cache_dir).unwrap();
 
     // Compute SHA-256 hashes of the inputs to each of the three icpx
@@ -1386,7 +1398,7 @@ fn build_intel_kernels() {
             }
             cmd.arg("-DRISC0_INTEL_EVAL_FAST");
             cmd.arg("-DRISC0_INTEL_EVAL_LOHI");
-            xs_options.push_str(" -igc_opts 'DisableRecompilation=1'");
+            xs_options.push_str(" -igc_opts 'DisableRecompilation=1,LscLoadCacheControlOverride=6,LscStoreCacheControlOverride=6'");
             eprintln!("  RISC0_INTEL_EVAL_FAST=1: compiling {}", fast_path.display());
             fast_path
         } else {
