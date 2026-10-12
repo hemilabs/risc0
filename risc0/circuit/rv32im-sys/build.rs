@@ -348,9 +348,10 @@ fn build_cuda_kernels() {
         .arg("eval_check_combined.cu");
 
     // Key the cache on the sources, the whole command (but its output path), and what nvcc
-    // reads from outside it (the NVCC_*_FLAGS that carry the GPU architecture list, and the
-    // nvcc version) -- and for -arch=native, this machine's GPUs -- so a changed source,
-    // header, architecture list or toolchain can never reuse an object built without it.
+    // reads from outside it (the NVCC_*_FLAGS that carry the GPU architecture list, the host
+    // compiler, include-path variables, the nvcc version) -- and for -arch=native, this
+    // machine's GPUs -- so a changed source, header, architecture list or toolchain doesn't
+    // reuse an object built without it.
     let native_key = if use_native_arch {
         risc0_build_kernel::native_gpu_arch_key(false)
     } else {
@@ -358,16 +359,17 @@ fn build_cuda_kernels() {
     };
     let key = risc0_build_kernel::hash_key(&[
         "rv32im-cuda-eval-check-v1",
-        &eval_check_sources_key(&[&cuda_root, &cxx_root, &sppark_root]),
+        &eval_check_sources_key(&cuda_root, &cxx_root, &sppark_root),
         &risc0_build_kernel::command_key(&cmd),
         &risc0_build_kernel::nvcc_environment_key(),
         &native_key,
     ]);
-    let eval_check_cached = risc0_build_kernel::cached_compile(
+    risc0_build_kernel::cached_compile(
         &cache_dir,
         "eval_check_combined_standalone",
         obj_ext,
         &key,
+        &eval_check_obj,
         |out| {
             let status = cmd
                 .arg("-o")
@@ -380,8 +382,6 @@ fn build_cuda_kernels() {
             );
         },
     );
-    // Copy cached object to OUT_DIR for this build.
-    std::fs::copy(&eval_check_cached, &eval_check_obj).unwrap();
 
     // Step 2: Compile remaining .cu files with -dc (separate compilation) via cc crate.
     // Exclude eval_check files (compiled standalone above).
@@ -542,15 +542,16 @@ fn build_rocm_kernels() {
     ];
     let eval_check_key = risc0_build_kernel::hash_key(&[
         "rv32im-rocm-eval-check-v1",
-        &eval_check_sources_key(&[&cuda_root, &cxx_root, &sppark_root]),
+        &eval_check_sources_key(&cuda_root, &cxx_root, &sppark_root),
         &format!("{eval_check_flags:?}"),
         &hipcc_key,
     ]);
-    let eval_check_cached = risc0_build_kernel::cached_compile(
+    risc0_build_kernel::cached_compile(
         &cache_dir,
         "eval_check_combined_standalone",
         "o",
         &eval_check_key,
+        &eval_check_obj,
         |out| {
             risc0_build_kernel::hip_compile(
                 &hipcc,
@@ -562,8 +563,6 @@ fn build_rocm_kernels() {
             )
         },
     );
-    // Copy cached object to OUT_DIR for this build.
-    std::fs::copy(&eval_check_cached, &eval_check_obj).unwrap();
 
     // Step 2: Single-TU amalgamation for remaining .cu files.
     // This avoids -fgpu-rdc and the problematic HIP device link step entirely.
@@ -629,6 +628,7 @@ fn build_rocm_kernels() {
             &kernel_dir,
         ],
         &[],
+        |_| true,
     );
 
     // Cache remaining_kernels.
@@ -640,11 +640,12 @@ fn build_rocm_kernels() {
         &format!("{local_flags:?}"),
         &hipcc_key,
     ]);
-    let remaining_cached = risc0_build_kernel::cached_compile(
+    risc0_build_kernel::cached_compile(
         &cache_dir,
         "remaining_kernels_rocm",
         "o",
         &remaining_key,
+        &remaining_obj,
         |out| {
             risc0_build_kernel::hip_compile(
                 &hipcc,
@@ -656,7 +657,6 @@ fn build_rocm_kernels() {
             )
         },
     );
-    std::fs::copy(&remaining_cached, &remaining_obj).unwrap();
 
     // Compile ffi_supra.cu separately (uses sppark types, can't be in same TU)
     // Also cached
@@ -671,10 +671,9 @@ fn build_rocm_kernels() {
             &format!("{local_flags:?}"),
             &hipcc_key,
         ]);
-        let cached_obj = risc0_build_kernel::cached_compile(&cache_dir, stem, "o", &key, |out| {
+        risc0_build_kernel::cached_compile(&cache_dir, stem, "o", &key, &obj, |out| {
             risc0_build_kernel::hip_compile(&hipcc, &local_flags, cu, out, &hip_arches, None)
         });
-        std::fs::copy(&cached_obj, &obj).unwrap();
         all_objs.push(obj);
     }
 
@@ -718,12 +717,25 @@ const EVAL_CHECK_LOCAL_SOURCES: &[&str] = &[
     "kernels/cuda/eval_check.cuh",
 ];
 
-/// A key over every file the eval_check compile can read: everything under the include roots
-/// and [`EVAL_CHECK_LOCAL_SOURCES`].
-fn eval_check_sources_key(include_roots: &[&str]) -> String {
-    let roots: Vec<&Path> = include_roots.iter().map(Path::new).collect();
+/// A key over every file the eval_check compile can read: [`EVAL_CHECK_LOCAL_SOURCES`], and
+/// what it can include from the include roots -- all but their `.c`/`.cc`/`.cpp`/`.cu`
+/// files, except sppark's `.cu` files, which its headers include (e.g. `ntt/ntt.cuh`
+/// includes `kernels.cu`). Leaving out risc0-sys's own translation units means editing one of
+/// them (e.g. its ffi.cu) doesn't trigger this ~24-minute compile.
+fn eval_check_sources_key(cuda_root: &str, cxx_root: &str, sppark_root: &str) -> String {
     let files: Vec<&Path> = EVAL_CHECK_LOCAL_SOURCES.iter().map(Path::new).collect();
-    risc0_build_kernel::kernel_sources_key(&roots, &files)
+    let sppark_root = Path::new(sppark_root);
+    risc0_build_kernel::kernel_sources_key(
+        &[Path::new(cuda_root), Path::new(cxx_root), sppark_root],
+        &files,
+        |path| {
+            path.starts_with(sppark_root)
+                || !matches!(
+                    path.extension().and_then(|e| e.to_str()),
+                    Some("c" | "cc" | "cpp" | "cu")
+                )
+        },
+    )
 }
 
 /// The include roots both GPU builds compile against: re-run this script when a file in them
@@ -738,10 +750,18 @@ fn rerun_if_include_roots_changed(roots: &[&str]) {
 }
 
 /// Delete what the stamp-file caches left in `cache_dir` before the caches were keyed by
-/// file name, best effort.
+/// file name, best effort, once unused for a week: until then a build of an older version
+/// sharing this target directory can still use them.
 fn remove_legacy_cache_files(cache_dir: &Path, names: &[&str]) {
+    let week = std::time::Duration::from_secs(7 * 24 * 60 * 60);
     for name in names {
-        let _ = std::fs::remove_file(cache_dir.join(name));
+        let path = cache_dir.join(name);
+        let stale = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t.elapsed().is_ok_and(|age| age > week));
+        if stale {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 

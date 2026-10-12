@@ -552,22 +552,62 @@ pub fn add_to_static_lib(out_dir: &Path, name: &str, objs: &[PathBuf]) {
 /// (where the GPU architecture list is usually set) and the nvcc version.
 /// For keying a cache of nvcc output.
 pub fn nvcc_environment_key() -> String {
-    let mut key = String::new();
-    // CL and _CL_ are cl.exe's own extra flags.
-    for var in ["NVCC_PREPEND_FLAGS", "NVCC_APPEND_FLAGS", "CL", "_CL_"] {
-        key.push_str(&format!("{var}={}\n", env::var(var).unwrap_or_default()));
-    }
+    // CL and _CL_ are cl.exe's own extra flags; CPATH and CPLUS_INCLUDE_PATH extend gcc's
+    // include path; CUDA_VISIBLE_DEVICES picks the GPUs `-arch=native` compiles for.
+    let mut key = env_key(&[
+        "NVCC_PREPEND_FLAGS",
+        "NVCC_APPEND_FLAGS",
+        "CL",
+        "_CL_",
+        "CPATH",
+        "CPLUS_INCLUDE_PATH",
+        "CUDA_VISIBLE_DEVICES",
+    ]);
     if is_msvc_target() {
         // The toolkit the forwarding headers of `msvc_toolkit_include_dir` point into.
         key.push_str(&format!("toolkit={}\n", cuda_toolkit_dir().display()));
+        // cl.exe prints its version (to stderr) when run without arguments.
+        let cl = cc::Build::new().cpp(true).get_compiler();
+        let mut cmd = Command::new(cl.path());
+        cmd.envs(cl.env().iter().cloned());
+        key.push_str(&format!("host={}\n", tool_output(cmd)));
+    } else {
+        // The host compiler nvcc runs (`-ccbin=c++` or its default, gcc), by version.
+        for host in ["c++", "gcc"] {
+            let mut cmd = Command::new(host);
+            cmd.arg("--version");
+            key.push_str(&format!("{host}={}\n", tool_output(cmd)));
+        }
     }
-    let version = Command::new(find_nvcc())
-        .arg("--version")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default();
-    key.push_str(&version);
+    let mut nvcc = Command::new(find_nvcc());
+    nvcc.arg("--version");
+    key.push_str(&tool_output(nvcc));
     key
+}
+
+/// `NAME=value` lines for `vars` (empty when unset), each also registered with cargo as a
+/// reason to re-run the build script, for keying a cache on the environment.
+fn env_key(vars: &[&str]) -> String {
+    let mut key = String::new();
+    for var in vars {
+        println!("cargo:rerun-if-env-changed={var}");
+        key.push_str(&format!("{var}={}\n", env::var(var).unwrap_or_default()));
+    }
+    key
+}
+
+/// What `cmd` prints (stdout, then stderr), or "" if it can't run: for keying a cache on a
+/// tool's version.
+fn tool_output(mut cmd: Command) -> String {
+    cmd.output()
+        .map(|o| {
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            )
+        })
+        .unwrap_or_default()
 }
 
 /// The GPUs `-arch=native` (nvcc) or `--offload-arch=native` (hipcc) compiles for on this
@@ -616,8 +656,8 @@ pub fn native_gpu_arch_key(hip: bool) -> String {
 /// the environment hipcc reads its compiler and extra flags from, and the hipcc version.
 /// For keying a cache of hipcc output.
 pub fn hipcc_environment_key(hipcc: &str) -> String {
-    let mut key = String::new();
-    for var in [
+    // The *_VISIBLE_DEVICES pick the GPUs `--offload-arch=native` compiles for.
+    let mut key = env_key(&[
         "HIPCC_COMPILE_FLAGS_APPEND",
         "HIPCC_COMPILE_FLAGS_PREPEND",
         "HIP_CLANG_PATH",
@@ -629,22 +669,19 @@ pub fn hipcc_environment_key(hipcc: &str) -> String {
         "HIP_INCLUDE_PATH",
         "CPATH",
         "CPLUS_INCLUDE_PATH",
-    ] {
-        key.push_str(&format!("{var}={}\n", env::var(var).unwrap_or_default()));
-    }
-    let version = Command::new(hipcc)
-        .arg("--version")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default();
-    key.push_str(&version);
+        "HIP_VISIBLE_DEVICES",
+        "ROCR_VISIBLE_DEVICES",
+    ]);
+    let mut cmd = Command::new(hipcc);
+    cmd.arg("--version");
+    key.push_str(&tool_output(cmd));
     key
 }
 
 /// Every file under `root` that [`kernel_sources_key`] hashes, searched recursively, skipping
-/// `target` and hidden directories and not following directory symlinks. For emitting
-/// `cargo:rerun-if-changed` per file, which, unlike a directory, can't recurse into a
-/// symlink loop.
+/// `target` directories, hidden files and directories and editor backups, and not following
+/// directory symlinks. For emitting `cargo:rerun-if-changed` per file, which, unlike a
+/// directory, can't recurse into a symlink loop.
 pub fn kernel_source_files(root: &Path) -> Vec<PathBuf> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         let Ok(entries) = fs::read_dir(dir) else {
@@ -657,11 +694,17 @@ pub fn kernel_source_files(root: &Path) -> Vec<PathBuf> {
             };
             let name = entry.file_name();
             let name = name.to_string_lossy();
+            if name.starts_with('.') {
+                continue;
+            }
             if file_type.is_dir() {
-                if !name.starts_with('.') && name != "target" {
+                if name != "target" {
                     walk(&path, out);
                 }
-            } else if path.is_file() {
+            } else if path.is_file()
+                && !name.ends_with('~')
+                && ![".orig", ".rej", ".bak"].iter().any(|s| name.ends_with(s))
+            {
                 out.push(path);
             }
         }
@@ -673,12 +716,17 @@ pub fn kernel_source_files(root: &Path) -> Vec<PathBuf> {
 }
 
 /// SHA-256 (hex) over every file under `roots` ([`kernel_source_files`]; not following
-/// directory symlinks, since sppark's `rust/sppark` links back to its root), plus `files`, by
-/// relative path and contents. A superset of what a compile with these include roots can
-/// read, whatever the extension (sppark includes `.hip` files and an extensionless
-/// `cuda/std/array`), for keying a cache of its output: unlike a list of known files, it
-/// can't miss a header a change adds.
-pub fn kernel_sources_key(roots: &[&Path], files: &[&Path]) -> String {
+/// directory symlinks, since sppark's `rust/sppark` links back to its root) that `include`
+/// accepts, plus `files`, by relative path and contents. A superset of what a compile with
+/// these include roots can read, whatever the extension (sppark includes `.hip` files and an
+/// extensionless `cuda/std/array`), for keying a cache of its output: unlike a list of known
+/// files, it can't miss a header a change adds. `include` can narrow it to what the compile
+/// can reach, e.g. leaving out a root's own translation units.
+pub fn kernel_sources_key(
+    roots: &[&Path],
+    files: &[&Path],
+    include: impl Fn(&Path) -> bool,
+) -> String {
     let mut hasher = Sha256::new();
     let mut add = |label: &str, path: &Path| {
         // A file that can't be read hashes as missing rather than failing the build.
@@ -696,6 +744,7 @@ pub fn kernel_sources_key(roots: &[&Path], files: &[&Path]) -> String {
     for (i, root) in roots.iter().enumerate() {
         let mut labeled: Vec<(String, PathBuf)> = kernel_source_files(root)
             .into_iter()
+            .filter(|p| include(p))
             .map(|p| {
                 let rel = p.strip_prefix(root).unwrap_or(&p).to_string_lossy();
                 (format!("{i}/{}", rel.replace('\\', "/")), p)
@@ -715,9 +764,9 @@ pub fn kernel_sources_key(roots: &[&Path], files: &[&Path]) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Look up `<cache_dir>/<stem>-<key>.<ext>`, a compiler output cached under `key` (which
-/// must cover everything the output depends on), and build it with `compile(path)` on a miss.
-/// Returns the cached file.
+/// Copy `<cache_dir>/<stem>-<key>.<ext>`, a compiler output cached under `key` (which must
+/// cover everything the output depends on), to `dest`, building it with `compile(path)` on a
+/// miss.
 ///
 /// The output goes to a temporary path and is renamed into place only once `compile`
 /// returns, so an interrupted or failed build never leaves a file a later build would take
@@ -728,29 +777,48 @@ pub fn cached_compile(
     stem: &str,
     ext: &str,
     key: &str,
+    dest: &Path,
     compile: impl FnOnce(&Path),
-) -> PathBuf {
+) {
     let key = &key[..key.len().min(32)];
     let cached = cache_dir.join(format!("{stem}-{key}.{ext}"));
-    if cached.exists() {
-        eprintln!("{stem}: inputs unchanged, reusing {}", cached.display());
-        // Mark it in use, so another build's pruning below leaves it alone.
+    // Copy first, then mark it in use (so another build's pruning below leaves it alone): if
+    // another build pruned it after all, the copy fails and this builds it afresh.
+    if fs::copy(&cached, dest).is_ok() {
+        eprintln!("{stem}: inputs unchanged, reused {}", cached.display());
         if let Ok(f) = fs::OpenOptions::new().write(true).open(&cached) {
             let _ = f.set_modified(std::time::SystemTime::now());
         }
-        return cached;
+        return;
     }
     eprintln!("{stem}: inputs changed (or first build), compiling...");
     let tmp = cache_dir.join(format!("{stem}-{key}.tmp{}.{ext}", std::process::id()));
     let _ = fs::remove_file(&tmp);
+    // Removes the (possibly large, partial) temporary output if `compile` panics.
+    struct RemoveOnDrop<'a>(&'a Path, bool);
+    impl Drop for RemoveOnDrop<'_> {
+        fn drop(&mut self) {
+            if self.1 {
+                let _ = fs::remove_file(self.0);
+            }
+        }
+    }
+    let mut guard = RemoveOnDrop(&tmp, true);
     compile(&tmp);
     assert!(
         tmp.exists(),
         "{stem}: the compiler produced no {}",
         tmp.display()
     );
+    fs::copy(&tmp, dest).unwrap_or_else(|e| {
+        panic!(
+            "failed to copy {} to {}: {e}",
+            tmp.display(),
+            dest.display()
+        )
+    });
     // On Windows a scanner briefly holding the new file can make the rename fail: retry, and
-    // if it still fails, use the output where it is rather than lose the compile.
+    // if it still fails, leave it uncached (the temporary file is removed).
     let mut renamed = fs::rename(&tmp, &cached);
     for attempt in 1..=10 {
         if renamed.is_ok() {
@@ -759,13 +827,14 @@ pub fn cached_compile(
         std::thread::sleep(std::time::Duration::from_millis(100 * attempt));
         renamed = fs::rename(&tmp, &cached);
     }
-    if let Err(e) = renamed {
-        println!(
+    match renamed {
+        Ok(()) => guard.1 = false,
+        Err(e) => println!(
             "cargo:warning=could not move {} into the cache ({e}); it will be rebuilt next time",
             tmp.display()
-        );
-        return tmp;
+        ),
     }
+    drop(guard);
     // Leave anything written in the last day: another build script running now may be about
     // to use it (two versions of a crate in one build share `cache_dir`).
     let day = std::time::Duration::from_secs(24 * 60 * 60);
@@ -781,7 +850,6 @@ pub fn cached_compile(
             }
         }
     }
-    cached
 }
 
 /// A cache key for what `cmd` runs: its program, arguments, working directory and the
