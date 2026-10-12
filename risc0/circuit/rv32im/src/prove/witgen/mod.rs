@@ -33,7 +33,7 @@ use risc0_core::scope;
 use risc0_zkp::{
     core::digest::DIGEST_WORDS,
     field::{Elem as _, ExtElem as _},
-    hal::Hal,
+    hal::{Buffer as _, Hal},
 };
 
 use self::{
@@ -94,7 +94,8 @@ impl PreflightResults {
         self.po2
     }
 
-    /// Build the Fiat-Shamir header from the CPU-side global vector.
+    /// The Fiat-Shamir header the segment's claim implies, from the CPU-side global vector:
+    /// what [`WitnessGenerator::header`] reads back from the device should equal it.
     /// Applies valid_or_zero() to match the GPU buffer state after eltwise_zeroize_elem,
     /// which converts INVALID sentinels (unfilled global positions) to ZERO.
     pub fn build_header(&self) -> Vec<Val> {
@@ -165,6 +166,41 @@ where
             );
         }
         Ok(result)
+    }
+
+    /// The Fiat-Shamir header: the globals as witgen left them on the device, then `po2`.
+    ///
+    /// Witgen writes the state out, output digest and terminate state into the globals,
+    /// and eval_check checks the constraints against these device globals, so the header
+    /// the verifier checks them against must be read from here too. `expected` is the
+    /// header the segment's claim implies ([`PreflightResults::build_header`]). If they
+    /// differ, witgen computed something other than the executor's claim; that is logged
+    /// (and asserted in debug builds), and the receipt's claim check will reject the proof.
+    pub fn header(&self, po2: u32, expected: &[Val]) -> Vec<Val> {
+        let mut header = Vec::with_capacity(self.global.cols + 1);
+        // Already zeroized (INVALID -> ZERO) on the device; valid_or_zero is a no-op then.
+        self.global
+            .buf
+            .view(|view| header.extend(view.iter().map(|elem| elem.valid_or_zero())));
+        header.push(Val::new_raw(po2));
+        let mismatched: Vec<(usize, u32, u32)> = zip(&header, expected)
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .map(|(i, (a, b))| (i, a.as_u32(), b.as_u32()))
+            .collect();
+        if !mismatched.is_empty() || header.len() != expected.len() {
+            tracing::warn!(
+                "rv32im witgen globals differ from the segment's claim at po2 {po2}: \
+                 (index, device, claim) {mismatched:?}; lengths {} vs {}",
+                header.len(),
+                expected.len()
+            );
+            debug_assert!(
+                false,
+                "rv32im witgen globals differ from the segment's claim"
+            );
+        }
+        header
     }
 
     #[allow(clippy::type_complexity)]

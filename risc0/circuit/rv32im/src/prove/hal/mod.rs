@@ -198,9 +198,10 @@ where
 
         let t1 = std::time::Instant::now();
         let po2 = preflight_results.po2();
-        let header = preflight_results.build_header();
+        let expected_header = preflight_results.build_header();
         let mut witgen =
             WitnessGenerator::new(hal.as_ref(), circuit_hal.as_ref(), preflight_results, mode)?;
+        let header = witgen.header(po2, &expected_header);
         if *VERBOSE {
             eprintln!(
                 "[prove_core] witgen: {:.1}ms",
@@ -238,7 +239,6 @@ where
                     .iop()
                     .commit(&hashfn.hash_elem_slice(&CircuitImpl::CIRCUIT_INFO.encode()));
 
-                // Use pre-computed header from CPU-side preflight data (no GPU sync needed).
                 let header_digest = hashfn.hash_elem_slice(&header);
                 prover.iop().commit(&header_digest);
                 prover.iop().write_field_elem_slice(header.as_slice());
@@ -368,9 +368,10 @@ where
         let (hal, circuit_hal) = self.get_hal();
 
         let po2 = preflight_results.po2();
-        let header = preflight_results.build_header();
+        let expected_header = preflight_results.build_header();
         let mut witgen =
             WitnessGenerator::new(hal.as_ref(), circuit_hal.as_ref(), preflight_results, mode)?;
+        let header = witgen.header(po2, &expected_header);
         let t_witgen = t0.elapsed();
 
         let code = &witgen.code.buf;
