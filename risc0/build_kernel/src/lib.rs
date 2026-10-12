@@ -553,7 +553,7 @@ pub fn add_to_static_lib(out_dir: &Path, name: &str, objs: &[PathBuf]) {
 /// For keying a cache of nvcc output.
 pub fn nvcc_environment_key() -> String {
     // CL and _CL_ are cl.exe's own extra flags; CPATH and CPLUS_INCLUDE_PATH extend gcc's
-    // include path; CUDA_VISIBLE_DEVICES picks the GPUs `-arch=native` compiles for.
+    // include path.
     let mut key = env_key(&[
         "NVCC_PREPEND_FLAGS",
         "NVCC_APPEND_FLAGS",
@@ -561,7 +561,6 @@ pub fn nvcc_environment_key() -> String {
         "_CL_",
         "CPATH",
         "CPLUS_INCLUDE_PATH",
-        "CUDA_VISIBLE_DEVICES",
     ]);
     if is_msvc_target() {
         // The toolkit the forwarding headers of `msvc_toolkit_include_dir` point into.
@@ -612,8 +611,21 @@ fn tool_output(mut cmd: Command) -> String {
 
 /// The GPUs `-arch=native` (nvcc) or `--offload-arch=native` (hipcc) compiles for on this
 /// machine, best effort (empty if the query tool is missing). For keying a cache of output
-/// built for `native`, so moving the build to a different GPU can't reuse it.
+/// built for `native`, so moving the build to a different GPU can't reuse it. Includes the
+/// `*_VISIBLE_DEVICES` variables, which pick the GPUs `native` sees (nvidia-smi ignores
+/// CUDA_VISIBLE_DEVICES); only call it when compiling for `native`, as they don't matter
+/// otherwise.
 pub fn native_gpu_arch_key(hip: bool) -> String {
+    let mut key = if hip {
+        env_key(&["HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES"])
+    } else {
+        env_key(&["CUDA_VISIBLE_DEVICES"])
+    };
+    key.push_str(&native_gpus(hip));
+    key
+}
+
+fn native_gpus(hip: bool) -> String {
     let mut queries: Vec<(String, &[&str])> = Vec::new();
     if hip {
         // Usually not on PATH: look in the ROCm install too.
@@ -656,7 +668,6 @@ pub fn native_gpu_arch_key(hip: bool) -> String {
 /// the environment hipcc reads its compiler and extra flags from, and the hipcc version.
 /// For keying a cache of hipcc output.
 pub fn hipcc_environment_key(hipcc: &str) -> String {
-    // The *_VISIBLE_DEVICES pick the GPUs `--offload-arch=native` compiles for.
     let mut key = env_key(&[
         "HIPCC_COMPILE_FLAGS_APPEND",
         "HIPCC_COMPILE_FLAGS_PREPEND",
@@ -669,8 +680,6 @@ pub fn hipcc_environment_key(hipcc: &str) -> String {
         "HIP_INCLUDE_PATH",
         "CPATH",
         "CPLUS_INCLUDE_PATH",
-        "HIP_VISIBLE_DEVICES",
-        "ROCR_VISIBLE_DEVICES",
     ]);
     let mut cmd = Command::new(hipcc);
     cmd.arg("--version");
@@ -783,13 +792,21 @@ pub fn cached_compile(
     let key = &key[..key.len().min(32)];
     let cached = cache_dir.join(format!("{stem}-{key}.{ext}"));
     // Copy first, then mark it in use (so another build's pruning below leaves it alone): if
-    // another build pruned it after all, the copy fails and this builds it afresh.
-    if fs::copy(&cached, dest).is_ok() {
-        eprintln!("{stem}: inputs unchanged, reused {}", cached.display());
-        if let Ok(f) = fs::OpenOptions::new().write(true).open(&cached) {
-            let _ = f.set_modified(std::time::SystemTime::now());
+    // another build pruned it after all, the copy finds nothing and this builds it afresh.
+    match fs::copy(&cached, dest) {
+        Ok(_) => {
+            eprintln!("{stem}: inputs unchanged, reused {}", cached.display());
+            if let Ok(f) = fs::OpenOptions::new().write(true).open(&cached) {
+                let _ = f.set_modified(std::time::SystemTime::now());
+            }
+            return;
         }
-        return;
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !cached.exists() => {}
+        Err(e) => panic!(
+            "failed to copy {} to {}: {e}",
+            cached.display(),
+            dest.display()
+        ),
     }
     eprintln!("{stem}: inputs changed (or first build), compiling...");
     let tmp = cache_dir.join(format!("{stem}-{key}.tmp{}.{ext}", std::process::id()));

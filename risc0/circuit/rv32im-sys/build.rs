@@ -750,8 +750,9 @@ fn rerun_if_include_roots_changed(roots: &[&str]) {
 }
 
 /// Delete what the stamp-file caches left in `cache_dir` before the caches were keyed by
-/// file name, best effort, once unused for a week: until then a build of an older version
-/// sharing this target directory can still use them.
+/// file name, best effort, once a week old (by write time: the old code never touched them
+/// on reuse): until then a build of an older version sharing this target directory can
+/// still use them.
 fn remove_legacy_cache_files(cache_dir: &Path, names: &[&str]) {
     let week = std::time::Duration::from_secs(7 * 24 * 60 * 60);
     for name in names {
