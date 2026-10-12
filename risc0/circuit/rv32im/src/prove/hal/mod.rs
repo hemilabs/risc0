@@ -198,7 +198,7 @@ where
 
         let t1 = std::time::Instant::now();
         let po2 = preflight_results.po2();
-        let expected_header = preflight_results.build_header();
+        let expected_header = preflight_results.claim_header();
         let mut witgen =
             WitnessGenerator::new(hal.as_ref(), circuit_hal.as_ref(), preflight_results, mode)?;
         let header = witgen.header(po2, &expected_header);
@@ -368,7 +368,7 @@ where
         let (hal, circuit_hal) = self.get_hal();
 
         let po2 = preflight_results.po2();
-        let expected_header = preflight_results.build_header();
+        let expected_header = preflight_results.claim_header();
         let mut witgen =
             WitnessGenerator::new(hal.as_ref(), circuit_hal.as_ref(), preflight_results, mode)?;
         let header = witgen.header(po2, &expected_header);

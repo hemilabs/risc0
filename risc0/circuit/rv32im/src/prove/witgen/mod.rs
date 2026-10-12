@@ -94,17 +94,23 @@ impl PreflightResults {
         self.po2
     }
 
-    /// The Fiat-Shamir header the segment's claim implies, from the CPU-side global vector:
-    /// what [`WitnessGenerator::header`] reads back from the device should equal it.
-    /// Applies valid_or_zero() to match the GPU buffer state after eltwise_zeroize_elem,
-    /// which converts INVALID sentinels (unfilled global positions) to ZERO.
-    pub fn build_header(&self) -> Vec<Val> {
+    /// The Fiat-Shamir header as far as the segment's claim determines it, from the CPU-side
+    /// global vector: `Some` where the claim sets a global, `None` where it leaves it unset
+    /// (INVALID), then po2. [`WitnessGenerator::header`] checks the device globals against it.
+    ///
+    /// Unset globals are not checked: witgen may legitimately fill them. E.g. it writes the
+    /// output digest at the end of every segment from guest memory, where a session resumed
+    /// after a pause still holds the digest from before it, while the claim has an output only
+    /// for the terminating segment; the verifier ignores the output unless the segment
+    /// terminates (`Rv32imV2Claim::decode`).
+    pub fn claim_header(&self) -> Vec<Option<Val>> {
         use risc0_core::field::Elem as _;
-        let mut header = vec![Val::ZERO; self.global.len() + 1];
-        for (i, elem) in self.global.iter().enumerate() {
-            header[i] = elem.valid_or_zero();
-        }
-        header[self.global.len()] = Val::new_raw(self.po2);
+        let mut header: Vec<Option<Val>> = self
+            .global
+            .iter()
+            .map(|elem| elem.is_valid().then_some(*elem))
+            .collect();
+        header.push(Some(Val::new_raw(self.po2)));
         header
     }
 }
@@ -173,10 +179,11 @@ where
     /// Witgen writes the state out, output digest and terminate state into the globals,
     /// and eval_check checks the constraints against these device globals, so the header
     /// the verifier checks them against must be read from here too. `expected` is the
-    /// header the segment's claim implies ([`PreflightResults::build_header`]). If they
-    /// differ, witgen computed something other than the executor's claim; that is logged
-    /// (and asserted in debug builds), and the receipt's claim check will reject the proof.
-    pub fn header(&self, po2: u32, expected: &[Val]) -> Vec<Val> {
+    /// header as far as the segment's claim determines it
+    /// ([`PreflightResults::claim_header`]). If a global it determines differs, witgen
+    /// computed something other than the executor's claim, and the seal won't prove that
+    /// claim: that is logged, and asserted in debug builds.
+    pub fn header(&self, po2: u32, expected: &[Option<Val>]) -> Vec<Val> {
         let mut header = Vec::with_capacity(self.global.cols + 1);
         // Already zeroized (INVALID -> ZERO) on the device; valid_or_zero is a no-op then.
         self.global
@@ -185,8 +192,10 @@ where
         header.push(Val::new_raw(po2));
         let mismatched: Vec<(usize, u32, u32)> = zip(&header, expected)
             .enumerate()
-            .filter(|(_, (a, b))| a != b)
-            .map(|(i, (a, b))| (i, a.as_u32(), b.as_u32()))
+            .filter_map(|(i, (a, b))| match b {
+                Some(b) if a != b => Some((i, a.as_u32(), b.as_u32())),
+                _ => None,
+            })
             .collect();
         if !mismatched.is_empty() || header.len() != expected.len() {
             tracing::warn!(
