@@ -56,7 +56,14 @@ static inline void randombytes_buf(void* buf, size_t size) {
 // returned as if it were valid.
 static inline void msm_ok(const RustError& err, const char* what) {
   if (err.code != 0) {
-    throw sppark_error(err.code, std::string("groth16 MSM failed: ") + what);
+    std::string msg = std::string("groth16 MSM failed: ") + what;
+    // RustError has no destructor: its message (strdup'd, when set) is ours to free.
+    if (err.message != nullptr) {
+      msg += ": ";
+      msg += err.message;
+      free(err.message);
+    }
+    throw sppark_error(err.code, msg);
   }
 }
 
