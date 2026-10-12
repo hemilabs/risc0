@@ -1398,6 +1398,8 @@ fn build_intel_kernels() {
             }
             cmd.arg("-DRISC0_INTEL_EVAL_FAST");
             cmd.arg("-DRISC0_INTEL_EVAL_LOHI");
+            // LSC cache-control override 6 on loads and stores: -4.5 ms per
+            // po2=20 segment on this kernel, bit-identical (7 gives wrong output).
             xs_options.push_str(" -igc_opts 'DisableRecompilation=1,LscLoadCacheControlOverride=6,LscStoreCacheControlOverride=6'");
             eprintln!("  RISC0_INTEL_EVAL_FAST=1: compiling {}", fast_path.display());
             fast_path

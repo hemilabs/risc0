@@ -8,6 +8,7 @@
 #include <sycl/ext/oneapi/properties/properties.hpp>
 #include <cstring>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 #include "bb31_field.hpp"
@@ -124,6 +125,7 @@ static void ensure_poseidon2_device_constants(sycl::queue& q) {
 // ============================================================================
 #include "poseidon2_gate0_cl.inc"   // defines POSEIDON2_GATE0_CL_SRC
 #include "poseidon2_commit_cl.inc"  // defines POSEIDON2_COMMIT_CL_SRC
+#include "poseidon2_lift_a.inc"     // defines POSEIDON2_LIFT_A (v9 DPAS tiles)
 
 static constexpr uint32_t POSEIDON2_R2_SQ = 1172168163u;  // R^2 mod P
 static constexpr uint32_t POSEIDON2_RC_PADDED = 696;       // gate0 padded layout
@@ -136,6 +138,11 @@ static std::optional<sycl::kernel> g_k_hash_rows_v6;       // commit-path: regis
 static std::optional<sycl::kernel> g_k_hash_fold_v3;       // commit-path: Shoup diag + literal RC
 static bool g_p2_v6 = false, g_p2_fold_v3 = false;  // set only once the kernels exist
 static size_t g_rows_lws = 1024;
+// Last argument of the commit-path rows/fold kernels: the Mont diagonal for
+// v3..v7, the partial-round lift table (POSEIDON2_LIFT_A) for v9.
+static uint16_t* g_d_lift_a = nullptr;
+static uint32_t* g_rows_diag = nullptr;
+static uint32_t* g_fold_diag = nullptr;
 
 static void ensure_poseidon2_opencl_kernels(sycl::queue& q) {
     // The commit-path kernels (v6 rows / v3 fold) are optional: if their
@@ -220,15 +227,27 @@ static void ensure_poseidon2_opencl_kernels(sycl::queue& q) {
                 // no madw, 1024-wide WGs; IGC picks SIMD16 in the default 128-GRF mode.
                 // 211 cols x 2^22: 121 ms vs 135 (v6) / 151 (v6 under IGC_TotalGRFNum=256).
                 // Needs IGC_TotalGRFNum unset (it forces 256 GRF on this bundle: v7 -> 181 ms).
-                // RISC0_P2_ROWS / RISC0_P2_FOLD select another kernel by suffix (e.g. v6, v3).
+                // v9: v7 with the 21 partial rounds evaluated as fixed linear
+                // forms on XMX (DPAS, exact; tools/poseidon2_lift_gen.py) and a
+                // signed-Montgomery S-box: rows -34%, fold -37% vs v7, bit-identical.
+                // RISC0_P2_ROWS / RISC0_P2_FOLD select another kernel by suffix (e.g. v7, v6, v3).
                 const char* rsel = std::getenv("RISC0_P2_ROWS");
                 const char* fsel = std::getenv("RISC0_P2_FOLD");
-                std::string rname = rsel ? rsel : "v7";
-                std::string fname = fsel ? fsel : "v7";
+                std::string rname = rsel ? rsel : "v9";
+                std::string fname = fsel ? fsel : "v9";
+                if (rname == "v9" || fname == "v9") {
+                    if (!g_d_lift_a) {
+                        g_d_lift_a = sycl::malloc_device<uint16_t>(sizeof(POSEIDON2_LIFT_A) / 2, q);
+                        if (!g_d_lift_a) throw std::runtime_error("lift table allocation failed");
+                        q.memcpy(g_d_lift_a, POSEIDON2_LIFT_A, sizeof(POSEIDON2_LIFT_A)).wait();
+                    }
+                }
                 g_rows_lws = (rname == "v6" || rname == "v7pf" || rname == "v7s16") ? 256 : 1024;
                 g_k_hash_rows_v6 = exe2.ext_oneapi_get_kernel("poseidon2_hash_rows_mont_io_" + rname);
                 g_k_hash_fold_v3 = exe2.ext_oneapi_get_kernel("poseidon2_hash_fold_mont_io_" + fname);
-                // v7 rows requires 1024-wide work-groups; if the JIT could not
+                g_rows_diag = (rname == "v9") ? reinterpret_cast<uint32_t*>(g_d_lift_a) : g_d_diag;
+                g_fold_diag = (fname == "v9") ? reinterpret_cast<uint32_t*>(g_d_lift_a) : g_d_diag;
+                // v7/v9 rows require 1024-wide work-groups; if the JIT could not
                 // provide that (e.g. IGC_TotalGRFNum=256 forces 256-GRF mode),
                 // use v6 (256-wide).
                 size_t rows_max = g_k_hash_rows_v6->get_info<
@@ -238,6 +257,7 @@ static void ensure_poseidon2_opencl_kernels(sycl::queue& q) {
                                  rname.c_str(), rows_max, g_rows_lws);
                     g_k_hash_rows_v6 = exe2.ext_oneapi_get_kernel("poseidon2_hash_rows_mont_io_v6");
                     g_rows_lws = 256;
+                    g_rows_diag = g_d_diag;
                 }
                 // fold v3 is launched with 1024-wide work-groups.
                 size_t fold_max = g_k_hash_fold_v3->get_info<
@@ -507,7 +527,7 @@ static void poseidon2_rows_impl(sycl::queue& q,
         uint32_t* d_dst = d_out;
         const uint32_t* d_src = d_in;
         uint32_t* d_rc_pad = g_d_rc_padded;
-        uint32_t* d_diag = g_d_diag;
+        uint32_t* d_diag = v6 ? g_rows_diag : g_d_diag;
         uint32_t cnt = count;
         uint32_t cs = col_size;
         const size_t lws = v6 ? g_rows_lws : 1024;
@@ -614,12 +634,12 @@ void esimd_poseidon2_fold(sycl::queue& q,
         const uint32_t r_sq = POSEIDON2_R2_SQ;
         // v3 only for real tree layers: esimd_warmup's 1-hash fold keeps the
         // original kernel so the warmup launch sequence is unchanged.
-        sycl::kernel k = (g_p2_fold_v3 && g_k_hash_fold_v3.has_value() && num_hashes >= 1024)
-                             ? *g_k_hash_fold_v3 : *g_k_hash_fold;
+        const bool v3 = g_p2_fold_v3 && g_k_hash_fold_v3.has_value() && num_hashes >= 1024;
+        sycl::kernel k = v3 ? *g_k_hash_fold_v3 : *g_k_hash_fold;
         uint32_t* d_dst = d_out;
         const uint32_t* d_src = d_in;
         uint32_t* d_rc_pad = g_d_rc_padded;
-        uint32_t* d_diag = g_d_diag;
+        uint32_t* d_diag = v3 ? g_fold_diag : g_d_diag;
         uint32_t nh = num_hashes;
         // LWS=1024 was the optimum measured for hash_fold on B70 in the
         // gate0 standalone bench (+5% over LWS=256).
