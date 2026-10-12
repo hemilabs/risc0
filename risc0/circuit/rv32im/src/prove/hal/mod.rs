@@ -328,13 +328,15 @@ where
             // (3.4 GB at po2=22) + witgen.accum (1.65 GB). Previously dropped
             // inside a post_eval_check closure to overlap with GPU compute,
             // but that keeps witgen live across eval_check's peak VRAM use.
+            // Free the host-side trace while eval_check runs (see prove_begin).
+            let trace = std::mem::take(&mut witgen.trace);
             drop(witgen);
 
             let t3 = std::time::Instant::now();
             let result = prover.finalize_with_hook(
                 &[&mix.buf, &global_clone],
                 circuit_hal.as_ref(),
-                || {},
+                move || drop(trace),
             );
 
             if *VERBOSE {
@@ -449,6 +451,10 @@ where
         // (witgen.data 3.4 GB + witgen.accum 1.65 GB at po2=22). The eval_check
         // kernel only needs globals (copied to global_clone) and the committed
         // PolyGroups' `evaluated` buffers, not any witgen buffer.
+        // The host-side preflight trace holds no VRAM; free it in the hook,
+        // which runs while eval_check is on the GPU, not on the critical path
+        // (~13 ms/segment at po2=20 on Intel).
+        let trace = std::mem::take(&mut witgen.trace);
         drop(witgen);
 
         let t_main = t0.elapsed();
@@ -457,7 +463,7 @@ where
         let mut deferred = prover.start_finalize_with_hook(
             &[&mix.buf, &global_clone],
             circuit_hal.as_ref(),
-            || {},
+            move || drop(trace),
         );
         // Keep globals alive until eval_check completes.
         deferred.keep_alive_buf(mix.buf);
