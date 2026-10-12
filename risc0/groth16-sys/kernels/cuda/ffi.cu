@@ -160,10 +160,9 @@ struct ProveParams {
 // Raw pointers: intentionally leaked at exit to avoid CUDA driver teardown crash.
 //
 // Locking: `cached_mutex` guards the pointers themselves. `prove_mutex[dev]` is held for a whole
-// prove call, while it uses the cached prover outside `cached_mutex`, and by release while it
-// frees them, so release waits for a prove in flight instead of freeing the prover under it (and
-// two proves on one device can't share the prover at once). Lock order: prove_mutex, then
-// cached_mutex.
+// prove call, while it uses the cached prover outside `cached_mutex`, and for a whole release,
+// so release waits for a prove in flight instead of freeing the prover under it (and two proves
+// on one device can't share the prover at once). Lock order: prove_mutex, then cached_mutex.
 static constexpr int kMaxDevices = 16;
 static SRS* cached_srs[kMaxDevices] = {};
 static groth16_prover* cached_prover[kMaxDevices] = {};
@@ -253,12 +252,20 @@ extern "C" const char* risc0_groth16_cuda_release() {
     int dev = current_device();
     // Waits for a prove in flight on this device to finish with the prover.
     std::lock_guard<std::mutex> prove_lock(prove_mutex[dev]);
-    std::lock_guard<std::mutex> lock(cached_mutex);
-    // The prover first: it was constructed from a reference to the SRS.
-    delete cached_prover[dev];
-    cached_prover[dev] = nullptr;
-    delete cached_srs[dev];
-    cached_srs[dev] = nullptr;
+    // A prove that threw midway can leave kernels queued that use the prover's buffers, and
+    // their frees (cudaFreeAsync on the legacy stream) aren't ordered after sppark's
+    // non-blocking streams: let that work finish first.
+    cudaDeviceSynchronize();
+    {
+      // Only around the pointers: the syncs wait for all of the device's work (a STARK on
+      // another thread, say), and preload for other devices shouldn't wait for that.
+      std::lock_guard<std::mutex> lock(cached_mutex);
+      // The prover first: it was constructed from a reference to the SRS.
+      delete cached_prover[dev];
+      cached_prover[dev] = nullptr;
+      delete cached_srs[dev];
+      cached_srs[dev] = nullptr;
+    }
     // gpu_ptr_t may free with cudaFreeAsync, so wait for those frees to reach the pool before
     // handing the pool's reservation back to the driver.
     cudaDeviceSynchronize();
