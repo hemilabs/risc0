@@ -203,6 +203,12 @@ def p_hoist_global():
             else: repl[n['line']]=['  Fp %s = poly_mix[%d].elems[0];'%(nm(F,i),hb+slot)]
             stats['hoist_roots_'+t]+=1
     body='\n'.join(code)+'\n'+'\n'.join('  tab[%d] = %s;'%(k,h if t=='E' else 'FpExt(%s)'%h) for k,(h,t) in enumerate(slots))
+    # rk_hoist runs on the GLOBAL poly_mix array, which holds only the first
+    # PMBASE entries; the Q-table products and hoist slots (>= PMBASE) exist
+    # only in SLM. verify.py's interpreter has them all, so a hoisted read of
+    # one would pass verification and read garbage on the device.
+    bad=sorted({int(k) for k in re.findall(r'poly_mix\[(\d+)\]',body) if int(k)>=PMBASE})
+    assert not bad, 'rk_hoist reads poly_mix entries that are not in the global array: %s'%bad[:8]
     HOIST=(len(slots),body)
 def p_zerolink(F):
     N=F.nodes
