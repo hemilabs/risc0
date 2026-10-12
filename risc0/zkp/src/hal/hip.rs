@@ -724,6 +724,7 @@ impl<HH: HipHash + ?Sized> HipHal<HH> {
         let poly_size = polynomial.size();
         let pow = pow.to_u32_words();
 
+        Self::sync_stream();
         let err = unsafe {
             supra_poly_divide(
                 polynomial.as_device_ptr(),

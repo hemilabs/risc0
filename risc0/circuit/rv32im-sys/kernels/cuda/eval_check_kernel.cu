@@ -171,22 +171,20 @@ const char* risc0_circuit_rv32im_cuda_eval_check(Fp* check,
   return nullptr;
 }
 
-// Make the persistent stream wait for eval_check to complete.
+// Make the persistent stream, and the host, wait for eval_check to complete.
 // Call this before operations on the persistent stream that read eval_check output
-// (e.g., iNTT on check_poly). This is a GPU-side dependency — the CPU returns
-// immediately; only the persistent stream blocks until eval_check finishes.
+// (e.g., iNTT on check_poly), and before freeing what eval_check reads.
 const char* risc0_circuit_rv32im_cuda_eval_check_dep() {
   try {
     cudaEvent_t event = getEvalCheckEvent();
     CUDA_OK(cudaEventRecord(event, getEvalCheckStream()));
     CUDA_OK(cudaStreamWaitEvent(getPersistentStream(), event, 0));
     // Wait on the host too. The caller (DeferredFinalize::complete) frees what eval_check
-    // reads -- the committed groups' evaluated buffers, released at po2 >= 22 -- as soon as this
-    // returns. A freed buffer goes back to the pool, or for >= 8 GB is unmapped, at once, and
-    // eval_check runs on a non-blocking stream that nothing else is ordered after: a
-    // synchronous copy or another stream could overwrite it, or the unmap fault it, while
-    // eval_check still reads it. Finalize waits for eval_check's result next anyway, so
-    // this costs no overlap.
+    // reads -- the committed groups' evaluated buffers, released in low-memory mode -- as soon
+    // as this returns. Work queued after it on the persistent stream is ordered after
+    // eval_check by the wait above, but a >= 8 GB (VMM) buffer is unmapped at once, not in
+    // stream order, which would fault eval_check if it still ran. Finalize waits for
+    // eval_check's result next anyway, so this costs no overlap.
     CUDA_OK(cudaStreamSynchronize(getEvalCheckStream()));
   } catch (const std::exception& err) {
     return strdup(err.what());

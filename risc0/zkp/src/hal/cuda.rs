@@ -252,14 +252,10 @@ impl CudaHash for CudaHashSha256 {
 /// not ordered after the persistent stream. Anything they read that a risc0 kernel wrote has to be
 /// complete first, or they read it half-written.
 fn sync_persistent_stream() {
-    try_sync_persistent_stream().unwrap();
-}
-
-fn try_sync_persistent_stream() -> Result<()> {
     extern "C" {
         fn risc0_zkp_cuda_sync_stream() -> *const std::os::raw::c_char;
     }
-    ffi_wrap(|| unsafe { risc0_zkp_cuda_sync_stream() })
+    ffi_wrap(|| unsafe { risc0_zkp_cuda_sync_stream() }).unwrap();
 }
 
 pub struct CudaHashPoseidon2 {
@@ -619,10 +615,11 @@ mod vmm {
 
     impl Drop for VmmAllocation {
         fn drop(&mut self) {
-            // Unmapping is immediate, not stream-ordered: kernels still queued on the persistent
-            // stream that use this memory would fault or read garbage. VMM buffers are the >= 8 GB
-            // ones, so the wait is rare. Best effort: a Drop must not panic, e.g. at teardown.
-            let _ = super::try_sync_persistent_stream();
+            // Unmapping is immediate, not stream-ordered: kernels still queued that use this
+            // memory -- on any stream, e.g. eval_check's when a panic unwinds mid-finalize --
+            // would fault or read garbage. VMM buffers are the >= 8 GB ones, so the wait is
+            // rare. Best effort: a Drop must not panic, e.g. at teardown.
+            let _ = unsafe { super::cuCtxSynchronize() };
             let mut off = 0usize;
             for (h, sz) in self.chunks.drain(..) {
                 unsafe {
@@ -765,7 +762,9 @@ impl Drop for RawBuffer {
             // orphaned-size allocation wastes VRAM headroom.
             drop(buf);
         } else {
-            BUFFER_POOL.with(|pool| pool.borrow_mut().push(size, buf));
+            // During thread shutdown the pool may already be gone; then `buf`, owned by the
+            // closure that never ran, is freed directly instead (as on HIP).
+            let _ = BUFFER_POOL.try_with(|pool| pool.borrow_mut().push(size, buf));
         }
     }
 }
@@ -969,6 +968,7 @@ impl<CH: CudaHash + ?Sized> CudaHal<CH> {
         let poly_size = polynomial.size();
         let pow = pow.to_u32_words();
 
+        Self::sync_stream();
         let err = unsafe {
             supra_poly_divide(
                 polynomial.as_device_ptr(),
