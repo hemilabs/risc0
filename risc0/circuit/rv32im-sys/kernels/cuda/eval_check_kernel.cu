@@ -181,10 +181,12 @@ const char* risc0_circuit_rv32im_cuda_eval_check_dep() {
     CUDA_OK(cudaStreamWaitEvent(getPersistentStream(), event, 0));
     // Wait on the host too. The caller (DeferredFinalize::complete) frees what eval_check
     // reads -- the committed groups' evaluated buffers, released in low-memory mode -- as soon
-    // as this returns. Work queued after it on the persistent stream is ordered after
-    // eval_check by the wait above, but a >= 8 GB (VMM) buffer is unmapped at once, not in
-    // stream order, which would fault eval_check if it still ran. Finalize waits for
-    // eval_check's result next anyway, so this costs no overlap.
+    // as this returns, and only kernels on the persistent stream are ordered after eval_check
+    // by the wait above. A freed buffer goes back to the pool, where synchronous copies (e.g.
+    // restore_coeffs' upload, on the legacy stream) and sppark's kernels (on its own
+    // non-blocking stream) can reuse it while eval_check still reads it; and a >= 8 GB (VMM)
+    // buffer is unmapped at once. Finalize waits for eval_check's result next anyway; what
+    // this gives up is overlapping eval_check with that restore_coeffs upload.
     CUDA_OK(cudaStreamSynchronize(getEvalCheckStream()));
   } catch (const std::exception& err) {
     return strdup(err.what());

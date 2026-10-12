@@ -618,7 +618,8 @@ mod vmm {
             // Unmapping is immediate, not stream-ordered: kernels still queued that use this
             // memory -- on any stream, e.g. eval_check's when a panic unwinds mid-finalize --
             // would fault or read garbage. VMM buffers are the >= 8 GB ones, so the wait is
-            // rare. Best effort: a Drop must not panic, e.g. at teardown.
+            // rare (unless RISC0_VMM_ALLOC forces VMM for every allocation: then every free
+            // waits for the device). Best effort: a Drop must not panic, e.g. at teardown.
             let _ = unsafe { super::cuCtxSynchronize() };
             let mut off = 0usize;
             for (h, sz) in self.chunks.drain(..) {
