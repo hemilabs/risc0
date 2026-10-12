@@ -494,15 +494,48 @@ pub fn get_registered_zkr(control_id: &Digest) -> Result<Program> {
         .unwrap_or_else(|| bail!("Control id {control_id} unregistered"))
 }
 
+/// The Merkle root of the allowed control IDs `control_ids` under hash function `hashfn`.
+///
+/// Cached per thread, keyed on the hash function and the allowed set itself:
+/// `ProverOpts::control_ids` need not follow from `max_segment_po2` (callers can set both),
+/// so keying on that alone could hand one set's root to another.
+fn allowed_set_root(hashfn: &str, control_ids: &[Digest]) -> Result<Digest> {
+    thread_local! {
+        static MERKLE_ROOT_CACHE: RefCell<HashMap<(String, Vec<Digest>), Digest>> =
+            RefCell::new(HashMap::new());
+    }
+    let key = (hashfn.to_string(), control_ids.to_vec());
+    MERKLE_ROOT_CACHE.with(|cache| {
+        if let Some(root) = cache.borrow().get(&key) {
+            return Ok(*root);
+        }
+        let suite = hash_suite_from_name(hashfn)
+            .ok_or_else(|| anyhow!("unsupported hash function: {hashfn}"))?;
+        let root = MerkleGroup::new(control_ids.to_vec())?.calc_root(suite.hashfn.as_ref());
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= RECURSION_CACHE_LIMIT {
+            cache.clear();
+        }
+        cache.insert(key, root);
+        Ok(root)
+    })
+}
+
 /// Utility to make a SuccinctReceipt from a RecursionReceipt, the Prover and the Claim.
 pub(crate) fn make_succinct_receipt<Claim>(
     prover: Prover,
     receipt: RecursionReceipt,
     claim: impl Into<MaybePruned<Claim>>,
 ) -> Result<SuccinctReceipt<Claim>> {
-    // Derive verifier parameters from the prover's control_ids.
-    let verifier_parameters =
-        SuccinctReceiptVerifierParameters::from_max_po2(prover.opts.max_segment_po2).digest();
+    // The verifier parameters commit to the root of the same allowed set the inclusion
+    // proof below is against (a poseidon2 root, as `from_max_po2` builds): deriving them from
+    // `max_segment_po2` instead would disagree with it whenever `control_ids` was set
+    // independently. On the default path both give the same root.
+    let verifier_parameters = SuccinctReceiptVerifierParameters {
+        control_root: allowed_set_root("poseidon2", &prover.opts.control_ids)?,
+        ..SuccinctReceiptVerifierParameters::default()
+    }
+    .digest();
     Ok(SuccinctReceipt {
         seal: receipt.seal,
         hashfn: prover.opts.hashfn.clone(),
@@ -677,29 +710,9 @@ impl Prover {
     fn new_lift_inner(segment: &SegmentReceipt, opts: ProverOpts, povw: bool) -> Result<Self> {
         ensure_poseidon2!(segment);
 
-        // Cache the merkle root of the allowed control IDs, keyed on the hash function and the
-        // allowed set itself: `opts.control_ids` need not follow from `max_segment_po2` (callers
-        // can set both), so keying on that alone could hand one set's root to another.
-        thread_local! {
-            static MERKLE_ROOT_CACHE: RefCell<HashMap<(String, Vec<Digest>), Digest>> =
-                RefCell::new(HashMap::new());
-        }
         let inner_hash_suite = hash_suite_from_name(&segment.hashfn)
             .ok_or_else(|| anyhow!("unsupported hash function: {}", segment.hashfn))?;
-        let cache_key = (segment.hashfn.clone(), opts.control_ids.clone());
-        let merkle_root = MERKLE_ROOT_CACHE.with(|cache| -> Result<Digest> {
-            let mut cache = cache.borrow_mut();
-            if let Some(root) = cache.get(&cache_key) {
-                return Ok(*root);
-            }
-            let allowed_ids = MerkleGroup::new(opts.control_ids.clone())?;
-            let root = allowed_ids.calc_root(inner_hash_suite.hashfn.as_ref());
-            if cache.len() >= RECURSION_CACHE_LIMIT {
-                cache.clear();
-            }
-            cache.insert(cache_key, root);
-            Ok(root)
-        })?;
+        let merkle_root = allowed_set_root(&segment.hashfn, &opts.control_ids)?;
 
         let out_size = risc0_circuit_rv32im::CircuitImpl::OUTPUT_SIZE;
 
