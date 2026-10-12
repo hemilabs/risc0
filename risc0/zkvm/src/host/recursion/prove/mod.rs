@@ -568,6 +568,10 @@ pub fn test_zkr(
     })
 }
 
+/// Entries kept in each of the recursion prover's per-thread caches (inclusion proofs,
+/// allowed-set roots) before they are cleared.
+const RECURSION_CACHE_LIMIT: usize = 64;
+
 /// Prover for zkVM use of the recursion circuit.
 pub struct Prover {
     prover: risc0_circuit_recursion::prove::Prover,
@@ -601,14 +605,21 @@ impl Prover {
     }
 
     /// Returns a Merkle inclusion proof of this prover's control ID in the set of allowed IDs.
-    /// Cached per control_id since the proof is deterministic for a given set of control_ids.
+    /// Cached, since the proof is deterministic for a given hash function, set of allowed
+    /// control IDs and control ID: the cache is keyed on all three, so provers with
+    /// different allowed sets (e.g. a different `max_segment_po2`) never share a proof.
     pub fn control_inclusion_proof(&self) -> Result<MerkleProof> {
         thread_local! {
-            static PROOF_CACHE: RefCell<HashMap<Digest, MerkleProof>> =
+            static PROOF_CACHE: RefCell<HashMap<(String, Vec<Digest>, Digest), MerkleProof>> =
                 RefCell::new(HashMap::new());
         }
+        let key = (
+            self.opts.hashfn.clone(),
+            self.opts.control_ids.clone(),
+            self.control_id,
+        );
         PROOF_CACHE.with(|cache| {
-            if let Some(proof) = cache.borrow().get(&self.control_id) {
+            if let Some(proof) = cache.borrow().get(&key) {
                 return Ok(proof.clone());
             }
             let hashfn = self
@@ -618,7 +629,12 @@ impl Prover {
                 .hashfn;
             let proof = MerkleGroup::new(self.opts.control_ids.clone())?
                 .get_proof(&self.control_id, hashfn.as_ref())?;
-            cache.borrow_mut().insert(self.control_id, proof.clone());
+            let mut cache = cache.borrow_mut();
+            // Bounded: a process cycling through many allowed sets mustn't grow it forever.
+            if cache.len() >= RECURSION_CACHE_LIMIT {
+                cache.clear();
+            }
+            cache.insert(key, proof.clone());
             Ok(proof)
         })
     }
@@ -661,24 +677,29 @@ impl Prover {
     fn new_lift_inner(segment: &SegmentReceipt, opts: ProverOpts, povw: bool) -> Result<Self> {
         ensure_poseidon2!(segment);
 
-        // Cache merkle root by (hashfn, max_segment_po2) to support non-default control_ids.
+        // Cache the merkle root of the allowed control IDs, keyed on the hash function and the
+        // allowed set itself: `opts.control_ids` need not follow from `max_segment_po2` (callers
+        // can set both), so keying on that alone could hand one set's root to another.
         thread_local! {
-            static MERKLE_ROOT_CACHE: RefCell<HashMap<(String, usize), Digest>> =
+            static MERKLE_ROOT_CACHE: RefCell<HashMap<(String, Vec<Digest>), Digest>> =
                 RefCell::new(HashMap::new());
         }
         let inner_hash_suite = hash_suite_from_name(&segment.hashfn)
             .ok_or_else(|| anyhow!("unsupported hash function: {}", segment.hashfn))?;
-        let cache_key = (segment.hashfn.clone(), opts.max_segment_po2);
-        let merkle_root = MERKLE_ROOT_CACHE.with(|cache| {
+        let cache_key = (segment.hashfn.clone(), opts.control_ids.clone());
+        let merkle_root = MERKLE_ROOT_CACHE.with(|cache| -> Result<Digest> {
             let mut cache = cache.borrow_mut();
             if let Some(root) = cache.get(&cache_key) {
-                return *root;
+                return Ok(*root);
             }
-            let allowed_ids = MerkleGroup::new(opts.control_ids.clone()).unwrap();
+            let allowed_ids = MerkleGroup::new(opts.control_ids.clone())?;
             let root = allowed_ids.calc_root(inner_hash_suite.hashfn.as_ref());
-            cache.insert(cache_key.clone(), root);
-            root
-        });
+            if cache.len() >= RECURSION_CACHE_LIMIT {
+                cache.clear();
+            }
+            cache.insert(cache_key, root);
+            Ok(root)
+        })?;
 
         let out_size = risc0_circuit_rv32im::CircuitImpl::OUTPUT_SIZE;
 
