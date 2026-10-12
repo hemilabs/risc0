@@ -216,6 +216,8 @@ fn intel_ab(program: Program) {
         )
         .unwrap()
         .data
+        .as_ref()
+        .unwrap()
         .to_vec();
 
         let mut first_intel: Option<Vec<_>> = None;
@@ -228,6 +230,8 @@ fn intel_ab(program: Program) {
             )
             .unwrap()
             .data
+            .as_ref()
+            .unwrap()
             .to_vec();
 
             let mut by_col: BTreeMap<usize, (usize, usize)> = BTreeMap::new();
