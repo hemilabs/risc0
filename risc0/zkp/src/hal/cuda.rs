@@ -1671,6 +1671,9 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
             .flat_map(|(_, pows)| pows.iter().flat_map(|p| p.to_u32_words()))
             .collect();
 
+        let mut remainders =
+            vec![BabyBearExtElem::ZERO; chunks.iter().map(|(_, pows)| pows.len()).sum()];
+
         Self::sync_stream();
         let err = unsafe {
             supra_poly_divide_multi(
@@ -1680,11 +1683,13 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
                 pows_per_combo.as_ptr(),
                 all_pows_flat.as_ptr(),
                 chunks.len() as u32,
+                remainders.as_mut_ptr() as *mut u32,
             )
         };
         if err.code != 0 {
             panic!("Failure during supra_poly_divide_multi: {err}");
         }
+        super::report_nonzero_remainders(&chunks, &remainders);
     }
 }
 

@@ -403,6 +403,30 @@ impl MemoryTracker {
     }
 }
 
+/// Reports every combo whose division by `(X - z)` left a nonzero remainder, for the GPU HALs'
+/// batched `combos_divide`. `remainders` holds one entry per root, in `chunks` order.
+///
+/// The CPU HAL, and upstream's GPU HALs, assert that each remainder is zero: a nonzero one means the
+/// combo polynomial does not vanish at the query point, so something upstream of this stage (the
+/// witness, the coefficients, the evaluations, the check polynomial) is inconsistent and the seal
+/// will not verify. Logged rather than asserted, so a bad proof still fails where callers already
+/// handle it (verifying the segment) instead of panicking the prover; but it is named here, at the
+/// stage it first shows.
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+pub(crate) fn report_nonzero_remainders<E: ExtElem>(chunks: &[(usize, Vec<E>)], remainders: &[E]) {
+    let mut remainders = remainders.iter();
+    for (combo, pows) in chunks {
+        for pow in 0..pows.len() {
+            if remainders.next().is_some_and(|r| *r != E::ZERO) {
+                tracing::error!(
+                    "combos_divide: combo {combo} has a nonzero remainder at root {pow}; this \
+                     segment's proof will not verify"
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(unused)]
 mod testutil {
