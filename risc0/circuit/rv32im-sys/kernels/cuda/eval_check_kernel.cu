@@ -171,15 +171,23 @@ const char* risc0_circuit_rv32im_cuda_eval_check(Fp* check,
   return nullptr;
 }
 
-// Make the persistent stream wait for eval_check to complete.
+// Make the persistent stream, and the host, wait for eval_check to complete.
 // Call this before operations on the persistent stream that read eval_check output
-// (e.g., iNTT on check_poly). This is a GPU-side dependency — the CPU returns
-// immediately; only the persistent stream blocks until eval_check finishes.
+// (e.g., iNTT on check_poly), and before freeing what eval_check reads.
 const char* risc0_circuit_rv32im_cuda_eval_check_dep() {
   try {
     cudaEvent_t event = getEvalCheckEvent();
     CUDA_OK(cudaEventRecord(event, getEvalCheckStream()));
     CUDA_OK(cudaStreamWaitEvent(getPersistentStream(), event, 0));
+    // Wait on the host too. The caller (DeferredFinalize::complete) frees what eval_check
+    // reads -- the committed groups' evaluated buffers, released in low-memory mode -- as soon
+    // as this returns, and only kernels on the persistent stream are ordered after eval_check
+    // by the wait above. A freed buffer goes back to the pool, where synchronous copies (e.g.
+    // restore_coeffs' upload, on the legacy stream) and sppark's kernels (on its own
+    // non-blocking stream) can reuse it while eval_check still reads it; and a >= 8 GB (VMM)
+    // buffer is unmapped at once. Finalize waits for eval_check's result next anyway; what
+    // this gives up is overlapping eval_check with that restore_coeffs upload.
+    CUDA_OK(cudaStreamSynchronize(getEvalCheckStream()));
   } catch (const std::exception& err) {
     return strdup(err.what());
   } catch (...) {

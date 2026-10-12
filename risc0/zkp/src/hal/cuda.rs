@@ -246,6 +246,18 @@ impl CudaHash for CudaHashSha256 {
     }
 }
 
+/// Wait, on the host, for everything queued on the risc0 persistent stream.
+///
+/// sppark's kernels (the hashes, NTTs, zk_shift) run on sppark's own non-blocking stream, which is
+/// not ordered after the persistent stream. Anything they read that a risc0 kernel wrote has to be
+/// complete first, or they read it half-written.
+fn sync_persistent_stream() {
+    extern "C" {
+        fn risc0_zkp_cuda_sync_stream() -> *const std::os::raw::c_char;
+    }
+    ffi_wrap(|| unsafe { risc0_zkp_cuda_sync_stream() }).unwrap();
+}
+
 pub struct CudaHashPoseidon2 {
     suite: HashSuite<BabyBear>,
 }
@@ -261,6 +273,7 @@ impl CudaHash for CudaHashPoseidon2 {
         let err = unsafe {
             let input = io.as_device_ptr_with_offset(2 * output_size);
             let output = io.as_device_ptr_with_offset(output_size);
+            sync_persistent_stream();
             sppark_poseidon2_fold(output, input, output_size)
         };
         if err.code != 0 {
@@ -269,6 +282,7 @@ impl CudaHash for CudaHashPoseidon2 {
     }
 
     fn hash_fold_tree(&self, io: &BufferImpl<Digest>, layers: usize) {
+        sync_persistent_stream();
         let err = unsafe { sppark_poseidon2_fold_tree(io.as_device_ptr(), layers as u32) };
         if err.code != 0 {
             panic!("Failure during hash_fold_tree: {err}");
@@ -280,6 +294,7 @@ impl CudaHash for CudaHashPoseidon2 {
         let col_size = matrix.size() / output.size();
         assert_eq!(matrix.size(), col_size * row_size);
 
+        sync_persistent_stream();
         let err = unsafe {
             sppark_poseidon2_rows(
                 output.as_device_ptr(),
@@ -313,6 +328,7 @@ impl CudaHash for CudaHashPoseidon254 {
         let err = unsafe {
             let input = io.as_device_ptr_with_offset(2 * output_size);
             let output = io.as_device_ptr_with_offset(output_size);
+            sync_persistent_stream();
             sppark_poseidon254_fold(output, input, output_size)
         };
         if err.code != 0 {
@@ -321,6 +337,7 @@ impl CudaHash for CudaHashPoseidon254 {
     }
 
     fn hash_fold_tree(&self, io: &BufferImpl<Digest>, layers: usize) {
+        sync_persistent_stream();
         let err = unsafe { sppark_poseidon254_fold_tree(io.as_device_ptr(), layers as u32) };
         if err.code != 0 {
             panic!("Failure during hash_fold_tree: {err}");
@@ -332,6 +349,7 @@ impl CudaHash for CudaHashPoseidon254 {
         let col_size = matrix.size() / output.size();
         assert_eq!(matrix.size(), col_size * row_size);
 
+        sync_persistent_stream();
         let err = unsafe {
             sppark_poseidon254_rows(
                 output.as_device_ptr(),
@@ -597,6 +615,12 @@ mod vmm {
 
     impl Drop for VmmAllocation {
         fn drop(&mut self) {
+            // Unmapping is immediate, not stream-ordered: kernels still queued that use this
+            // memory -- on any stream, e.g. eval_check's when a panic unwinds mid-finalize --
+            // would fault or read garbage. VMM buffers are the >= 8 GB ones, so the wait is
+            // rare (unless RISC0_VMM_ALLOC forces VMM for every allocation: then every free
+            // waits for the device). Best effort: a Drop must not panic, e.g. at teardown.
+            let _ = unsafe { super::cuCtxSynchronize() };
             let mut off = 0usize;
             for (h, sz) in self.chunks.drain(..) {
                 unsafe {
@@ -739,7 +763,9 @@ impl Drop for RawBuffer {
             // orphaned-size allocation wastes VRAM headroom.
             drop(buf);
         } else {
-            BUFFER_POOL.with(|pool| pool.borrow_mut().push(size, buf));
+            // During thread shutdown the pool may already be gone; then `buf`, owned by the
+            // closure that never ran, is freed directly instead (as on HIP).
+            let _ = BUFFER_POOL.try_with(|pool| pool.borrow_mut().push(size, buf));
         }
     }
 }
@@ -930,10 +956,7 @@ impl<CH: CudaHash + ?Sized> CudaHal<CH> {
     /// Must be called before sppark operations that read from buffers
     /// last written by risc0 kernels (which use a different CUDA stream).
     fn sync_stream() {
-        extern "C" {
-            fn risc0_zkp_cuda_sync_stream() -> *const std::os::raw::c_char;
-        }
-        ffi_wrap(|| unsafe { risc0_zkp_cuda_sync_stream() }).unwrap();
+        sync_persistent_stream();
     }
 
     #[allow(dead_code)]
@@ -946,6 +969,7 @@ impl<CH: CudaHash + ?Sized> CudaHal<CH> {
         let poly_size = polynomial.size();
         let pow = pow.to_u32_words();
 
+        Self::sync_stream();
         let err = unsafe {
             supra_poly_divide(
                 polynomial.as_device_ptr(),
@@ -1271,6 +1295,7 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
         let bits = log2_ceil(io.size() / poly_count);
         assert_eq!(io.size(), poly_count * (1 << bits));
 
+        Self::sync_stream();
         let err = unsafe {
             sppark_batch_zk_shift(
                 io.as_device_ptr(),

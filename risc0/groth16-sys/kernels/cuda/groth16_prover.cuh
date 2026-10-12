@@ -37,15 +37,33 @@ __global__ __launch_bounds__(512) void witness_into_poly(fr_t* out,
 
 // from https://github.com/iden3/rapidsnark/blob/main/src/random_generator.hpp
 static inline void randombytes_buf(void* buf, size_t size) {
-  static std::random_device engine;
+  // Per thread: proves on different devices can run concurrently (each under its own
+  // device's lock), and the standard library's engines aren't safe to share.
+  static thread_local std::random_device engine;
   // Uniform over every byte value. Not `uniform_int_distribution<uint8_t>`: the
   // standard does not allow 8-bit types there, and MSVC's library rejects them.
-  static std::uniform_int_distribution<unsigned int> distr(0, 255);
+  static thread_local std::uniform_int_distribution<unsigned int> distr(0, 255);
 
   uint8_t* buffer = static_cast<uint8_t*>(buf);
 
   for (size_t i = 0; i < size; i++) {
     buffer[i] = static_cast<uint8_t>(distr(engine));
+  }
+}
+
+// msm_t::invoke reports a CUDA failure (e.g. out of memory for its scratch buffers) by
+// returning it, not by throwing: check it, or the proof is assembled from a partial sum and
+// returned as if it were valid.
+static inline void msm_ok(const RustError& err, const char* what) {
+  if (err.code != 0) {
+    std::string msg = std::string("groth16 MSM failed: ") + what;
+    // RustError has no destructor: its message (strdup'd, when set) is ours to free.
+    if (err.message != nullptr) {
+      msg += ": ";
+      msg += err.message;
+      free(err.message);
+    }
+    throw sppark_error(err.code, msg);
   }
 }
 
@@ -302,14 +320,18 @@ public:
       , msm_g2(nullptr, srs.get_b_g2_size()) {
     init_memory();
 
-    msm_g1.invoke(fuzzed_results.a, srs.get_a(), srs.get_a_size(), d_fuzz, false);
-    msm_g1.invoke(fuzzed_results.b_g1, srs.get_b_g1(), srs.get_b_g1_size(), d_fuzz, false);
-    msm_g2.invoke(fuzzed_results.b_g2, srs.get_b_g2(), srs.get_b_g2_size(), d_fuzz, false);
-    msm_g1.invoke(fuzzed_results.c,
-                  srs.get_c(),
-                  srs.get_c_size(),
-                  dev_ptr_t<fr_t>{&d_fuzz[witness_size - srs.get_c_size()]},
-                  false);
+    msm_ok(msm_g1.invoke(fuzzed_results.a, srs.get_a(), srs.get_a_size(), d_fuzz, false),
+           "fuzz a");
+    msm_ok(msm_g1.invoke(fuzzed_results.b_g1, srs.get_b_g1(), srs.get_b_g1_size(), d_fuzz, false),
+           "fuzz b_g1");
+    msm_ok(msm_g2.invoke(fuzzed_results.b_g2, srs.get_b_g2(), srs.get_b_g2_size(), d_fuzz, false),
+           "fuzz b_g2");
+    msm_ok(msm_g1.invoke(fuzzed_results.c,
+                         srs.get_c(),
+                         srs.get_c_size(),
+                         dev_ptr_t<fr_t>{&d_fuzz[witness_size - srs.get_c_size()]},
+                         false),
+           "fuzz c");
 
     fuzzed_results.a.cneg(true);
     fuzzed_results.b_g1.cneg(true);
@@ -360,20 +382,23 @@ public:
           &d_a[0], &d_b[0], &d_c[0], lg_domain_size);
       CUDA_OK(cudaGetLastError());
       gpu.sync();
-      msm_g1.invoke(results.h, srs.get_h(), domain_size, d_poly_a_b_c);
+      msm_ok(msm_g1.invoke(results.h, srs.get_h(), domain_size, d_poly_a_b_c), "h");
 
       coeff_wise_add<<<gpu.sm_count(), 1024, 0, gpu>>>(&d_witness[0], &d_fuzz[0], witness_size);
       CUDA_OK(cudaGetLastError());
       gpu.sync();
 
-      msm_g1.invoke(results.a, srs.get_a(), srs.get_a_size(), d_witness, false);
-      msm_g1.invoke(results.b_g1, srs.get_b_g1(), srs.get_b_g1_size(), d_witness, false);
-      msm_g2.invoke(results.b_g2, srs.get_b_g2(), srs.get_b_g2_size(), d_witness, false);
-      msm_g1.invoke(results.c,
-                    srs.get_c(),
-                    srs.get_c_size(),
-                    dev_ptr_t<fr_t>{&d_witness[witness_size - srs.get_c_size()]},
-                    false);
+      msm_ok(msm_g1.invoke(results.a, srs.get_a(), srs.get_a_size(), d_witness, false), "a");
+      msm_ok(msm_g1.invoke(results.b_g1, srs.get_b_g1(), srs.get_b_g1_size(), d_witness, false),
+             "b_g1");
+      msm_ok(msm_g2.invoke(results.b_g2, srs.get_b_g2(), srs.get_b_g2_size(), d_witness, false),
+             "b_g2");
+      msm_ok(msm_g1.invoke(results.c,
+                           srs.get_c(),
+                           srs.get_c_size(),
+                           dev_ptr_t<fr_t>{&d_witness[witness_size - srs.get_c_size()]},
+                           false),
+             "c");
 
       write_public_file_thread.join();
       if (eptr != nullptr) {
