@@ -66,22 +66,7 @@ fn build_cuda_kernels() {
 
     env::set_var("SCCACHE_IDLE_TIMEOUT", "0");
 
-    let cuda_root = env::var("DEP_RISC0_SYS_CUDA_ROOT").unwrap();
-    let sppark_root = env::var("DEP_SPPARK_ROOT").unwrap();
-    let out_dir = env::var("OUT_DIR").map(PathBuf::from).unwrap();
-    let kernel_dir = std::fs::canonicalize("kernels/cuda").unwrap();
-
-    // Build 1: witgen/steps/ffi files with --device-c (need cross-TU device linking)
-    let witgen_files: Vec<PathBuf> = glob_paths("kernels/cuda/*.cu")
-        .into_iter()
-        .filter(|p| {
-            let name = p.file_name().unwrap().to_str().unwrap();
-            !name.starts_with("eval_check") && name != "ffi_supra.cu"
-        })
-        .collect();
-
     let msvc = risc0_build_kernel::is_msvc_target();
-
     let mut build = cc::Build::new();
     build
         .cuda(true)
@@ -91,8 +76,8 @@ fn build_cuda_kernels() {
         .flag("-diag-suppress=550")
         .flag("-diag-suppress=2922")
         .flag(risc0_build_kernel::cuda_cxx_std_flag())
-        .include(&cuda_root)
-        .include(&sppark_root);
+        .include(env::var("DEP_RISC0_SYS_CUDA_ROOT").unwrap())
+        .include(env::var("DEP_SPPARK_ROOT").unwrap());
     // GCC/Clang warning flags; cl.exe, nvcc's host compiler on MSVC, rejects them.
     if msvc {
         risc0_build_kernel::msvc_cuda_build_setup(&mut build);
@@ -104,51 +89,7 @@ fn build_cuda_kernels() {
     if env::var_os("NVCC_PREPEND_FLAGS").is_none() && env::var_os("NVCC_APPEND_FLAGS").is_none() {
         build.flag("-arch=native");
     }
-    build
-        .files(witgen_files)
-        .compile("risc0_keccak_cuda_witgen");
-
-    // Build 2: eval_check as a single TU WITHOUT --device-c (whole program mode).
-    // This enables inlining of the deep poly_fp chain (keccak_0..keccak_47),
-    // reducing per-thread stack from ~82KB to ~8KB and preventing CUDA OOM at po2=18.
-    let eval_check_obj = out_dir.join(format!(
-        "eval_check_combined.{}",
-        risc0_build_kernel::object_extension()
-    ));
-    let mut nvcc = risc0_build_kernel::nvcc_command();
-    if !msvc {
-        nvcc.arg("-Xcompiler").arg("-fPIC")
-            .arg("-Xcompiler").arg("-Wno-unused-function,-Wno-unused-parameter");
-    }
-    nvcc.arg(risc0_build_kernel::cuda_cxx_std_flag())
-        .arg("-O3")
-        .arg("-diag-suppress=177")
-        .arg("-diag-suppress=550")
-        .arg("-diag-suppress=2922")
-        .arg(format!("-I{}", cuda_root))
-        .arg(format!("-I{}", sppark_root))
-        .arg(format!("-I{}", kernel_dir.display()));
-    if env::var_os("NVCC_PREPEND_FLAGS").is_none() && env::var_os("NVCC_APPEND_FLAGS").is_none() {
-        nvcc.arg("-arch=native");
-    }
-    nvcc.arg("-c")
-        .arg("kernels/cuda/eval_check_combined.cu")
-        .arg("-o")
-        .arg(&eval_check_obj);
-
-    let status = nvcc.status().expect("failed to run nvcc");
-    assert!(
-        status.success(),
-        "nvcc failed to compile eval_check_combined.cu"
-    );
-
-    // Archive into static lib
-    let lib_name = if msvc { format!("{output}.lib") } else { format!("lib{output}.a") };
-    let _ = std::fs::remove_file(out_dir.join(lib_name));
-    risc0_build_kernel::add_to_static_lib(&out_dir, output, &[eval_check_obj]);
-
-    println!("cargo:rustc-link-search=native={}", out_dir.display());
-    println!("cargo:rustc-link-lib=static={output}");
+    build.files(glob_paths("kernels/cuda/*.cu")).compile(output);
 }
 
 fn build_rocm_kernels() {
@@ -191,16 +132,6 @@ fn build_rocm_kernels() {
     let mut supra_amalg = String::new();
     for cu in &cu_files {
         let name = cu.file_name().unwrap().to_str().unwrap();
-        // eval_check_combined.cu is a full amalgamation that already #includes
-        // ffi_supra.cu AND eval_check_0..N.cu. Compiling any of those in the same
-        // TU too would double-define their symbols (keccak_*, eval_check,
-        // risc0_circuit_keccak_cuda_eval_check). So emit ONLY eval_check_combined.cu
-        // for the supra group (mirrors the CUDA path, which compiles just it).
-        if (name.starts_with("eval_check") && name != "eval_check_combined.cu")
-            || name == "ffi_supra.cu"
-        {
-            continue;
-        }
         let abs = std::fs::canonicalize(cu).unwrap();
         let line = format!("#include \"{}\"\n", abs.display());
         if name == "ffi_supra.cu" || name.starts_with("eval_check") {
@@ -219,24 +150,14 @@ fn build_rocm_kernels() {
     let kernel_dir_str = kernel_dir.to_str().unwrap();
     let arches = risc0_build_kernel::hip_arches();
     let base_flags: Vec<&str> = vec![
-        "-x",
-        "hip",
-        "-std=c++17",
-        "-O2",
-        "-fPIC",
-        "-Wno-unused-function",
-        "-Wno-unused-parameter",
-        "-Wno-missing-braces",
-        "-mllvm",
-        "-amdgpu-early-inline-all=false",
-        "-include",
-        &include_cuda2hip,
-        "-I",
-        &cuda_root,
-        "-I",
-        &sppark_root,
-        "-I",
-        kernel_dir_str,
+        "-x", "hip",
+        "-std=c++17", "-O2", "-fPIC",
+        "-Wno-unused-function", "-Wno-unused-parameter", "-Wno-missing-braces",
+        "-mllvm", "-amdgpu-early-inline-all=false",
+        "-include", &include_cuda2hip,
+        "-I", &cuda_root,
+        "-I", &sppark_root,
+        "-I", kernel_dir_str,
     ];
 
     let mut obj_files = Vec::new();

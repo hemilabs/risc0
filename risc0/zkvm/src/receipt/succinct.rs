@@ -450,7 +450,8 @@ mod keccak_control_root_tests {
         use risc0_zkp::core::hash::poseidon2::Poseidon2HashSuite;
 
         let hashfn = Poseidon2HashSuite::new_suite().hashfn;
-        let ids = crate::host::server::prove::keccak::keccak_allowed_control_ids();
+        // The IDs in the order prove_keccak commits to them.
+        let ids = risc0_circuit_keccak::KECCAK_CONTROL_IDS.to_vec();
         let group = crate::receipt::merkle::MerkleGroup::new(ids).unwrap();
         assert_eq!(group.calc_root(hashfn.as_ref()), KECCAK_CONTROL_ROOT);
     }

@@ -1,17 +1,16 @@
-// Copyright 2026 RISC Zero, Inc.
+// Copyright 2024 RISC Zero, Inc.
 //
-// Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
-// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
-// http://opensource.org/licenses/MIT>, at your option. This file may not be
-// copied, modified, or distributed except according to those terms.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-//
-// SPDX-License-Identifier: Apache-2.0 OR MIT
 
 #include "buffers.h"
 #include "cuda.h"
@@ -22,7 +21,12 @@
 
 #include <cstdint>
 #include <cstdio>
+#ifdef __HIPCC__
+#include <array>
+namespace cuda { namespace std { using ::std::array; } }
+#else
 #include <cuda/std/array>
+#endif
 #include <string.h>
 
 using namespace risc0;
@@ -167,9 +171,6 @@ __global__ void scatter_preflight(Fp* into,
   const ScatterInfo& info = infos[gid];
   uint32_t innerCount = 32 / info.bits;
   uint32_t mask = (1 << (info.bits)) - 1;
-  if (info.bits == 32) {
-    mask = 0xffffffff;
-  }
   for (size_t i = 0; i < info.count; i++) {
     uint32_t word = from[info.offset + (i / innerCount)];
     size_t j = i % innerCount;
@@ -195,20 +196,21 @@ const char* risc0_circuit_keccak_cuda_witgen(uint32_t mode,
                                              uint32_t lastCycle) {
   try {
     HostContext ctx(buffers, preflight, lastCycle);
+    CudaStream stream;
 
     auto cfg = getSimpleConfig(lastCycle);
     switch (mode) {
     case kStepModeSeqParallel:
-      par_stepExec<<<cfg.grid, cfg.block>>>(ctx.ctx, lastCycle);
+      par_stepExec<<<cfg.grid, cfg.block, 0, stream>>>(ctx.ctx, lastCycle);
       break;
     case kStepModeSeqForward:
-      fwd_stepExec<<<cfg.grid, cfg.block>>>(ctx.ctx, lastCycle);
+      fwd_stepExec<<<cfg.grid, cfg.block, 0, stream>>>(ctx.ctx, lastCycle);
       break;
     case kStepModeSeqReverse:
-      rev_stepExec<<<cfg.grid, cfg.block>>>(ctx.ctx, lastCycle);
+      rev_stepExec<<<cfg.grid, cfg.block, 0, stream>>>(ctx.ctx, lastCycle);
       break;
     }
-    CUDA_OK(cudaDeviceSynchronize());
+    CUDA_OK(cudaStreamSynchronize(stream));
   } catch (const std::exception& err) {
     return strdup(err.what());
   } catch (...) {
@@ -224,9 +226,10 @@ const char* risc0_circuit_keccak_cuda_scatter(Fp* into,
                                               const uint32_t count) {
   try {
     ScatterContext ctx(infos, count);
+    CudaStream stream;
     auto cfg = getSimpleConfig(count);
-    scatter_preflight<<<cfg.grid, cfg.block>>>(into, ctx.d_infos, from, rows, count);
-    CUDA_OK(cudaDeviceSynchronize());
+    scatter_preflight<<<cfg.grid, cfg.block, 0, stream>>>(into, ctx.d_infos, from, rows, count);
+    CUDA_OK(cudaStreamSynchronize(stream));
   } catch (const std::exception& err) {
     return strdup(err.what());
   } catch (...) {

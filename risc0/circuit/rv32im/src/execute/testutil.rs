@@ -146,9 +146,10 @@ pub mod kernel {
             (0, 1),
         ] {
             asm.li(REG_A7, HOST_ECALL_POSEIDON2);
-            asm.li(REG_A0, state);
-            asm.li(REG_A1, IN_BYTES);
-            asm.li(REG_A2, OUT_BYTES);
+            // Word addresses, as the platform's sys_poseidon2 passes them.
+            asm.li(REG_A0, state / WORD_SIZE as u32);
+            asm.li(REG_A1, IN_BYTES / WORD_SIZE as u32);
+            asm.li(REG_A2, OUT_BYTES / WORD_SIZE as u32);
             asm.li(REG_A3, count);
             asm.ecall();
         }
