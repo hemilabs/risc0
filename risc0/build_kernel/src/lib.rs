@@ -553,8 +553,13 @@ pub fn add_to_static_lib(out_dir: &Path, name: &str, objs: &[PathBuf]) {
 /// For keying a cache of nvcc output.
 pub fn nvcc_environment_key() -> String {
     let mut key = String::new();
-    for var in ["NVCC_PREPEND_FLAGS", "NVCC_APPEND_FLAGS"] {
+    // CL and _CL_ are cl.exe's own extra flags.
+    for var in ["NVCC_PREPEND_FLAGS", "NVCC_APPEND_FLAGS", "CL", "_CL_"] {
         key.push_str(&format!("{var}={}\n", env::var(var).unwrap_or_default()));
+    }
+    if is_msvc_target() {
+        // The toolkit the forwarding headers of `msvc_toolkit_include_dir` point into.
+        key.push_str(&format!("toolkit={}\n", cuda_toolkit_dir().display()));
     }
     let version = Command::new(find_nvcc())
         .arg("--version")
@@ -569,15 +574,38 @@ pub fn nvcc_environment_key() -> String {
 /// machine, best effort (empty if the query tool is missing). For keying a cache of output
 /// built for `native`, so moving the build to a different GPU can't reuse it.
 pub fn native_gpu_arch_key(hip: bool) -> String {
-    let queries: &[(&str, &[&str])] = if hip {
-        &[("amdgpu-arch", &[]), ("rocm_agent_enumerator", &[])]
+    let mut queries: Vec<(String, &[&str])> = Vec::new();
+    if hip {
+        // Usually not on PATH: look in the ROCm install too.
+        for root in ["HIP_PATH", "ROCM_PATH"]
+            .iter()
+            .filter_map(|v| env::var(v).ok())
+        {
+            for dir in ["bin", "llvm/bin"] {
+                for tool in ["amdgpu-arch", "amdgpu-arch.exe", "rocm_agent_enumerator"] {
+                    let p = Path::new(&root).join(dir).join(tool);
+                    if p.is_file() {
+                        queries.push((p.to_string_lossy().into_owned(), &[]));
+                    }
+                }
+            }
+        }
+        if Path::new("/opt/rocm/llvm/bin/amdgpu-arch").is_file() {
+            queries.push(("/opt/rocm/llvm/bin/amdgpu-arch".into(), &[]));
+        }
+        queries.push(("amdgpu-arch".into(), &[]));
+        queries.push(("rocm_agent_enumerator".into(), &[]));
     } else {
-        &[("nvidia-smi", &["--query-gpu=compute_cap", "--format=csv,noheader"])]
-    };
-    for (tool, args) in queries {
+        queries.push((
+            "nvidia-smi".into(),
+            &["--query-gpu=compute_cap", "--format=csv,noheader"],
+        ));
+    }
+    for (tool, args) in &queries {
         if let Ok(o) = Command::new(tool).args(*args).output() {
             if o.status.success() {
-                return format!("{tool}: {}", String::from_utf8_lossy(&o.stdout).trim());
+                // The tool's path isn't part of the key, only what it found.
+                return String::from_utf8_lossy(&o.stdout).trim().to_string();
             }
         }
     }
@@ -596,6 +624,11 @@ pub fn hipcc_environment_key(hipcc: &str) -> String {
         "HIP_PATH",
         "ROCM_PATH",
         "HIP_PLATFORM",
+        "HIP_DEVICE_LIB_PATH",
+        "DEVICE_LIB_PATH",
+        "HIP_INCLUDE_PATH",
+        "CPATH",
+        "CPLUS_INCLUDE_PATH",
     ] {
         key.push_str(&format!("{var}={}\n", env::var(var).unwrap_or_default()));
     }
@@ -608,37 +641,44 @@ pub fn hipcc_environment_key(hipcc: &str) -> String {
     key
 }
 
-const KERNEL_SOURCE_EXTENSIONS: &[&str] = &[
-    "h", "hh", "hpp", "hxx", "cuh", "cu", "c", "cc", "cpp", "cxx", "inc", "inl", "ipp",
-];
-
-/// SHA-256 (hex) over every C, C++ and CUDA source and header under `roots` (searched
-/// recursively, skipping `target` and hidden directories), plus `files`, by relative path and
-/// contents. A superset of what a compile with these include roots can read, for keying a
-/// cache of its output: unlike a list of known files, it can't miss a header a change adds.
-pub fn kernel_sources_key(roots: &[&Path], files: &[&Path]) -> String {
+/// Every file under `root` that [`kernel_sources_key`] hashes, searched recursively, skipping
+/// `target` and hidden directories and not following directory symlinks. For emitting
+/// `cargo:rerun-if-changed` per file, which, unlike a directory, can't recurse into a
+/// symlink loop.
+pub fn kernel_source_files(root: &Path) -> Vec<PathBuf> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         let Ok(entries) = fs::read_dir(dir) else {
             return;
         };
         for entry in entries.flatten() {
             let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if path.is_dir() {
+            if file_type.is_dir() {
                 if !name.starts_with('.') && name != "target" {
                     walk(&path, out);
                 }
-            } else if path
-                .extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| KERNEL_SOURCE_EXTENSIONS.contains(&e))
-            {
+            } else if path.is_file() {
                 out.push(path);
             }
         }
     }
+    let mut out = Vec::new();
+    walk(root, &mut out);
+    out.sort();
+    out
+}
 
+/// SHA-256 (hex) over every file under `roots` ([`kernel_source_files`]; not following
+/// directory symlinks, since sppark's `rust/sppark` links back to its root), plus `files`, by
+/// relative path and contents. A superset of what a compile with these include roots can
+/// read, whatever the extension (sppark includes `.hip` files and an extensionless
+/// `cuda/std/array`), for keying a cache of its output: unlike a list of known files, it
+/// can't miss a header a change adds.
+pub fn kernel_sources_key(roots: &[&Path], files: &[&Path]) -> String {
     let mut hasher = Sha256::new();
     let mut add = |label: &str, path: &Path| {
         // A file that can't be read hashes as missing rather than failing the build.
@@ -654,9 +694,7 @@ pub fn kernel_sources_key(roots: &[&Path], files: &[&Path]) -> String {
         }
     };
     for (i, root) in roots.iter().enumerate() {
-        let mut paths = Vec::new();
-        walk(root, &mut paths);
-        let mut labeled: Vec<(String, PathBuf)> = paths
+        let mut labeled: Vec<(String, PathBuf)> = kernel_source_files(root)
             .into_iter()
             .map(|p| {
                 let rel = p.strip_prefix(root).unwrap_or(&p).to_string_lossy();
@@ -669,7 +707,10 @@ pub fn kernel_sources_key(roots: &[&Path], files: &[&Path]) -> String {
         }
     }
     for file in files {
-        add(&format!("file/{}", file.to_string_lossy().replace('\\', "/")), file);
+        add(
+            &format!("file/{}", file.to_string_lossy().replace('\\', "/")),
+            file,
+        );
     }
     hex::encode(hasher.finalize())
 }
@@ -703,9 +744,28 @@ pub fn cached_compile(
     let tmp = cache_dir.join(format!("{stem}-{key}.tmp{}.{ext}", std::process::id()));
     let _ = fs::remove_file(&tmp);
     compile(&tmp);
-    assert!(tmp.exists(), "{stem}: the compiler produced no {}", tmp.display());
-    fs::rename(&tmp, &cached)
-        .unwrap_or_else(|e| panic!("failed to move {} into the cache: {e}", tmp.display()));
+    assert!(
+        tmp.exists(),
+        "{stem}: the compiler produced no {}",
+        tmp.display()
+    );
+    // On Windows a scanner briefly holding the new file can make the rename fail: retry, and
+    // if it still fails, use the output where it is rather than lose the compile.
+    let mut renamed = fs::rename(&tmp, &cached);
+    for attempt in 1..=10 {
+        if renamed.is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100 * attempt));
+        renamed = fs::rename(&tmp, &cached);
+    }
+    if let Err(e) = renamed {
+        println!(
+            "cargo:warning=could not move {} into the cache ({e}); it will be rebuilt next time",
+            tmp.display()
+        );
+        return tmp;
+    }
     // Leave anything written in the last day: another build script running now may be about
     // to use it (two versions of a crate in one build share `cache_dir`).
     let day = std::time::Duration::from_secs(24 * 60 * 60);
@@ -722,6 +782,41 @@ pub fn cached_compile(
         }
     }
     cached
+}
+
+/// A cache key for what `cmd` runs: its program, arguments, working directory and the
+/// environment it sets. `OUT_DIR`, which changes with the crate's fingerprint (and appears in
+/// arguments such as the MSVC forwarding-header include), is replaced by a placeholder, so
+/// that a rebuild of the same sources reuses the cached output.
+pub fn command_key(cmd: &Command) -> String {
+    let out_dir = env::var("OUT_DIR").unwrap_or_default();
+    let normalize = |s: &std::ffi::OsStr| {
+        let s = s.to_string_lossy();
+        if out_dir.is_empty() {
+            s.into_owned()
+        } else {
+            s.replace(&out_dir, "<OUT_DIR>")
+        }
+    };
+    let mut key = format!("program={}\n", normalize(cmd.get_program()));
+    for arg in cmd.get_args() {
+        key.push_str(&format!("arg={}\n", normalize(arg)));
+    }
+    if let Some(dir) = cmd.get_current_dir() {
+        key.push_str(&format!("cwd={}\n", normalize(dir.as_os_str())));
+    }
+    // Not PATH, which `cc` passes whole for MSVC: it varies with the shell, and the tools it
+    // finds are keyed by their versions.
+    let mut envs: Vec<_> = cmd
+        .get_envs()
+        .filter(|(k, _)| !k.eq_ignore_ascii_case("PATH"))
+        .collect();
+    envs.sort();
+    for (k, v) in envs {
+        let v = v.map(normalize).unwrap_or_else(|| "<removed>".into());
+        key.push_str(&format!("env {}={v}\n", k.to_string_lossy()));
+    }
+    key
 }
 
 /// SHA-256 (hex) of `parts`, each length-prefixed so different splits can't collide.

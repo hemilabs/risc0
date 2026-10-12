@@ -286,6 +286,7 @@ fn build_cuda_kernels() {
     let cuda_root = env::var("DEP_RISC0_SYS_CUDA_ROOT").unwrap();
     let cxx_root = env::var("DEP_RISC0_SYS_CXX_ROOT").unwrap();
     let sppark_root = env::var("DEP_SPPARK_ROOT").unwrap();
+    rerun_if_include_roots_changed(&[&cuda_root, &cxx_root, &sppark_root]);
     let use_native_arch =
         env::var_os("NVCC_PREPEND_FLAGS").is_none() && env::var_os("NVCC_APPEND_FLAGS").is_none();
 
@@ -310,6 +311,13 @@ fn build_cuda_kernels() {
     let msvc = risc0_build_kernel::is_msvc_target();
     let obj_ext = risc0_build_kernel::object_extension();
     let eval_check_obj = out_dir.join(format!("eval_check_combined_standalone.{obj_ext}"));
+    remove_legacy_cache_files(
+        &cache_dir,
+        &[
+            &format!("eval_check_combined_standalone.{obj_ext}"),
+            "eval_check_hash.stamp",
+        ],
+    );
 
     let mut cmd = risc0_build_kernel::nvcc_command();
     cmd.current_dir("kernels/cuda");
@@ -351,7 +359,7 @@ fn build_cuda_kernels() {
     let key = risc0_build_kernel::hash_key(&[
         "rv32im-cuda-eval-check-v1",
         &eval_check_sources_key(&[&cuda_root, &cxx_root, &sppark_root]),
-        &format!("{cmd:?}"),
+        &risc0_build_kernel::command_key(&cmd),
         &risc0_build_kernel::nvcc_environment_key(),
         &native_key,
     ]);
@@ -462,6 +470,7 @@ fn build_rocm_kernels() {
     let cuda_root = env::var("DEP_RISC0_SYS_CUDA_ROOT").unwrap();
     let cxx_root = env::var("DEP_RISC0_SYS_CXX_ROOT").unwrap();
     let sppark_root = env::var("DEP_SPPARK_ROOT").unwrap();
+    rerun_if_include_roots_changed(&[&cuda_root, &cxx_root, &sppark_root]);
     let hipcc = risc0_build_kernel::find_hipcc();
 
     // Step 1: Compile eval_check_combined.cu standalone with hipcc.
@@ -478,6 +487,17 @@ fn build_rocm_kernels() {
         .map(|p| p.join("eval_check_cache_rocm"))
         .unwrap_or_else(|| out_dir.join("eval_check_cache_rocm"));
     std::fs::create_dir_all(&cache_dir).unwrap();
+    remove_legacy_cache_files(
+        &cache_dir,
+        &[
+            "eval_check_combined_standalone.o",
+            "eval_check_hash_rocm.stamp",
+            "remaining_kernels_rocm.o",
+            "remaining_kernels_hash_rocm.stamp",
+            "ffi_supra.o",
+            "ffi_supra_hash_rocm.stamp",
+        ],
+    );
     let eval_check_obj = out_dir.join("eval_check_combined_standalone.o");
     // Every cache below is keyed on its sources, the hipcc command and flags, what hipcc
     // reads from outside its arguments (its version and environment), and the architectures
@@ -626,7 +646,14 @@ fn build_rocm_kernels() {
         "o",
         &remaining_key,
         |out| {
-            risc0_build_kernel::hip_compile(&hipcc, &local_flags, &amalg_path, out, &hip_arches, None)
+            risc0_build_kernel::hip_compile(
+                &hipcc,
+                &local_flags,
+                &amalg_path,
+                out,
+                &hip_arches,
+                None,
+            )
         },
     );
     std::fs::copy(&remaining_cached, &remaining_obj).unwrap();
@@ -678,19 +705,44 @@ fn glob_paths(pattern: &str) -> Vec<PathBuf> {
     glob::glob(pattern).unwrap().map(|x| x.unwrap()).collect()
 }
 
-/// A key over every source and header the eval_check compile can read: everything under the
-/// include roots (headers there can include `.cu` files, as sppark's do), and the eval_check
-/// sources and headers in kernels/cuda. Not the other `.cu` files there, so changing one of
-/// them doesn't trigger this ~24-minute compile.
+/// The files in kernels/cuda that eval_check_combined.cu reads: itself and what it includes
+/// from there. The rest of kernels/cuda (witgen, steps, the layouts) is left out, so changing
+/// it doesn't trigger this ~24-minute compile; add a file here if eval_check starts
+/// including it.
+const EVAL_CHECK_LOCAL_SOURCES: &[&str] = &[
+    "kernels/cuda/eval_check_combined.cu",
+    "kernels/cuda/eval_check_0.cu",
+    "kernels/cuda/eval_check_1.cu",
+    "kernels/cuda/eval_check_2.cu",
+    "kernels/cuda/eval_check_3.cu",
+    "kernels/cuda/eval_check.cuh",
+];
+
+/// A key over every file the eval_check compile can read: everything under the include roots
+/// and [`EVAL_CHECK_LOCAL_SOURCES`].
 fn eval_check_sources_key(include_roots: &[&str]) -> String {
-    let mut files: Vec<PathBuf> = ["*.h", "*.cuh", "*.hpp", "*.inc", "eval_check*.cu"]
-        .iter()
-        .flat_map(|pattern| glob_paths(&format!("kernels/cuda/{pattern}")))
-        .collect();
-    files.sort();
     let roots: Vec<&Path> = include_roots.iter().map(Path::new).collect();
-    let files: Vec<&Path> = files.iter().map(PathBuf::as_path).collect();
+    let files: Vec<&Path> = EVAL_CHECK_LOCAL_SOURCES.iter().map(Path::new).collect();
     risc0_build_kernel::kernel_sources_key(&roots, &files)
+}
+
+/// The include roots both GPU builds compile against: re-run this script when a file in them
+/// changes (as a path dependency), so the cache keys are recomputed. File by file, as
+/// a directory would make cargo recurse into sppark's `rust/sppark` symlink loop.
+fn rerun_if_include_roots_changed(roots: &[&str]) {
+    for root in roots {
+        for file in risc0_build_kernel::kernel_source_files(Path::new(root)) {
+            rerun_if_changed(file);
+        }
+    }
+}
+
+/// Delete what the stamp-file caches left in `cache_dir` before the caches were keyed by
+/// file name, best effort.
+fn remove_legacy_cache_files(cache_dir: &Path, names: &[&str]) {
+    for name in names {
+        let _ = std::fs::remove_file(cache_dir.join(name));
+    }
 }
 
 /// Stamp version: bump when stamp inputs or layout change so older stamps
