@@ -199,9 +199,9 @@ impl<'a, H: Hal> Prover<'a, H> {
         deferred.complete(hal, circuit_hal)
     }
 
-    /// Launch eval_check asynchronously and return a DeferredFinalize that can
-    /// be completed later. This enables pipelining: the next segment's main
-    /// phase can run on the GPU while eval_check computes on a separate stream.
+    /// Launch eval_check asynchronously and return a DeferredFinalize to complete. Work the
+    /// caller queues before `complete` can overlap eval_check, which runs on a separate stream;
+    /// `complete` waits for it (on the host) before it frees what eval_check reads.
     ///
     /// NOTE: `taps` must be 'static for DeferredFinalize to be stored across calls.
     pub fn start_finalize_with_hook<C, F>(

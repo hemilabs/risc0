@@ -228,11 +228,28 @@ where
 {
     hal: Arc<H>,
     circuit_hal: Arc<C>,
-    // Cache ctrl PolyGroup by (code_rows, po2) to skip iNTT/expand/merkle on
+    // Cache ctrl PolyGroup by program to skip iNTT/expand/merkle on
     // repeated proofs with the same program (e.g. 43 lifts all use the same ZKR).
     cached_ctrl_group: RefCell<HashMap<CtrlKey, PolyGroup<H>>>,
-    // Cache ctrl GPU buffer by (code_rows, po2) to skip re-uploading ~24MB per proof.
+    // Cache ctrl GPU buffer by program to skip re-uploading ~24MB per proof.
     cached_ctrl_buffer: RefCell<HashMap<CtrlKey, H::Buffer<H::Elem>>>,
+    // The code of the program each key's entries above were built from. The key only
+    // samples the code, so a hit is checked against this exactly (`claim_ctrl_caches`).
+    cached_ctrl_code: RefCell<HashMap<CtrlKey, Arc<Vec<BabyBearElem>>>>,
+}
+
+/// Programs whose ctrl the device caches keep at once; more clears them (each holds a
+/// ~24 MB device buffer and its committed group).
+const CTRL_DEVICE_CACHE_CAP: usize = 8;
+
+/// Whether two programs' code is identical, compared in parallel (~24 MB for a lift).
+fn same_code(a: &[BabyBearElem], b: &[BabyBearElem]) -> bool {
+    use rayon::prelude::*;
+    const CHUNK: usize = 1 << 16;
+    a.len() == b.len()
+        && a.par_chunks(CHUNK)
+            .zip(b.par_chunks(CHUNK))
+            .all(|(x, y)| x == y)
 }
 
 /// (code_rows, po2, sampled code fingerprint). All recursion programs share
@@ -283,6 +300,7 @@ where
 
         let t0 = std::time::Instant::now();
         let ctrl_key = ctrl_cache_key(program);
+        self.claim_ctrl_caches(ctrl_key, program);
         let cached_ctrl = self.cached_ctrl_buffer.borrow().get(&ctrl_key).cloned();
         let witgen = WitnessGenerator::new(
             self.hal.as_ref(),
@@ -332,10 +350,9 @@ where
                 prover.set_po2(program.po2);
 
                 // Cache ctrl PolyGroup to skip iNTT/expand/merkle on repeated proofs
-                // with the same program. Lift and join ZKRs have different code_rows,
-                // so we key by (code_rows, po2) to cache both independently.
+                // with the same program (`ctrl_key`, whose entries `claim_ctrl_caches`
+                // checked belong to exactly this program).
                 let t0 = std::time::Instant::now();
-                let ctrl_key = ctrl_cache_key(program);
                 let ctrl_cached;
                 {
                     let mut cache = self.cached_ctrl_group.borrow_mut();
@@ -405,7 +422,30 @@ where
             circuit_hal,
             cached_ctrl_group: RefCell::new(HashMap::new()),
             cached_ctrl_buffer: RefCell::new(HashMap::new()),
+            cached_ctrl_code: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// Make the device ctrl caches' entries under `key` belong to exactly `program`. The key
+    /// samples the code, so another program of the same size can share it: if the entries
+    /// were built from different code (or there are none), they are dropped, to be rebuilt
+    /// from `program`'s own code, instead of committing another program's ctrl.
+    fn claim_ctrl_caches(&self, key: CtrlKey, program: &Program) {
+        let mut codes = self.cached_ctrl_code.borrow_mut();
+        if codes
+            .get(&key)
+            .is_some_and(|code| same_code(code, &program.code))
+        {
+            return;
+        }
+        self.cached_ctrl_buffer.borrow_mut().remove(&key);
+        self.cached_ctrl_group.borrow_mut().remove(&key);
+        if codes.len() >= CTRL_DEVICE_CACHE_CAP {
+            codes.clear();
+            self.cached_ctrl_buffer.borrow_mut().clear();
+            self.cached_ctrl_group.borrow_mut().clear();
+        }
+        codes.insert(key, Arc::new(program.code.clone()));
     }
 
     fn preflight(&self, program: &Program, input: VecDeque<u32>) -> Result<Preflight> {
