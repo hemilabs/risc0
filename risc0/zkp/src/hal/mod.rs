@@ -54,6 +54,12 @@ pub trait Buffer<T>: Clone {
     fn view_mut<F: FnOnce(&mut [T])>(&self, f: F);
 
     fn to_vec(&self) -> Vec<T>;
+
+    /// Opt-in hint: when all clones of this Buffer are dropped, release the
+    /// underlying device memory directly to the driver instead of caching it
+    /// in a reuse pool. HALs without a reuse pool can leave this as the
+    /// default no-op.
+    fn set_bypass_pool(&self) {}
 }
 
 pub trait Hal {
@@ -65,6 +71,12 @@ pub trait Hal {
     const CHECK_SIZE: usize = INV_RATE * Self::ExtElem::EXT_SIZE;
 
     fn has_unified_memory(&self) -> bool;
+
+    /// Ask the HAL to return any cached / stream-ordered mempool memory back
+    /// to the driver. Called at GPU-memory-pressure points (e.g. after a host
+    /// spill at po2>=22) so the next large allocation can succeed.
+    /// Default no-op for HALs without a reuse cache.
+    fn trim_device_memory(&self) {}
 
     /// Returns the amount of free GPU memory in bytes.
     /// Returns `usize::MAX` for CPU HALs or when the information is unavailable.
@@ -388,6 +400,30 @@ impl MemoryTracker {
 
     pub fn free(&mut self, size: usize) {
         self.total -= size as isize;
+    }
+}
+
+/// Reports every combo whose division by `(X - z)` left a nonzero remainder, for the GPU HALs'
+/// batched `combos_divide`. `remainders` holds one entry per root, in `chunks` order.
+///
+/// The CPU HAL, and upstream's GPU HALs, assert that each remainder is zero: a nonzero one means the
+/// combo polynomial does not vanish at the query point, so something upstream of this stage (the
+/// witness, the coefficients, the evaluations, the check polynomial) is inconsistent and the seal
+/// will not verify. Logged rather than asserted, so a bad proof still fails where callers already
+/// handle it (verifying the segment) instead of panicking the prover; but it is named here, at the
+/// stage it first shows.
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+pub(crate) fn report_nonzero_remainders<E: ExtElem>(chunks: &[(usize, Vec<E>)], remainders: &[E]) {
+    let mut remainders = remainders.iter();
+    for (combo, pows) in chunks {
+        for pow in 0..pows.len() {
+            if remainders.next().is_some_and(|r| *r != E::ZERO) {
+                tracing::error!(
+                    "combos_divide: combo {combo} has a nonzero remainder at root {pow}; this \
+                     segment's proof will not verify"
+                );
+            }
+        }
     }
 }
 

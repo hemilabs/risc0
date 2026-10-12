@@ -14,9 +14,16 @@
 
 #pragma once
 
-#ifndef __HIPCC__
-// CUDA 13.1's CCCL v2 headers need driver API types from system <cuda.h>
+// The kernels use the driver API, and CUDA 13.1's CCCL v2 headers need its types,
+// from the toolkit's own <cuda.h>, which this file shadows. MSVC has no
+// `#include_next`; risc0-build-kernel generates a header that includes the toolkit's
+// by absolute path (see `msvc_toolkit_include_dir`).
+#if !defined(__HIPCC__)
+#if defined(_MSC_VER)
+#include <risc0_toolkit_cuda.h>
+#else
 #include_next <cuda.h>
+#endif
 #endif
 
 #include <cstdint>

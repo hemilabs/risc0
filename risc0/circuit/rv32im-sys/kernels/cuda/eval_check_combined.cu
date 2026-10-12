@@ -12,6 +12,7 @@
 // --- eval_check kernel + host wrappers (moved from ffi_supra.cu) ---
 
 #include "cuda.h"
+#include <cstdlib>
 
 namespace risc0::circuit::rv32im_v2::cuda {
 
@@ -67,7 +68,10 @@ __global__ void eval_check(Fp* check,
                            uint32_t domain) {
   // Enable shared memory spilling: trades STACK for SHARED, improving L1 cache
   // utilization. With CUDA 12.9+: REG:255 STACK:8560 SHARED:16384 (~5% speedup).
+  // PTX-only inline-asm directive; HIP/clang rejects it as "unknown directive".
+#ifndef __HIPCC__
   asm volatile (".pragma \"enable_smem_spilling\";");
+#endif
   uint32_t cycle = blockDim.x * blockIdx.x + threadIdx.x;
   if (cycle < domain) {
     FpExt tot = poly_fp(cycle, domain, ctrl, out, data, mix, accum);
@@ -173,12 +177,52 @@ const char* risc0_circuit_rv32im_cuda_eval_check(Fp* check,
     eval_check<<<grid, block, 0, stream>>>(
         check, ctrl, data, accum, mix, out, rou, po2, domain);
     CUDA_OK(cudaGetLastError());
-    // Sync eval_check stream before returning. Required to prevent data corruption
-    // from concurrent kernel execution during pipelining (witgen(N+1) interferes
-    // with eval_check(N) at ~1% rate when running concurrently, even though they
-    // use separate streams and non-overlapping buffers — root cause appears to be
-    // a hardware-level resource conflict with REG:255 kernels on RTX 5090).
-    CUDA_OK(cudaStreamSynchronize(stream));
+    // Re-enable eval_check<->witgen pipelining on pre-Blackwell GPUs.
+    //
+    // The unconditional sync below was added to mitigate a ~1% data-corruption
+    // bug observed only on RTX 5090 (sm_120, Blackwell), where REG:255
+    // eval_check kernels concurrent with the next segment's witgen produced
+    // wrong values despite using separate streams and non-overlapping buffers.
+    // On Ada (sm_89, RTX 4090) and earlier the pipelining is safe and recovers
+    // ~5-9 s per 21-segment composite STARK at po2=21.
+    //
+    // eval_check_dep() records an event on this stream and makes the
+    // persistent stream wait on it; with that in place, dependent work in the
+    // next prove_begin is correctly ordered even when this sync is skipped.
+    static int s_force_sync = -1;
+    static int s_skip_sync = -1;
+    if (s_force_sync < 0) {
+      s_force_sync = std::getenv("RISC0_EVAL_CHECK_FORCE_SYNC") ? 1 : 0;
+      s_skip_sync = std::getenv("RISC0_EVAL_CHECK_SKIP_SYNC") ? 1 : 0;
+    }
+    bool needs_sync;
+    if (s_force_sync) {
+      needs_sync = true;
+    } else if (s_skip_sync) {
+      needs_sync = false;
+    } else {
+#ifdef __HIPCC__
+      // On HIP/ROCm, default to the serialized path. eval_check<->witgen
+      // pipelining was only ever validated safe on pre-Blackwell NVIDIA; on
+      // RDNA3 (gfx1100) it reproduces the same intermittent concurrent-kernel
+      // corruption seen on Blackwell, producing invalid multi-segment proofs.
+      // Also: `cudaDevAttrComputeCapabilityMajor` is CUDA-only and undeclared
+      // for the AMD platform, so the compute-capability gate below cannot be
+      // used here. Override with RISC0_EVAL_CHECK_SKIP_SYNC=1 to experiment.
+      needs_sync = true;
+#else
+      // Sync only on Blackwell+ (compute capability major >= 12).
+      static int s_cc_major = -1;
+      if (s_cc_major < 0) {
+        int dev = getCachedDevice();
+        cudaDeviceGetAttribute(&s_cc_major, cudaDevAttrComputeCapabilityMajor, dev);
+      }
+      needs_sync = s_cc_major >= 12;
+#endif
+    }
+    if (needs_sync) {
+      CUDA_OK(cudaStreamSynchronize(stream));
+    }
   } catch (const std::exception& err) {
     return strdup(err.what());
   } catch (...) {

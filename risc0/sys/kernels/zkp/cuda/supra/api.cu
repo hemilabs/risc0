@@ -92,7 +92,10 @@ sppark_poseidon2_fold(poseidon_out_t* d_out, const poseidon_in_t* d_in, size_t n
   const size_t P2_BLOCK = 256;
 #endif
   size_t block_size = num_hashes < P2_BLOCK ? num_hashes : P2_BLOCK;
-  size_t num_blocks = num_hashes < P2_BLOCK ? 1 : num_hashes / P2_BLOCK;
+  // Ceil-div: previously used `num_hashes / P2_BLOCK` which silently dropped
+  // up to P2_BLOCK-1 trailing hashes for non-pow2 input. _rows already used
+  // ceil; aligning fold for correctness.
+  size_t num_blocks = num_hashes < P2_BLOCK ? 1 : (num_hashes + P2_BLOCK - 1) / P2_BLOCK;
 
   try {
     (void)cudaGetLastError(); // consume any stale async errors
@@ -334,14 +337,17 @@ supra_poly_divide_batch(fr4_t d_inout[/*len*/], size_t len,
 
 // Batch polynomial division across multiple combo slices.
 // Each combo slice (at combos_base + combo_indices[c] * stride) is divided
-// by its respective roots in-place. No remainder check — all kernels are
-// pipelined with a single gpu.sync() at the end for better GPU utilization.
+// by its respective roots in-place. Kernels are pipelined with a single
+// gpu.sync() at the end for better GPU utilization; each division's remainder
+// (the slice's last element) is copied out in stream order, into
+// remainders[pows_offset + d], for the caller to check.
 extern "C" RustError::by_value
 supra_poly_divide_multi(fr4_t* combos_base, size_t stride,
                         const uint32_t combo_indices[],
                         const uint32_t pows_per_combo[],
                         const uint32_t all_pows_raw[],
-                        uint32_t num_combos) {
+                        uint32_t num_combos,
+                        fr4_t* remainders) {
   const gpu_t& gpu = select_gpu(-1);
   int sm_count = get_real_sm_count();
   const fr4_t* all_pows = reinterpret_cast<const fr4_t*>(all_pows_raw);
@@ -352,6 +358,7 @@ supra_poly_divide_multi(fr4_t* combos_base, size_t stride,
       fr4_t* slice = combos_base + combo_indices[c] * stride;
       for (uint32_t d = 0; d < pows_per_combo[c]; d++) {
         div_by_x_minus_z<true>(slice, stride, all_pows[pows_offset + d], gpu, sm_count);
+        gpu.DtoH(&remainders[pows_offset + d], &slice[stride - 1], 1);
       }
       pows_offset += pows_per_combo[c];
     }

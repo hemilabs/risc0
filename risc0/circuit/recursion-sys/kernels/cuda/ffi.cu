@@ -35,6 +35,10 @@ namespace cuda { namespace std { using ::std::array; } }
 #include <cuda_runtime.h>
 #endif
 #include <exception>
+#ifdef _WIN32
+#include <mutex>
+#include <vector>
+#endif
 #include <thrust/execution_policy.h>
 #include <thrust/host_vector.h>
 #include <thrust/sort.h>
@@ -167,9 +171,46 @@ __global__ void parStepVerifyAccum(AccumContext* ctx) {
   }
 }
 
-// Cached GPU buffers for HostExecContext to avoid repeated alloc/free overhead.
-// Pre-allocated to the max size seen and reused across calls.
-struct CachedExecBuffers {
+#ifdef _WIN32
+// Thread exit for the per-thread GPU buffer caches below, on Windows.
+//
+// MSVC constructs namespace-scope thread_locals on every thread in the process, and
+// destroys them in the thread-detach callback, under the loader lock, where CUDA must
+// not be called: a thread that never touched the GPU deadlocked there, initializing a
+// CUDA context for its `cudaFree(nullptr)`. (GCC builds thread_locals on first use and
+// destroys them outside any loader lock, so elsewhere they are freed as before.) Here a
+// cache is never freed at thread exit: its buffers, if it has any, are parked for the
+// next thread on the same device, which is host-side bookkeeping alone.
+template <typename State> class ParkedBuffers {
+  std::mutex lock;
+  std::vector<State> parked;
+
+public:
+  static ParkedBuffers& get() {
+    static ParkedBuffers pool;
+    return pool;
+  }
+
+  void park(const State& state) {
+    std::lock_guard<std::mutex> guard(lock);
+    parked.push_back(state);
+  }
+
+  // Moves a parked state for `device` into `out`, if there is one.
+  void take(int device, State& out) {
+    std::lock_guard<std::mutex> guard(lock);
+    for (size_t i = 0; i < parked.size(); i++) {
+      if (parked[i].device == device) {
+        out = parked[i];
+        parked.erase(parked.begin() + i);
+        return;
+      }
+    }
+  }
+};
+#endif
+
+struct ExecBuffersState {
   ExecContext* ctx = nullptr;
   PreflightTrace* trace = nullptr;
   WomArgumentRow* womRows = nullptr;
@@ -180,8 +221,19 @@ struct CachedExecBuffers {
   uint32_t maxCycles = 0;
   uint32_t maxWoms = 0;
   uint32_t maxIops = 0;
+  int device = -1;
+};
 
+// Cached GPU buffers for HostExecContext to avoid repeated alloc/free overhead.
+// Pre-allocated to the max size seen and reused across calls.
+struct CachedExecBuffers : ExecBuffersState {
   void ensure(uint32_t numCycles, uint32_t numWoms, uint32_t numIops) {
+#ifdef _WIN32
+    if (!ctx) {
+      CUDA_OK(cudaGetDevice(&device));
+      ParkedBuffers<ExecBuffersState>::get().take(device, *this);
+    }
+#endif
     if (!ctx) {
       CUDA_OK(cudaMallocManaged(&ctx, sizeof(ExecContext)));
       CUDA_OK(cudaMallocManaged(&trace, sizeof(PreflightTrace)));
@@ -208,6 +260,11 @@ struct CachedExecBuffers {
   }
 
   ~CachedExecBuffers() {
+#ifdef _WIN32
+    if (ctx) {
+      ParkedBuffers<ExecBuffersState>::get().park(*this);
+    }
+#else
     cudaFree(iops);
     cudaFree(cycles);
     cudaFree(wom);
@@ -215,6 +272,7 @@ struct CachedExecBuffers {
     cudaFree(womRows);
     cudaFree(trace);
     cudaFree(ctx);
+#endif
   }
 };
 
@@ -301,7 +359,8 @@ struct HostExecContext {
     {
       nvtx3::scoped_range range("injectWomBacks");
       injectWomBacks<<<cfg.grid, cfg.block, 0, stream>>>(ctx);
-      CUDA_OK(cudaStreamSynchronize(stream));
+      // No intermediate sync — the next kernel runs on the same stream and
+      // is naturally ordered after this one.
     }
 
     {
@@ -312,13 +371,22 @@ struct HostExecContext {
   }
 };
 
-// Cached GPU buffers for HostAccumContext
-struct CachedAccumBuffers {
+struct AccumBuffersState {
   AccumContext* ctx = nullptr;
   FpExt* accum = nullptr;
   uint32_t maxWorkCycles = 0;
+  int device = -1;
+};
 
+// Cached GPU buffers for HostAccumContext
+struct CachedAccumBuffers : AccumBuffersState {
   void ensure(uint32_t workCycles) {
+#ifdef _WIN32
+    if (!ctx) {
+      CUDA_OK(cudaGetDevice(&device));
+      ParkedBuffers<AccumBuffersState>::get().take(device, *this);
+    }
+#endif
     if (!ctx) {
       CUDA_OK(cudaMallocManaged(&ctx, sizeof(AccumContext)));
     }
@@ -330,8 +398,14 @@ struct CachedAccumBuffers {
   }
 
   ~CachedAccumBuffers() {
+#ifdef _WIN32
+    if (ctx) {
+      ParkedBuffers<AccumBuffersState>::get().park(*this);
+    }
+#else
     cudaFree(accum);
     cudaFree(ctx);
+#endif
   }
 };
 

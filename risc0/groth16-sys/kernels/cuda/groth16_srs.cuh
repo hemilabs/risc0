@@ -2,10 +2,69 @@
 
 #if !defined(__HIP_DEVICE_COMPILE__)
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
+// Windows stand-ins for the read-only open(2) + mmap(2) the SRS loader uses.
+// The SRS is large, so it is mapped, not read into a host buffer.
+static int srs_win32_errno(DWORD err) {
+  switch (err) {
+  case ERROR_FILE_NOT_FOUND:
+  case ERROR_PATH_NOT_FOUND:
+    return ENOENT;
+  case ERROR_ACCESS_DENIED:
+    return EACCES;
+  case ERROR_NOT_ENOUGH_MEMORY:
+    return ENOMEM;
+  default:
+    return EIO;
+  }
+}
+
+static const byte* srs_map_file(const char* path, size_t* size) {
+  HANDLE file = CreateFileA(
+      path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+  if (file == INVALID_HANDLE_VALUE) {
+    throw sppark_error{srs_win32_errno(GetLastError()), "open(\"%s\") failed: ", path};
+  }
+  LARGE_INTEGER file_size;
+  if (!GetFileSizeEx(file, &file_size)) {
+    int err = srs_win32_errno(GetLastError());
+    CloseHandle(file);
+    throw sppark_error{err, "stat(\"%s\") failed: ", path};
+  }
+  // The mapping holds the file open, and the view holds the mapping.
+  HANDLE mapping = CreateFileMappingA(file, NULL, PAGE_READONLY, 0, 0, NULL);
+  int map_err = mapping ? 0 : srs_win32_errno(GetLastError());
+  CloseHandle(file);
+  if (!mapping) {
+    throw sppark_error{map_err, "mmap(\"%s\") failed: ", path};
+  }
+  const void* view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+  int view_err = view ? 0 : srs_win32_errno(GetLastError());
+  CloseHandle(mapping);
+  if (!view) {
+    throw sppark_error{view_err, "mmap(\"%s\") failed: ", path};
+  }
+  *size = (size_t)file_size.QuadPart;
+  return (const byte*)view;
+}
+
+static inline int munmap(void* addr, size_t) {
+  return UnmapViewOfFile(addr) ? 0 : -1;
+}
+#else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 #pragma pack(push, 1)
 struct coeff_file_t {
@@ -145,6 +204,10 @@ public:
       } coeffs, a, b_g1, b_g2, c, h;
     } data;
 
+#ifdef _WIN32
+    size_t srs_file_size;
+    const byte* srs_ptr = srs_map_file(srs_path, &srs_file_size);
+#else
     int srs_file = open(srs_path, O_RDONLY);
 
     if (srs_file < 0) {
@@ -162,13 +225,14 @@ public:
       int err = errno;
       close(srs_file);
       if (srs_ptr == MAP_FAILED) {
-        throw sppark_error{err, "mmap(\"%s\") failed: ", srs_file};
+        throw sppark_error{err, "mmap(\"%s\") failed: ", srs_path};
       }
     }
+#endif
 
     try {
       if (memcmp(srs_ptr, "zkey", 4) != 0) {
-        throw sppark_error{EINVAL, "srs file's (\"%s\") type is not \"zkey\": ", srs_file};
+        throw sppark_error{EINVAL, "srs file's (\"%s\") type is not \"zkey\": ", srs_path};
       }
 
       size_t cursor = 4;
@@ -181,7 +245,7 @@ public:
         throw sppark_error{EINVAL,
                            "srs file (\"%s\") does not have the expected number of sections of 10; "
                            "it has %u sections: ",
-                           srs_file,
+                           srs_path,
                            num_sections};
       }
 
@@ -193,7 +257,7 @@ public:
 
       uint32_t protocol = read_u32(srs_ptr, cursor);
       if (protocol != 1) {
-        throw sppark_error{EINVAL, "srs file's (\"%s\") protocol is not groth16: ", srs_file};
+        throw sppark_error{EINVAL, "srs file's (\"%s\") protocol is not groth16: ", srs_path};
       }
 
       // Section 2: Metadata and verification key

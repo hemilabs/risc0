@@ -140,5 +140,6 @@ extern "C" {
         pows_per_combo: *const u32,
         all_pows: *const u32,
         num_combos: u32,
+        remainders: *mut u32,
     ) -> sppark::Error;
 }

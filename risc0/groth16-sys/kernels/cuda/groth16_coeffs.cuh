@@ -1,10 +1,17 @@
 #pragma once
 
+#ifdef _WIN32
+#include <cerrno>
+#include <cstdio>
+#include <sys/stat.h>
+#include <vector>
+#else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#endif
 
 typedef uint8_t byte;
 
@@ -118,6 +125,111 @@ public:
     gpu.sync();
   }
 
+#ifdef _WIN32
+  // Windows has no mmap(2): the file is read into, and written from, a host buffer.
+  // The layout is the same as below: four size_t counts, the coefficients, then the
+  // independent indices.
+  static std::vector<byte> read_whole_file(const char* file_path) {
+    std::FILE* file = std::fopen(file_path, "rb");
+    if (!file) {
+      throw sppark_error{errno, "open(\"%s\") failed: ", file_path};
+    }
+    struct _stat64 st;
+    if (_fstat64(_fileno(file), &st) != 0) {
+      int err = errno;
+      std::fclose(file);
+      throw sppark_error{err, "fstat(\"%s\") failed: ", file_path};
+    }
+    std::vector<byte> buf((size_t)st.st_size);
+    size_t got = std::fread(buf.data(), 1, buf.size(), file);
+    int err = errno;
+    std::fclose(file);
+    if (got != buf.size()) {
+      throw sppark_error{err ? err : EIO, "read(\"%s\") failed: ", file_path};
+    }
+    return buf;
+  }
+
+  preprocessed_coeffs(const gpu_t& gpu, const char* file_path) : gpu(gpu) {
+    std::vector<byte> file = read_whole_file(file_path);
+    if (file.size() < 4 * sizeof(size_t)) {
+      throw sppark_error{EINVAL, "\"%s\" is truncated: ", file_path};
+    }
+
+    try {
+      {
+        size_t* ptr = (size_t*)file.data();
+        size_t coeff_count_a = ptr[0];
+        size_t coeff_count_b = ptr[1];
+        size_t unique_count_a = ptr[2];
+        size_t unique_count_b = ptr[3];
+
+        d_coeffs = gpu_ptr_t<coeff_t>(
+            (coeff_t*)gpu.Dmalloc((coeff_count_a + coeff_count_b) * sizeof(coeff_t)));
+        d_independent_indices = gpu_ptr_t<uint32_t>(
+            (uint32_t*)gpu.Dmalloc((unique_count_a + unique_count_b) * sizeof(uint32_t)));
+
+        d_coeffs_a = slice_t<coeff_t>(&d_coeffs[0], coeff_count_a);
+        d_coeffs_b = slice_t<coeff_t>(&d_coeffs[coeff_count_a], coeff_count_b);
+
+        d_ind_idx_a = slice_t<uint32_t>(&d_independent_indices[0], unique_count_a);
+        d_ind_idx_b = slice_t<uint32_t>(&d_independent_indices[unique_count_a], unique_count_b);
+      }
+
+      const byte* ptr = file.data() + 4 * sizeof(size_t);
+      gpu.HtoD(&d_coeffs[0], (coeff_t*)&ptr[0], d_coeffs_a.size() + d_coeffs_b.size());
+
+      ptr += (d_coeffs_a.size() + d_coeffs_b.size()) * sizeof(coeff_t);
+      gpu.HtoD(
+          &d_independent_indices[0], (uint32_t*)&ptr[0], d_ind_idx_a.size() + d_ind_idx_b.size());
+
+      // The copies are asynchronous: `file` must outlive them.
+      gpu.sync();
+    } catch (const sppark_error& e) {
+      gpu.sync();
+      throw;
+    }
+  }
+
+  void write_to_file(const char* file_path) {
+    size_t file_size = 4 * sizeof(size_t) +
+                       (d_coeffs_a.size() + d_coeffs_b.size()) * sizeof(coeff_t) +
+                       (d_ind_idx_a.size() + d_ind_idx_b.size()) * sizeof(uint32_t);
+    std::vector<byte> file(file_size);
+
+    try {
+      {
+        size_t* file_ptr = (size_t*)file.data();
+        file_ptr[0] = d_coeffs_a.size();
+        file_ptr[1] = d_coeffs_b.size();
+        file_ptr[2] = d_ind_idx_a.size();
+        file_ptr[3] = d_ind_idx_b.size();
+      }
+
+      byte* file_ptr = file.data() + 4 * sizeof(size_t);
+      gpu.DtoH((coeff_t*)file_ptr, &d_coeffs[0], d_coeffs_a.size() + d_coeffs_b.size());
+
+      file_ptr += (d_coeffs_a.size() + d_coeffs_b.size()) * sizeof(coeff_t);
+      gpu.DtoH(
+          (uint32_t*)file_ptr, &d_independent_indices[0], d_ind_idx_a.size() + d_ind_idx_b.size());
+
+      gpu.sync();
+    } catch (const sppark_error& e) {
+      gpu.sync();
+      throw;
+    }
+
+    std::FILE* out = std::fopen(file_path, "wb");
+    if (!out) {
+      throw sppark_error{errno, "open(\"%s\") failed: ", file_path};
+    }
+    size_t written = std::fwrite(file.data(), 1, file_size, out);
+    int err = errno;
+    if (std::fclose(out) != 0 || written != file_size) {
+      throw sppark_error{err ? err : EIO, "write(\"%s\") failed: ", file_path};
+    }
+  }
+#else
   preprocessed_coeffs(const gpu_t& gpu, const char* file_path) : gpu(gpu) {
     int pcoeffs_file = open(file_path, O_RDONLY);
 
@@ -227,6 +339,7 @@ public:
       throw;
     }
   }
+#endif // _WIN32
 
   const slice_t<coeff_t> get_coeffs_a() const { return d_coeffs_a; }
 

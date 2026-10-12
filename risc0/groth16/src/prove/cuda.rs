@@ -33,15 +33,45 @@ static ROOT_DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
 
 fn get_root_dir() -> Result<&'static Path> {
     let dir = ROOT_DIR.get_or_init(|| {
+        // `RISC0_GROTH16_DIR` names the component's directory outright, bypassing rzup:
+        // rzup does not run on Windows (`Platform::detect` knows only Linux and macOS),
+        // so there the files are installed by hand and located through this.
+        if let Some(dir) = std::env::var_os("RISC0_GROTH16_DIR") {
+            return dir.into();
+        }
+        let version = Version::new(0, 1, 0);
         Rzup::new()
-            .and_then(|r| r.get_version_dir(&Component::Risc0Groth16, &Version::new(0, 1, 0)))
+            .and_then(|r| r.get_version_dir(&Component::Risc0Groth16, &version))
+            .ok()
+            .or_else(|| rzup_layout_dir(&version))
             .expect(
                 "Missing required `risc0-groth16` rzup component. \
                 To install it, ensure that your `rzup` version is >= 0.5.0, \
-                and then run `rzup install risc0-groth16`.",
+                and then run `rzup install risc0-groth16`. \
+                Where rzup does not run (Windows), copy the component's files to \
+                ~/.risc0/extensions/v0.1.0-risc0-groth16, or set RISC0_GROTH16_DIR \
+                to a directory holding them.",
             )
     });
     Ok(dir.as_path())
+}
+
+/// Where rzup installs the component, when it is there: `$RISC0_HOME` (else
+/// `~/.risc0`) `/extensions/v<version>-risc0-groth16`. For hosts where `Rzup::new`
+/// fails outright, such as Windows, which its `Platform::detect` does not know, so
+/// that a copy installed by hand in the same place is found the same way.
+fn rzup_layout_dir(version: &Version) -> Option<std::path::PathBuf> {
+    let risc0_home = std::env::var_os("RISC0_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(|home| std::path::PathBuf::from(home).join(".risc0"))
+        })?;
+    let dir = risc0_home
+        .join("extensions")
+        .join(format!("v{version}-risc0-groth16"));
+    dir.is_dir().then_some(dir)
 }
 
 /// Cached deserialized circom graph to avoid re-parsing ~241MB on each call (~554ms).
@@ -90,6 +120,12 @@ pub(crate) fn preload_srs() -> Result<()> {
         SetupParams::new(root_dir).context("failed to create groth16 setup params for preload")?;
     risc0_groth16_sys::preload(&setup_params).context("failed to preload groth16 SRS")?;
     Ok(())
+}
+
+/// Drop the prover and SRS that `preload_srs` and `shrink_wrap` cached on the GPU. See
+/// `prove::release_srs`.
+pub(crate) fn release_srs() -> Result<()> {
+    risc0_groth16_sys::release().context("failed to release the cached groth16 SRS")
 }
 
 pub(crate) fn shrink_wrap(seal_bytes: &[u8]) -> Result<Seal> {

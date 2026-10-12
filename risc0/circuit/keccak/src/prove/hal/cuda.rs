@@ -1,17 +1,16 @@
-// Copyright 2026 RISC Zero, Inc.
+// Copyright 2024 RISC Zero, Inc.
 //
-// Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
-// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
-// http://opensource.org/licenses/MIT>, at your option. This file may not be
-// copied, modified, or distributed except according to those terms.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-//
-// SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use std::rc::Rc;
 
@@ -203,7 +202,6 @@ impl<CH: CudaHash> CircuitHal<CudaHal<CH>> for CudaCircuitHal<CH> {
             BabyBearExtElem::as_u32_slice(poly_mix_pows.as_slice())
                 .try_into()
                 .unwrap();
-        let poly_mix_pows_gpu = self.hal.copy_from_u32("poly_mix_pows", &poly_mix_pows[..]);
 
         ffi_wrap(|| unsafe {
             risc0_circuit_keccak_cuda_eval_check(
@@ -216,7 +214,7 @@ impl<CH: CudaHash> CircuitHal<CudaHal<CH>> for CudaCircuitHal<CH> {
                 &rou as *const BabyBearElem,
                 po2 as u32,
                 domain as u32,
-                poly_mix_pows_gpu.as_device_ptr().as_ptr() as *const u32,
+                poly_mix_pows.as_ptr(),
             )
         })
         .unwrap();
@@ -233,4 +231,28 @@ pub fn keccak_prover() -> Result<Box<dyn KeccakProver>> {
 
 fn cuda_reset() {
     ffi_wrap(|| unsafe { risc0_circuit_keccak_cuda_reset() }).unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::rc::Rc;
+
+    use risc0_core::field::baby_bear::BabyBear;
+    use risc0_zkp::{
+        core::hash::sha::Sha256HashSuite,
+        hal::{cpu::CpuHal, cuda::CudaHalSha256},
+    };
+    use test_log::test;
+
+    use crate::prove::hal::cpu::CpuCircuitHal;
+
+    #[test]
+    fn eval_check() {
+        const PO2: usize = 4;
+        let cpu_hal: CpuHal<BabyBear> = CpuHal::new(Sha256HashSuite::new_suite());
+        let cpu_eval = CpuCircuitHal;
+        let gpu_hal = Rc::new(CudaHalSha256::new());
+        let gpu_eval = super::CudaCircuitHal::new(gpu_hal.clone());
+        crate::prove::testutil::eval_check(&cpu_hal, cpu_eval, gpu_hal.as_ref(), gpu_eval, PO2);
+    }
 }
