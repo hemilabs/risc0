@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <vector>
 #include <stdexcept>
+#include <mutex>
 #include <cstdlib>
 
 // Forward declarations for ESIMD kernel functions (defined in other .cpp files)
@@ -481,15 +482,25 @@ const char* esimd_batch_expand_and_evaluate_ntt(void* queue,
 static uint32_t* g_zk_shift_powers[28] = {};
 static uint32_t g_zk_shift_sizes[28] = {};
 
+static std::mutex g_zk_shift_mutex;
+
 static uint32_t* ensure_zk_shift_powers(sycl::queue& q, uint32_t lg_n) {
+    std::lock_guard<std::mutex> lock(g_zk_shift_mutex);
     if (g_zk_shift_powers[lg_n] && g_zk_shift_sizes[lg_n] == (1u << lg_n))
         return g_zk_shift_powers[lg_n];
 
+    // table[i] = Mont(3^bitrev(i)): the powers 3^k by repeated Montgomery
+    // multiplication (O(n), ~5 ms at lg 20 vs ~55 ms for n independent
+    // square-and-multiply pows), then the bit-reversal permutation.
     uint32_t n = 1u << lg_n;
     uint32_t gen_mont = (uint32_t)(((uint64_t)3 << 32) % bb31::MOD);
+    std::vector<uint32_t> pw(n);
+    pw[0] = (uint32_t)(((uint64_t)1 << 32) % bb31::MOD);
+    for (uint32_t k = 1; k < n; k++)
+        pw[k] = host_mont_mul_ffi(pw[k - 1], gen_mont);
     auto* h_powers = sycl::malloc_host<uint32_t>(n, q);
     for (uint32_t i = 0; i < n; i++)
-        h_powers[i] = host_mont_pow_ffi(gen_mont, bit_rev_ffi(i, lg_n));
+        h_powers[i] = pw[bit_rev_ffi(i, lg_n)];
 
     if (g_zk_shift_powers[lg_n]) sycl::free(g_zk_shift_powers[lg_n], q);
     g_zk_shift_powers[lg_n] = sycl::malloc_device<uint32_t>(n, q);
@@ -498,6 +509,15 @@ static uint32_t* ensure_zk_shift_powers(sycl::queue& q, uint32_t lg_n) {
     q.wait();
     sycl::free(h_powers, q);
     return g_zk_shift_powers[lg_n];
+}
+
+// Build (and cache) the zk_shift power table for lg_n ahead of first use.
+const char* esimd_prepare_zk_shift(void* queue, uint32_t lg_n) {
+    auto* q = static_cast<sycl::queue*>(queue);
+    FFI_WRAP(
+        if (lg_n >= 28) throw std::runtime_error("esimd_prepare_zk_shift: lg_n out of range");
+        ensure_zk_shift_powers(*q, lg_n);
+    )
 }
 
 // Batch zk_shift: for each of poly_count polynomials, multiply by 3^bit_rev(pos)

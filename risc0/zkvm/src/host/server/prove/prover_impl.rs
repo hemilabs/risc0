@@ -70,6 +70,12 @@ pub struct ProverImpl {
 impl ProverImpl {
     /// Construct a [ProverImpl].
     pub fn new(opts: ProverOpts) -> Self {
+        // Intel: GPU init (queue, warmup, zk_shift table) overlaps guest
+        // execution and segment-0 preflight instead of preceding segment 0.
+        #[cfg(feature = "intel")]
+        if std::env::var("RISC0_INTEL_EARLY_INIT").as_deref() != Ok("0") {
+            risc0_zkp::hal::intel::start_background_init(vec![opts.max_segment_po2 as u32]);
+        }
         Self { opts }
     }
 

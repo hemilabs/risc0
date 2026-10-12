@@ -29,6 +29,8 @@ use risc0_core::{
     },
     scope,
 };
+/// See [risc0_sys::intel::start_background_init].
+pub use risc0_sys::intel::start_background_init;
 use risc0_sys::intel::{
     self, esimd_check, get_queue, DevicePointer, IntelDeviceBuffer,
 };
@@ -564,12 +566,9 @@ impl<IH: IntelHash + ?Sized> IntelHal<IH> {
         // Ensure the SYCL queue is initialized (creates on first call)
         let queue = get_queue();
 
-        // Pre-warm twiddle tables + SYCL runtime (only on first call)
-        static WARMUP_DONE: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-        if !WARMUP_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            unsafe { intel::esimd_warmup(queue, 22) };
-        }
+        // Pre-warm twiddle tables + SYCL runtime (only once per process; may
+        // already have run on the background init thread).
+        intel::warmup_once(queue);
 
         let mut hal = Self { hash: None };
         hal.hash = Some(hash);

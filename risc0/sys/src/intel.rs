@@ -39,6 +39,7 @@ extern "C" {
 
     // Warmup
     pub fn esimd_warmup(queue: *mut c_void, max_lg_n: u32);
+    pub fn esimd_prepare_zk_shift(queue: *mut c_void, lg_n: u32) -> *const std::os::raw::c_char;
 
     // NTT
     pub fn esimd_forward_ntt(queue: *mut c_void, d_data: *mut c_void, lg_n: u32) -> *const std::os::raw::c_char;
@@ -105,9 +106,7 @@ static mut QUEUE: *mut c_void = std::ptr::null_mut();
 // for cross-thread reuse ordering), removed the failure at no measured
 // throughput cost.
 
-/// Get the singleton SYCL queue, creating it on first call.
-/// Panics if no Intel GPU is found.
-pub fn get_queue() -> *mut c_void {
+fn create_queue_once() -> *mut c_void {
     unsafe {
         INIT.call_once(|| {
             QUEUE = esimd_create_queue();
@@ -117,6 +116,52 @@ pub fn get_queue() -> *mut c_void {
         });
         QUEUE
     }
+}
+
+static BG_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static BG_INIT: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> = std::sync::Mutex::new(None);
+static WARMUP: Once = Once::new();
+
+/// Get the singleton SYCL queue, creating it on first call.
+/// Panics if no Intel GPU is found. If [start_background_init] is running,
+/// waits for it first, so no other GPU work overlaps the warmup.
+pub fn get_queue() -> *mut c_void {
+    if BG_PENDING.load(std::sync::atomic::Ordering::Acquire) {
+        let handle = BG_INIT.lock().unwrap().take();
+        if let Some(h) = handle {
+            if h.thread().id() == std::thread::current().id() {
+                *BG_INIT.lock().unwrap() = Some(h);
+            } else {
+                let _ = h.join();
+                BG_PENDING.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+    }
+    create_queue_once()
+}
+
+/// Run the one-time kernel warmup (twiddles, JIT of the hot kernels) on `queue`.
+pub fn warmup_once(queue: *mut c_void) {
+    WARMUP.call_once(|| unsafe { esimd_warmup(queue, 22) });
+}
+
+/// Create the queue, run the warmup and build the zk_shift tables for
+/// `lgs` on a background thread (e.g. while the guest executes and segment
+/// 0 is preflighted). The first [get_queue] call from another thread joins
+/// it. Same work and order as the lazy path, just earlier.
+pub fn start_background_init(lgs: Vec<u32>) {
+    let mut slot = BG_INIT.lock().unwrap();
+    if slot.is_some() || INIT.is_completed() {
+        return;
+    }
+    BG_PENDING.store(true, std::sync::atomic::Ordering::Release);
+    *slot = Some(std::thread::spawn(move || {
+        let queue = create_queue_once();
+        warmup_once(queue);
+        for lg in lgs {
+            esimd_check(unsafe { esimd_prepare_zk_shift(queue, lg) });
+        }
+    }));
 }
 
 /// Synchronize the SYCL queue (wait for all submitted work to complete).
