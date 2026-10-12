@@ -20,6 +20,8 @@ mod cuda;
 mod hip;
 #[cfg(not(any(feature = "cuda", feature = "rocm")))]
 mod docker;
+#[cfg(all(feature = "intel", not(any(feature = "cuda", feature = "rocm"))))]
+mod fast;
 mod seal_format;
 mod seal_to_json;
 
@@ -38,8 +40,30 @@ pub fn preload_graph() -> Result<()> {
             self::cuda::preload_graph()
         } else if #[cfg(feature = "rocm")] {
             self::hip::preload_graph()
+        } else if #[cfg(feature = "intel")] {
+            self::fast::preload()
         } else {
             Ok(()) // docker mode doesn't use local graph
+        }
+    }
+}
+
+/// Start the Groth16 prover ahead of [shrink_wrap] so that it loads its
+/// proving key while the caller finishes `identity_p254` (intel builds with
+/// the rzup `risc0-groth16` component installed; otherwise a no-op).
+pub fn prestart_prover() -> Result<()> {
+    cfg_if::cfg_if! {
+        if #[cfg(all(feature = "intel", not(any(feature = "cuda", feature = "rocm"))))] {
+            // Only check that the graph exists here: building the witness
+            // program (~1 s) stays on the preload thread, off this path.
+            if self::docker::fast_enabled()
+                && self::fast::graph_path().map(|p| p.exists()).unwrap_or(false)
+            {
+                self::fast::prestart()?;
+            }
+            Ok(())
+        } else {
+            Ok(())
         }
     }
 }

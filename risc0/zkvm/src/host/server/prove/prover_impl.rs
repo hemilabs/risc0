@@ -461,7 +461,7 @@ impl ProverImpl {
 
         // Preload circom graph on background thread so the ~728ms file read + parse
         // overlaps with segment proving and recursion.  Only needed for Groth16.
-        #[cfg(any(feature = "cuda", feature = "rocm"))]
+        #[cfg(any(feature = "cuda", feature = "rocm", feature = "intel"))]
         let _graph_preload = if self.opts.receipt_kind == ReceiptKind::Groth16 {
             Some(std::thread::spawn(|| {
                 if let Err(e) = risc0_groth16::prove::preload_graph() {
@@ -918,6 +918,9 @@ impl ProverImpl {
         let groth16_receipt = if let Some(ident_receipt) = pre_ident {
             // identity_p254 already computed by recursion worker (overlapped with STARK).
             use risc0_groth16::prove::shrink_wrap;
+            if let Err(e) = risc0_groth16::prove::prestart_prover() {
+                eprintln!("[groth16] prover prestart failed (non-fatal): {e}");
+            }
             let t0 = std::time::Instant::now();
             let seal_bytes = ident_receipt.get_seal_bytes();
             let seal = shrink_wrap(&seal_bytes)?.to_vec();

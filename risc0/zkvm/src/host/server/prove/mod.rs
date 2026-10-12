@@ -201,6 +201,10 @@ pub trait ProverServer: private::Sealed {
         receipt: &SuccinctReceipt<ReceiptClaim>,
     ) -> Result<Groth16Receipt<ReceiptClaim>> {
         let t0 = std::time::Instant::now();
+        // Let the Groth16 prover load its proving key while identity_p254 runs.
+        if let Err(e) = risc0_groth16::prove::prestart_prover() {
+            tracing::warn!("groth16 prover prestart failed (non-fatal): {e}");
+        }
         let ident_receipt = self.identity_p254(receipt).unwrap();
         let ident_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
