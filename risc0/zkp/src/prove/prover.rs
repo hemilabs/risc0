@@ -58,12 +58,14 @@ fn make_coeffs<H: Hal>(hal: &H, witness: &H::Buffer<H::Elem>, count: usize) -> H
     scope!("make_coeffs");
     let t0 = std::time::Instant::now();
     let coeffs = hal.alloc_elem("coeffs", witness.size());
-    hal.eltwise_copy_elem(&coeffs, witness);
     // Do interpolate + zk_shift (f(x) -> f(3x), multiplying coefficients c_i by 3^i)
     #[cfg(not(feature = "circuit_debug"))]
-    hal.batch_interpolate_ntt_zk_shift(&coeffs, count);
+    hal.batch_interpolate_ntt_zk_shift_from(&coeffs, witness, count);
     #[cfg(feature = "circuit_debug")]
-    hal.batch_interpolate_ntt(&coeffs, count);
+    {
+        hal.eltwise_copy_elem(&coeffs, witness);
+        hal.batch_interpolate_ntt(&coeffs, count);
+    }
     if std::env::var_os("RISC0_VERBOSE").is_some() {
         eprintln!(
             "[make_coeffs] name={} count={count} size={} intt_zk={:.1}ms",

@@ -575,6 +575,27 @@ const char* esimd_batch_inverse_ntt_zk_shift(void* queue, void* d_data,
     )
 }
 
+void gpu_inverse_ntt_zk_shift_from_no_wait(sycl::queue& q, uint32_t* d_dst, const uint32_t* d_src,
+                                           uint32_t lg_n, const uint32_t* d_zk_powers);
+
+// Out-of-place esimd_batch_inverse_ntt_zk_shift: dst = INTT_zk(src), src unchanged.
+const char* esimd_batch_inverse_ntt_zk_shift_from(void* queue, void* d_dst, const void* d_src,
+                                                   uint32_t lg_domain_size,
+                                                   uint32_t poly_count, uint32_t stride) {
+    auto* q = static_cast<sycl::queue*>(queue);
+    FFI_WRAP(
+        if (lg_domain_size >= 26) throw std::runtime_error("inverse_ntt_zk_shift_from: lg >= 26 unsupported");
+        auto* dst = static_cast<uint32_t*>(d_dst);
+        auto* src = static_cast<const uint32_t*>(d_src);
+        auto* d_powers = ensure_zk_shift_powers(*q, lg_domain_size);
+        for (uint32_t c = 0; c < poly_count; c++) {
+            gpu_inverse_ntt_zk_shift_from_no_wait(*q, dst + size_t(c) * stride,
+                                                  src + size_t(c) * stride,
+                                                  lg_domain_size, d_powers);
+        }
+    )
+}
+
 // ============================================================================
 // Poseidon2 Hash
 // ============================================================================

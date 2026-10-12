@@ -143,6 +143,17 @@ pub trait Hal {
         self.zk_shift(io, count);
     }
 
+    /// `dst = interpolate_zk_shift(src)`, leaving `src` unchanged.
+    fn batch_interpolate_ntt_zk_shift_from(
+        &self,
+        dst: &Self::Buffer<Self::Elem>,
+        src: &Self::Buffer<Self::Elem>,
+        count: usize,
+    ) {
+        self.eltwise_copy_elem(dst, src);
+        self.batch_interpolate_ntt_zk_shift(dst, count);
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn mix_poly_coeffs(
         &self,

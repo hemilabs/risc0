@@ -853,6 +853,34 @@ impl<IH: IntelHash + ?Sized> Hal for IntelHal<IH> {
         });
     }
 
+    // Out-of-place: the first inverse-NTT pass reads the witness directly
+    // (saves the make_coeffs copy, ~3 ms per po2=20 segment).
+    fn batch_interpolate_ntt_zk_shift_from(
+        &self,
+        dst: &Self::Buffer<Self::Elem>,
+        src: &Self::Buffer<Self::Elem>,
+        count: usize,
+    ) {
+        assert_eq!(dst.size(), src.size());
+        let row_size = src.size() / count;
+        assert_eq!(row_size * count, src.size());
+        let n_bits = log2_ceil(row_size);
+        assert_eq!(row_size, 1 << n_bits);
+        assert!(n_bits < Self::Elem::MAX_ROU_PO2);
+
+        let queue = get_queue();
+        esimd_check(unsafe {
+            intel::esimd_batch_inverse_ntt_zk_shift_from(
+                queue,
+                dst.as_device_ptr().0 as *mut std::ffi::c_void,
+                src.as_device_ptr().0 as *const std::ffi::c_void,
+                ffi_u32(n_bits),
+                ffi_u32(count),
+                ffi_u32(row_size),
+            )
+        });
+    }
+
     fn mix_poly_coeffs(
         &self,
         output: &Self::Buffer<Self::ExtElem>,

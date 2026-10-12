@@ -470,7 +470,11 @@ static void ntt_ct_tail(sycl::queue& q, uint32_t* d_data, uint32_t lg_n, const T
 }
 
 template <uint32_t H>
-static void ntt_gs_tail(sycl::queue& q, uint32_t* d_data, uint32_t lg_n, const TwiddleTables& tw, const uint32_t* d_tab) {
+// d_src (optional): read the input from d_src instead of d_data (out-of-place
+// first pass; every element is read once, before any write).
+static void ntt_gs_tail(sycl::queue& q, uint32_t* d_data, uint32_t lg_n, const TwiddleTables& tw, const uint32_t* d_tab,
+                        const uint32_t* d_src = nullptr) {
+  const uint32_t* d_in = d_src ? d_src : d_data;
   constexpr uint32_t R = 1u << H, TH = R, K = 2 * H;
   uint32_t n = 1u << lg_n;
   uint32_t num_wg = n >> (K + 4);
@@ -490,7 +494,7 @@ static void ntt_gs_tail(sycl::queue& q, uint32_t* d_data, uint32_t lg_n, const T
       // phase 1 (high k bits, descending stages): k = c*R + t
 #pragma unroll
       for (uint32_t c = 0; c < R; c++)
-        dv[c] = esimd::block_load<uint32_t, 16>(d_data + jbase + ((size_t)(c * R + t) << 14));
+        dv[c] = esimd::block_load<uint32_t, 16>(d_in + jbase + ((size_t)(c * R + t) << 14));
 #pragma unroll
       for (int ii = H - 1; ii >= 0; ii--) {
         uint32_t i = ii;
@@ -556,11 +560,12 @@ static bool ct_tail_single(sycl::queue& q, uint32_t* d, uint32_t lg_n, const Twi
         default: return false;
     }
 }
-static bool gs_tail_single(sycl::queue& q, uint32_t* d, uint32_t lg_n, const TwiddleTables& tw) {
+static bool gs_tail_single(sycl::queue& q, uint32_t* d, uint32_t lg_n, const TwiddleTables& tw,
+                           const uint32_t* src = nullptr) {
     if (!g_ntt_tail_on) return false;
     switch (lg_n) {
-        case 20: ntt_gs_tail<3>(q, d, lg_n, tw, get_tail_table(q, 3, false)); return true;
-        case 22: ntt_gs_tail<4>(q, d, lg_n, tw, get_tail_table(q, 4, false)); return true;
+        case 20: ntt_gs_tail<3>(q, d, lg_n, tw, get_tail_table(q, 3, false), src); return true;
+        case 22: ntt_gs_tail<4>(q, d, lg_n, tw, get_tail_table(q, 4, false), src); return true;
         default: return false;
     }
 }

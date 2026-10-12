@@ -3079,6 +3079,23 @@ void gpu_inverse_ntt_zk_shift_no_wait(sycl::queue& q, uint32_t* d_data,
     // No q.wait() — caller batches
 }
 
+// Out-of-place inverse NTT + zk_shift: dst = INTT_zk(src). For lg 20/22 the
+// single-kernel tail reads src directly (no copy); otherwise copy + in-place.
+void gpu_inverse_ntt_zk_shift_from_no_wait(sycl::queue& q, uint32_t* d_dst, const uint32_t* d_src,
+                                           uint32_t lg_n, const uint32_t* d_zk_powers) {
+    if (lg_n >= SLM_LG_BLOCK && lg_n < 26) {
+        const auto& tw = get_cached_twiddles(q, lg_n, false);
+        if (gs_tail_single(q, d_dst, lg_n, tw, d_src)) {
+            uint32_t inv_n = ntt::domain_inv[lg_n];
+            if (g_ntt_v3_on) ntt_gs_slm_v3<32>(q, d_dst, lg_n, tw.d_buffer, tw, inv_n, d_zk_powers);
+            else ntt_gs_slm_combined(q, d_dst, lg_n, tw.d_buffer, tw, inv_n, /*total_elements=*/0, d_zk_powers);
+            return;
+        }
+    }
+    q.memcpy(d_dst, d_src, size_t(4) << lg_n);
+    gpu_inverse_ntt_zk_shift_no_wait(q, d_dst, lg_n, d_zk_powers);
+}
+
 // ============================================================================
 // Original (unoptimized) NTT orchestrators — kept for reference/validation
 // ============================================================================
