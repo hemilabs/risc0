@@ -280,6 +280,17 @@ impl ProverImpl {
             verifier_parameters,
         };
 
+        // This path does not verify segment seals as it proves them, so verify the whole receipt
+        // here, as prove_session does on the sequential path.
+        if std::env::var("RISC0_SKIP_VERIFY").is_err() {
+            composite_receipt.verify_integrity_with_context(ctx)?;
+        }
+        check_claims(
+            &session.claim()?,
+            "composite",
+            MaybePruned::Value(composite_receipt.claim()?),
+        )?;
+
         if self.opts.receipt_kind == ReceiptKind::Composite {
             let receipt = Receipt::new(
                 InnerReceipt::Composite(composite_receipt),
@@ -458,6 +469,9 @@ impl ProverImpl {
             && self.opts.receipt_kind != ReceiptKind::Composite
             && !session.povw_job_id.is_some()
             && session.assumptions.is_empty()
+            && session.pending_keccaks.is_empty()
+            // Each GPU must get at least one segment: an empty half has nothing to finalize.
+            && session.segments.len() >= 2
         {
             return self.prove_session_parallel_stark(ctx, session);
         }
@@ -489,6 +503,15 @@ impl ProverImpl {
         };
 
         let skip_verify = std::env::var("RISC0_SKIP_VERIFY").is_ok();
+        if skip_verify {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    "RISC0_SKIP_VERIFY is set: the prover will not verify the segments, composite \
+                     or succinct receipts it produces; only their claims are checked"
+                )
+            });
+        }
         let max_po2 = self.opts.max_segment_po2;
 
         // Pipeline: overlap preflight(N+1) CPU work with prove_core(N) GPU work.
@@ -862,16 +885,19 @@ impl ProverImpl {
 
         let session_claim = session.claim()?;
 
-        // Verify the receipt to catch if something is broken in the proving process.
-        // When background verification verified each segment's seal, skip the redundant
-        // composite verify (which re-verifies all seals) and just check the claims match.
+        // Verify the receipt to catch if something is broken in the proving process. Each
+        // segment's seal was verified as it was proved, so it is not verified again here; the
+        // rest of the composite is: the segments' chaining, exit codes and outputs, and the
+        // assumption receipts. RISC0_SKIP_VERIFY skips that, but never the claim check, which
+        // costs nothing.
         if !skip_verify {
-            check_claims(
-                &session_claim,
-                "composite",
-                MaybePruned::Value(composite_receipt.claim()?),
-            )?;
+            composite_receipt.verify_integrity_inner(ctx, false)?;
         }
+        check_claims(
+            &session_claim,
+            "composite",
+            MaybePruned::Value(composite_receipt.claim()?),
+        )?;
 
         if self.opts.receipt_kind == ReceiptKind::Composite {
             let receipt = Receipt::new(
@@ -908,10 +934,22 @@ impl ProverImpl {
 
         // composite_to_succinct calls lift/join without the per-receipt
         // verify_integrity of the default Compress impl; each join verifies its
-        // inputs in-circuit, so verifying the final receipt covers them.
+        // inputs in-circuit, so verifying the final receipt covers them. Above the
+        // default po2 the recursion allows the wider set of control IDs, and so
+        // must the verifier.
         if !skip_verify {
+            let max_po2 = self.opts.max_segment_po2;
+            let wide_ctx;
+            let succinct_ctx = if max_po2 > crate::receipt::DEFAULT_MAX_PO2 {
+                wide_ctx = ctx.clone().with_succinct_verifier_parameters(
+                    SuccinctReceiptVerifierParameters::from_max_po2(max_po2),
+                );
+                &wide_ctx
+            } else {
+                ctx
+            };
             succinct_receipt
-                .verify_integrity_with_context(ctx)
+                .verify_integrity_with_context(succinct_ctx)
                 .context("verify succinct")?;
         }
 
