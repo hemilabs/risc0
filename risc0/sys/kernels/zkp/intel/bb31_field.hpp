@@ -41,42 +41,19 @@ using Mask16 = esimd::simd_mask<16>;
 // Uses experimental::esimd::imul() for full 64-bit product.
 // IGC compiles this to native MADW instructions at SIMD16.
 ESIMD_INLINE Vec16 mont_mul(Vec16 a, Vec16 b) {
-    const Vec16 P_vec(MOD);
-    const Vec16 M0_vec(M0);
-
-    // Step 1: Full 32x32 -> 64-bit product
+    // Signed REDC: with m = lo(ab) * P^-1 mod 2^32, lo(m*P) == lo(ab) exactly, so
+    // (ab - m*P) / 2^32 = hi(ab) - hi(m*P), which lies in (-P, P); add P if negative.
+    // Canonical [0, P) result, bit-identical to the carry-based REDC (no carry term).
     Vec16 lo;
     Vec16 hi = esimd_exp::imul(lo, a, b);
-
-    // Step 2: Compute reduction factor
-    Vec16 red = lo * M0_vec;
-
-    // Step 3: red * P + (lo, hi)
-    Vec16 prod_lo;
-    Vec16 prod_hi = esimd_exp::imul(prod_lo, red, P_vec);
-
-    // Montgomery property: lo + prod_lo = 0 (mod 2^32) or 2^32 exactly.
-    // Proof: red = lo * M0, prod_lo = (red * P) mod 2^32.
-    // Since M0 * P = -1 (mod 2^32), prod_lo = -lo (mod 2^32).
-    // So lo + prod_lo = 0 when lo=0, or 2^32 when lo!=0.
-    // The comparison lo != 0 depends only on imul#1 output (available early),
-    // not on prod_lo from imul#2, breaking the dependency chain (~2 cyc win).
-    Vec16 carry_val(0u);
-    carry_val.merge(Vec16(1u), lo != Vec16(0u));
-
-    // Result = hi + prod_hi + carry
-    Vec16 result = hi + prod_hi + carry_val;
-
-    // Conditional final subtraction (branchless)
-    Vec16 reduced = result - P_vec;
-    result.merge(reduced, result >= P_vec);
-
-    return result;
+    Vec16 m = lo * Vec16(0x88000001u);  // P^-1 mod 2^32 for P = 0x78000001
+    Vec16 mlo;
+    Vec16 mh = esimd_exp::imul(mlo, m, Vec16(MOD));
+    Vec16 u = hi - mh;
+    u.merge(u + Vec16(MOD), hi < mh);
+    return u;
 }
 
-// Montgomery multiplication WITHOUT final subtraction (lazy reduction).
-// Result is in [0, 2*P). Caller must ensure no overflow accumulates.
-// +20% speedup when used in butterfly sequences where add/sub follows.
 ESIMD_INLINE Vec16 mont_mul_lazy(Vec16 a, Vec16 b) {
     const Vec16 P_vec(MOD);
     const Vec16 M0_vec(M0);

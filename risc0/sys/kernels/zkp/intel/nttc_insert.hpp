@@ -84,6 +84,49 @@ ESIMD_INLINE void slm_gs(uint32_t STAGE, const uint32_t* ptw, uint32_t off, uint
   esimd::barrier();
 }
 
+// ---- r6: lane stages without iselect. Pair two vectors A,B; for lane bit b gather the
+// bit-b=0 lanes of A and B into X (16 wide) and the bit-b=1 lanes into Y with 2D regions,
+// do one 16-wide butterfly, scatter back. Twiddle for X lane i is table[i] (period 2^b).
+template <int b> struct LaneGeo { static constexpr int C = 2 << b; static constexpr int R = 16 / C; static constexpr int H = C / 2; };
+template <int b>
+ESIMD_INLINE void lane_split(bb31::Vec16& A, bb31::Vec16& B, bb31::Vec16& X, bb31::Vec16& Y) {
+  using L = LaneGeo<b>;
+  auto ma = A.template bit_cast_view<uint32_t, L::R, L::C>();
+  auto mb = B.template bit_cast_view<uint32_t, L::R, L::C>();
+  esimd::simd<uint32_t, 8> at = ma.template select<L::R, 1, L::H, 1>(0, 0);
+  esimd::simd<uint32_t, 8> ab = ma.template select<L::R, 1, L::H, 1>(0, L::H);
+  esimd::simd<uint32_t, 8> bt = mb.template select<L::R, 1, L::H, 1>(0, 0);
+  esimd::simd<uint32_t, 8> bbm = mb.template select<L::R, 1, L::H, 1>(0, L::H);
+  X.template select<8, 1>(0) = at; X.template select<8, 1>(8) = bt;
+  Y.template select<8, 1>(0) = ab; Y.template select<8, 1>(8) = bbm;
+}
+template <int b>
+ESIMD_INLINE void lane_merge(bb31::Vec16& A, bb31::Vec16& B, bb31::Vec16 X, bb31::Vec16 Y) {
+  using L = LaneGeo<b>;
+  auto ma = A.template bit_cast_view<uint32_t, L::R, L::C>();
+  auto mb = B.template bit_cast_view<uint32_t, L::R, L::C>();
+  esimd::simd<uint32_t, 8> x0 = X.template select<8, 1>(0), x1 = X.template select<8, 1>(8);
+  esimd::simd<uint32_t, 8> y0 = Y.template select<8, 1>(0), y1 = Y.template select<8, 1>(8);
+  ma.template select<L::R, 1, L::H, 1>(0, 0) = x0.template bit_cast_view<uint32_t, L::R, L::H>();
+  ma.template select<L::R, 1, L::H, 1>(0, L::H) = y0.template bit_cast_view<uint32_t, L::R, L::H>();
+  mb.template select<L::R, 1, L::H, 1>(0, 0) = x1.template bit_cast_view<uint32_t, L::R, L::H>();
+  mb.template select<L::R, 1, L::H, 1>(0, L::H) = y1.template bit_cast_view<uint32_t, L::R, L::H>();
+}
+template <int b, bool TRIV>
+ESIMD_INLINE void lane_ct(bb31::Vec16& A, bb31::Vec16& B, const bb31::Vec16& tw) {
+  bb31::Vec16 X, Y; lane_split<b>(A, B, X, Y);
+  bb31::Vec16 r = TRIV ? Y : bb31::mont_mul(tw, Y);
+  bb31::Vec16 s = bb31::field_add(X, r), d = bb31::field_sub(X, r);
+  lane_merge<b>(A, B, s, d);
+}
+template <int b, bool TRIV>
+ESIMD_INLINE void lane_gs(bb31::Vec16& A, bb31::Vec16& B, const bb31::Vec16& tw) {
+  bb31::Vec16 X, Y; lane_split<b>(A, B, X, Y);
+  bb31::Vec16 s = bb31::field_add(X, Y), d = bb31::field_sub(X, Y);
+  if constexpr (!TRIV) d = bb31::mont_mul(tw, d);
+  lane_merge<b>(A, B, s, d);
+}
+
 template <uint32_t T, bool EXPAND>
 static void ntt_ct_slm_v3(sycl::queue& q, uint32_t* d_out, const uint32_t* d_in, uint32_t lg_n,
                           const uint32_t* d_twiddles, const TwiddleTables& tw) {
@@ -113,35 +156,22 @@ static void ntt_ct_slm_v3(sycl::queue& q, uint32_t* d_out, const uint32_t* d_in,
             esimd::simd<uint32_t, 16> off = ((e0 >> 2) + (lane32 >> 2)) * 4u;
             dv[c] = esimd::gather<uint32_t, 16>(pin, off);
           }
-          esimd::simd<uint16_t, 16> xi4(lane32 ^ esimd::simd<uint32_t, 16>(4u));
-          esimd::simd<uint16_t, 16> xi8(lane32 ^ esimd::simd<uint32_t, 16>(8u));
-          auto t4 = (lane32 & 4u) == esimd::simd<uint32_t, 16>(0u);
-          auto t8 = (lane32 & 8u) == esimd::simd<uint32_t, 16>(0u);
           auto tw3 = esimd::block_load<uint32_t, 16>(ptw + o3);
           auto tw4 = esimd::block_load<uint32_t, 16>(ptw + o4);
 #pragma unroll
-          for (uint32_t c = 0; c < G::LOADS; c++) {
-            auto& data = dv[c];
-            { auto p = data.iselect(xi4);
-              bb31::Vec16 bv = data; bv.merge(p, t4);
-              bb31::Vec16 tv = p; tv.merge(data, t4);
-              auto r = bb31::mont_mul(tw3, bv);
-              auto s = bb31::field_add(tv, r); auto d = bb31::field_sub(tv, r);
-              data = d; data.merge(s, t4); }
-            { auto p = data.iselect(xi8);
-              bb31::Vec16 bv = data; bv.merge(p, t8);
-              bb31::Vec16 tv = p; tv.merge(data, t8);
-              auto r = bb31::mont_mul(tw4, bv);
-              auto s = bb31::field_add(tv, r); auto d = bb31::field_sub(tv, r);
-              data = d; data.merge(s, t8); }
-          }
+          for (uint32_t c = 0; c < G::LOADS; c += 2) { lane_ct<2, false>(dv[c], dv[c + 1], tw3); lane_ct<3, false>(dv[c], dv[c + 1], tw4); }
         } else {
 #pragma unroll
           for (uint32_t c = 0; c < G::LOADS; c++)
             dv[c] = esimd::block_load<uint32_t, 16>(pin + global_base + c * G::CHUNK + lid * 16);
+          auto tw2 = esimd::block_load<uint32_t, 16>(ptw + o2);
+          auto tw3 = esimd::block_load<uint32_t, 16>(ptw + o3);
+          auto tw4 = esimd::block_load<uint32_t, 16>(ptw + o4);
 #pragma unroll
-          for (uint32_t c = 0; c < G::LOADS; c++)
-            FUSED_CT_STAGES_1_4(dv[c], ptw, o2, o3, o4)
+          for (uint32_t c = 0; c < G::LOADS; c += 2) {
+            lane_ct<0, true>(dv[c], dv[c + 1], tw2); lane_ct<1, false>(dv[c], dv[c + 1], tw2);
+            lane_ct<2, false>(dv[c], dv[c + 1], tw3); lane_ct<3, false>(dv[c], dv[c + 1], tw4);
+          }
         }
 #pragma unroll
         for (uint32_t c = 0; c < G::LOADS; c++)
@@ -215,9 +245,16 @@ static void ntt_gs_slm_v3(sycl::queue& q, uint32_t* d_data, uint32_t lg_n,
 #pragma unroll
         for (uint32_t c = 0; c < G::LOADS; c++)
           dv[c] = esimd::slm_block_load<uint32_t, 16>((c * G::CHUNK + lid * 16) * 4u);
+        {
+          auto tw2 = esimd::block_load<uint32_t, 16>(ptw + o2);
+          auto tw3 = esimd::block_load<uint32_t, 16>(ptw + o3);
+          auto tw4 = esimd::block_load<uint32_t, 16>(ptw + o4);
 #pragma unroll
-        for (uint32_t c = 0; c < G::LOADS; c++)
-          FUSED_GS_STAGES_4_1(dv[c], ptw, o2, o3, o4)
+          for (uint32_t c = 0; c < G::LOADS; c += 2) {
+            lane_gs<3, false>(dv[c], dv[c + 1], tw4); lane_gs<2, false>(dv[c], dv[c + 1], tw3);
+            lane_gs<1, false>(dv[c], dv[c + 1], tw2); lane_gs<0, true>(dv[c], dv[c + 1], tw2);
+          }
+        }
         if (sf != bb31::ONE) {
 #pragma unroll
           for (uint32_t c = 0; c < G::LOADS; c++) dv[c] = bb31::mont_mul(dv[c], bb31::Vec16(sf));
