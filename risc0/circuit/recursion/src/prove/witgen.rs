@@ -92,8 +92,9 @@ pub(crate) fn host_ctrl_for(zkr: &Program) -> Arc<Vec<BabyBearElem>> {
     v
 }
 
-/// RISC0_RECURSION_PREWITGEN_CHECK: "0" never, "1"/"always" every proof,
-/// default "once" = the first prewitgen proof of each program in this process.
+/// RISC0_RECURSION_PREWITGEN_CHECK: "1"/"always" every proof, "once" = the
+/// first prewitgen proof of each program in this process, default never (set it
+/// in CI; a bad witness still fails the next join and the final verify).
 /// The check regenerates the witness through the HAL path into the device
 /// buffers and compares it with the host (prewitgen) witness before upload,
 /// i.e. it compares two independently computed witnesses (unlike the host
@@ -103,10 +104,7 @@ fn prewitgen_check_due(key: super::CtrlKey) -> bool {
     match std::env::var("RISC0_RECURSION_PREWITGEN_CHECK").as_deref() {
         Ok("0") => false,
         Ok("1") | Ok("always") => true,
-        _ => {
-            if std::env::var_os("RISC0_RECURSION_SHADOW_CHECK").is_some() {
-                return true;
-            }
+        Ok("once") => {
             let mut c = CHECKED.lock().unwrap();
             if c.contains(&key) {
                 false
@@ -115,6 +113,7 @@ fn prewitgen_check_due(key: super::CtrlKey) -> bool {
                 true
             }
         }
+        _ => std::env::var_os("RISC0_RECURSION_SHADOW_CHECK").is_some(),
     }
 }
 
@@ -325,7 +324,17 @@ pub(crate) fn host_witgen(zkr: &Program, preflight: &Preflight) -> Result<(Vec<B
     let total_cycles = 1usize << zkr.po2;
     // Exact program identity (key + full validation), shared with the HAL path.
     let ctrl = host_ctrl_for(zkr);
-    let mut data = vec![BabyBearElem::INVALID; total_cycles * CIRCUIT.data_size()];
+    // ~128 MB: fill in parallel (a serial fill is ~30 ms on the prepare thread).
+    let n = total_cycles * CIRCUIT.data_size();
+    let mut data: Vec<BabyBearElem> = Vec::with_capacity(n);
+    {
+        use rayon::prelude::*;
+        data.spare_capacity_mut()
+            .par_chunks_mut(1 << 16)
+            .for_each(|c| c.iter_mut().for_each(|x| { x.write(BabyBearElem::INVALID); }));
+        // SAFETY: every element of the spare capacity was initialised above.
+        unsafe { data.set_len(n) };
+    }
     let mut global = vec![BabyBearElem::INVALID; CircuitImpl::OUTPUT_SIZE];
     // The C++ witgen consumes the trace (extern.cpp: `trace->cycles[c].iopIdx++`),
     // so run it on a private copy of `cycles` (~2 MB). This keeps

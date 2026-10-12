@@ -637,15 +637,85 @@ fn build_intel_kernels() {
         eprintln!("Using cached Intel recursion eval_check kernel");
     }
 
+    build_intel_accum(&icpx, &icpx_version, &cxx_root, &cache_dir, &out_dir);
+
     // Link
     println!("cargo:rustc-link-search=native={}", cache_dir.display());
     println!("cargo:rustc-link-lib=dylib=risc0_recursion_intel");
+    println!("cargo:rustc-link-lib=dylib=risc0_recursion_intel_accum");
 
     // RPATH for runtime
     let intel_lib = PathBuf::from("/opt/intel/oneapi/compiler/latest/lib");
     if intel_lib.exists() {
         println!("cargo:rustc-link-search=native={}", intel_lib.display());
     }
+}
+
+const RECURSION_ACCUM_STAMP_VERSION: &str = "recursion-accum-v1";
+
+/// GPU accum kernel: kernels/intel/accum.cpp with the generated
+/// step_compute_accum.cpp / step_verify_accum.cpp spliced in (their
+/// extern.h/ffi.h includes dropped; accum.cpp defines the device-side
+/// extern_plonk{Read,Write}Accum_wom). Separate library and stamp so that it
+/// does not invalidate the eval_check build. -O2 is bit-exact here (checked
+/// against the CPU accum with RISC0_RECURSION_GPU_ACCUM=check).
+fn build_intel_accum(icpx: &Path, icpx_version: &str, cxx_root: &str, cache_dir: &Path, out_dir: &Path) {
+    let so_path = cache_dir.join("librisc0_recursion_intel_accum.so");
+    let stamp_path = cache_dir.join("intel_accum.stamp");
+    let mut pairs: Vec<(PathBuf, PathBuf)> = [
+        "kernels/intel/accum.cpp",
+        "kernels/cxx/step_compute_accum.cpp",
+        "kernels/cxx/step_verify_accum.cpp",
+        "build.rs",
+    ]
+    .iter()
+    .map(|p| (PathBuf::from(p), PathBuf::from(p)))
+    .collect();
+    pairs.extend(cxx_root_headers(cxx_root));
+    let hash = stamp::hash_labeled(&pairs, &[icpx_version, RECURSION_ACCUM_STAMP_VERSION]);
+    if !stamp::need_rebuild(&so_path, &stamp_path, &hash) {
+        eprintln!("Using cached Intel recursion accum kernel");
+        return;
+    }
+    eprintln!("Building Intel SYCL accum kernel for recursion...");
+    let marker = "// @RECURSION_ACCUM_STEPS@";
+    let wrapper = std::fs::read_to_string("kernels/intel/accum.cpp").unwrap();
+    assert!(wrapper.contains(marker), "accum.cpp lost its {marker} marker");
+    let mut steps = String::new();
+    for f in ["kernels/cxx/step_compute_accum.cpp", "kernels/cxx/step_verify_accum.cpp"] {
+        let src = std::fs::read_to_string(f).unwrap();
+        for inc in ["#include \"extern.h\"\n", "#include \"ffi.h\"\n"] {
+            assert!(src.contains(inc), "{f}: expected {inc:?}");
+        }
+        steps.push_str(&src.replace("#include \"extern.h\"\n", "").replace("#include \"ffi.h\"\n", ""));
+        steps.push('\n');
+    }
+    let amalg_path = out_dir.join("intel_recursion_accum_amalg.cpp");
+    std::fs::write(&amalg_path, wrapper.replace(marker, &steps)).unwrap();
+    let mut cmd = Command::new(icpx);
+    cmd.arg("-shared")
+        .arg("-fPIC")
+        .arg("-fsycl")
+        .arg("-std=c++17")
+        .arg("-O2")
+        .arg("-Wno-unused-parameter")
+        .arg("-Wno-unused-function")
+        .arg("-Wno-unused-variable")
+        .arg("-Wno-sign-compare")
+        .arg(format!("-I{cxx_root}"))
+        .arg("-Ikernels/cxx")
+        .arg(&amalg_path)
+        .arg("-o")
+        .arg(&so_path)
+        .arg("-fsycl-targets=intel_gpu_bmg_g31");
+    eprintln!("  Running: {:?}", cmd);
+    let output = cmd.output().expect("Failed to run icpx");
+    if !output.status.success() {
+        stamp::write(&stamp_path, &hash, icpx_version, "failed");
+        panic!("Intel recursion accum compilation failed:\n{}", String::from_utf8_lossy(&output.stderr));
+    }
+    stamp::write(&stamp_path, &hash, icpx_version, "ok");
+    eprintln!("  Built {}", so_path.display());
 }
 
 fn rerun_if_changed<P: AsRef<Path>>(path: P) {

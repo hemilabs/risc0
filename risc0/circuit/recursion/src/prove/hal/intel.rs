@@ -251,6 +251,16 @@ impl<IH: IntelHash> CircuitWitnessGenerator<IntelHal<IH>> for IntelCircuitHal<IH
     }
 }
 
+/// RISC0_RECURSION_GPU_ACCUM: default on (GPU accum); "0" runs the CPU accum
+/// on host copies; "check" runs both and compares the full accum buffer.
+fn gpu_accum_mode() -> &'static str {
+    match std::env::var("RISC0_RECURSION_GPU_ACCUM").as_deref() {
+        Ok("0") => "cpu",
+        Ok("check") => "check",
+        _ => "gpu",
+    }
+}
+
 impl<IH: IntelHash> CircuitAccumulator<IntelHal<IH>> for IntelCircuitHal<IH> {
     fn accumulate(
         &self,
@@ -262,6 +272,73 @@ impl<IH: IntelHash> CircuitAccumulator<IntelHal<IH>> for IntelCircuitHal<IH> {
         mix: &IntelBuffer<BabyBearElem>,
         accum: &IntelBuffer<BabyBearElem>,
     ) -> Result<()> {
+        let mode = gpu_accum_mode();
+        if mode == "cpu" {
+            return self
+                .accumulate_cpu(work_cycles, total_cycles, ctrl, global, data, mix, accum, true)
+                .map(|_| ());
+        }
+        let t0 = std::time::Instant::now();
+        let reference = if mode == "check" {
+            Some(self.accumulate_cpu(work_cycles, total_cycles, ctrl, global, data, mix, accum, false)?)
+        } else {
+            // The data host shadow is only needed by the CPU accum; free it
+            // off the GPU thread.
+            if let Some(v) = self.data_shadow.lock().unwrap().take() {
+                std::thread::spawn(move || drop(v));
+            }
+            None
+        };
+        let dp = |b: &IntelBuffer<BabyBearElem>| b.as_device_ptr().0 as *mut std::ffi::c_void;
+        ffi_wrap(|| unsafe {
+            risc0_circuit_recursion_sys::risc0_circuit_recursion_intel_accum(
+                risc0_sys::intel::get_queue(),
+                dp(ctrl),
+                dp(global),
+                dp(data),
+                dp(mix),
+                dp(accum),
+                work_cycles,
+                total_cycles,
+            )
+        })?;
+        if let Some(r) = reference {
+            let dev = dtoh_vec(accum);
+            let bad = dev
+                .iter()
+                .zip(r.iter())
+                .filter(|(a, b)| a.as_u32_montgomery() != b.as_u32_montgomery())
+                .count();
+            if bad != 0 || dev.len() != r.len() {
+                bail!("recursion GPU accum mismatch: {bad} of {} differ (work_cycles={work_cycles})", dev.len());
+            }
+            eprintln!("[recursion_gpu_accum_check] identical ({} elems, work_cycles={work_cycles})", dev.len());
+        }
+        if std::env::var_os("RISC0_VERBOSE").is_some() {
+            eprintln!(
+                "[recursion_accum_intel] gpu enqueue={:.1}ms work_cycles={work_cycles} total_cycles={total_cycles}",
+                t0.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        Ok(())
+    }
+}
+
+impl<IH: IntelHash> IntelCircuitHal<IH> {
+    /// CPU accum on host copies (host shadows when available). With `upload`
+    /// the result is written back to the device; returns the host accum.
+    #[allow(clippy::too_many_arguments)]
+    fn accumulate_cpu(
+        &self,
+        work_cycles: u32,
+        total_cycles: u32,
+        ctrl: &IntelBuffer<BabyBearElem>,
+        global: &IntelBuffer<BabyBearElem>,
+        data: &IntelBuffer<BabyBearElem>,
+        mix: &IntelBuffer<BabyBearElem>,
+        accum: &IntelBuffer<BabyBearElem>,
+        upload: bool,
+    ) -> Result<Vec<BabyBearElem>> {
         let verbose = std::env::var_os("RISC0_VERBOSE").is_some();
         let t0 = std::time::Instant::now();
         let total = total_cycles as usize;
@@ -316,9 +393,11 @@ impl<IH: IntelHash> CircuitAccumulator<IntelHal<IH>> for IntelCircuitHal<IH> {
         // Upload modified buffers back to GPU (H2D only, no redundant D2H).
         // The accum steps write only args[4] (accum), so global is unchanged.
         let t2 = std::time::Instant::now();
-        accum.copy_from_host(&accum_host);
-        if !shadow {
-            global.copy_from_host(&global_host);
+        if upload {
+            accum.copy_from_host(&accum_host);
+            if !shadow {
+                global.copy_from_host(&global_host);
+            }
         }
         let h2d_ms = t2.elapsed().as_secs_f64() * 1000.0;
 
@@ -328,7 +407,7 @@ impl<IH: IntelHash> CircuitAccumulator<IntelHal<IH>> for IntelCircuitHal<IH> {
                 work_cycles, total_cycles);
         }
 
-        Ok(())
+        Ok(accum_host)
     }
 }
 

@@ -123,4 +123,17 @@ extern "C" {
         po2: u32,
         domain: u32,
     ) -> *const std::os::raw::c_char;
+
+    /// GPU accum (step_compute_accum, prefix product, step_verify_accum) on
+    /// the device buffers; enqueued on `queue` without waiting.
+    pub fn risc0_circuit_recursion_intel_accum(
+        queue: *mut std::os::raw::c_void,
+        ctrl: *mut std::os::raw::c_void,
+        global: *mut std::os::raw::c_void,
+        data: *mut std::os::raw::c_void,
+        mix: *mut std::os::raw::c_void,
+        accum: *mut std::os::raw::c_void,
+        work: u32,
+        total: u32,
+    ) -> *const std::os::raw::c_char;
 }
