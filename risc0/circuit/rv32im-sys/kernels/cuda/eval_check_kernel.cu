@@ -180,6 +180,14 @@ const char* risc0_circuit_rv32im_cuda_eval_check_dep() {
     cudaEvent_t event = getEvalCheckEvent();
     CUDA_OK(cudaEventRecord(event, getEvalCheckStream()));
     CUDA_OK(cudaStreamWaitEvent(getPersistentStream(), event, 0));
+    // Wait on the host too. The caller (DeferredFinalize::complete) frees what eval_check
+    // reads -- the committed groups' evaluated buffers, released at po2 >= 22 -- as soon as this
+    // returns. A freed buffer goes back to the pool, or for >= 8 GB is unmapped, at once, and
+    // eval_check runs on a non-blocking stream that nothing else is ordered after: a
+    // synchronous copy or another stream could overwrite it, or the unmap fault it, while
+    // eval_check still reads it. Finalize waits for eval_check's result next anyway, so
+    // this costs no overlap.
+    CUDA_OK(cudaStreamSynchronize(getEvalCheckStream()));
   } catch (const std::exception& err) {
     return strdup(err.what());
   } catch (...) {
