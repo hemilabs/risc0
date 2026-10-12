@@ -60,8 +60,7 @@ static CACHED_GRAPH: OnceLock<CachedGraph> = OnceLock::new();
 
 fn get_cached_graph(graph_path: &Path) -> &'static CachedGraph {
     CACHED_GRAPH.get_or_init(|| {
-        let graph_bytes =
-            std::fs::read(graph_path).expect("failed to read circom graph file");
+        let graph_bytes = std::fs::read(graph_path).expect("failed to read circom graph file");
         let (nodes, signals, input_mapping) =
             deserialize_witnesscalc_graph_from_bytes(&graph_bytes)
                 .expect("failed to deserialize circom graph");
@@ -89,8 +88,7 @@ pub(crate) fn preload_srs() -> Result<()> {
     let root_dir = get_root_dir()?;
     let setup_params =
         SetupParams::new(root_dir).context("failed to create groth16 setup params for preload")?;
-    risc0_groth16_sys::preload(&setup_params)
-        .context("failed to preload groth16 SRS")?;
+    risc0_groth16_sys::preload(&setup_params).context("failed to preload groth16 SRS")?;
     Ok(())
 }
 
@@ -118,8 +116,7 @@ pub(crate) fn shrink_wrap(seal_bytes: &[u8]) -> Result<Seal> {
 
     let witness_params = WitnessParams::new(root_dir);
     let graph = get_cached_graph(&witness_params.graph_path);
-    let witness = calc_witness(graph, &inputs)
-        .context("failed to calculate groth16 witness")?;
+    let witness = calc_witness(graph, &inputs).context("failed to calculate groth16 witness")?;
 
     // Wait for SRS preload to complete before taking the GPU lock.
     let _ = srs_preload.join();
@@ -158,9 +155,8 @@ fn calc_witness(graph: &CachedGraph, inputs: &str) -> Result<CalcWitness> {
         .ok_or_else(|| anyhow::anyhow!("unexpected graph node type"))?;
 
     // Parse inputs into field elements.
-    let input_list: HashMap<String, Vec<U254>> =
-        deserialize_inputs2(inputs.as_bytes(), &nodes.ff)
-            .map_err(|e| anyhow::anyhow!("failed to deserialize inputs: {e}"))?;
+    let input_list: HashMap<String, Vec<U254>> = deserialize_inputs2(inputs.as_bytes(), &nodes.ff)
+        .map_err(|e| anyhow::anyhow!("failed to deserialize inputs: {e}"))?;
 
     // Map parsed inputs to the input index array.
     let mut max_idx: usize = 0;

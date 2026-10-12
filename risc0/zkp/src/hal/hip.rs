@@ -35,7 +35,7 @@ use risc0_sys::{
     cuda::{DevicePointer, *},
     ffi_wrap,
     hip::{
-        hip_check, hipDeviceGetAttribute, hipGetDeviceCount, hipInit, hipSetDevice,
+        hipDeviceGetAttribute, hipGetDeviceCount, hipInit, hipSetDevice, hip_check,
         HipDeviceBuffer, HIP_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
     },
 };
@@ -84,9 +84,7 @@ impl BufferPool {
     fn push(&mut self, size: usize, buf: HipDeviceBuffer) {
         // Always pool small buffers (hipFree overhead > storage cost).
         // Only enforce cap for large buffers.
-        if size >= BUFFER_POOL_SMALL_THRESHOLD
-            && self.total_cached + size > BUFFER_POOL_MAX_BYTES
-        {
+        if size >= BUFFER_POOL_SMALL_THRESHOLD && self.total_cached + size > BUFFER_POOL_MAX_BYTES {
             drop(buf);
             return;
         }
@@ -118,12 +116,11 @@ fn auto_configure_sdma() {
         }
 
         // Parse HIP_VISIBLE_DEVICES to know which GPUs are active.
-        let visible: Option<Vec<usize>> =
-            std::env::var("HIP_VISIBLE_DEVICES").ok().map(|val| {
-                val.split(',')
-                    .filter_map(|s| s.trim().parse().ok())
-                    .collect()
-            });
+        let visible: Option<Vec<usize>> = std::env::var("HIP_VISIBLE_DEVICES").ok().map(|val| {
+            val.split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect()
+        });
 
         // Read GPU architectures from sysfs (works without HIP runtime).
         // /sys/class/kfd/kfd/topology/nodes/*/properties has gfx_target_version.
@@ -247,9 +244,7 @@ pub fn singleton() -> &'static ReentrantMutex<()> {
 
 pub fn singleton_for_device(device: i32) -> &'static ReentrantMutex<()> {
     static ONCE: OnceLock<Vec<ReentrantMutex<()>>> = OnceLock::new();
-    let locks = ONCE.get_or_init(|| {
-        (0..16).map(|_| ReentrantMutex::new(())).collect()
-    });
+    let locks = ONCE.get_or_init(|| (0..16).map(|_| ReentrantMutex::new(())).collect());
     &locks[device as usize]
 }
 
@@ -357,9 +352,7 @@ impl HipHash for HipHashPoseidon2 {
     }
 
     fn hash_fold_tree(&self, io: &BufferImpl<Digest>, layers: usize) {
-        let err = unsafe {
-            sppark_poseidon2_fold_tree(io.as_device_ptr(), layers as u32)
-        };
+        let err = unsafe { sppark_poseidon2_fold_tree(io.as_device_ptr(), layers as u32) };
         if err.code != 0 {
             panic!("Failure during hash_fold_tree: {err}");
         }
@@ -411,9 +404,7 @@ impl HipHash for HipHashPoseidon254 {
     }
 
     fn hash_fold_tree(&self, io: &BufferImpl<Digest>, layers: usize) {
-        let err = unsafe {
-            sppark_poseidon254_fold_tree(io.as_device_ptr(), layers as u32)
-        };
+        let err = unsafe { sppark_poseidon254_fold_tree(io.as_device_ptr(), layers as u32) };
         if err.code != 0 {
             panic!("Failure during hash_fold_tree: {err}");
         }
@@ -470,7 +461,9 @@ impl RawBuffer {
                     // Clear the stale HIP error from the failed hipMalloc above.
                     // Without this, sppark's cudaGetLastError() picks up the old
                     // "out of memory" error and panics even though the retry succeeds.
-                    unsafe { risc0_sys::hip::hipGetLastError(); }
+                    unsafe {
+                        risc0_sys::hip::hipGetLastError();
+                    }
                     HipDeviceBuffer::uninitialized(size)
                         .context(format!("allocation failed on {name}: {size} bytes"))
                         .unwrap()
@@ -915,7 +908,6 @@ impl<HH: HipHash + ?Sized> Hal for HipHal<HH> {
         if err.code != 0 {
             panic!("Failure during batch_interpolate_ntt: {err}");
         }
-
     }
 
     fn batch_bit_reverse(&self, io: &Self::Buffer<Self::Elem>, count: usize) {
@@ -927,9 +919,8 @@ impl<HH: HipHash + ?Sized> Hal for HipHal<HH> {
         // Sync persistent stream before sppark operates on the buffer.
         Self::sync_stream();
 
-        let err = unsafe {
-            sppark_batch_bit_reverse(io.as_device_ptr(), bits as u32, count as u32)
-        };
+        let err =
+            unsafe { sppark_batch_bit_reverse(io.as_device_ptr(), bits as u32, count as u32) };
         if err.code != 0 {
             panic!("Failure during sppark_batch_bit_reverse: {err}");
         }
@@ -1294,12 +1285,7 @@ impl<HH: HipHash + ?Sized> Hal for HipHal<HH> {
         .unwrap();
     }
 
-    fn scatter_bits(
-        &self,
-        into: &Self::Buffer<Self::Elem>,
-        bit_data: &[u32],
-        cycles: u32,
-    ) {
+    fn scatter_bits(&self, into: &Self::Buffer<Self::Elem>, bit_data: &[u32], cycles: u32) {
         let count = bit_data.len() / 3;
         if count == 0 {
             return;

@@ -49,8 +49,8 @@ pub fn max_keccak_inputs(po2: usize) -> usize {
 #[cfg(feature = "prove")]
 pub fn compute_keccak_digest(input: &[u8]) -> Digest {
     use risc0_core::field::baby_bear::BabyBearElem;
-    use risc0_zkp::core::digest::{DIGEST_WORDS, Digest};
-    use risc0_zkp::core::hash::poseidon2::{CELLS, poseidon2_mix};
+    use risc0_zkp::core::digest::{Digest, DIGEST_WORDS};
+    use risc0_zkp::core::hash::poseidon2::{poseidon2_mix, CELLS};
 
     let mut transcript = vec![];
 

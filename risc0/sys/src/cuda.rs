@@ -94,10 +94,7 @@ extern "C" {
         num_hashes: usize,
     ) -> sppark::Error;
 
-    pub fn sppark_poseidon2_fold_tree(
-        nodes: DevicePointer<u8>,
-        layers: u32,
-    ) -> sppark::Error;
+    pub fn sppark_poseidon2_fold_tree(nodes: DevicePointer<u8>, layers: u32) -> sppark::Error;
 
     pub fn sppark_poseidon2_rows(
         d_out: DevicePointer<u8>,
@@ -112,10 +109,7 @@ extern "C" {
         num_hashes: usize,
     ) -> sppark::Error;
 
-    pub fn sppark_poseidon254_fold_tree(
-        nodes: DevicePointer<u8>,
-        layers: u32,
-    ) -> sppark::Error;
+    pub fn sppark_poseidon254_fold_tree(nodes: DevicePointer<u8>, layers: u32) -> sppark::Error;
 
     pub fn sppark_poseidon254_rows(
         d_out: DevicePointer<u8>,

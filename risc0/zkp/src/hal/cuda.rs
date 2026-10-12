@@ -13,13 +13,8 @@
 // limitations under the License.
 
 use std::{
-    cell::RefCell,
-    collections::HashMap,
-    fmt::Debug,
-    marker::PhantomData,
-    mem::ManuallyDrop,
-    rc::Rc,
-    sync::OnceLock,
+    cell::RefCell, collections::HashMap, fmt::Debug, marker::PhantomData, mem::ManuallyDrop,
+    rc::Rc, sync::OnceLock,
 };
 
 use anyhow::{bail, Context as _, Result};
@@ -82,9 +77,7 @@ impl BufferPool {
     fn push(&mut self, size: usize, buf: DeviceBuffer<u8>) {
         // Always pool small buffers (cuMemFree overhead > storage cost).
         // Only enforce cap for large buffers.
-        if size >= BUFFER_POOL_SMALL_THRESHOLD
-            && self.total_cached + size > BUFFER_POOL_MAX_BYTES
-        {
+        if size >= BUFFER_POOL_SMALL_THRESHOLD && self.total_cached + size > BUFFER_POOL_MAX_BYTES {
             drop(buf);
             return;
         }
@@ -217,9 +210,7 @@ impl CudaHash for CudaHashPoseidon2 {
     }
 
     fn hash_fold_tree(&self, io: &BufferImpl<Digest>, layers: usize) {
-        let err = unsafe {
-            sppark_poseidon2_fold_tree(io.as_device_ptr(), layers as u32)
-        };
+        let err = unsafe { sppark_poseidon2_fold_tree(io.as_device_ptr(), layers as u32) };
         if err.code != 0 {
             panic!("Failure during hash_fold_tree: {err}");
         }
@@ -271,9 +262,7 @@ impl CudaHash for CudaHashPoseidon254 {
     }
 
     fn hash_fold_tree(&self, io: &BufferImpl<Digest>, layers: usize) {
-        let err = unsafe {
-            sppark_poseidon254_fold_tree(io.as_device_ptr(), layers as u32)
-        };
+        let err = unsafe { sppark_poseidon254_fold_tree(io.as_device_ptr(), layers as u32) };
         if err.code != 0 {
             panic!("Failure during hash_fold_tree: {err}");
         }
@@ -1078,12 +1067,7 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
         .unwrap();
     }
 
-    fn scatter_bits(
-        &self,
-        into: &Self::Buffer<Self::Elem>,
-        bit_data: &[u32],
-        cycles: u32,
-    ) {
+    fn scatter_bits(&self, into: &Self::Buffer<Self::Elem>, bit_data: &[u32], cycles: u32) {
         let count = bit_data.len() / 3;
         if count == 0 {
             return;

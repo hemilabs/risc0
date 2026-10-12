@@ -40,9 +40,7 @@ fn main() -> ExitCode {
         "succinct" => ReceiptKind::Succinct,
         "groth16" => ReceiptKind::Groth16,
         other => {
-            eprintln!(
-                "unknown receipt kind '{other}' (expected composite|succinct|groth16)"
-            );
+            eprintln!("unknown receipt kind '{other}' (expected composite|succinct|groth16)");
             return ExitCode::from(2);
         }
     };
@@ -106,7 +104,10 @@ fn main() -> ExitCode {
             .segment_limit_po2(po2)
             .build()
             .unwrap();
-        let session = ExecutorImpl::from_elf(env, BENCH_ELF).unwrap().run().unwrap();
+        let session = ExecutorImpl::from_elf(env, BENCH_ELF)
+            .unwrap()
+            .run()
+            .unwrap();
 
         // Surface non-halt exits — a Fault or SystemSplit would otherwise just
         // propagate as a possibly-valid receipt that proves "the program crashed".

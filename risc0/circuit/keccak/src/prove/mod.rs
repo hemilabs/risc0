@@ -37,16 +37,16 @@ use self::{
     preflight::PreflightTrace,
 };
 use crate::{
-    KeccakState,
     zirgen::{
-        CircuitImpl,
         circuit::{
-            CircuitField, ExtVal, LAYOUT_GLOBAL, REGCOUNT_ACCUM, REGCOUNT_CODE, REGCOUNT_DATA,
+            CircuitField, ExtVal, Val, LAYOUT_GLOBAL, REGCOUNT_ACCUM, REGCOUNT_CODE, REGCOUNT_DATA,
             REGCOUNT_GLOBAL, REGCOUNT_MIX, REGISTER_GROUP_ACCUM, REGISTER_GROUP_CODE,
-            REGISTER_GROUP_DATA, Val,
+            REGISTER_GROUP_DATA,
         },
         taps::TAPSET,
+        CircuitImpl,
     },
+    KeccakState,
 };
 
 const GLOBAL_MIX: usize = 0;

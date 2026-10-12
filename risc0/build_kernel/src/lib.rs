@@ -466,14 +466,11 @@ pub fn emit_rocm_lib_link() {
 /// Looks in `C:\Program Files\AMD\ROCm\<version>\<subdir>\<filename>`,
 /// trying the latest version first.
 fn find_in_windows_rocm(subdir: &str, filename: &str) -> Option<String> {
-    let program_files = env::var("ProgramFiles")
-        .unwrap_or_else(|_| r"C:\Program Files".to_string());
+    let program_files =
+        env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".to_string());
     let rocm_dir = PathBuf::from(&program_files).join("AMD").join("ROCm");
     if let Ok(entries) = fs::read_dir(&rocm_dir) {
-        let mut versions: Vec<PathBuf> = entries
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .collect();
+        let mut versions: Vec<PathBuf> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
         versions.sort();
         // Try latest version first
         for ver in versions.iter().rev() {
@@ -541,11 +538,7 @@ fn hip_compile_single(
     let status = cmd
         .status()
         .unwrap_or_else(|e| panic!("hipcc failed to start: {e}"));
-    assert!(
-        status.success(),
-        "hipcc failed for {}",
-        source.display()
-    );
+    assert!(status.success(), "hipcc failed for {}", source.display());
 }
 
 /// Parallel multi-arch compilation:
@@ -598,7 +591,9 @@ fn hip_compile_parallel(
 
         let status = cmd.status()?;
         if !status.success() {
-            return Err(format!("hipcc --offload-host-only failed for {}", source.display()).into());
+            return Err(
+                format!("hipcc --offload-host-only failed for {}", source.display()).into(),
+            );
         }
     }
 
@@ -622,7 +617,9 @@ fn hip_compile_parallel(
                 .status()
                 .map_err(|e| format!("hipcc device-only ({arch}) failed to start: {e}"))?;
             if !status.success() {
-                return Err(format!("hipcc --offload-device-only --offload-arch={arch} failed"));
+                return Err(format!(
+                    "hipcc --offload-device-only --offload-arch={arch} failed"
+                ));
             }
             Ok(dev_obj)
         })
@@ -659,7 +656,11 @@ fn hip_compile_parallel(
     cmd.arg(format!("-output={}", output.display()));
     cmd.arg(format!("-targets={targets}"));
 
-    eprintln!("hip_compile: bundling {} arches → {}", arch_list.len(), output.display());
+    eprintln!(
+        "hip_compile: bundling {} arches → {}",
+        arch_list.len(),
+        output.display()
+    );
     let status = cmd.status()?;
     if !status.success() {
         return Err("clang-offload-bundler failed".into());

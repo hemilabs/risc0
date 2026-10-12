@@ -22,7 +22,10 @@ fn main() {
         .segment_limit_po2(po2)
         .build()
         .unwrap();
-    let session = ExecutorImpl::from_elf(env, BENCH_ELF).unwrap().run().unwrap();
+    let session = ExecutorImpl::from_elf(env, BENCH_ELF)
+        .unwrap()
+        .run()
+        .unwrap();
     eprintln!(
         "  segments: {}, total_cycles: {}, user_cycles: {}",
         session.segments.len(),

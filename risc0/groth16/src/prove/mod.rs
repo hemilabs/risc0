@@ -16,12 +16,12 @@
 
 #[cfg(feature = "cuda")]
 mod cuda;
-#[cfg(feature = "rocm")]
-mod hip;
 #[cfg(not(any(feature = "cuda", feature = "rocm")))]
 mod docker;
 #[cfg(all(feature = "intel", not(any(feature = "cuda", feature = "rocm"))))]
 mod fast;
+#[cfg(feature = "rocm")]
+mod hip;
 mod seal_format;
 mod seal_to_json;
 

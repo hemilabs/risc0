@@ -123,7 +123,10 @@ fn build_program() -> Result<Program> {
         .ok_or_else(|| anyhow!("unexpected witness graph node type"))?;
     // The seal is the only input signal ("iop"), K_SEAL_ELEMS long.
     if input_mapping.len() != 1 {
-        bail!("witness graph has {} input signals, expected 1", input_mapping.len());
+        bail!(
+            "witness graph has {} input signals, expected 1",
+            input_mapping.len()
+        );
     }
     let &(input_offset, input_len) = input_mapping.values().next().unwrap();
     if input_len != K_SEAL_ELEMS {
@@ -182,7 +185,11 @@ pub(crate) fn preload() -> Result<()> {
 /// generator's JSON parsing).
 fn seal_inputs(seal_bytes: &[u8]) -> Result<Vec<U254>> {
     if seal_bytes.len() != K_SEAL_WORDS * 4 {
-        bail!("identity_p254 seal has {} bytes, expected {}", seal_bytes.len(), K_SEAL_WORDS * 4);
+        bail!(
+            "identity_p254 seal has {} bytes, expected {}",
+            seal_bytes.len(),
+            K_SEAL_WORDS * 4
+        );
     }
     let iop: &[u32] = bytemuck::cast_slice(seal_bytes);
     let mut values = Vec::with_capacity(K_SEAL_ELEMS);
@@ -213,7 +220,9 @@ fn write_witness(prog: &Program, inputs: &[U254], out: impl Write) -> Result<()>
             // [input_offset, input_offset + input_len); any other input is 0.
             Op::Leaf => match prog.nodes[i] {
                 Node::Input(0) => Fr::from(1u64),
-                Node::Input(x) if x >= prog.input_offset && x < prog.input_offset + prog.input_len => {
+                Node::Input(x)
+                    if x >= prog.input_offset && x < prog.input_offset + prog.input_len =>
+                {
                     to_fr(&inputs[x - prog.input_offset])
                 }
                 Node::Input(x) if x < prog.input_offset => Fr::zero(),
@@ -309,15 +318,29 @@ fn start_prover() -> Result<Prover> {
         .arg("timeout")
         .arg(IMAGE)
         .arg(PROVER_TIMEOUT_S.to_string())
-        .args(["prover", "stark_verify.cs", "stark_verify_final.pk.dmp", "/mnt/witness.wtns", "/mnt/proof.json"])
+        .args([
+            "prover",
+            "stark_verify.cs",
+            "stark_verify_final.pk.dmp",
+            "/mnt/witness.wtns",
+            "/mnt/proof.json",
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::from(File::create(dir.path().join("prover.log"))?))
         .spawn()
         .context("failed to start the groth16 prover container")?;
     // Read-write open of a FIFO does not block on Linux and keeps a writer
     // alive until we are done (see the module docs).
-    let fifo = std::fs::OpenOptions::new().read(true).write(true).open(&fifo_path)?;
-    Ok(Prover { child: Some(child), name, dir, fifo: Some(fifo) })
+    let fifo = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&fifo_path)?;
+    Ok(Prover {
+        child: Some(child),
+        name,
+        dir,
+        fifo: Some(fifo),
+    })
 }
 
 /// Start the prover container ahead of shrink_wrap so that it loads the

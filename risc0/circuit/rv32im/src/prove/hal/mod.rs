@@ -15,12 +15,15 @@
 pub(crate) mod cpu;
 #[cfg(feature = "cuda")]
 pub(crate) mod cuda;
-#[cfg(feature = "intel")]
-pub(crate) mod intel;
 #[cfg(feature = "rocm")]
 pub(crate) mod hip;
+#[cfg(feature = "intel")]
+pub(crate) mod intel;
 
-use std::{cell::RefCell, sync::{Arc, LazyLock}};
+use std::{
+    cell::RefCell,
+    sync::{Arc, LazyLock},
+};
 
 use anyhow::Result;
 use risc0_core::scope;
@@ -189,14 +192,24 @@ where
         };
 
         let (hal, circuit_hal) = self.get_hal();
-        if *VERBOSE { eprintln!("[prove_core] hal_factory: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0); }
+        if *VERBOSE {
+            eprintln!(
+                "[prove_core] hal_factory: {:.1}ms",
+                t0.elapsed().as_secs_f64() * 1000.0
+            );
+        }
 
         let t1 = std::time::Instant::now();
         let po2 = preflight_results.po2();
         let header = preflight_results.build_header();
         let witgen =
             WitnessGenerator::new(hal.as_ref(), circuit_hal.as_ref(), preflight_results, mode)?;
-        if *VERBOSE { eprintln!("[prove_core] witgen: {:.1}ms", t1.elapsed().as_secs_f64() * 1000.0); }
+        if *VERBOSE {
+            eprintln!(
+                "[prove_core] witgen: {:.1}ms",
+                t1.elapsed().as_secs_f64() * 1000.0
+            );
+        }
 
         let code = &witgen.code.buf;
         let data = &witgen.data.buf;
@@ -233,7 +246,12 @@ where
                 prover.iop().commit(&header_digest);
                 prover.iop().write_field_elem_slice(header.as_slice());
                 prover.set_po2(po2 as usize);
-                if *VERBOSE { eprintln!("  [main] setup: {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0); }
+                if *VERBOSE {
+                    eprintln!(
+                        "  [main] setup: {:.1}ms",
+                        mt0.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
 
                 // Code buffer is always zeros (INVALID → zeroized, never written to).
                 // Cache its PolyGroup to skip iNTT/expand/merkle on subsequent segments
@@ -243,31 +261,62 @@ where
                     if let Some((ref cached, cached_po2)) = *cache {
                         if cached_po2 == po2 as usize {
                             prover.commit_cached_group(REGISTER_GROUP_CODE, cached.clone());
-                            if *VERBOSE { eprintln!("  [main] commit(code) [cached]: {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0); }
+                            if *VERBOSE {
+                                eprintln!(
+                                    "  [main] commit(code) [cached]: {:.1}ms",
+                                    mt0.elapsed().as_secs_f64() * 1000.0
+                                );
+                            }
                         } else {
                             prover.commit_group(REGISTER_GROUP_CODE, code);
-                            *cache = prover.get_group(REGISTER_GROUP_CODE).cloned()
+                            *cache = prover
+                                .get_group(REGISTER_GROUP_CODE)
+                                .cloned()
                                 .map(|g| (g, po2 as usize));
-                            if *VERBOSE { eprintln!("  [main] commit(code) [recomputed, po2 changed {cached_po2}->{po2}]: {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0); }
+                            if *VERBOSE {
+                                eprintln!("  [main] commit(code) [recomputed, po2 changed {cached_po2}->{po2}]: {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0);
+                            }
                         }
                     } else {
                         prover.commit_group(REGISTER_GROUP_CODE, code);
-                        *cache = prover.get_group(REGISTER_GROUP_CODE).cloned()
+                        *cache = prover
+                            .get_group(REGISTER_GROUP_CODE)
+                            .cloned()
                             .map(|g| (g, po2 as usize));
-                        if *VERBOSE { eprintln!("  [main] commit(code) [computed+cached]: {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0); }
+                        if *VERBOSE {
+                            eprintln!(
+                                "  [main] commit(code) [computed+cached]: {:.1}ms",
+                                mt0.elapsed().as_secs_f64() * 1000.0
+                            );
+                        }
                     }
                 }
                 prover.commit_group(REGISTER_GROUP_DATA, data);
-                if *VERBOSE { eprintln!("  [main] commit(data): {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0); }
+                if *VERBOSE {
+                    eprintln!(
+                        "  [main] commit(data): {:.1}ms",
+                        mt0.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
 
                 // Make the mixing values
                 let mix: [Val; REGCOUNT_MIX] = std::array::from_fn(|_| prover.iop().random_elem());
 
                 let mix = witgen.accum(hal.as_ref(), circuit_hal.as_ref(), &mix)?;
-                if *VERBOSE { eprintln!("  [main] accum: {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0); }
+                if *VERBOSE {
+                    eprintln!(
+                        "  [main] accum: {:.1}ms",
+                        mt0.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
 
                 prover.commit_group(REGISTER_GROUP_ACCUM, &witgen.accum.buf);
-                if *VERBOSE { eprintln!("  [main] commit(accum): {:.1}ms", mt0.elapsed().as_secs_f64() * 1000.0); }
+                if *VERBOSE {
+                    eprintln!(
+                        "  [main] commit(accum): {:.1}ms",
+                        mt0.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
 
                 // Clone tiny global buffer (90 elements = 360 bytes) so witgen can
                 // be dropped during async GPU eval_check.
@@ -287,16 +336,27 @@ where
                 move || {
                     let td = std::time::Instant::now();
                     drop(witgen);
-                    if *VERBOSE { eprintln!("[prove_core] witgen_drop (overlapped with eval_check): {:.1}ms",
-                        td.elapsed().as_secs_f64() * 1000.0); }
+                    if *VERBOSE {
+                        eprintln!(
+                            "[prove_core] witgen_drop (overlapped with eval_check): {:.1}ms",
+                            td.elapsed().as_secs_f64() * 1000.0
+                        );
+                    }
                 },
             );
 
-            if *VERBOSE { eprintln!("[prove_core] prove_inner: {:.1}ms (main: {:.1}ms, finalize: {:.1}ms)",
-                t2.elapsed().as_secs_f64() * 1000.0,
-                (t3 - t2).as_secs_f64() * 1000.0,
-                t3.elapsed().as_secs_f64() * 1000.0);
-            eprintln!("[prove_core] TOTAL: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0); }
+            if *VERBOSE {
+                eprintln!(
+                    "[prove_core] prove_inner: {:.1}ms (main: {:.1}ms, finalize: {:.1}ms)",
+                    t2.elapsed().as_secs_f64() * 1000.0,
+                    (t3 - t2).as_secs_f64() * 1000.0,
+                    t3.elapsed().as_secs_f64() * 1000.0
+                );
+                eprintln!(
+                    "[prove_core] TOTAL: {:.1}ms",
+                    t0.elapsed().as_secs_f64() * 1000.0
+                );
+            }
             result
         });
 
@@ -410,7 +470,8 @@ where
         let seal = deferred.complete(hal.as_ref(), circuit_hal.as_ref());
         *self.pending_seal.borrow_mut() = Some(seal);
 
-        if *VERBOSE { eprintln!(
+        if *VERBOSE {
+            eprintln!(
             "[prove_begin] witgen={:.1}ms data_commit={:.1}ms accum={:.1}ms accum_commit={:.1}ms main={:.1}ms total={:.1}ms",
             t_witgen.as_secs_f64() * 1000.0,
             t_data_commit.as_secs_f64() * 1000.0,
@@ -418,7 +479,8 @@ where
             t_accum_commit.as_secs_f64() * 1000.0,
             t_main.as_secs_f64() * 1000.0,
             t0.elapsed().as_secs_f64() * 1000.0
-        ); }
+        );
+        }
 
         Ok(prev_seal)
     }

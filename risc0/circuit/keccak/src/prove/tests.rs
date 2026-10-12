@@ -22,8 +22,8 @@ use test_log::test;
 use super::testutil::test_inputs;
 use crate::{
     prove::{
-        CircuitWitnessGenerator as _, MetaBuffer, PreflightTrace, StepMode, keccak_prover,
-        preflight::ForwardPreflightOrder,
+        keccak_prover, preflight::ForwardPreflightOrder, CircuitWitnessGenerator as _, MetaBuffer,
+        PreflightTrace, StepMode,
     },
     zirgen::circuit::*,
 };

@@ -63,14 +63,24 @@ fn build_rocm_kernels() {
     let blst_src = env::var("DEP_BLST_C_SRC").unwrap();
     let arches = risc0_build_kernel::hip_arches();
     let mut base_flags: Vec<&str> = vec![
-        "-x", "hip",
-        "-std=c++17", "-O3", "-fPIC",
-        "-Wno-unused-function", "-Wno-unused-parameter", "-Wno-missing-braces",
-        "-mllvm", "-amdgpu-early-inline-all=false",
-        "-include", &include_cuda2hip,
-        "-I", kernel_dir.to_str().unwrap(),
-        "-I", &blst_src,
-        "-I", &sppark_root,
+        "-x",
+        "hip",
+        "-std=c++17",
+        "-O3",
+        "-fPIC",
+        "-Wno-unused-function",
+        "-Wno-unused-parameter",
+        "-Wno-missing-braces",
+        "-mllvm",
+        "-amdgpu-early-inline-all=false",
+        "-include",
+        &include_cuda2hip,
+        "-I",
+        kernel_dir.to_str().unwrap(),
+        "-I",
+        &blst_src,
+        "-I",
+        &sppark_root,
         "-D__ADX__",
     ];
 
@@ -116,8 +126,11 @@ fn build_rocm_kernels() {
 
     // Create archive with our HIP object
     let status = Command::new(&ar)
-        .arg("rcs").arg(&lib_path).arg(&obj)
-        .status().expect("failed to run ar");
+        .arg("rcs")
+        .arg(&lib_path)
+        .arg(&obj)
+        .status()
+        .expect("failed to run ar");
     assert!(status.success(), "ar failed");
 
     // Extract blst objects and merge them into our archive
@@ -125,16 +138,21 @@ fn build_rocm_kernels() {
     let _ = std::fs::remove_dir_all(&blst_tmp);
     std::fs::create_dir_all(&blst_tmp).unwrap();
     let status = Command::new(&ar)
-        .arg("x").arg(&blst_lib)
+        .arg("x")
+        .arg(&blst_lib)
         .current_dir(&blst_tmp)
-        .status().expect("failed to extract blst objects");
+        .status()
+        .expect("failed to extract blst objects");
     assert!(status.success(), "ar extract failed");
 
     for entry in std::fs::read_dir(&blst_tmp).unwrap() {
         let obj_path = entry.unwrap().path();
         let status = Command::new(&ar)
-            .arg("rcs").arg(&lib_path).arg(&obj_path)
-            .status().expect("failed to add blst object to archive");
+            .arg("rcs")
+            .arg(&lib_path)
+            .arg(&obj_path)
+            .status()
+            .expect("failed to add blst object to archive");
         assert!(status.success(), "ar append failed");
     }
 

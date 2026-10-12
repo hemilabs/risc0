@@ -126,9 +126,7 @@ extern "C" {
     ) -> *const c_char;
 
     #[cfg(any(feature = "cuda", feature = "rocm"))]
-    fn risc0_groth16_cuda_preload(
-        setup: *const RawSetupParams,
-    ) -> *const c_char;
+    fn risc0_groth16_cuda_preload(setup: *const RawSetupParams) -> *const c_char;
 
     #[cfg(all(any(feature = "cuda", feature = "rocm"), feature = "setup"))]
     fn risc0_groth16_cuda_setup(params: *const RawSetupParams) -> *const c_char;

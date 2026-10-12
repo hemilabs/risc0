@@ -10,7 +10,9 @@ fn main() {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(100);
-    let kind_arg = std::env::args().nth(2).unwrap_or_else(|| "composite".into());
+    let kind_arg = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "composite".into());
     let kind = match kind_arg.as_str() {
         "composite" => ReceiptKind::Composite,
         "succinct" => ReceiptKind::Succinct,
@@ -33,7 +35,10 @@ fn main() {
         env_builder.segment_limit_po2(p as u32);
     }
     let env = env_builder.build().unwrap();
-    let session = ExecutorImpl::from_elf(env, BENCH_ELF).unwrap().run().unwrap();
+    let session = ExecutorImpl::from_elf(env, BENCH_ELF)
+        .unwrap()
+        .run()
+        .unwrap();
     eprintln!(
         "  segments: {}, total_cycles: {}, user_cycles: {}",
         session.segments.len(),
@@ -68,7 +73,11 @@ fn main() {
         session.segments.len(),
         prove_elapsed.as_secs_f64() * 1000.0 / session.segments.len() as f64,
     );
-    println!("verify: {:.3}s  receipt_kind={:?}", verify_elapsed.as_secs_f64(), kind);
+    println!(
+        "verify: {:.3}s  receipt_kind={:?}",
+        verify_elapsed.as_secs_f64(),
+        kind
+    );
     println!("stats:  {:?}", prove_info.stats);
     let bytes = bincode::serialize(&receipt).unwrap();
     println!("receipt size: {} bytes", bytes.len());

@@ -16,10 +16,10 @@ use std::{path::Path, sync::OnceLock};
 
 use anyhow::{anyhow, Context as _, Result};
 use circom_witnesscalc::deserialize_inputs2;
+use circom_witnesscalc::field::FieldOperations;
 use circom_witnesscalc::field::U254;
 use circom_witnesscalc::graph::{Node, Nodes, NodesInterface, NodesStorage, VecNodes};
 use circom_witnesscalc::storage::proto_deserializer::deserialize_witnesscalc_graph_from_bytes;
-use circom_witnesscalc::field::FieldOperations;
 use circom_witnesscalc::InputSignalsInfo;
 use num_traits::{One, Zero};
 use rayon::prelude::*;
@@ -59,7 +59,8 @@ pub(crate) fn preload_graph() -> Result<()> {
         .as_any()
         .downcast_ref::<Nodes<U254, VecNodes>>()
         .expect("expected U254 nodes in circom graph");
-    pg.level_data.get_or_init(|| compute_level_data(&nodes.nodes));
+    pg.level_data
+        .get_or_init(|| compute_level_data(&nodes.nodes));
 
     Ok(())
 }
@@ -68,9 +69,8 @@ fn load_graph(graph_path: &Path) -> ParsedGraph {
     let t0 = std::time::Instant::now();
     let graph_bytes = std::fs::read(graph_path).expect("failed to read circom graph file");
     let t1 = std::time::Instant::now();
-    let (nodes, signals, input_mapping) =
-        deserialize_witnesscalc_graph_from_bytes(&graph_bytes)
-            .expect("failed to parse circom graph");
+    let (nodes, signals, input_mapping) = deserialize_witnesscalc_graph_from_bytes(&graph_bytes)
+        .expect("failed to parse circom graph");
     let t2 = std::time::Instant::now();
     eprintln!(
         "[groth16_witness] graph cached: read={:.1}ms parse={:.1}ms",
@@ -153,8 +153,8 @@ pub(crate) fn shrink_wrap(seal_bytes: &[u8]) -> Result<Seal> {
     let clear_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     // Start SRS preloading on background thread (GPU work, ~1.2s)
-    let setup_params_clone = SetupParams::new(&root_dir)
-        .context("failed to create groth16 setup params for preload")?;
+    let setup_params_clone =
+        SetupParams::new(&root_dir).context("failed to create groth16 setup params for preload")?;
     let preload_handle = std::thread::spawn(move || {
         risc0_zkp::hal::hip::switch_to_device(groth16_device);
         risc0_groth16_sys::preload(&setup_params_clone)
@@ -476,9 +476,8 @@ fn calc_witness(graph_path: &Path, inputs: &str) -> Result<CalcWitness> {
     // FieldElement<32> wraps [u8; 32] (32 bytes). On little-endian, the byte representations
     // are identical (confirmed by U254::as_le_slice). The Vec's alignment (8) exceeds
     // FieldElement's requirement (1).
-    const _: () = assert!(
-        std::mem::size_of::<U254>() == std::mem::size_of::<wtns_file::FieldElement<32>>()
-    );
+    const _: () =
+        assert!(std::mem::size_of::<U254>() == std::mem::size_of::<wtns_file::FieldElement<32>>());
     let witness: Vec<wtns_file::FieldElement<32>> = unsafe {
         let mut result = std::mem::ManuallyDrop::new(result);
         Vec::from_raw_parts(
@@ -552,9 +551,8 @@ fn calc_witness_binary(graph_path: &Path, iop_values: Vec<U254>) -> Result<CalcW
     let t2 = std::time::Instant::now();
 
     // Zero-copy transmute Vec<U254> → Vec<FieldElement<32>>.
-    const _: () = assert!(
-        std::mem::size_of::<U254>() == std::mem::size_of::<wtns_file::FieldElement<32>>()
-    );
+    const _: () =
+        assert!(std::mem::size_of::<U254>() == std::mem::size_of::<wtns_file::FieldElement<32>>());
     let witness: Vec<wtns_file::FieldElement<32>> = unsafe {
         let mut result = std::mem::ManuallyDrop::new(result);
         Vec::from_raw_parts(

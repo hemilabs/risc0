@@ -241,9 +241,8 @@ impl<'a, H: Hal> Prover<'a, H> {
         }
 
         // SAFETY: taps is always &'static TAPSET in practice.
-        let taps: &'static TapSet<'static> = unsafe {
-            std::mem::transmute::<&'_ TapSet<'_>, &'static TapSet<'static>>(self.taps)
-        };
+        let taps: &'static TapSet<'static> =
+            unsafe { std::mem::transmute::<&'_ TapSet<'_>, &'static TapSet<'static>>(self.taps) };
 
         DeferredFinalize {
             taps,
@@ -553,8 +552,7 @@ impl<H: Hal> DeferredFinalize<H> {
         // Sum the combos up into one final polynomial + make it into 4 Fp polys.
         // Additionally, it needs to be bit reversed to make everyone happy
         let final_poly_coeffs = scope!("sum", {
-            let final_poly_coeffs =
-                hal.alloc_elem("final_poly_coeffs", self.cycles * ext_size);
+            let final_poly_coeffs = hal.alloc_elem("final_poly_coeffs", self.cycles * ext_size);
             hal.eltwise_sum_extelem(&final_poly_coeffs, &combos);
             final_poly_coeffs
         });
@@ -587,8 +585,7 @@ impl<H: Hal> DeferredFinalize<H> {
                     trees.push(check_group.merkle.batch_prove(hal, indices));
                     let n = indices.len();
                     let num_trees = trees.len();
-                    let mut result: Vec<Vec<(Vec<H::Elem>, Vec<Digest>)>> =
-                        Vec::with_capacity(n);
+                    let mut result: Vec<Vec<(Vec<H::Elem>, Vec<Digest>)>> = Vec::with_capacity(n);
                     for q in 0..n {
                         let mut query_data = Vec::with_capacity(num_trees);
                         for tree in trees.iter_mut() {
@@ -613,8 +610,7 @@ impl<H: Hal> DeferredFinalize<H> {
                     trees.push(check_group.merkle.batch_prove(hal, indices));
                     let n = indices.len();
                     let num_trees = trees.len();
-                    let mut result: Vec<Vec<(Vec<H::Elem>, Vec<Digest>)>> =
-                        Vec::with_capacity(n);
+                    let mut result: Vec<Vec<(Vec<H::Elem>, Vec<Digest>)>> = Vec::with_capacity(n);
                     for q in 0..n {
                         let mut query_data = Vec::with_capacity(num_trees);
                         for tree in trees.iter_mut() {

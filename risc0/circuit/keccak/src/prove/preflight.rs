@@ -16,7 +16,7 @@
 use risc0_circuit_keccak_sys::ScatterInfo;
 use risc0_core::field::baby_bear::BabyBearElem;
 use risc0_core::scope;
-use risc0_zkp::core::hash::poseidon2::{CELLS, poseidon2_mix};
+use risc0_zkp::core::hash::poseidon2::{poseidon2_mix, CELLS};
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 

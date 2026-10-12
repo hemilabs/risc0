@@ -172,7 +172,10 @@ fn intel_ab(program: Program) {
     use crate::prove::hal::intel::IntelCircuitHalPoseidon2;
 
     fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
-        std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
     }
     let po2: usize = env_or("RISC0_WITGEN_AB_PO2", DEFAULT_SEGMENT_LIMIT_PO2);
     let reps: usize = env_or("RISC0_WITGEN_AB_REPS", 5);
@@ -198,14 +201,22 @@ fn intel_ab(program: Program) {
     let rand_z = ExtVal::random(&mut rng);
     let mut total_bad = 0usize;
 
-    eprintln!("[witgen-ab] {} segment(s), po2 limit={po2}", session.segments.len());
+    eprintln!(
+        "[witgen-ab] {} segment(s), po2 limit={po2}",
+        session.segments.len()
+    );
     for segment in session.segments {
         let pf = PreflightResults::new(&segment, rand_z).unwrap();
         let cycles = 1usize << segment.po2;
-        let cpu = WitnessGenerator::new(cpu_hal.as_ref(), &cpu_circuit, pf.clone(), StepMode::SeqForward)
-            .unwrap()
-            .data
-            .to_vec();
+        let cpu = WitnessGenerator::new(
+            cpu_hal.as_ref(),
+            &cpu_circuit,
+            pf.clone(),
+            StepMode::SeqForward,
+        )
+        .unwrap()
+        .data
+        .to_vec();
 
         let mut first_intel: Option<Vec<_>> = None;
         for rep in 0..reps {
@@ -250,5 +261,8 @@ fn intel_ab(program: Program) {
             }
         }
     }
-    assert_eq!(total_bad, 0, "Intel parallel witgen diverged from CPU sequential witgen");
+    assert_eq!(
+        total_bad, 0,
+        "Intel parallel witgen diverged from CPU sequential witgen"
+    );
 }

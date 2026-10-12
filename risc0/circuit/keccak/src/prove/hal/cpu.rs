@@ -18,25 +18,25 @@ use std::rc::Rc;
 use anyhow::Result;
 use rayon::{iter::IntoParallelIterator, prelude::*};
 use risc0_circuit_keccak_sys::{
-    RawBuffer, RawExecBuffers, RawPreflightTrace, ScatterInfo, risc0_circuit_keccak_cpu_poly_fp,
-    risc0_circuit_keccak_cpu_witgen,
+    risc0_circuit_keccak_cpu_poly_fp, risc0_circuit_keccak_cpu_witgen, RawBuffer, RawExecBuffers,
+    RawPreflightTrace, ScatterInfo,
 };
 use risc0_core::scope;
 use risc0_sys::ffi_wrap;
 use risc0_zkp::{
-    INV_RATE,
     core::{hash::poseidon2::Poseidon2HashSuite, log2_ceil},
-    field::{Elem as _, ExtElem as _, RootsOfUnity as _, map_pow},
+    field::{map_pow, Elem as _, ExtElem as _, RootsOfUnity as _},
     hal::{
-        AccumPreflight, CircuitHal,
         cpu::{CpuBuffer, CpuHal},
+        AccumPreflight, CircuitHal,
     },
+    INV_RATE,
 };
 
 use crate::{
-    prove::{GLOBAL_MIX, GLOBAL_OUT, KeccakProver, KeccakProverImpl},
+    prove::{KeccakProver, KeccakProverImpl, GLOBAL_MIX, GLOBAL_OUT},
     zirgen::{
-        circuit::{CircuitField, ExtVal, REGISTER_GROUP_ACCUM, REGISTER_GROUP_DATA, Val},
+        circuit::{CircuitField, ExtVal, Val, REGISTER_GROUP_ACCUM, REGISTER_GROUP_DATA},
         info::POLY_MIX_POWERS,
     },
 };

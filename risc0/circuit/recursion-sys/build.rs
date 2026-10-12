@@ -43,7 +43,7 @@ mod stamp {
     }
 
     #[allow(dead_code)] // kept as a convenience entry-point for callers that
-                       // don't need label/content separation
+                        // don't need label/content separation
     pub fn hash(files: &[&Path], extras: &[&str]) -> String {
         let pairs: Vec<(PathBuf, PathBuf)> = files
             .iter()
@@ -178,11 +178,7 @@ mod stamp {
         need_rebuild_multi(&[artifact], stamp_path, expected_hash)
     }
 
-    pub fn need_rebuild_multi(
-        artifacts: &[&Path],
-        stamp_path: &Path,
-        expected_hash: &str,
-    ) -> bool {
+    pub fn need_rebuild_multi(artifacts: &[&Path], stamp_path: &Path, expected_hash: &str) -> bool {
         if artifacts.iter().any(|p| !p.exists()) {
             return true;
         }
@@ -233,12 +229,15 @@ fn compute_recursion_intel_hash(cxx_root: &str, icpx_version: &str) -> String {
     if std::env::var_os("RISC0_RECURSION_SPLIT_POLY_FP").is_some() {
         in_tree.push(PathBuf::from("kernels/intel/split_poly_fp.py"));
     }
-    let mut pairs: Vec<(PathBuf, PathBuf)> =
-        in_tree.into_iter().map(|p| (p.clone(), p)).collect();
+    let mut pairs: Vec<(PathBuf, PathBuf)> = in_tree.into_iter().map(|p| (p.clone(), p)).collect();
     pairs.extend(cxx_root_headers(cxx_root));
     // R3-A06 follow-up: include RISC0_RECURSION_OPTIMIZE env in stamp so the
     // cache invalidates when the user flips the optimization mode.
-    let opt_tag = if std::env::var_os("RISC0_RECURSION_OPTIMIZE").is_some() { "opt1" } else { "opt0" };
+    let opt_tag = if std::env::var_os("RISC0_RECURSION_OPTIMIZE").is_some() {
+        "opt1"
+    } else {
+        "opt0"
+    };
     let split_tag = if std::env::var_os("RISC0_RECURSION_SPLIT_POLY_FP").is_some() {
         let n = std::env::var("RISC0_RECURSION_SPLIT_N").unwrap_or_else(|_| "10".to_string());
         format!("split{n}")
@@ -247,7 +246,13 @@ fn compute_recursion_intel_hash(cxx_root: &str, icpx_version: &str) -> String {
     };
     stamp::hash_labeled(
         &pairs,
-        &[icpx_version, RECURSION_INTEL_STAMP_VERSION, "recursion", opt_tag, &split_tag],
+        &[
+            icpx_version,
+            RECURSION_INTEL_STAMP_VERSION,
+            "recursion",
+            opt_tag,
+            &split_tag,
+        ],
     )
 }
 
@@ -357,16 +362,27 @@ fn build_rocm_kernels() {
     let kernel_dir_str = kernel_dir.to_str().unwrap();
     let arches = risc0_build_kernel::hip_arches();
     let base_flags: Vec<&str> = vec![
-        "-x", "hip",
-        "-std=c++17", "-O3", "-fPIC",
-        "-Wno-unused-function", "-Wno-unused-parameter", "-Wno-missing-braces",
-        "-mllvm", "-amdgpu-early-inline-all=false",
+        "-x",
+        "hip",
+        "-std=c++17",
+        "-O3",
+        "-fPIC",
+        "-Wno-unused-function",
+        "-Wno-unused-parameter",
+        "-Wno-missing-braces",
+        "-mllvm",
+        "-amdgpu-early-inline-all=false",
         "-DFEATURE_BABY_BEAR",
-        "-include", &include_cuda2hip,
-        "-I", &cuda_root,
-        "-I", &cxx_root,
-        "-I", &sppark_root,
-        "-I", kernel_dir_str,
+        "-include",
+        &include_cuda2hip,
+        "-I",
+        &cuda_root,
+        "-I",
+        &cxx_root,
+        "-I",
+        &sppark_root,
+        "-I",
+        kernel_dir_str,
     ];
 
     let mut obj_files = Vec::new();
@@ -445,7 +461,11 @@ fn build_intel_kernels() {
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             let oneapi = PathBuf::from("/opt/intel/oneapi/compiler/latest/bin/icpx");
-            if oneapi.exists() { oneapi } else { PathBuf::from("icpx") }
+            if oneapi.exists() {
+                oneapi
+            } else {
+                PathBuf::from("icpx")
+            }
         });
 
     // Cache directory anchored on the <profile> dir under target/, regardless
@@ -492,7 +512,8 @@ fn build_intel_kernels() {
             .arg("-std=c++17");
         if recursion_optimize {
             cmd.arg("-O2")
-                .arg("-Xs").arg(format!("-options \"-cl-intel-256-GRF-per-thread\""));
+                .arg("-Xs")
+                .arg(format!("-options \"-cl-intel-256-GRF-per-thread\""));
         } else {
             // Fast path (same recipe as rv32im eval_check): -Os, 256 GRF,
             // RISC0_INTEL_EVAL_FAST device helpers (mandatory: without them the
@@ -503,7 +524,9 @@ fn build_intel_kernels() {
                 .arg("-DRISC0_INTEL_EVAL_FAST")
                 .arg("-DRECURSION_QTABLE")
                 .arg("-Xs")
-                .arg("-options \"-cl-intel-256-GRF-per-thread -igc_opts 'DisableRecompilation=1'\"");
+                .arg(
+                    "-options \"-cl-intel-256-GRF-per-thread -igc_opts 'DisableRecompilation=1'\"",
+                );
         }
         cmd.arg("-Wno-unused-parameter")
             .arg("-Wno-unused-function")
@@ -547,18 +570,23 @@ fn build_intel_kernels() {
             let split_dir = out_dir.join("poly_fp_split");
             std::fs::create_dir_all(&split_dir).unwrap();
             let split_script = PathBuf::from("kernels/intel/split_poly_fp.py");
-            let split_n = std::env::var("RISC0_RECURSION_SPLIT_N").unwrap_or_else(|_| "10".to_string());
+            let split_n =
+                std::env::var("RISC0_RECURSION_SPLIT_N").unwrap_or_else(|_| "10".to_string());
             let status = Command::new("python3")
                 .arg(&split_script)
                 .arg("kernels/cxx/poly_fp.cpp")
                 .arg(&split_dir)
-                .arg("--n").arg(&split_n)
+                .arg("--n")
+                .arg(&split_n)
                 .status()
                 .expect("Failed to run split_poly_fp.py");
             if !status.success() {
                 panic!("split_poly_fp.py failed");
             }
-            eprintln!("  RISC0_RECURSION_SPLIT_POLY_FP=1 (n={split_n}): split sources at {}", split_dir.display());
+            eprintln!(
+                "  RISC0_RECURSION_SPLIT_POLY_FP=1 (n={split_n}): split sources at {}",
+                split_dir.display()
+            );
             // Include both split files' bodies.
             for fname in &["rust_poly_fp_0.cpp", "rust_poly_fp_1.cpp"] {
                 let src = std::fs::read_to_string(split_dir.join(fname)).unwrap();
@@ -604,7 +632,10 @@ fn build_intel_kernels() {
             let lazy_path = out_dir.join("intel_recursion_eval_check_amalg_lazy.cpp");
             std::fs::write(&raw_path, &amalg).unwrap();
             for (script, args) in [
-                ("kernels/intel/eval_lazy_chain.py", vec![raw_path.clone(), lazy_path.clone()]),
+                (
+                    "kernels/intel/eval_lazy_chain.py",
+                    vec![raw_path.clone(), lazy_path.clone()],
+                ),
                 (
                     "kernels/intel/eval_remat_loads.py",
                     vec![lazy_path.clone(), amalg_path.clone(), PathBuf::from("400")],
@@ -659,7 +690,13 @@ const RECURSION_ACCUM_STAMP_VERSION: &str = "recursion-accum-v1";
 /// extern_plonk{Read,Write}Accum_wom). Separate library and stamp so that it
 /// does not invalidate the eval_check build. -O2 is bit-exact here (checked
 /// against the CPU accum with RISC0_RECURSION_GPU_ACCUM=check).
-fn build_intel_accum(icpx: &Path, icpx_version: &str, cxx_root: &str, cache_dir: &Path, out_dir: &Path) {
+fn build_intel_accum(
+    icpx: &Path,
+    icpx_version: &str,
+    cxx_root: &str,
+    cache_dir: &Path,
+    out_dir: &Path,
+) {
     let so_path = cache_dir.join("librisc0_recursion_intel_accum.so");
     let stamp_path = cache_dir.join("intel_accum.stamp");
     let mut pairs: Vec<(PathBuf, PathBuf)> = [
@@ -680,14 +717,23 @@ fn build_intel_accum(icpx: &Path, icpx_version: &str, cxx_root: &str, cache_dir:
     eprintln!("Building Intel SYCL accum kernel for recursion...");
     let marker = "// @RECURSION_ACCUM_STEPS@";
     let wrapper = std::fs::read_to_string("kernels/intel/accum.cpp").unwrap();
-    assert!(wrapper.contains(marker), "accum.cpp lost its {marker} marker");
+    assert!(
+        wrapper.contains(marker),
+        "accum.cpp lost its {marker} marker"
+    );
     let mut steps = String::new();
-    for f in ["kernels/cxx/step_compute_accum.cpp", "kernels/cxx/step_verify_accum.cpp"] {
+    for f in [
+        "kernels/cxx/step_compute_accum.cpp",
+        "kernels/cxx/step_verify_accum.cpp",
+    ] {
         let src = std::fs::read_to_string(f).unwrap();
         for inc in ["#include \"extern.h\"\n", "#include \"ffi.h\"\n"] {
             assert!(src.contains(inc), "{f}: expected {inc:?}");
         }
-        steps.push_str(&src.replace("#include \"extern.h\"\n", "").replace("#include \"ffi.h\"\n", ""));
+        steps.push_str(
+            &src.replace("#include \"extern.h\"\n", "")
+                .replace("#include \"ffi.h\"\n", ""),
+        );
         steps.push('\n');
     }
     let amalg_path = out_dir.join("intel_recursion_accum_amalg.cpp");
@@ -712,7 +758,10 @@ fn build_intel_accum(icpx: &Path, icpx_version: &str, cxx_root: &str, cache_dir:
     let output = cmd.output().expect("Failed to run icpx");
     if !output.status.success() {
         stamp::write(&stamp_path, &hash, icpx_version, "failed");
-        panic!("Intel recursion accum compilation failed:\n{}", String::from_utf8_lossy(&output.stderr));
+        panic!(
+            "Intel recursion accum compilation failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
     stamp::write(&stamp_path, &hash, icpx_version, "ok");
     eprintln!("  Built {}", so_path.display());

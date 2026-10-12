@@ -22,7 +22,13 @@ mod program;
 mod witgen;
 pub mod zkr;
 
-use std::{cell::RefCell, collections::HashMap, collections::VecDeque, fmt::Debug, sync::{Arc, LazyLock}};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    collections::VecDeque,
+    fmt::Debug,
+    sync::{Arc, LazyLock},
+};
 
 use anyhow::Result;
 use cfg_if::cfg_if;
@@ -143,11 +149,19 @@ impl Prover {
         }
         #[cfg(feature = "intel")]
         // Default on; RISC0_RECURSION_PREWITGEN=0 keeps witgen on the GPU thread.
-        if !matches!(std::env::var("RISC0_RECURSION_PREWITGEN").as_deref(), Ok("0")) {
+        if !matches!(
+            std::env::var("RISC0_RECURSION_PREWITGEN").as_deref(),
+            Ok("0")
+        ) {
             let t0 = std::time::Instant::now();
             let w = self::witgen::host_witgen(&self.program, &preflight)?;
             *preflight.host_witness.lock().unwrap() = Some(w);
-            if *VERBOSE { eprintln!("[recursion_prewitgen] host witgen on prepare thread: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0); }
+            if *VERBOSE {
+                eprintln!(
+                    "[recursion_prewitgen] host witgen on prepare thread: {:.1}ms",
+                    t0.elapsed().as_secs_f64() * 1000.0
+                );
+            }
         }
         self.prepared_preflight = Some(preflight);
         Ok(())
@@ -279,7 +293,9 @@ where
         )?;
         // Cache the ctrl GPU buffer for reuse by subsequent same-program proofs.
         if !self.cached_ctrl_buffer.borrow().contains_key(&ctrl_key) {
-            self.cached_ctrl_buffer.borrow_mut().insert(ctrl_key, witgen.ctrl.clone());
+            self.cached_ctrl_buffer
+                .borrow_mut()
+                .insert(ctrl_key, witgen.ctrl.clone());
         }
         let witgen_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
@@ -352,7 +368,9 @@ where
                 prover.commit_group(REGISTER_GROUP_ACCUM, &witgen.accum);
                 let accum_commit_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-                if *VERBOSE { eprintln!("[recursion_prove] preflight={preflight_ms:.1}ms(cached={preflight_was_cached}) witgen={witgen_ms:.1}ms ctrl={ctrl_ms:.1}ms(cached={ctrl_cached}) data_commit={data_commit_ms:.1}ms accum={accum_ms:.1}ms accum_commit={accum_commit_ms:.1}ms"); }
+                if *VERBOSE {
+                    eprintln!("[recursion_prove] preflight={preflight_ms:.1}ms(cached={preflight_was_cached}) witgen={witgen_ms:.1}ms ctrl={ctrl_ms:.1}ms(cached={ctrl_cached}) data_commit={data_commit_ms:.1}ms accum={accum_ms:.1}ms accum_commit={accum_commit_ms:.1}ms");
+                }
 
                 mix
             });
@@ -360,7 +378,12 @@ where
             let t0 = std::time::Instant::now();
             let seal = prover.finalize(&[&mix, global], self.circuit_hal.as_ref());
             let fri_ms = t0.elapsed().as_secs_f64() * 1000.0;
-            if *VERBOSE { eprintln!("[recursion_prove] fri={fri_ms:.1}ms total={:.1}ms", t_total.elapsed().as_secs_f64() * 1000.0); }
+            if *VERBOSE {
+                eprintln!(
+                    "[recursion_prove] fri={fri_ms:.1}ms total={:.1}ms",
+                    t_total.elapsed().as_secs_f64() * 1000.0
+                );
+            }
             seal
         });
 

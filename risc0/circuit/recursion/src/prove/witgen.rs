@@ -319,7 +319,10 @@ where
 /// Bit-identical to the HAL path: data/global start as INVALID, ctrl is the
 /// transposed program code, exactly as WitnessGenerator::new sets them up.
 #[cfg(feature = "intel")]
-pub(crate) fn host_witgen(zkr: &Program, preflight: &Preflight) -> Result<(Vec<BabyBearElem>, Vec<BabyBearElem>)> {
+pub(crate) fn host_witgen(
+    zkr: &Program,
+    preflight: &Preflight,
+) -> Result<(Vec<BabyBearElem>, Vec<BabyBearElem>)> {
     use risc0_circuit_recursion_sys::{risc0_circuit_recursion_cpu_witgen, RawExecBuffers};
     let total_cycles = 1usize << zkr.po2;
     // Exact program identity (key + full validation), shared with the HAL path.
@@ -331,7 +334,11 @@ pub(crate) fn host_witgen(zkr: &Program, preflight: &Preflight) -> Result<(Vec<B
         use rayon::prelude::*;
         data.spare_capacity_mut()
             .par_chunks_mut(1 << 16)
-            .for_each(|c| c.iter_mut().for_each(|x| { x.write(BabyBearElem::INVALID); }));
+            .for_each(|c| {
+                c.iter_mut().for_each(|x| {
+                    x.write(BabyBearElem::INVALID);
+                })
+            });
         // SAFETY: every element of the spare capacity was initialised above.
         unsafe { data.set_len(n) };
     }
@@ -356,7 +363,12 @@ pub(crate) fn host_witgen(zkr: &Program, preflight: &Preflight) -> Result<(Vec<B
         global: global.as_mut_ptr(),
     };
     risc0_sys::ffi_wrap(|| unsafe {
-        risc0_circuit_recursion_cpu_witgen(StepMode::Parallel, &buffers, &raw_trace, total_cycles as u32)
+        risc0_circuit_recursion_cpu_witgen(
+            StepMode::Parallel,
+            &buffers,
+            &raw_trace,
+            total_cycles as u32,
+        )
     })?;
     Ok((data, global))
 }

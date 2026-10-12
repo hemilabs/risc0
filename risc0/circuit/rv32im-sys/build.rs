@@ -49,7 +49,7 @@ mod stamp {
     /// Each file's path AND content go into the digest. Convenience wrapper:
     /// label == content_path, suitable for in-tree relative paths.
     #[allow(dead_code)] // kept as a convenience entry-point for callers that
-                       // don't need label/content separation
+                        // don't need label/content separation
     pub fn hash(files: &[&Path], extras: &[&str]) -> String {
         let pairs: Vec<(PathBuf, PathBuf)> = files
             .iter()
@@ -221,11 +221,7 @@ mod stamp {
     /// Multi-artifact variant: cache hit requires ALL artifacts present plus
     /// the same stamp invariants. Used by the multipass branch which must
     /// verify both pass1.so and pass2.so.
-    pub fn need_rebuild_multi(
-        artifacts: &[&Path],
-        stamp_path: &Path,
-        expected_hash: &str,
-    ) -> bool {
+    pub fn need_rebuild_multi(artifacts: &[&Path], stamp_path: &Path, expected_hash: &str) -> bool {
         if artifacts.iter().any(|p| !p.exists()) {
             return true;
         }
@@ -347,7 +343,9 @@ fn build_cuda_kernels() {
             .arg("eval_check_combined.cu")
             .arg("-o")
             .arg(&eval_check_cached);
-        let status = cmd.status().expect("failed to run nvcc for eval_check_combined.cu");
+        let status = cmd
+            .status()
+            .expect("failed to run nvcc for eval_check_combined.cu");
         assert!(
             status.success(),
             "nvcc failed for eval_check_combined.cu (standalone mode)"
@@ -474,18 +472,31 @@ fn build_rocm_kernels() {
         eprintln!("eval_check (rocm): source changed (or first build), compiling standalone...");
         let include_cuda2hip = format!("{}/util/cuda2hip.hpp", &sppark_root);
         let eval_check_flags: Vec<&str> = vec![
-            "-x", "hip",
-            "-std=c++17", "-O3", "-fPIC",
-            "-Wno-unused-function", "-Wno-unused-parameter",
-            "-mllvm", "-amdgpu-early-inline-all=false",
-            "-mllvm", "-amdgpu-use-aa-in-codegen",
-            "-mllvm", "-amdgpu-schedule-metric-bias=0",
-            "-mllvm", "-amdgpu-internalize-symbols",
-            "-mllvm", "-amdgpu-schedule-relaxed-occupancy",
-            "-include", &include_cuda2hip,
-            "-I", &cuda_root,
-            "-I", &cxx_root,
-            "-I", &sppark_root,
+            "-x",
+            "hip",
+            "-std=c++17",
+            "-O3",
+            "-fPIC",
+            "-Wno-unused-function",
+            "-Wno-unused-parameter",
+            "-mllvm",
+            "-amdgpu-early-inline-all=false",
+            "-mllvm",
+            "-amdgpu-use-aa-in-codegen",
+            "-mllvm",
+            "-amdgpu-schedule-metric-bias=0",
+            "-mllvm",
+            "-amdgpu-internalize-symbols",
+            "-mllvm",
+            "-amdgpu-schedule-relaxed-occupancy",
+            "-include",
+            &include_cuda2hip,
+            "-I",
+            &cuda_root,
+            "-I",
+            &cxx_root,
+            "-I",
+            &sppark_root,
         ];
         risc0_build_kernel::hip_compile(
             &hipcc,
@@ -549,7 +560,11 @@ fn build_rocm_kernels() {
             }
         }
         // Also hash header files (.h, .cuh, .inc) since they affect compilation
-        for pattern in &["kernels/cuda/*.h", "kernels/cuda/*.cuh", "kernels/cuda/*.inc"] {
+        for pattern in &[
+            "kernels/cuda/*.h",
+            "kernels/cuda/*.cuh",
+            "kernels/cuda/*.inc",
+        ] {
             for hdr in glob_paths(pattern) {
                 let abs = std::fs::canonicalize(&hdr).unwrap();
                 if let Ok(content) = std::fs::read_to_string(&abs) {
@@ -567,15 +582,25 @@ fn build_rocm_kernels() {
         let include_cuda2hip = format!("{sppark_root}/util/cuda2hip.hpp");
         let kernel_dir_str = kernel_dir.to_str().unwrap();
         let remaining_flags: Vec<&str> = vec![
-            "-x", "hip",
-            "-std=c++17", "-O3", "-fPIC",
-            "-Wno-unused-function", "-Wno-unused-parameter",
-            "-mllvm", "-amdgpu-early-inline-all=false",
-            "-include", &include_cuda2hip,
-            "-I", &cuda_root,
-            "-I", &cxx_root,
-            "-I", &sppark_root,
-            "-I", kernel_dir_str,
+            "-x",
+            "hip",
+            "-std=c++17",
+            "-O3",
+            "-fPIC",
+            "-Wno-unused-function",
+            "-Wno-unused-parameter",
+            "-mllvm",
+            "-amdgpu-early-inline-all=false",
+            "-include",
+            &include_cuda2hip,
+            "-I",
+            &cuda_root,
+            "-I",
+            &cxx_root,
+            "-I",
+            &sppark_root,
+            "-I",
+            kernel_dir_str,
         ];
         risc0_build_kernel::hip_compile(
             &hipcc,
@@ -616,15 +641,25 @@ fn build_rocm_kernels() {
             let include_cuda2hip = format!("{sppark_root}/util/cuda2hip.hpp");
             let kernel_dir_str = kernel_dir.to_str().unwrap();
             let sep_flags: Vec<&str> = vec![
-                "-x", "hip",
-                "-std=c++17", "-O3", "-fPIC",
-                "-Wno-unused-function", "-Wno-unused-parameter",
-                "-mllvm", "-amdgpu-early-inline-all=false",
-                "-include", &include_cuda2hip,
-                "-I", &cuda_root,
-                "-I", &cxx_root,
-                "-I", &sppark_root,
-                "-I", kernel_dir_str,
+                "-x",
+                "hip",
+                "-std=c++17",
+                "-O3",
+                "-fPIC",
+                "-Wno-unused-function",
+                "-Wno-unused-parameter",
+                "-mllvm",
+                "-amdgpu-early-inline-all=false",
+                "-include",
+                &include_cuda2hip,
+                "-I",
+                &cuda_root,
+                "-I",
+                &cxx_root,
+                "-I",
+                &sppark_root,
+                "-I",
+                kernel_dir_str,
             ];
             risc0_build_kernel::hip_compile(
                 &hipcc,
@@ -722,10 +757,7 @@ fn intel_grf_mode() -> String {
     let v = std::env::var("RISC0_INTEL_GRF_MODE").unwrap_or_else(|_| DEFAULT_GRF_MODE.into());
     match v.as_str() {
         "128" | "256" => v,
-        other => panic!(
-            "RISC0_INTEL_GRF_MODE must be 128 or 256, got {:?}",
-            other
-        ),
+        other => panic!("RISC0_INTEL_GRF_MODE must be 128 or 256, got {:?}", other),
     }
 }
 
@@ -867,8 +899,7 @@ fn cxx_root_headers(cxx_root: &str) -> Vec<(PathBuf, PathBuf)> {
 /// Build a `(label, content_path)` pair list for in-tree files (label ==
 /// content_path) plus cxx_root files (label == `cxx_root/<basename>`).
 fn build_pairs(in_tree: Vec<PathBuf>, cxx_root: &str) -> Vec<(PathBuf, PathBuf)> {
-    let mut pairs: Vec<(PathBuf, PathBuf)> =
-        in_tree.into_iter().map(|p| (p.clone(), p)).collect();
+    let mut pairs: Vec<(PathBuf, PathBuf)> = in_tree.into_iter().map(|p| (p.clone(), p)).collect();
     pairs.extend(cxx_root_headers(cxx_root));
     pairs
 }
@@ -890,7 +921,11 @@ fn compute_mono_hash(cxx_root: &str, icpx_version: &str) -> String {
     if std::env::var_os("RISC0_TREE_REDUCE").is_some() {
         in_tree.push(PathBuf::from("kernels/intel/tree_reduce_fma.py"));
     }
-    let tree_reduce_tag = if std::env::var_os("RISC0_TREE_REDUCE").is_some() { "tr1" } else { "tr0" };
+    let tree_reduce_tag = if std::env::var_os("RISC0_TREE_REDUCE").is_some() {
+        "tr1"
+    } else {
+        "tr0"
+    };
     // T3.1 cross-function CSE: hoist shared args[group][col*steps+...] reads
     // from the 20 noinline sub-functions into the entry poly_fp.
     // DEFAULT ON (R3-A01 confirmed +11.5% E2E). Disable with RISC0_POLY_FP_CSE=0.
@@ -910,7 +945,11 @@ fn compute_mono_hash(cxx_root: &str, icpx_version: &str) -> String {
     let lsc_state = if matches!(
         std::env::var("RISC0_LSC_HINTS").as_deref(),
         Ok("1") | Ok("true") | Ok("on") | Ok("ON")
-    ) { "1" } else { "0" };
+    ) {
+        "1"
+    } else {
+        "0"
+    };
     let cse_raw = format!("{}|{}|{}|lsc={}", cse_state, cse_top, cse_min, lsc_state);
     let cse_tag = format!("cse-{:x}", {
         use std::collections::hash_map::DefaultHasher;
@@ -940,7 +979,11 @@ fn compute_mono_hash(cxx_root: &str, icpx_version: &str) -> String {
             .collect();
         scripts.sort();
         in_tree.extend(scripts);
-        if intel_eval_xmx_enabled() { "fast3-xmx" } else { "fast3" }
+        if intel_eval_xmx_enabled() {
+            "fast3-xmx"
+        } else {
+            "fast3"
+        }
     } else {
         "fast0"
     };
@@ -948,7 +991,16 @@ fn compute_mono_hash(cxx_root: &str, icpx_version: &str) -> String {
     let variant = intel_variant_tag();
     stamp::hash_labeled(
         &pairs,
-        &[icpx_version, INTEL_STAMP_VERSION, "mono", &variant, tree_reduce_tag, &iex_tag, &cse_tag, fast_tag],
+        &[
+            icpx_version,
+            INTEL_STAMP_VERSION,
+            "mono",
+            &variant,
+            tree_reduce_tag,
+            &iex_tag,
+            &cse_tag,
+            fast_tag,
+        ],
     )
 }
 
@@ -1038,10 +1090,7 @@ fn try_recover_witgen_so(out_dir: &Path, dest_so: &Path) {
     // (`<target>/<profile>/build/<crate>-<hash>/out`) instead of
     // string-matching "target" — works under custom CARGO_TARGET_DIR
     // and `--target=<triple>` cross-compile dirs.
-    let target_root = out_dir
-        .ancestors()
-        .nth(4)
-        .map(Path::to_path_buf);
+    let target_root = out_dir.ancestors().nth(4).map(Path::to_path_buf);
     let target_root = match target_root {
         Some(r) => r,
         None => {
@@ -1175,7 +1224,11 @@ fn build_intel_kernels() {
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             let oneapi = PathBuf::from("/opt/intel/oneapi/compiler/latest/bin/icpx");
-            if oneapi.exists() { oneapi } else { PathBuf::from("icpx") }
+            if oneapi.exists() {
+                oneapi
+            } else {
+                PathBuf::from("icpx")
+            }
         });
 
     // Cache directory for the expensive eval_check compilation. Anchor on the
@@ -1237,8 +1290,7 @@ fn build_intel_kernels() {
         // feed the amalgamation. The transform is mathematically exact
         // (commutativity + associativity of FpExt addition).
         let use_tree_reduce = std::env::var_os("RISC0_TREE_REDUCE").is_some();
-        let mut current_src_dir: std::path::PathBuf =
-            std::path::PathBuf::from("kernels/cxx");
+        let mut current_src_dir: std::path::PathBuf = std::path::PathBuf::from("kernels/cxx");
         if use_tree_reduce {
             let dst = out_dir.join("poly_fp_tree_reduced");
             std::fs::create_dir_all(&dst).unwrap();
@@ -1252,8 +1304,10 @@ fn build_intel_kernels() {
             if !status.success() {
                 panic!("tree_reduce_fma.py failed");
             }
-            eprintln!("  RISC0_TREE_REDUCE=1: using tree-reduced poly_fp sources at {}",
-                      dst.display());
+            eprintln!(
+                "  RISC0_TREE_REDUCE=1: using tree-reduced poly_fp sources at {}",
+                dst.display()
+            );
             current_src_dir = dst;
         }
 
@@ -1280,22 +1334,23 @@ fn build_intel_kernels() {
             let dst = out_dir.join("poly_fp_cse");
             std::fs::create_dir_all(&dst).unwrap();
             let script = std::path::PathBuf::from("kernels/intel/poly_fp_cse.py");
-            let cse_top = std::env::var("RISC0_POLY_FP_CSE_TOP")
-                .unwrap_or_else(|_| "16".to_string());
-            let cse_min = std::env::var("RISC0_POLY_FP_CSE_MIN_SHARE")
-                .unwrap_or_else(|_| "10".to_string());
+            let cse_top =
+                std::env::var("RISC0_POLY_FP_CSE_TOP").unwrap_or_else(|_| "16".to_string());
+            let cse_min =
+                std::env::var("RISC0_POLY_FP_CSE_MIN_SHARE").unwrap_or_else(|_| "10".to_string());
             let mut script_cmd = std::process::Command::new("python3");
             script_cmd
                 .arg(&script)
                 .arg(&current_src_dir)
                 .arg(&dst)
-                .arg("--top").arg(&cse_top)
-                .arg("--min-share").arg(&cse_min);
+                .arg("--top")
+                .arg(&cse_top)
+                .arg("--min-share")
+                .arg(&cse_min);
             if lsc_hints_enabled {
                 script_cmd.arg("--lsc-hints");
             }
-            let status = script_cmd.status()
-                .expect("Failed to run poly_fp_cse.py");
+            let status = script_cmd.status().expect("Failed to run poly_fp_cse.py");
             if !status.success() {
                 panic!("poly_fp_cse.py failed");
             }
@@ -1349,9 +1404,8 @@ fn build_intel_kernels() {
         // Tested selective inlining (pairs) — SLOWER due to increased per-function
         // register pressure. All-noinline with 256 GRF is optimal.
         for i in 0..4 {
-            let src = std::fs::read_to_string(
-                poly_fp_dir.join(format!("rust_poly_fp_{i}.cpp"))
-            ).unwrap();
+            let src =
+                std::fs::read_to_string(poly_fp_dir.join(format!("rust_poly_fp_{i}.cpp"))).unwrap();
             if let Some(ns_start) = src.find("namespace risc0::circuit::rv32im_v2 {") {
                 let body_start = ns_start + "namespace risc0::circuit::rv32im_v2 {".len();
                 if let Some(body_end) = src.rfind('}') {
@@ -1375,8 +1429,11 @@ fn build_intel_kernels() {
 
         // Also save the mono amalgamation (without kernel wrapper) for multipass generation
         let mono_path = out_dir.join("intel_eval_check_mono.cpp");
-        let mono_content = amalg[..amalg.rfind("} // namespace risc0::circuit::rv32im_v2").unwrap()
-            + "} // namespace risc0::circuit::rv32im_v2\n".len()].to_string();
+        let mono_content = amalg[..amalg
+            .rfind("} // namespace risc0::circuit::rv32im_v2")
+            .unwrap()
+            + "} // namespace risc0::circuit::rv32im_v2\n".len()]
+            .to_string();
         std::fs::write(&mono_path, &mono_content).unwrap();
 
         // RISC0_INTEL_EVAL_FAST post-passes run on the mono build's copy only
@@ -1394,14 +1451,19 @@ fn build_intel_kernels() {
                 .status()
                 .unwrap_or_else(|e| panic!("failed to run evalfast/pipeline.py: {e}"));
             if !status.success() {
-                panic!("evalfast/pipeline.py failed (RISC0_INTEL_EVAL_FAST=0 builds the plain kernel)");
+                panic!(
+                    "evalfast/pipeline.py failed (RISC0_INTEL_EVAL_FAST=0 builds the plain kernel)"
+                );
             }
             cmd.arg("-DRISC0_INTEL_EVAL_FAST");
             cmd.arg("-DRISC0_INTEL_EVAL_LOHI");
             // LSC cache-control override 6 on loads and stores: -4.5 ms per
             // po2=20 segment on this kernel, bit-identical (7 gives wrong output).
             xs_options.push_str(" -igc_opts 'DisableRecompilation=1,LscLoadCacheControlOverride=6,LscStoreCacheControlOverride=6'");
-            eprintln!("  RISC0_INTEL_EVAL_FAST=1: compiling {}", fast_path.display());
+            eprintln!(
+                "  RISC0_INTEL_EVAL_FAST=1: compiling {}",
+                fast_path.display()
+            );
             fast_path
         } else {
             amalg_path.clone()
@@ -1414,7 +1476,8 @@ fn build_intel_kernels() {
             // Force 256 GRF mode: doubles register file from 8KB to 16KB per thread,
             // dramatically reducing the 42KB spill overhead. Trades occupancy (8→4 threads/EU)
             // for fewer spills — net win since kernel is spill-bound, not compute-bound.
-            .arg("-Xs").arg(format!("-options \"{xs_options}\""));
+            .arg("-Xs")
+            .arg(format!("-options \"{xs_options}\""));
 
         eprintln!("  Running: {:?}", cmd);
         let output = cmd.output().expect("Failed to run icpx");
@@ -1460,11 +1523,8 @@ fn build_intel_kernels() {
     // Multipass cache is hit only when both pass-side .so files exist and the
     // stamp hash matches mono+gen_multipass.py inputs. Either .so missing or
     // hash drift triggers a full rebuild of both passes.
-    let multipass_rebuild = stamp::need_rebuild_multi(
-        &[&pass1_so, &pass2_so],
-        &multipass_stamp,
-        &multipass_hash,
-    );
+    let multipass_rebuild =
+        stamp::need_rebuild_multi(&[&pass1_so, &pass2_so], &multipass_stamp, &multipass_hash);
 
     if multipass_rebuild {
         let multipass_script = PathBuf::from("kernels/intel/gen_multipass.py");
@@ -1488,15 +1548,26 @@ fn build_intel_kernels() {
                 // Compile pass1
                 eprintln!("  Compiling pass1...");
                 let p1_output = Command::new(&icpx)
-                    .arg("-shared").arg("-fPIC").arg("-fsycl").arg("-std=c++17")
+                    .arg("-shared")
+                    .arg("-fPIC")
+                    .arg("-fsycl")
+                    .arg("-std=c++17")
                     .arg("-Os")
-                    .arg("-Wno-unused-parameter").arg("-Wno-unused-function")
-                    .arg("-Wno-unused-variable").arg("-Wno-sign-compare")
-                    .arg(format!("-I{cxx_root}")).arg("-Ikernels/cxx").arg("-Ikernels/intel")
-                    .arg(&pass1_amalg).arg("-o").arg(&pass1_so)
+                    .arg("-Wno-unused-parameter")
+                    .arg("-Wno-unused-function")
+                    .arg("-Wno-unused-variable")
+                    .arg("-Wno-sign-compare")
+                    .arg(format!("-I{cxx_root}"))
+                    .arg("-Ikernels/cxx")
+                    .arg("-Ikernels/intel")
+                    .arg(&pass1_amalg)
+                    .arg("-o")
+                    .arg(&pass1_so)
                     .arg("-fsycl-targets=intel_gpu_bmg_g31")
-                    .arg("-Xs").arg(format!("-options \"{}\"", intel_xs_options()))
-                    .output().expect("Failed to run icpx for pass1");
+                    .arg("-Xs")
+                    .arg(format!("-options \"{}\"", intel_xs_options()))
+                    .output()
+                    .expect("Failed to run icpx for pass1");
 
                 if !p1_output.status.success() {
                     let stderr = String::from_utf8_lossy(&p1_output.stderr);
@@ -1508,15 +1579,26 @@ fn build_intel_kernels() {
                 // Compile pass2
                 eprintln!("  Compiling pass2...");
                 let p2_output = Command::new(&icpx)
-                    .arg("-shared").arg("-fPIC").arg("-fsycl").arg("-std=c++17")
+                    .arg("-shared")
+                    .arg("-fPIC")
+                    .arg("-fsycl")
+                    .arg("-std=c++17")
                     .arg("-Os")
-                    .arg("-Wno-unused-parameter").arg("-Wno-unused-function")
-                    .arg("-Wno-unused-variable").arg("-Wno-sign-compare")
-                    .arg(format!("-I{cxx_root}")).arg("-Ikernels/cxx").arg("-Ikernels/intel")
-                    .arg(&pass2_amalg).arg("-o").arg(&pass2_so)
+                    .arg("-Wno-unused-parameter")
+                    .arg("-Wno-unused-function")
+                    .arg("-Wno-unused-variable")
+                    .arg("-Wno-sign-compare")
+                    .arg(format!("-I{cxx_root}"))
+                    .arg("-Ikernels/cxx")
+                    .arg("-Ikernels/intel")
+                    .arg(&pass2_amalg)
+                    .arg("-o")
+                    .arg(&pass2_so)
                     .arg("-fsycl-targets=intel_gpu_bmg_g31")
-                    .arg("-Xs").arg(format!("-options \"{}\"", intel_xs_options()))
-                    .output().expect("Failed to run icpx for pass2");
+                    .arg("-Xs")
+                    .arg(format!("-options \"{}\"", intel_xs_options()))
+                    .output()
+                    .expect("Failed to run icpx for pass2");
 
                 if !p2_output.status.success() {
                     let stderr = String::from_utf8_lossy(&p2_output.stderr);
@@ -1579,16 +1661,27 @@ fn build_intel_kernels() {
                     let s = line.trim_start();
 
                     // Inject noinline on function definitions
-                    if !s.is_empty() && !s.starts_with("//") && !s.starts_with('#')
-                        && !s.starts_with("namespace") && !s.starts_with("using")
-                        && !s.starts_with('}') && !s.starts_with('{')
-                        && !s.starts_with("if") && !s.starts_with("for")
-                        && !s.starts_with("while") && !s.starts_with("switch")
-                        && !s.starts_with("else") && !s.starts_with("return")
-                        && !s.starts_with("auto") && !s.starts_with("Val ")
-                        && !s.starts_with("ExtVal") && !s.starts_with("size_t")
-                        && s.contains('(') && s.trim_end().ends_with('{')
-                        && (s.contains("Struct ") || s.starts_with("void step_")
+                    if !s.is_empty()
+                        && !s.starts_with("//")
+                        && !s.starts_with('#')
+                        && !s.starts_with("namespace")
+                        && !s.starts_with("using")
+                        && !s.starts_with('}')
+                        && !s.starts_with('{')
+                        && !s.starts_with("if")
+                        && !s.starts_with("for")
+                        && !s.starts_with("while")
+                        && !s.starts_with("switch")
+                        && !s.starts_with("else")
+                        && !s.starts_with("return")
+                        && !s.starts_with("auto")
+                        && !s.starts_with("Val ")
+                        && !s.starts_with("ExtVal")
+                        && !s.starts_with("size_t")
+                        && s.contains('(')
+                        && s.trim_end().ends_with('{')
+                        && (s.contains("Struct ")
+                            || s.starts_with("void step_")
                             || s.starts_with("ComponentStruct "))
                     {
                         witgen_amalg.push_str("__attribute__((noinline)) ");
@@ -1602,9 +1695,7 @@ fn build_intel_kernels() {
         }
         witgen_amalg.push_str("} // namespace risc0::circuit::rv32im_v2::intel\n\n");
         // Append the kernel wrapper + extern implementations
-        witgen_amalg.push_str(
-            &std::fs::read_to_string("kernels/intel/ffi_witgen.cpp").unwrap()
-        );
+        witgen_amalg.push_str(&std::fs::read_to_string("kernels/intel/ffi_witgen.cpp").unwrap());
         std::fs::write(&witgen_amalg_path, &witgen_amalg).unwrap();
         // Montgomery batch inversion of the FpExt inv_0 calls in each
         // exec_TopAccum mux arm (chunks of 8; 64 miscompiled under IGC spill
@@ -1634,7 +1725,8 @@ fn build_intel_kernels() {
             // 2026-04-21: patched IGC + no cl-opt-disable + explicit 256 GRF (committed setup).
             // 2026-04-22: -Xfinalizer presched-rp/spillAllowed flags tested via -options nesting,
             // ocloc rejected with exit 226. Need different syntax — deferred.
-            .arg("-Xs").arg(format!("-options \"{}\"", intel_xs_options()))
+            .arg("-Xs")
+            .arg(format!("-options \"{}\"", intel_xs_options()))
             .arg("-Wno-unused-parameter")
             .arg("-Wno-unused-function")
             .arg("-Wno-unused-variable")

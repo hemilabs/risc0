@@ -91,7 +91,12 @@ impl<H: Hal> PolyGroup<H> {
         let evaluated = hal.alloc_elem("evaluated", self.count * domain);
         // Coefficients are bit-reversed; undo before expand+NTT
         hal.batch_bit_reverse(&self.coeffs, self.count);
-        hal.batch_expand_into_evaluate_ntt(&evaluated, &self.coeffs, self.count, log2_ceil(INV_RATE));
+        hal.batch_expand_into_evaluate_ntt(
+            &evaluated,
+            &self.coeffs,
+            self.count,
+            log2_ceil(INV_RATE),
+        );
         // Re-bit-reverse coefficients (other code expects them bit-reversed)
         hal.batch_bit_reverse(&self.coeffs, self.count);
         self.merkle.set_matrix(evaluated);

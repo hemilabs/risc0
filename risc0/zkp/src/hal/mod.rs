@@ -244,12 +244,7 @@ pub trait Hal {
     /// Scatter u32 values as 32-bit decompositions into the data buffer.
     /// `bit_data` contains packed (row, base_col, value) triples. Each triple
     /// writes 32 field elements: data[(base_col+i)*cycles + row] = (value>>i)&1.
-    fn scatter_bits(
-        &self,
-        into: &Self::Buffer<Self::Elem>,
-        bit_data: &[u32],
-        cycles: u32,
-    ) {
+    fn scatter_bits(&self, into: &Self::Buffer<Self::Elem>, bit_data: &[u32], cycles: u32) {
         let n = bit_data.len() / 3;
         if n == 0 {
             return;

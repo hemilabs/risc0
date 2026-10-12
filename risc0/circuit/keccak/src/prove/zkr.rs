@@ -15,7 +15,7 @@
 
 use std::io::Read as _;
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use liblzma::read::XzDecoder;
 use risc0_circuit_recursion::prove::Program;
 

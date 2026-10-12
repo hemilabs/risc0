@@ -101,7 +101,10 @@ fn build_rocm_kernels(cxx_root: &Path) {
         .flag("-Wno-unused-function")
         .flag("-Wno-unused-parameter")
         .flag("-Wno-missing-braces")
-        .flag(&format!("--offload-arch={}", std::env::var("RISC0_HIP_ARCH").unwrap_or_else(|_| "native".to_string())))
+        .flag(&format!(
+            "--offload-arch={}",
+            std::env::var("RISC0_HIP_ARCH").unwrap_or_else(|_| "native".to_string())
+        ))
         .flag("-mllvm")
         .flag("-amdgpu-early-inline-all=false")
         .flag("-include")
@@ -187,7 +190,9 @@ fn build_intel_kernels() {
         cmd.arg(src);
     }
 
-    let status = cmd.status().expect("Failed to run icpx. Is oneAPI installed?");
+    let status = cmd
+        .status()
+        .expect("Failed to run icpx. Is oneAPI installed?");
     if !status.success() {
         panic!("icpx compilation failed for Intel ESIMD kernels");
     }

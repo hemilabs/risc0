@@ -399,7 +399,10 @@ where
                 anyhow!("malformed composite receipt has no continuation segment receipts")
             })?;
 
-        eprintln!("[composite_to_succinct] lift/join done: {:.1}s", t_pipeline.elapsed().as_secs_f64());
+        eprintln!(
+            "[composite_to_succinct] lift/join done: {:.1}s",
+            t_pipeline.elapsed().as_secs_f64()
+        );
 
         // Compress assumptions and resolve them to get the final succinct receipt.
         let result = composite_receipt.assumption_receipts.iter().try_fold(
@@ -418,7 +421,10 @@ where
             },
         )?;
 
-        eprintln!("[composite_to_succinct] total: {:.1}s", t_pipeline.elapsed().as_secs_f64());
+        eprintln!(
+            "[composite_to_succinct] total: {:.1}s",
+            t_pipeline.elapsed().as_secs_f64()
+        );
         Ok(result)
     }
 }

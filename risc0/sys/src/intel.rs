@@ -32,62 +32,287 @@ extern "C" {
     // Device memory management
     pub fn esimd_malloc_device(queue: *mut c_void, bytes: usize) -> *mut c_void;
     pub fn esimd_free_device(queue: *mut c_void, ptr: *mut c_void);
-    pub fn esimd_memcpy_htod(queue: *mut c_void, dst: *mut c_void, src: *const c_void, bytes: usize);
-    pub fn esimd_memcpy_dtoh(queue: *mut c_void, dst: *mut c_void, src: *const c_void, bytes: usize);
+    pub fn esimd_memcpy_htod(
+        queue: *mut c_void,
+        dst: *mut c_void,
+        src: *const c_void,
+        bytes: usize,
+    );
+    pub fn esimd_memcpy_dtoh(
+        queue: *mut c_void,
+        dst: *mut c_void,
+        src: *const c_void,
+        bytes: usize,
+    );
     pub fn esimd_memset(queue: *mut c_void, ptr: *mut c_void, value: c_int, bytes: usize);
-    pub fn esimd_memcpy_dtod(queue: *mut c_void, dst: *mut c_void, src: *const c_void, bytes: usize);
+    pub fn esimd_memcpy_dtod(
+        queue: *mut c_void,
+        dst: *mut c_void,
+        src: *const c_void,
+        bytes: usize,
+    );
 
     // Warmup
     pub fn esimd_warmup(queue: *mut c_void, max_lg_n: u32);
     pub fn esimd_prepare_zk_shift(queue: *mut c_void, lg_n: u32) -> *const std::os::raw::c_char;
 
     // NTT
-    pub fn esimd_forward_ntt(queue: *mut c_void, d_data: *mut c_void, lg_n: u32) -> *const std::os::raw::c_char;
-    pub fn esimd_inverse_ntt(queue: *mut c_void, d_data: *mut c_void, lg_n: u32) -> *const std::os::raw::c_char;
-    pub fn esimd_batch_forward_ntt(queue: *mut c_void, d_data: *mut c_void, lg_n: u32, poly_count: u32, stride: u32) -> *const std::os::raw::c_char;
-    pub fn esimd_batch_inverse_ntt(queue: *mut c_void, d_data: *mut c_void, lg_n: u32, poly_count: u32, stride: u32) -> *const std::os::raw::c_char;
-    pub fn esimd_batch_bit_reverse_ffi(queue: *mut c_void, d_io: *mut c_void, n_bits: u32, count: u32) -> *const std::os::raw::c_char;
-    pub fn esimd_batch_expand(queue: *mut c_void, d_out: *mut c_void, d_in: *const c_void, lg_domain_size: u32, lg_blowup: u32, poly_count: u32) -> *const std::os::raw::c_char;
-    pub fn esimd_batch_expand_and_evaluate_ntt(queue: *mut c_void, d_out: *mut c_void, d_in: *const c_void, lg_domain_size: u32, lg_blowup: u32, poly_count: u32) -> *const std::os::raw::c_char;
-    pub fn esimd_batch_zk_shift(queue: *mut c_void, d_data: *mut c_void, lg_domain_size: u32, poly_count: u32) -> *const std::os::raw::c_char;
-    pub fn esimd_batch_inverse_ntt_zk_shift(queue: *mut c_void, d_data: *mut c_void, lg_domain_size: u32, poly_count: u32, stride: u32) -> *const std::os::raw::c_char;
-    pub fn esimd_batch_inverse_ntt_zk_shift_from(queue: *mut c_void, d_dst: *mut c_void, d_src: *const c_void, lg_domain_size: u32, poly_count: u32, stride: u32) -> *const std::os::raw::c_char;
-    pub fn esimd_batch_expand_ffi(queue: *mut c_void, d_out: *mut c_void, d_in: *const c_void, in_rows: u32, out_rows: u32, cols: u32, exp_po2: u32) -> *const std::os::raw::c_char;
+    pub fn esimd_forward_ntt(
+        queue: *mut c_void,
+        d_data: *mut c_void,
+        lg_n: u32,
+    ) -> *const std::os::raw::c_char;
+    pub fn esimd_inverse_ntt(
+        queue: *mut c_void,
+        d_data: *mut c_void,
+        lg_n: u32,
+    ) -> *const std::os::raw::c_char;
+    pub fn esimd_batch_forward_ntt(
+        queue: *mut c_void,
+        d_data: *mut c_void,
+        lg_n: u32,
+        poly_count: u32,
+        stride: u32,
+    ) -> *const std::os::raw::c_char;
+    pub fn esimd_batch_inverse_ntt(
+        queue: *mut c_void,
+        d_data: *mut c_void,
+        lg_n: u32,
+        poly_count: u32,
+        stride: u32,
+    ) -> *const std::os::raw::c_char;
+    pub fn esimd_batch_bit_reverse_ffi(
+        queue: *mut c_void,
+        d_io: *mut c_void,
+        n_bits: u32,
+        count: u32,
+    ) -> *const std::os::raw::c_char;
+    pub fn esimd_batch_expand(
+        queue: *mut c_void,
+        d_out: *mut c_void,
+        d_in: *const c_void,
+        lg_domain_size: u32,
+        lg_blowup: u32,
+        poly_count: u32,
+    ) -> *const std::os::raw::c_char;
+    pub fn esimd_batch_expand_and_evaluate_ntt(
+        queue: *mut c_void,
+        d_out: *mut c_void,
+        d_in: *const c_void,
+        lg_domain_size: u32,
+        lg_blowup: u32,
+        poly_count: u32,
+    ) -> *const std::os::raw::c_char;
+    pub fn esimd_batch_zk_shift(
+        queue: *mut c_void,
+        d_data: *mut c_void,
+        lg_domain_size: u32,
+        poly_count: u32,
+    ) -> *const std::os::raw::c_char;
+    pub fn esimd_batch_inverse_ntt_zk_shift(
+        queue: *mut c_void,
+        d_data: *mut c_void,
+        lg_domain_size: u32,
+        poly_count: u32,
+        stride: u32,
+    ) -> *const std::os::raw::c_char;
+    pub fn esimd_batch_inverse_ntt_zk_shift_from(
+        queue: *mut c_void,
+        d_dst: *mut c_void,
+        d_src: *const c_void,
+        lg_domain_size: u32,
+        poly_count: u32,
+        stride: u32,
+    ) -> *const std::os::raw::c_char;
+    pub fn esimd_batch_expand_ffi(
+        queue: *mut c_void,
+        d_out: *mut c_void,
+        d_in: *const c_void,
+        in_rows: u32,
+        out_rows: u32,
+        cols: u32,
+        exp_po2: u32,
+    ) -> *const std::os::raw::c_char;
     /// Fused x4 LDE (expand + forward NTT); see intel_ffi.cpp.
-    pub fn esimd_batch_expand_fwd_fused(queue: *mut c_void, d_out: *mut c_void, d_in: *const c_void, lg_out: u32, lg_blowup: u32, cols: u32) -> *const std::os::raw::c_char;
+    pub fn esimd_batch_expand_fwd_fused(
+        queue: *mut c_void,
+        d_out: *mut c_void,
+        d_in: *const c_void,
+        lg_out: u32,
+        lg_blowup: u32,
+        cols: u32,
+    ) -> *const std::os::raw::c_char;
 
     // Poseidon2
-    pub fn esimd_poseidon2_hash_rows(queue: *mut c_void, d_out: *mut c_void, d_in: *const c_void, count: u32, col_size: u32) -> *const std::os::raw::c_char;
-    pub fn esimd_poseidon2_hash_fold(queue: *mut c_void, d_out: *mut c_void, d_in: *const c_void, num_hashes: u32) -> *const std::os::raw::c_char;
+    pub fn esimd_poseidon2_hash_rows(
+        queue: *mut c_void,
+        d_out: *mut c_void,
+        d_in: *const c_void,
+        count: u32,
+        col_size: u32,
+    ) -> *const std::os::raw::c_char;
+    pub fn esimd_poseidon2_hash_fold(
+        queue: *mut c_void,
+        d_out: *mut c_void,
+        d_in: *const c_void,
+        num_hashes: u32,
+    ) -> *const std::os::raw::c_char;
 
     // Poseidon-254 (BN254 field)
-    pub fn esimd_poseidon254_hash_rows(queue: *mut c_void, d_out: *mut c_void, d_in: *const c_void, row_size: u32, col_size: u32) -> *const std::os::raw::c_char;
-    pub fn esimd_poseidon254_hash_fold(queue: *mut c_void, d_out: *mut c_void, d_in: *const c_void, num_hashes: u32) -> *const std::os::raw::c_char;
+    pub fn esimd_poseidon254_hash_rows(
+        queue: *mut c_void,
+        d_out: *mut c_void,
+        d_in: *const c_void,
+        row_size: u32,
+        col_size: u32,
+    ) -> *const std::os::raw::c_char;
+    pub fn esimd_poseidon254_hash_fold(
+        queue: *mut c_void,
+        d_out: *mut c_void,
+        d_in: *const c_void,
+        num_hashes: u32,
+    ) -> *const std::os::raw::c_char;
 
     // Element-wise operations
-    pub fn esimd_eltwise_add_fp_ffi(queue: *mut c_void, out: *mut c_void, x: *const c_void, y: *const c_void, count: u32) -> *const std::os::raw::c_char;
-    pub fn esimd_eltwise_copy_fp_ffi(queue: *mut c_void, out: *mut c_void, inp: *const c_void, count: u32) -> *const std::os::raw::c_char;
-    pub fn esimd_eltwise_copy_fp_region_ffi(queue: *mut c_void, into: *mut c_void, from: *const c_void, from_rows: u32, from_cols: u32, from_offset: u32, from_stride: u32, into_offset: u32, into_stride: u32) -> *const std::os::raw::c_char;
-    pub fn esimd_eltwise_sum_fpext_ffi(queue: *mut c_void, out: *mut c_void, inp: *const c_void, to_add: u32, count: u32) -> *const std::os::raw::c_char;
-    pub fn esimd_eltwise_zeroize_fp_ffi(queue: *mut c_void, elems: *mut c_void, count: u32) -> *const std::os::raw::c_char;
-    pub fn esimd_gather_sample_fp_ffi(queue: *mut c_void, dst: *mut c_void, src: *const c_void, idx: u32, size: u32, stride: u32) -> *const std::os::raw::c_char;
-    pub fn esimd_scatter_fp_ffi(queue: *mut c_void, into: *mut c_void, index: *const c_void, offsets: *const c_void, values: *const c_void, count: u32) -> *const std::os::raw::c_char;
-    pub fn esimd_gather_digests_ffi(queue: *mut c_void, dst: *mut c_void, src: *const c_void, indices: *const c_void, count: u32) -> *const std::os::raw::c_char;
+    pub fn esimd_eltwise_add_fp_ffi(
+        queue: *mut c_void,
+        out: *mut c_void,
+        x: *const c_void,
+        y: *const c_void,
+        count: u32,
+    ) -> *const std::os::raw::c_char;
+    pub fn esimd_eltwise_copy_fp_ffi(
+        queue: *mut c_void,
+        out: *mut c_void,
+        inp: *const c_void,
+        count: u32,
+    ) -> *const std::os::raw::c_char;
+    pub fn esimd_eltwise_copy_fp_region_ffi(
+        queue: *mut c_void,
+        into: *mut c_void,
+        from: *const c_void,
+        from_rows: u32,
+        from_cols: u32,
+        from_offset: u32,
+        from_stride: u32,
+        into_offset: u32,
+        into_stride: u32,
+    ) -> *const std::os::raw::c_char;
+    pub fn esimd_eltwise_sum_fpext_ffi(
+        queue: *mut c_void,
+        out: *mut c_void,
+        inp: *const c_void,
+        to_add: u32,
+        count: u32,
+    ) -> *const std::os::raw::c_char;
+    pub fn esimd_eltwise_zeroize_fp_ffi(
+        queue: *mut c_void,
+        elems: *mut c_void,
+        count: u32,
+    ) -> *const std::os::raw::c_char;
+    pub fn esimd_gather_sample_fp_ffi(
+        queue: *mut c_void,
+        dst: *mut c_void,
+        src: *const c_void,
+        idx: u32,
+        size: u32,
+        stride: u32,
+    ) -> *const std::os::raw::c_char;
+    pub fn esimd_scatter_fp_ffi(
+        queue: *mut c_void,
+        into: *mut c_void,
+        index: *const c_void,
+        offsets: *const c_void,
+        values: *const c_void,
+        count: u32,
+    ) -> *const std::os::raw::c_char;
+    pub fn esimd_gather_digests_ffi(
+        queue: *mut c_void,
+        dst: *mut c_void,
+        src: *const c_void,
+        indices: *const c_void,
+        count: u32,
+    ) -> *const std::os::raw::c_char;
 
     // FRI and polynomial operations
-    pub fn esimd_fri_fold_ffi(queue: *mut c_void, d_out: *mut c_void, d_in: *const c_void, d_mix: *const c_void, count: u32) -> *const std::os::raw::c_char;
-    pub fn esimd_mix_poly_coeffs_ffi(queue: *mut c_void, d_out: *mut c_void, d_in: *const c_void, d_combos: *const c_void, d_mix_start: *const c_void, d_mix: *const c_void, input_size: u32, count: u32) -> *const std::os::raw::c_char;
-    pub fn esimd_batch_evaluate_any_ffi(queue: *mut c_void, d_out: *mut c_void, d_coeffs: *const c_void, d_which: *const c_void, d_xs: *const c_void, count: u32, deg: u32) -> *const std::os::raw::c_char;
-    pub fn esimd_combos_prepare_ffi(queue: *mut c_void, d_combos: *mut c_void, d_coeff_u: *const c_void, combo_count: u32, cycles: u32, regs_count: u32, d_reg_sizes: *const c_void, d_reg_combo_ids: *const c_void, check_size: u32, d_mix: *const c_void) -> *const std::os::raw::c_char;
-    pub fn esimd_combos_divide_ffi(queue: *mut c_void, d_combos: *mut c_void, rows: u32, combos_cols: u32, d_info: *const c_void, info_count: u32, d_remainders: *mut c_void) -> *const std::os::raw::c_char;
+    pub fn esimd_fri_fold_ffi(
+        queue: *mut c_void,
+        d_out: *mut c_void,
+        d_in: *const c_void,
+        d_mix: *const c_void,
+        count: u32,
+    ) -> *const std::os::raw::c_char;
+    pub fn esimd_mix_poly_coeffs_ffi(
+        queue: *mut c_void,
+        d_out: *mut c_void,
+        d_in: *const c_void,
+        d_combos: *const c_void,
+        d_mix_start: *const c_void,
+        d_mix: *const c_void,
+        input_size: u32,
+        count: u32,
+    ) -> *const std::os::raw::c_char;
+    pub fn esimd_batch_evaluate_any_ffi(
+        queue: *mut c_void,
+        d_out: *mut c_void,
+        d_coeffs: *const c_void,
+        d_which: *const c_void,
+        d_xs: *const c_void,
+        count: u32,
+        deg: u32,
+    ) -> *const std::os::raw::c_char;
+    pub fn esimd_combos_prepare_ffi(
+        queue: *mut c_void,
+        d_combos: *mut c_void,
+        d_coeff_u: *const c_void,
+        combo_count: u32,
+        cycles: u32,
+        regs_count: u32,
+        d_reg_sizes: *const c_void,
+        d_reg_combo_ids: *const c_void,
+        check_size: u32,
+        d_mix: *const c_void,
+    ) -> *const std::os::raw::c_char;
+    pub fn esimd_combos_divide_ffi(
+        queue: *mut c_void,
+        d_combos: *mut c_void,
+        rows: u32,
+        combos_cols: u32,
+        d_info: *const c_void,
+        info_count: u32,
+        d_remainders: *mut c_void,
+    ) -> *const std::os::raw::c_char;
     /// Device-side combos division (blocked synthetic division). `h_info`: host array of
     /// `info_count` x {col, z[4] raw Montgomery}; `h_rem`: host array of `info_count` x 4 u32.
     /// Synchronous; returns an error string if any remainder is nonzero.
-    pub fn esimd_combos_divide_v2_ffi(queue: *mut c_void, d_combos: *mut c_void, rows: u32, ncols: u32, h_info: *const c_void, info_count: u32, h_rem: *mut c_void) -> *const std::os::raw::c_char;
-    pub fn esimd_combos_finalize_ffi(queue: *mut c_void, d_out: *mut c_void, d_combos: *const c_void, rows: u32, combos_cols: u32) -> *const std::os::raw::c_char;
+    pub fn esimd_combos_divide_v2_ffi(
+        queue: *mut c_void,
+        d_combos: *mut c_void,
+        rows: u32,
+        ncols: u32,
+        h_info: *const c_void,
+        info_count: u32,
+        h_rem: *mut c_void,
+    ) -> *const std::os::raw::c_char;
+    pub fn esimd_combos_finalize_ffi(
+        queue: *mut c_void,
+        d_out: *mut c_void,
+        d_combos: *const c_void,
+        rows: u32,
+        combos_cols: u32,
+    ) -> *const std::os::raw::c_char;
 
     // GPU query (extract column + Merkle auth path on device)
-    pub fn esimd_query_ffi(queue: *mut c_void, d_out: *mut c_void, d_data: *const c_void, d_tree: *const c_void, query_size: u32, rows: u32, cols: u32, idx: u32) -> *const std::os::raw::c_char;
+    pub fn esimd_query_ffi(
+        queue: *mut c_void,
+        d_out: *mut c_void,
+        d_data: *const c_void,
+        d_tree: *const c_void,
+        query_size: u32,
+        rows: u32,
+        cols: u32,
+        idx: u32,
+    ) -> *const std::os::raw::c_char;
 }
 
 // ============================================================================
@@ -185,7 +410,9 @@ pub fn esimd_check(err: *const std::os::raw::c_char) {
                 .to_str()
                 .unwrap_or("invalid error string")
                 .to_string();
-            extern "C" { fn free(ptr: *const std::os::raw::c_char); }
+            extern "C" {
+                fn free(ptr: *const std::os::raw::c_char);
+            }
             free(err);
             s
         };
@@ -243,7 +470,12 @@ impl IntelDeviceBuffer {
 
     /// Copy host data to device.
     pub fn copy_from(&mut self, data: &[u8]) -> anyhow::Result<()> {
-        assert!(data.len() <= self.len, "copy_from: data ({}) exceeds buffer ({})", data.len(), self.len);
+        assert!(
+            data.len() <= self.len,
+            "copy_from: data ({}) exceeds buffer ({})",
+            data.len(),
+            self.len
+        );
         let queue = get_queue();
         unsafe {
             esimd_memcpy_htod(

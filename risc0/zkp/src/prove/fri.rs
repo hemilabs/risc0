@@ -72,7 +72,6 @@ impl<H: Hal> ProveRoundInfo<H> {
             merkle,
         }
     }
-
 }
 
 pub fn fri_prove<H: Hal, F>(

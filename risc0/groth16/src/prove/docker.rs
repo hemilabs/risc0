@@ -42,7 +42,9 @@ pub(crate) fn shrink_wrap(identity_p254_seal_bytes: &[u8]) -> Result<Seal> {
     if fast_enabled() {
         match super::fast::preload() {
             Ok(()) => return super::fast::shrink_wrap(identity_p254_seal_bytes),
-            Err(e) => tracing::warn!("fast shrink_wrap unavailable, using the plain Docker path: {e:#}"),
+            Err(e) => {
+                tracing::warn!("fast shrink_wrap unavailable, using the plain Docker path: {e:#}")
+            }
         }
     }
 

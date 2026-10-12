@@ -96,7 +96,9 @@ fn build_cuda_kernels() {
     if env::var_os("NVCC_PREPEND_FLAGS").is_none() && env::var_os("NVCC_APPEND_FLAGS").is_none() {
         build.flag("-arch=native");
     }
-    build.files(witgen_files).compile("risc0_keccak_cuda_witgen");
+    build
+        .files(witgen_files)
+        .compile("risc0_keccak_cuda_witgen");
 
     // Build 2: eval_check as a single TU WITHOUT --device-c (whole program mode).
     // This enables inlining of the deep poly_fp chain (keccak_0..keccak_47),
@@ -105,11 +107,13 @@ fn build_cuda_kernels() {
     let mut nvcc = Command::new("nvcc");
     nvcc.arg("-std=c++17")
         .arg("-O3")
-        .arg("-Xcompiler").arg("-fPIC")
+        .arg("-Xcompiler")
+        .arg("-fPIC")
         .arg("-diag-suppress=177")
         .arg("-diag-suppress=550")
         .arg("-diag-suppress=2922")
-        .arg("-Xcompiler").arg("-Wno-unused-function,-Wno-unused-parameter")
+        .arg("-Xcompiler")
+        .arg("-Wno-unused-function,-Wno-unused-parameter")
         .arg(format!("-I{}", cuda_root))
         .arg(format!("-I{}", sppark_root))
         .arg(format!("-I{}", kernel_dir.display()));
@@ -118,10 +122,14 @@ fn build_cuda_kernels() {
     }
     nvcc.arg("-c")
         .arg("kernels/cuda/eval_check_combined.cu")
-        .arg("-o").arg(&eval_check_obj);
+        .arg("-o")
+        .arg(&eval_check_obj);
 
     let status = nvcc.status().expect("failed to run nvcc");
-    assert!(status.success(), "nvcc failed to compile eval_check_combined.cu");
+    assert!(
+        status.success(),
+        "nvcc failed to compile eval_check_combined.cu"
+    );
 
     // Archive into static lib
     let lib_path = out_dir.join(format!("lib{output}.a"));
@@ -193,14 +201,24 @@ fn build_rocm_kernels() {
     let kernel_dir_str = kernel_dir.to_str().unwrap();
     let arches = risc0_build_kernel::hip_arches();
     let base_flags: Vec<&str> = vec![
-        "-x", "hip",
-        "-std=c++17", "-O2", "-fPIC",
-        "-Wno-unused-function", "-Wno-unused-parameter", "-Wno-missing-braces",
-        "-mllvm", "-amdgpu-early-inline-all=false",
-        "-include", &include_cuda2hip,
-        "-I", &cuda_root,
-        "-I", &sppark_root,
-        "-I", kernel_dir_str,
+        "-x",
+        "hip",
+        "-std=c++17",
+        "-O2",
+        "-fPIC",
+        "-Wno-unused-function",
+        "-Wno-unused-parameter",
+        "-Wno-missing-braces",
+        "-mllvm",
+        "-amdgpu-early-inline-all=false",
+        "-include",
+        &include_cuda2hip,
+        "-I",
+        &cuda_root,
+        "-I",
+        &sppark_root,
+        "-I",
+        kernel_dir_str,
     ];
 
     let mut obj_files = Vec::new();

@@ -659,8 +659,11 @@ fn bench_prove_multi_segment_po2_20() {
         let seg_elapsed = t.elapsed().as_secs_f64();
         segment_times.push(seg_elapsed);
         if std::env::var_os("RISC0_VERBOSE").is_some() {
-            eprintln!("[multi_bench] seg {i}: {seg_elapsed:.3}s (po2={}, seal={})",
-                segment.inner.po2, receipt.seal.len() * 4);
+            eprintln!(
+                "[multi_bench] seg {i}: {seg_elapsed:.3}s (po2={}, seal={})",
+                segment.inner.po2,
+                receipt.seal.len() * 4
+            );
         }
     }
     let elapsed = start.elapsed();

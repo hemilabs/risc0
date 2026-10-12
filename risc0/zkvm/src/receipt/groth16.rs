@@ -100,7 +100,11 @@ impl<Claim> Groth16Receipt<Claim> {
             &params.verifying_key,
         );
         if let Err(ref e) = verifier_result {
-            tracing::error!("Groth16 Verifier::new failed: {:?}, seal len: {}", e, self.seal.len());
+            tracing::error!(
+                "Groth16 Verifier::new failed: {:?}, seal len: {}",
+                e,
+                self.seal.len()
+            );
         }
         let verifier = verifier_result.map_err(|_| VerificationError::ReceiptFormatError)?;
         let verify_result = verifier.verify();

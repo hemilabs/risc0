@@ -15,10 +15,10 @@
 #[cfg(feature = "cuda")]
 use cust::memory::DevicePointer;
 
-#[cfg(feature = "rocm")]
-use risc0_sys::cuda::DevicePointer;
 use derive_more::Debug;
 use risc0_core::field::baby_bear::{BabyBearElem, BabyBearExtElem};
+#[cfg(feature = "rocm")]
+use risc0_sys::cuda::DevicePointer;
 
 #[derive(Clone, Debug, PartialEq)]
 #[repr(C)]

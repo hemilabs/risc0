@@ -20,24 +20,20 @@ use risc0_zkp::field::Elem as _;
 use anyhow::{bail, Result};
 use risc0_circuit_recursion_sys::{
     risc0_circuit_recursion_cpu_accum, risc0_circuit_recursion_cpu_eval_check,
-    risc0_circuit_recursion_cpu_witgen,
-    RawAccumBuffers, RawExecBuffers, RawPreflightTrace,
+    risc0_circuit_recursion_cpu_witgen, RawAccumBuffers, RawExecBuffers, RawPreflightTrace,
     StepMode,
 };
 use risc0_sys::ffi_wrap;
 use risc0_zkp::{
-    core::{
-        log2_ceil,
-    },
+    core::log2_ceil,
     field::{
         baby_bear::{BabyBearElem, BabyBearExtElem},
         map_pow, RootsOfUnity as _,
     },
     hal::{
         intel::{
-            BufferImpl as IntelBuffer, IntelHal, IntelHalPoseidon2,
-            IntelHalPoseidon254, IntelHalSha256, IntelHash,
-            IntelHashPoseidon2, IntelHashPoseidon254, IntelHashSha256,
+            BufferImpl as IntelBuffer, IntelHal, IntelHalPoseidon2, IntelHalPoseidon254,
+            IntelHalSha256, IntelHash, IntelHashPoseidon2, IntelHashPoseidon254, IntelHashSha256,
         },
         AccumPreflight, Buffer, CircuitHal,
     },
@@ -64,7 +60,14 @@ struct IntelCircuitHal<IH: IntelHash> {
     //    content; generic code then writes ZK noise into the tail ZK_CYCLES
     //    rows of every column and zeroizes INVALID. accumulate() re-reads just
     //    those tail rows from the device and applies the same zeroize on host.
-    ctrl_cache: Mutex<Vec<(usize, usize, IntelBuffer<BabyBearElem>, Arc<Vec<BabyBearElem>>)>>,
+    ctrl_cache: Mutex<
+        Vec<(
+            usize,
+            usize,
+            IntelBuffer<BabyBearElem>,
+            Arc<Vec<BabyBearElem>>,
+        )>,
+    >,
     data_shadow: Mutex<Option<(usize, usize, Vec<BabyBearElem>)>>,
 }
 
@@ -79,7 +82,10 @@ impl<IH: IntelHash> IntelCircuitHal<IH> {
 }
 
 fn host_shadow_enabled() -> bool {
-    !matches!(std::env::var("RISC0_RECURSION_HOST_SHADOW").as_deref(), Ok("0"))
+    !matches!(
+        std::env::var("RISC0_RECURSION_HOST_SHADOW").as_deref(),
+        Ok("0")
+    )
 }
 
 fn shadow_check_enabled() -> bool {
@@ -115,7 +121,11 @@ fn vec_filled(n: usize, val: BabyBearElem) -> Vec<BabyBearElem> {
     let mut v: Vec<BabyBearElem> = Vec::with_capacity(n);
     v.spare_capacity_mut()
         .par_chunks_mut(1 << 16)
-        .for_each(|c| c.iter_mut().for_each(|x| { x.write(val); }));
+        .for_each(|c| {
+            c.iter_mut().for_each(|x| {
+                x.write(val);
+            })
+        });
     unsafe { v.set_len(n) };
     v
 }
@@ -135,7 +145,11 @@ fn zeroize_host(v: &mut [BabyBearElem]) {
         .for_each(|c| c.iter_mut().for_each(|x| *x = x.valid_or_zero()));
 }
 
-fn shadow_compare(name: &str, buf: &IntelBuffer<BabyBearElem>, host: &[BabyBearElem]) -> Result<()> {
+fn shadow_compare(
+    name: &str,
+    buf: &IntelBuffer<BabyBearElem>,
+    host: &[BabyBearElem],
+) -> Result<()> {
     let dev = dtoh_vec(buf);
     let bad = dev
         .iter()
@@ -143,9 +157,15 @@ fn shadow_compare(name: &str, buf: &IntelBuffer<BabyBearElem>, host: &[BabyBearE
         .filter(|(a, b)| a.as_u32_montgomery() != b.as_u32_montgomery())
         .count();
     if bad != 0 || dev.len() != host.len() {
-        bail!("host shadow mismatch on {name}: {bad} of {} differ", dev.len());
+        bail!(
+            "host shadow mismatch on {name}: {bad} of {} differ",
+            dev.len()
+        );
     }
-    eprintln!("[recursion_shadow_check] {name}: {} elems identical", dev.len());
+    eprintln!(
+        "[recursion_shadow_check] {name}: {} elems identical",
+        dev.len()
+    );
     Ok(())
 }
 
@@ -245,7 +265,10 @@ impl<IH: IntelHash> CircuitWitnessGenerator<IntelHal<IH>> for IntelCircuitHal<IH
             *self.data_shadow.lock().unwrap() = None;
         }
         if std::env::var_os("RISC0_VERBOSE").is_some() {
-            eprintln!("[recursion_witgen_intel] prewitgen upload h2d={:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+            eprintln!(
+                "[recursion_witgen_intel] prewitgen upload h2d={:.1}ms",
+                t0.elapsed().as_secs_f64() * 1000.0
+            );
         }
         Ok(())
     }
@@ -275,12 +298,30 @@ impl<IH: IntelHash> CircuitAccumulator<IntelHal<IH>> for IntelCircuitHal<IH> {
         let mode = gpu_accum_mode();
         if mode == "cpu" {
             return self
-                .accumulate_cpu(work_cycles, total_cycles, ctrl, global, data, mix, accum, true)
+                .accumulate_cpu(
+                    work_cycles,
+                    total_cycles,
+                    ctrl,
+                    global,
+                    data,
+                    mix,
+                    accum,
+                    true,
+                )
                 .map(|_| ());
         }
         let t0 = std::time::Instant::now();
         let reference = if mode == "check" {
-            Some(self.accumulate_cpu(work_cycles, total_cycles, ctrl, global, data, mix, accum, false)?)
+            Some(self.accumulate_cpu(
+                work_cycles,
+                total_cycles,
+                ctrl,
+                global,
+                data,
+                mix,
+                accum,
+                false,
+            )?)
         } else {
             // The data host shadow is only needed by the CPU accum; free it
             // off the GPU thread.
@@ -310,9 +351,15 @@ impl<IH: IntelHash> CircuitAccumulator<IntelHal<IH>> for IntelCircuitHal<IH> {
                 .filter(|(a, b)| a.as_u32_montgomery() != b.as_u32_montgomery())
                 .count();
             if bad != 0 || dev.len() != r.len() {
-                bail!("recursion GPU accum mismatch: {bad} of {} differ (work_cycles={work_cycles})", dev.len());
+                bail!(
+                    "recursion GPU accum mismatch: {bad} of {} differ (work_cycles={work_cycles})",
+                    dev.len()
+                );
             }
-            eprintln!("[recursion_gpu_accum_check] identical ({} elems, work_cycles={work_cycles})", dev.len());
+            eprintln!(
+                "[recursion_gpu_accum_check] identical ({} elems, work_cycles={work_cycles})",
+                dev.len()
+            );
         }
         if std::env::var_os("RISC0_VERBOSE").is_some() {
             eprintln!(
@@ -365,7 +412,13 @@ impl<IH: IntelHash> IntelCircuitHal<IH> {
                     shadow_compare("data(accum)", data, &data_host)?;
                     shadow_compare("accum(pre)", accum, &accum_host)?;
                 }
-                (self.host_ctrl(ctrl), dtoh_vec(global), data_host, dtoh_vec(mix), accum_host)
+                (
+                    self.host_ctrl(ctrl),
+                    dtoh_vec(global),
+                    data_host,
+                    dtoh_vec(mix),
+                    accum_host,
+                )
             } else {
                 (
                     Arc::new(ctrl.to_vec()),
@@ -427,15 +480,12 @@ impl<IH: IntelHash> CircuitHal<IntelHal<IH>> for IntelCircuitHal<IH> {
 
         // GPU eval_check: -O1 frontend + -cl-opt-disable for ocloc (fast compile).
         // At po2=18 (1M domain), the unoptimized GPU code may run within TDR limits.
-        let poly_mix_buf: IntelBuffer<u32> = IntelBuffer::copy_from(
-            "poly_mix",
-            unsafe {
-                std::slice::from_raw_parts(
-                    poly_mix_pows.as_ptr() as *const u32,
-                    poly_mix_pows.len() * 4,
-                )
-            },
-        );
+        let poly_mix_buf: IntelBuffer<u32> = IntelBuffer::copy_from("poly_mix", unsafe {
+            std::slice::from_raw_parts(
+                poly_mix_pows.as_ptr() as *const u32,
+                poly_mix_pows.len() * 4,
+            )
+        });
 
         let rou = BabyBearElem::ROU_FWD[po2 + EXP_PO2];
         let rou_raw: u32 = unsafe { std::mem::transmute(rou) };
@@ -494,9 +544,13 @@ impl<IH: IntelHash> CircuitHal<IntelHal<IH>> for IntelCircuitHal<IH> {
                 .map(|(i, _)| i)
                 .collect();
             if bad.is_empty() {
-                eprintln!("[recursion_eval_check_shadow] po2={po2} domain={domain}: {} elems identical", gpu.len());
+                eprintln!(
+                    "[recursion_eval_check_shadow] po2={po2} domain={domain}: {} elems identical",
+                    gpu.len()
+                );
             } else {
-                let rows: std::collections::BTreeSet<usize> = bad.iter().map(|i| i % domain).collect();
+                let rows: std::collections::BTreeSet<usize> =
+                    bad.iter().map(|i| i % domain).collect();
                 panic!(
                     "[recursion_eval_check_shadow] po2={po2} domain={domain}: {} of {} differ, {} distinct rows, first rows {:?}",
                     bad.len(),

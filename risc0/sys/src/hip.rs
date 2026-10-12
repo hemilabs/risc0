@@ -117,7 +117,12 @@ impl HipDeviceBuffer {
     /// Copy a range of device data to a new host Vec.
     /// `offset` and `len` are in bytes.
     pub fn as_host_vec_range(&self, offset: usize, len: usize) -> anyhow::Result<Vec<u8>> {
-        assert!(offset + len <= self.len, "range [{offset}..{}] exceeds buffer size {}", offset + len, self.len);
+        assert!(
+            offset + len <= self.len,
+            "range [{offset}..{}] exceeds buffer size {}",
+            offset + len,
+            self.len
+        );
         let mut vec = vec![0u8; len];
         hip_check(unsafe {
             hipMemcpy(
@@ -136,9 +141,7 @@ impl HipDeviceBuffer {
             hip_check(unsafe { hipMemset(self.ptr as *mut c_void, 0, self.len) });
         } else {
             let count = self.len / 4;
-            hip_check(unsafe {
-                hipMemsetD32(self.ptr as *mut c_void, value as c_int, count)
-            });
+            hip_check(unsafe { hipMemsetD32(self.ptr as *mut c_void, value as c_int, count) });
         }
     }
 

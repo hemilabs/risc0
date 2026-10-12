@@ -1,18 +1,17 @@
 use std::time::Instant;
 
-use risc0_zkvm::{get_prover_server, ExecutorEnv, ExecutorImpl, ProverOpts, ReceiptKind, VerifierContext};
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 use risc0_circuit_rv32im;
+use risc0_zkvm::{
+    get_prover_server, ExecutorEnv, ExecutorImpl, ProverOpts, ReceiptKind, VerifierContext,
+};
 use risc0_zkvm_methods::{bench::BenchmarkSpec, BENCH_ELF, BENCH_ID};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let iters: u32 = args.get(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10_000);
+    let iters: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10_000);
 
-    let po2: Option<u32> = args.get(2)
-        .and_then(|s| s.parse().ok());
+    let po2: Option<u32> = args.get(2).and_then(|s| s.parse().ok());
 
     // Receipt kind: "composite" (default), "succinct", or "groth16"
     let receipt_kind = match args.get(3).map(|s| s.as_str()) {
@@ -33,7 +32,10 @@ fn main() {
         iters,
     };
 
-    eprintln!("Executing guest ({iters} SHA256 iterations, po2={})...", po2.map_or("default(20)".to_string(), |p| p.to_string()));
+    eprintln!(
+        "Executing guest ({iters} SHA256 iterations, po2={})...",
+        po2.map_or("default(20)".to_string(), |p| p.to_string())
+    );
     let mut builder = ExecutorEnv::builder();
     builder.write(&spec).unwrap();
     if let Some(po2) = po2 {
@@ -67,7 +69,10 @@ fn main() {
         ReceiptKind::Groth16 => "groth16",
         _ => "unknown",
     };
-    eprintln!("Proving {} segments ({kind_str})...", session.segments.len());
+    eprintln!(
+        "Proving {} segments ({kind_str})...",
+        session.segments.len()
+    );
     let t0 = Instant::now();
     let prove_info = prover.prove_session(&ctx, &session).unwrap();
     let elapsed = t0.elapsed();

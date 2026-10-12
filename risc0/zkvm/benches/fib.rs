@@ -70,7 +70,11 @@ fn prove_segment(group: &mut BenchGroup, hashfn: &str) {
 
         let session = setup_exec(iterations).run().unwrap();
         // Pick the largest segment (usually index 1+, since index 0 is just init)
-        eprintln!("  session: {} segments, total_cycles: {}", session.segments.len(), session.total_cycles);
+        eprintln!(
+            "  session: {} segments, total_cycles: {}",
+            session.segments.len(),
+            session.total_cycles
+        );
         let seg_idx = if session.segments.len() > 1 { 1 } else { 0 };
         let segment = session.segments[seg_idx].resolve().unwrap();
 

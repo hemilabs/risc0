@@ -76,7 +76,9 @@ fn borrowed_err_wrap(inner: impl FnOnce() -> *const std::os::raw::c_char) -> Res
     if c_ptr.is_null() {
         return Ok(());
     }
-    let msg = unsafe { std::ffi::CStr::from_ptr(c_ptr) }.to_string_lossy().into_owned();
+    let msg = unsafe { std::ffi::CStr::from_ptr(c_ptr) }
+        .to_string_lossy()
+        .into_owned();
     Err(anyhow::anyhow!(msg))
 }
 
@@ -165,17 +167,23 @@ impl<IH: IntelHash> CircuitAccumulator<IntelHal<IH>> for IntelCircuitHal<IH> {
             risc0_circuit_rv32im_sys::risc0_circuit_rv32im_intel_accum(
                 queue,
                 data.buf.as_device_ptr().0 as *mut std::ffi::c_void,
-                data.rows as u32, data.cols as u32,
+                data.rows as u32,
+                data.cols as u32,
                 accum.buf.as_device_ptr().0 as *mut std::ffi::c_void,
-                accum.rows as u32, accum.cols as u32,
+                accum.rows as u32,
+                accum.cols as u32,
                 global.buf.as_device_ptr().0 as *mut std::ffi::c_void,
                 global.cols as u32,
                 mix.buf.as_device_ptr().0 as *mut std::ffi::c_void,
                 mix.cols as u32,
-                preflight.cycles.as_ptr(), preflight.cycles.len() as u32,
-                preflight.txns.as_ptr(), preflight.txns.len() as u32,
-                preflight.bigint_bytes.as_ptr(), preflight.bigint_bytes.len() as u32,
-                preflight.table_split_cycle, cycles as u32,
+                preflight.cycles.as_ptr(),
+                preflight.cycles.len() as u32,
+                preflight.txns.as_ptr(),
+                preflight.txns.len() as u32,
+                preflight.bigint_bytes.as_ptr(),
+                preflight.bigint_bytes.len() as u32,
+                preflight.table_split_cycle,
+                cycles as u32,
             )
         })?;
 
@@ -217,7 +225,10 @@ impl<IH: IntelHash> CircuitHal<IntelHal<IH>> for IntelCircuitHal<IH> {
         // Upload poly_mix_pows (+ qtab) to GPU. Stored in the struct to keep
         // it alive until eval_check_dep(). Both are in device (Montgomery) form.
         let mut poly_mix_words: Vec<u32> = unsafe {
-            std::slice::from_raw_parts(poly_mix_pows.as_ptr() as *const u32, poly_mix_pows.len() * 4)
+            std::slice::from_raw_parts(
+                poly_mix_pows.as_ptr() as *const u32,
+                poly_mix_pows.len() * 4,
+            )
         }
         .to_vec();
         poly_mix_words.extend(qtab.iter().map(|q| q.as_u32_montgomery()));
@@ -241,7 +252,11 @@ impl<IH: IntelHash> CircuitHal<IntelHal<IH>> for IntelCircuitHal<IH> {
             let n_inter_fp = 197 * domain;
             let n_inter_ext = 9 * domain * 4;
             let verbose = std::env::var_os("RISC0_VERBOSE").is_some();
-            let t0 = if verbose { Some(std::time::Instant::now()) } else { None };
+            let t0 = if verbose {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
 
             let inter_fp = self._hal.alloc_u32("inter_fp", n_inter_fp);
             let inter_ext = self._hal.alloc_u32("inter_ext", n_inter_ext);
@@ -267,11 +282,17 @@ impl<IH: IntelHash> CircuitHal<IntelHal<IH>> for IntelCircuitHal<IH> {
                     risc0_circuit_rv32im_sys::risc0_circuit_rv32im_intel_eval_check_sync(queue)
                 });
                 let t1 = std::time::Instant::now();
-                eprintln!("      [eval_check_pass1] {:.1}ms",
-                    t1.duration_since(t0.unwrap()).as_secs_f64() * 1000.0);
+                eprintln!(
+                    "      [eval_check_pass1] {:.1}ms",
+                    t1.duration_since(t0.unwrap()).as_secs_f64() * 1000.0
+                );
             }
 
-            let t1 = if verbose { Some(std::time::Instant::now()) } else { None };
+            let t1 = if verbose {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
 
             // Pass 2: reads intermediate → writes check buffer
             risc0_sys::intel::esimd_check(unsafe {
@@ -296,8 +317,10 @@ impl<IH: IntelHash> CircuitHal<IntelHal<IH>> for IntelCircuitHal<IH> {
                     risc0_circuit_rv32im_sys::risc0_circuit_rv32im_intel_eval_check_sync(queue)
                 });
                 let t2 = std::time::Instant::now();
-                eprintln!("      [eval_check_pass2] {:.1}ms",
-                    t2.duration_since(t1.unwrap()).as_secs_f64() * 1000.0);
+                eprintln!(
+                    "      [eval_check_pass2] {:.1}ms",
+                    t2.duration_since(t1.unwrap()).as_secs_f64() * 1000.0
+                );
             }
 
             // Keep intermediate buffers alive until eval_check_dep()
@@ -426,10 +449,7 @@ mod tests {
     impl EnvGuard {
         fn new(keys: &[&'static str]) -> Self {
             let _guard = env_lock().lock();
-            let saved = keys
-                .iter()
-                .map(|k| (*k, std::env::var_os(k)))
-                .collect();
+            let saved = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
             Self { saved, _guard }
         }
     }
@@ -457,11 +477,7 @@ mod tests {
                 actual.len()
             );
         }
-        let total_diffs = expected
-            .iter()
-            .zip(actual)
-            .filter(|(a, b)| a != b)
-            .count();
+        let total_diffs = expected.iter().zip(actual).filter(|(a, b)| a != b).count();
         if total_diffs > 0 {
             let i = expected
                 .iter()
@@ -724,7 +740,8 @@ mod tests {
         match std::fs::read(&path) {
             Ok(expected) => {
                 assert_eq!(
-                    observed_bytes, expected,
+                    observed_bytes,
+                    expected,
                     "golden mismatch for {} (path={})",
                     mode,
                     path.display()
@@ -777,7 +794,10 @@ mod tests {
             bad.first(),
             bad.last()
         );
-        assert!(bad.is_empty(), "Intel eval_check diverged from CPU at po2=21");
+        assert!(
+            bad.is_empty(),
+            "Intel eval_check diverged from CPU at po2=21"
+        );
     }
 
     /// Intel eval_check matches CPU at the small production po2s, on both
@@ -801,7 +821,10 @@ mod tests {
                 }
             }
         }
-        assert!(failures.is_empty(), "Intel eval_check diverged: {failures:?}");
+        assert!(
+            failures.is_empty(),
+            "Intel eval_check diverged: {failures:?}"
+        );
     }
 
     /// 2. Random differential — Intel multipass path matches CPU reference.
@@ -901,16 +924,14 @@ mod tests {
             .and_then(|s| s.parse().ok())
             .unwrap_or(100)
             .max(1); // Guard against accidental ITERS=0; index OOB would
-                    // panic on times[len/2] otherwise.
+                     // panic on times[len/2] otherwise.
         let warmup: usize = std::env::var("RISC0_PHASE0C_WARMUP")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(10);
         let multipass = std::env::var_os("RISC0_PHASE0C_MULTIPASS").is_some();
 
-        eprintln!(
-            "phase0c_bench: po2={po2} iters={iters} warmup={warmup} multipass={multipass}"
-        );
+        eprintln!("phase0c_bench: po2={po2} iters={iters} warmup={warmup} multipass={multipass}");
 
         // Build params once; the kernel reads input buffers, doesn't mutate
         // them, so the same params can be reused across iterations.
@@ -1014,7 +1035,6 @@ mod tests {
             "empty query must not match the empty CSV tokens"
         );
     }
-
 }
 
 /// Debug aid: with `RISC0_INTEL_EVAL_CHECK_SHADOW=1`, wait for the GPU

@@ -28,8 +28,7 @@ static ZKR_ENCODED_CACHE: Mutex<Option<HashMap<String, Vec<u32>>>> = Mutex::new(
 
 /// Cache fully constructed Program objects keyed by (name, po2) behind Arc to avoid
 /// cloning ~24MB code vectors on each call (~2.4ms × 85 proofs = 200ms for SHA256 100K).
-static ZKR_PROGRAM_CACHE: Mutex<Option<HashMap<(String, usize), Arc<Program>>>> =
-    Mutex::new(None);
+static ZKR_PROGRAM_CACHE: Mutex<Option<HashMap<(String, usize), Arc<Program>>>> = Mutex::new(None);
 
 pub fn get_zkr(name: &str, po2: usize) -> Result<Arc<Program>> {
     // Check program cache first (avoids from_encoded conversion + 24MB clone).

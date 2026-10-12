@@ -78,7 +78,10 @@ pub fn lift(segment_receipt: &SegmentReceipt) -> Result<SuccinctReceipt<ReceiptC
 }
 
 /// Run the lift program with custom ProverOpts (e.g. for non-default max_segment_po2).
-pub fn lift_with_opts(segment_receipt: &SegmentReceipt, opts: ProverOpts) -> Result<SuccinctReceipt<ReceiptClaim>> {
+pub fn lift_with_opts(
+    segment_receipt: &SegmentReceipt,
+    opts: ProverOpts,
+) -> Result<SuccinctReceipt<ReceiptClaim>> {
     tracing::debug!("Proving lift: claim = {:#?}", segment_receipt.claim);
     let t0 = std::time::Instant::now();
     let mut prover = Prover::new_lift(segment_receipt, opts)?;
@@ -94,7 +97,9 @@ pub fn lift_with_opts(segment_receipt: &SegmentReceipt, opts: ProverOpts) -> Res
     let result = make_succinct_receipt(prover, receipt, claim);
     let post_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
-    if *VERBOSE { eprintln!("[lift_detail] setup={setup_ms:.1}ms run={run_ms:.1}ms post={post_ms:.1}ms"); }
+    if *VERBOSE {
+        eprintln!("[lift_detail] setup={setup_ms:.1}ms run={run_ms:.1}ms post={post_ms:.1}ms");
+    }
     result
 }
 
@@ -496,9 +501,8 @@ pub(crate) fn make_succinct_receipt<Claim>(
     claim: impl Into<MaybePruned<Claim>>,
 ) -> Result<SuccinctReceipt<Claim>> {
     // Derive verifier parameters from the prover's control_ids.
-    let verifier_parameters = SuccinctReceiptVerifierParameters::from_max_po2(
-        prover.opts.max_segment_po2,
-    ).digest();
+    let verifier_parameters =
+        SuccinctReceiptVerifierParameters::from_max_po2(prover.opts.max_segment_po2).digest();
     Ok(SuccinctReceipt {
         seal: receipt.seal,
         hashfn: prover.opts.hashfn.clone(),

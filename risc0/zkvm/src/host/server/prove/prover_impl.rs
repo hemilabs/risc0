@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{cell::RefCell, collections::HashMap, sync::LazyLock, sync::mpsc};
+use std::{cell::RefCell, collections::HashMap, sync::mpsc, sync::LazyLock};
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 
@@ -51,7 +51,10 @@ use crate::{
         server::{exec::executor::ExecutorImpl, prove::union_peak::UnionPeak},
     },
     mmr::MerkleMountainAccumulator,
-    receipt::{Groth16Receipt, Groth16ReceiptVerifierParameters, InnerReceipt, SegmentReceipt, SuccinctReceipt},
+    receipt::{
+        Groth16Receipt, Groth16ReceiptVerifierParameters, InnerReceipt, SegmentReceipt,
+        SuccinctReceipt,
+    },
     recursion::prove::{
         join_povw, join_unwrap_povw, lift_povw, resolve_povw, resolve_unwrap_povw, union,
         unwrap_povw,
@@ -120,7 +123,9 @@ impl ProverImpl {
         let split = (num_segments * 46 + 50) / 100;
         eprintln!(
             "[parallel-stark] {} segments: GPU0={}, GPU1={}",
-            num_segments, split, num_segments - split
+            num_segments,
+            split,
+            num_segments - split
         );
 
         let seg_verifier_params_digest = ctx
@@ -160,10 +165,8 @@ impl ProverImpl {
                     max_po2
                 );
                 let rand_z = ExtVal::random(&mut rand::rng());
-                let preflight = risc0_circuit_rv32im::prove::PreflightResults::new(
-                    &segment.inner,
-                    rand_z,
-                )?;
+                let preflight =
+                    risc0_circuit_rv32im::prove::PreflightResults::new(&segment.inner, rand_z)?;
                 let po2 = preflight.po2();
 
                 // Use prove_begin/prove_end pipeline for eval_check overlap.
@@ -173,8 +176,7 @@ impl ProverImpl {
                 if let Some(seal) = prev_seal {
                     let prev_seg = &segments[local_idx - 1];
                     let prev_po2 = prev_po2_stash;
-                    let mut claim =
-                        ReceiptClaim::decode_from_seal_v2(&seal, Some(prev_po2))?;
+                    let mut claim = ReceiptClaim::decode_from_seal_v2(&seal, Some(prev_po2))?;
                     claim.output = prev_seg.output.clone().into();
                     receipts.push(SegmentReceipt {
                         seal,
@@ -198,8 +200,7 @@ impl ProverImpl {
             // Complete last segment's deferred finalize.
             let last_seal = sp.prove_end()?;
             let last_seg = segments.last().unwrap();
-            let mut claim =
-                ReceiptClaim::decode_from_seal_v2(&last_seal, Some(prev_po2_stash))?;
+            let mut claim = ReceiptClaim::decode_from_seal_v2(&last_seal, Some(prev_po2_stash))?;
             claim.output = last_seg.output.clone().into();
             receipts.push(SegmentReceipt {
                 seal: last_seal,
@@ -322,26 +323,31 @@ impl ProverImpl {
 
         // Channel-based persistent lift thread: receives segments, returns lifted receipts.
         let (lift_tx, lift_rx) = std::sync::mpsc::sync_channel::<(SegmentReceipt, ProverOpts)>(1);
-        let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<Result<SuccinctReceipt<ReceiptClaim>>>(1);
+        let (result_tx, result_rx) =
+            std::sync::mpsc::sync_channel::<Result<SuccinctReceipt<ReceiptClaim>>>(1);
 
-        let lift_thread = std::thread::Builder::new()
-            .name("lift-gpu0".into())
-            .spawn(move || {
-                risc0_zkp::hal::hip::switch_to_device(lift_device);
-                // Process lift requests until channel closes.
-                while let Ok((seg, opts)) = lift_rx.recv() {
-                    let result = lift_with_opts(&seg, opts);
-                    if result_tx.send(result).is_err() {
-                        break; // main thread dropped receiver
+        let lift_thread =
+            std::thread::Builder::new()
+                .name("lift-gpu0".into())
+                .spawn(move || {
+                    risc0_zkp::hal::hip::switch_to_device(lift_device);
+                    // Process lift requests until channel closes.
+                    while let Ok((seg, opts)) = lift_rx.recv() {
+                        let result = lift_with_opts(&seg, opts);
+                        if result_tx.send(result).is_err() {
+                            break; // main thread dropped receiver
+                        }
                     }
-                }
-            })?;
+                })?;
 
         // Send lift(0).
         lift_tx.send((segments_ref[0].clone(), recursion_opts.clone()))?;
-        let mut accumulator = result_rx.recv()
+        let mut accumulator = result_rx
+            .recv()
             .map_err(|_| anyhow!("lift thread died"))??;
-        if *VERBOSE { eprintln!("[parallel-recursion] step 0/{num_segs}: lift on device {lift_device}"); }
+        if *VERBOSE {
+            eprintln!("[parallel-recursion] step 0/{num_segs}: lift on device {lift_device}");
+        }
 
         // Send lift(1) ahead (will run while main thread is idle or doing join).
         if num_segs > 1 {
@@ -353,7 +359,8 @@ impl ProverImpl {
             let t_step = std::time::Instant::now();
 
             // Wait for lift(step_idx) to complete.
-            let lifted = result_rx.recv()
+            let lifted = result_rx
+                .recv()
                 .map_err(|_| anyhow!("lift thread died"))??;
             let lift_ms = t_step.elapsed().as_secs_f64() * 1000.0;
 
@@ -384,7 +391,10 @@ impl ProverImpl {
 
         let succinct_receipt = accumulator;
         let rec_ms = t_rec.elapsed().as_secs_f64() * 1000.0;
-        eprintln!("[parallel-stark] recursion done: {:.1}ms (multi-GPU pipeline)", rec_ms);
+        eprintln!(
+            "[parallel-stark] recursion done: {:.1}ms (multi-GPU pipeline)",
+            rec_ms
+        );
 
         if self.opts.receipt_kind == ReceiptKind::Succinct {
             let receipt = Receipt::new(
@@ -500,9 +510,7 @@ impl ProverImpl {
             .as_ref()
             .ok_or_else(|| anyhow!("segment receipt verifier parameters missing from context"))?
             .digest();
-        let mut pending_receipt: Option<
-            std::thread::JoinHandle<Result<SegmentReceipt>>,
-        > = None;
+        let mut pending_receipt: Option<std::thread::JoinHandle<Result<SegmentReceipt>>> = None;
         // Metadata from the previous iteration, paired with the seal returned by prove_begin.
         let mut prev_seal_meta: Option<(u32, u32, Option<Output>, String)> = None;
 
@@ -669,8 +677,7 @@ impl ProverImpl {
             // complete prev deferred finalize + launch eval_check for this segment.
             // Returns the PREVIOUS segment's seal (None on first call).
             let t_psc = std::time::Instant::now();
-            let prev_seal =
-                with_segment_prover(|sp| sp.prove_begin(results.inner))?;
+            let prev_seal = with_segment_prover(|sp| sp.prove_begin(results.inner))?;
             let prove_begin_ms = t_psc.elapsed().as_secs_f64() * 1000.0;
 
             // If we got a previous segment's seal, process it.
@@ -695,8 +702,7 @@ impl ProverImpl {
                 let vp_digest = seg_verifier_params_digest;
                 let skip_verify_copy = skip_verify;
                 pending_receipt = Some(std::thread::spawn(move || {
-                    let mut claim =
-                        ReceiptClaim::decode_from_seal_v2(&seal, Some(prev_po2))?;
+                    let mut claim = ReceiptClaim::decode_from_seal_v2(&seal, Some(prev_po2))?;
                     claim.output = prev_output.into();
                     let receipt = SegmentReceipt {
                         seal,
@@ -722,13 +728,15 @@ impl ProverImpl {
 
             let t_prove = t_seg.elapsed() - t_preflight;
             let t_total = t_seg.elapsed();
-            if *VERBOSE { eprintln!(
+            if *VERBOSE {
+                eprintln!(
                 "[prove_session] seg {seg_idx}: preflight={:.1}ms prove_begin={:.1}ms prove={:.1}ms total={:.1}ms",
                 t_preflight.as_secs_f64() * 1000.0,
                 prove_begin_ms,
                 t_prove.as_secs_f64() * 1000.0,
                 t_total.as_secs_f64() * 1000.0,
-            ); }
+            );
+            }
 
             for hook in &session.hooks {
                 hook.on_post_prove_segment(&segment);
@@ -755,8 +763,7 @@ impl ProverImpl {
             let (last_po2, last_seg_idx, last_output, last_hashfn) = prev_seal_meta
                 .take()
                 .ok_or_else(|| anyhow!("segment pipeline: seal without metadata"))?;
-            let mut claim =
-                ReceiptClaim::decode_from_seal_v2(&last_seal, Some(last_po2))?;
+            let mut claim = ReceiptClaim::decode_from_seal_v2(&last_seal, Some(last_po2))?;
             claim.output = last_output.into();
             let receipt = SegmentReceipt {
                 seal: last_seal,
@@ -891,8 +898,7 @@ impl ProverImpl {
         } else {
             match session.povw_job_id.is_some() {
                 true => {
-                    let work_receipt =
-                        self.composite_to_succinct_povw(&composite_receipt)?;
+                    let work_receipt = self.composite_to_succinct_povw(&composite_receipt)?;
                     let unwrapped = self.unwrap_povw(&work_receipt)?;
                     (unwrapped, Some(work_receipt), None)
                 }
@@ -1046,12 +1052,22 @@ impl ProverServer for ProverImpl {
 
         let po2 = preflight_results.inner.po2();
         let t_psc = std::time::Instant::now();
-        let seal =
-            with_segment_prover(|sp| sp.prove_core(preflight_results.inner))?;
-        if *VERBOSE { eprintln!("[prove_segment_core] prove_core: {:.1}ms", t_psc.elapsed().as_secs_f64() * 1000.0); }
+        let seal = with_segment_prover(|sp| sp.prove_core(preflight_results.inner))?;
+        if *VERBOSE {
+            eprintln!(
+                "[prove_segment_core] prove_core: {:.1}ms",
+                t_psc.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         let t_dec = std::time::Instant::now();
         let mut claim = ReceiptClaim::decode_from_seal_v2(&seal, Some(po2))?;
-        if *VERBOSE { eprintln!("[prove_segment_core] decode: {:.1}ms (seal len: {})", t_dec.elapsed().as_secs_f64() * 1000.0, seal.len()); }
+        if *VERBOSE {
+            eprintln!(
+                "[prove_segment_core] decode: {:.1}ms (seal len: {})",
+                t_dec.elapsed().as_secs_f64() * 1000.0,
+                seal.len()
+            );
+        }
         claim.output = preflight_results.output.into();
 
         let verifier_parameters = ctx
@@ -1083,9 +1099,16 @@ impl ProverServer for ProverImpl {
         if std::env::var("RISC0_SKIP_VERIFY").is_err() {
             let t1 = std::time::Instant::now();
             receipt.verify_integrity().context("verify lift")?;
-            if *VERBOSE { eprintln!("[lift] prove={prove_ms:.1}ms verify={:.1}ms", t1.elapsed().as_secs_f64() * 1000.0); }
+            if *VERBOSE {
+                eprintln!(
+                    "[lift] prove={prove_ms:.1}ms verify={:.1}ms",
+                    t1.elapsed().as_secs_f64() * 1000.0
+                );
+            }
         } else {
-            if *VERBOSE { eprintln!("[lift] prove={prove_ms:.1}ms verify=skipped"); }
+            if *VERBOSE {
+                eprintln!("[lift] prove={prove_ms:.1}ms verify=skipped");
+            }
         }
         Ok(receipt)
     }
@@ -1114,9 +1137,16 @@ impl ProverServer for ProverImpl {
         if std::env::var("RISC0_SKIP_VERIFY").is_err() {
             let t1 = std::time::Instant::now();
             receipt.verify_integrity().context("verify join")?;
-            if *VERBOSE { eprintln!("[join] prove={prove_ms:.1}ms verify={:.1}ms", t1.elapsed().as_secs_f64() * 1000.0); }
+            if *VERBOSE {
+                eprintln!(
+                    "[join] prove={prove_ms:.1}ms verify={:.1}ms",
+                    t1.elapsed().as_secs_f64() * 1000.0
+                );
+            }
         } else {
-            if *VERBOSE { eprintln!("[join] prove={prove_ms:.1}ms verify=skipped"); }
+            if *VERBOSE {
+                eprintln!("[join] prove={prove_ms:.1}ms verify=skipped");
+            }
         }
         Ok(receipt)
     }
@@ -1148,9 +1178,16 @@ impl ProverServer for ProverImpl {
         if std::env::var("RISC0_SKIP_VERIFY").is_err() {
             let t1 = std::time::Instant::now();
             receipt.verify_integrity().context("verify resolve")?;
-            if *VERBOSE { eprintln!("[resolve] prove={prove_ms:.1}ms verify={:.1}ms", t1.elapsed().as_secs_f64() * 1000.0); }
+            if *VERBOSE {
+                eprintln!(
+                    "[resolve] prove={prove_ms:.1}ms verify={:.1}ms",
+                    t1.elapsed().as_secs_f64() * 1000.0
+                );
+            }
         } else {
-            if *VERBOSE { eprintln!("[resolve] prove={prove_ms:.1}ms verify=skipped"); }
+            if *VERBOSE {
+                eprintln!("[resolve] prove={prove_ms:.1}ms verify=skipped");
+            }
         }
         Ok(receipt)
     }
@@ -1198,9 +1235,16 @@ impl ProverServer for ProverImpl {
         if std::env::var("RISC0_SKIP_VERIFY").is_err() {
             let t1 = std::time::Instant::now();
             receipt.verify_integrity().context("verify union")?;
-            if *VERBOSE { eprintln!("[union] prove={prove_ms:.1}ms verify={:.1}ms", t1.elapsed().as_secs_f64() * 1000.0); }
+            if *VERBOSE {
+                eprintln!(
+                    "[union] prove={prove_ms:.1}ms verify={:.1}ms",
+                    t1.elapsed().as_secs_f64() * 1000.0
+                );
+            }
         } else {
-            if *VERBOSE { eprintln!("[union] prove={prove_ms:.1}ms verify=skipped"); }
+            if *VERBOSE {
+                eprintln!("[union] prove={prove_ms:.1}ms verify=skipped");
+            }
         }
         Ok(receipt)
     }
@@ -1223,8 +1267,7 @@ impl ProverServer for ProverImpl {
         composite_receipt: &CompositeReceipt,
     ) -> Result<SuccinctReceipt<ReceiptClaim>> {
         use crate::host::recursion::prove::{
-            join_with_opts, lift_with_opts,
-            make_succinct_receipt, Prover as RecursionProverJob,
+            join_with_opts, lift_with_opts, make_succinct_receipt, Prover as RecursionProverJob,
         };
 
         let t_pipeline = std::time::Instant::now();
@@ -1253,7 +1296,8 @@ impl ProverServer for ProverImpl {
         // attempted via RISC0_LIFT_JOIN_OVERLAP env gate; produced invalid
         // proofs on B70 (single-CCS hardware, shared recursion HAL state).
         // See memory: project_lift_join_overlap_invalid.md
-        let mut pending_prepared_lift: Option<std::thread::JoinHandle<Result<RecursionProverJob>>> = None;
+        let mut pending_prepared_lift: Option<std::thread::JoinHandle<Result<RecursionProverJob>>> =
+            None;
 
         // Run lift(k+1) on the GPU while a background thread prepares
         // join(acc, lift(k)) (preflight + host witgen, see
@@ -1263,12 +1307,21 @@ impl ProverServer for ProverImpl {
         // Default on; RISC0_RECURSION_REORDER=0 uses the sequential loop below.
         let reorder = !matches!(std::env::var("RISC0_RECURSION_REORDER").as_deref(), Ok("0"));
         if reorder && num_segments >= 2 {
-            let spawn_lift_prep = |idx: usize| -> Result<std::thread::JoinHandle<Result<RecursionProverJob>>> {
-                let p = RecursionProverJob::new_lift(&segments[idx], recursion_opts.clone())?;
-                Ok(std::thread::spawn(move || -> Result<RecursionProverJob> { let mut p = p; p.prepare()?; Ok(p) }))
-            };
-            let finish_lift = |h: std::thread::JoinHandle<Result<RecursionProverJob>>, idx: usize| -> Result<SuccinctReceipt<ReceiptClaim>> {
-                let mut prover = h.join().map_err(|_| anyhow!("lift prepare thread panicked"))??;
+            let spawn_lift_prep =
+                |idx: usize| -> Result<std::thread::JoinHandle<Result<RecursionProverJob>>> {
+                    let p = RecursionProverJob::new_lift(&segments[idx], recursion_opts.clone())?;
+                    Ok(std::thread::spawn(move || -> Result<RecursionProverJob> {
+                        let mut p = p;
+                        p.prepare()?;
+                        Ok(p)
+                    }))
+                };
+            let finish_lift = |h: std::thread::JoinHandle<Result<RecursionProverJob>>,
+                               idx: usize|
+             -> Result<SuccinctReceipt<ReceiptClaim>> {
+                let mut prover = h
+                    .join()
+                    .map_err(|_| anyhow!("lift prepare thread panicked"))??;
                 let receipt = prover.run()?;
                 let claim_decoded = ReceiptClaim::decode(&mut receipt.out_stream())?;
                 let claim = claim_decoded.merge(&segments[idx].claim)?;
@@ -1277,20 +1330,40 @@ impl ProverServer for ProverImpl {
             let t0 = std::time::Instant::now();
             let mut acc = lift_with_opts(&segments[0], recursion_opts.clone())?;
             let mut cur = finish_lift(spawn_lift_prep(1)?, 1)?;
-            if *VERBOSE { eprintln!("[composite_to_succinct] reorder: lift0+lift1={:.1}ms", t0.elapsed().as_secs_f64() * 1000.0); }
+            if *VERBOSE {
+                eprintln!(
+                    "[composite_to_succinct] reorder: lift0+lift1={:.1}ms",
+                    t0.elapsed().as_secs_f64() * 1000.0
+                );
+            }
             let mut pending: Option<std::thread::JoinHandle<Result<RecursionProverJob>>> =
-                if num_segments > 2 { Some(spawn_lift_prep(2)?) } else { None };
+                if num_segments > 2 {
+                    Some(spawn_lift_prep(2)?)
+                } else {
+                    None
+                };
             for k in 1..num_segments {
                 let t_step = std::time::Instant::now();
                 // background: prepare join(acc, cur)
                 let jp = RecursionProverJob::new_join(&acc, &cur, recursion_opts.clone())?;
                 let join_claim = acc.claim.join(&cur.claim)?.value()?;
-                let jh = std::thread::spawn(move || -> Result<RecursionProverJob> { let mut p = jp; p.prepare()?; Ok(p) });
+                let jh = std::thread::spawn(move || -> Result<RecursionProverJob> {
+                    let mut p = jp;
+                    p.prepare()?;
+                    Ok(p)
+                });
                 // GPU: next lift (prepared during the previous join)
-                let next = match pending.take() { Some(h) => Some(finish_lift(h, k + 1)?), None => None };
+                let next = match pending.take() {
+                    Some(h) => Some(finish_lift(h, k + 1)?),
+                    None => None,
+                };
                 let lift_ms = t_step.elapsed().as_secs_f64() * 1000.0;
-                let mut jprover = jh.join().map_err(|_| anyhow!("join prepare thread panicked"))??;
-                if k + 2 < num_segments { pending = Some(spawn_lift_prep(k + 2)?); }
+                let mut jprover = jh
+                    .join()
+                    .map_err(|_| anyhow!("join prepare thread panicked"))??;
+                if k + 2 < num_segments {
+                    pending = Some(spawn_lift_prep(k + 2)?);
+                }
                 let t_join = std::time::Instant::now();
                 let receipt = jprover.run()?;
                 let claim_decoded = ReceiptClaim::decode(&mut receipt.out_stream())?;
@@ -1301,12 +1374,19 @@ impl ProverServer for ProverImpl {
                     eprintln!("[composite_to_succinct] reorder step {k}/{num_segments}: next_lift={lift_ms:.1}ms join={join_ms:.1}ms total={:.1}ms",
                         t_step.elapsed().as_secs_f64() * 1000.0);
                 }
-                match next { Some(n) => cur = n, None => break }
+                match next {
+                    Some(n) => cur = n,
+                    None => break,
+                }
             }
             accumulator = Some(acc);
         }
 
-        for step_idx in 0..(if reorder && num_segments >= 2 { 0 } else { num_segments }) {
+        for step_idx in 0..(if reorder && num_segments >= 2 {
+            0
+        } else {
+            num_segments
+        }) {
             let t_step = std::time::Instant::now();
 
             // Get the lifted receipt.
@@ -1330,17 +1410,13 @@ impl ProverServer for ProverImpl {
             // Start CPU preflight for next lift in background.
             if step_idx + 1 < num_segments {
                 let opts_next = recursion_opts.clone();
-                let next_prover = RecursionProverJob::new_lift(
-                    &segments[step_idx + 1],
-                    opts_next,
-                )?;
-                pending_prepared_lift = Some(std::thread::spawn(
-                    move || -> Result<RecursionProverJob> {
+                let next_prover = RecursionProverJob::new_lift(&segments[step_idx + 1], opts_next)?;
+                pending_prepared_lift =
+                    Some(std::thread::spawn(move || -> Result<RecursionProverJob> {
                         let mut p = next_prover;
                         p.prepare()?;
                         Ok(p)
-                    },
-                ));
+                    }));
             }
 
             // Run join on main thread (GPU) while background thread prepares next lift.

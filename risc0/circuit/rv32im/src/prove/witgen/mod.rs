@@ -151,8 +151,13 @@ where
             trace: preflight_results.trace,
             bigint_rows: preflight_results.bigint_rows,
         };
-        if *VERBOSE { eprintln!("      [witgen_new] hal_gen={:.1}ms struct_build={:.1}ms",
-            (tn1-tn0).as_secs_f64()*1000.0, tn1.elapsed().as_secs_f64()*1000.0); }
+        if *VERBOSE {
+            eprintln!(
+                "      [witgen_new] hal_gen={:.1}ms struct_build={:.1}ms",
+                (tn1 - tn0).as_secs_f64() * 1000.0,
+                tn1.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         Ok(result)
     }
 
@@ -197,7 +202,12 @@ where
             // pre_data positions must resolve to valid Fp; INVALID (0xFFFFFFFF) is
             // non-canonical and can trigger UB in downstream arithmetic.
             let buf = hal.alloc_elem_init("pre_data", cycles * REGCOUNT_DATA, Val::ZERO);
-            Some(MetaBuffer { buf, rows: cycles, cols: REGCOUNT_DATA, checked: false })
+            Some(MetaBuffer {
+                buf,
+                rows: cycles,
+                cols: REGCOUNT_DATA,
+                checked: false,
+            })
         } else {
             None
         };
@@ -225,13 +235,15 @@ where
             hal.scatter_bits(&pd.buf, &injector.bit_data, cycles as u32);
         }
         let tw4 = std::time::Instant::now();
-        if *VERBOSE { eprintln!("      [scatter_detail] s1={:.1}ms s2={:.1}ms sb1={:.1}ms sb2={:.1}ms total={:.1}ms",
+        if *VERBOSE {
+            eprintln!("      [scatter_detail] s1={:.1}ms s2={:.1}ms sb1={:.1}ms sb2={:.1}ms total={:.1}ms",
             (ts1-ts0).as_secs_f64()*1000.0,
             (ts2-ts1).as_secs_f64()*1000.0,
             (ts3-ts2).as_secs_f64()*1000.0,
             (tw4-ts3).as_secs_f64()*1000.0,
             (tw4-tw3).as_secs_f64()*1000.0,
-        ); }
+        );
+        }
         // Drop 126MB of injector Vecs in background while GPU runs generate_witness.
         // After scatter + scatter_bits, all host data has been copied to GPU (sync memcpy).
         let inj_idx = injector.index.len();
@@ -252,7 +264,8 @@ where
             hal.eltwise_zeroize_elem(&data.buf);
         });
         let tw6 = std::time::Instant::now();
-        if *VERBOSE { eprintln!("      [hal_witgen] global+code={:.1}ms data+pre_data={:.1}ms accum={:.1}ms scatter={:.1}ms ffi={:.1}ms zeroize={:.1}ms (inj: idx={} off={} val={} bits={})",
+        if *VERBOSE {
+            eprintln!("      [hal_witgen] global+code={:.1}ms data+pre_data={:.1}ms accum={:.1}ms scatter={:.1}ms ffi={:.1}ms zeroize={:.1}ms (inj: idx={} off={} val={} bits={})",
             (tw1-tw0).as_secs_f64()*1000.0,
             (tw2-tw1).as_secs_f64()*1000.0,
             (tw3-tw2).as_secs_f64()*1000.0,
@@ -260,7 +273,8 @@ where
             (tw5-tw4).as_secs_f64()*1000.0,
             (tw6-tw5).as_secs_f64()*1000.0,
             inj_idx, inj_off, inj_val, inj_bits,
-        ); }
+        );
+        }
         Ok((global, code, data, accum))
     }
 
@@ -288,7 +302,12 @@ where
                 injector.push();
             }
         }
-        if *VERBOSE { eprintln!("    [accum] bigint_inject: {:.1}ms", ta0.elapsed().as_secs_f64() * 1000.0); }
+        if *VERBOSE {
+            eprintln!(
+                "    [accum] bigint_inject: {:.1}ms",
+                ta0.elapsed().as_secs_f64() * 1000.0
+            );
+        }
 
         hal.scatter(
             &self.accum.buf,
@@ -296,7 +315,12 @@ where
             &injector.offsets,
             &injector.values,
         );
-        if *VERBOSE { eprintln!("    [accum] scatter: {:.1}ms", ta0.elapsed().as_secs_f64() * 1000.0); }
+        if *VERBOSE {
+            eprintln!(
+                "    [accum] scatter: {:.1}ms",
+                ta0.elapsed().as_secs_f64() * 1000.0
+            );
+        }
 
         let mix = MetaBuffer {
             buf: hal.copy_from_elem("mix", mix),
@@ -304,15 +328,30 @@ where
             cols: REGCOUNT_MIX,
             checked: true,
         };
-        if *VERBOSE { eprintln!("    [accum] mix_upload: {:.1}ms", ta0.elapsed().as_secs_f64() * 1000.0); }
+        if *VERBOSE {
+            eprintln!(
+                "    [accum] mix_upload: {:.1}ms",
+                ta0.elapsed().as_secs_f64() * 1000.0
+            );
+        }
 
         circuit_hal.step_accum(&self.trace, &self.data, &self.accum, &self.global, &mix)?;
-        if *VERBOSE { eprintln!("    [accum] step_accum: {:.1}ms", ta0.elapsed().as_secs_f64() * 1000.0); }
+        if *VERBOSE {
+            eprintln!(
+                "    [accum] step_accum: {:.1}ms",
+                ta0.elapsed().as_secs_f64() * 1000.0
+            );
+        }
 
         scope!("zeroize(accum)", {
             hal.eltwise_zeroize_elem(&self.accum.buf);
         });
-        if *VERBOSE { eprintln!("    [accum] zeroize: {:.1}ms", ta0.elapsed().as_secs_f64() * 1000.0); }
+        if *VERBOSE {
+            eprintln!(
+                "    [accum] zeroize: {:.1}ms",
+                ta0.elapsed().as_secs_f64() * 1000.0
+            );
+        }
 
         Ok(mix)
     }
@@ -391,78 +430,77 @@ fn build_injector(trace: &PreflightTrace, cycles: usize) -> (Injector, Vec<usize
     let values_send = values_ptr as usize;
     let bit_data_send = bit_data_ptr as usize;
 
-    trace
-        .backs
-        .par_iter()
-        .enumerate()
-        .for_each(|(row, back)| {
-            let cycle = &trace.cycles[row];
-            let mut pos = index[row] as usize;
-            let mut bit_pos = bit_index[row] as usize;
+    trace.backs.par_iter().enumerate().for_each(|(row, back)| {
+        let cycle = &trace.cycles[row];
+        let mut pos = index[row] as usize;
+        let mut bit_pos = bit_index[row] as usize;
 
-            let offsets_p = offsets_send as *mut u32;
-            let values_p = values_send as *mut Val;
-            let bit_data_p = bit_data_send as *mut u32;
+        let offsets_p = offsets_send as *mut u32;
+        let values_p = values_send as *mut Val;
+        let bit_data_p = bit_data_send as *mut u32;
 
-            let mut set = |col: usize, value: u32| {
-                let idx = col * cycles + row;
-                unsafe {
-                    *offsets_p.add(pos) = idx as u32;
-                    *values_p.add(pos) = Val::new(value);
-                }
-                pos += 1;
-            };
+        let mut set = |col: usize, value: u32| {
+            let idx = col * cycles + row;
+            unsafe {
+                *offsets_p.add(pos) = idx as u32;
+                *values_p.add(pos) = Val::new(value);
+            }
+            pos += 1;
+        };
 
-            let mut set_bits = |col: usize, value: u32| {
-                unsafe {
-                    *bit_data_p.add(bit_pos * 3) = row as u32;
-                    *bit_data_p.add(bit_pos * 3 + 1) = col as u32;
-                    *bit_data_p.add(bit_pos * 3 + 2) = value;
-                }
-                bit_pos += 1;
-            };
+        let mut set_bits = |col: usize, value: u32| {
+            unsafe {
+                *bit_data_p.add(bit_pos * 3) = row as u32;
+                *bit_data_p.add(bit_pos * 3 + 1) = col as u32;
+                *bit_data_p.add(bit_pos * 3 + 2) = value;
+            }
+            bit_pos += 1;
+        };
 
-            match back {
-                Back::None => {}
-                Back::Ecall(s0, s1, s2) => {
-                    set(ECALL_S0, *s0);
-                    set(ECALL_S1, *s1);
-                    set(ECALL_S2, *s2);
-                }
-                Back::Poseidon2(p2_state) => {
-                    for (col, value) in zip(Poseidon2State::offsets(), p2_state.as_array()) {
-                        set(col, value);
-                    }
-                }
-                Back::Sha2(sha2_state) => {
-                    for (col, value) in zip(Sha2State::fp_offsets(), sha2_state.fp_array()) {
-                        set(col, value);
-                    }
-                    for (col, value) in zip(Sha2State::u32_offsets(), sha2_state.u32_array()) {
-                        set_bits(col, value);
-                    }
-                }
-                Back::BigInt(state) => {
-                    for (col, value) in zip(BigIntState::offsets(), state.as_array()) {
-                        set(col, value);
-                    }
+        match back {
+            Back::None => {}
+            Back::Ecall(s0, s1, s2) => {
+                set(ECALL_S0, *s0);
+                set(ECALL_S1, *s1);
+                set(ECALL_S2, *s2);
+            }
+            Back::Poseidon2(p2_state) => {
+                for (col, value) in zip(Poseidon2State::offsets(), p2_state.as_array()) {
+                    set(col, value);
                 }
             }
+            Back::Sha2(sha2_state) => {
+                for (col, value) in zip(Sha2State::fp_offsets(), sha2_state.fp_array()) {
+                    set(col, value);
+                }
+                for (col, value) in zip(Sha2State::u32_offsets(), sha2_state.u32_array()) {
+                    set_bits(col, value);
+                }
+            }
+            Back::BigInt(state) => {
+                for (col, value) in zip(BigIntState::offsets(), state.as_array()) {
+                    set(col, value);
+                }
+            }
+        }
 
-            set(CYCLE_COL, row as u32);
-            set(NEXT_PC_LOW, cycle.pc & 0xffff);
-            set(NEXT_PC_HIGH, cycle.pc >> 16);
-            set(NEXT_STATE, cycle.state);
-            set(NEXT_MACHINE_MODE, cycle.machine_mode as u32);
-        });
+        set(CYCLE_COL, row as u32);
+        set(NEXT_PC_LOW, cycle.pc & 0xffff);
+        set(NEXT_PC_HIGH, cycle.pc >> 16);
+        set(NEXT_STATE, cycle.state);
+        set(NEXT_MACHINE_MODE, cycle.machine_mode as u32);
+    });
 
-    (Injector {
-        rows: cycles,
-        offsets,
-        values,
-        index,
-        bit_data,
-    }, bigint_rows)
+    (
+        Injector {
+            rows: cycles,
+            offsets,
+            values,
+            index,
+            bit_data,
+        },
+        bigint_rows,
+    )
 }
 
 fn build_global_vec(segment: &Segment, trace: &PreflightTrace) -> Vec<Val> {

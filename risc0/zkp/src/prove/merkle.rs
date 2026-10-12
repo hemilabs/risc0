@@ -162,7 +162,10 @@ impl<H: Hal> MerkleTreeProver<H> {
     /// wrong row is specified.
     pub fn prove(&self, hal: &H, iop: &mut WriteIOP<H::Field>, idx: usize) -> Vec<H::Elem> {
         assert!(idx < self.params.row_size);
-        let matrix = self.matrix.as_ref().expect("matrix released; call set_matrix() first");
+        let matrix = self
+            .matrix
+            .as_ref()
+            .expect("matrix released; call set_matrix() first");
         let mut out = Vec::with_capacity(self.params.col_size);
         if hal.has_unified_memory() {
             matrix.view(|view| {
@@ -207,7 +210,10 @@ impl<H: Hal> MerkleTreeProver<H> {
         if n == 0 {
             return Vec::new();
         }
-        let matrix = self.matrix.as_ref().expect("matrix released; call set_matrix() first");
+        let matrix = self
+            .matrix
+            .as_ref()
+            .expect("matrix released; call set_matrix() first");
         let col_size = self.params.col_size;
 
         // Collect column data for all queries

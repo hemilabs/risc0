@@ -31,9 +31,7 @@ use risc0_core::{
 };
 /// See [risc0_sys::intel::start_background_init].
 pub use risc0_sys::intel::start_background_init;
-use risc0_sys::intel::{
-    self, esimd_check, get_queue, DevicePointer, IntelDeviceBuffer,
-};
+use risc0_sys::intel::{self, esimd_check, get_queue, DevicePointer, IntelDeviceBuffer};
 
 use super::{tracker, Buffer, Hal};
 use crate::{
@@ -277,7 +275,10 @@ const POOL_SMALL_THRESHOLD: usize = 64 << 10; // Always pool buffers under 64 Ki
 
 impl IntelBufferPool {
     fn new() -> Self {
-        Self { cache: HashMap::new(), total_cached: 0 }
+        Self {
+            cache: HashMap::new(),
+            total_cached: 0,
+        }
     }
 
     fn pop(&mut self, size: usize) -> Option<IntelDeviceBuffer> {
@@ -1190,8 +1191,14 @@ impl<IH: IntelHash + ?Sized> Hal for IntelHal<IH> {
         }
         // The kernel writes through raw device pointers (see gather_sample).
         let n = index[count] as usize;
-        assert!(n <= offsets.len() && n <= values.len(), "scatter: index exceeds inputs");
-        debug_assert!(index.windows(2).all(|w| w[0] <= w[1]), "scatter: index not sorted");
+        assert!(
+            n <= offsets.len() && n <= values.len(),
+            "scatter: index exceeds inputs"
+        );
+        debug_assert!(
+            index.windows(2).all(|w| w[0] <= w[1]),
+            "scatter: index not sorted"
+        );
         debug_assert!(
             offsets[..n].iter().all(|&o| (o as usize) < into.size()),
             "scatter: offset out of range"
@@ -1244,19 +1251,25 @@ impl<IH: IntelHash + ?Sized> Hal for IntelHal<IH> {
             // and opt-out: CPU path, identical to the trait default.
             use rayon::prelude::*;
             combos.view_mut(|combos| {
-                combos
-                    .par_chunks_exact_mut(cycles)
-                    .zip(chunks)
-                    .for_each(|(combo_slice, (i, pows))| {
+                combos.par_chunks_exact_mut(cycles).zip(chunks).for_each(
+                    |(combo_slice, (i, pows))| {
                         for pow in pows {
                             let remainder = crate::core::poly::poly_divide(combo_slice, pow);
-                            assert_eq!(remainder, <BabyBearExtElem as risc0_core::field::Elem>::ZERO, "i: {i}");
+                            assert_eq!(
+                                remainder,
+                                <BabyBearExtElem as risc0_core::field::Elem>::ZERO,
+                                "i: {i}"
+                            );
                         }
-                    });
+                    },
+                );
             });
             return;
         }
-        assert!(cycles.is_power_of_two(), "combos_divide: cycles {cycles} not a power of two");
+        assert!(
+            cycles.is_power_of_two(),
+            "combos_divide: cycles {cycles} not a power of two"
+        );
         let ncols = combos.size() / cycles;
         assert_eq!(ncols * cycles, combos.size());
         let mut info: Vec<u32> = Vec::new();
@@ -1264,7 +1277,9 @@ impl<IH: IntelHash + ?Sized> Hal for IntelHal<IH> {
             assert!(*col < ncols, "combos_divide: column {col} >= {ncols}");
             for pow in pows {
                 info.push(*col as u32);
-                info.extend_from_slice(unchecked_cast::<Self::ExtElem, u32>(std::slice::from_ref(pow)));
+                info.extend_from_slice(unchecked_cast::<Self::ExtElem, u32>(std::slice::from_ref(
+                    pow,
+                )));
             }
         }
         let count = info.len() / 5;
@@ -1284,7 +1299,10 @@ impl<IH: IntelHash + ?Sized> Hal for IntelHal<IH> {
             )
         });
         for (k, r) in rems.chunks_exact(4).enumerate() {
-            assert!(r.iter().all(|&w| w == 0), "combos_divide: nonzero remainder (entry {k})");
+            assert!(
+                r.iter().all(|&w| w == 0),
+                "combos_divide: nonzero remainder (entry {k})"
+            );
         }
     }
 
@@ -1437,7 +1455,12 @@ mod tests {
         let cpu = CpuHal::new(Poseidon2HashSuite::new_suite());
         let mut rng = StdRng::seed_from_u64(11);
         let mut bad_total = 0;
-        for (lg, polys, npoints) in [(14usize, 40usize, 3usize), (16, 120, 9), (20, 64, 9), (21, 24, 5)] {
+        for (lg, polys, npoints) in [
+            (14usize, 40usize, 3usize),
+            (16, 120, 9),
+            (20, 64, 9),
+            (21, 24, 5),
+        ] {
             let deg = 1usize << lg;
             let coeffs: Vec<Elem> = (0..polys * deg).map(|_| Elem::random(&mut rng)).collect();
             let points: Vec<ExtElem> = (0..npoints).map(|_| ExtElem::random(&mut rng)).collect();
@@ -1467,11 +1490,22 @@ mod tests {
                 &cpu.copy_from_extelem("xs", &xs),
                 &c_out,
             );
-            let bad = g_out.to_vec().iter().zip(&c_out.to_vec()).filter(|(a, b)| a != b).count();
-            eprintln!("[eval_any] lg={lg} polys={polys} taps={}: {bad} differ", which.len());
+            let bad = g_out
+                .to_vec()
+                .iter()
+                .zip(&c_out.to_vec())
+                .filter(|(a, b)| a != b)
+                .count();
+            eprintln!(
+                "[eval_any] lg={lg} polys={polys} taps={}: {bad} differ",
+                which.len()
+            );
             bad_total += bad;
         }
-        assert_eq!(bad_total, 0, "power-table batch_evaluate_any diverged from CPU");
+        assert_eq!(
+            bad_total, 0,
+            "power-table batch_evaluate_any diverged from CPU"
+        );
     }
 
     #[test]
@@ -1495,7 +1529,12 @@ mod tests {
                 gpu.hash_rows(&g_out, &gpu.copy_from_elem("in", &data));
                 let c_out = cpu.alloc_digest("out", rows);
                 cpu.hash_rows(&c_out, &cpu.copy_from_elem("in", &data));
-                let bad = g_out.to_vec().iter().zip(&c_out.to_vec()).filter(|(a, b)| a != b).count();
+                let bad = g_out
+                    .to_vec()
+                    .iter()
+                    .zip(&c_out.to_vec())
+                    .filter(|(a, b)| a != b)
+                    .count();
                 if bad > 0 {
                     eprintln!("[p254 rows] cols={cols} rows={rows}: {bad} differ");
                     failures.push(format!("rows {cols}x{rows}"));
@@ -1570,7 +1609,9 @@ mod tests {
             let n = 2usize << layers;
             let digests: Vec<crate::core::digest::Digest> = (0..n)
                 .map(|_| {
-                    let w: Vec<u32> = (0..8).map(|_| Elem::random(&mut rng).as_u32_montgomery()).collect();
+                    let w: Vec<u32> = (0..8)
+                        .map(|_| Elem::random(&mut rng).as_u32_montgomery())
+                        .collect();
                     crate::core::digest::Digest::try_from(w.as_slice()).unwrap()
                 })
                 .collect();
@@ -1587,7 +1628,10 @@ mod tests {
                 failures.push((0, layers));
             }
         }
-        assert!(failures.is_empty(), "hash_rows/hash_fold mismatches: {failures:?}");
+        assert!(
+            failures.is_empty(),
+            "hash_rows/hash_fold mismatches: {failures:?}"
+        );
     }
 
     #[test]
@@ -1636,20 +1680,35 @@ mod tests {
         let cpu_eval = cpu.alloc_elem("eval", count * domain);
         gpu.batch_expand_into_evaluate_ntt(&gpu_eval, &gpu_in, count, expand_bits);
         cpu.batch_expand_into_evaluate_ntt(&cpu_eval, &cpu_in, count, expand_bits);
-        let mut bad = report("batch_expand_into_evaluate_ntt", &gpu_eval.to_vec(), &cpu_eval.to_vec(), 4);
+        let mut bad = report(
+            "batch_expand_into_evaluate_ntt",
+            &gpu_eval.to_vec(),
+            &cpu_eval.to_vec(),
+            4,
+        );
 
         let gpu_digests = gpu.alloc_digest("rows", domain);
         let cpu_digests = cpu.alloc_digest("rows", domain);
         gpu.hash_rows(&gpu_digests, &gpu_eval);
         cpu.hash_rows(&cpu_digests, &cpu_eval);
-        bad += report("hash_rows", &gpu_digests.to_vec(), &cpu_digests.to_vec(), 32);
+        bad += report(
+            "hash_rows",
+            &gpu_digests.to_vec(),
+            &cpu_digests.to_vec(),
+            32,
+        );
 
         for idx in [0, domain / 2, domain - 1] {
             let gpu_col = gpu.alloc_elem("sample", count);
             let cpu_col = cpu.alloc_elem("sample", count);
             gpu.gather_sample(&gpu_col, &gpu_eval, idx, count, domain);
             cpu.gather_sample(&cpu_col, &cpu_eval, idx, count, domain);
-            bad += report(&format!("gather_sample idx={idx}"), &gpu_col.to_vec(), &cpu_col.to_vec(), 4);
+            bad += report(
+                &format!("gather_sample idx={idx}"),
+                &gpu_col.to_vec(),
+                &cpu_col.to_vec(),
+                4,
+            );
         }
 
         assert_eq!(bad, 0, "Intel HAL diverged from CPU on a >4 GiB buffer");
@@ -1678,7 +1737,12 @@ mod tests {
         for (lg, count) in cases {
             let n = count << lg;
             let input: Vec<Elem> = (0..n).map(|_| Elem::random(&mut rng)).collect();
-            for op in ["interpolate", "interpolate_zk_shift", "bit_reverse", "zk_shift"] {
+            for op in [
+                "interpolate",
+                "interpolate_zk_shift",
+                "bit_reverse",
+                "zk_shift",
+            ] {
                 let g = gpu.copy_from_elem("io", &input);
                 let c = cpu.copy_from_elem("io", &input);
                 match op {
@@ -1719,11 +1783,23 @@ mod tests {
                 lde_cases.push((lg, count, 2usize));
             }
         }
-        lde_cases.extend([(22, 16, 2), (22, 211, 2), (23, 16, 2), (24, 4, 2), (16, 16, 1), (20, 16, 1), (19, 16, 3), (22, 8, 3)]);
+        lde_cases.extend([
+            (22, 16, 2),
+            (22, 211, 2),
+            (23, 16, 2),
+            (24, 4, 2),
+            (16, 16, 1),
+            (20, 16, 1),
+            (19, 16, 3),
+            (22, 8, 3),
+        ]);
         for (lg, count, bits) in lde_cases {
             let n_in = count << (lg - bits);
             let input: Vec<Elem> = (0..n_in).map(|_| Elem::random(&mut rng)).collect();
-            let (gi, ci) = (gpu.copy_from_elem("in", &input), cpu.copy_from_elem("in", &input));
+            let (gi, ci) = (
+                gpu.copy_from_elem("in", &input),
+                cpu.copy_from_elem("in", &input),
+            );
             let go = gpu.alloc_elem("out", count << lg);
             let co = cpu.alloc_elem("out", count << lg);
             gpu.batch_expand_into_evaluate_ntt(&go, &gi, count, bits);
@@ -1765,7 +1841,10 @@ mod tests {
             drop(host);
             let back = dev.to_vec();
             let bad = back.iter().zip(&expected).filter(|(a, b)| a != b).count();
-            assert_eq!(bad, 0, "round {round}: {bad}/{N} uploaded elements read after host reuse");
+            assert_eq!(
+                bad, 0,
+                "round {round}: {bad}/{N} uploaded elements read after host reuse"
+            );
         }
     }
 }
