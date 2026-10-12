@@ -565,6 +565,175 @@ pub fn nvcc_environment_key() -> String {
     key
 }
 
+/// The GPUs `-arch=native` (nvcc) or `--offload-arch=native` (hipcc) compiles for on this
+/// machine, best effort (empty if the query tool is missing). For keying a cache of output
+/// built for `native`, so moving the build to a different GPU can't reuse it.
+pub fn native_gpu_arch_key(hip: bool) -> String {
+    let queries: &[(&str, &[&str])] = if hip {
+        &[("amdgpu-arch", &[]), ("rocm_agent_enumerator", &[])]
+    } else {
+        &[("nvidia-smi", &["--query-gpu=compute_cap", "--format=csv,noheader"])]
+    };
+    for (tool, args) in queries {
+        if let Ok(o) = Command::new(tool).args(*args).output() {
+            if o.status.success() {
+                return format!("{tool}: {}", String::from_utf8_lossy(&o.stdout).trim());
+            }
+        }
+    }
+    String::new()
+}
+
+/// Everything outside a direct hipcc command's own arguments that changes what it produces:
+/// the environment hipcc reads its compiler and extra flags from, and the hipcc version.
+/// For keying a cache of hipcc output.
+pub fn hipcc_environment_key(hipcc: &str) -> String {
+    let mut key = String::new();
+    for var in [
+        "HIPCC_COMPILE_FLAGS_APPEND",
+        "HIPCC_COMPILE_FLAGS_PREPEND",
+        "HIP_CLANG_PATH",
+        "HIP_PATH",
+        "ROCM_PATH",
+        "HIP_PLATFORM",
+    ] {
+        key.push_str(&format!("{var}={}\n", env::var(var).unwrap_or_default()));
+    }
+    let version = Command::new(hipcc)
+        .arg("--version")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    key.push_str(&version);
+    key
+}
+
+const KERNEL_SOURCE_EXTENSIONS: &[&str] = &[
+    "h", "hh", "hpp", "hxx", "cuh", "cu", "c", "cc", "cpp", "cxx", "inc", "inl", "ipp",
+];
+
+/// SHA-256 (hex) over every C, C++ and CUDA source and header under `roots` (searched
+/// recursively, skipping `target` and hidden directories), plus `files`, by relative path and
+/// contents. A superset of what a compile with these include roots can read, for keying a
+/// cache of its output: unlike a list of known files, it can't miss a header a change adds.
+pub fn kernel_sources_key(roots: &[&Path], files: &[&Path]) -> String {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if path.is_dir() {
+                if !name.starts_with('.') && name != "target" {
+                    walk(&path, out);
+                }
+            } else if path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| KERNEL_SOURCE_EXTENSIONS.contains(&e))
+            {
+                out.push(path);
+            }
+        }
+    }
+
+    let mut hasher = Sha256::new();
+    let mut add = |label: &str, path: &Path| {
+        // A file that can't be read hashes as missing rather than failing the build.
+        let contents = fs::read(path).ok();
+        hasher.update((label.len() as u64).to_le_bytes());
+        hasher.update(label.as_bytes());
+        match contents {
+            Some(c) => {
+                hasher.update((c.len() as u64).to_le_bytes());
+                hasher.update(&c);
+            }
+            None => hasher.update(u64::MAX.to_le_bytes()),
+        }
+    };
+    for (i, root) in roots.iter().enumerate() {
+        let mut paths = Vec::new();
+        walk(root, &mut paths);
+        let mut labeled: Vec<(String, PathBuf)> = paths
+            .into_iter()
+            .map(|p| {
+                let rel = p.strip_prefix(root).unwrap_or(&p).to_string_lossy();
+                (format!("{i}/{}", rel.replace('\\', "/")), p)
+            })
+            .collect();
+        labeled.sort();
+        for (label, path) in &labeled {
+            add(label, path);
+        }
+    }
+    for file in files {
+        add(&format!("file/{}", file.to_string_lossy().replace('\\', "/")), file);
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// Look up `<cache_dir>/<stem>-<key>.<ext>`, a compiler output cached under `key` (which
+/// must cover everything the output depends on), and build it with `compile(path)` on a miss.
+/// Returns the cached file.
+///
+/// The output goes to a temporary path and is renamed into place only once `compile`
+/// returns, so an interrupted or failed build never leaves a file a later build would take
+/// for finished, and builds of different keys sharing `cache_dir` can't overwrite each other's
+/// output. After a build, outputs not written for a day are deleted, to bound the cache.
+pub fn cached_compile(
+    cache_dir: &Path,
+    stem: &str,
+    ext: &str,
+    key: &str,
+    compile: impl FnOnce(&Path),
+) -> PathBuf {
+    let key = &key[..key.len().min(32)];
+    let cached = cache_dir.join(format!("{stem}-{key}.{ext}"));
+    if cached.exists() {
+        eprintln!("{stem}: inputs unchanged, reusing {}", cached.display());
+        // Mark it in use, so another build's pruning below leaves it alone.
+        if let Ok(f) = fs::OpenOptions::new().write(true).open(&cached) {
+            let _ = f.set_modified(std::time::SystemTime::now());
+        }
+        return cached;
+    }
+    eprintln!("{stem}: inputs changed (or first build), compiling...");
+    let tmp = cache_dir.join(format!("{stem}-{key}.tmp{}.{ext}", std::process::id()));
+    let _ = fs::remove_file(&tmp);
+    compile(&tmp);
+    assert!(tmp.exists(), "{stem}: the compiler produced no {}", tmp.display());
+    fs::rename(&tmp, &cached)
+        .unwrap_or_else(|e| panic!("failed to move {} into the cache: {e}", tmp.display()));
+    // Leave anything written in the last day: another build script running now may be about
+    // to use it (two versions of a crate in one build share `cache_dir`).
+    let day = std::time::Duration::from_secs(24 * 60 * 60);
+    if let Ok(entries) = fs::read_dir(cache_dir) {
+        let prefix = format!("{stem}-");
+        for entry in entries.flatten() {
+            let stale = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .is_ok_and(|t| t.elapsed().is_ok_and(|age| age > day));
+            if stale && entry.file_name().to_string_lossy().starts_with(&prefix) {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+    cached
+}
+
+/// SHA-256 (hex) of `parts`, each length-prefixed so different splits can't collide.
+pub fn hash_key(parts: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
 // ---------------------------------------------------------------------------
 // HIP build utilities (cross-platform: Linux + Windows)
 // ---------------------------------------------------------------------------

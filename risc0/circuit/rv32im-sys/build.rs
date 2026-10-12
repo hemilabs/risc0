@@ -13,9 +13,7 @@
 // limitations under the License.
 
 use std::{
-    collections::hash_map::DefaultHasher,
     env,
-    hash::{Hash, Hasher},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -297,8 +295,9 @@ fn build_cuda_kernels() {
     // parameter passing through local memory). With -dc, NVCC generates
     // relocatable code that cannot inline across function boundaries.
     //
-    // CACHING: eval_check compilation takes ~24 minutes. We hash all eval_check
-    // source files and skip recompilation when only other .cu files changed.
+    // CACHING: eval_check compilation takes ~24 minutes. We cache it under a key over
+    // everything it can read (see `eval_check_sources_key`) and the compiler, and skip
+    // recompilation when only other .cu files changed.
     // Use a stable cache dir (target/release/) instead of OUT_DIR which changes
     // with each cargo build hash.
     let out_dir = env::var("OUT_DIR").map(PathBuf::from).unwrap();
@@ -310,8 +309,6 @@ fn build_cuda_kernels() {
     std::fs::create_dir_all(&cache_dir).unwrap();
     let msvc = risc0_build_kernel::is_msvc_target();
     let obj_ext = risc0_build_kernel::object_extension();
-    let eval_check_cached = cache_dir.join(format!("eval_check_combined_standalone.{obj_ext}"));
-    let eval_check_stamp = cache_dir.join("eval_check_hash.stamp");
     let eval_check_obj = out_dir.join(format!("eval_check_combined_standalone.{obj_ext}"));
 
     let mut cmd = risc0_build_kernel::nvcc_command();
@@ -340,28 +337,41 @@ fn build_cuda_kernels() {
         cmd.arg("-arch=native");
     }
     cmd.arg("-c") // compile only, NO --device-c
-        .arg("eval_check_combined.cu")
-        .arg("-o")
-        .arg(&eval_check_cached);
+        .arg("eval_check_combined.cu");
 
-    // Key the cache on the whole command plus what nvcc reads from outside it (the
-    // NVCC_*_FLAGS that carry the GPU architecture list, and the nvcc version), so a
-    // changed architecture list or toolchain can never reuse an object built without it.
-    let nvcc_key = format!("{cmd:?}\n{}", risc0_build_kernel::nvcc_environment_key());
-    let current_hash = eval_check_source_hash(Some(&nvcc_key));
-    let cached_hash = std::fs::read_to_string(&eval_check_stamp).unwrap_or_default();
-    let need_rebuild = current_hash != cached_hash || !eval_check_cached.exists();
-    if need_rebuild {
-        eprintln!("eval_check: source changed (or first build), compiling standalone...");
-        let status = cmd.status().expect("failed to run nvcc for eval_check_combined.cu");
-        assert!(
-            status.success(),
-            "nvcc failed for eval_check_combined.cu (standalone mode)"
-        );
-        std::fs::write(&eval_check_stamp, &current_hash).unwrap();
+    // Key the cache on the sources, the whole command (but its output path), and what nvcc
+    // reads from outside it (the NVCC_*_FLAGS that carry the GPU architecture list, and the
+    // nvcc version) -- and for -arch=native, this machine's GPUs -- so a changed source,
+    // header, architecture list or toolchain can never reuse an object built without it.
+    let native_key = if use_native_arch {
+        risc0_build_kernel::native_gpu_arch_key(false)
     } else {
-        eprintln!("eval_check: source unchanged, reusing cached object");
-    }
+        String::new()
+    };
+    let key = risc0_build_kernel::hash_key(&[
+        "rv32im-cuda-eval-check-v1",
+        &eval_check_sources_key(&[&cuda_root, &cxx_root, &sppark_root]),
+        &format!("{cmd:?}"),
+        &risc0_build_kernel::nvcc_environment_key(),
+        &native_key,
+    ]);
+    let eval_check_cached = risc0_build_kernel::cached_compile(
+        &cache_dir,
+        "eval_check_combined_standalone",
+        obj_ext,
+        &key,
+        |out| {
+            let status = cmd
+                .arg("-o")
+                .arg(out)
+                .status()
+                .expect("failed to run nvcc for eval_check_combined.cu");
+            assert!(
+                status.success(),
+                "nvcc failed for eval_check_combined.cu (standalone mode)"
+            );
+        },
+    );
     // Copy cached object to OUT_DIR for this build.
     std::fs::copy(&eval_check_cached, &eval_check_obj).unwrap();
 
@@ -468,54 +478,70 @@ fn build_rocm_kernels() {
         .map(|p| p.join("eval_check_cache_rocm"))
         .unwrap_or_else(|| out_dir.join("eval_check_cache_rocm"));
     std::fs::create_dir_all(&cache_dir).unwrap();
-    let eval_check_cached = cache_dir.join("eval_check_combined_standalone.o");
-    let eval_check_stamp = cache_dir.join("eval_check_hash_rocm.stamp");
     let eval_check_obj = out_dir.join("eval_check_combined_standalone.o");
-    let current_hash = eval_check_source_hash(None);
-    let cached_hash = std::fs::read_to_string(&eval_check_stamp).unwrap_or_default();
-    let need_rebuild = current_hash != cached_hash || !eval_check_cached.exists();
-    if need_rebuild {
-        eprintln!("eval_check (rocm): source changed (or first build), compiling standalone...");
-        let include_cuda2hip = format!("{}/util/cuda2hip.hpp", &sppark_root);
-        let eval_check_flags: Vec<&str> = vec![
-            "-x",
-            "hip",
-            "-std=c++17",
-            "-O3",
-            "-fPIC",
-            "-Wno-unused-function",
-            "-Wno-unused-parameter",
-            "-mllvm",
-            "-amdgpu-early-inline-all=false",
-            "-mllvm",
-            "-amdgpu-use-aa-in-codegen",
-            "-mllvm",
-            "-amdgpu-schedule-metric-bias=0",
-            "-mllvm",
-            "-amdgpu-internalize-symbols",
-            "-mllvm",
-            "-amdgpu-schedule-relaxed-occupancy",
-            "-include",
-            &include_cuda2hip,
-            "-I",
-            &cuda_root,
-            "-I",
-            &cxx_root,
-            "-I",
-            &sppark_root,
-        ];
-        risc0_build_kernel::hip_compile(
-            &hipcc,
-            &eval_check_flags,
-            Path::new("eval_check_combined.cu"),
-            &eval_check_cached,
-            &risc0_build_kernel::hip_arches(),
-            Some(Path::new("kernels/cuda")),
-        );
-        std::fs::write(&eval_check_stamp, &current_hash).unwrap();
-    } else {
-        eprintln!("eval_check (rocm): source unchanged, reusing cached object");
-    }
+    // Every cache below is keyed on its sources, the hipcc command and flags, what hipcc
+    // reads from outside its arguments (its version and environment), and the architectures
+    // -- for `native`, this machine's GPUs -- so none can reuse an object built without them.
+    let hip_arches = risc0_build_kernel::hip_arches();
+    let hipcc_key = format!(
+        "{hipcc}\n{}\narches={hip_arches}\n{}",
+        risc0_build_kernel::hipcc_environment_key(&hipcc),
+        if hip_arches.split(',').any(|a| a.trim() == "native") {
+            risc0_build_kernel::native_gpu_arch_key(true)
+        } else {
+            String::new()
+        }
+    );
+    let include_cuda2hip = format!("{}/util/cuda2hip.hpp", &sppark_root);
+    let eval_check_flags: Vec<&str> = vec![
+        "-x",
+        "hip",
+        "-std=c++17",
+        "-O3",
+        "-fPIC",
+        "-Wno-unused-function",
+        "-Wno-unused-parameter",
+        "-mllvm",
+        "-amdgpu-early-inline-all=false",
+        "-mllvm",
+        "-amdgpu-use-aa-in-codegen",
+        "-mllvm",
+        "-amdgpu-schedule-metric-bias=0",
+        "-mllvm",
+        "-amdgpu-internalize-symbols",
+        "-mllvm",
+        "-amdgpu-schedule-relaxed-occupancy",
+        "-include",
+        &include_cuda2hip,
+        "-I",
+        &cuda_root,
+        "-I",
+        &cxx_root,
+        "-I",
+        &sppark_root,
+    ];
+    let eval_check_key = risc0_build_kernel::hash_key(&[
+        "rv32im-rocm-eval-check-v1",
+        &eval_check_sources_key(&[&cuda_root, &cxx_root, &sppark_root]),
+        &format!("{eval_check_flags:?}"),
+        &hipcc_key,
+    ]);
+    let eval_check_cached = risc0_build_kernel::cached_compile(
+        &cache_dir,
+        "eval_check_combined_standalone",
+        "o",
+        &eval_check_key,
+        |out| {
+            risc0_build_kernel::hip_compile(
+                &hipcc,
+                &eval_check_flags,
+                Path::new("eval_check_combined.cu"),
+                out,
+                &hip_arches,
+                Some(Path::new("kernels/cuda")),
+            )
+        },
+    );
     // Copy cached object to OUT_DIR for this build.
     std::fs::copy(&eval_check_cached, &eval_check_obj).unwrap();
 
@@ -550,76 +576,59 @@ fn build_rocm_kernels() {
     }
     std::fs::write(&amalg_path, &amalg).unwrap();
 
-    // Cache remaining_kernels: hash source files, skip recompilation if unchanged
-    let remaining_cached = cache_dir.join("remaining_kernels_rocm.o");
-    let remaining_stamp = cache_dir.join("remaining_kernels_hash_rocm.stamp");
+    // Both of the compiles below take every .cu and header under kernels/cuda (the
+    // amalgamation by absolute path, and with `-I` to it), so their caches are keyed on all
+    // of them.
+    let kernel_dir_str = kernel_dir.to_str().unwrap();
+    let local_flags: Vec<&str> = vec![
+        "-x",
+        "hip",
+        "-std=c++17",
+        "-O3",
+        "-fPIC",
+        "-Wno-unused-function",
+        "-Wno-unused-parameter",
+        "-mllvm",
+        "-amdgpu-early-inline-all=false",
+        "-include",
+        &include_cuda2hip,
+        "-I",
+        &cuda_root,
+        "-I",
+        &cxx_root,
+        "-I",
+        &sppark_root,
+        "-I",
+        kernel_dir_str,
+    ];
+    let local_sources_key = risc0_build_kernel::kernel_sources_key(
+        &[
+            Path::new(&cuda_root),
+            Path::new(&cxx_root),
+            Path::new(&sppark_root),
+            &kernel_dir,
+        ],
+        &[],
+    );
+
+    // Cache remaining_kernels.
     let remaining_obj = out_dir.join("remaining_kernels_rocm.o");
-    let remaining_hash = {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        // Hash .cu files
-        for cu in &cuda_files {
-            let abs = std::fs::canonicalize(cu).unwrap();
-            if let Ok(content) = std::fs::read_to_string(&abs) {
-                content.hash(&mut hasher);
-            }
-        }
-        // Also hash header files (.h, .cuh, .inc) since they affect compilation
-        for pattern in &[
-            "kernels/cuda/*.h",
-            "kernels/cuda/*.cuh",
-            "kernels/cuda/*.inc",
-        ] {
-            for hdr in glob_paths(pattern) {
-                let abs = std::fs::canonicalize(&hdr).unwrap();
-                if let Ok(content) = std::fs::read_to_string(&abs) {
-                    content.hash(&mut hasher);
-                }
-            }
-        }
-        // Hash target architectures so cache invalidates when arch list changes
-        risc0_build_kernel::hip_arches().hash(&mut hasher);
-        format!("{:016x}", hasher.finish())
-    };
-    let remaining_prev = std::fs::read_to_string(&remaining_stamp).unwrap_or_default();
-    if remaining_hash != remaining_prev || !remaining_cached.exists() {
-        eprintln!("remaining_kernels (rocm): source changed, compiling...");
-        let include_cuda2hip = format!("{sppark_root}/util/cuda2hip.hpp");
-        let kernel_dir_str = kernel_dir.to_str().unwrap();
-        let remaining_flags: Vec<&str> = vec![
-            "-x",
-            "hip",
-            "-std=c++17",
-            "-O3",
-            "-fPIC",
-            "-Wno-unused-function",
-            "-Wno-unused-parameter",
-            "-mllvm",
-            "-amdgpu-early-inline-all=false",
-            "-include",
-            &include_cuda2hip,
-            "-I",
-            &cuda_root,
-            "-I",
-            &cxx_root,
-            "-I",
-            &sppark_root,
-            "-I",
-            kernel_dir_str,
-        ];
-        risc0_build_kernel::hip_compile(
-            &hipcc,
-            &remaining_flags,
-            &amalg_path,
-            &remaining_cached,
-            &risc0_build_kernel::hip_arches(),
-            None,
-        );
-        std::fs::write(&remaining_stamp, &remaining_hash).unwrap();
-    } else {
-        eprintln!("remaining_kernels (rocm): source unchanged, reusing cached object");
-    }
+    let remaining_key = risc0_build_kernel::hash_key(&[
+        "rv32im-rocm-remaining-v1",
+        &local_sources_key,
+        &amalg,
+        &format!("{local_flags:?}"),
+        &hipcc_key,
+    ]);
+    let remaining_cached = risc0_build_kernel::cached_compile(
+        &cache_dir,
+        "remaining_kernels_rocm",
+        "o",
+        &remaining_key,
+        |out| {
+            risc0_build_kernel::hip_compile(&hipcc, &local_flags, &amalg_path, out, &hip_arches, None)
+        },
+    );
     std::fs::copy(&remaining_cached, &remaining_obj).unwrap();
 
     // Compile ffi_supra.cu separately (uses sppark types, can't be in same TU)
@@ -628,57 +637,16 @@ fn build_rocm_kernels() {
     for cu in &separate_files {
         let stem = cu.file_stem().unwrap().to_str().unwrap();
         let obj = out_dir.join(format!("{stem}.o"));
-        let cached_obj = cache_dir.join(format!("{stem}.o"));
-        let cached_stamp = cache_dir.join(format!("{stem}_hash_rocm.stamp"));
-        let src_hash = {
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut hasher = DefaultHasher::new();
-            if let Ok(content) = std::fs::read_to_string(cu) {
-                content.hash(&mut hasher);
-            }
-            // Hash target architectures so cache invalidates when arch list changes
-            risc0_build_kernel::hip_arches().hash(&mut hasher);
-            format!("{:016x}", hasher.finish())
-        };
-        let prev_hash = std::fs::read_to_string(&cached_stamp).unwrap_or_default();
-        if src_hash != prev_hash || !cached_obj.exists() {
-            eprintln!("{stem} (rocm): source changed, compiling...");
-            let include_cuda2hip = format!("{sppark_root}/util/cuda2hip.hpp");
-            let kernel_dir_str = kernel_dir.to_str().unwrap();
-            let sep_flags: Vec<&str> = vec![
-                "-x",
-                "hip",
-                "-std=c++17",
-                "-O3",
-                "-fPIC",
-                "-Wno-unused-function",
-                "-Wno-unused-parameter",
-                "-mllvm",
-                "-amdgpu-early-inline-all=false",
-                "-include",
-                &include_cuda2hip,
-                "-I",
-                &cuda_root,
-                "-I",
-                &cxx_root,
-                "-I",
-                &sppark_root,
-                "-I",
-                kernel_dir_str,
-            ];
-            risc0_build_kernel::hip_compile(
-                &hipcc,
-                &sep_flags,
-                cu,
-                &cached_obj,
-                &risc0_build_kernel::hip_arches(),
-                None,
-            );
-            std::fs::write(&cached_stamp, &src_hash).unwrap();
-        } else {
-            eprintln!("{stem} (rocm): source unchanged, reusing cached object");
-        }
+        let key = risc0_build_kernel::hash_key(&[
+            "rv32im-rocm-separate-v1",
+            &local_sources_key,
+            &cu.to_string_lossy(),
+            &format!("{local_flags:?}"),
+            &hipcc_key,
+        ]);
+        let cached_obj = risc0_build_kernel::cached_compile(&cache_dir, stem, "o", &key, |out| {
+            risc0_build_kernel::hip_compile(&hipcc, &local_flags, cu, out, &hip_arches, None)
+        });
         std::fs::copy(&cached_obj, &obj).unwrap();
         all_objs.push(obj);
     }
@@ -710,41 +678,19 @@ fn glob_paths(pattern: &str) -> Vec<PathBuf> {
     glob::glob(pattern).unwrap().map(|x| x.unwrap()).collect()
 }
 
-/// Hash the contents of all files relevant to eval_check compilation, plus
-/// `compiler_key` (everything about the compiler invocation that changes its output).
-/// Returns a hex string that changes when any of them changes.
-fn eval_check_source_hash(compiler_key: Option<&str>) -> String {
-    let mut hasher = DefaultHasher::new();
-    let files = [
-        "kernels/cuda/eval_check_combined.cu",
-        "kernels/cuda/eval_check_0.cu",
-        "kernels/cuda/eval_check_1.cu",
-        "kernels/cuda/eval_check_2.cu",
-        "kernels/cuda/eval_check_3.cu",
-        "kernels/cuda/eval_check.cuh",
-    ];
-    for f in &files {
-        if let Ok(contents) = std::fs::read(f) {
-            f.hash(&mut hasher);
-            contents.hash(&mut hasher);
-        }
-    }
-    // Also hash include dirs and arch flag so cache invalidates on toolchain change.
-    if let Ok(v) = env::var("DEP_RISC0_SYS_CUDA_ROOT") {
-        v.hash(&mut hasher);
-    }
-    if let Ok(v) = env::var("DEP_RISC0_SYS_CXX_ROOT") {
-        v.hash(&mut hasher);
-    }
-    if let Ok(v) = env::var("DEP_SPPARK_ROOT") {
-        v.hash(&mut hasher);
-    }
-    // Hash target architectures so cache invalidates when arch list changes
-    risc0_build_kernel::hip_arches().hash(&mut hasher);
-    if let Some(key) = compiler_key {
-        key.hash(&mut hasher);
-    }
-    format!("{:016x}", hasher.finish())
+/// A key over every source and header the eval_check compile can read: everything under the
+/// include roots (headers there can include `.cu` files, as sppark's do), and the eval_check
+/// sources and headers in kernels/cuda. Not the other `.cu` files there, so changing one of
+/// them doesn't trigger this ~24-minute compile.
+fn eval_check_sources_key(include_roots: &[&str]) -> String {
+    let mut files: Vec<PathBuf> = ["*.h", "*.cuh", "*.hpp", "*.inc", "eval_check*.cu"]
+        .iter()
+        .flat_map(|pattern| glob_paths(&format!("kernels/cuda/{pattern}")))
+        .collect();
+    files.sort();
+    let roots: Vec<&Path> = include_roots.iter().map(Path::new).collect();
+    let files: Vec<&Path> = files.iter().map(PathBuf::as_path).collect();
+    risc0_build_kernel::kernel_sources_key(&roots, &files)
 }
 
 /// Stamp version: bump when stamp inputs or layout change so older stamps
