@@ -158,13 +158,10 @@ where
 
 impl<H, C, F> SegmentProver for SegmentProverImpl<H, C, F>
 where
-    // Send + Sync + 'static so prove_begin can spawn the backgrounded
-    // finalize on a worker thread. The H::Buffer<T> bounds let
-    // DeferredFinalize<H> (which contains buffers of various T) be Send.
-    H: Hal<Field = CircuitField, Elem = Val, ExtElem = ExtVal> + Send + Sync + 'static,
-    H::Buffer<Val>: Send,
-    H::Buffer<risc0_zkp::core::digest::Digest>: Send,
-    C: CircuitHal<H> + CircuitWitnessGenerator<H> + CircuitAccumulator<H> + Send + Sync + 'static,
+    // No Send/Sync bounds: prove_begin finalizes on the calling thread (see below), and the CUDA
+    // and HIP HALs are not Send.
+    H: Hal<Field = CircuitField, Elem = Val, ExtElem = ExtVal> + 'static,
+    C: CircuitHal<H> + CircuitWitnessGenerator<H> + CircuitAccumulator<H> + 'static,
     F: Fn() -> (Arc<H>, Arc<C>),
 {
     fn preflight(&self, segment: &Segment) -> Result<PreflightResults> {
