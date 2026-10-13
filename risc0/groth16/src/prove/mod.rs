@@ -22,6 +22,8 @@ mod docker;
 mod fast;
 #[cfg(feature = "rocm")]
 mod hip;
+#[cfg(all(feature = "intel", not(any(feature = "cuda", feature = "rocm"))))]
+mod intel;
 mod seal_format;
 mod seal_to_json;
 #[cfg(feature = "cuda")]
@@ -69,6 +71,10 @@ pub fn preload_graph_background() {
 pub fn prestart_prover() -> Result<()> {
     cfg_if::cfg_if! {
         if #[cfg(all(feature = "intel", not(any(feature = "cuda", feature = "rocm"))))] {
+            if self::intel::enabled() {
+                // Uploads the proving key to the GPU in the background.
+                return self::intel::prestart();
+            }
             // Only check that the graph exists here: building the witness
             // program (~1 s) stays on the preload thread, off this path.
             if self::docker::fast_enabled()
@@ -105,6 +111,12 @@ pub fn preload_srs() -> Result<()> {
             self::cuda::preload_srs()
         } else if #[cfg(feature = "rocm")] {
             Ok(()) // hip.rs handles SRS loading internally
+        } else if #[cfg(feature = "intel")] {
+            if self::intel::enabled() {
+                self::intel::preload_srs()
+            } else {
+                Ok(())
+            }
         } else {
             Ok(())
         }
@@ -125,6 +137,12 @@ pub fn release_srs() -> Result<()> {
     cfg_if::cfg_if! {
         if #[cfg(feature = "cuda")] {
             self::cuda::release_srs()
+        } else if #[cfg(all(feature = "intel", not(feature = "rocm")))] {
+            if self::intel::enabled() {
+                self::intel::release_srs()
+            } else {
+                Ok(())
+            }
         } else {
             // ROCm caches through hip.rs's own path, untested here; docker mode holds nothing.
             Ok(())
@@ -163,6 +181,12 @@ pub fn shrink_wrap(identity_p254_seal_bytes: &[u8]) -> Result<Seal> {
             self::cuda::shrink_wrap(identity_p254_seal_bytes)
         } else if #[cfg(feature = "rocm")] {
             self::hip::shrink_wrap(identity_p254_seal_bytes)
+        } else if #[cfg(feature = "intel")] {
+            if self::intel::enabled() {
+                self::intel::shrink_wrap(identity_p254_seal_bytes)
+            } else {
+                self::docker::shrink_wrap(identity_p254_seal_bytes)
+            }
         } else {
             self::docker::shrink_wrap(identity_p254_seal_bytes)
         }

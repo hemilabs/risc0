@@ -24,6 +24,36 @@ fn main() {
     if env::var("CARGO_FEATURE_ROCM").is_ok() {
         build_rocm_kernels();
     }
+
+    if env::var("CARGO_FEATURE_INTEL").is_ok() {
+        build_intel_kernels();
+    }
+}
+
+fn build_intel_kernels() {
+    println!("cargo:rerun-if-changed=kernels/intel");
+    let icpx = risc0_build_kernel::find_icpx();
+    let out_dir = env::var("OUT_DIR").map(PathBuf::from).unwrap();
+    let args: Vec<std::ffi::OsString> = ["-fsycl", "-std=c++17", "-O3", "-Ikernels/intel"]
+        .iter()
+        .map(Into::into)
+        .collect();
+    let output = risc0_build_kernel::intel_build_library(
+        &icpx,
+        &args,
+        &[PathBuf::from("kernels/intel/ffi.cpp")],
+        &out_dir,
+        "risc0_groth16_intel",
+    );
+    if !output.status.success() {
+        panic!(
+            "icpx failed for the Intel Groth16 prover:
+{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    risc0_build_kernel::intel_link_library(&out_dir, "risc0_groth16_intel");
 }
 
 fn build_cuda_kernels() {
