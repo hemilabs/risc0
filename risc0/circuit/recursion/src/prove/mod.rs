@@ -193,6 +193,10 @@ impl Prover {
     /// Run the prover, producing a receipt of execution for the recursion circuit over the loaded
     /// program and input.
     pub fn run(&mut self) -> Result<RecursionReceipt> {
+        // Exclusive use of the GPU against other threads for this proof; the cached prover's HAL
+        // doesn't hold it (see `risc0_zkp::hal::cuda::singleton`).
+        #[cfg(feature = "cuda")]
+        let _gpu = risc0_zkp::hal::cuda::exclusive();
         // Cache provers by hashfn to avoid recreating HAL + circuit_hal each call.
         // Using HashMap instead of single-entry cache prevents eviction when hashfn
         // alternates (e.g., "poseidon2" for lift/join → "poseidon_254" for identity_p254),

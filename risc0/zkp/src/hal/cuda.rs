@@ -150,9 +150,20 @@ pub fn clear_buffer_pool() {
 }
 
 // The GPU becomes unstable as the number of concurrent provers grow.
+//
+// Held for a whole proving call by the code that proves (`exclusive`; the rv32im session, each
+// recursion and keccak proof, the Groth16 wrap), and by `CudaHal::new` while it initializes. Not
+// for a `CudaHal`'s lifetime: the provers cache their HALs per thread, so a HAL holding it would
+// keep it as long as its thread lives, and every other thread that proves would wait forever.
 pub fn singleton() -> &'static ReentrantMutex<()> {
     static ONCE: OnceLock<ReentrantMutex<()>> = OnceLock::new();
     ONCE.get_or_init(|| ReentrantMutex::new(()))
+}
+
+/// Exclusive use of the GPU for one proving call, against other threads: hold the returned guard
+/// for the call. Reentrant, so a call nested in another on the same thread goes straight through.
+pub fn exclusive() -> ReentrantMutexGuard<'static, ()> {
+    singleton().lock()
 }
 
 #[derive(Clone, Copy)]
@@ -374,7 +385,6 @@ pub struct CudaHal<Hash: CudaHash + ?Sized> {
     // Use primary context (None) to avoid per-instance CUDA module loading overhead.
     // The primary context persists for the process lifetime, so modules load once.
     _context: Option<Context>,
-    _lock: ReentrantMutexGuard<'static, ()>,
 }
 
 pub type CudaHalSha256 = CudaHal<CudaHashSha256>;
@@ -946,7 +956,6 @@ impl<CH: CudaHash + ?Sized> CudaHal<CH> {
             max_threads: max_threads as u32,
             _context: None,
             hash: None,
-            _lock,
         };
         hal.hash = Some(hash);
         hal

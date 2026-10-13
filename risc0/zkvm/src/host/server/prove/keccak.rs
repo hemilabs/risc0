@@ -31,6 +31,7 @@ use crate::{
 
 /// Generate a keccak proof that has been lifted.
 pub(crate) fn prove_keccak(request: &ProveKeccakRequest) -> Result<SuccinctReceipt<Unknown>> {
+    let _gpu = super::exclusive_gpu();
     let zkr_input = {
         let prover = keccak_prover()?;
         let seal = prover.prove(&request.input, request.po2)?;
