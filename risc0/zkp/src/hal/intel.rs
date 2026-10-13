@@ -340,7 +340,12 @@ impl RawBuffer {
         let buf = pooled.unwrap_or_else(|| {
             IntelDeviceBuffer::uninitialized(size).unwrap_or_else(|_| {
                 // Cached buffers of other sizes may be holding the VRAM.
+                // esimd_free_device does not wait for queued work that may
+                // still use them; drain the queue first.
                 let all = BUFFER_POOL.lock().take_all();
+                if !all.is_empty() {
+                    unsafe { intel::esimd_sync(get_queue()) };
+                }
                 drop(all);
                 IntelDeviceBuffer::uninitialized(size).unwrap_or_else(|e| {
                     panic!("Intel GPU allocation failed on {name}: {size} bytes: {e}")
@@ -361,6 +366,11 @@ impl Drop for RawBuffer {
         tracker().lock().unwrap().free(size);
         let buf = unsafe { ManuallyDrop::take(&mut self.buf) };
         let overflow = BUFFER_POOL.lock().push(size, buf);
+        if overflow.is_some() {
+            // Over the pool cap (reachable at po2=21): the buffer is freed, and
+            // esimd_free_device does not wait for queued kernels still using it.
+            unsafe { intel::esimd_sync(get_queue()) };
+        }
         drop(overflow);
     }
 }
