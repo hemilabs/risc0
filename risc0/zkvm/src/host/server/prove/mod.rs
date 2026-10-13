@@ -41,6 +41,15 @@ use crate::{
     Session, VerifierContext, WorkClaim,
 };
 
+/// Verify a Groth16 receipt this prover just produced, before handing it out.
+/// A faulty shrink-wrap (prover, witness or GPU bug) then fails here, instead of
+/// surfacing later as an invalid proof, e.g. on chain. Costs a few milliseconds.
+pub(crate) fn check_groth16_receipt(receipt: &Groth16Receipt<ReceiptClaim>) -> Result<()> {
+    receipt
+        .verify_integrity_with_context(&VerifierContext::default())
+        .map_err(|e| anyhow!("Groth16 receipt failed verification: {e}"))
+}
+
 mod private {
     use super::{dev_mode::DevModeProver, prover_impl::ProverImpl};
 
@@ -225,11 +234,13 @@ pub trait ProverServer: private::Sealed {
             t0.elapsed().as_secs_f64() * 1000.0,
         );
 
-        Ok(Groth16Receipt {
+        let groth16_receipt = Groth16Receipt {
             seal,
             claim: receipt.claim.clone(),
             verifier_parameters: Groth16ReceiptVerifierParameters::default().digest(),
-        })
+        };
+        check_groth16_receipt(&groth16_receipt)?;
+        Ok(groth16_receipt)
     }
 
     /// Compress a receipt into one with a smaller representation.
