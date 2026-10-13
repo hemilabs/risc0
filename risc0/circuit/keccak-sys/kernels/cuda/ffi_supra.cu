@@ -21,6 +21,9 @@
 
 namespace risc0::circuit::keccak::cuda {
 
+// ROCm builds this eval_check. CUDA builds its own, from eval_check_scratch_kernel.cuh (see
+// there and build.rs), with the scratch array in global memory.
+
 __constant__ FpExt poly_mix[kNumPolyMixPows];
 
 __global__ void eval_check(Fp* check,
