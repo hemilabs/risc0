@@ -8,8 +8,45 @@
 #pragma once
 
 #include <cstdint>
+#if defined(SYCL_LANGUAGE_VERSION)
+#include <sycl/sycl.hpp>
+#endif
 
 namespace r0g16 {
+
+// Out-of-line point operations: the full addition, doubling and small multiples are off the
+// MSM's hot path (bucket sums use add_affine), and inlining them too makes the kernels so large
+// that IGC takes many minutes to compile them.
+#define R0G16_OUTLINE __attribute__((noinline))
+
+// High half of a 32 x 32-bit product. On the GPU, 64-bit integer arithmetic is emulated, so the
+// field arithmetic below works on 32-bit values only (2.4x faster Montgomery multiplication on
+// an Arc Pro B70); the host compiles the same code.
+inline uint32_t mulhi32(uint32_t a, uint32_t b) {
+#if defined(__SYCL_DEVICE_ONLY__)
+  return sycl::mul_hi(a, b);
+#else
+  return (uint32_t)(((uint64_t)a * b) >> 32);
+#endif
+}
+
+// a + b + carry_in; carry_out set to the carry (0 or 1).
+inline uint32_t addc(uint32_t a, uint32_t b, uint32_t carry_in, uint32_t& carry_out) {
+  uint32_t s = a + b;
+  uint32_t c = s < a;
+  uint32_t s2 = s + carry_in;
+  carry_out = c + (s2 < s);
+  return s2;
+}
+
+// a - b - borrow_in; borrow_out set to the borrow (0 or 1).
+inline uint32_t subb(uint32_t a, uint32_t b, uint32_t borrow_in, uint32_t& borrow_out) {
+  uint32_t d = a - b;
+  uint32_t br = a < b;
+  uint32_t d2 = d - borrow_in;
+  borrow_out = br + (d < borrow_in);
+  return d2;
+}
 
 // Base field Fp (sppark ALT_BN128_P and friends).
 struct FpParams {
@@ -108,12 +145,9 @@ template <class Params> struct Mont {
   // t (8 limbs, plus a carry-out bit `hi`) reduced once by P, to [0, P).
   static inline Mont reduce_once(const uint32_t t[8], uint32_t hi) {
     uint32_t u[8];
-    uint64_t borrow = 0;
-    for (int i = 0; i < 8; i++) {
-      uint64_t d = (uint64_t)t[i] - Params::P[i] - borrow;
-      u[i] = (uint32_t)d;
-      borrow = (d >> 32) & 1;
-    }
+    uint32_t borrow = 0;
+    for (int i = 0; i < 8; i++)
+      u[i] = subb(t[i], Params::P[i], borrow, borrow);
     // Keep t - P unless it went negative (and t had no carry-out).
     bool keep_t = borrow && !hi;
     Mont r;
@@ -124,64 +158,68 @@ template <class Params> struct Mont {
 
   friend inline Mont operator+(const Mont& a, const Mont& b) {
     uint32_t t[8];
-    uint64_t c = 0;
-    for (int i = 0; i < 8; i++) {
-      c += (uint64_t)a.l[i] + b.l[i];
-      t[i] = (uint32_t)c;
-      c >>= 32;
-    }
-    return reduce_once(t, (uint32_t)c);
+    uint32_t c = 0;
+    for (int i = 0; i < 8; i++)
+      t[i] = addc(a.l[i], b.l[i], c, c);
+    return reduce_once(t, c);
   }
 
   friend inline Mont operator-(const Mont& a, const Mont& b) {
     uint32_t t[8];
-    uint64_t borrow = 0;
-    for (int i = 0; i < 8; i++) {
-      uint64_t d = (uint64_t)a.l[i] - b.l[i] - borrow;
-      t[i] = (uint32_t)d;
-      borrow = (d >> 32) & 1;
-    }
-    if (borrow) {
-      uint64_t c = 0;
-      for (int i = 0; i < 8; i++) {
-        c += (uint64_t)t[i] + Params::P[i];
-        t[i] = (uint32_t)c;
-        c >>= 32;
-      }
-    }
+    uint32_t borrow = 0;
+    for (int i = 0; i < 8; i++)
+      t[i] = subb(a.l[i], b.l[i], borrow, borrow);
+    // Add P back if it went negative (masked, no branch).
+    uint32_t mask = 0u - borrow;
+    uint32_t c = 0;
+    for (int i = 0; i < 8; i++)
+      t[i] = addc(t[i], Params::P[i] & mask, c, c);
     return from_limbs(t);
   }
 
   inline Mont neg() const { return is_zero() ? *this : zero() - *this; }
   inline Mont dbl() const { return *this + *this; }
 
-  // Montgomery multiplication (CIOS): a * b * R^-1 mod P.
+  // Montgomery multiplication (CIOS, 32-bit operations only): a * b * R^-1 mod P.
   friend inline Mont operator*(const Mont& a, const Mont& b) {
     uint32_t t[10];
     for (int i = 0; i < 10; i++)
       t[i] = 0;
     for (int i = 0; i < 8; i++) {
-      uint64_t c = 0;
-      uint64_t bi = b.l[i];
+      uint32_t c = 0;
+      uint32_t bi = b.l[i];
       for (int j = 0; j < 8; j++) {
-        c += (uint64_t)a.l[j] * bi + t[j];
-        t[j] = (uint32_t)c;
-        c >>= 32;
+        // t[j] + a[j] * bi + c fits in 64 bits: (hi, lo).
+        uint32_t lo = a.l[j] * bi, hi = mulhi32(a.l[j], bi);
+        uint32_t k;
+        lo = addc(lo, t[j], 0, k);
+        hi += k;
+        lo = addc(lo, c, 0, k);
+        hi += k;
+        t[j] = lo;
+        c = hi;
       }
-      uint64_t s = (uint64_t)t[8] + c;
-      t[8] = (uint32_t)s;
-      t[9] = (uint32_t)(s >> 32);
+      uint32_t k;
+      t[8] = addc(t[8], c, 0, k);
+      t[9] = k;
 
       uint32_t m = t[0] * Params::M0;
-      c = ((uint64_t)m * Params::P[0] + t[0]) >> 32;
+      // t[0] + m * P[0] is 0 mod 2^32; only its carry matters.
+      uint32_t lo = m * Params::P[0], hi = mulhi32(m, Params::P[0]);
+      (void)addc(lo, t[0], 0, k);
+      c = hi + k;
       for (int j = 1; j < 8; j++) {
-        c += (uint64_t)m * Params::P[j] + t[j];
-        t[j - 1] = (uint32_t)c;
-        c >>= 32;
+        lo = m * Params::P[j];
+        hi = mulhi32(m, Params::P[j]);
+        lo = addc(lo, t[j], 0, k);
+        hi += k;
+        lo = addc(lo, c, 0, k);
+        hi += k;
+        t[j - 1] = lo;
+        c = hi;
       }
-      s = (uint64_t)t[8] + c;
-      t[7] = (uint32_t)s;
-      t[8] = t[9] + (uint32_t)(s >> 32);
+      t[7] = addc(t[8], c, 0, k);
+      t[8] = t[9] + k;
     }
     return reduce_once(t, t[8]);
   }
@@ -294,7 +332,7 @@ template <class F> struct Xyzz {
   }
 
   // 2 * self (dbl-2008-s-1, a = 0).
-  inline Xyzz dbl() const {
+  R0G16_OUTLINE Xyzz dbl() const {
     if (is_inf() || y.is_zero())
       return inf();
     F u = y.dbl();
@@ -306,6 +344,22 @@ template <class F> struct Xyzz {
     F x3 = m.sqr() - s.dbl();
     F y3 = m * (s - x3) - w * y;
     return {x3, y3, v * zz, w * zzz};
+  }
+
+  // 2 * q for affine q (mdbl-2008-s-1), inline: add_affine is the MSM's hot loop, and a call
+  // there, even on this rarely taken branch, makes IGC save its live values around it.
+  static inline Xyzz dbl_affine(const Affine<F>& q) {
+    if (q.y.is_zero())
+      return inf();
+    F u = q.y.dbl();
+    F v = u.sqr();
+    F w = u * v;
+    F s = q.x * v;
+    F x2 = q.x.sqr();
+    F m = x2.dbl() + x2;
+    F x3 = m.sqr() - s.dbl();
+    F y3 = m * (s - x3) - w * q.y;
+    return {x3, y3, v, w};
   }
 
   // self + q for affine q (madd-2008-s).
@@ -320,7 +374,7 @@ template <class F> struct Xyzz {
     F r = s2 - y;
     if (p.is_zero()) {
       if (r.is_zero())
-        return from_affine(q).dbl();
+        return dbl_affine(q);
       return inf();
     }
     F pp = p.sqr();
@@ -332,7 +386,7 @@ template <class F> struct Xyzz {
   }
 
   // self + q (add-2008-s).
-  inline Xyzz add(const Xyzz& q) const {
+  R0G16_OUTLINE Xyzz add(const Xyzz& q) const {
     if (q.is_inf())
       return *this;
     if (is_inf())
@@ -359,9 +413,12 @@ template <class F> struct Xyzz {
   inline Xyzz neg() const { return {x, y.neg(), zz, zzz}; }
 
   // k * self for a small (up to 32-bit) multiplier.
-  inline Xyzz mul_small(uint32_t k) const {
+  R0G16_OUTLINE Xyzz mul_small(uint32_t k) const {
     Xyzz acc = inf();
-    for (int i = 31; i >= 0; i--) {
+    int top = 31;
+    while (top >= 0 && !((k >> top) & 1))
+      top--;
+    for (int i = top; i >= 0; i--) {
       acc = acc.dbl();
       if ((k >> i) & 1)
         acc = acc.add(*this);

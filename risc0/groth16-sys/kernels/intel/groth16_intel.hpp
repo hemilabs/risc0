@@ -13,6 +13,8 @@
 #pragma once
 
 #include <sycl/sycl.hpp>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+#include <sycl/ext/oneapi/experimental/enqueue_functions.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -516,10 +518,24 @@ inline void generate_fuzz(sycl::queue& q, Fr* out, size_t blocks) {
 // MSM (Pippenger)
 // ---------------------------------------------------------------------------------------------
 
+// Kernel properties for the MSM's point-arithmetic kernels: the large register file (256 GRF),
+// since each work-item holds several 256-bit (512-bit for G2) values and spills otherwise.
+#ifndef R0G16_GRF
+#define R0G16_GRF 256
+#endif
+template <class K> inline void heavy_parallel_for(sycl::queue& q, size_t n, K kernel) {
+  namespace syclex = sycl::ext::oneapi::experimental;
+  namespace intelex = sycl::ext::intel::experimental;
+  syclex::parallel_for(
+      q,
+      syclex::launch_config{sycl::range<1>(n), syclex::properties{intelex::grf_size<R0G16_GRF>}},
+      kernel);
+}
+
 constexpr uint32_t MSM_C = 16;                      // window bits
 constexpr uint32_t MSM_WINDOWS = (256 + MSM_C - 1) / MSM_C;
 constexpr uint32_t MSM_BUCKETS = 1u << MSM_C;      // bucket 0 unused
-constexpr uint32_t MSM_SEG = 256;                   // buckets per reduction work-item
+constexpr uint32_t MSM_SEG = 64;                    // buckets per reduction work-item
 constexpr uint32_t MSM_SEGS = MSM_BUCKETS / MSM_SEG;
 
 inline uint32_t scalar_digit(const Fr& s, uint32_t w) {
@@ -560,6 +576,19 @@ Xyzz<F> msm(sycl::queue& q,
   uint32_t* sorted = sc.sorted.ptr;
   P* buckets = (P*)sc.buckets.ptr;
   P* partial = (P*)sc.partial.ptr;
+  // With RISC0_GROTH16_INTEL_VERBOSE, time each step (waits after each).
+  auto t_step = std::chrono::steady_clock::now();
+  auto step = [&](const char* name) {
+    if (!verbose())
+      return;
+    q.wait();
+    auto now = std::chrono::steady_clock::now();
+    std::fprintf(stderr,
+                 "[groth16-intel]   msm %s: %.1f ms\n",
+                 name,
+                 std::chrono::duration<double, std::milli>(now - t_step).count());
+    t_step = now;
+  };
 
   // 1. Count the points per (window, bucket).
   q.memset(hist, 0, sizeof(uint32_t) * MSM_WINDOWS * MSM_BUCKETS);
@@ -580,6 +609,7 @@ Xyzz<F> msm(sycl::queue& q,
       }
     }
   });
+  step("count");
   // 2. Exclusive prefix sums per window (one work-item per window; 64K entries each).
   q.parallel_for(sycl::range<1>(MSM_WINDOWS), [=](sycl::id<1> id) {
     size_t base = id[0] * MSM_BUCKETS;
@@ -591,6 +621,7 @@ Xyzz<F> msm(sycl::queue& q,
       acc += c;
     }
   });
+  step("prefix sums");
   // 3. Scatter the point indices into their buckets.
   q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> id) {
     size_t i = id[0];
@@ -610,8 +641,9 @@ Xyzz<F> msm(sycl::queue& q,
       }
     }
   });
+  step("scatter");
   // 4. Sum each bucket. hist now holds each bucket's end.
-  q.parallel_for(sycl::range<1>((size_t)MSM_WINDOWS * MSM_BUCKETS), [=](sycl::id<1> id) {
+  heavy_parallel_for(q, (size_t)MSM_WINDOWS * MSM_BUCKETS, [=](sycl::id<1> id) {
     size_t wb = id[0];
     size_t w = wb / MSM_BUCKETS;
     uint32_t start = offset[wb], end = hist[wb];
@@ -621,8 +653,9 @@ Xyzz<F> msm(sycl::queue& q,
       acc = acc.add_affine(points[idx[k]]);
     buckets[wb] = acc;
   });
+  step("buckets");
   // 5. Per segment of buckets [lo, lo + SEG): sum_b b * B_b, by running sums.
-  q.parallel_for(sycl::range<1>((size_t)MSM_WINDOWS * MSM_SEGS), [=](sycl::id<1> id) {
+  heavy_parallel_for(q, (size_t)MSM_WINDOWS * MSM_SEGS, [=](sycl::id<1> id) {
     size_t ws = id[0];
     size_t w = ws / MSM_SEGS;
     uint32_t lo = (uint32_t)(ws % MSM_SEGS) * MSM_SEG;
@@ -639,6 +672,7 @@ Xyzz<F> msm(sycl::queue& q,
       total = total.add(running.mul_small(lo - 1));
     partial[ws] = total;
   });
+  step("reduce");
   // 6. On the host: the windows' sums, then sum_w 2^(C w) S_w.
   std::vector<P> host((size_t)MSM_WINDOWS * MSM_SEGS);
   q.memcpy(host.data(), partial, host.size() * sizeof(P)).wait();
@@ -730,9 +764,20 @@ public:
       , abc(queue, 3 * srs.domain_size)
       , witness(queue, srs.a.len)
       , scratch(queue, std::max(srs.domain_size, srs.a.len)) {
-    Timer t("generate fuzz");
-    q.memset(fuzz.ptr, 0, fuzz.len * sizeof(Fr));
-    generate_fuzz(q, fuzz.ptr, fuzz.len / 2);
+    {
+      Timer t("generate fuzz");
+      q.memset(fuzz.ptr, 0, fuzz.len * sizeof(Fr));
+      generate_fuzz(q, fuzz.ptr, fuzz.len / 2);
+      q.wait();
+    }
+    // Run each kernel once now, so that their JIT compilation (~30 s the first time on a
+    // machine; the driver caches it) happens here, in the preload, not in the first proof.
+    Timer t("compile kernels");
+    (void)msm<Fp>(q, scratch, srs.a.ptr, fuzz.ptr, 1);
+    (void)msm<Fp2>(q, scratch, srs.b_g2.ptr, fuzz.ptr, 1);
+    fill_zero(q, abc.ptr, 3 * srs.domain_size);
+    witness_into_poly(q, abc.ptr, coeffs.coeffs.ptr, coeffs.indices.ptr, 2, fuzz.ptr);
+    ntt.to_coset(q, abc.ptr);
     q.wait();
   }
 
