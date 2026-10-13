@@ -569,17 +569,7 @@ fn build_intel_kernels() {
     let cxx_root = env::var("DEP_RISC0_SYS_CXX_ROOT").unwrap();
     let out_dir = env::var("OUT_DIR").map(PathBuf::from).unwrap();
 
-    // Find icpx compiler
-    let icpx = env::var("RISC0_ICPX")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let oneapi = PathBuf::from("/opt/intel/oneapi/compiler/latest/bin/icpx");
-            if oneapi.exists() {
-                oneapi
-            } else {
-                PathBuf::from("icpx")
-            }
-        });
+    let icpx = risc0_build_kernel::find_icpx();
 
     // Cache directory anchored on the <profile> dir under target/, regardless
     // of profile name (so custom profiles still cache). OUT_DIR layout is
@@ -596,7 +586,7 @@ fn build_intel_kernels() {
         .unwrap_or_else(|| out_dir.join("intel_recursion_cache"));
     std::fs::create_dir_all(&cache_dir).unwrap();
 
-    let so_path = cache_dir.join("librisc0_recursion_intel.so");
+    let so_path = risc0_build_kernel::intel_library_path(&cache_dir, "risc0_recursion_intel");
 
     // Compute SHA-256 over the recursion eval_check inputs. Stamp invalidates
     // when any of poly_fp.cpp, eval_check.cpp, build.rs, or the icpx version
@@ -618,11 +608,9 @@ fn build_intel_kernels() {
         // no -cl-opt-disable). Compile time grows to ~30-50 min but the
         // GPU kernel may run 2-5× faster, saving 1-4% Succinct E2E.
         let recursion_optimize = std::env::var_os("RISC0_RECURSION_OPTIMIZE").is_some();
+        // Collects the arguments for intel_build_library (not run itself).
         let mut cmd = Command::new(&icpx);
-        cmd.arg("-shared")
-            .arg("-fPIC")
-            .arg("-fsycl")
-            .arg("-std=c++17");
+        cmd.arg("-fsycl").arg("-std=c++17");
         if recursion_optimize {
             cmd.arg("-O2")
                 .arg("-Xs")
@@ -685,7 +673,7 @@ fn build_intel_kernels() {
             let split_script = PathBuf::from("kernels/intel/split_poly_fp.py");
             let split_n =
                 std::env::var("RISC0_RECURSION_SPLIT_N").unwrap_or_else(|_| "10".to_string());
-            let status = Command::new("python3")
+            let status = risc0_build_kernel::python_command()
                 .arg(&split_script)
                 .arg("kernels/cxx/poly_fp.cpp")
                 .arg(&split_dir)
@@ -754,7 +742,7 @@ fn build_intel_kernels() {
                     vec![lazy_path.clone(), amalg_path.clone(), PathBuf::from("400")],
                 ),
             ] {
-                let status = Command::new("python3")
+                let status = risc0_build_kernel::python_command()
                     .arg(script)
                     .args(&args)
                     .status()
@@ -763,13 +751,16 @@ fn build_intel_kernels() {
             }
         }
 
-        cmd.arg(&amalg_path)
-            .arg("-o")
-            .arg(&so_path)
-            .arg("-fsycl-targets=intel_gpu_bmg_g31"); // AOT for BMG
+        cmd.arg("-fsycl-targets=intel_gpu_bmg_g31"); // AOT for BMG
 
-        eprintln!("  Running: {:?}", cmd);
-        let output = cmd.output().expect("Failed to run icpx");
+        let args: Vec<std::ffi::OsString> = cmd.get_args().map(|a| a.to_owned()).collect();
+        let output = risc0_build_kernel::intel_build_library(
+            &icpx,
+            &args,
+            std::slice::from_ref(&amalg_path),
+            &cache_dir,
+            "risc0_recursion_intel",
+        );
         if !output.status.success() {
             stamp::write(&stamp_path, &recursion_hash, &icpx_version, "failed");
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -784,9 +775,8 @@ fn build_intel_kernels() {
     build_intel_accum(&icpx, &icpx_version, &cxx_root, &cache_dir, &out_dir);
 
     // Link
-    println!("cargo:rustc-link-search=native={}", cache_dir.display());
-    println!("cargo:rustc-link-lib=dylib=risc0_recursion_intel");
-    println!("cargo:rustc-link-lib=dylib=risc0_recursion_intel_accum");
+    risc0_build_kernel::intel_link_library(&cache_dir, "risc0_recursion_intel");
+    risc0_build_kernel::intel_link_library(&cache_dir, "risc0_recursion_intel_accum");
 
     // RPATH for runtime
     let intel_lib = PathBuf::from("/opt/intel/oneapi/compiler/latest/lib");
@@ -810,7 +800,7 @@ fn build_intel_accum(
     cache_dir: &Path,
     out_dir: &Path,
 ) {
-    let so_path = cache_dir.join("librisc0_recursion_intel_accum.so");
+    let so_path = risc0_build_kernel::intel_library_path(cache_dir, "risc0_recursion_intel_accum");
     let stamp_path = cache_dir.join("intel_accum.stamp");
     let mut pairs: Vec<(PathBuf, PathBuf)> = [
         "kernels/intel/accum.cpp",
@@ -839,7 +829,8 @@ fn build_intel_accum(
         "kernels/cxx/step_compute_accum.cpp",
         "kernels/cxx/step_verify_accum.cpp",
     ] {
-        let src = std::fs::read_to_string(f).unwrap();
+        // CRLF in a Windows checkout: match the includes on LF.
+        let src = std::fs::read_to_string(f).unwrap().replace("\r\n", "\n");
         for inc in ["#include \"extern.h\"\n", "#include \"ffi.h\"\n"] {
             assert!(src.contains(inc), "{f}: expected {inc:?}");
         }
@@ -851,10 +842,9 @@ fn build_intel_accum(
     }
     let amalg_path = out_dir.join("intel_recursion_accum_amalg.cpp");
     std::fs::write(&amalg_path, wrapper.replace(marker, &steps)).unwrap();
+    // Collects the arguments for intel_build_library (not run itself).
     let mut cmd = Command::new(icpx);
-    cmd.arg("-shared")
-        .arg("-fPIC")
-        .arg("-fsycl")
+    cmd.arg("-fsycl")
         .arg("-std=c++17")
         .arg("-O2")
         .arg("-Wno-unused-parameter")
@@ -863,12 +853,15 @@ fn build_intel_accum(
         .arg("-Wno-sign-compare")
         .arg(format!("-I{cxx_root}"))
         .arg("-Ikernels/cxx")
-        .arg(&amalg_path)
-        .arg("-o")
-        .arg(&so_path)
         .arg("-fsycl-targets=intel_gpu_bmg_g31");
-    eprintln!("  Running: {:?}", cmd);
-    let output = cmd.output().expect("Failed to run icpx");
+    let args: Vec<std::ffi::OsString> = cmd.get_args().map(|a| a.to_owned()).collect();
+    let output = risc0_build_kernel::intel_build_library(
+        icpx,
+        &args,
+        &[amalg_path],
+        cache_dir,
+        "risc0_recursion_intel_accum",
+    );
     if !output.status.success() {
         stamp::write(&stamp_path, &hash, icpx_version, "failed");
         panic!(
