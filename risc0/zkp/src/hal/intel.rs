@@ -1847,4 +1847,44 @@ mod tests {
             );
         }
     }
+
+    // Out-of-place interpolate + zk_shift at every lg the prover can use,
+    // including the copy-fallback sizes, compared to the CPU HAL; the source
+    // must be left unchanged. (The fallback once used a device-to-device
+    // q.memcpy that was not reliably ordered before the NTT kernels.)
+    #[test]
+    #[ignore = "large"]
+    fn interpolate_zk_shift_from_matches_cpu() {
+        use crate::{
+            core::hash::poseidon2::Poseidon2HashSuite,
+            field::{baby_bear::BabyBearElem as Elem, Elem as _},
+            hal::{cpu::CpuHal, Buffer as _, Hal as _},
+        };
+        let gpu = IntelHalPoseidon2::new();
+        let cpu = CpuHal::new(Poseidon2HashSuite::new_suite());
+        let mut rng = rand::rng();
+        let mut cases: Vec<(usize, usize)> = (14..=23usize)
+            .map(|lg| (lg, if lg >= 22 { 3 } else { 5 }))
+            .collect();
+        cases.extend([(18, 103), (19, 103), (21, 33)]);
+        let mut bad_total = 0;
+        for (lg, count) in cases {
+            let n = count << lg;
+            let input: Vec<Elem> = (0..n).map(|_| Elem::random(&mut rng)).collect();
+            let gs = gpu.copy_from_elem("src", &input);
+            let cs = cpu.copy_from_elem("src", &input);
+            let gd = gpu.alloc_elem_init("dst", n, Elem::new(7));
+            let cd = cpu.alloc_elem("dst", n);
+            gpu.batch_interpolate_ntt_zk_shift_from(&gd, &gs, count);
+            cpu.batch_interpolate_ntt_zk_shift_from(&cd, &cs, count);
+            let (gv, cv, sv) = (gd.to_vec(), cd.to_vec(), gs.to_vec());
+            let bad = (0..n).filter(|&i| gv[i] != cv[i]).count();
+            let src_bad = (0..n).filter(|&i| sv[i] != input[i]).count();
+            if bad + src_bad > 0 {
+                eprintln!("lg={lg} count={count}: {bad}/{n} differ, src modified {src_bad}");
+            }
+            bad_total += bad + src_bad;
+        }
+        assert_eq!(bad_total, 0);
+    }
 }
