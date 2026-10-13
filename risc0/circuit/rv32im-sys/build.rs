@@ -1131,7 +1131,9 @@ fn try_recover_witgen_so(out_dir: &Path, dest_so: &Path) {
         }
     };
     let variant = intel_variant_tag();
-    let so_name = "librisc0_rv32im_intel_witgen.so";
+    let so_name_path =
+        risc0_build_kernel::intel_library_path(Path::new(""), "risc0_rv32im_intel_witgen");
+    let so_name = so_name_path.to_str().unwrap();
     // Same-variant only. We DO include both same-profile and release
     // candidates — a debug build's recovery can pull from release
     // (icpx flags are profile-invariant for the same variant), but we
@@ -1248,17 +1250,7 @@ fn build_intel_kernels() {
         println!("cargo:rerun-if-changed={cxx_root}/{header}");
     }
 
-    // Find icpx compiler
-    let icpx = env::var("RISC0_ICPX")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let oneapi = PathBuf::from("/opt/intel/oneapi/compiler/latest/bin/icpx");
-            if oneapi.exists() {
-                oneapi
-            } else {
-                PathBuf::from("icpx")
-            }
-        });
+    let icpx = risc0_build_kernel::find_icpx();
 
     // Cache directory for the expensive eval_check compilation. Anchor on the
     // <profile> directory under target/ regardless of profile name so custom
@@ -1302,7 +1294,7 @@ fn build_intel_kernels() {
     let multipass_hash = compute_multipass_hash(&cxx_root, &icpx_version);
     let witgen_hash = compute_witgen_hash(&cxx_root, &icpx_version);
 
-    let so_path = cache_dir.join("librisc0_rv32im_intel.so");
+    let so_path = risc0_build_kernel::intel_library_path(&cache_dir, "risc0_rv32im_intel");
 
     // Check if we can skip rebuild: artifact present, stamp parses, hash
     // matches the recomputed-from-source hash, status was "ok" last build.
@@ -1324,7 +1316,7 @@ fn build_intel_kernels() {
             let dst = out_dir.join("poly_fp_tree_reduced");
             std::fs::create_dir_all(&dst).unwrap();
             let script = std::path::PathBuf::from("kernels/intel/tree_reduce_fma.py");
-            let status = std::process::Command::new("python3")
+            let status = risc0_build_kernel::python_command()
                 .arg(&script)
                 .arg(&current_src_dir)
                 .arg(&dst)
@@ -1367,7 +1359,7 @@ fn build_intel_kernels() {
                 std::env::var("RISC0_POLY_FP_CSE_TOP").unwrap_or_else(|_| "16".to_string());
             let cse_min =
                 std::env::var("RISC0_POLY_FP_CSE_MIN_SHARE").unwrap_or_else(|_| "10".to_string());
-            let mut script_cmd = std::process::Command::new("python3");
+            let mut script_cmd = risc0_build_kernel::python_command();
             script_cmd
                 .arg(&script)
                 .arg(&current_src_dir)
@@ -1391,10 +1383,9 @@ fn build_intel_kernels() {
         }
         let poly_fp_dir = current_src_dir;
 
+        // Collects the arguments for intel_build_library (not run itself).
         let mut cmd = Command::new(&icpx);
-        cmd.arg("-shared")
-            .arg("-fPIC")
-            .arg("-fsycl")
+        cmd.arg("-fsycl")
             .arg("-std=c++17")
             .arg("-Os") // -Os + noinline + 256 GRF: best eval_check perf (18MB vs 30MB -O1, 2x fewer icache misses)
             // Tell ocloc to skip expensive optimization passes via -cl-opt-disable.
@@ -1472,7 +1463,7 @@ fn build_intel_kernels() {
         let compile_src = if eval_fast {
             let fast_path = out_dir.join("intel_eval_check_amalg_fast.cpp");
             let work_dir = out_dir.join("evalfast_work");
-            let status = Command::new("python3")
+            let status = risc0_build_kernel::python_command()
                 .arg("kernels/intel/evalfast/pipeline.py")
                 .arg(&amalg_path)
                 .arg(&fast_path)
@@ -1498,18 +1489,21 @@ fn build_intel_kernels() {
             amalg_path.clone()
         };
 
-        cmd.arg(&compile_src)
-            .arg("-o")
-            .arg(&so_path)
-            .arg("-fsycl-targets=intel_gpu_bmg_g31") // AOT with noinline sub-functions
+        cmd.arg("-fsycl-targets=intel_gpu_bmg_g31") // AOT with noinline sub-functions
             // Force 256 GRF mode: doubles register file from 8KB to 16KB per thread,
             // dramatically reducing the 42KB spill overhead. Trades occupancy (8→4 threads/EU)
             // for fewer spills — net win since kernel is spill-bound, not compute-bound.
             .arg("-Xs")
             .arg(format!("-options \"{xs_options}\""));
 
-        eprintln!("  Running: {:?}", cmd);
-        let output = cmd.output().expect("Failed to run icpx");
+        let args: Vec<std::ffi::OsString> = cmd.get_args().map(|a| a.to_owned()).collect();
+        let output = risc0_build_kernel::intel_build_library(
+            &icpx,
+            &args,
+            &[compile_src],
+            &cache_dir,
+            "risc0_rv32im_intel",
+        );
         // IGC/ocloc report warnings on stdout, the compiler driver on stderr.
         let log = format!(
             "{}{}",
@@ -1536,8 +1530,7 @@ fn build_intel_kernels() {
     }
 
     // Link eval_check
-    println!("cargo:rustc-link-search=native={}", cache_dir.display());
-    println!("cargo:rustc-link-lib=dylib=risc0_rv32im_intel");
+    risc0_build_kernel::intel_link_library(&cache_dir, "risc0_rv32im_intel");
 
     // mono_path is the monolithic amalgamation without kernel wrapper (for multipass gen)
     let mono_path = out_dir.join("intel_eval_check_mono.cpp");
@@ -1546,8 +1539,8 @@ fn build_intel_kernels() {
     // Build 2-way multi-pass eval_check (two separate .so files)
     // Each .so has ~27K lines (half monolithic) → ~9MB GPU binary, fits in L2.
     // ========================================================================
-    let pass1_so = cache_dir.join("librisc0_rv32im_intel_pass1.so");
-    let pass2_so = cache_dir.join("librisc0_rv32im_intel_pass2.so");
+    let pass1_so = risc0_build_kernel::intel_library_path(&cache_dir, "risc0_rv32im_intel_pass1");
+    let pass2_so = risc0_build_kernel::intel_library_path(&cache_dir, "risc0_rv32im_intel_pass2");
     let multipass_stamp = cache_dir.join("intel_multipass.stamp");
     // Multipass cache is hit only when both pass-side .so files exist and the
     // stamp hash matches mono+gen_multipass.py inputs. Either .so missing or
@@ -1562,7 +1555,7 @@ fn build_intel_kernels() {
             let pass1_amalg = out_dir.join("intel_eval_check_pass1.cpp");
             let pass2_amalg = out_dir.join("intel_eval_check_pass2.cpp");
 
-            let mp_output = Command::new("python3")
+            let mp_output = risc0_build_kernel::python_command()
                 .arg(&multipass_script)
                 .arg(&mono_path)
                 .arg(&pass1_amalg)
@@ -1576,27 +1569,31 @@ fn build_intel_kernels() {
 
                 // Compile pass1
                 eprintln!("  Compiling pass1...");
-                let p1_output = Command::new(&icpx)
-                    .arg("-shared")
-                    .arg("-fPIC")
-                    .arg("-fsycl")
-                    .arg("-std=c++17")
-                    .arg("-Os")
-                    .arg("-Wno-unused-parameter")
-                    .arg("-Wno-unused-function")
-                    .arg("-Wno-unused-variable")
-                    .arg("-Wno-sign-compare")
-                    .arg(format!("-I{cxx_root}"))
-                    .arg("-Ikernels/cxx")
-                    .arg("-Ikernels/intel")
-                    .arg(&pass1_amalg)
-                    .arg("-o")
-                    .arg(&pass1_so)
-                    .arg("-fsycl-targets=intel_gpu_bmg_g31")
-                    .arg("-Xs")
-                    .arg(format!("-options \"{}\"", intel_xs_options()))
-                    .output()
-                    .expect("Failed to run icpx for pass1");
+                let p1_args: Vec<std::ffi::OsString> = [
+                    "-fsycl".to_string(),
+                    "-std=c++17".into(),
+                    "-Os".into(),
+                    "-Wno-unused-parameter".into(),
+                    "-Wno-unused-function".into(),
+                    "-Wno-unused-variable".into(),
+                    "-Wno-sign-compare".into(),
+                    format!("-I{cxx_root}"),
+                    "-Ikernels/cxx".into(),
+                    "-Ikernels/intel".into(),
+                    "-fsycl-targets=intel_gpu_bmg_g31".into(),
+                    "-Xs".into(),
+                    format!("-options \"{}\"", intel_xs_options()),
+                ]
+                .into_iter()
+                .map(Into::into)
+                .collect();
+                let p1_output = risc0_build_kernel::intel_build_library(
+                    &icpx,
+                    &p1_args,
+                    &[pass1_amalg.clone()],
+                    &cache_dir,
+                    "risc0_rv32im_intel_pass1",
+                );
 
                 if !p1_output.status.success() {
                     let stderr = String::from_utf8_lossy(&p1_output.stderr);
@@ -1607,27 +1604,31 @@ fn build_intel_kernels() {
 
                 // Compile pass2
                 eprintln!("  Compiling pass2...");
-                let p2_output = Command::new(&icpx)
-                    .arg("-shared")
-                    .arg("-fPIC")
-                    .arg("-fsycl")
-                    .arg("-std=c++17")
-                    .arg("-Os")
-                    .arg("-Wno-unused-parameter")
-                    .arg("-Wno-unused-function")
-                    .arg("-Wno-unused-variable")
-                    .arg("-Wno-sign-compare")
-                    .arg(format!("-I{cxx_root}"))
-                    .arg("-Ikernels/cxx")
-                    .arg("-Ikernels/intel")
-                    .arg(&pass2_amalg)
-                    .arg("-o")
-                    .arg(&pass2_so)
-                    .arg("-fsycl-targets=intel_gpu_bmg_g31")
-                    .arg("-Xs")
-                    .arg(format!("-options \"{}\"", intel_xs_options()))
-                    .output()
-                    .expect("Failed to run icpx for pass2");
+                let p2_args: Vec<std::ffi::OsString> = [
+                    "-fsycl".to_string(),
+                    "-std=c++17".into(),
+                    "-Os".into(),
+                    "-Wno-unused-parameter".into(),
+                    "-Wno-unused-function".into(),
+                    "-Wno-unused-variable".into(),
+                    "-Wno-sign-compare".into(),
+                    format!("-I{cxx_root}"),
+                    "-Ikernels/cxx".into(),
+                    "-Ikernels/intel".into(),
+                    "-fsycl-targets=intel_gpu_bmg_g31".into(),
+                    "-Xs".into(),
+                    format!("-options \"{}\"", intel_xs_options()),
+                ]
+                .into_iter()
+                .map(Into::into)
+                .collect();
+                let p2_output = risc0_build_kernel::intel_build_library(
+                    &icpx,
+                    &p2_args,
+                    &[pass2_amalg.clone()],
+                    &cache_dir,
+                    "risc0_rv32im_intel_pass2",
+                );
 
                 if !p2_output.status.success() {
                     let stderr = String::from_utf8_lossy(&p2_output.stderr);
@@ -1653,16 +1654,16 @@ fn build_intel_kernels() {
 
     // Link multi-pass .so files if they exist
     if pass1_so.exists() {
-        println!("cargo:rustc-link-lib=dylib=risc0_rv32im_intel_pass1");
+        risc0_build_kernel::intel_link_library(&cache_dir, "risc0_rv32im_intel_pass1");
     }
     if pass2_so.exists() {
-        println!("cargo:rustc-link-lib=dylib=risc0_rv32im_intel_pass2");
+        risc0_build_kernel::intel_link_library(&cache_dir, "risc0_rv32im_intel_pass2");
     }
 
     // ========================================================================
     // Build Intel SYCL witgen kernel (separate .so, ~34s compile)
     // ========================================================================
-    let witgen_so = cache_dir.join("librisc0_rv32im_intel_witgen.so");
+    let witgen_so = risc0_build_kernel::intel_library_path(&cache_dir, "risc0_rv32im_intel_witgen");
     let witgen_stamp = cache_dir.join("intel_witgen.stamp");
     let witgen_rebuild = stamp::need_rebuild(&witgen_so, &witgen_stamp, &witgen_hash);
 
@@ -1729,7 +1730,7 @@ fn build_intel_kernels() {
         // Montgomery batch inversion of the FpExt inv_0 calls in each
         // exec_TopAccum mux arm (chunks of 8; 64 miscompiled under IGC spill
         // pressure, 8/16 verified bit-exact). Expect all but 4 of 411 batched.
-        let st = Command::new("python3")
+        let st = risc0_build_kernel::python_command()
             .arg("kernels/intel/accum_batchinv.py")
             .arg(&witgen_amalg_path)
             .arg(&witgen_amalg_path)
@@ -1743,10 +1744,9 @@ fn build_intel_kernels() {
             String::from_utf8_lossy(&st.stderr)
         );
 
+        // Collects the arguments for intel_build_library (not run itself).
         let mut cmd = Command::new(&icpx);
-        cmd.arg("-shared")
-            .arg("-fPIC")
-            .arg("-fsycl")
+        cmd.arg("-fsycl")
             .arg("-std=c++17")
             .arg("-Os") // -Os: different opt passes to avoid icpx -O1 accum miscompilation
             // 32-bit Montgomery + inlined lazy FpExt mul (fp.h/fpext.h): accum 2x.
@@ -1764,13 +1764,16 @@ fn build_intel_kernels() {
             .arg(format!("-Ikernels/intel"))
             .arg(format!("-I{cxx_root}"))
             .arg("-Ikernels/cxx")
-            .arg(&witgen_amalg_path)
-            .arg("-o")
-            .arg(&witgen_so)
             .arg("-fsycl-targets=intel_gpu_bmg_g31");
 
-        eprintln!("  Running: {:?}", cmd);
-        let output = cmd.output().expect("Failed to run icpx for witgen");
+        let args: Vec<std::ffi::OsString> = cmd.get_args().map(|a| a.to_owned()).collect();
+        let output = risc0_build_kernel::intel_build_library(
+            &icpx,
+            &args,
+            &[witgen_amalg_path.clone()],
+            &cache_dir,
+            "risc0_rv32im_intel_witgen",
+        );
         if !output.status.success() {
             stamp::write(&witgen_stamp, &witgen_hash, &icpx_version, "failed");
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1804,7 +1807,7 @@ fn build_intel_kernels() {
 
     // Link witgen .so (if it exists)
     if witgen_so.exists() {
-        println!("cargo:rustc-link-lib=dylib=risc0_rv32im_intel_witgen");
+        risc0_build_kernel::intel_link_library(&cache_dir, "risc0_rv32im_intel_witgen");
     }
 
     // RPATH for runtime
