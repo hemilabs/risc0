@@ -845,6 +845,14 @@ impl ProverImpl {
         let keccak_ctx = VerifierContext::default()
             .with_succinct_verifier_parameters(SuccinctReceiptVerifierParameters::for_keccak());
 
+        // The keccak prover's witness generation and sppark's NTTs allocate outside the STARK HAL,
+        // so they cannot reclaim what the segments left in its buffer pool: release it first, as
+        // for the Groth16 wrap. Without this, the first keccak proof after the segments ran out of
+        // memory on an RTX 5080 (16 GB) and on an RTX 4090 limited to 12 GB.
+        if !session.pending_keccaks.is_empty() {
+            super::release_hal_buffers();
+        }
+
         for proof_request in session.pending_keccaks.iter() {
             let receipt = prove_keccak(proof_request).context("prove keccak")?;
             receipt.verify_integrity_with_context(&keccak_ctx)?;
