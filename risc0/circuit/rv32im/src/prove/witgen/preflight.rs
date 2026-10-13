@@ -84,6 +84,8 @@ pub(crate) struct Preflight<'a> {
     orig_words: PagedMap,
     prev_cycle: PagedMap,
     page_memory: PagedMap,
+    /// First guest sys_poseidon2 ecall this segment cannot prove (pc, a0, a1, a2).
+    unprovable_poseidon2: Option<(u32, u32, u32, u32)>,
 }
 
 impl Segment {
@@ -95,6 +97,15 @@ impl Segment {
         preflight.read_povw_nonce()?;
         preflight.read_pages()?;
         preflight.body()?;
+        if let Some((pc, a0, a1, a2)) = preflight.unprovable_poseidon2 {
+            bail!(
+                "sys_poseidon2 with non-null pointers cannot be proven by the RISC Zero 3.0 \
+                 rv32im circuit (pc={pc:#010x}, a0={a0:#010x}, a1={a1:#010x}, a2={a2:#010x}): \
+                 the circuit reads the pointers as byte addresses, while the 3.0 guest ABI \
+                 passes word addresses. Fixed upstream only in v5 (risc0#3431); this tree keeps \
+                 the 3.0 ABI for compatibility. Execution is unaffected."
+            );
+        }
         preflight.write_pages()?;
         preflight.generate_tables()?;
         preflight.wrap_memory_txns()?;
@@ -145,6 +156,7 @@ impl<'a> Preflight<'a> {
             orig_words: Default::default(),
             prev_cycle: Default::default(),
             page_memory,
+            unprovable_poseidon2: None,
         }
     }
 
@@ -675,6 +687,18 @@ impl Risc0Context for Preflight<'_> {
     }
 
     fn on_poseidon2_cycle(&mut self, cur_state: CycleState, p2: &Poseidon2State) {
+        // First cycle of a guest ecall (mode 1), before any load: the state
+        // still holds the raw register values. Only null pointers are read the
+        // same way by the executor (word addresses) and the circuit (byte
+        // addresses); see the error in `preflight`.
+        if p2.mode == 1
+            && cur_state == CycleState::PoseidonEntry
+            && self.unprovable_poseidon2.is_none()
+            && (p2.state_addr != 0 || p2.buf_out_addr != 0 || (p2.buf_in_addr != 0 && p2.count > 0))
+        {
+            self.unprovable_poseidon2 =
+                Some((self.pc.0, p2.state_addr, p2.buf_in_addr, p2.buf_out_addr));
+        }
         self.add_cycle_special(
             cur_state,
             p2.next_state,

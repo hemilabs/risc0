@@ -346,6 +346,7 @@ fn create_queue_once() -> *mut c_void {
 
 static BG_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static BG_INIT: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> = std::sync::Mutex::new(None);
+static BG_JOIN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static WARMUP: Once = Once::new();
 
 /// Get the singleton SYCL queue, creating it on first call.
@@ -353,13 +354,21 @@ static WARMUP: Once = Once::new();
 /// waits for it first, so no other GPU work overlaps the warmup.
 pub fn get_queue() -> *mut c_void {
     if BG_PENDING.load(std::sync::atomic::Ordering::Acquire) {
-        let handle = BG_INIT.lock().unwrap().take();
-        if let Some(h) = handle {
-            if h.thread().id() == std::thread::current().id() {
-                *BG_INIT.lock().unwrap() = Some(h);
-            } else {
-                let _ = h.join();
-                BG_PENDING.store(false, std::sync::atomic::Ordering::Release);
+        // Every caller other than the background thread waits here until the
+        // init has been joined. Without this lock, a second thread arriving
+        // while the first was inside join() found no handle and went ahead,
+        // overlapping the warmup. (The background thread itself never calls
+        // get_queue; the thread-id check below guards against a deadlock.)
+        let _join = BG_JOIN.lock().unwrap();
+        if BG_PENDING.load(std::sync::atomic::Ordering::Acquire) {
+            let handle = BG_INIT.lock().unwrap().take();
+            if let Some(h) = handle {
+                if h.thread().id() == std::thread::current().id() {
+                    *BG_INIT.lock().unwrap() = Some(h);
+                } else {
+                    let _ = h.join();
+                    BG_PENDING.store(false, std::sync::atomic::Ordering::Release);
+                }
             }
         }
     }
