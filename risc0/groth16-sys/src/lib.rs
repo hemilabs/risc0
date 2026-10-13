@@ -99,6 +99,43 @@ pub fn prove(prover_params: &ProverParams, setup_params: &SetupParams) -> anyhow
     ffi_wrap(|| unsafe { risc0_groth16_cuda_prove(&setup_params, &prover_params) })
 }
 
+/// Load the proving key and coefficients onto the Intel GPU, where they stay cached until
+/// [intel_release]. [intel_prove] does this itself if needed.
+#[cfg(feature = "intel")]
+pub fn intel_preload(setup_params: &SetupParams) -> anyhow::Result<()> {
+    let setup_params = setup_params.raw();
+    ffi_wrap(|| unsafe { risc0_groth16_intel_preload(&setup_params) })
+}
+
+/// Prove with the Intel GPU prover; writes the proof to `prover_params.proof_path`.
+#[cfg(feature = "intel")]
+pub fn intel_prove(prover_params: &ProverParams, setup_params: &SetupParams) -> anyhow::Result<()> {
+    let setup_params = setup_params.raw();
+    let prover_params = RawProverParams {
+        public_path: prover_params.public_path.c_str.as_ptr(),
+        proof_path: prover_params.proof_path.c_str.as_ptr(),
+        witness: prover_params.witness,
+    };
+    ffi_wrap(|| unsafe { risc0_groth16_intel_prove(&setup_params, &prover_params) })
+}
+
+/// Free the Intel GPU prover's cached proving key, coefficients and scratch (several GB).
+#[cfg(feature = "intel")]
+pub fn intel_release() -> anyhow::Result<()> {
+    ffi_wrap(|| unsafe { risc0_groth16_intel_release() })
+}
+
+#[cfg(feature = "intel")]
+impl SetupParams {
+    fn raw(&self) -> RawSetupParams {
+        RawSetupParams {
+            pcoeffs_path: self.pcoeffs_path.c_str.as_ptr(),
+            fres_path: self.fres_path.c_str.as_ptr(),
+            srs_path: self.srs_path.c_str.as_ptr(),
+        }
+    }
+}
+
 #[cfg(all(any(feature = "cuda", feature = "rocm"), feature = "setup"))]
 pub fn setup(params: &SetupParams) -> anyhow::Result<()> {
     let raw_params = RawSetupParams {
@@ -109,7 +146,10 @@ pub fn setup(params: &SetupParams) -> anyhow::Result<()> {
     ffi_wrap(|| unsafe { risc0_groth16_cuda_setup(&raw_params) })
 }
 
-#[cfg_attr(not(any(feature = "cuda", feature = "rocm")), allow(dead_code))]
+#[cfg_attr(
+    not(any(feature = "cuda", feature = "rocm", feature = "intel")),
+    allow(dead_code)
+)]
 #[repr(C)]
 struct RawProverParams {
     pub public_path: *const c_char,
@@ -117,7 +157,10 @@ struct RawProverParams {
     pub witness: *const u8,
 }
 
-#[cfg_attr(not(any(feature = "cuda", feature = "rocm")), allow(dead_code))]
+#[cfg_attr(
+    not(any(feature = "cuda", feature = "rocm", feature = "intel")),
+    allow(dead_code)
+)]
 #[repr(C)]
 struct RawSetupParams {
     pub pcoeffs_path: *const c_char,
@@ -138,11 +181,26 @@ extern "C" {
     #[cfg(any(feature = "cuda", feature = "rocm"))]
     fn risc0_groth16_cuda_release() -> *const c_char;
 
+    #[cfg(feature = "intel")]
+    fn risc0_groth16_intel_preload(setup: *const RawSetupParams) -> *const c_char;
+
+    #[cfg(feature = "intel")]
+    fn risc0_groth16_intel_prove(
+        setup: *const RawSetupParams,
+        params: *const RawProverParams,
+    ) -> *const c_char;
+
+    #[cfg(feature = "intel")]
+    fn risc0_groth16_intel_release() -> *const c_char;
+
     #[cfg(all(any(feature = "cuda", feature = "rocm"), feature = "setup"))]
     fn risc0_groth16_cuda_setup(params: *const RawSetupParams) -> *const c_char;
 }
 
-#[cfg_attr(not(any(feature = "cuda", feature = "rocm")), allow(dead_code))]
+#[cfg_attr(
+    not(any(feature = "cuda", feature = "rocm", feature = "intel")),
+    allow(dead_code)
+)]
 fn ffi_wrap<F>(mut inner: F) -> Result<()>
 where
     F: FnMut() -> *const c_char,
@@ -167,7 +225,10 @@ where
     }
 }
 
-#[cfg_attr(not(any(feature = "cuda", feature = "rocm")), allow(dead_code))]
+#[cfg_attr(
+    not(any(feature = "cuda", feature = "rocm", feature = "intel")),
+    allow(dead_code)
+)]
 pub struct RawPath {
     path: PathBuf,
     c_str: CString,

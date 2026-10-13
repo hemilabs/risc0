@@ -53,7 +53,6 @@ use risc0_zkp::core::{
     digest::{Digest, DIGEST_WORDS},
     hash::poseidon_254::digest_to_fr_bytes,
 };
-use rzup::{Component, Rzup, Version};
 use tempfile::TempDir;
 
 use super::seal_format::{IopType, K_SEAL_ELEMS, K_SEAL_TYPES, K_SEAL_WORDS};
@@ -101,11 +100,7 @@ fn to_u(x: &Fr) -> U254 {
 static PROGRAM: OnceLock<std::result::Result<Program, String>> = OnceLock::new();
 
 pub(crate) fn graph_path() -> Result<PathBuf> {
-    let root = Rzup::new()
-        .context("failed to initialize rzup")?
-        .get_version_dir(&Component::Risc0Groth16, &Version::new(0, 1, 0))
-        .context("rzup component `risc0-groth16` 0.1.0 is not installed")?;
-    Ok(root.join("stark_verify_graph.bin"))
+    Ok(super::intel::component_dir()?.join("stark_verify_graph.bin"))
 }
 
 fn build_program() -> Result<Program> {
@@ -210,8 +205,25 @@ fn seal_inputs(seal_bytes: &[u8]) -> Result<Vec<U254>> {
     Ok(values)
 }
 
+/// The circuit's witness for an `identity_p254` seal, as canonical little-endian field
+/// elements (the GPU prover's input).
+pub(crate) fn witness(seal_bytes: &[u8]) -> Result<Vec<wtns_file::FieldElement<32>>> {
+    let prog = program()?;
+    witness_elements(prog, &seal_inputs(seal_bytes)?)
+}
+
 /// Evaluate the witness and write it in .wtns format to `out`.
 fn write_witness(prog: &Program, inputs: &[U254], out: impl Write) -> Result<()> {
+    let w = witness_elements(prog, inputs)?;
+    let prime = wtns_file::FieldElement::from(prog.prime.to_le_bytes::<32>());
+    wtns_file::WtnsFile::<32>::from_vec(w, prime)
+        .write(out)
+        .context("failed to write the witness")?;
+    Ok(())
+}
+
+/// Evaluate the witness graph: the signals' values, canonical little-endian.
+fn witness_elements(prog: &Program, inputs: &[U254]) -> Result<Vec<wtns_file::FieldElement<32>>> {
     let n = prog.nodes.len();
     let mut v: Vec<Fr> = vec![Fr::zero(); n];
     for i in 0..n {
@@ -248,16 +260,11 @@ fn write_witness(prog: &Program, inputs: &[U254], out: impl Write) -> Result<()>
             },
         };
     }
-    let w: Vec<wtns_file::FieldElement<32>> = prog
+    Ok(prog
         .signals
         .iter()
         .map(|&i| wtns_file::FieldElement::from(to_u(&v[i]).to_le_bytes::<32>()))
-        .collect();
-    let prime = wtns_file::FieldElement::from(prog.prime.to_le_bytes::<32>());
-    wtns_file::WtnsFile::<32>::from_vec(w, prime)
-        .write(out)
-        .context("failed to write the witness")?;
-    Ok(())
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
