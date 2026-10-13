@@ -3079,6 +3079,8 @@ void gpu_inverse_ntt_zk_shift_no_wait(sycl::queue& q, uint32_t* d_data,
     // No q.wait() — caller batches
 }
 
+extern "C" void esimd_eltwise_copy_fp(sycl::queue& q, uint32_t* out, const uint32_t* in, uint32_t count);
+
 // Out-of-place inverse NTT + zk_shift: dst = INTT_zk(src). For lg 20/22 the
 // single-kernel tail reads src directly (no copy); otherwise copy + in-place.
 void gpu_inverse_ntt_zk_shift_from_no_wait(sycl::queue& q, uint32_t* d_dst, const uint32_t* d_src,
@@ -3092,7 +3094,10 @@ void gpu_inverse_ntt_zk_shift_from_no_wait(sycl::queue& q, uint32_t* d_dst, cons
             return;
         }
     }
-    q.memcpy(d_dst, d_src, size_t(4) << lg_n);
+    // Copy with the ESIMD kernel, not q.memcpy: a device-to-device q.memcpy
+    // here was not reliably ordered against the NTT kernels that follow
+    // (succinct proofs failed under unitrace in 8/8 runs; 0/9 with a kernel copy).
+    esimd_eltwise_copy_fp(q, d_dst, d_src, 1u << lg_n);
     gpu_inverse_ntt_zk_shift_no_wait(q, d_dst, lg_n, d_zk_powers);
 }
 

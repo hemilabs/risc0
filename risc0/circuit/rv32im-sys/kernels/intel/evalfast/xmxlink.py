@@ -187,9 +187,13 @@ pre = r'''        // ---- xmxlink: full poly_mix table and the aligned-group DPA
         }
         const uint16_t* atab_g = g_atab;
 '''
-anchor = '#ifdef RK_NWORDS\n        std::lock_guard<std::mutex> slab_lock(g_slab_mutex);'
+# Insert right after the slab lock: the pre-kernels rewrite the shared
+# g_pmfull/g_atab tables that the main kernel reads, so the lock must cover
+# them and the tile loop together (two concurrent eval_check calls would
+# otherwise interleave their tables on the queue).
+anchor = '#ifdef RK_NWORDS\n        std::lock_guard<std::mutex> slab_lock(g_slab_mutex);\n'
 assert anchor in out, 'xmxlink: wrapper anchor (slab lock) missing'
-i = out.index(anchor); out = out[:i] + pre + out[i:]
+i = out.index(anchor) + len(anchor); out = out[:i] + '#endif\n' + pre + '#ifdef RK_NWORDS\n' + out[i:]
 old = 'sycl::local_accessor<FpExt, 1> slm(sycl::range<1>(POLY_MIX_COUNT + circuit::rv32im_v2::RK_QN + circuit::rv32im_v2::RK_HN), h);'
 assert old in out, 'xmxlink: SLM accessor anchor missing'
 out = out.replace(old, 'sycl::local_accessor<FpExt, 1> slm(sycl::range<1>(POLY_MIX_COUNT + circuit::rv32im_v2::RK_QN + circuit::rv32im_v2::RK_HN + circuit::rv32im_v2::RK_XG * 32), h);')

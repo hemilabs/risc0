@@ -340,7 +340,12 @@ impl RawBuffer {
         let buf = pooled.unwrap_or_else(|| {
             IntelDeviceBuffer::uninitialized(size).unwrap_or_else(|_| {
                 // Cached buffers of other sizes may be holding the VRAM.
+                // esimd_free_device does not wait for queued work that may
+                // still use them; drain the queue first.
                 let all = BUFFER_POOL.lock().take_all();
+                if !all.is_empty() {
+                    unsafe { intel::esimd_sync(get_queue()) };
+                }
                 drop(all);
                 IntelDeviceBuffer::uninitialized(size).unwrap_or_else(|e| {
                     panic!("Intel GPU allocation failed on {name}: {size} bytes: {e}")
@@ -361,6 +366,11 @@ impl Drop for RawBuffer {
         tracker().lock().unwrap().free(size);
         let buf = unsafe { ManuallyDrop::take(&mut self.buf) };
         let overflow = BUFFER_POOL.lock().push(size, buf);
+        if overflow.is_some() {
+            // Over the pool cap (reachable at po2=21): the buffer is freed, and
+            // esimd_free_device does not wait for queued kernels still using it.
+            unsafe { intel::esimd_sync(get_queue()) };
+        }
         drop(overflow);
     }
 }
@@ -1846,5 +1856,103 @@ mod tests {
                 "round {round}: {bad}/{N} uploaded elements read after host reuse"
             );
         }
+    }
+
+    // NEO captures only the FIRST pageable copy from a given host address; a
+    // second copy from the same address, enqueued before the host has seen the
+    // first one complete, reads the buffer when the GPU runs it. A single upload
+    // per buffer (as above) never hits that, so exercise repeated addresses: a
+    // Vec refilled in place, a stack value uploaded twice from one frame, and
+    // alloc_elem_init (set_32) twice at the same size. All behind queued work.
+    #[test]
+    fn upload_survives_same_address_reuse() {
+        use crate::{
+            field::{baby_bear::BabyBearElem as Elem, Elem as _},
+            hal::{Buffer as _, Hal as _},
+        };
+
+        fn upload_one(hal: &IntelHalSha256, x: Elem) -> super::BufferImpl<Elem> {
+            let v = [x];
+            hal.copy_from_elem("one", &v)
+        }
+
+        fn check(round: usize, name: &str, got: Vec<Elem>, want: impl Fn(usize) -> Elem) {
+            let wrong = got
+                .iter()
+                .enumerate()
+                .filter(|(i, v)| **v != want(*i))
+                .count();
+            assert_eq!(wrong, 0, "round {round}: {name}: {wrong} elements wrong");
+        }
+
+        let hal = IntelHalSha256::new();
+        const BUSY_PO2: usize = 22;
+        const BUSY_POLYS: usize = 16;
+        let busy = hal.alloc_elem_init("busy", BUSY_POLYS << BUSY_PO2, Elem::ONE);
+        const N: usize = 1 << 16;
+        for round in 0..3 {
+            for _ in 0..32 {
+                hal.batch_interpolate_ntt(&busy, BUSY_POLYS);
+            }
+            let a_vals: Vec<Elem> = (0..N as u32).map(Elem::new).collect();
+            let b_vals: Vec<Elem> = (0..N as u32).map(|i| Elem::new(i + 7)).collect();
+            let mut host = a_vals.clone();
+            let a = hal.copy_from_elem("a", &host);
+            host.copy_from_slice(&b_vals);
+            let b = hal.copy_from_elem("b", &host);
+            host.fill(Elem::new(0xdead));
+            let s1 = upload_one(&hal, Elem::new(11));
+            let s2 = upload_one(&hal, Elem::new(22));
+            let f1 = hal.alloc_elem_init("f1", N, Elem::new(3));
+            drop(f1);
+            let f2 = hal.alloc_elem_init("f2", N, Elem::new(5));
+            let f3 = hal.alloc_elem_init("f3", N, Elem::new(9));
+            check(round, "vec 1st", a.to_vec(), |i| a_vals[i]);
+            check(round, "vec 2nd", b.to_vec(), |i| b_vals[i]);
+            check(round, "stack 1st", s1.to_vec(), |_| Elem::new(11));
+            check(round, "stack 2nd", s2.to_vec(), |_| Elem::new(22));
+            check(round, "set_32 1st", f2.to_vec(), |_| Elem::new(5));
+            check(round, "set_32 2nd", f3.to_vec(), |_| Elem::new(9));
+        }
+    }
+
+    // Out-of-place interpolate + zk_shift at every lg the prover can use,
+    // including the copy-fallback sizes, compared to the CPU HAL; the source
+    // must be left unchanged. (The fallback once used a device-to-device
+    // q.memcpy that was not reliably ordered before the NTT kernels.)
+    #[test]
+    #[ignore = "large"]
+    fn interpolate_zk_shift_from_matches_cpu() {
+        use crate::{
+            core::hash::poseidon2::Poseidon2HashSuite,
+            field::{baby_bear::BabyBearElem as Elem, Elem as _},
+            hal::{cpu::CpuHal, Buffer as _, Hal as _},
+        };
+        let gpu = IntelHalPoseidon2::new();
+        let cpu = CpuHal::new(Poseidon2HashSuite::new_suite());
+        let mut rng = rand::rng();
+        let mut cases: Vec<(usize, usize)> = (14..=23usize)
+            .map(|lg| (lg, if lg >= 22 { 3 } else { 5 }))
+            .collect();
+        cases.extend([(18, 103), (19, 103), (21, 33)]);
+        let mut bad_total = 0;
+        for (lg, count) in cases {
+            let n = count << lg;
+            let input: Vec<Elem> = (0..n).map(|_| Elem::random(&mut rng)).collect();
+            let gs = gpu.copy_from_elem("src", &input);
+            let cs = cpu.copy_from_elem("src", &input);
+            let gd = gpu.alloc_elem_init("dst", n, Elem::new(7));
+            let cd = cpu.alloc_elem("dst", n);
+            gpu.batch_interpolate_ntt_zk_shift_from(&gd, &gs, count);
+            cpu.batch_interpolate_ntt_zk_shift_from(&cd, &cs, count);
+            let (gv, cv, sv) = (gd.to_vec(), cd.to_vec(), gs.to_vec());
+            let bad = (0..n).filter(|&i| gv[i] != cv[i]).count();
+            let src_bad = (0..n).filter(|&i| sv[i] != input[i]).count();
+            if bad + src_bad > 0 {
+                eprintln!("lg={lg} count={count}: {bad}/{n} differ, src modified {src_bad}");
+            }
+            bad_total += bad + src_bad;
+        }
+        assert_eq!(bad_total, 0);
     }
 }

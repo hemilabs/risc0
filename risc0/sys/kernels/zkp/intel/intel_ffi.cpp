@@ -9,6 +9,82 @@
 #include <stdexcept>
 #include <mutex>
 #include <cstdlib>
+#include <algorithm>
+#include <deque>
+
+// Host-to-device staging. A pageable q.memcpy is NOT reliably captured at
+// enqueue: NEO stages only the first copy from a given host address, and a
+// later copy from the same address that is enqueued before the host has seen
+// the earlier one complete reads the buffer when the GPU runs it. Callers
+// routinely free or reuse their buffer (or stack slot) right after
+// esimd_memcpy_htod returns, so every upload is copied into a pinned chunk
+// that is not reused until its copy's event has completed. Same CPU memcpy
+// the driver's staging already does; no measured cost.
+// RISC0_INTEL_HTOD_STAGING=0 restores the direct (unsafe) copy for A/B tests.
+namespace htod_staging {
+struct Chunk { char* p; size_t cap; };
+struct Inflight { Chunk c; sycl::event e; };
+static constexpr size_t SMALL = size_t(64) << 10, BIG = size_t(4) << 20, CAP = size_t(512) << 20;
+static std::mutex mu;
+static std::vector<Chunk> free_small, free_big;
+static std::deque<Inflight> inflight;
+static size_t pinned_total = 0;
+
+// Return completed chunks to the free lists; with block_one, wait for the oldest.
+static void reclaim(bool block_one) {
+    while (!inflight.empty()) {
+        auto& f = inflight.front();
+        if (f.e.get_info<sycl::info::event::command_execution_status>() !=
+            sycl::info::event_command_status::complete) {
+            if (!block_one) return;
+            f.e.wait();
+            block_one = false;
+        }
+        (f.c.cap == SMALL ? free_small : free_big).push_back(f.c);
+        inflight.pop_front();
+    }
+}
+
+static Chunk get(sycl::queue& q, size_t len) {
+    const bool small = len <= SMALL;
+    auto& fl = small ? free_small : free_big;
+    reclaim(false);
+    for (;;) {
+        if (!fl.empty()) { Chunk c = fl.back(); fl.pop_back(); return c; }
+        const size_t cap = small ? SMALL : BIG;
+        if (pinned_total + cap <= CAP || inflight.empty()) {
+            char* p = sycl::malloc_host<char>(cap, q);
+            if (!p) return Chunk{nullptr, 0};  // caller falls back to a blocking copy
+            pinned_total += cap;
+            return Chunk{p, cap};
+        }
+        reclaim(true);
+    }
+}
+
+static bool enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("RISC0_INTEL_HTOD_STAGING");
+        return !(e && std::strcmp(e, "0") == 0);
+    }();
+    return on;
+}
+
+static void copy(sycl::queue& q, char* dst, const char* src, size_t bytes) {
+    std::lock_guard<std::mutex> g(mu);
+    for (size_t off = 0; off < bytes;) {
+        const size_t len = std::min(bytes - off, BIG);
+        Chunk c = get(q, len);
+        if (!c.p) {
+            q.memcpy(dst + off, src + off, len).wait();  // no pinned memory: copy synchronously
+        } else {
+            std::memcpy(c.p, src + off, len);
+            inflight.push_back({c, q.memcpy(dst + off, c.p, len)});
+        }
+        off += len;
+    }
+}
+}  // namespace htod_staging
 
 // Forward declarations for ESIMD kernel functions (defined in other .cpp files)
 extern "C" {
@@ -141,9 +217,15 @@ void esimd_free_device(void* queue, void* ptr) {
 
 void esimd_memcpy_htod(void* queue, void* dst, const void* src, size_t bytes) {
     auto* q = static_cast<sycl::queue*>(queue);
+    if (htod_staging::enabled()) {
+        // The source is copied before this returns, so the caller may free
+        // or reuse it immediately. See htod_staging above.
+        htod_staging::copy(*q, static_cast<char*>(dst), static_cast<const char*>(src), bytes);
+        return;
+    }
     q->memcpy(dst, src, bytes);
     // No wait: in-order queue guarantees subsequent kernels see the data.
-    // Removing this lets CPU prepare next operations while GPU does the transfer.
+    // Unsafe if the caller reuses `src` before the copy runs (see htod_staging).
 }
 
 void esimd_memcpy_dtoh(void* queue, void* dst, const void* src, size_t bytes) {

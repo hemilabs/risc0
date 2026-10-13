@@ -993,12 +993,15 @@ impl ProverImpl {
                 "[succinct_to_groth16] identity_p254=pre-computed shrink_wrap={wrap_ms:.1}ms \
                  total={wrap_ms:.1}ms"
             );
-            Groth16Receipt {
+            let groth16_receipt = Groth16Receipt {
                 seal,
                 claim: succinct_receipt.claim.clone(),
                 verifier_parameters: Groth16ReceiptVerifierParameters::default().digest(),
-            }
+            };
+            super::check_groth16_receipt(&groth16_receipt)?;
+            groth16_receipt
         } else {
+            // succinct_to_groth16 verifies the receipt before returning it.
             self.succinct_to_groth16(&succinct_receipt)?
         };
 
