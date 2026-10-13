@@ -1411,9 +1411,13 @@ pub fn find_icpx() -> PathBuf {
         return PathBuf::from(icpx);
     }
     let exe = if cfg!(windows) { "icpx.exe" } else { "icpx" };
-    let mut roots: Vec<PathBuf> = env::var_os("ONEAPI_ROOT").map(PathBuf::from).into_iter().collect();
+    let mut roots: Vec<PathBuf> = env::var_os("ONEAPI_ROOT")
+        .map(PathBuf::from)
+        .into_iter()
+        .collect();
     if cfg!(windows) {
-        let pf86 = env::var("ProgramFiles(x86)").unwrap_or_else(|_| r"C:\Program Files (x86)".into());
+        let pf86 =
+            env::var("ProgramFiles(x86)").unwrap_or_else(|_| r"C:\Program Files (x86)".into());
         roots.push(PathBuf::from(pf86).join("Intel").join("oneAPI"));
     } else {
         roots.push(PathBuf::from("/opt/intel/oneapi"));
@@ -1507,7 +1511,8 @@ pub fn intel_build_library(
         );
         for line in String::from_utf8_lossy(&out.stdout).lines() {
             let mut fields = line.split_whitespace();
-            let (Some(_addr), Some(kind), Some(sym)) = (fields.next(), fields.next(), fields.next())
+            let (Some(_addr), Some(kind), Some(sym)) =
+                (fields.next(), fields.next(), fields.next())
             else {
                 continue;
             };
@@ -1516,7 +1521,10 @@ pub fn intel_build_library(
             }
         }
     }
-    assert!(!exports.is_empty(), "{name}: no C functions found to export");
+    assert!(
+        !exports.is_empty(),
+        "{name}: no C functions found to export"
+    );
     let def = obj_dir.join(format!("{name}.def"));
     let mut def_text = format!("LIBRARY {name}\nEXPORTS\n");
     for sym in &exports {
