@@ -359,6 +359,16 @@ public:
     try {
       event_t sync_event;
 
+      // The witness is uploaded on `gpu` (sppark's zero stream), but witness_into_poly for d_a
+      // runs on gpu[0], another non-blocking stream: make it wait for the upload. Without this
+      // it can read d_witness before the copy lands (a stale witness from the previous proof);
+      // from pageable memory cudaMemcpyAsync returns before its DMA completes.
+      {
+        event_t h2d_done;
+        h2d_done.record(gpu);
+        h2d_done.wait(gpu[0]);
+      }
+
       gpu[0].bzero(&d_a[0], domain_size);
       witness_into_poly<<<gpu.sm_count(), 512, 0, gpu[0]>>>(
           &d_a[0], coeffs.get_coeffs_a().data(), coeffs.get_indices_a(), &d_witness[0]);
