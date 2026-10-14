@@ -58,20 +58,7 @@ impl CircuitWitnessGenerator<CpuHal<CircuitField>> for CpuCircuitHal {
         data: &[u32],
     ) -> Result<()> {
         scope!("scatter");
-        let mut into_slice = into.buf.as_slice_mut();
-        for info in infos {
-            let inner_count = 32 / info.bits;
-            let mask: u32 = (1 << info.bits) - 1;
-            for i in 0..info.count as u32 {
-                let from_idx = info.offset + (i / inner_count);
-                let word = data[from_idx as usize];
-                let j = i % inner_count;
-                let val = (word >> (j * info.bits)) & mask;
-                let col = info.col as u32 + i;
-                let into_idx = col as usize * into.rows + info.row as usize;
-                into_slice[into_idx] = val.into();
-            }
-        }
+        scatter_preflight_host(&mut into.buf.as_slice_mut(), into.rows, infos, data);
         Ok(())
     }
 
@@ -83,49 +70,103 @@ impl CircuitWitnessGenerator<CpuHal<CircuitField>> for CpuCircuitHal {
         data: &MetaBuffer<CpuHal<CircuitField>>,
     ) -> Result<()> {
         scope!("witgen");
-
-        let cycles = preflight.cycle;
-        assert_eq!(cycles, data.rows);
-        tracing::debug!("witgen: {cycles}");
-
-        let global_buf = global.buf.as_slice();
-        let data_buf = data.buf.as_slice();
-        let buffers = RawExecBuffers {
-            global: RawBuffer {
-                buf: global_buf.as_ptr(),
-                rows: global.rows,
-                cols: global.cols,
-                checked_reads: global.checked_reads,
-            },
-            data: RawBuffer {
-                buf: data_buf.as_ptr(),
-                rows: data.rows,
-                cols: data.cols,
-                checked_reads: data.checked_reads,
-            },
-        };
-        let run_order: Vec<u32> = preflight
-            .cycles
-            .values()
-            .flatten()
-            .map(|c| c.cycle)
-            .collect();
-        let preimage_idx: Vec<u32> = preflight
-            .cycles
-            .values()
-            .flatten()
-            .map(|c| c.preimage_idx)
-            .collect();
-        let preflight = RawPreflightTrace {
-            preimages: preflight.preimages.as_ptr(),
-            preimages_count: preflight.preimages.len() as u32,
-            preimage_idxs: preimage_idx.as_ptr(),
-            run_order: run_order.as_ptr(),
-        };
-        ffi_wrap(|| unsafe {
-            risc0_circuit_keccak_cpu_witgen(mode as u32, &buffers, &preflight, cycles as u32)
-        })
+        generate_witness_host(
+            mode,
+            preflight,
+            HostMetaBuffer::of(global, &mut global.buf.as_slice_mut()),
+            HostMetaBuffer::of(data, &mut data.buf.as_slice_mut()),
+        )
     }
+}
+
+/// A host buffer of the witness, with its shape (see [MetaBuffer]).
+pub(crate) struct HostMetaBuffer<'a> {
+    pub buf: &'a mut [Val],
+    pub rows: usize,
+    pub cols: usize,
+    pub checked_reads: bool,
+}
+
+impl<'a> HostMetaBuffer<'a> {
+    pub fn of<H: risc0_zkp::hal::Hal>(meta: &MetaBuffer<H>, buf: &'a mut [Val]) -> Self {
+        assert_eq!(buf.len(), meta.rows * meta.cols);
+        Self {
+            buf,
+            rows: meta.rows,
+            cols: meta.cols,
+            checked_reads: meta.checked_reads,
+        }
+    }
+}
+
+/// Scatter the preflight's `data` into `into`, a witness buffer of `rows` rows, on the CPU.
+pub(crate) fn scatter_preflight_host(
+    into: &mut [Val],
+    rows: usize,
+    infos: &[ScatterInfo],
+    data: &[u32],
+) {
+    for info in infos {
+        let inner_count = 32 / info.bits;
+        let mask: u32 = (1 << info.bits) - 1;
+        for i in 0..info.count as u32 {
+            let from_idx = info.offset + (i / inner_count);
+            let word = data[from_idx as usize];
+            let j = i % inner_count;
+            let val = (word >> (j * info.bits)) & mask;
+            let col = info.col as u32 + i;
+            let into_idx = col as usize * rows + info.row as usize;
+            into[into_idx] = val.into();
+        }
+    }
+}
+
+/// Generate the witness into host buffers, on the CPU.
+pub(crate) fn generate_witness_host<O: PreflightCycleOrder>(
+    mode: StepMode,
+    preflight: &PreflightTrace<O>,
+    global: HostMetaBuffer,
+    data: HostMetaBuffer,
+) -> Result<()> {
+    let cycles = preflight.cycle;
+    assert_eq!(cycles, data.rows);
+    tracing::debug!("witgen: {cycles}");
+
+    let buffers = RawExecBuffers {
+        global: RawBuffer {
+            buf: global.buf.as_ptr(),
+            rows: global.rows,
+            cols: global.cols,
+            checked_reads: global.checked_reads,
+        },
+        data: RawBuffer {
+            buf: data.buf.as_ptr(),
+            rows: data.rows,
+            cols: data.cols,
+            checked_reads: data.checked_reads,
+        },
+    };
+    let run_order: Vec<u32> = preflight
+        .cycles
+        .values()
+        .flatten()
+        .map(|c| c.cycle)
+        .collect();
+    let preimage_idx: Vec<u32> = preflight
+        .cycles
+        .values()
+        .flatten()
+        .map(|c| c.preimage_idx)
+        .collect();
+    let preflight = RawPreflightTrace {
+        preimages: preflight.preimages.as_ptr(),
+        preimages_count: preflight.preimages.len() as u32,
+        preimage_idxs: preimage_idx.as_ptr(),
+        run_order: run_order.as_ptr(),
+    };
+    ffi_wrap(|| unsafe {
+        risc0_circuit_keccak_cpu_witgen(mode as u32, &buffers, &preflight, cycles as u32)
+    })
 }
 
 impl CircuitHal<CpuHal<CircuitField>> for CpuCircuitHal {
