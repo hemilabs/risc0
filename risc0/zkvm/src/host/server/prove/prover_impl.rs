@@ -31,6 +31,7 @@ thread_local! {
 }
 
 fn with_segment_prover<R>(f: impl FnOnce(&dyn SegmentProver) -> Result<R>) -> Result<R> {
+    let _gpu = super::exclusive_gpu();
     CACHED_SEGMENT_PROVER.with(|cell| {
         {
             let mut borrow = cell.borrow_mut();
@@ -441,6 +442,8 @@ impl ProverImpl {
     }
 
     fn prove_session_impl(&self, ctx: &VerifierContext, session: &Session) -> Result<ProveInfo> {
+        // The whole session, segments to Groth16: its calls nest on this thread.
+        let _gpu = super::exclusive_gpu();
         tracing::debug!(
             "prove_session: exit_code = {:?}, journal = {:?}, segments: {}",
             session.exit_code,

@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Used by the CPU and Intel paths; the CUDA/ROCm path below takes an Arc.
+#[cfg_attr(any(feature = "cuda", feature = "rocm"), allow(unused_imports))]
 use std::rc::Rc;
 
 use risc0_binfmt::{MemoryImage, Program};
@@ -75,7 +77,7 @@ fn fwd_rev_ab_test(program: Program) {
         if #[cfg(any(feature = "cuda", feature = "rocm"))] {
             use risc0_zkp::hal::cuda::CudaHalPoseidon2;
             use crate::prove::hal::cuda::CudaCircuitHalPoseidon2;
-            let hal = Rc::new(CudaHalPoseidon2::new());
+            let hal = std::sync::Arc::new(CudaHalPoseidon2::new());
             let circuit_hal = CudaCircuitHalPoseidon2::new(hal.clone());
         // } else if #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), target_os = "ios"))] {
         //     use risc0_zkp::hal::metal::MetalHalSha256;

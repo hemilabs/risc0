@@ -358,6 +358,8 @@ mod tests {
             params.po2,
             params.steps,
         );
+        // eval_check is asynchronous on pre-Blackwell GPUs: wait for it, as finalize does.
+        circuit_hal.eval_check_dep();
         let mut ret = vec![H::Elem::ZERO; check.size()];
         check.view(|view| {
             ret.clone_from_slice(view);

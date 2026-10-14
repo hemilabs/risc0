@@ -409,10 +409,13 @@ fn build_rocm_kernels() {
     // Device-link: with -fgpu-rdc, device code is compiled as bitcode in each .o file.
     // We must link all device code together into a single GPU code object so that
     // cross-TU device function calls resolve and __noinline__ functions stay separate.
+    // For the architectures the objects were compiled for (RISC0_HIP_ARCH, else `native`):
+    // `native` alone fails on a machine without an AMD GPU, such as a CI runner, and links for
+    // the wrong target on one whose GPU is not in RISC0_HIP_ARCH.
     let device_linked = out_dir.join("device_linked_rocm.o");
     {
         let mut cmd = Command::new(&hipcc);
-        cmd.arg("--offload-arch=native")
+        cmd.arg(format!("--offload-arch={arches}"))
             .arg("-fgpu-rdc")
             .arg("-fPIC")
             .arg("-r")

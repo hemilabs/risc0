@@ -476,6 +476,17 @@ pub fn get_prover_server(opts: &ProverOpts) -> Result<Rc<dyn ProverServer>> {
     Ok(Rc::new(ProverImpl::new(opts.clone())))
 }
 
+/// Exclusive use of the CUDA GPU against other threads, for one proving call: hold the result for
+/// the call. The provers cache their HALs per thread, so the HALs can't hold it (see
+/// `risc0_zkp::hal::cuda::singleton`); the calls that prove do. Reentrant on one thread.
+#[cfg(feature = "cuda")]
+pub(crate) fn exclusive_gpu() -> impl Sized {
+    risc0_zkp::hal::cuda::exclusive()
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn exclusive_gpu() -> impl Sized {}
+
 /// Return the STARK HAL's cached device memory to the driver, around the Groth16 wrap.
 ///
 /// The wrap allocates through sppark rather than through the HAL, so it cannot reclaim what the HAL
