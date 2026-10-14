@@ -17,6 +17,8 @@ pub(crate) mod cpu;
 pub(crate) mod cuda;
 #[cfg(feature = "rocm")]
 pub(crate) mod hip;
+#[cfg(feature = "intel")]
+pub(crate) mod intel;
 
 use anyhow::Result;
 use risc0_circuit_keccak_sys::ScatterInfo;
