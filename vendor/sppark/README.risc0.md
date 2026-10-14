@@ -20,8 +20,9 @@ and 8.9M in 2000 2^17 transforms; with the barriers, none. Under `compute-saniti
 crate makes risc0 proofs fail verification, and racecheck reports the races; with the barriers
 both are clean. `_CT_NTT` already ends its exchange loop with a barrier and needs none.
 
-Upstream 0.1.15 has the same code. Drop this directory and go back to the crates.io release once
-a release fixes them.
+The latest release, 0.1.15, has the same code. Upstream has since fixed both on its master branch
+(division in 9e5c795, the GS NTT in 6b931f3), each with its own placement of the barriers. Drop
+this directory and go back to crates.io once a release includes them.
 
 The workspace `Cargo.toml` points at it with `[patch.crates-io]`, which applies to this
 repository's own builds only. A crate that depends on this repository resolves sppark through its

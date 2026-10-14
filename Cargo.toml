@@ -80,7 +80,7 @@ opt-level = 3
 lto = true
 
 # sppark 0.1.14 with four missing __syncthreads() (shared-memory races in the GS NTT and in
-# polynomial division that corrupt proofs; still in upstream 0.1.15): see vendor/sppark/README.risc0.md.
+# polynomial division that corrupt proofs; still in the 0.1.15 release): see vendor/sppark/README.risc0.md.
 # Only CUDA/ROCm builds use sppark. A [patch] applies to this workspace's builds only: a crate
 # depending on this repository resolves sppark through its own (zk-miner patches in the hemilabs
 # fork, which needs the same barriers).
