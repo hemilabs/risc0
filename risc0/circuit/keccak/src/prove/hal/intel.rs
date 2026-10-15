@@ -78,6 +78,7 @@ fn device_ptr<T>(buf: &IntelBuffer<T>) -> *mut u32 {
 
 impl<IH: IntelHash> CircuitWitnessGenerator<IntelHal<IH>> for IntelCircuitHal<IH> {
     type PreferredPreflightOrder = ForwardPreflightOrder;
+    const HOST_WITNESS: bool = true;
 
     fn scatter_preflight(
         &self,

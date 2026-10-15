@@ -50,6 +50,7 @@ pub struct CpuCircuitHal;
 
 impl CircuitWitnessGenerator<CpuHal<CircuitField>> for CpuCircuitHal {
     type PreferredPreflightOrder = ForwardPreflightOrder;
+    const HOST_WITNESS: bool = true;
 
     fn scatter_preflight(
         &self,

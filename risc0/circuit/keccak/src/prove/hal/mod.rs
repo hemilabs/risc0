@@ -61,6 +61,10 @@ pub(crate) enum StepMode {
 pub(crate) trait CircuitWitnessGenerator<H: Hal> {
     type PreferredPreflightOrder: PreflightCycleOrder;
 
+    /// Whether this generates the witness on the CPU, as `host_witness` does: if so, the prover
+    /// can take a witness `host_witness` made instead (see `KeccakProver::prove_host_witness`).
+    const HOST_WITNESS: bool = false;
+
     fn scatter_preflight(
         &self,
         into: &MetaBuffer<H>,

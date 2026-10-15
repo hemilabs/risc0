@@ -18,7 +18,10 @@ use anyhow::{anyhow, bail, ensure, Context, Result};
 
 static VERBOSE: LazyLock<bool> = LazyLock::new(|| std::env::var("RISC0_VERBOSE").is_ok());
 
-use super::{keccak::prove_keccak, ProverServer};
+use super::{
+    keccak::{prove_keccak, prove_keccak_with},
+    ProverServer,
+};
 use risc0_circuit_rv32im::prove::SegmentProver;
 
 thread_local! {
@@ -1139,23 +1142,56 @@ impl ProverImpl {
         }
 
         let t_keccaks = std::time::Instant::now();
-        for (i, proof_request) in session.pending_keccaks.iter().enumerate() {
-            let t_keccak = std::time::Instant::now();
-            let receipt = prove_keccak(proof_request).context("prove keccak")?;
-            let prove_ms = t_keccak.elapsed().as_secs_f64() * 1000.0;
-            receipt.verify_integrity_with_context(&keccak_ctx)?;
-            tracing::debug!("adding keccak assumption: {}", receipt.claim.digest());
-            let t_insert = std::time::Instant::now();
-            keccak_receipts.insert(receipt)?;
-            if *VERBOSE {
-                eprintln!(
-                    "[keccak] {i}: po2={} prove+lift={prove_ms:.1}ms insert={:.1}ms total={:.1}ms",
-                    proof_request.po2,
-                    t_insert.elapsed().as_secs_f64() * 1000.0,
-                    t_keccak.elapsed().as_secs_f64() * 1000.0,
-                );
+        std::thread::scope(|scope| -> Result<()> {
+            // On Intel a keccak proof's witness is made on the CPU, about half of the proof's
+            // time: make each on a thread, a proof ahead of the GPU, so the two overlap. (On
+            // CUDA the GPU makes it.) Returning early drops `witnesses`, which ends the thread.
+            let witnesses =
+                (cfg!(feature = "intel") && session.pending_keccaks.len() > 1).then(|| {
+                    let (tx, rx) = mpsc::sync_channel(1);
+                    let requests = &session.pending_keccaks;
+                    scope.spawn(move || {
+                        for request in requests {
+                            let witness = risc0_circuit_keccak::prove::host_witness(
+                                &request.input,
+                                request.po2,
+                            );
+                            if tx.send(witness).is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    rx
+                });
+            for (i, proof_request) in session.pending_keccaks.iter().enumerate() {
+                let t_keccak = std::time::Instant::now();
+                let witness = match &witnesses {
+                    Some(rx) => Some(
+                        rx.recv()
+                            .map_err(|_| anyhow!("the keccak witness thread ended early"))?
+                            .context("keccak witness")?,
+                    ),
+                    None => None,
+                };
+                let wait_ms = t_keccak.elapsed().as_secs_f64() * 1000.0;
+                let receipt = prove_keccak_with(proof_request, witness).context("prove keccak")?;
+                let prove_ms = t_keccak.elapsed().as_secs_f64() * 1000.0;
+                receipt.verify_integrity_with_context(&keccak_ctx)?;
+                tracing::debug!("adding keccak assumption: {}", receipt.claim.digest());
+                let t_insert = std::time::Instant::now();
+                keccak_receipts.insert(receipt)?;
+                if *VERBOSE {
+                    eprintln!(
+                        "[keccak] {i}: po2={} witness wait={wait_ms:.1}ms \
+                         prove+lift={prove_ms:.1}ms insert={:.1}ms total={:.1}ms",
+                        proof_request.po2,
+                        t_insert.elapsed().as_secs_f64() * 1000.0,
+                        t_keccak.elapsed().as_secs_f64() * 1000.0,
+                    );
+                }
             }
-        }
+            Ok(())
+        })?;
 
         // NOTE: Calling keccak_receipts.root() proves the union tree.
         let t_root = std::time::Instant::now();

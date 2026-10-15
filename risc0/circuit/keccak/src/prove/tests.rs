@@ -37,6 +37,18 @@ fn basic() {
 }
 
 #[test]
+fn host_witness() {
+    let po2 = 8;
+    let inputs = test_inputs(po2);
+    let prover = keccak_prover().unwrap();
+    let witness = super::host_witness(&inputs, po2).unwrap();
+    // `None` from a prover that makes its witness on the GPU.
+    if let Some(seal) = prover.prove_host_witness(witness) {
+        prover.verify(&seal.unwrap()).expect("Verification failed");
+    }
+}
+
+#[test]
 fn fwd_rev_ab() {
     cfg_if! {
         if #[cfg(any(feature = "cuda", feature = "rocm"))] {

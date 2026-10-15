@@ -18,7 +18,7 @@ use anyhow::{ensure, Result};
 use risc0_binfmt::read_sha_halfs;
 use risc0_circuit_keccak::{
     get_control_id,
-    prove::{keccak_prover, zkr::get_keccak_zkr_shared},
+    prove::{keccak_prover, zkr::get_keccak_zkr_shared, HostWitness},
     KECCAK_CONTROL_IDS,
 };
 use risc0_core::field::baby_bear::BabyBearElem;
@@ -31,11 +31,23 @@ use crate::{
 
 /// Generate a keccak proof that has been lifted.
 pub(crate) fn prove_keccak(request: &ProveKeccakRequest) -> Result<SuccinctReceipt<Unknown>> {
+    prove_keccak_with(request, None)
+}
+
+/// [prove_keccak], from the request's witness if `risc0_circuit_keccak::prove::host_witness` has
+/// made it already.
+pub(crate) fn prove_keccak_with(
+    request: &ProveKeccakRequest,
+    witness: Option<HostWitness>,
+) -> Result<SuccinctReceipt<Unknown>> {
     let _gpu = super::exclusive_gpu();
     let t_prove = std::time::Instant::now();
     let zkr_input = {
         let prover = keccak_prover()?;
-        let seal = prover.prove(&request.input, request.po2)?;
+        let seal = match witness.and_then(|witness| prover.prove_host_witness(witness)) {
+            Some(seal) => seal?,
+            None => prover.prove(&request.input, request.po2)?,
+        };
 
         let claim_digest: Digest = read_sha_halfs(&mut VecDeque::from_iter(
             bytemuck::checked::cast_slice::<_, BabyBearElem>(&seal[0..DIGEST_SHORTS])
