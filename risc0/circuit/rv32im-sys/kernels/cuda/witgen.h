@@ -51,6 +51,60 @@ struct ExecContext {
   size_t cycle;
 };
 
+#ifdef __HIPCC__
+// HIP keeps the virtual buffer objects: with the non-virtual ones below, HIP (7.2, gfx1201)
+// witness generation differs from the CPU's in a fraction of the data cells, although
+// every object is constructed with its own kind. Not root-caused; the change is a CUDA
+// optimization.
+struct BufferObj {
+  __device__ virtual Val load(ExecContext& ctx, size_t col, size_t back) = 0;
+  __device__ virtual void store(ExecContext& ctx, size_t col, Val val) = 0;
+};
+
+struct MutableBufObj : public BufferObj {
+  __device__ MutableBufObj(Buffer& buf, size_t zeroBack = 0)
+      : buf(buf), preDataBuf{nullptr, 0, 0, false}, zeroBack(zeroBack) {}
+  __device__ MutableBufObj(Buffer& buf, Buffer preDataBuf, size_t zeroBack = 0)
+      : buf(buf), preDataBuf(preDataBuf), zeroBack(zeroBack) {}
+
+  __device__ Val load(ExecContext& ctx, size_t col, size_t back) override {
+    if (zeroBack && col > zeroBack && back > 0) {
+      return 0;
+    }
+    size_t backRow = (buf.rows + ctx.cycle - back) % buf.rows;
+    if (back > 0 && preDataBuf.buf) {
+      return preDataBuf.get(backRow, col);
+    }
+    return buf.get(backRow, col);
+  }
+
+  __device__ void store(ExecContext& ctx, size_t col, Val val) override {
+    buf.set(ctx.cycle, col, val);
+  }
+
+  Buffer& buf;
+  Buffer preDataBuf;
+  size_t zeroBack;
+};
+
+using MutableBuf = MutableBufObj*;
+
+struct GlobalBufObj : public BufferObj {
+  __device__ GlobalBufObj(Buffer& buf) : buf(buf) {}
+
+  __device__ Val load(ExecContext& ctx, size_t col, size_t back) override {
+    return buf.get(0, col);
+  }
+
+  __device__ void store(ExecContext& ctx, size_t col, Val val) override {
+    buf.set(0, col, val);
+  }
+
+  Buffer& buf;
+};
+
+using GlobalBuf = GlobalBufObj*;
+#else
 // Non-virtual buffer objects (kind tag + inline dispatch) and power-of-two row masking.
 // The original used virtual load/store (an indirect ABI call per access) and a 64-bit
 // modulo per load (__cuda_sm20_rem_u64). Same values are loaded/stored.
@@ -124,6 +178,7 @@ __device__ __forceinline__ void BufferObj::store(ExecContext& ctx, size_t col, V
 }
 
 using GlobalBuf = GlobalBufObj*;
+#endif  // __HIPCC__
 
 template <typename T> struct BoundLayout {
   __device__ BoundLayout(const T& layout, BufferObj* buf) : layout(layout), buf(buf) {}
