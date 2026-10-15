@@ -51,6 +51,7 @@ namespace cuda { namespace std { using ::std::array; } }
 #include <cuda/std/array>
 #include <thrust/execution_policy.h>
 #include <thrust/scan.h>
+#include <thrust/sort.h>
 #endif
 
 static bool g_verbose = (std::getenv("RISC0_VERBOSE") != nullptr);
@@ -118,8 +119,8 @@ struct DeviceCache {
   LookupTables* d_accum_tables = nullptr;
 
   // Shared lookup table memory (reused, zeroed between phases)
-  ::cuda::atomic<uint32_t>* d_tableU8 = nullptr;
-  ::cuda::atomic<uint32_t>* d_tableU16 = nullptr;
+  LookupCell* d_tableU8 = nullptr;
+  LookupCell* d_tableU16 = nullptr;
 
   // Variable-size preflight data (grow-only, shared between exec and accum)
   PreflightCycle* d_cycles = nullptr;
@@ -503,10 +504,14 @@ __global__ void fwd_stepExec(DeviceExecContext* ctx, uint32_t count) {
   }
 }
 
-__global__ void stepAccum(DeviceAccumContext* ctx, uint32_t count) {
+__global__ void stepAccum(DeviceAccumContext* ctx, uint32_t count, const uint32_t* perm = nullptr) {
   uint32_t cycle = blockDim.x * blockIdx.x + threadIdx.x;
   if (cycle >= count) {
     return;
+  }
+  // Optional cycle order (cycles grouped by major), so a warp mostly runs one mux arm.
+  if (perm) {
+    cycle = perm[cycle];
   }
 
   ExecContext execCtx(*ctx->preflight, *ctx->tables, cycle);
@@ -519,6 +524,15 @@ __global__ void stepAccum(DeviceAccumContext* ctx, uint32_t count) {
   Buffer globalBuf = *ctx->global;
   GlobalBufObj global(globalBuf);
   step_TopAccum(execCtx, &accum, &data, &global, &mix);
+}
+
+// keys[i] = cycles[i].major, vals[i] = i: the input of stepAccum's cycle sort.
+__global__ void majorKeys(const PreflightCycle* cycles, uint8_t* keys, uint32_t* vals, uint32_t n) {
+  uint32_t i = blockDim.x * blockIdx.x + threadIdx.x;
+  if (i < n) {
+    keys[i] = cycles[i].major;
+    vals[i] = i;
+  }
 }
 
 __global__ void finalizeAccum(DeviceAccumContext* ctx, uint32_t lastCycle) {
@@ -615,7 +629,31 @@ const char* risc0_circuit_rv32im_cuda_accum(AccumBuffers* buffers,
 
     {
       nvtx3::scoped_range range("stepAccum");
-      stepAccum<<<cfg.grid, cfg.block, 0, stream>>>(d_ctx, lastCycle);
+      // Run stepAccum's cycles grouped by major (stable sort), so warps diverge less. Same
+      // output: each cycle still runs once and writes only its own row, and its only
+      // back-reads (zeroBack) don't depend on other cycles. The buffers are grow-only and
+      // per device; callers hold the process-wide GPU lock (risc0_zkp::hal::cuda::exclusive).
+      uint32_t* perm = nullptr;
+#ifndef __HIPCC__
+      static uint8_t* s_keys[16] = {};
+      static uint32_t* s_perm[16] = {};
+      static size_t s_cap[16] = {};
+      {
+        int dev = getCachedDevice();
+        if (lastCycle > s_cap[dev]) {
+          if (s_keys[dev]) CUDA_OK(cudaFree(s_keys[dev]));
+          if (s_perm[dev]) CUDA_OK(cudaFree(s_perm[dev]));
+          CUDA_OK(cudaMalloc(&s_keys[dev], lastCycle));
+          CUDA_OK(cudaMalloc(&s_perm[dev], lastCycle * sizeof(uint32_t)));
+          s_cap[dev] = lastCycle;
+        }
+        majorKeys<<<cfg.grid, cfg.block, 0, stream>>>(get_cache().d_cycles, s_keys[dev], s_perm[dev], lastCycle);
+        auto kpolicy = thrust::cuda::par_nosync.on(stream);
+        thrust::stable_sort_by_key(kpolicy, s_keys[dev], s_keys[dev] + lastCycle, s_perm[dev]);
+        perm = s_perm[dev];
+      }
+#endif
+      stepAccum<<<cfg.grid, cfg.block, 0, stream>>>(d_ctx, lastCycle, perm);
 
       size_t rows = buffers->accum.rows;
 #ifdef __HIPCC__

@@ -239,6 +239,22 @@ pub trait Hal {
         stride: usize,
     );
 
+    /// Gather `size` strided samples for each index in `indices` into consecutive slices of
+    /// `dst` (`dst[q * size + i] = src[idxs[q] + i * stride]`). Default: one gather_sample per
+    /// index. CUDA overrides this with a single launch.
+    fn gather_samples(
+        &self,
+        dst: &Self::Buffer<Self::Elem>,
+        src: &Self::Buffer<Self::Elem>,
+        indices: &[usize],
+        size: usize,
+        stride: usize,
+    ) {
+        for (q, &idx) in indices.iter().enumerate() {
+            self.gather_sample(&dst.slice(q * size, size), src, idx, size, stride);
+        }
+    }
+
     /// Batch-read digests at scattered indices. Default impl uses individual get_at() calls.
     /// CUDA overrides this with a gather kernel + single D2H transfer.
     fn batch_get_digest_at(&self, buf: &Self::Buffer<Digest>, indices: &[usize]) -> Vec<Digest> {

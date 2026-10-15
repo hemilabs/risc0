@@ -743,7 +743,7 @@ impl ProverImpl {
                                 segment_verifier_parameters: params,
                                 ..VerifierContext::empty()
                             })
-                            .context("verify segment")?;
+                            .with_context(|| format!("verify segment {prev_seg_idx}"))?;
                     }
                     Ok(receipt)
                 }));
@@ -804,7 +804,7 @@ impl ProverImpl {
                         segment_verifier_parameters: verify_params.clone(),
                         ..VerifierContext::empty()
                     })
-                    .context("verify segment")?;
+                    .with_context(|| format!("verify segment (last) {}", receipt.index))?;
             }
             segments.push(receipt);
         }

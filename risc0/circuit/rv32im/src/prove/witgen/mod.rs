@@ -233,10 +233,22 @@ where
         };
         let code = MetaBuffer::new("code", hal, cycles, REGCOUNT_CODE, false);
         let tw1 = std::time::Instant::now();
-        let data = scope!(
-            "alloc(data)",
-            MetaBuffer::new("data", hal, cycles, REGCOUNT_DATA, true)
-        );
+        // On CUDA, zero-fill the data buffer instead of INVALID-filling it, so the zeroize
+        // pass over it after witgen can be skipped: the cells witgen doesn't write end up 0
+        // either way (replay-verified: the witness after zeroize is unchanged).
+        let zero_data = cfg!(feature = "cuda");
+        let data = scope!("alloc(data)", {
+            if zero_data {
+                MetaBuffer {
+                    buf: hal.alloc_elem_init("data", cycles * REGCOUNT_DATA, Val::ZERO),
+                    rows: cycles,
+                    cols: REGCOUNT_DATA,
+                    checked: true,
+                }
+            } else {
+                MetaBuffer::new("data", hal, cycles, REGCOUNT_DATA, true)
+            }
+        });
         let tw2 = std::time::Instant::now();
         // On CDNA (MI300X), allocate a separate read-only pre_data buffer to avoid
         // race conditions in parallel witgen. On consumer GPUs (RDNA4), skip it to
@@ -306,7 +318,9 @@ where
         scope!("zeroize", {
             hal.eltwise_zeroize_elem(&global.buf);
             hal.eltwise_zeroize_elem(&code.buf);
-            hal.eltwise_zeroize_elem(&data.buf);
+            if !zero_data {
+                hal.eltwise_zeroize_elem(&data.buf);
+            }
         });
         let tw6 = std::time::Instant::now();
         if *VERBOSE {

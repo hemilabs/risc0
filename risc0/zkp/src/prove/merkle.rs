@@ -232,16 +232,10 @@ impl<H: Hal> MerkleTreeProver<H> {
         } else if col_size > 0 {
             // GPU path: batch all gather_sample kernels (async), single D2H via view()
             let batch_buf = hal.alloc_elem("batch_samples", n * col_size);
-            for (i, &idx) in indices.iter().enumerate() {
+            for &idx in indices.iter() {
                 assert!(idx < self.params.row_size);
-                hal.gather_sample(
-                    &batch_buf.slice(i * col_size, col_size),
-                    matrix,
-                    idx,
-                    col_size,
-                    self.params.row_size,
-                );
             }
+            hal.gather_samples(&batch_buf, matrix, indices, col_size, self.params.row_size);
             batch_buf.view(|view| {
                 for i in 0..n {
                     all_col_data.push(view[i * col_size..(i + 1) * col_size].to_vec());

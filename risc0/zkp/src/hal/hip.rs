@@ -972,6 +972,7 @@ impl<HH: HipHash + ?Sized> Hal for HipHal<HH> {
                 shared_size: u32,
                 kernel_count: u32,
                 count: u32,
+                eval_count: u32,
             ) -> *const std::os::raw::c_char;
         }
 
@@ -984,6 +985,7 @@ impl<HH: HipHash + ?Sized> Hal for HipHal<HH> {
                 shared_size,
                 kernel_count as u32,
                 count as u32,
+                eval_count as u32,
             )
         })
         .unwrap();

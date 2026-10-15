@@ -183,3 +183,211 @@ __global__ void mix_poly_coeffs(FpExt* out,
     }
   }
 }
+
+#ifndef __HIPCC__
+// ---- eval_u v2 (CUDA only: the reductions assume 32-lane warps) ----
+// Split-K over (chunk, eval point), per-point power tables, J coefficients per thread per
+// step, one REDC per pair of products. Exact field arithmetic (canonical Montgomery form),
+// so results are bit-identical to the Horner kernel batch_evaluate_any for any input.
+
+#define EU_J 16
+#define EU_THREADS 256
+
+__device__ __forceinline__ uint32_t eu_addmod(uint32_t a, uint32_t b) {
+  uint32_t r = a + b;
+  return r >= Fp::P ? r - Fp::P : r;
+}
+// (a0*b0 + a1*b1) * 2^-32 mod p, inputs < p. Same REDC formulation as Fp::mul.
+__device__ __forceinline__ uint32_t eu_redc_pair(uint32_t a0, uint32_t b0, uint32_t a1, uint32_t b1) {
+  uint64_t o64 = (uint64_t)a0 * b0 + (uint64_t)a1 * b1;  // < 2p^2 < p*2^32
+  uint32_t low = -uint32_t(o64);
+  uint32_t red = Fp::M * low;
+  o64 += uint64_t(red) * uint64_t(Fp::P);  // < 2^64
+  uint32_t ret = o64 >> 32;                 // < 2p
+  return ret >= Fp::P ? ret - Fp::P : ret;
+}
+
+// pw[e*EU_THREADS + t] = x_e^(J*t);  ps[e*S + s] = x_e^(s*chunk)
+__global__ void eu2_pows(FpExt* pw, FpExt* ps, const FpExt* xs, uint32_t S, uint32_t chunk) {
+  uint32_t e = blockIdx.x;
+  uint32_t t = threadIdx.x;
+  FpExt x = xs[e];
+  pw[(size_t)e * EU_THREADS + t] = pow(x, (size_t)EU_J * t);
+  for (uint32_t s = t; s < S; s += blockDim.x) {
+    ps[(size_t)e * S + s] = pow(x, (size_t)s * chunk);
+  }
+}
+
+__device__ __forceinline__ FpExt fpext_shfl_down(FpExt v, int d) {
+  FpExt r;
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    r.elems[i] = Fp::fromRaw(__shfl_down_sync(0xffffffff, v.elems[i].asRaw(), d));
+  }
+  return r;
+}
+
+// grid = (S, nEvals), block = EU_THREADS
+__global__ void __launch_bounds__(EU_THREADS) eu2_main(FpExt* partial,
+                                                       const Fp* __restrict__ coeffs,
+                                                       const uint32_t* __restrict__ which,
+                                                       const FpExt* __restrict__ xs,
+                                                       const FpExt* __restrict__ pw,
+                                                       const FpExt* __restrict__ ps,
+                                                       uint32_t deg,
+                                                       uint32_t chunk) {
+  const uint32_t s = blockIdx.x;
+  const uint32_t e = blockIdx.y;
+  const uint32_t S = gridDim.x;
+  const uint32_t t = threadIdx.x;
+  const Fp* poly = coeffs + (size_t)which[e] * deg + (size_t)s * chunk;
+  FpExt x = xs[e];
+  FpExt xp[EU_J];
+  xp[0] = FpExt(1);
+#pragma unroll
+  for (int j = 1; j < EU_J; j++)
+    xp[j] = xp[j - 1] * x;
+  // step = x^(J*THREADS)
+  FpExt step = pw[(size_t)e * EU_THREADS + (EU_THREADS - 1)] * (xp[EU_J - 1] * x);
+  const uint32_t iters = chunk / (EU_J * EU_THREADS);
+  FpExt acc;
+  const uint4* p4 = reinterpret_cast<const uint4*>(poly);
+#pragma unroll 2
+  for (int k = (int)iters - 1; k >= 0; k--) {
+    size_t base = ((size_t)k * EU_THREADS + t) * (EU_J / 4);
+    uint32_t c[EU_J];
+#pragma unroll
+    for (int q = 0; q < EU_J / 4; q++) {
+      uint4 v = __ldg(p4 + base + q);
+      c[4 * q + 0] = v.x;
+      c[4 * q + 1] = v.y;
+      c[4 * q + 2] = v.z;
+      c[4 * q + 3] = v.w;
+    }
+    // Pair-wise lazy reduction: one REDC per two products.
+    FpExt inner;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      uint32_t sacc = 0;
+#pragma unroll
+      for (int j = 0; j < EU_J; j += 2)
+        sacc = eu_addmod(sacc, eu_redc_pair(c[j], xp[j].elems[i].asRaw(), c[j + 1], xp[j + 1].elems[i].asRaw()));
+      inner.elems[i] = Fp::fromRaw(sacc);
+    }
+    acc = acc * step + inner;
+  }
+  acc = acc * pw[(size_t)e * EU_THREADS + t];
+  // block reduce
+#pragma unroll
+  for (int d = 16; d > 0; d >>= 1)
+    acc += fpext_shfl_down(acc, d);
+  __shared__ FpExt red[EU_THREADS / 32];
+  if ((t & 31) == 0)
+    red[t >> 5] = acc;
+  __syncthreads();
+  if (t < 32) {
+    FpExt v = (t < EU_THREADS / 32) ? red[t] : FpExt();
+#pragma unroll
+    for (int d = 16; d > 0; d >>= 1)
+      v += fpext_shfl_down(v, d);
+    if (t == 0)
+      partial[(size_t)e * S + s] = v * ps[(size_t)e * S + s];
+  }
+}
+
+// grid = nEvals, block = 32
+__global__ void eu2_reduce(FpExt* out, const FpExt* partial, uint32_t S) {
+  uint32_t e = blockIdx.x;
+  FpExt v;
+  for (uint32_t s = threadIdx.x; s < S; s += 32)
+    v += partial[(size_t)e * S + s];
+#pragma unroll
+  for (int d = 16; d > 0; d >>= 1)
+    v += fpext_shfl_down(v, d);
+  if (threadIdx.x == 0)
+    out[e] = v;
+}
+#endif // __HIPCC__
+
+
+#ifndef __HIPCC__
+// ---- mix_poly_coeffs v2 (CUDA only, like eval_u v2: untested on ROCm) ----
+// one RMW of `out` per run of equal combo ids (instead of one per input),
+// lazy pair REDC for the FpExt x Fp products, parallel mix-power table in shared memory.
+// Exact field arithmetic with canonical outputs => bit-identical to the original kernel.
+
+__device__ __forceinline__ uint32_t mx_addmod(uint32_t a, uint32_t b) {
+  uint32_t r = a + b;
+  return r >= Fp::P ? r - Fp::P : r;
+}
+// (a0*b0 + a1*b1) * 2^-32 mod p for inputs < p (same REDC as Fp::mul).
+__device__ __forceinline__ uint32_t mx_redc_pair(uint32_t a0, uint32_t b0, uint32_t a1, uint32_t b1) {
+  uint64_t o64 = (uint64_t)a0 * b0 + (uint64_t)a1 * b1;
+  uint32_t low = -uint32_t(o64);
+  uint32_t red = Fp::M * low;
+  o64 += uint64_t(red) * uint64_t(Fp::P);
+  uint32_t ret = o64 >> 32;
+  return ret >= Fp::P ? ret - Fp::P : ret;
+}
+
+__global__ void __launch_bounds__(256) mix_poly_coeffs_v2(FpExt* __restrict__ out,
+                                                          const Fp* __restrict__ in,
+                                                          const uint32_t* __restrict__ combos,
+                                                          const FpExt* __restrict__ mixStart,
+                                                          const FpExt* __restrict__ mix,
+                                                          const uint32_t inputSize,
+                                                          const uint32_t count) {
+  extern __shared__ uint32_t mx_smem[];
+  FpExt* mixPows = reinterpret_cast<FpExt*>(mx_smem);
+  uint32_t* cids = mx_smem + 4 * inputSize;
+  {
+    FpExt ms = *mixStart;
+    FpExt m = *mix;
+    for (uint32_t i = threadIdx.x; i < inputSize; i += blockDim.x) {
+      mixPows[i] = ms * pow(m, i);
+      cids[i] = combos[i];
+    }
+  }
+  __syncthreads();
+  const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= count)
+    return;
+  uint32_t acc[4] = {0, 0, 0, 0};
+  uint32_t i = 0;
+  while (i < inputSize) {
+    uint32_t id = cids[i];
+    bool pair = (i + 1 < inputSize) && (cids[i + 1] == id);
+    uint32_t c0 = __ldg(reinterpret_cast<const uint32_t*>(in) + (size_t)count * i + idx);
+    uint32_t c1 = pair ? __ldg(reinterpret_cast<const uint32_t*>(in) + (size_t)count * (i + 1) + idx) : 0;
+    const FpExt& m0 = mixPows[i];
+    const FpExt& m1 = mixPows[pair ? i + 1 : i];
+#pragma unroll
+    for (int k = 0; k < 4; k++)
+      acc[k] = mx_addmod(acc[k], mx_redc_pair(c0, m0.elems[k].asRaw(), c1, m1.elems[k].asRaw()));
+    i += pair ? 2 : 1;
+    if (i >= inputSize || cids[i] != id) {
+      FpExt* o = out + (size_t)count * id + idx;
+      FpExt v = *o;
+#pragma unroll
+      for (int k = 0; k < 4; k++) {
+        v.elems[k] = v.elems[k] + Fp::fromRaw(acc[k]);
+        acc[k] = 0;
+      }
+      *o = v;
+    }
+  }
+}
+
+
+#endif // __HIPCC__
+
+// ---- batched gather_sample (all FRI queries of one tree in one launch) ----
+__global__ void gather_samples(Fp* dst, const Fp* src, const uint32_t* idxs, const uint32_t n,
+                               const uint32_t size, const uint32_t stride) {
+  uint gid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (gid < n * size) {
+    uint32_t q = gid / size;
+    uint32_t i = gid - q * size;
+    dst[gid] = src[(size_t)i * stride + idxs[q]];
+  }
+}

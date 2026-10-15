@@ -1207,6 +1207,7 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
                 shared_size: u32,
                 kernel_count: u32,
                 count: u32,
+                eval_count: u32,
             ) -> *const std::os::raw::c_char;
         }
 
@@ -1219,6 +1220,7 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
                 shared_size,
                 kernel_count as u32,
                 count as u32,
+                eval_count as u32,
             )
         })
         .unwrap();
@@ -1247,6 +1249,48 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
                 dst.as_device_ptr(),
                 src.as_device_ptr(),
                 idx as u32,
+                size as u32,
+                stride as u32,
+            )
+        })
+        .unwrap();
+    }
+
+    fn gather_samples(
+        &self,
+        dst: &Self::Buffer<Self::Elem>,
+        src: &Self::Buffer<Self::Elem>,
+        indices: &[usize],
+        size: usize,
+        stride: usize,
+    ) {
+        if indices.len() < 2 {
+            for (q, &idx) in indices.iter().enumerate() {
+                self.gather_sample(&dst.slice(q * size, size), src, idx, size, stride);
+            }
+            return;
+        }
+        let idxs: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
+        // copy_from is a synchronous copy on the legacy stream, which waits for the persistent
+        // stream: so idx_buf can go back to the pool right after the async launch below (the
+        // next copy into it waits for this kernel), as with the other temporaries here.
+        let idx_buf = self.copy_from_u32("gather_idx", &idxs);
+        extern "C" {
+            fn risc0_zkp_cuda_gather_samples(
+                dst: DevicePointer<u8>,
+                src: DevicePointer<u8>,
+                idxs: DevicePointer<u8>,
+                n: u32,
+                size: u32,
+                stride: u32,
+            ) -> *const std::os::raw::c_char;
+        }
+        ffi_wrap(|| unsafe {
+            risc0_zkp_cuda_gather_samples(
+                dst.as_device_ptr(),
+                src.as_device_ptr(),
+                idx_buf.as_device_ptr(),
+                idxs.len() as u32,
                 size as u32,
                 stride as u32,
             )
@@ -1653,39 +1697,47 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
         reg_combo_ids: &[u32],
         mix: &Self::ExtElem,
     ) {
-        let coeff_u = self.copy_from_extelem("coeff_u", coeff_u);
-        let combo_count = combo_count as u32;
-        let cycles = cycles as u32;
-        let regs_count = reg_sizes.len() as u32;
-        let reg_sizes = self.copy_from_u32("reg_sizes", reg_sizes);
-        let reg_combo_ids = self.copy_from_u32("reg_combo_ids", reg_combo_ids);
-        let mix = self.copy_from_extelem("mix", &[*mix]);
-
+        // Compute the per-element deltas on the host (coeff_u is host data) and apply them
+        // with one small parallel kernel, instead of a single-thread device loop. The
+        // temporaries are freed after the async launch; see gather_samples.
+        let mut deltas: std::collections::BTreeMap<u32, Self::ExtElem> =
+            std::collections::BTreeMap::new();
+        let mut cur = Self::ExtElem::ONE;
+        let mut pos = 0usize;
+        for (size, combo_id) in reg_sizes.iter().zip(reg_combo_ids.iter()) {
+            for j in 0..*size as usize {
+                let off = (cycles * *combo_id as usize + j) as u32;
+                let e = deltas.entry(off).or_insert(Self::ExtElem::ZERO);
+                *e += cur * coeff_u[pos + j];
+            }
+            cur *= *mix;
+            pos += *size as usize;
+        }
+        for _ in 0..Self::CHECK_SIZE {
+            let off = (cycles * combo_count) as u32;
+            let e = deltas.entry(off).or_insert(Self::ExtElem::ZERO);
+            *e += cur * coeff_u[pos];
+            pos += 1;
+            cur *= *mix;
+        }
+        let offs: Vec<u32> = deltas.keys().copied().collect();
+        let vals: Vec<Self::ExtElem> = deltas.values().copied().collect();
+        let offs_buf = self.copy_from_u32("combos_offs", &offs);
+        let vals_buf = self.copy_from_extelem("combos_deltas", &vals);
         extern "C" {
-            fn risc0_zkp_cuda_combos_prepare(
+            fn risc0_zkp_cuda_combos_sub(
                 combos: DevicePointer<u8>,
-                coeff_u: DevicePointer<u8>,
-                combo_count: u32,
-                cycles: u32,
-                regs_count: u32,
-                reg_sizes: DevicePointer<u8>,
-                reg_combo_ids: DevicePointer<u8>,
-                checkSize: u32,
-                mix: DevicePointer<u8>,
+                deltas: DevicePointer<u8>,
+                offsets: DevicePointer<u8>,
+                count: u32,
             ) -> *const std::os::raw::c_char;
         }
-
         ffi_wrap(|| unsafe {
-            risc0_zkp_cuda_combos_prepare(
+            risc0_zkp_cuda_combos_sub(
                 combos.as_device_ptr(),
-                coeff_u.as_device_ptr(),
-                combo_count,
-                cycles,
-                regs_count,
-                reg_sizes.as_device_ptr(),
-                reg_combo_ids.as_device_ptr(),
-                Self::CHECK_SIZE as u32,
-                mix.as_device_ptr(),
+                vals_buf.as_device_ptr(),
+                offs_buf.as_device_ptr(),
+                offs.len() as u32,
             )
         })
         .unwrap();
