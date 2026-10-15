@@ -717,12 +717,34 @@ mod testutil {
         hal.hash_fold(&io, INPUTS, OUTPUTS);
     }
 
+    /// `hash_fold_tree` (which GPU HALs implement as one call) against the CPU HAL.
+    pub(crate) fn hash_fold_tree<H: Hal>(hal_gpu: H) {
+        let mut rng = rand::rng();
+        let hal_cpu = CpuHal::new(hal_gpu.get_hash_suite().clone());
+        for layers in [1, 2, 7, 12] {
+            let leaves = 1 << layers;
+            let digests: Vec<Digest> = (0..leaves * 2)
+                .map(|_| Digest::from(std::array::from_fn(|_| rng.next_u32() / 3)))
+                .collect();
+            let gpu_io = hal_gpu.copy_from_digest("io", &digests);
+            let cpu_io = hal_cpu.copy_from_digest("io", &digests);
+            hal_gpu.hash_fold_tree(&gpu_io, layers);
+            hal_cpu.hash_fold_tree(&cpu_io, layers);
+            assert!(
+                gpu_io.to_vec()[1..] == cpu_io.to_vec()[1..],
+                "layers={layers}"
+            );
+        }
+    }
+
     pub(crate) fn hash_rows<H: Hal<Elem = BabyBearElem>>(hal_gpu: H) {
         let mut rng = rand::rng();
         let hal_cpu = CpuHal::new(hal_gpu.get_hash_suite().clone());
         let hal = DualHal::new(Rc::new(hal_cpu), Rc::new(hal_gpu));
-        let rows = [1, 2, 3, 4, 10];
-        let cols = [16, 32, 64, 128];
+        // Includes every column count the provers hash (1, 12, 16, 23, 64, 103, 128, 211) and
+        // rows past one CUDA block.
+        let rows = [1, 2, 3, 4, 10, 129, 1000];
+        let cols = [1, 12, 16, 23, 32, 64, 103, 128, 211];
         for row_count in rows {
             for col_count in cols {
                 let matrix_size = row_count * col_count;

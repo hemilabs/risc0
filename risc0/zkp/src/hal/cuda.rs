@@ -1850,6 +1850,11 @@ mod tests {
     }
 
     #[test]
+    fn hash_fold_tree_poseidon2() {
+        testutil::hash_fold_tree(CudaHalPoseidon2::new());
+    }
+
+    #[test]
     fn fri_fold() {
         testutil::fri_fold(CudaHalSha256::new());
     }
