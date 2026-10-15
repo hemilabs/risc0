@@ -22,6 +22,7 @@
 use std::{cell::RefCell, rc::Rc};
 
 use anyhow::Result;
+use rayon::prelude::*;
 use risc0_circuit_keccak_sys::{risc0_circuit_keccak_intel_eval_check, ScatterInfo};
 use risc0_core::{
     field::{
@@ -85,7 +86,12 @@ impl<IH: IntelHash> CircuitWitnessGenerator<IntelHal<IH>> for IntelCircuitHal<IH
         from: &[u32],
     ) -> Result<()> {
         scope!("scatter");
-        let mut host = into.buf.to_vec();
+        // `into` was just allocated all INVALID (see `MetaBuffer::new`): make that on the host, in
+        // parallel, rather than download it (0.13 s for 574 MB at po2 17).
+        let mut host: Vec<Val> = (0..into.buf.size())
+            .into_par_iter()
+            .map(|_| Val::INVALID)
+            .collect();
         scatter_preflight_host(&mut host, into.rows, infos, from);
         *self.scattered.borrow_mut() = Some((device_ptr(&into.buf) as usize, host));
         Ok(())

@@ -100,25 +100,37 @@ impl<'a> HostMetaBuffer<'a> {
 }
 
 /// Scatter the preflight's `data` into `into`, a witness buffer of `rows` rows, on the CPU.
+///
+/// In parallel, as CUDA does it (a thread per info): the infos set disjoint cells, and their writes
+/// land a column apart, so one thread spent 0.8 s at po2 17 waiting on memory.
 pub(crate) fn scatter_preflight_host(
     into: &mut [Val],
     rows: usize,
     infos: &[ScatterInfo],
     data: &[u32],
 ) {
-    for info in infos {
-        let inner_count = 32 / info.bits;
-        let mask: u32 = (1 << info.bits) - 1;
-        for i in 0..info.count as u32 {
-            let from_idx = info.offset + (i / inner_count);
-            let word = data[from_idx as usize];
-            let j = i % inner_count;
-            let val = (word >> (j * info.bits)) & mask;
-            let col = info.col as u32 + i;
-            let into_idx = col as usize * rows + info.row as usize;
-            into[into_idx] = val.into();
+    struct Cells(*mut Val, usize);
+    // SAFETY: each cell is written by one info only, and `into` outlives the parallel loop.
+    unsafe impl Sync for Cells {}
+    let cells = Cells(into.as_mut_ptr(), into.len());
+    infos.par_chunks(1024).for_each(|chunk| {
+        let cells = &cells;
+        for info in chunk {
+            let inner_count = 32 / info.bits;
+            let mask: u32 = (1 << info.bits) - 1;
+            for i in 0..info.count as u32 {
+                let from_idx = info.offset + (i / inner_count);
+                let word = data[from_idx as usize];
+                let j = i % inner_count;
+                let val = (word >> (j * info.bits)) & mask;
+                let col = info.col as u32 + i;
+                let into_idx = col as usize * rows + info.row as usize;
+                assert!(into_idx < cells.1);
+                // SAFETY: in bounds (checked above), and no other info writes this cell.
+                unsafe { *cells.0.add(into_idx) = val.into() };
+            }
         }
-    }
+    });
 }
 
 /// Generate the witness into host buffers, on the CPU.
