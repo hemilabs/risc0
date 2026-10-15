@@ -84,6 +84,14 @@ fn build_cuda_kernels(cxx_root: &Path) {
 fn build_rocm_kernels(cxx_root: &Path) {
     let sppark_root = env::var("DEP_SPPARK_ROOT").unwrap();
     println!("cargo:rerun-if-env-changed=RISC0_HIP_ARCH");
+    // `cc` tracks no sources itself, and the line above turns off cargo's default of re-running
+    // on any change in the package: track the kernels and the headers they include. File by
+    // file for sppark, whose `rust/sppark` symlink loop a directory would make cargo recurse.
+    println!("cargo:rerun-if-changed=kernels/zkp/cuda");
+    println!("cargo:rerun-if-changed={}", cxx_root.display());
+    for file in risc0_build_kernel::kernel_source_files(Path::new(&sppark_root)) {
+        println!("cargo:rerun-if-changed={}", file.display());
+    }
 
     env::set_var("HIP_PLATFORM", "amd");
 

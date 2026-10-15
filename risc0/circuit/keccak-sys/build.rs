@@ -755,6 +755,8 @@ fn build_rocm_kernels() {
 
     let sppark_root = env::var("DEP_SPPARK_ROOT").unwrap();
     let cuda_root = env::var("DEP_RISC0_SYS_CUDA_ROOT").unwrap();
+    // The headers these kernels include (see the CUDA build).
+    rerun_if_include_roots_changed(&[&sppark_root, &cuda_root]);
     let hipcc = risc0_build_kernel::find_hipcc();
     let out_dir = env::var("OUT_DIR").map(PathBuf::from).unwrap();
     let kernel_dir = std::fs::canonicalize("kernels/cuda").unwrap();

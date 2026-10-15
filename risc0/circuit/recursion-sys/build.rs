@@ -435,6 +435,13 @@ fn build_rocm_kernels() {
     let sppark_root = env::var("DEP_SPPARK_ROOT").unwrap();
     let cuda_root = env::var("DEP_RISC0_SYS_CUDA_ROOT").unwrap();
     let cxx_root = env::var("DEP_RISC0_SYS_CXX_ROOT").unwrap();
+    // The headers these kernels include: re-run when one changes (file by file for sppark, whose
+    // `rust/sppark` symlink loop a directory would make cargo recurse).
+    for root in [&sppark_root, &cuda_root, &cxx_root] {
+        for file in risc0_build_kernel::kernel_source_files(Path::new(root)) {
+            println!("cargo:rerun-if-changed={}", file.display());
+        }
+    }
     let hipcc = risc0_build_kernel::find_hipcc();
     let out_dir = env::var("OUT_DIR").map(PathBuf::from).unwrap();
     let kernel_dir = std::fs::canonicalize("kernels/cuda").unwrap();

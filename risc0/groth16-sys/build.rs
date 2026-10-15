@@ -12,7 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{env, path::PathBuf, process::Command};
+use std::{
+    env,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use risc0_build_kernel::{KernelBuild, KernelType};
 
@@ -86,6 +90,11 @@ fn build_rocm_kernels() {
     env::set_var("HIP_PLATFORM", "amd");
 
     let sppark_root = env::var("DEP_SPPARK_ROOT").unwrap();
+    // The sppark headers these kernels include (MSM, NTT): re-run when one changes, file by file,
+    // as a directory would make cargo recurse into sppark's `rust/sppark` symlink loop.
+    for file in risc0_build_kernel::kernel_source_files(Path::new(&sppark_root)) {
+        println!("cargo:rerun-if-changed={}", file.display());
+    }
     let hipcc = risc0_build_kernel::find_hipcc();
     let out_dir = env::var("OUT_DIR").map(PathBuf::from).unwrap();
     let kernel_dir = std::fs::canonicalize("kernels/cuda").unwrap();
