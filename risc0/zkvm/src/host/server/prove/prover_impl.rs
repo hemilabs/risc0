@@ -1143,11 +1143,13 @@ impl ProverImpl {
 
         let t_keccaks = std::time::Instant::now();
         std::thread::scope(|scope| -> Result<()> {
-            // On Intel a keccak proof's witness is made on the CPU, about half of the proof's
-            // time: make each on a thread, a proof ahead of the GPU, so the two overlap. (On
-            // CUDA the GPU makes it.) Returning early drops `witnesses`, which ends the thread.
-            let witnesses =
-                (cfg!(feature = "intel") && session.pending_keccaks.len() > 1).then(|| {
+            // On Intel and AMD GPUs a keccak proof's witness is made on the CPU, about half of
+            // the proof's time: make each on a thread, a proof ahead of the GPU, so the two
+            // overlap. (On CUDA the GPU makes it.) Returning early drops `witnesses`, which ends
+            // the thread.
+            let witnesses = (cfg!(any(feature = "intel", feature = "rocm"))
+                && session.pending_keccaks.len() > 1)
+                .then(|| {
                     let (tx, rx) = mpsc::sync_channel(1);
                     let requests = &session.pending_keccaks;
                     scope.spawn(move || {
