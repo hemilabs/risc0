@@ -584,6 +584,29 @@ impl<T> BufferImpl<T> {
         }
     }
 
+    /// Upload `data` over the whole buffer, without downloading it first as `view_mut` does.
+    /// Returns once the copy is done, so `data` may be freed.
+    pub fn copy_from_host(&self, data: &[T]) {
+        assert_eq!(data.len(), self.size, "copy_from_host: size mismatch");
+        extern "C" {
+            fn risc0_zkp_cuda_memcpy_h2d(
+                dst: *mut std::os::raw::c_void,
+                src: *const std::os::raw::c_void,
+                size: usize,
+            ) -> *const std::os::raw::c_char;
+        }
+        let bytes: &[u8] = unchecked_cast(data);
+        ffi_wrap(|| unsafe {
+            risc0_zkp_cuda_memcpy_h2d(
+                self.as_device_ptr().0 as *mut std::os::raw::c_void,
+                bytes.as_ptr() as *const std::os::raw::c_void,
+                bytes.len(),
+            )
+        })
+        .unwrap();
+        sync_persistent_stream();
+    }
+
     pub fn as_device_ptr(&self) -> DevicePointer<u8> {
         let ptr = self.buffer.borrow_mut().buf.as_device_ptr();
         let offset = self.offset * std::mem::size_of::<T>();
