@@ -40,6 +40,22 @@ pub(crate) trait CircuitWitnessGenerator<H: Hal> {
         global: &H::Buffer<H::Elem>,
     ) -> Result<()>;
 
+    /// Like `generate_witness`, with the rows of some sequential chains already computed on
+    /// the host. HALs without support ignore them and run every chain.
+    #[allow(clippy::too_many_arguments)]
+    fn generate_witness_with_chains(
+        &self,
+        mode: StepMode,
+        total_cycles: u32,
+        preflight: &RawPreflightTrace,
+        _host_chains: Option<&super::witgen::HostChains>,
+        ctrl: &H::Buffer<H::Elem>,
+        data: &H::Buffer<H::Elem>,
+        global: &H::Buffer<H::Elem>,
+    ) -> Result<()> {
+        self.generate_witness(mode, total_cycles, preflight, ctrl, data, global)
+    }
+
     /// Upload a witness that was generated on the host ahead of time.
     fn upload_host_witness(
         &self,

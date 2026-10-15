@@ -96,3 +96,15 @@ extern "C" const char* risc0_circuit_recursion_cuda_eval_check(Fp* check,
   }
   return nullptr;
 }
+
+// Load the recursion eval_check kernel off the GPU thread (see ffi.cu warmup).
+extern "C" const char* risc0_circuit_recursion_cuda_warmup_eval_check() {
+#ifndef __HIPCC__
+  cudaFuncAttributes attr;
+  cudaError_t err = cudaFuncGetAttributes(&attr, risc0::circuit::recursion::cuda::eval_check);
+  if (err != cudaSuccess) {
+    return strdup(cudaGetErrorString(err));
+  }
+#endif
+  return nullptr;
+}

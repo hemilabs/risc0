@@ -89,6 +89,10 @@ pub struct Preflight {
     /// RISC0_RECURSION_PREWITGEN): lets the CPU witgen run on the pipelining
     /// thread instead of the GPU thread.
     pub(crate) host_witness: std::sync::Mutex<Option<(Vec<Fp>, Vec<Fp>)>>,
+
+    /// Rows of the long sequential witgen chains, executed on the host (see
+    /// `witgen::host_chains`), so the GPU witgen does not run them one thread at a time.
+    pub(crate) host_chains: std::sync::Mutex<Option<super::witgen::HostChains>>,
 }
 
 impl Preflight {
@@ -111,6 +115,7 @@ impl Preflight {
             cur_iop_body: VecDeque::new(),
             iop_idx: 0,
             host_witness: std::sync::Mutex::new(None),
+            host_chains: std::sync::Mutex::new(None),
         }
     }
 

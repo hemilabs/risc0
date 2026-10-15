@@ -84,6 +84,21 @@ fn spawn_cuda_warmup() -> std::thread::JoinHandle<()> {
     std::thread::spawn(risc0_circuit_rv32im::prove::cuda_warmup)
 }
 
+/// The recursion kernels' module loading, started by a non-composite session.
+#[cfg(feature = "cuda")]
+static CUDA_REC_WARMUP: std::sync::Mutex<CudaWarmup> =
+    std::sync::Mutex::new(CudaWarmup::NotStarted);
+
+/// Wait for the recursion warmup, if one is running (it makes no GPU launches and takes no
+/// GPU lock, so this cannot deadlock against a session).
+#[cfg(feature = "cuda")]
+fn join_cuda_rec_warmup() {
+    let warmup = std::mem::replace(&mut *CUDA_REC_WARMUP.lock().unwrap(), CudaWarmup::Taken);
+    if let CudaWarmup::Running(handle) = warmup {
+        let _ = handle.join();
+    }
+}
+
 /// An implementation of a Prover that runs locally.
 pub struct ProverImpl {
     opts: ProverOpts,
@@ -515,6 +530,17 @@ impl ProverImpl {
                 CudaWarmup::Taken => None,
             }
         };
+        // Recursion kernels load on their own thread, once per process, off the composite's
+        // path; the first lift joins it.
+        #[cfg(feature = "cuda")]
+        if self.opts.receipt_kind != ReceiptKind::Composite {
+            let mut warmup = CUDA_REC_WARMUP.lock().unwrap();
+            if matches!(*warmup, CudaWarmup::NotStarted) {
+                *warmup = CudaWarmup::Running(std::thread::spawn(
+                    risc0_circuit_recursion::prove::cuda_warmup,
+                ));
+            }
+        }
         #[cfg(feature = "rocm")]
         let mut warmup_handle = Some(std::thread::spawn(|| {
             risc0_circuit_rv32im::prove::rocm_warmup();
@@ -1376,6 +1402,9 @@ impl ProverServer for ProverImpl {
             ProverOpts::succinct()
         };
 
+        #[cfg(feature = "cuda")]
+        join_cuda_rec_warmup();
+
         // Cross-segment pipelining: bg thread does CPU preflight of next lift
         // while main thread runs the GPU join of the previous one. Validated
         // ~3% E2E win at composite=42 segs.
@@ -1416,20 +1445,24 @@ impl ProverServer for ProverImpl {
                 make_succinct_receipt(prover, receipt, claim)
             };
             let t0 = std::time::Instant::now();
-            let mut acc = lift_with_opts(&segments[0], recursion_opts.clone())?;
-            let mut cur = finish_lift(spawn_lift_prep(1)?, 1)?;
-            if *VERBOSE {
-                eprintln!(
-                    "[composite_to_succinct] reorder: lift0+lift1={:.1}ms",
-                    t0.elapsed().as_secs_f64() * 1000.0
-                );
-            }
+            // Prepare lift0, lift1 (and lift2) concurrently up front, instead of lift0's
+            // preflight on the GPU thread and lift1's only after lift0 (~40 ms of idle GPU).
+            let h0 = spawn_lift_prep(0)?;
+            let h1 = spawn_lift_prep(1)?;
             let mut pending: Option<std::thread::JoinHandle<Result<RecursionProverJob>>> =
                 if num_segments > 2 {
                     Some(spawn_lift_prep(2)?)
                 } else {
                     None
                 };
+            let mut acc = finish_lift(h0, 0)?;
+            let mut cur = finish_lift(h1, 1)?;
+            if *VERBOSE {
+                eprintln!(
+                    "[composite_to_succinct] reorder: lift0+lift1={:.1}ms",
+                    t0.elapsed().as_secs_f64() * 1000.0
+                );
+            }
             for k in 1..num_segments {
                 let t_step = std::time::Instant::now();
                 // background: prepare join(acc, cur)

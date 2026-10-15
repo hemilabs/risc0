@@ -67,9 +67,39 @@ __device__ void nextStepExec(ExecContext* ctx, uint32_t cycle, uint32_t count) {
 __global__ void parStepExec(ExecContext* ctx) {
   uint32_t cycle = blockDim.x * blockIdx.x + threadIdx.x;
   uint32_t count = ctx->trace->numCycles;
-  if (cycle < count) {
+  // isParSafe == 2 marks the head of a chain whose rows the host already computed.
+  if (cycle < count && ctx->trace->cycles[cycle].isParSafe != 2) {
     nextStepExec(ctx, cycle, count);
   }
+}
+
+// Rows of sequential chains executed on the host (see risc0_circuit_recursion_cpu_chains).
+struct HostChains {
+  const uint32_t* heads;    // chain head cycles
+  uint32_t numHeads;
+  const uint32_t* cycles;   // one entry per chain row
+  const uint32_t* rows;     // numRows * dataCols raw Fp, row-major
+  const uint32_t* womIdx;   // numRows
+  const uint32_t* womRows;  // numRows * kMaxWomRowsPerCycle * 5
+  uint32_t numRows;
+  uint32_t dataCols;
+};
+
+__global__ void markHostChains(ExecContext* ctx, const uint32_t* heads, uint32_t n) {
+  uint32_t i = blockDim.x * blockIdx.x + threadIdx.x;
+  if (i < n) ctx->trace->cycles[heads[i]].isParSafe = 2;
+}
+
+__global__ void scatterHostChains(ExecContext* ctx, const uint32_t* cycles, const uint32_t* rows,
+                                  const uint32_t* womIdx, const WomArgumentRow* womRows,
+                                  uint32_t n, uint32_t dataCols) {
+  uint32_t t = blockDim.x * blockIdx.x + threadIdx.x;
+  if (t >= n * dataCols) return;
+  uint32_t i = t / dataCols, k = t % dataCols, c = cycles[i];
+  reinterpret_cast<uint32_t*>(ctx->buffers.data)[(size_t)k * ctx->totalCycles + c] = rows[t];
+  if (k == 0) ctx->womIndex[c] = womIdx[i];
+  if (k < kMaxWomRowsPerCycle)
+    ctx->womRows[(size_t)c * kMaxWomRowsPerCycle + k] = womRows[(size_t)i * kMaxWomRowsPerCycle + k];
 }
 
 __global__ void fwdStepExec(ExecContext* ctx) {
@@ -325,6 +355,37 @@ struct HostExecContext {
     // Buffers are owned by g_execCache, not freed here
   }
 
+  // Upload the host-executed chains, write their rows, and mark their heads to be skipped.
+  void applyHostChains(const HostChains* hc) {
+    nvtx3::scoped_range range("hostChains");
+    static_assert(sizeof(WomArgumentRow) == 20, "WomArgumentRow layout");
+    if (hc->dataCols != 128) throw std::runtime_error("host chains: unexpected data width");
+    static thread_local uint32_t* dBuf = nullptr;
+    static thread_local size_t dCap = 0;
+    size_t nWords = hc->numHeads + (size_t)hc->numRows * (2 + hc->dataCols + kMaxWomRowsPerCycle * 5);
+    if (nWords > dCap) {
+      if (dBuf) cudaFree(dBuf);
+      CUDA_OK(cudaMalloc(&dBuf, nWords * 4));
+      dCap = nWords;
+    }
+    uint32_t* dHeads = dBuf;
+    uint32_t* dCycles = dHeads + hc->numHeads;
+    uint32_t* dRows = dCycles + hc->numRows;
+    uint32_t* dWomIdx = dRows + (size_t)hc->numRows * hc->dataCols;
+    uint32_t* dWomRows = dWomIdx + hc->numRows;
+    CUDA_OK(cudaMemcpyAsync(dHeads, hc->heads, hc->numHeads * 4, cudaMemcpyHostToDevice, stream));
+    CUDA_OK(cudaMemcpyAsync(dCycles, hc->cycles, hc->numRows * 4, cudaMemcpyHostToDevice, stream));
+    CUDA_OK(cudaMemcpyAsync(dRows, hc->rows, (size_t)hc->numRows * hc->dataCols * 4, cudaMemcpyHostToDevice, stream));
+    CUDA_OK(cudaMemcpyAsync(dWomIdx, hc->womIdx, hc->numRows * 4, cudaMemcpyHostToDevice, stream));
+    CUDA_OK(cudaMemcpyAsync(dWomRows, hc->womRows, (size_t)hc->numRows * kMaxWomRowsPerCycle * 20, cudaMemcpyHostToDevice, stream));
+    markHostChains<<<(hc->numHeads + 255) / 256, 256, 0, stream>>>(ctx, dHeads, hc->numHeads);
+    uint32_t n = hc->numRows * hc->dataCols;
+    scatterHostChains<<<(n + 255) / 256, 256, 0, stream>>>(
+        ctx, dCycles, dRows, dWomIdx, reinterpret_cast<const WomArgumentRow*>(dWomRows), hc->numRows, hc->dataCols);
+    // Ordered before doStepExec on `stream`; the host buffers are pageable (staged at enqueue)
+    // and the caller keeps them alive until this witgen call returns (it syncs).
+  }
+
   void doStepExec(uint32_t mode) {
     nvtx3::scoped_range range("stepExec");
     switch (mode) {
@@ -461,18 +522,53 @@ struct HostAccumContext {
 
 extern "C" {
 
+const char* risc0_circuit_recursion_cuda_witgen_chains(uint32_t mode,
+                                                       ExecBuffers* buffers,
+                                                       PreflightTrace* trace,
+                                                       uint32_t totalCycles,
+                                                       const HostChains* hostChains);
+
 const char* risc0_circuit_recursion_cuda_witgen(uint32_t mode,
                                                 ExecBuffers* buffers,
                                                 PreflightTrace* trace,
                                                 uint32_t totalCycles) {
+  return risc0_circuit_recursion_cuda_witgen_chains(mode, buffers, trace, totalCycles, nullptr);
+}
+
+const char* risc0_circuit_recursion_cuda_witgen_chains(uint32_t mode,
+                                                       ExecBuffers* buffers,
+                                                       PreflightTrace* trace,
+                                                       uint32_t totalCycles,
+                                                       const HostChains* hostChains) {
   try {
     // Sync all GPU work before accessing buffers written by external streams
     // (e.g., Rust HAL's persistent stream). hipMemcpy doesn't reliably
     // synchronize across all streams on ROCm.
     CUDA_OK(cudaDeviceSynchronize());
     HostExecContext ctx(buffers, trace, totalCycles);
+    if (hostChains && hostChains->numHeads && mode == kStepModeParallel) {
+      ctx.applyHostChains(hostChains);
+    }
     ctx.doStepExec(mode);
     ctx.verifyWom(mode);
+  } catch (const std::exception& err) {
+    return strdup(err.what());
+  }
+  return nullptr;
+}
+
+// Load the recursion witgen/accum kernels (CUDA lazy loading) off the GPU thread, without
+// launching anything: cudaFuncGetAttributes forces the module load.
+const char* risc0_circuit_recursion_cuda_warmup() {
+  try {
+    cudaFuncAttributes attr;
+    CUDA_OK(cudaFuncGetAttributes(&attr, parStepExec));
+    CUDA_OK(cudaFuncGetAttributes(&attr, injectWomBacks));
+    CUDA_OK(cudaFuncGetAttributes(&attr, parStepVerifyWom));
+    CUDA_OK(cudaFuncGetAttributes(&attr, markHostChains));
+    CUDA_OK(cudaFuncGetAttributes(&attr, scatterHostChains));
+    CUDA_OK(cudaFuncGetAttributes(&attr, parStepComputeAccum));
+    CUDA_OK(cudaFuncGetAttributes(&attr, parStepVerifyAccum));
   } catch (const std::exception& err) {
     return strdup(err.what());
   }
