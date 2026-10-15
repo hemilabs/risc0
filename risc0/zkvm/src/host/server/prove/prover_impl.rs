@@ -1099,19 +1099,27 @@ impl ProverServer for ProverImpl {
     ) -> Result<ProveInfo> {
         #[allow(unused_mut)]
         let mut env = env;
-        // Intel: succinct/groth16 receipts are faster with po2=21 segments
-        // (half the lifts and joins; composite proving costs ~8% more per
-        // cycle at po2=21, a net -0.4 s for a 12M-cycle guest). Only when the
-        // caller did not choose a segment size; RISC0_INTEL_SUCCINCT_SEGMENT_PO2
-        // overrides (e.g. 20 keeps the executor default).
-        #[cfg(feature = "intel")]
+        // Intel and CUDA: succinct/groth16 receipts are faster with po2=21 segments (half the
+        // lifts and joins; composite proving costs more per cycle at po2=21, but less than the
+        // recursion it saves). Only when the caller did not choose a segment size;
+        // RISC0_SUCCINCT_SEGMENT_PO2 (or RISC0_INTEL_SUCCINCT_SEGMENT_PO2) overrides, e.g. 20
+        // keeps the executor default. CUDA needs ~28 GB of device memory for po2=21.
+        #[cfg(any(feature = "intel", feature = "cuda"))]
         if self.opts.receipt_kind != ReceiptKind::Composite && env.segment_limit_po2.is_none() {
-            let po2 = std::env::var("RISC0_INTEL_SUCCINCT_SEGMENT_PO2")
+            let po2 = std::env::var("RISC0_SUCCINCT_SEGMENT_PO2")
+                .or_else(|_| std::env::var("RISC0_INTEL_SUCCINCT_SEGMENT_PO2"))
                 .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(21)
-                .min(self.opts.max_segment_po2 as u32);
-            env.segment_limit_po2 = Some(po2);
+                .and_then(|v| v.parse::<u32>().ok());
+            #[cfg(feature = "cuda")]
+            let po2 = po2.or_else(|| {
+                let total = risc0_zkp::hal::cuda::device_total_memory().unwrap_or(0);
+                (total >= 30 << 30).then_some(21)
+            });
+            #[cfg(feature = "intel")]
+            let po2 = po2.or(Some(21));
+            if let Some(po2) = po2 {
+                env.segment_limit_po2 = Some(po2.min(self.opts.max_segment_po2 as u32));
+            }
         }
         let session = ExecutorImpl::from_elf(env, elf)?.run()?;
         self.prove_session(ctx, &session)

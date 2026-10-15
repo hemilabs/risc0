@@ -166,6 +166,14 @@ pub fn exclusive() -> ReentrantMutexGuard<'static, ()> {
     singleton().lock()
 }
 
+/// Total memory of CUDA device 0 in bytes, or None if there is no usable device.
+pub fn device_total_memory() -> Option<usize> {
+    cust::init(CudaFlags::empty()).ok()?;
+    cust::device::Device::get_device(0)
+        .and_then(|d| d.total_memory())
+        .ok()
+}
+
 #[derive(Clone, Copy)]
 #[repr(transparent)]
 pub struct DeviceElem(pub BabyBearElem);
