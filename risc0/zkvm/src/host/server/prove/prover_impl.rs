@@ -66,6 +66,24 @@ use crate::{
     SuccinctReceiptVerifierParameters, UnionClaim, Unknown, VerifierContext, WorkClaim,
 };
 
+/// CUDA context creation and module loading (`cuda_warmup`), started by [ProverImpl::new] so it
+/// overlaps guest execution and taken by the first session that proves. Warmup only loads
+/// modules early, so a session that finds it taken (or done) simply skips it.
+#[cfg(feature = "cuda")]
+enum CudaWarmup {
+    NotStarted,
+    Running(std::thread::JoinHandle<()>),
+    Taken,
+}
+
+#[cfg(feature = "cuda")]
+static CUDA_WARMUP: std::sync::Mutex<CudaWarmup> = std::sync::Mutex::new(CudaWarmup::NotStarted);
+
+#[cfg(feature = "cuda")]
+fn spawn_cuda_warmup() -> std::thread::JoinHandle<()> {
+    std::thread::spawn(risc0_circuit_rv32im::prove::cuda_warmup)
+}
+
 /// An implementation of a Prover that runs locally.
 pub struct ProverImpl {
     opts: ProverOpts,
@@ -79,6 +97,13 @@ impl ProverImpl {
         #[cfg(feature = "intel")]
         if std::env::var("RISC0_INTEL_EARLY_INIT").as_deref() != Ok("0") {
             risc0_zkp::hal::intel::start_background_init(vec![opts.max_segment_po2 as u32]);
+        }
+        #[cfg(feature = "cuda")]
+        {
+            let mut warmup = CUDA_WARMUP.lock().unwrap();
+            if matches!(*warmup, CudaWarmup::NotStarted) {
+                *warmup = CudaWarmup::Running(spawn_cuda_warmup());
+            }
         }
         Self { opts }
     }
@@ -479,12 +504,17 @@ impl ProverImpl {
             return self.prove_session_parallel_stark(ctx, session);
         }
 
-        // Trigger CUDA module loading in background while first segment is prepared.
-        // With primary context, this is a one-time cost amortized across all segments.
+        // CUDA module loading, joined before the first segment: the thread ProverImpl::new
+        // started, or a new one if none was (a one-time cost per process).
         #[cfg(feature = "cuda")]
-        let mut warmup_handle = Some(std::thread::spawn(|| {
-            risc0_circuit_rv32im::prove::cuda_warmup();
-        }));
+        let mut warmup_handle = {
+            let mut warmup = CUDA_WARMUP.lock().unwrap();
+            match std::mem::replace(&mut *warmup, CudaWarmup::Taken) {
+                CudaWarmup::Running(handle) => Some(handle),
+                CudaWarmup::NotStarted => Some(spawn_cuda_warmup()),
+                CudaWarmup::Taken => None,
+            }
+        };
         #[cfg(feature = "rocm")]
         let mut warmup_handle = Some(std::thread::spawn(|| {
             risc0_circuit_rv32im::prove::rocm_warmup();

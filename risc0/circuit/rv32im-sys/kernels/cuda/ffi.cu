@@ -223,10 +223,14 @@ struct DeviceCache {
     size_t total_pf_bytes = cycles_bytes + txns_bytes + bigint_bytes;
 
     // Grow pinned staging buffer if needed.
+    // Grow with 25% headroom: the trace grows over the first segments, and every regrow
+    // costs ~20 ms of pinning on the critical path plus cudaFreeHost's implicit device
+    // synchronization.
     if (total_pf_bytes > cap_h_pinned_preflight) {
+      size_t want = total_pf_bytes + total_pf_bytes / 4;
       if (h_pinned_preflight) CUDA_OK(cudaFreeHost(h_pinned_preflight));
-      CUDA_OK(cudaHostAlloc(&h_pinned_preflight, total_pf_bytes, cudaHostAllocDefault));
-      cap_h_pinned_preflight = total_pf_bytes;
+      CUDA_OK(cudaHostAlloc(&h_pinned_preflight, want, cudaHostAllocDefault));
+      cap_h_pinned_preflight = want;
     }
 
     // Copy to pinned staging (fast CPU memcpy).
