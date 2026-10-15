@@ -551,6 +551,7 @@ struct MsmScratch {
   DeviceBuffer<uint8_t> buckets; // [window][bucket] Xyzz (G1 or G2)
   DeviceBuffer<uint8_t> partial; // [window][segment] Xyzz
   size_t cap = 0;
+  size_t sorted_n = 0; // the scalar count msm_sort last sorted
 
   MsmScratch(sycl::queue& q, size_t max_n)
       : hist(q, (size_t)MSM_WINDOWS * MSM_BUCKETS)
@@ -561,24 +562,12 @@ struct MsmScratch {
       , cap(max_n) {}
 };
 
-// sum_i scalars[i] * points[i] for canonical (non-Montgomery) scalars.
-template <class F>
-Xyzz<F> msm(sycl::queue& q,
-            MsmScratch& sc,
-            const Affine<F>* points,
-            const Fr* scalars,
-            size_t n) {
-  using P = Xyzz<F>;
-  if (n > sc.cap)
-    throw std::runtime_error("groth16-intel: MSM larger than its scratch");
-  uint32_t* hist = sc.hist.ptr;
-  uint32_t* offset = sc.offset.ptr;
-  uint32_t* sorted = sc.sorted.ptr;
-  P* buckets = (P*)sc.buckets.ptr;
-  P* partial = (P*)sc.partial.ptr;
-  // With RISC0_GROTH16_INTEL_VERBOSE, time each step (waits after each).
-  auto t_step = std::chrono::steady_clock::now();
-  auto step = [&](const char* name) {
+// With RISC0_GROTH16_INTEL_VERBOSE, a step's time (waiting for the queue after each).
+struct MsmSteps {
+  sycl::queue& q;
+  std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
+
+  void operator()(const char* name) {
     if (!verbose())
       return;
     q.wait();
@@ -586,17 +575,28 @@ Xyzz<F> msm(sycl::queue& q,
     std::fprintf(stderr,
                  "[groth16-intel]   msm %s: %.1f ms\n",
                  name,
-                 std::chrono::duration<double, std::milli>(now - t_step).count());
-    t_step = now;
-  };
+                 std::chrono::duration<double, std::milli>(now - t).count());
+    t = now;
+  }
+};
 
-  // 1. Count the points per (window, bucket).
+// Sort the digits of scalars[0..n) (canonical, not Montgomery) by window and bucket, for msm_sorted:
+// sc.sorted then holds, per window, the scalar indices of each bucket b in
+// [sc.offset[b], sc.hist[b]). MSMs over the same scalars share one sort: A, B1, B2 and C use the
+// witness. Points at infinity are not left out here (msm_sorted's additions skip them), so that
+// the sort depends on the scalars alone; they are 6-8% of A, B1 and B2 and none of C and H.
+inline void msm_sort(sycl::queue& q, MsmScratch& sc, const Fr* scalars, size_t n) {
+  if (n > sc.cap)
+    throw std::runtime_error("groth16-intel: MSM larger than its scratch");
+  uint32_t* hist = sc.hist.ptr;
+  uint32_t* offset = sc.offset.ptr;
+  uint32_t* sorted = sc.sorted.ptr;
+  MsmSteps step{q};
+
+  // 1. Count the scalars per (window, bucket).
   q.memset(hist, 0, sizeof(uint32_t) * MSM_WINDOWS * MSM_BUCKETS);
   q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> id) {
-    size_t i = id[0];
-    if (points[i].is_inf())
-      return;
-    Fr s = scalars[i];
+    Fr s = scalars[id[0]];
     for (uint32_t w = 0; w < MSM_WINDOWS; w++) {
       uint32_t d = scalar_digit(s, w);
       if (d) {
@@ -622,14 +622,12 @@ Xyzz<F> msm(sycl::queue& q,
     }
   });
   step("prefix sums");
-  // 3. Scatter the point indices into their buckets.
-  q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> id) {
-    size_t i = id[0];
-    if (points[i].is_inf())
-      return;
-    Fr s = scalars[i];
-    for (uint32_t w = 0; w < MSM_WINDOWS; w++) {
-      uint32_t d = scalar_digit(s, w);
+  // 3. Scatter the scalar indices into their buckets, a window at a time: each launch writes into
+  // its window's n entries (22 MB for the witness) rather than all 16 windows' at once.
+  for (uint32_t w = 0; w < MSM_WINDOWS; w++) {
+    q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> id) {
+      size_t i = id[0];
+      uint32_t d = scalar_digit(scalars[i], w);
       if (d) {
         sycl::atomic_ref<uint32_t,
                          sycl::memory_order::relaxed,
@@ -639,9 +637,25 @@ Xyzz<F> msm(sycl::queue& q,
         uint32_t pos = a.fetch_add(1u);
         sorted[(size_t)w * n + pos] = (uint32_t)i;
       }
-    }
-  });
+    });
+  }
   step("scatter");
+  sc.sorted_n = n;
+}
+
+// sum_i scalars[i] * points[i - first] over the scalars msm_sort sorted last, for i >= first (C's
+// scalars are the witness's from index 6 on).
+template <class F>
+Xyzz<F> msm_sorted(sycl::queue& q, MsmScratch& sc, const Affine<F>* points, size_t first) {
+  using P = Xyzz<F>;
+  const size_t n = sc.sorted_n;
+  const uint32_t* hist = sc.hist.ptr;
+  const uint32_t* offset = sc.offset.ptr;
+  const uint32_t* sorted = sc.sorted.ptr;
+  P* buckets = (P*)sc.buckets.ptr;
+  P* partial = (P*)sc.partial.ptr;
+  MsmSteps step{q};
+
   // 4. Sum each bucket. hist now holds each bucket's end.
   heavy_parallel_for(q, (size_t)MSM_WINDOWS * MSM_BUCKETS, [=](sycl::id<1> id) {
     size_t wb = id[0];
@@ -649,8 +663,11 @@ Xyzz<F> msm(sycl::queue& q,
     uint32_t start = offset[wb], end = hist[wb];
     P acc = P::inf();
     const uint32_t* idx = sorted + w * n;
-    for (uint32_t k = start; k < end; k++)
-      acc = acc.add_affine(points[idx[k]]);
+    for (uint32_t k = start; k < end; k++) {
+      size_t i = idx[k];
+      if (i >= first)
+        acc = acc.add_affine(points[i - first]);
+    }
     buckets[wb] = acc;
   });
   step("buckets");
@@ -684,6 +701,17 @@ Xyzz<F> msm(sycl::queue& q,
       result = result.add(host[(size_t)w * MSM_SEGS + s]);
   }
   return result;
+}
+
+// sum_i scalars[i] * points[i] for canonical (non-Montgomery) scalars.
+template <class F>
+Xyzz<F> msm(sycl::queue& q,
+            MsmScratch& sc,
+            const Affine<F>* points,
+            const Fr* scalars,
+            size_t n) {
+  msm_sort(q, sc, scalars, n);
+  return msm_sorted<F>(q, sc, points, 0);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -832,21 +860,28 @@ public:
       Timer t("MSM H");
       h = msm<Fp>(q, scratch, srs.h.ptr, a, n);
     }
+    // A, B1, B2 and C have the same scalars, the witness (C's from wn - c.len on): sort them once.
+    if (srs.a.len != wn || srs.b_g1.len != wn || srs.b_g2.len != wn || srs.c.len > wn)
+      throw std::runtime_error("groth16-intel: A, B1, B2 or C does not match the witness");
+    {
+      Timer t("witness sort");
+      msm_sort(q, scratch, w, wn);
+    }
     {
       Timer t("MSM A");
-      ra = msm<Fp>(q, scratch, srs.a.ptr, w, srs.a.len);
+      ra = msm_sorted<Fp>(q, scratch, srs.a.ptr, 0);
     }
     {
       Timer t("MSM B1");
-      rb1 = msm<Fp>(q, scratch, srs.b_g1.ptr, w, srs.b_g1.len);
+      rb1 = msm_sorted<Fp>(q, scratch, srs.b_g1.ptr, 0);
     }
     {
       Timer t("MSM B2");
-      rb2 = msm<Fp2>(q, scratch, srs.b_g2.ptr, w, srs.b_g2.len);
+      rb2 = msm_sorted<Fp2>(q, scratch, srs.b_g2.ptr, 0);
     }
     {
       Timer t("MSM C");
-      rc = msm<Fp>(q, scratch, srs.c.ptr, w + (wn - srs.c.len), srs.c.len);
+      rc = msm_sorted<Fp>(q, scratch, srs.c.ptr, wn - srs.c.len);
     }
 
     // Remove the fuzz (the file's results are already negated) and blind.
