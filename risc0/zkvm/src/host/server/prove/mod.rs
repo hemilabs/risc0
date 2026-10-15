@@ -501,7 +501,14 @@ pub(crate) fn exclusive_gpu() -> impl Sized {}
 ///
 /// Not called on ROCm, whose HAL has the same pool and its own `clear_buffer_pool`: that path was not
 /// tested when this was added.
+///
+/// On Intel the HAL's pool (capped at 16 GiB) is released the same way: neither the Groth16 prover
+/// nor the keccak eval_check allocates through it. Without this, a session's keccak proofs and its
+/// wrap, and the next session's segments, ran with the segments' idle buffers still cached and
+/// spilled into shared system memory on an Arc Pro B70 (32 GB), at 2-5x the time.
 pub(crate) fn release_hal_buffers() {
     #[cfg(feature = "cuda")]
     risc0_zkp::hal::cuda::clear_buffer_pool();
+    #[cfg(feature = "intel")]
+    risc0_zkp::hal::intel::release_idle_buffers();
 }
