@@ -155,6 +155,24 @@ pub trait Hal {
         self.zk_shift(io, count);
     }
 
+    /// True if `commit_coeffs_lde` is implemented for columns of `2^po2` rows.
+    fn has_commit_coeffs_lde(&self, _po2: usize) -> bool {
+        false
+    }
+
+    /// Fused commit: `coeffs` = the natural-order zk-shifted coefficients of `witness`
+    /// (what `make_coeffs` + `PolyGroup::new`'s bit-reverse produce) and `evaluated` = the
+    /// INV_RATE LDE (what `batch_expand_into_evaluate_ntt` produces). `witness` is unchanged.
+    fn commit_coeffs_lde(
+        &self,
+        _coeffs: &Self::Buffer<Self::Elem>,
+        _evaluated: &Self::Buffer<Self::Elem>,
+        _witness: &Self::Buffer<Self::Elem>,
+        _count: usize,
+    ) {
+        unimplemented!()
+    }
+
     /// `dst = interpolate_zk_shift(src)`, leaving `src` unchanged.
     fn batch_interpolate_ntt_zk_shift_from(
         &self,
@@ -727,6 +745,51 @@ mod testutil {
         let nodes = hal.alloc_digest("nodes", rows * 2);
         let matrix = generate_elem(&hal, &mut rng, matrix_size);
         hal.hash_rows(&nodes.slice(rows, rows), &matrix);
+    }
+
+    /// `commit_coeffs_lde` against the unfused path (`make_coeffs` + `PolyGroup::new`) on the
+    /// CPU HAL.
+    pub(crate) fn commit_coeffs_lde<H: Hal>(hal_gpu: H) {
+        let mut rng = rand::rng();
+        let hal_cpu = CpuHal::new(hal_gpu.get_hash_suite().clone());
+        let lg_blowup = crate::core::log2_ceil(INV_RATE);
+        for (po2, count) in [
+            (10, 1),
+            (10, 7),
+            (11, 64),
+            (13, 33),
+            (16, 211),
+            (18, 5),
+            (21, 2),
+        ] {
+            assert!(hal_gpu.has_commit_coeffs_lde(po2));
+            let size = (1 << po2) * count;
+            let values: Vec<H::Elem> = (0..size).map(|_| H::Elem::random(&mut rng)).collect();
+            let witness = hal_gpu.copy_from_elem("witness", &values);
+            let coeffs = hal_gpu.alloc_elem("coeffs", size);
+            let evaluated = hal_gpu.alloc_elem("evaluated", size * INV_RATE);
+            hal_gpu.commit_coeffs_lde(&coeffs, &evaluated, &witness, count);
+
+            let cpu_witness = hal_cpu.copy_from_elem("witness", &values);
+            let cpu_coeffs = hal_cpu.alloc_elem("coeffs", size);
+            hal_cpu.batch_interpolate_ntt_zk_shift_from(&cpu_coeffs, &cpu_witness, count);
+            let cpu_evaluated = hal_cpu.alloc_elem("evaluated", size * INV_RATE);
+            hal_cpu.batch_expand_into_evaluate_ntt(&cpu_evaluated, &cpu_coeffs, count, lg_blowup);
+            hal_cpu.batch_bit_reverse(&cpu_coeffs, count);
+
+            assert!(
+                witness.to_vec() == values,
+                "po2={po2} count={count}: witness changed"
+            );
+            assert!(
+                coeffs.to_vec() == cpu_coeffs.to_vec(),
+                "po2={po2} count={count}: coeffs differ"
+            );
+            assert!(
+                evaluated.to_vec() == cpu_evaluated.to_vec(),
+                "po2={po2} count={count}: evaluated differs"
+            );
+        }
     }
 
     pub(crate) fn zk_shift<H: Hal>(hal_gpu: H) {

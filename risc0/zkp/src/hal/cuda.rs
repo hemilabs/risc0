@@ -391,7 +391,6 @@ pub type CudaHalSha256 = CudaHal<CudaHashSha256>;
 pub type CudaHalPoseidon2 = CudaHal<CudaHashPoseidon2>;
 pub type CudaHalPoseidon254 = CudaHal<CudaHashPoseidon254>;
 
-
 // ====================== VMM (cuMemCreate / cuMemMap) allocator ======================
 // Composes a large contiguous virtual allocation from smaller physical chunks,
 // defeating device-memory fragmentation at po2=22 on 24 GB cards.
@@ -560,9 +559,7 @@ mod vmm {
             let mut base: CUdeviceptr = 0;
             let rc = unsafe { cuMemAddressReserve(&mut base, reserve_size, gran, 0, 0) };
             if rc != 0 {
-                tracing::warn!(
-                    "vmm: cuMemAddressReserve({reserve_size}) failed rc={rc}"
-                );
+                tracing::warn!("vmm: cuMemAddressReserve({reserve_size}) failed rc={rc}");
                 return None;
             }
 
@@ -587,7 +584,8 @@ mod vmm {
                 if rc != 0 {
                     tracing::warn!(
                         "vmm: cuMemCreate(chunk {} / {} bytes at offset {offset}) failed rc={rc}",
-                        this_chunk, reserve_size
+                        this_chunk,
+                        reserve_size
                     );
                     drop(alloc);
                     return None;
@@ -600,8 +598,7 @@ mod vmm {
                     drop(alloc);
                     return None;
                 }
-                let rc =
-                    unsafe { cuMemSetAccess(chunk_ptr, this_chunk, &access, 1) };
+                let rc = unsafe { cuMemSetAccess(chunk_ptr, this_chunk, &access, 1) };
                 if rc != 0 {
                     tracing::warn!("vmm: cuMemSetAccess failed rc={rc}");
                     unsafe { cuMemUnmap(chunk_ptr, this_chunk) };
@@ -691,16 +688,12 @@ impl RawBuffer {
             // every free byte is up for grabs as physical chunks.
             BUFFER_POOL.with(|pool| pool.borrow_mut().drain());
             trim_cuda_mempool();
-            if let Some(allocation) =
-                vmm::VmmAllocation::new(size, 0, vmm::VMM_CHUNK_SIZE)
-            {
+            if let Some(allocation) = vmm::VmmAllocation::new(size, 0, vmm::VMM_CHUNK_SIZE) {
                 // Wrap the VMM virtual pointer in a DeviceBuffer so the rest
                 // of this file keeps working unchanged. We never drop the
                 // DeviceBuffer itself (that would call cuMemFree on a VMM
                 // pointer, which is illegal); the VmmAllocation owns cleanup.
-                let dptr = DevicePointer::<u8>::from_raw(
-                    allocation.ptr as cust::sys::CUdeviceptr,
-                );
+                let dptr = DevicePointer::<u8>::from_raw(allocation.ptr as cust::sys::CUdeviceptr);
                 let buf = unsafe { DeviceBuffer::<u8>::from_raw_parts(dptr, size) };
                 return Self {
                     name,
@@ -1156,25 +1149,54 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
         }
     }
 
+    fn has_commit_coeffs_lde(&self, po2: usize) -> bool {
+        // The range sppark_commit_coeffs_lde is verified bit-exact for.
+        (10..=23).contains(&po2)
+    }
+
+    fn commit_coeffs_lde(
+        &self,
+        coeffs: &Self::Buffer<Self::Elem>,
+        evaluated: &Self::Buffer<Self::Elem>,
+        witness: &Self::Buffer<Self::Elem>,
+        count: usize,
+    ) {
+        let row_size = witness.size() / count;
+        assert_eq!(row_size * count, witness.size());
+        assert_eq!(coeffs.size(), witness.size());
+        let n_bits = log2_ceil(row_size);
+        assert_eq!(row_size, 1 << n_bits);
+        let lg_blowup = log2_ceil(crate::INV_RATE);
+        assert_eq!(evaluated.size(), witness.size() << lg_blowup);
+        assert!(n_bits + lg_blowup < Self::Elem::MAX_ROU_PO2);
+        Self::sync_stream();
+        let err = unsafe {
+            sppark_commit_coeffs_lde(
+                coeffs.as_device_ptr(),
+                evaluated.as_device_ptr(),
+                witness.as_device_ptr(),
+                n_bits as u32,
+                lg_blowup as u32,
+                count as u32,
+            )
+        };
+        if err.code != 0 {
+            panic!("Failure during commit_coeffs_lde: {err}");
+        }
+    }
+
     fn batch_bit_reverse(&self, io: &Self::Buffer<Self::Elem>, count: usize) {
         let row_size = io.size() / count;
         assert_eq!(row_size * count, io.size());
         let bits = log2_ceil(row_size);
         assert_eq!(row_size, 1 << bits);
-        let io_size = io.size();
-
-        extern "C" {
-            fn risc0_zkp_cuda_batch_bit_reverse(
-                io: DevicePointer<u8>,
-                bits: u32,
-                count: u32,
-            ) -> *const std::os::raw::c_char;
+        Self::sync_stream();
+        let err = unsafe {
+            sppark_batch_bit_reverse_tiled(io.as_device_ptr(), bits as u32, count as u32)
+        };
+        if err.code != 0 {
+            panic!("Failure during batch_bit_reverse_tiled: {err}");
         }
-
-        ffi_wrap(|| unsafe {
-            risc0_zkp_cuda_batch_bit_reverse(io.as_device_ptr(), bits as u32, io_size as u32)
-        })
-        .unwrap();
     }
 
     fn batch_evaluate_any(
@@ -1370,7 +1392,7 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
         Self::sync_stream();
 
         let err = unsafe {
-            sppark_batch_iNTT_zk_shift(
+            sppark_batch_iNTT_zk_shift_fused(
                 io.as_device_ptr(),
                 n_bits.try_into().unwrap(),
                 count.try_into().unwrap(),
@@ -1865,5 +1887,10 @@ mod tests {
     #[test]
     fn mix_poly_coeffs() {
         testutil::mix_poly_coeffs(CudaHalSha256::new());
+    }
+
+    #[test]
+    fn commit_coeffs_lde() {
+        testutil::commit_coeffs_lde(CudaHalSha256::new());
     }
 }

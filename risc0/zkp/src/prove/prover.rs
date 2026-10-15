@@ -20,7 +20,7 @@ use risc0_core::{
 };
 
 use crate::{
-    core::{digest::Digest, poly::poly_interpolate},
+    core::{digest::Digest, log2_ceil, poly::poly_interpolate},
     hal::{Buffer, CircuitHal, Hal},
     prove::{fri::fri_prove, poly_group::PolyGroup, write_iop::WriteIOP},
     taps::TapSet,
@@ -118,14 +118,28 @@ impl<'a, H: Hal> Prover<'a, H> {
             "Attempted to commit group {} more than once",
             self.taps.group_name(tap_group_index)
         );
-        let coeffs = make_coeffs(self.hal, witness, group_size);
-        let group_ref = self.groups[tap_group_index].insert(PolyGroup::new(
-            self.hal,
-            coeffs,
-            group_size,
-            self.cycles,
-            witness.name(),
-        ));
+        let fused = !cfg!(feature = "circuit_debug")
+            && self.hal.has_commit_coeffs_lde(log2_ceil(self.cycles));
+        let group = if fused {
+            let coeffs = self.hal.alloc_elem("coeffs", witness.size());
+            let evaluated = self
+                .hal
+                .alloc_elem("evaluated", group_size * self.cycles * INV_RATE);
+            self.hal
+                .commit_coeffs_lde(&coeffs, &evaluated, witness, group_size);
+            PolyGroup::new_with_evaluated(
+                self.hal,
+                coeffs,
+                evaluated,
+                group_size,
+                self.cycles,
+                witness.name(),
+            )
+        } else {
+            let coeffs = make_coeffs(self.hal, witness, group_size);
+            PolyGroup::new(self.hal, coeffs, group_size, self.cycles, witness.name())
+        };
+        let group_ref = self.groups[tap_group_index].insert(group);
 
         group_ref.merkle.commit(&mut self.iop);
 
