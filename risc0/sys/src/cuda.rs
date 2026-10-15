@@ -74,6 +74,27 @@ extern "C" {
         poly_count: u32,
     ) -> sppark::Error;
 
+    pub fn sppark_batch_iNTT_zk_shift_fused(
+        d_inout: DevicePointer<u8>,
+        lg_domain_size: u32,
+        poly_count: u32,
+    ) -> sppark::Error;
+
+    pub fn sppark_batch_bit_reverse_tiled(
+        d_inout: DevicePointer<u8>,
+        lg_domain_size: u32,
+        poly_count: u32,
+    ) -> sppark::Error;
+
+    pub fn sppark_commit_coeffs_lde(
+        d_coeffs: DevicePointer<u8>,
+        d_evaluated: DevicePointer<u8>,
+        d_witness: DevicePointer<u8>,
+        lg_domain_size: u32,
+        lg_blowup: u32,
+        poly_count: u32,
+    ) -> sppark::Error;
+
     pub fn sppark_batch_bit_reverse(
         d_inout: DevicePointer<u8>,
         lg_domain_size: u32,

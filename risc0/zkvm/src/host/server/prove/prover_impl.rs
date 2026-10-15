@@ -66,6 +66,39 @@ use crate::{
     SuccinctReceiptVerifierParameters, UnionClaim, Unknown, VerifierContext, WorkClaim,
 };
 
+/// CUDA context creation and module loading (`cuda_warmup`), started by [ProverImpl::new] so it
+/// overlaps guest execution and taken by the first session that proves. Warmup only loads
+/// modules early, so a session that finds it taken (or done) simply skips it.
+#[cfg(feature = "cuda")]
+enum CudaWarmup {
+    NotStarted,
+    Running(std::thread::JoinHandle<()>),
+    Taken,
+}
+
+#[cfg(feature = "cuda")]
+static CUDA_WARMUP: std::sync::Mutex<CudaWarmup> = std::sync::Mutex::new(CudaWarmup::NotStarted);
+
+#[cfg(feature = "cuda")]
+fn spawn_cuda_warmup() -> std::thread::JoinHandle<()> {
+    std::thread::spawn(risc0_circuit_rv32im::prove::cuda_warmup)
+}
+
+/// The recursion kernels' module loading, started by a non-composite session.
+#[cfg(feature = "cuda")]
+static CUDA_REC_WARMUP: std::sync::Mutex<CudaWarmup> =
+    std::sync::Mutex::new(CudaWarmup::NotStarted);
+
+/// Wait for the recursion warmup, if one is running (it makes no GPU launches and takes no
+/// GPU lock, so this cannot deadlock against a session).
+#[cfg(feature = "cuda")]
+fn join_cuda_rec_warmup() {
+    let warmup = std::mem::replace(&mut *CUDA_REC_WARMUP.lock().unwrap(), CudaWarmup::Taken);
+    if let CudaWarmup::Running(handle) = warmup {
+        let _ = handle.join();
+    }
+}
+
 /// An implementation of a Prover that runs locally.
 pub struct ProverImpl {
     opts: ProverOpts,
@@ -79,6 +112,13 @@ impl ProverImpl {
         #[cfg(feature = "intel")]
         if std::env::var("RISC0_INTEL_EARLY_INIT").as_deref() != Ok("0") {
             risc0_zkp::hal::intel::start_background_init(vec![opts.max_segment_po2 as u32]);
+        }
+        #[cfg(feature = "cuda")]
+        {
+            let mut warmup = CUDA_WARMUP.lock().unwrap();
+            if matches!(*warmup, CudaWarmup::NotStarted) {
+                *warmup = CudaWarmup::Running(spawn_cuda_warmup());
+            }
         }
         Self { opts }
     }
@@ -479,12 +519,28 @@ impl ProverImpl {
             return self.prove_session_parallel_stark(ctx, session);
         }
 
-        // Trigger CUDA module loading in background while first segment is prepared.
-        // With primary context, this is a one-time cost amortized across all segments.
+        // CUDA module loading, joined before the first segment: the thread ProverImpl::new
+        // started, or a new one if none was (a one-time cost per process).
         #[cfg(feature = "cuda")]
-        let mut warmup_handle = Some(std::thread::spawn(|| {
-            risc0_circuit_rv32im::prove::cuda_warmup();
-        }));
+        let mut warmup_handle = {
+            let mut warmup = CUDA_WARMUP.lock().unwrap();
+            match std::mem::replace(&mut *warmup, CudaWarmup::Taken) {
+                CudaWarmup::Running(handle) => Some(handle),
+                CudaWarmup::NotStarted => Some(spawn_cuda_warmup()),
+                CudaWarmup::Taken => None,
+            }
+        };
+        // Recursion kernels load on their own thread, once per process, off the composite's
+        // path; the first lift joins it.
+        #[cfg(feature = "cuda")]
+        if self.opts.receipt_kind != ReceiptKind::Composite {
+            let mut warmup = CUDA_REC_WARMUP.lock().unwrap();
+            if matches!(*warmup, CudaWarmup::NotStarted) {
+                *warmup = CudaWarmup::Running(std::thread::spawn(
+                    risc0_circuit_recursion::prove::cuda_warmup,
+                ));
+            }
+        }
         #[cfg(feature = "rocm")]
         let mut warmup_handle = Some(std::thread::spawn(|| {
             risc0_circuit_rv32im::prove::rocm_warmup();
@@ -743,7 +799,7 @@ impl ProverImpl {
                                 segment_verifier_parameters: params,
                                 ..VerifierContext::empty()
                             })
-                            .context("verify segment")?;
+                            .with_context(|| format!("verify segment {prev_seg_idx}"))?;
                     }
                     Ok(receipt)
                 }));
@@ -804,7 +860,7 @@ impl ProverImpl {
                         segment_verifier_parameters: verify_params.clone(),
                         ..VerifierContext::empty()
                     })
-                    .context("verify segment")?;
+                    .with_context(|| format!("verify segment (last) {}", receipt.index))?;
             }
             segments.push(receipt);
         }
@@ -1043,19 +1099,27 @@ impl ProverServer for ProverImpl {
     ) -> Result<ProveInfo> {
         #[allow(unused_mut)]
         let mut env = env;
-        // Intel: succinct/groth16 receipts are faster with po2=21 segments
-        // (half the lifts and joins; composite proving costs ~8% more per
-        // cycle at po2=21, a net -0.4 s for a 12M-cycle guest). Only when the
-        // caller did not choose a segment size; RISC0_INTEL_SUCCINCT_SEGMENT_PO2
-        // overrides (e.g. 20 keeps the executor default).
-        #[cfg(feature = "intel")]
+        // Intel and CUDA: succinct/groth16 receipts are faster with po2=21 segments (half the
+        // lifts and joins; composite proving costs more per cycle at po2=21, but less than the
+        // recursion it saves). Only when the caller did not choose a segment size;
+        // RISC0_SUCCINCT_SEGMENT_PO2 (or RISC0_INTEL_SUCCINCT_SEGMENT_PO2) overrides, e.g. 20
+        // keeps the executor default. CUDA needs ~28 GB of device memory for po2=21.
+        #[cfg(any(feature = "intel", feature = "cuda"))]
         if self.opts.receipt_kind != ReceiptKind::Composite && env.segment_limit_po2.is_none() {
-            let po2 = std::env::var("RISC0_INTEL_SUCCINCT_SEGMENT_PO2")
+            let po2 = std::env::var("RISC0_SUCCINCT_SEGMENT_PO2")
+                .or_else(|_| std::env::var("RISC0_INTEL_SUCCINCT_SEGMENT_PO2"))
                 .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(21)
-                .min(self.opts.max_segment_po2 as u32);
-            env.segment_limit_po2 = Some(po2);
+                .and_then(|v| v.parse::<u32>().ok());
+            #[cfg(feature = "cuda")]
+            let po2 = po2.or_else(|| {
+                let total = risc0_zkp::hal::cuda::device_total_memory().unwrap_or(0);
+                (total >= 30 << 30).then_some(21)
+            });
+            #[cfg(feature = "intel")]
+            let po2 = po2.or(Some(21));
+            if let Some(po2) = po2 {
+                env.segment_limit_po2 = Some(po2.min(self.opts.max_segment_po2 as u32));
+            }
         }
         let session = ExecutorImpl::from_elf(env, elf)?.run()?;
         self.prove_session(ctx, &session)
@@ -1346,6 +1410,9 @@ impl ProverServer for ProverImpl {
             ProverOpts::succinct()
         };
 
+        #[cfg(feature = "cuda")]
+        join_cuda_rec_warmup();
+
         // Cross-segment pipelining: bg thread does CPU preflight of next lift
         // while main thread runs the GPU join of the previous one. Validated
         // ~3% E2E win at composite=42 segs.
@@ -1386,20 +1453,24 @@ impl ProverServer for ProverImpl {
                 make_succinct_receipt(prover, receipt, claim)
             };
             let t0 = std::time::Instant::now();
-            let mut acc = lift_with_opts(&segments[0], recursion_opts.clone())?;
-            let mut cur = finish_lift(spawn_lift_prep(1)?, 1)?;
-            if *VERBOSE {
-                eprintln!(
-                    "[composite_to_succinct] reorder: lift0+lift1={:.1}ms",
-                    t0.elapsed().as_secs_f64() * 1000.0
-                );
-            }
+            // Prepare lift0, lift1 (and lift2) concurrently up front, instead of lift0's
+            // preflight on the GPU thread and lift1's only after lift0 (~40 ms of idle GPU).
+            let h0 = spawn_lift_prep(0)?;
+            let h1 = spawn_lift_prep(1)?;
             let mut pending: Option<std::thread::JoinHandle<Result<RecursionProverJob>>> =
                 if num_segments > 2 {
                     Some(spawn_lift_prep(2)?)
                 } else {
                     None
                 };
+            let mut acc = finish_lift(h0, 0)?;
+            let mut cur = finish_lift(h1, 1)?;
+            if *VERBOSE {
+                eprintln!(
+                    "[composite_to_succinct] reorder: lift0+lift1={:.1}ms",
+                    t0.elapsed().as_secs_f64() * 1000.0
+                );
+            }
             for k in 1..num_segments {
                 let t_step = std::time::Instant::now();
                 // background: prepare join(acc, cur)

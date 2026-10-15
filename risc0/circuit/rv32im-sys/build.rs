@@ -290,14 +290,13 @@ fn build_cuda_kernels() {
     let use_native_arch =
         env::var_os("NVCC_PREPEND_FLAGS").is_none() && env::var_os("NVCC_APPEND_FLAGS").is_none();
 
-    // Step 1: Compile eval_check_combined.cu WITHOUT -dc (standalone mode).
-    // This allows NVCC to inline the 20 device functions in the poly_fp call
-    // chain, eliminating cross-function ABI overhead (register save/restore,
-    // parameter passing through local memory). With -dc, NVCC generates
-    // relocatable code that cannot inline across function boundaries.
+    // Step 1: Compile eval_check_ef.cu WITHOUT -dc (standalone mode). It is the
+    // generated evalfast kernel (kernels/cuda/evalfast/regen.py); ROCm keeps
+    // eval_check_combined.cu. Standalone, NVCC sees the whole poly_fp call chain
+    // in one translation unit; with -dc it would compile relocatable code.
     //
-    // CACHING: eval_check compilation takes ~24 minutes. We cache it under a key over
-    // everything it can read (see `eval_check_sources_key`) and the compiler, and skip
+    // CACHING: eval_check compilation takes a few minutes. We cache it under a key over
+    // everything it can read (see `eval_check_ef_sources_key`) and the compiler, and skip
     // recompilation when only other .cu files changed.
     // Use a stable cache dir (target/release/) instead of OUT_DIR which changes
     // with each cargo build hash.
@@ -310,7 +309,7 @@ fn build_cuda_kernels() {
     std::fs::create_dir_all(&cache_dir).unwrap();
     let msvc = risc0_build_kernel::is_msvc_target();
     let obj_ext = risc0_build_kernel::object_extension();
-    let eval_check_obj = out_dir.join(format!("eval_check_combined_standalone.{obj_ext}"));
+    let eval_check_obj = out_dir.join(format!("eval_check_ef_standalone.{obj_ext}"));
     remove_legacy_cache_files(
         &cache_dir,
         &[
@@ -335,6 +334,7 @@ fn build_cuda_kernels() {
         .arg("-diag-suppress=177")
         .arg("-diag-suppress=550")
         .arg("-diag-suppress=2922")
+        .arg("--expt-relaxed-constexpr")
         .arg("-I")
         .arg(&cuda_root)
         .arg("-I")
@@ -345,7 +345,7 @@ fn build_cuda_kernels() {
         cmd.arg("-arch=native");
     }
     cmd.arg("-c") // compile only, NO --device-c
-        .arg("eval_check_combined.cu");
+        .arg("eval_check_ef.cu");
 
     // Key the cache on the sources, the whole command (but its output path), and what nvcc
     // reads from outside it (the NVCC_*_FLAGS that carry the GPU architecture list, the host
@@ -358,15 +358,15 @@ fn build_cuda_kernels() {
         String::new()
     };
     let key = risc0_build_kernel::hash_key(&[
-        "rv32im-cuda-eval-check-v1",
-        &eval_check_sources_key(&cuda_root, &cxx_root, &sppark_root),
+        "rv32im-cuda-eval-check-ef-v1",
+        &eval_check_ef_sources_key(&cuda_root, &cxx_root, &sppark_root),
         &risc0_build_kernel::command_key(&cmd),
         &risc0_build_kernel::nvcc_environment_key(),
         &native_key,
     ]);
     risc0_build_kernel::cached_compile(
         &cache_dir,
-        "eval_check_combined_standalone",
+        "eval_check_ef_standalone",
         obj_ext,
         &key,
         &eval_check_obj,
@@ -375,10 +375,10 @@ fn build_cuda_kernels() {
                 .arg("-o")
                 .arg(out)
                 .status()
-                .expect("failed to run nvcc for eval_check_combined.cu");
+                .expect("failed to run nvcc for eval_check_ef.cu");
             assert!(
                 status.success(),
-                "nvcc failed for eval_check_combined.cu (standalone mode)"
+                "nvcc failed for eval_check_ef.cu (standalone mode)"
             );
         },
     );
@@ -422,7 +422,8 @@ fn build_cuda_kernels() {
                     | "eval_check_1.cu"
                     | "eval_check_2.cu"
                     | "eval_check_3.cu"
-                    | "eval_check_combined.cu"
+                    | "eval_check_combined.cu" // ROCm only
+                    | "eval_check_ef.cu"
                     | "eval_check_kernel.cu"  // RDC-only, not used by NVIDIA
                     | "witgen_combined.cu"
             )
@@ -579,6 +580,7 @@ fn build_rocm_kernels() {
                     | "eval_check_2.cu"
                     | "eval_check_3.cu"
                     | "eval_check_combined.cu"
+                    | "eval_check_ef.cu" // CUDA only
                     | "eval_check_kernel.cu"
                     | "witgen_combined.cu"
                     | "ffi_supra.cu"
@@ -717,13 +719,39 @@ const EVAL_CHECK_LOCAL_SOURCES: &[&str] = &[
     "kernels/cuda/eval_check.cuh",
 ];
 
+/// The files in kernels/cuda that the CUDA eval_check_ef.cu reads.
+const EVAL_CHECK_EF_LOCAL_SOURCES: &[&str] = &[
+    "kernels/cuda/eval_check_ef.cu",
+    "kernels/cuda/ef_fp.h",
+    "kernels/cuda/ef_fpext.h",
+];
+
+/// [`eval_check_sources_key`] for the CUDA eval_check_ef.cu.
+fn eval_check_ef_sources_key(cuda_root: &str, cxx_root: &str, sppark_root: &str) -> String {
+    include_roots_sources_key(
+        EVAL_CHECK_EF_LOCAL_SOURCES,
+        cuda_root,
+        cxx_root,
+        sppark_root,
+    )
+}
+
 /// A key over every file the eval_check compile can read: [`EVAL_CHECK_LOCAL_SOURCES`], and
 /// what it can include from the include roots -- all but their `.c`/`.cc`/`.cpp`/`.cu`
 /// files, except sppark's `.cu` files, which its headers include (e.g. `ntt/ntt.cuh`
 /// includes `kernels.cu`). Leaving out risc0-sys's own translation units means editing one of
 /// them (e.g. its ffi.cu) doesn't trigger this ~24-minute compile.
 fn eval_check_sources_key(cuda_root: &str, cxx_root: &str, sppark_root: &str) -> String {
-    let files: Vec<&Path> = EVAL_CHECK_LOCAL_SOURCES.iter().map(Path::new).collect();
+    include_roots_sources_key(EVAL_CHECK_LOCAL_SOURCES, cuda_root, cxx_root, sppark_root)
+}
+
+fn include_roots_sources_key(
+    local: &[&str],
+    cuda_root: &str,
+    cxx_root: &str,
+    sppark_root: &str,
+) -> String {
+    let files: Vec<&Path> = local.iter().map(Path::new).collect();
     let sppark_root = Path::new(sppark_root);
     risc0_build_kernel::kernel_sources_key(
         &[Path::new(cuda_root), Path::new(cxx_root), sppark_root],

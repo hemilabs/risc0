@@ -29,6 +29,21 @@ use anyhow::Result;
 use risc0_core::scope;
 
 static VERBOSE: LazyLock<bool> = LazyLock::new(|| std::env::var("RISC0_VERBOSE").is_ok());
+
+/// Free the host preflight trace (~124 MB at po2=20) after the eval_check launch. On CUDA, on a
+/// background thread: inline it holds up the next segment by 10-20 ms with the GPU idle. The
+/// trace is plain host memory (nothing in it is registered with the device).
+fn drop_trace(trace: PreflightTrace) {
+    #[cfg(feature = "cuda")]
+    if let Err(err) = std::thread::Builder::new()
+        .name("drop_trace".into())
+        .spawn(move || drop(trace))
+    {
+        tracing::debug!("drop_trace: inline ({err})");
+    }
+    #[cfg(not(feature = "cuda"))]
+    drop(trace);
+}
 use risc0_zkp::{
     adapter::{CircuitInfo as _, PROOF_SYSTEM_INFO},
     core::digest::Digest,
@@ -336,7 +351,7 @@ where
             let result = prover.finalize_with_hook(
                 &[&mix.buf, &global_clone],
                 circuit_hal.as_ref(),
-                move || drop(trace),
+                move || drop_trace(trace),
             );
 
             if *VERBOSE {
@@ -463,7 +478,7 @@ where
         let mut deferred = prover.start_finalize_with_hook(
             &[&mix.buf, &global_clone],
             circuit_hal.as_ref(),
-            move || drop(trace),
+            move || drop_trace(trace),
         );
         // Keep globals alive until eval_check completes.
         deferred.keep_alive_buf(mix.buf);

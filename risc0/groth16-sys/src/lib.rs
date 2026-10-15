@@ -83,6 +83,46 @@ pub fn release() -> anyhow::Result<()> {
     ffi_wrap(|| unsafe { risc0_groth16_cuda_release() })
 }
 
+/// The process-wide pinned host buffer for the witness (see `risc0_groth16_cuda_host_buffer`),
+/// held exclusively: other callers wait until this is dropped, so keep it until the `prove`
+/// that reads it has returned.
+#[cfg(feature = "cuda")]
+pub struct HostBuffer {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    ptr: *mut u8,
+    len: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl HostBuffer {
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr
+    }
+
+    /// The buffer as `len / 32` 32-byte field elements (four little-endian u64 limbs).
+    pub fn as_limbs_mut(&mut self) -> &mut [[u64; 4]] {
+        // Safety: ptr is a page-aligned allocation of at least len bytes that only the holder
+        // of the guard uses.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut [u64; 4], self.len / 32) }
+    }
+}
+
+/// Lock the pinned witness buffer, growing it to at least `bytes`.
+#[cfg(feature = "cuda")]
+pub fn host_buffer(bytes: usize) -> anyhow::Result<HostBuffer> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let ptr = unsafe { risc0_groth16_cuda_host_buffer(bytes) };
+    if ptr.is_null() {
+        return Err(anyhow!("cudaMallocHost({bytes}) failed"));
+    }
+    Ok(HostBuffer {
+        _guard: guard,
+        ptr,
+        len: bytes,
+    })
+}
+
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 pub fn prove(prover_params: &ProverParams, setup_params: &SetupParams) -> anyhow::Result<()> {
     let setup_params = RawSetupParams {
@@ -137,6 +177,9 @@ extern "C" {
 
     #[cfg(any(feature = "cuda", feature = "rocm"))]
     fn risc0_groth16_cuda_release() -> *const c_char;
+
+    #[cfg(feature = "cuda")]
+    fn risc0_groth16_cuda_host_buffer(bytes: usize) -> *mut u8;
 
     #[cfg(all(any(feature = "cuda", feature = "rocm"), feature = "setup"))]
     fn risc0_groth16_cuda_setup(params: *const RawSetupParams) -> *const c_char;

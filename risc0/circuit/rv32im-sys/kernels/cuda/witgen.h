@@ -51,29 +51,36 @@ struct ExecContext {
   size_t cycle;
 };
 
+// Non-virtual buffer objects (kind tag + inline dispatch) and power-of-two row masking.
+// The original used virtual load/store (an indirect ABI call per access) and a 64-bit
+// modulo per load (__cuda_sm20_rem_u64). Same values are loaded/stored.
 struct BufferObj {
-  __device__ virtual Val load(ExecContext& ctx, size_t col, size_t back) = 0;
-  __device__ virtual void store(ExecContext& ctx, size_t col, Val val) = 0;
+  __device__ BufferObj(int kind) : kind(kind) {}
+  __device__ inline Val load(ExecContext& ctx, size_t col, size_t back);
+  __device__ inline void store(ExecContext& ctx, size_t col, Val val);
+  int kind;  // 0 = mutable, 1 = global
 };
 
 struct MutableBufObj : public BufferObj {
   __device__ MutableBufObj(Buffer& buf, size_t zeroBack = 0)
-      : buf(buf), preDataBuf{nullptr, 0, 0, false}, zeroBack(zeroBack) {}
+      : BufferObj(0), buf(buf), preDataBuf{nullptr, 0, 0, false}, zeroBack(zeroBack) {}
   __device__ MutableBufObj(Buffer& buf, Buffer preDataBuf, size_t zeroBack = 0)
-      : buf(buf), preDataBuf(preDataBuf), zeroBack(zeroBack) {}
+      : BufferObj(0), buf(buf), preDataBuf(preDataBuf), zeroBack(zeroBack) {}
 
-  __device__ Val load(ExecContext& ctx, size_t col, size_t back) override {
+  __device__ __forceinline__ Val load(ExecContext& ctx, size_t col, size_t back) {
     if (zeroBack && col > zeroBack && back > 0) {
       return 0;
     }
-    size_t backRow = (buf.rows + ctx.cycle - back) % buf.rows;
+    size_t rows = buf.rows;
+    size_t backRow = ((rows & (rows - 1)) == 0) ? ((ctx.cycle - back) & (rows - 1))
+                                                 : ((rows + ctx.cycle - back) % rows);
     if (back > 0 && preDataBuf.buf) {
       return preDataBuf.get(backRow, col);
     }
     return buf.get(backRow, col);
   }
 
-  __device__ void store(ExecContext& ctx, size_t col, Val val) override {
+  __device__ __forceinline__ void store(ExecContext& ctx, size_t col, Val val) {
     buf.set(ctx.cycle, col, val);
   }
 
@@ -85,18 +92,30 @@ struct MutableBufObj : public BufferObj {
 using MutableBuf = MutableBufObj*;
 
 struct GlobalBufObj : public BufferObj {
-  __device__ GlobalBufObj(Buffer& buf) : buf(buf) {}
+  __device__ GlobalBufObj(Buffer& buf) : BufferObj(1), buf(buf) {}
 
-  __device__ Val load(ExecContext& ctx, size_t col, size_t back) override {
+  __device__ __forceinline__ Val load(ExecContext& ctx, size_t col, size_t back) {
     return buf.get(0, col);
   }
 
-  __device__ void store(ExecContext& ctx, size_t col, Val val) override {
+  __device__ __forceinline__ void store(ExecContext& ctx, size_t col, Val val) {
     buf.set(0, col, val);
   }
 
   Buffer& buf;
 };
+
+__device__ __forceinline__ Val BufferObj::load(ExecContext& ctx, size_t col, size_t back) {
+  if (kind == 0)
+    return static_cast<MutableBufObj*>(this)->load(ctx, col, back);
+  return static_cast<GlobalBufObj*>(this)->load(ctx, col, back);
+}
+__device__ __forceinline__ void BufferObj::store(ExecContext& ctx, size_t col, Val val) {
+  if (kind == 0)
+    static_cast<MutableBufObj*>(this)->store(ctx, col, val);
+  else
+    static_cast<GlobalBufObj*>(this)->store(ctx, col, val);
+}
 
 using GlobalBuf = GlobalBufObj*;
 
@@ -126,12 +145,49 @@ __device__ inline Val neg_0(Val x) {
   return -x;
 }
 
+// Addition-chain Fp inverse x^(P-2), P-2 = 0x77FFFFFF: 37 mul/sqr instead of the ~59 of
+// the generic square-and-multiply pow(). Same value (incl. inv(0) = 0).
+__device__ __forceinline__ Fp inv_chain(Fp x) {
+  Fp x2 = x * x;
+  Fp x3 = x2 * x;
+  Fp x6 = x3 * x3;
+  Fp y3 = x6 * x;  // x^(2^3-1)
+  Fp t = y3;
+#pragma unroll
+  for (int i = 0; i < 3; i++) t = t * t;
+  Fp y6 = t * y3;  // x^(2^6-1)
+  Fp z = y3;
+#pragma unroll
+  for (int i = 0; i < 4; i++) z = z * z;
+  z = z * y3;  // x^0x77
+#pragma unroll
+  for (int k = 0; k < 4; k++) {
+#pragma unroll
+    for (int i = 0; i < 6; i++) z = z * z;
+    z = z * y6;
+  }
+  return z;
+}
+
+__device__ __forceinline__ FpExt inv_ext_chain(FpExt in) {
+  const Fp* a = in.elems;
+  const Fp beta(11), nbeta(Fp::P - 11);
+  Fp b0 = a[0] * a[0] + beta * (a[1] * (a[3] + a[3]) - a[2] * a[2]);
+  Fp b2 = a[0] * (a[2] + a[2]) - a[1] * a[1] + beta * (a[3] * a[3]);
+  Fp c = b0 * b0 + beta * b2 * b2;
+  Fp ic = inv_chain(c);
+  b0 *= ic;
+  b2 *= ic;
+  return FpExt(a[0] * b0 + beta * a[2] * b2, -a[1] * b0 + nbeta * a[3] * b2,
+               -a[0] * b2 + a[2] * b0, a[1] * b2 - a[3] * b0);
+}
+
 __device__ inline Val inv_0(Val x) {
-  return inv(x);
+  return inv_chain(x);
 }
 
 __device__ inline ExtVal inv_0(ExtVal x) {
-  return inv(x);
+  return inv_ext_chain(x);
 }
 
 __device__ inline Val bitAnd(Val a, Val b) {

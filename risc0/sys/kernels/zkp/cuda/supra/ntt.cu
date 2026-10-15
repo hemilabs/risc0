@@ -315,3 +315,70 @@ sppark_batch_bit_reverse(fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly_c
 
   return RustError{cudaSuccess};
 }
+
+#ifndef __HIPCC__
+// Fused commit NTT and its batched helpers (ntt_x.cuh; CUDA only, untested on ROCm).
+#include "ntt_x.cuh"
+
+// Batched iNTT + zk-shift: the per-column iNTTs, then one zk-shift kernel over all columns.
+extern "C" RustError::by_value
+sppark_batch_iNTT_zk_shift_fused(fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly_count) {
+  if (lg_domain_size == 0)
+    return RustError{cudaSuccess};
+  uint32_t domain_size = 1U << lg_domain_size;
+  const gpu_t& gpu = select_gpu(-1);
+  try {
+    for (uint32_t i = 0; i < poly_count; i++) {
+      NTT::Base_dev_ptr(gpu, &d_inout[(uint64_t)i * domain_size], lg_domain_size,
+                        NTT::InputOutputOrder::NR, NTT::Direction::inverse, NTT::Type::standard);
+    }
+    nttx_batch_zk_shift(gpu, d_inout, lg_domain_size, poly_count);
+    gpu.sync();
+  } catch (const cuda_error& e) {
+    gpu.sync();
+    return RustError{e.code(), e.what()};
+  } catch (...) {
+    return RustError(cudaErrorUnknown, "Generic exception");
+  }
+  return RustError{cudaSuccess};
+}
+
+// Batched, tiled bit reversal of poly_count columns.
+extern "C" RustError::by_value
+sppark_batch_bit_reverse_tiled(fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly_count) {
+  if (lg_domain_size == 0 || poly_count == 0)
+    return RustError{cudaSuccess};
+  const gpu_t& gpu = select_gpu(-1);
+  try {
+    bitrev_batched(gpu, d_inout, lg_domain_size, poly_count);
+    gpu.sync();
+  } catch (const cuda_error& e) {
+    gpu.sync();
+    return RustError{e.code(), e.what()};
+  } catch (...) {
+    return RustError(cudaErrorUnknown, "Generic exception");
+  }
+  return RustError{cudaSuccess};
+}
+
+// Fused commit: d_coeffs = the natural-order zk-shifted coefficients of d_witness and
+// d_evaluated = their 2^lg_blowup LDE, in L2-sized column chunks. d_witness is unchanged.
+// Bit-exact with iNTT + zk-shift + expand + NTT + bit reversal for lg_domain_size 10..23.
+extern "C" RustError::by_value
+sppark_commit_coeffs_lde(fr_t* d_coeffs, fr_t* d_evaluated, const fr_t* d_witness,
+                         uint32_t lg_domain_size, uint32_t lg_blowup, uint32_t poly_count) {
+  if (lg_domain_size < 10 || lg_domain_size > 23)
+    return RustError(cudaErrorInvalidValue, "commit_coeffs_lde: lg_domain_size out of range");
+  const gpu_t& gpu = select_gpu(-1);
+  try {
+    nttx_commit(gpu, d_coeffs, d_evaluated, d_witness, lg_domain_size, lg_blowup, poly_count, 0);
+    gpu.sync();
+  } catch (const cuda_error& e) {
+    gpu.sync();
+    return RustError{e.code(), e.what()};
+  } catch (...) {
+    return RustError(cudaErrorUnknown, "Generic exception");
+  }
+  return RustError{cudaSuccess};
+}
+#endif // __HIPCC__

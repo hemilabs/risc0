@@ -79,6 +79,8 @@ struct CachedGraph {
     nodes: Box<dyn NodesInterface>,
     signals: Vec<usize>,
     input_mapping: InputSignalsInfo,
+    /// The graph compiled for `witness_fast` (None if it doesn't qualify).
+    fast: Option<super::witness_fast::Program>,
 }
 
 // Safety: The underlying Nodes<U254, VecNodes> contains Vec<Node>, Field<U254>, HashMap —
@@ -94,10 +96,18 @@ fn get_cached_graph(graph_path: &Path) -> &'static CachedGraph {
         let (nodes, signals, input_mapping) =
             deserialize_witnesscalc_graph_from_bytes(&graph_bytes)
                 .expect("failed to deserialize circom graph");
+        let fast = nodes
+            .as_any()
+            .downcast_ref::<Nodes<U254, VecNodes>>()
+            .and_then(|nodes| super::witness_fast::compile(nodes, &signals));
+        if fast.is_none() {
+            tracing::warn!("groth16: the fast witness evaluator does not support this graph");
+        }
         CachedGraph {
             nodes,
             signals,
             input_mapping,
+            fast,
         }
     })
 }
@@ -173,13 +183,18 @@ pub(crate) fn shrink_wrap(seal_bytes: &[u8]) -> Result<Seal> {
     }
 }
 
-struct CalcWitness {
-    witness: Vec<wtns_file::FieldElement<32>>,
+enum CalcWitness {
+    Vec(Vec<wtns_file::FieldElement<32>>),
+    /// Canonical little-endian values in the pinned buffer, held until the prove has read it.
+    Pinned(risc0_groth16_sys::HostBuffer),
 }
 
 impl CalcWitness {
     fn as_ptr(&self) -> *const u8 {
-        self.witness.as_ptr() as *const u8
+        match self {
+            CalcWitness::Vec(w) => w.as_ptr() as *const u8,
+            CalcWitness::Pinned(buf) => buf.as_ptr(),
+        }
     }
 }
 
@@ -214,6 +229,13 @@ fn calc_witness(graph: &CachedGraph, inputs: &str) -> Result<CalcWitness> {
         }
     }
 
+    if let Some(program) = graph.fast.as_ref() {
+        let mut buf = risc0_groth16_sys::host_buffer(graph.signals.len() * 32)
+            .context("failed to allocate the pinned witness buffer")?;
+        super::witness_fast::eval(program, nodes, &input_vec, buf.as_limbs_mut());
+        return Ok(CalcWitness::Pinned(buf));
+    }
+
     // Evaluate the witness graph directly (skip WTNS encode/decode roundtrip).
     // Temporarily redirect stdout to suppress circom_witnesscalc's println! calls
     // which add ~100-500ms of terminal I/O overhead.
@@ -239,7 +261,7 @@ fn calc_witness(graph: &CachedGraph, inputs: &str) -> Result<CalcWitness> {
         })
         .collect();
 
-    Ok(CalcWitness { witness })
+    Ok(CalcWitness::Vec(witness))
 }
 
 /// RAII guard that redirects stdout to /dev/null and restores on drop.

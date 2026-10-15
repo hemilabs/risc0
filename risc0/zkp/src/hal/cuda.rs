@@ -166,6 +166,14 @@ pub fn exclusive() -> ReentrantMutexGuard<'static, ()> {
     singleton().lock()
 }
 
+/// Total memory of CUDA device 0 in bytes, or None if there is no usable device.
+pub fn device_total_memory() -> Option<usize> {
+    cust::init(CudaFlags::empty()).ok()?;
+    cust::device::Device::get_device(0)
+        .and_then(|d| d.total_memory())
+        .ok()
+}
+
 #[derive(Clone, Copy)]
 #[repr(transparent)]
 pub struct DeviceElem(pub BabyBearElem);
@@ -391,7 +399,6 @@ pub type CudaHalSha256 = CudaHal<CudaHashSha256>;
 pub type CudaHalPoseidon2 = CudaHal<CudaHashPoseidon2>;
 pub type CudaHalPoseidon254 = CudaHal<CudaHashPoseidon254>;
 
-
 // ====================== VMM (cuMemCreate / cuMemMap) allocator ======================
 // Composes a large contiguous virtual allocation from smaller physical chunks,
 // defeating device-memory fragmentation at po2=22 on 24 GB cards.
@@ -560,9 +567,7 @@ mod vmm {
             let mut base: CUdeviceptr = 0;
             let rc = unsafe { cuMemAddressReserve(&mut base, reserve_size, gran, 0, 0) };
             if rc != 0 {
-                tracing::warn!(
-                    "vmm: cuMemAddressReserve({reserve_size}) failed rc={rc}"
-                );
+                tracing::warn!("vmm: cuMemAddressReserve({reserve_size}) failed rc={rc}");
                 return None;
             }
 
@@ -587,7 +592,8 @@ mod vmm {
                 if rc != 0 {
                     tracing::warn!(
                         "vmm: cuMemCreate(chunk {} / {} bytes at offset {offset}) failed rc={rc}",
-                        this_chunk, reserve_size
+                        this_chunk,
+                        reserve_size
                     );
                     drop(alloc);
                     return None;
@@ -600,8 +606,7 @@ mod vmm {
                     drop(alloc);
                     return None;
                 }
-                let rc =
-                    unsafe { cuMemSetAccess(chunk_ptr, this_chunk, &access, 1) };
+                let rc = unsafe { cuMemSetAccess(chunk_ptr, this_chunk, &access, 1) };
                 if rc != 0 {
                     tracing::warn!("vmm: cuMemSetAccess failed rc={rc}");
                     unsafe { cuMemUnmap(chunk_ptr, this_chunk) };
@@ -691,16 +696,12 @@ impl RawBuffer {
             // every free byte is up for grabs as physical chunks.
             BUFFER_POOL.with(|pool| pool.borrow_mut().drain());
             trim_cuda_mempool();
-            if let Some(allocation) =
-                vmm::VmmAllocation::new(size, 0, vmm::VMM_CHUNK_SIZE)
-            {
+            if let Some(allocation) = vmm::VmmAllocation::new(size, 0, vmm::VMM_CHUNK_SIZE) {
                 // Wrap the VMM virtual pointer in a DeviceBuffer so the rest
                 // of this file keeps working unchanged. We never drop the
                 // DeviceBuffer itself (that would call cuMemFree on a VMM
                 // pointer, which is illegal); the VmmAllocation owns cleanup.
-                let dptr = DevicePointer::<u8>::from_raw(
-                    allocation.ptr as cust::sys::CUdeviceptr,
-                );
+                let dptr = DevicePointer::<u8>::from_raw(allocation.ptr as cust::sys::CUdeviceptr);
                 let buf = unsafe { DeviceBuffer::<u8>::from_raw_parts(dptr, size) };
                 return Self {
                     name,
@@ -1156,25 +1157,54 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
         }
     }
 
+    fn has_commit_coeffs_lde(&self, po2: usize) -> bool {
+        // The range sppark_commit_coeffs_lde is verified bit-exact for.
+        (10..=23).contains(&po2)
+    }
+
+    fn commit_coeffs_lde(
+        &self,
+        coeffs: &Self::Buffer<Self::Elem>,
+        evaluated: &Self::Buffer<Self::Elem>,
+        witness: &Self::Buffer<Self::Elem>,
+        count: usize,
+    ) {
+        let row_size = witness.size() / count;
+        assert_eq!(row_size * count, witness.size());
+        assert_eq!(coeffs.size(), witness.size());
+        let n_bits = log2_ceil(row_size);
+        assert_eq!(row_size, 1 << n_bits);
+        let lg_blowup = log2_ceil(crate::INV_RATE);
+        assert_eq!(evaluated.size(), witness.size() << lg_blowup);
+        assert!(n_bits + lg_blowup < Self::Elem::MAX_ROU_PO2);
+        Self::sync_stream();
+        let err = unsafe {
+            sppark_commit_coeffs_lde(
+                coeffs.as_device_ptr(),
+                evaluated.as_device_ptr(),
+                witness.as_device_ptr(),
+                n_bits as u32,
+                lg_blowup as u32,
+                count as u32,
+            )
+        };
+        if err.code != 0 {
+            panic!("Failure during commit_coeffs_lde: {err}");
+        }
+    }
+
     fn batch_bit_reverse(&self, io: &Self::Buffer<Self::Elem>, count: usize) {
         let row_size = io.size() / count;
         assert_eq!(row_size * count, io.size());
         let bits = log2_ceil(row_size);
         assert_eq!(row_size, 1 << bits);
-        let io_size = io.size();
-
-        extern "C" {
-            fn risc0_zkp_cuda_batch_bit_reverse(
-                io: DevicePointer<u8>,
-                bits: u32,
-                count: u32,
-            ) -> *const std::os::raw::c_char;
+        Self::sync_stream();
+        let err = unsafe {
+            sppark_batch_bit_reverse_tiled(io.as_device_ptr(), bits as u32, count as u32)
+        };
+        if err.code != 0 {
+            panic!("Failure during batch_bit_reverse_tiled: {err}");
         }
-
-        ffi_wrap(|| unsafe {
-            risc0_zkp_cuda_batch_bit_reverse(io.as_device_ptr(), bits as u32, io_size as u32)
-        })
-        .unwrap();
     }
 
     fn batch_evaluate_any(
@@ -1207,6 +1237,7 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
                 shared_size: u32,
                 kernel_count: u32,
                 count: u32,
+                eval_count: u32,
             ) -> *const std::os::raw::c_char;
         }
 
@@ -1219,6 +1250,7 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
                 shared_size,
                 kernel_count as u32,
                 count as u32,
+                eval_count as u32,
             )
         })
         .unwrap();
@@ -1247,6 +1279,48 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
                 dst.as_device_ptr(),
                 src.as_device_ptr(),
                 idx as u32,
+                size as u32,
+                stride as u32,
+            )
+        })
+        .unwrap();
+    }
+
+    fn gather_samples(
+        &self,
+        dst: &Self::Buffer<Self::Elem>,
+        src: &Self::Buffer<Self::Elem>,
+        indices: &[usize],
+        size: usize,
+        stride: usize,
+    ) {
+        if indices.len() < 2 {
+            for (q, &idx) in indices.iter().enumerate() {
+                self.gather_sample(&dst.slice(q * size, size), src, idx, size, stride);
+            }
+            return;
+        }
+        let idxs: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
+        // copy_from is a synchronous copy on the legacy stream, which waits for the persistent
+        // stream: so idx_buf can go back to the pool right after the async launch below (the
+        // next copy into it waits for this kernel), as with the other temporaries here.
+        let idx_buf = self.copy_from_u32("gather_idx", &idxs);
+        extern "C" {
+            fn risc0_zkp_cuda_gather_samples(
+                dst: DevicePointer<u8>,
+                src: DevicePointer<u8>,
+                idxs: DevicePointer<u8>,
+                n: u32,
+                size: u32,
+                stride: u32,
+            ) -> *const std::os::raw::c_char;
+        }
+        ffi_wrap(|| unsafe {
+            risc0_zkp_cuda_gather_samples(
+                dst.as_device_ptr(),
+                src.as_device_ptr(),
+                idx_buf.as_device_ptr(),
+                idxs.len() as u32,
                 size as u32,
                 stride as u32,
             )
@@ -1326,7 +1400,7 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
         Self::sync_stream();
 
         let err = unsafe {
-            sppark_batch_iNTT_zk_shift(
+            sppark_batch_iNTT_zk_shift_fused(
                 io.as_device_ptr(),
                 n_bits.try_into().unwrap(),
                 count.try_into().unwrap(),
@@ -1653,39 +1727,47 @@ impl<CH: CudaHash + ?Sized> Hal for CudaHal<CH> {
         reg_combo_ids: &[u32],
         mix: &Self::ExtElem,
     ) {
-        let coeff_u = self.copy_from_extelem("coeff_u", coeff_u);
-        let combo_count = combo_count as u32;
-        let cycles = cycles as u32;
-        let regs_count = reg_sizes.len() as u32;
-        let reg_sizes = self.copy_from_u32("reg_sizes", reg_sizes);
-        let reg_combo_ids = self.copy_from_u32("reg_combo_ids", reg_combo_ids);
-        let mix = self.copy_from_extelem("mix", &[*mix]);
-
+        // Compute the per-element deltas on the host (coeff_u is host data) and apply them
+        // with one small parallel kernel, instead of a single-thread device loop. The
+        // temporaries are freed after the async launch; see gather_samples.
+        let mut deltas: std::collections::BTreeMap<u32, Self::ExtElem> =
+            std::collections::BTreeMap::new();
+        let mut cur = Self::ExtElem::ONE;
+        let mut pos = 0usize;
+        for (size, combo_id) in reg_sizes.iter().zip(reg_combo_ids.iter()) {
+            for j in 0..*size as usize {
+                let off = (cycles * *combo_id as usize + j) as u32;
+                let e = deltas.entry(off).or_insert(Self::ExtElem::ZERO);
+                *e += cur * coeff_u[pos + j];
+            }
+            cur *= *mix;
+            pos += *size as usize;
+        }
+        for _ in 0..Self::CHECK_SIZE {
+            let off = (cycles * combo_count) as u32;
+            let e = deltas.entry(off).or_insert(Self::ExtElem::ZERO);
+            *e += cur * coeff_u[pos];
+            pos += 1;
+            cur *= *mix;
+        }
+        let offs: Vec<u32> = deltas.keys().copied().collect();
+        let vals: Vec<Self::ExtElem> = deltas.values().copied().collect();
+        let offs_buf = self.copy_from_u32("combos_offs", &offs);
+        let vals_buf = self.copy_from_extelem("combos_deltas", &vals);
         extern "C" {
-            fn risc0_zkp_cuda_combos_prepare(
+            fn risc0_zkp_cuda_combos_sub(
                 combos: DevicePointer<u8>,
-                coeff_u: DevicePointer<u8>,
-                combo_count: u32,
-                cycles: u32,
-                regs_count: u32,
-                reg_sizes: DevicePointer<u8>,
-                reg_combo_ids: DevicePointer<u8>,
-                checkSize: u32,
-                mix: DevicePointer<u8>,
+                deltas: DevicePointer<u8>,
+                offsets: DevicePointer<u8>,
+                count: u32,
             ) -> *const std::os::raw::c_char;
         }
-
         ffi_wrap(|| unsafe {
-            risc0_zkp_cuda_combos_prepare(
+            risc0_zkp_cuda_combos_sub(
                 combos.as_device_ptr(),
-                coeff_u.as_device_ptr(),
-                combo_count,
-                cycles,
-                regs_count,
-                reg_sizes.as_device_ptr(),
-                reg_combo_ids.as_device_ptr(),
-                Self::CHECK_SIZE as u32,
-                mix.as_device_ptr(),
+                vals_buf.as_device_ptr(),
+                offs_buf.as_device_ptr(),
+                offs.len() as u32,
             )
         })
         .unwrap();
@@ -1776,6 +1858,11 @@ mod tests {
     }
 
     #[test]
+    fn hash_fold_tree_poseidon2() {
+        testutil::hash_fold_tree(CudaHalPoseidon2::new());
+    }
+
+    #[test]
     fn fri_fold() {
         testutil::fri_fold(CudaHalSha256::new());
     }
@@ -1813,5 +1900,10 @@ mod tests {
     #[test]
     fn mix_poly_coeffs() {
         testutil::mix_poly_coeffs(CudaHalSha256::new());
+    }
+
+    #[test]
+    fn commit_coeffs_lde() {
+        testutil::commit_coeffs_lde(CudaHalSha256::new());
     }
 }

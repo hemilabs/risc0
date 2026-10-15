@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc, LazyLock, Mutex,
+};
 
 use anyhow::{Context as _, Result};
 use risc0_circuit_recursion_sys::{RawPreflightTrace, StepMode};
@@ -76,11 +79,18 @@ pub(crate) fn host_ctrl_for(zkr: &Program) -> Arc<Vec<BabyBearElem>> {
     }
     let ctrl_size = CIRCUIT.ctrl_size();
     assert_eq!(ctrl_size, zkr.code_size);
+    // One column per task: contiguous writes (the row-major loop wrote with a 1 MB stride).
     let mut v = vec![BabyBearElem::ZERO; total_cycles * ctrl_size];
-    for i in 0..zkr.code_rows() {
-        for j in 0..ctrl_size {
-            v[j * total_cycles + i] = zkr.code[i * ctrl_size + j];
-        }
+    {
+        use rayon::prelude::*;
+        let rows = zkr.code_rows();
+        v.par_chunks_mut(total_cycles)
+            .enumerate()
+            .for_each(|(j, col)| {
+                for (i, x) in col[..rows].iter_mut().enumerate() {
+                    *x = zkr.code[i * ctrl_size + j];
+                }
+            });
     }
     let v = Arc::new(v);
     let mut cache = CTRL_CACHE.lock().unwrap();
@@ -124,6 +134,101 @@ fn first_mismatch(a: &[BabyBearElem], b: &[BabyBearElem]) -> Option<usize> {
     a.iter()
         .zip(b.iter())
         .position(|(x, y)| x.as_u32_montgomery() != y.as_u32_montgomery())
+}
+
+/// Rows of the long sequential (non-par-safe) witgen chains, computed on the host.
+///
+/// The device witgen runs each chain in one GPU thread; the longest lift chain is a
+/// 1439-cycle Poseidon2 sponge that costs ~23 ms of the ~26 ms stepExec. A host core runs
+/// it ~20x faster per step, in parallel with the others, off the GPU thread (`prepare`).
+pub(crate) struct HostChains {
+    pub heads: Vec<u32>,
+    pub cycles: Vec<u32>,
+    pub rows: Vec<u32>,
+    pub wom_idx: Vec<u32>,
+    pub wom_rows: Vec<u32>,
+}
+
+/// Chains at least this long run on the host.
+const HOST_CHAIN_MIN_LEN: usize = 16;
+
+/// When set, every witness generated with host chains is regenerated without them and compared
+/// (a test hook; see [crate::prove::set_host_chains_check]).
+pub(crate) static HOST_CHAINS_CHECK: AtomicBool = AtomicBool::new(false);
+/// How many witnesses the check compared.
+pub(crate) static HOST_CHAINS_CHECKED: AtomicUsize = AtomicUsize::new(0);
+
+/// Execute the chains of at least `HOST_CHAIN_MIN_LEN` cycles on the host. `None` if there are
+/// none, or if that fails (e.g. a chain writes a global): the device witgen then runs every
+/// chain itself, as without host chains.
+pub(crate) fn host_chains(zkr: &Program, preflight: &Preflight) -> Option<HostChains> {
+    match try_host_chains(zkr, preflight) {
+        Ok(chains) => chains,
+        Err(err) => {
+            tracing::debug!("host chains: falling back to device witgen: {err}");
+            None
+        }
+    }
+}
+
+fn try_host_chains(zkr: &Program, preflight: &Preflight) -> Result<Option<HostChains>> {
+    use risc0_circuit_recursion_sys::risc0_circuit_recursion_cpu_chains;
+    let min_len = HOST_CHAIN_MIN_LEN;
+    let cycles = &preflight.trace.cycles;
+    let n = cycles.len();
+    let mut chains: Vec<u32> = Vec::new();
+    let mut heads: Vec<u32> = Vec::new();
+    let mut start = 0usize;
+    let mut num_rows = 0usize;
+    for c in 1..=n {
+        if c == n || cycles[c].is_par_safe != 0 {
+            let len = c - start;
+            if len >= min_len {
+                chains.push(start as u32);
+                chains.push(len as u32);
+                heads.push(start as u32);
+                num_rows += len;
+            }
+            start = c;
+        }
+    }
+    if heads.is_empty() {
+        return Ok(None);
+    }
+    let total_cycles = 1usize << zkr.po2;
+    let data_cols = CIRCUIT.data_size();
+    assert_eq!(zkr.code.len(), zkr.code_rows() * zkr.code_size);
+    let raw_trace = RawPreflightTrace {
+        wom: preflight.trace.wom.as_ptr(),
+        cycles: cycles.as_ptr(),
+        iops: preflight.trace.iops.as_ptr(),
+        num_woms: preflight.trace.wom.len() as u32,
+        num_cycles: n as u32,
+        num_iops: preflight.trace.iops.len() as u32,
+    };
+    let mut out = HostChains {
+        heads,
+        cycles: vec![0; num_rows],
+        rows: vec![0; num_rows * data_cols],
+        wom_idx: vec![0; num_rows],
+        wom_rows: vec![0; num_rows * 9 * 5],
+    };
+    risc0_sys::ffi_wrap(|| unsafe {
+        risc0_circuit_recursion_cpu_chains(
+            zkr.code.as_ptr(),
+            zkr.code_size as u32,
+            &raw_trace,
+            total_cycles as u32,
+            data_cols as u32,
+            chains.as_ptr(),
+            out.heads.len() as u32,
+            out.cycles.as_mut_ptr(),
+            out.rows.as_mut_ptr(),
+            out.wom_idx.as_mut_ptr(),
+            out.wom_rows.as_mut_ptr(),
+        )
+    })?;
+    Ok(Some(out))
 }
 
 pub(crate) struct WitnessGenerator<H: Hal> {
@@ -223,16 +328,56 @@ where
                 .upload_host_witness(&data, &global, host_data, host_global)
                 .context("witness upload failure")?;
         } else {
+            // Long chains from `prepare`, or computed here (a few ms of host time that saves
+            // ~20 ms of single-thread GPU time).
+            let mut chains = preflight.host_chains.lock().unwrap().take();
+            if chains.is_none() && cfg!(feature = "cuda") {
+                chains = host_chains(zkr, preflight);
+            }
             circuit_hal
-                .generate_witness(
+                .generate_witness_with_chains(
                     StepMode::Parallel,
                     total_cycles as u32,
                     &raw_trace,
+                    chains.as_ref(),
                     &ctrl,
                     &data,
                     &global,
                 )
                 .context("witness generation failure")?;
+            if chains.is_some() && HOST_CHAINS_CHECK.load(Ordering::Relaxed) {
+                let ref_data = hal.alloc_elem_init(
+                    "data_ref",
+                    total_cycles * CIRCUIT.data_size(),
+                    BabyBearElem::INVALID,
+                );
+                let ref_global = hal.copy_from_elem(
+                    "global_ref",
+                    &vec![BabyBearElem::INVALID; CircuitImpl::OUTPUT_SIZE],
+                );
+                circuit_hal
+                    .generate_witness(
+                        StepMode::Parallel,
+                        total_cycles as u32,
+                        &raw_trace,
+                        &ctrl,
+                        &ref_data,
+                        &ref_global,
+                    )
+                    .context("witness generation failure (host chains check)")?;
+                let (a, b) = (data.to_vec(), ref_data.to_vec());
+                if let Some(i) = first_mismatch(&a, &b) {
+                    anyhow::bail!(
+                        "host chains witness mismatch at col {} row {}",
+                        i / total_cycles,
+                        i % total_cycles
+                    );
+                }
+                if let Some(i) = first_mismatch(&global.to_vec(), &ref_global.to_vec()) {
+                    anyhow::bail!("host chains global mismatch at {i}");
+                }
+                HOST_CHAINS_CHECKED.fetch_add(1, Ordering::Relaxed);
+            }
         }
 
         // Add random noise to end of the data columns

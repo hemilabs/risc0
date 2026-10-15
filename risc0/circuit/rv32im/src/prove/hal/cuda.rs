@@ -212,6 +212,9 @@ impl<CH: CudaHash> CircuitHal<CudaHal<CH>> for CudaCircuitHal<CH> {
         let rou = Val::ROU_FWD[po2 + EXP_PO2];
 
         tracing::debug!("steps: {steps}, domain: {domain}, po2: {po2}, rou: {rou:?}");
+        // eval_check_ef.cu is generated for this many powers (EF_NPC); a circuit
+        // change must regenerate it (kernels/cuda/evalfast/regen.py).
+        const _: () = assert!(NUM_POLY_MIX_POWERS == 458);
         let poly_mix_pows = map_pow(poly_mix, POLY_MIX_POWERS);
         let poly_mix_pows: &[u32; ExtVal::EXT_SIZE * NUM_POLY_MIX_POWERS] =
             ExtVal::as_u32_slice(poly_mix_pows.as_slice())

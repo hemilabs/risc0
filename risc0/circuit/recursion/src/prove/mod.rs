@@ -91,6 +91,37 @@ pub trait RecursionProver {
         input: VecDeque<u32>,
         preflight: Option<Preflight>,
     ) -> Result<RecursionReceipt>;
+
+    /// Like `prove`, for a shared program: lets the prover recognize a program it has seen
+    /// (same `Arc`) without comparing its code again.
+    fn prove_shared(
+        &self,
+        program: &Arc<Program>,
+        input: VecDeque<u32>,
+        preflight: Option<Preflight>,
+    ) -> Result<RecursionReceipt> {
+        self.prove(program, input, preflight)
+    }
+}
+
+/// Load the recursion CUDA kernels (no launches), so the first lift does not pay the lazy
+/// module load on the GPU thread. Run it on a background thread.
+#[cfg(feature = "cuda")]
+pub fn cuda_warmup() {
+    use risc0_circuit_recursion_sys::{
+        risc0_circuit_recursion_cuda_warmup, risc0_circuit_recursion_cuda_warmup_eval_check,
+    };
+    let _ = risc0_sys::ffi_wrap(|| unsafe { risc0_circuit_recursion_cuda_warmup() });
+    let _ = risc0_sys::ffi_wrap(|| unsafe { risc0_circuit_recursion_cuda_warmup_eval_check() });
+}
+
+/// Test hook: while on, each recursion witness generated with host-executed chains is
+/// regenerated on the device without them and compared (an error if they differ). Returns how
+/// many witnesses were compared so far.
+#[doc(hidden)]
+pub fn set_host_chains_check(on: bool) -> usize {
+    witgen::HOST_CHAINS_CHECK.store(on, std::sync::atomic::Ordering::Relaxed);
+    witgen::HOST_CHAINS_CHECKED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn recursion_prover(hashfn: &str) -> Result<Box<dyn RecursionProver>> {
@@ -163,6 +194,20 @@ impl Prover {
                 );
             }
         }
+        #[cfg(feature = "cuda")]
+        {
+            let t0 = std::time::Instant::now();
+            let chains = self::witgen::host_chains(&self.program, &preflight);
+            if *VERBOSE {
+                eprintln!(
+                    "[recursion_host_chains] {} chains, {} rows on prepare thread: {:.1}ms",
+                    chains.as_ref().map_or(0, |c| c.heads.len()),
+                    chains.as_ref().map_or(0, |c| c.cycles.len()),
+                    t0.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            *preflight.host_chains.lock().unwrap() = chains;
+        }
         self.prepared_preflight = Some(preflight);
         Ok(())
     }
@@ -220,7 +265,7 @@ impl Prover {
             cache
                 .get(&hashfn)
                 .unwrap()
-                .prove(&self.program, input, preflight)
+                .prove_shared(&self.program, input, preflight)
         })
     }
 }
@@ -240,6 +285,10 @@ where
     // The code of the program each key's entries above were built from. The key only
     // samples the code, so a hit is checked against this exactly (`claim_ctrl_caches`).
     cached_ctrl_code: RefCell<HashMap<CtrlKey, Arc<Vec<BabyBearElem>>>>,
+    // The shared program whose code `cached_ctrl_code[key]` was last checked against. Holding
+    // the `Arc` keeps the program (immutable behind the `Arc`) alive, so pointer equality means
+    // identical code and the ~24 MB compare can be skipped.
+    cached_ctrl_program: RefCell<HashMap<CtrlKey, Arc<Program>>>,
 }
 
 /// Programs whose ctrl the device caches keep at once; more clears them (each holds a
@@ -291,6 +340,31 @@ where
         input: VecDeque<u32>,
         preflight: Option<Preflight>,
     ) -> Result<RecursionReceipt> {
+        self.prove_impl(program, None, input, preflight)
+    }
+
+    fn prove_shared(
+        &self,
+        program: &Arc<Program>,
+        input: VecDeque<u32>,
+        preflight: Option<Preflight>,
+    ) -> Result<RecursionReceipt> {
+        self.prove_impl(program, Some(program), input, preflight)
+    }
+}
+
+impl<H, C> RecursionProverImpl<H, C>
+where
+    H: Hal<Field = BabyBear, Elem = BabyBearElem, ExtElem = BabyBearExtElem> + 'static,
+    C: CircuitHal<H> + CircuitWitnessGenerator<H> + CircuitAccumulator<H>,
+{
+    fn prove_impl(
+        &self,
+        program: &Program,
+        shared: Option<&Arc<Program>>,
+        input: VecDeque<u32>,
+        preflight: Option<Preflight>,
+    ) -> Result<RecursionReceipt> {
         scope!("prove");
         let t_total = std::time::Instant::now();
 
@@ -304,7 +378,7 @@ where
 
         let t0 = std::time::Instant::now();
         let ctrl_key = ctrl_cache_key(program);
-        self.claim_ctrl_caches(ctrl_key, program);
+        self.claim_ctrl_caches(ctrl_key, program, shared);
         let cached_ctrl = self.cached_ctrl_buffer.borrow().get(&ctrl_key).cloned();
         let witgen = WitnessGenerator::new(
             self.hal.as_ref(),
@@ -427,6 +501,7 @@ where
             cached_ctrl_group: RefCell::new(HashMap::new()),
             cached_ctrl_buffer: RefCell::new(HashMap::new()),
             cached_ctrl_code: RefCell::new(HashMap::new()),
+            cached_ctrl_program: RefCell::new(HashMap::new()),
         }
     }
 
@@ -434,22 +509,41 @@ where
     /// samples the code, so another program of the same size can share it: if the entries
     /// were built from different code (or there are none), they are dropped, to be rebuilt
     /// from `program`'s own code, instead of committing another program's ctrl.
-    fn claim_ctrl_caches(&self, key: CtrlKey, program: &Program) {
+    fn claim_ctrl_caches(&self, key: CtrlKey, program: &Program, shared: Option<&Arc<Program>>) {
         let mut codes = self.cached_ctrl_code.borrow_mut();
+        if codes.contains_key(&key) {
+            if let (Some(arc), Some(seen)) = (shared, self.cached_ctrl_program.borrow().get(&key)) {
+                if Arc::ptr_eq(arc, seen) {
+                    return;
+                }
+            }
+        }
         if codes
             .get(&key)
             .is_some_and(|code| same_code(code, &program.code))
         {
+            if let Some(arc) = shared {
+                self.cached_ctrl_program
+                    .borrow_mut()
+                    .insert(key, arc.clone());
+            }
             return;
         }
+        self.cached_ctrl_program.borrow_mut().remove(&key);
         self.cached_ctrl_buffer.borrow_mut().remove(&key);
         self.cached_ctrl_group.borrow_mut().remove(&key);
         if codes.len() >= CTRL_DEVICE_CACHE_CAP {
             codes.clear();
             self.cached_ctrl_buffer.borrow_mut().clear();
             self.cached_ctrl_group.borrow_mut().clear();
+            self.cached_ctrl_program.borrow_mut().clear();
         }
         codes.insert(key, Arc::new(program.code.clone()));
+        if let Some(arc) = shared {
+            self.cached_ctrl_program
+                .borrow_mut()
+                .insert(key, arc.clone());
+        }
     }
 
     fn preflight(&self, program: &Program, input: VecDeque<u32>) -> Result<Preflight> {

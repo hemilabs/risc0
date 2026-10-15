@@ -22,6 +22,26 @@
 #include <cstdint>
 #include <exception>
 
+#ifndef __HIPCC__
+// eval_u v2 and mix v2 (kernels.cu; CUDA only: eval_u v2 assumes 32-lane warps)
+#define EU_J 16
+#define EU_THREADS 256
+__global__ void eu2_pows(FpExt* pw, FpExt* ps, const FpExt* xs, uint32_t S, uint32_t chunk);
+__global__ void eu2_main(FpExt* partial, const Fp* __restrict__ coeffs, const uint32_t* __restrict__ which,
+                         const FpExt* __restrict__ xs, const FpExt* __restrict__ pw,
+                         const FpExt* __restrict__ ps, uint32_t deg, uint32_t chunk);
+__global__ void eu2_reduce(FpExt* out, const FpExt* partial, uint32_t S);
+__global__ void mix_poly_coeffs_v2(FpExt* __restrict__ out, const Fp* __restrict__ in,
+                                   const uint32_t* __restrict__ combos,
+                                   const FpExt* __restrict__ mixStart,
+                                   const FpExt* __restrict__ mix, const uint32_t inputSize,
+                                   const uint32_t count);
+#endif
+__global__ void gather_samples(Fp* dst, const Fp* src, const uint32_t* idxs, const uint32_t n,
+                               const uint32_t size, const uint32_t stride);
+__global__ void combos_sub(FpExt* combos, const FpExt* deltas, const uint32_t* offsets,
+                           const uint32_t count);
+
 extern "C" {
 
 // Trigger CUDA module loading for risc0-zkp kernels (eltwise, sha, etc.)
@@ -146,8 +166,28 @@ const char* risc0_zkp_cuda_mix_poly_coeffs(FpExt* out,
                                            const FpExt* mix,
                                            const uint32_t inputSize,
                                            const uint32_t count) {
+#ifndef __HIPCC__
+  // v2 keeps the mix powers and combo ids in shared memory (20 bytes per input).
+  if (inputSize <= 2048) {
+    return launchKernel(mix_poly_coeffs_v2, count, inputSize * (sizeof(FpExt) + sizeof(uint32_t)),
+                        out, in, combos, mixStart, mix, inputSize, count);
+  }
+#endif
   return launchKernel(mix_poly_coeffs, count, inputSize * sizeof(FpExt),
                       out, in, combos, mixStart, mix, inputSize, count);
+}
+
+const char* risc0_zkp_cuda_gather_samples(Fp* dst, const Fp* src, const uint32_t* idxs,
+                                          const uint32_t n, const uint32_t size,
+                                          const uint32_t stride) {
+  return launchKernel(gather_samples, n * size, 0, dst, src, idxs, n, size, stride);
+}
+
+const char* risc0_zkp_cuda_combos_sub(FpExt* combos,
+                                      const FpExt* deltas,
+                                      const uint32_t* offsets,
+                                      const uint32_t count) {
+  return launchKernel(combos_sub, count, 0, combos, deltas, offsets, count);
 }
 
 const char* risc0_zkp_cuda_batch_bit_reverse(Fp* io, const uint32_t nBits, const uint32_t count) {
@@ -160,8 +200,46 @@ const char* risc0_zkp_cuda_batch_evaluate_any(FpExt* out,
                                               const FpExt* xs,
                                               uint32_t shared_size,
                                               const uint32_t count,
-                                              const uint32_t deg) {
+                                              const uint32_t deg,
+                                              const uint32_t nEvals) {
+#ifdef __HIPCC__
   return launchKernel(batch_evaluate_any, count, shared_size, out, coeffs, which, xs, deg);
+#else
+  // eval_u v2: split-K over (chunk, eval point) with per-point power tables. Falls back to
+  // the original kernel for small or unaligned inputs.
+  const uint32_t minChunk = EU_J * EU_THREADS;
+  if (nEvals == 0 || deg < minChunk || (deg % minChunk) != 0 ||
+      (reinterpret_cast<uintptr_t>(coeffs) & 15) != 0) {
+    return launchKernel(batch_evaluate_any, count, shared_size, out, coeffs, which, xs, deg);
+  }
+  try {
+    cudaStream_t stream = getPersistentStream();
+    const uint32_t targetBlocks = 1024;
+    uint32_t maxS = deg / minChunk;
+    uint32_t S = 1;
+    while (S < maxS && (uint64_t)S * nEvals < targetBlocks)
+      S <<= 1;
+    uint32_t chunk = deg / S;
+    // Stream-ordered scratch: safe against concurrent callers sharing the stream.
+    size_t pwBytes = (size_t)nEvals * EU_THREADS * sizeof(FpExt);
+    size_t psBytes = (size_t)nEvals * S * sizeof(FpExt);
+    char* scratch = nullptr;
+    CUDA_OK(cudaMallocAsync(&scratch, pwBytes + 2 * psBytes, stream));
+    FpExt* pw = reinterpret_cast<FpExt*>(scratch);
+    FpExt* ps = reinterpret_cast<FpExt*>(scratch + pwBytes);
+    FpExt* part = reinterpret_cast<FpExt*>(scratch + pwBytes + psBytes);
+    eu2_pows<<<nEvals, EU_THREADS, 0, stream>>>(pw, ps, xs, S, chunk);
+    eu2_main<<<dim3(S, nEvals), EU_THREADS, 0, stream>>>(part, coeffs, which, xs, pw, ps, deg, chunk);
+    eu2_reduce<<<nEvals, 32, 0, stream>>>(out, part, S);
+    CUDA_OK(cudaGetLastError());
+    CUDA_OK(cudaFreeAsync(scratch, stream));
+  } catch (const std::exception& err) {
+    return strdup(err.what());
+  } catch (...) {
+    return strdup("Generic exception");
+  }
+  return nullptr;
+#endif
 }
 
 const char* risc0_zkp_cuda_gather_sample(
