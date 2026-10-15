@@ -122,6 +122,7 @@ fn build_rocm_kernels(cxx_root: &Path) {
             "kernels/zkp/cuda/supra/api.cu",
             "kernels/zkp/cuda/supra/ntt.cu",
         ])
+        .flags(risc0_build_kernel::hip_host_flags())
         .compile("risc0_zkp_cuda");
 
     // Link against HIP runtime

@@ -98,7 +98,6 @@ fn build_rocm_kernels() {
         "hip",
         "-std=c++17",
         "-O3",
-        "-fPIC",
         "-Wno-unused-function",
         "-Wno-unused-parameter",
         "-Wno-missing-braces",
@@ -120,10 +119,26 @@ fn build_rocm_kernels() {
     if env::var("CARGO_FEATURE_SETUP").is_ok() {
         base_flags.push("-DSRS_READ_COEFFS");
     }
+    base_flags.extend(risc0_build_kernel::hip_host_flags());
 
-    let obj = out_dir.join("groth16_ffi.o");
+    let obj = out_dir.join(format!(
+        "groth16_ffi.{}",
+        risc0_build_kernel::object_extension()
+    ));
     let ffi_cu = kernel_dir.join("ffi.cu");
     risc0_build_kernel::hip_compile(&hipcc, &base_flags, &ffi_cu, &obj, &arches, None);
+
+    // On MSVC, whose linker resolves symbols across libraries in any order, archive the object
+    // alone and link blst beside it, as the CUDA build does.
+    if risc0_build_kernel::is_msvc_target() {
+        let _ = std::fs::remove_file(out_dir.join(format!("{output}.lib")));
+        risc0_build_kernel::add_to_static_lib(&out_dir, output, &[obj]);
+        println!("cargo:rustc-link-search=native={}", out_dir.display());
+        println!("cargo:rustc-link-lib=static={output}");
+        println!("cargo:rustc-link-lib=static=blst");
+        risc0_build_kernel::emit_rocm_lib_link();
+        return;
+    }
 
     // Merge blst objects into our archive so that the linker can resolve
     // blst symbols referenced by host-side fp2_t/xyzz_t/jacobian_t code

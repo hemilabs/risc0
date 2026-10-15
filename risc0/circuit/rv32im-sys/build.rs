@@ -572,7 +572,8 @@ fn build_rocm_kernels() {
             "ffi_supra_hash_rocm.stamp",
         ],
     );
-    let eval_check_obj = out_dir.join("eval_check_combined_standalone.o");
+    let obj_ext = risc0_build_kernel::object_extension();
+    let eval_check_obj = out_dir.join(format!("eval_check_combined_standalone.{obj_ext}"));
     // Every cache below is keyed on its sources, the hipcc command and flags, what hipcc
     // reads from outside its arguments (its version and environment), and the architectures
     // -- for `native`, this machine's GPUs -- so none can reuse an object built without them.
@@ -587,12 +588,11 @@ fn build_rocm_kernels() {
         }
     );
     let include_cuda2hip = format!("{}/util/cuda2hip.hpp", &sppark_root);
-    let eval_check_flags: Vec<&str> = vec![
+    let mut eval_check_flags: Vec<&str> = vec![
         "-x",
         "hip",
         "-std=c++17",
         "-O3",
-        "-fPIC",
         "-Wno-unused-function",
         "-Wno-unused-parameter",
         "-mllvm",
@@ -614,6 +614,7 @@ fn build_rocm_kernels() {
         "-I",
         &sppark_root,
     ];
+    eval_check_flags.extend(risc0_build_kernel::hip_host_flags());
     let eval_check_key = risc0_build_kernel::hash_key(&[
         "rv32im-rocm-eval-check-v1",
         &eval_check_sources_key(&cuda_root, &cxx_root, &sppark_root),
@@ -623,7 +624,7 @@ fn build_rocm_kernels() {
     risc0_build_kernel::cached_compile(
         &cache_dir,
         "eval_check_combined_standalone",
-        "o",
+        obj_ext,
         &eval_check_key,
         &eval_check_obj,
         |out| {
@@ -676,12 +677,11 @@ fn build_rocm_kernels() {
     // amalgamation by absolute path, and with `-I` to it), so their caches are keyed on all
     // of them.
     let kernel_dir_str = kernel_dir.to_str().unwrap();
-    let local_flags: Vec<&str> = vec![
+    let mut local_flags: Vec<&str> = vec![
         "-x",
         "hip",
         "-std=c++17",
         "-O3",
-        "-fPIC",
         "-Wno-unused-function",
         "-Wno-unused-parameter",
         "-mllvm",
@@ -697,6 +697,7 @@ fn build_rocm_kernels() {
         "-I",
         kernel_dir_str,
     ];
+    local_flags.extend(risc0_build_kernel::hip_host_flags());
     let local_sources_key = risc0_build_kernel::kernel_sources_key(
         &[
             Path::new(&cuda_root),
@@ -709,7 +710,7 @@ fn build_rocm_kernels() {
     );
 
     // Cache remaining_kernels.
-    let remaining_obj = out_dir.join("remaining_kernels_rocm.o");
+    let remaining_obj = out_dir.join(format!("remaining_kernels_rocm.{obj_ext}"));
     let remaining_key = risc0_build_kernel::hash_key(&[
         "rv32im-rocm-remaining-v1",
         &local_sources_key,
@@ -720,7 +721,7 @@ fn build_rocm_kernels() {
     risc0_build_kernel::cached_compile(
         &cache_dir,
         "remaining_kernels_rocm",
-        "o",
+        obj_ext,
         &remaining_key,
         &remaining_obj,
         |out| {
@@ -740,7 +741,7 @@ fn build_rocm_kernels() {
     let mut all_objs = vec![eval_check_obj.clone(), remaining_obj];
     for cu in &separate_files {
         let stem = cu.file_stem().unwrap().to_str().unwrap();
-        let obj = out_dir.join(format!("{stem}.o"));
+        let obj = out_dir.join(format!("{stem}.{obj_ext}"));
         let key = risc0_build_kernel::hash_key(&[
             "rv32im-rocm-separate-v1",
             &local_sources_key,
@@ -748,23 +749,16 @@ fn build_rocm_kernels() {
             &format!("{local_flags:?}"),
             &hipcc_key,
         ]);
-        risc0_build_kernel::cached_compile(&cache_dir, stem, "o", &key, &obj, |out| {
+        risc0_build_kernel::cached_compile(&cache_dir, stem, obj_ext, &key, &obj, |out| {
             risc0_build_kernel::hip_compile(&hipcc, &local_flags, cu, out, &hip_arches, None)
         });
         all_objs.push(obj);
     }
 
     // Step 3: Archive all objects
-    let archive = out_dir.join(format!("lib{output}.a"));
-    let _ = std::fs::remove_file(&archive);
-    let ar = risc0_build_kernel::find_ar_tool();
-    let mut ar_cmd = Command::new(&ar);
-    ar_cmd.arg("rcs").arg(&archive);
-    for obj in &all_objs {
-        ar_cmd.arg(obj);
-    }
-    let status = ar_cmd.status().expect("failed to run ar");
-    assert!(status.success(), "ar failed");
+    let _ = std::fs::remove_file(out_dir.join(format!("lib{output}.a")));
+    let _ = std::fs::remove_file(out_dir.join(format!("{output}.lib")));
+    risc0_build_kernel::add_to_static_lib(&out_dir, output, &all_objs);
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static={output}");

@@ -1021,30 +1021,63 @@ pub fn hash_key(parts: &[&str]) -> String {
 
 /// Find the hipcc compiler, handling Windows HIP SDK quirks.
 ///
-/// On Windows, the HIP SDK ships `hipcc` as a Perl wrapper script and
-/// `hipcc.bin.exe` as the actual compiler driver. This function checks
-/// `HIPCC` env var first, then tries `hipcc.bin.exe` on Windows (avoids
-/// Perl dependency), then falls back to `hipcc` on PATH.
+/// Checks the `HIPCC` env var first. On Windows, older HIP SDKs ship `hipcc` as a Perl wrapper
+/// script with `hipcc.bin.exe` as the actual compiler driver, and newer ones (7.x) `hipcc.exe`
+/// itself, neither on PATH by default: this looks for either under `HIP_PATH`, then under the
+/// standard install paths. Else `hipcc` on PATH.
 pub fn find_hipcc() -> String {
+    println!("cargo:rerun-if-env-changed=HIPCC");
+    println!("cargo:rerun-if-env-changed=HIP_PATH");
     if let Ok(hipcc) = env::var("HIPCC") {
         return hipcc;
     }
 
     if cfg!(target_os = "windows") {
-        // Try hipcc.bin.exe from HIP_PATH (avoids Perl dependency)
-        if let Ok(hip_path) = env::var("HIP_PATH") {
-            let candidate = PathBuf::from(&hip_path).join("bin").join("hipcc.bin.exe");
-            if candidate.exists() {
-                return candidate.to_string_lossy().into_owned();
+        for exe in ["hipcc.bin.exe", "hipcc.exe"] {
+            if let Ok(hip_path) = env::var("HIP_PATH") {
+                let candidate = PathBuf::from(&hip_path).join("bin").join(exe);
+                if candidate.exists() {
+                    return candidate.to_string_lossy().into_owned();
+                }
             }
-        }
-        // Try standard Windows ROCm install paths
-        if let Some(candidate) = find_in_windows_rocm("bin", "hipcc.bin.exe") {
-            return candidate;
+            if let Some(candidate) = find_in_windows_rocm("bin", exe) {
+                return candidate;
+            }
         }
     }
 
     "hipcc".to_string()
+}
+
+/// The flags every hipcc compile needs for its host code on the target toolchain.
+///
+/// `-fPIC` elsewhere. On MSVC, where clang rejects `-fPIC`, the C runtime the rest of the binary
+/// links: rustc links the DLL runtime (`/MD`; the static one, `/MT`, under `+crt-static`), and
+/// clang targeting MSVC defaults to neither, which leaves the STL's runtime check expecting the
+/// static one and the link failing on `cc`'s `/MD` objects (LNK2038).
+pub fn hip_host_flags() -> Vec<&'static str> {
+    if !is_msvc_target() {
+        vec!["-fPIC"]
+    } else if crt_static() {
+        vec!["-fms-runtime-lib=static", "-DNOMINMAX"]
+    } else {
+        vec!["-fms-runtime-lib=dll", "-DNOMINMAX"]
+    }
+}
+
+/// A `Command` for a direct hipcc invocation (one that bypasses `cc`): `hipcc`, with, on MSVC,
+/// the environment of the cl.exe `cc` finds (`INCLUDE`, `LIB`, `PATH`), so the MSVC headers and
+/// libraries are found outside a Visual Studio developer shell. The caller adds
+/// [`hip_host_flags`].
+pub fn hipcc_command(hipcc: &str) -> Command {
+    let mut cmd = Command::new(hipcc);
+    if is_msvc_target() {
+        let cl = cc::Build::new().cpp(true).get_compiler();
+        for (key, value) in cl.env() {
+            cmd.env(key, value);
+        }
+    }
+    cmd
 }
 
 /// Find a platform-appropriate static archive tool (`ar` / `llvm-ar`).
@@ -1167,7 +1200,7 @@ fn hip_compile_single(
     arches: &str,
     work_dir: Option<&Path>,
 ) {
-    let mut cmd = Command::new(hipcc);
+    let mut cmd = hipcc_command(hipcc);
     if let Some(dir) = work_dir {
         cmd.current_dir(dir);
     }

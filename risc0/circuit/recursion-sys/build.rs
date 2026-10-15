@@ -471,12 +471,11 @@ fn build_rocm_kernels() {
     let include_cuda2hip = format!("{sppark_root}/util/cuda2hip.hpp");
     let kernel_dir_str = kernel_dir.to_str().unwrap();
     let arches = risc0_build_kernel::hip_arches();
-    let base_flags: Vec<&str> = vec![
+    let mut base_flags: Vec<&str> = vec![
         "-x",
         "hip",
         "-std=c++17",
         "-O3",
-        "-fPIC",
         "-Wno-unused-function",
         "-Wno-unused-parameter",
         "-Wno-missing-braces",
@@ -494,13 +493,15 @@ fn build_rocm_kernels() {
         "-I",
         kernel_dir_str,
     ];
+    base_flags.extend(risc0_build_kernel::hip_host_flags());
+    let obj_ext = risc0_build_kernel::object_extension();
 
     let mut obj_files = Vec::new();
     for (amalg_path, obj_name) in [
-        (&risc0_amalg_path, "risc0_kernels_rocm.o"),
-        (&supra_amalg_path, "supra_kernels_rocm.o"),
+        (&risc0_amalg_path, "risc0_kernels_rocm"),
+        (&supra_amalg_path, "supra_kernels_rocm"),
     ] {
-        let obj = out_dir.join(obj_name);
+        let obj = out_dir.join(format!("{obj_name}.{obj_ext}"));
         risc0_build_kernel::hip_compile(&hipcc, &base_flags, amalg_path, &obj, &arches, None);
         obj_files.push(obj);
     }
@@ -509,11 +510,23 @@ fn build_rocm_kernels() {
     // code (gpu_t.cuh) that can't be in the same TU as device kernels.
     for cu in &separate_files {
         let name = cu.file_name().unwrap().to_str().unwrap();
-        let obj_name = format!("{}.o", name.trim_end_matches(".cu"));
+        let obj_name = format!("{}.{obj_ext}", name.trim_end_matches(".cu"));
         let obj = out_dir.join(&obj_name);
         let abs = std::fs::canonicalize(cu).unwrap();
         risc0_build_kernel::hip_compile(&hipcc, &base_flags, &abs, &obj, &arches, None);
         obj_files.push(obj);
+    }
+
+    // On MSVC, where lld-link has no relocatable (`-r`) link, archive the objects themselves:
+    // none is compiled with -fgpu-rdc, so each carries its own complete GPU code object and there
+    // is no device code to link across them.
+    if risc0_build_kernel::is_msvc_target() {
+        let _ = std::fs::remove_file(out_dir.join(format!("{output}.lib")));
+        risc0_build_kernel::add_to_static_lib(&out_dir, output, &obj_files);
+        println!("cargo:rustc-link-search=native={}", out_dir.display());
+        println!("cargo:rustc-link-lib=static={output}");
+        risc0_build_kernel::emit_rocm_lib_link();
+        return;
     }
 
     // Device-link: with -fgpu-rdc, device code is compiled as bitcode in each .o file.
