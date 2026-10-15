@@ -19,52 +19,18 @@
 //! fuzzed MSM results, as the CUDA prover does, and produces the same kind of proof.
 //! `RISC0_GROTH16_INTEL_PROVER=docker` selects the Docker prover instead.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{anyhow, Context as _, Result};
 use risc0_groth16_sys::{ProverParams, SetupParams};
-use rzup::{Component, Rzup, Version};
 use tempfile::tempdir;
 
+use super::component::component_dir;
 use crate::{ProofJson, Seal};
 
 /// Whether to prove on the GPU (the default) rather than with the Docker prover.
 pub(crate) fn enabled() -> bool {
     std::env::var("RISC0_GROTH16_INTEL_PROVER").as_deref() != Ok("docker")
-}
-
-/// The rzup `risc0-groth16` component's directory: `RISC0_GROTH16_DIR` if set (rzup does not
-/// run on Windows, where the files are installed by hand), else rzup's, else rzup's layout
-/// under `$RISC0_HOME` or `~/.risc0`.
-pub(crate) fn component_dir() -> Result<PathBuf> {
-    if let Some(dir) = std::env::var_os("RISC0_GROTH16_DIR") {
-        return Ok(dir.into());
-    }
-    let version = Version::new(0, 1, 0);
-    if let Ok(dir) = Rzup::new().and_then(|r| r.get_version_dir(&Component::Risc0Groth16, &version))
-    {
-        return Ok(dir);
-    }
-    let home = std::env::var_os("RISC0_HOME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .or_else(|| std::env::var_os("USERPROFILE"))
-                .map(|home| PathBuf::from(home).join(".risc0"))
-        })
-        .ok_or_else(|| anyhow!("cannot locate the risc0-groth16 component: no home directory"))?;
-    let dir = home
-        .join("extensions")
-        .join(format!("v{version}-risc0-groth16"));
-    if dir.is_dir() {
-        Ok(dir)
-    } else {
-        Err(anyhow!(
-            "missing the `risc0-groth16` component: install it with `rzup install risc0-groth16`, \
-             copy its files to {}, or set RISC0_GROTH16_DIR",
-            dir.display()
-        ))
-    }
 }
 
 fn preload(dir: &Path) -> Result<()> {

@@ -29,7 +29,6 @@ use risc0_zkp::core::{
     digest::{Digest, DIGEST_WORDS},
     hash::poseidon_254::digest_to_fr_bytes,
 };
-use rzup::{Component, Rzup, Version};
 use tempfile::tempdir;
 
 use crate::{ProofJson, Seal};
@@ -41,14 +40,7 @@ use super::seal_format::{IopType, K_SEAL_ELEMS, K_SEAL_TYPES, K_SEAL_WORDS};
 /// Call this early (e.g. on a background thread) to overlap the ~1.2s graph
 /// read+parse and ~1.2s SRS load with segment proving.
 pub(crate) fn preload_graph() -> Result<()> {
-    let root_dir = Rzup::new()
-        .context("failed to initialize rzup")?
-        .get_version_dir(&Component::Risc0Groth16, &Version::new(0, 1, 0))
-        .context(
-            "Missing required `risc0-groth16` rzup component. \
-            To install it, ensure that your `rzup` version is >= 0.5.0, \
-            and then run `rzup install risc0-groth16`.",
-        )?;
+    let root_dir = super::component::component_dir()?;
     let witness_params = WitnessParams::new(&root_dir);
     let pg = PARSED_GRAPH.get_or_init(|| load_graph(&witness_params.graph_path));
 
@@ -118,14 +110,7 @@ pub(crate) fn shrink_wrap(seal_bytes: &[u8]) -> Result<Seal> {
     tracing::info!("shrink_wrap: {} seal bytes", seal_bytes.len());
 
     let t0 = std::time::Instant::now();
-    let root_dir = Rzup::new()
-        .context("failed to initialize rzup")?
-        .get_version_dir(&Component::Risc0Groth16, &Version::new(0, 1, 0))
-        .context(
-            "Missing required `risc0-groth16` rzup component. \
-            To install it, ensure that your `rzup` version is >= 0.5.0, \
-            and then run `rzup install risc0-groth16`.",
-        )?;
+    let root_dir = super::component::component_dir()?;
     let setup_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     let tmp_dir = tempdir().context("failed to create temporary directory")?;

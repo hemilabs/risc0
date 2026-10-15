@@ -14,6 +14,8 @@
 
 //! # Groth16 Prover
 
+#[cfg(any(feature = "rocm", feature = "intel"))]
+mod component;
 #[cfg(feature = "cuda")]
 mod cuda;
 #[cfg(not(any(feature = "cuda", feature = "rocm")))]

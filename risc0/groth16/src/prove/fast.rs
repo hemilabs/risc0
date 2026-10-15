@@ -101,7 +101,7 @@ fn to_u(x: &Fr) -> U254 {
 static PROGRAM: OnceLock<std::result::Result<Program, String>> = OnceLock::new();
 
 pub(crate) fn graph_path() -> Result<PathBuf> {
-    Ok(super::intel::component_dir()?.join("stark_verify_graph.bin"))
+    Ok(super::component::component_dir()?.join("stark_verify_graph.bin"))
 }
 
 fn build_program() -> Result<Program> {
