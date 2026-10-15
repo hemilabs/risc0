@@ -97,6 +97,10 @@ pub(crate) fn shrink_wrap(identity_p254_seal_bytes: &[u8]) -> Result<Seal> {
     let dir = component_dir()?;
     let setup = SetupParams::new(&dir).context("failed to create groth16 setup params")?;
 
+    let verbose = std::env::var_os("RISC0_VERBOSE").is_some();
+    let t0 = std::time::Instant::now();
+    let ms = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1000.0;
+
     // The proving key's upload (first use only) overlaps the witness computation.
     let loader = {
         let dir = dir.clone();
@@ -104,14 +108,22 @@ pub(crate) fn shrink_wrap(identity_p254_seal_bytes: &[u8]) -> Result<Seal> {
     };
     let witness = super::fast::witness(identity_p254_seal_bytes)
         .context("failed to calculate the groth16 witness")?;
+    let witness_ms = ms(t0);
     loader
         .join()
         .map_err(|_| anyhow!("the groth16 proving key loader panicked"))??;
+    let loaded_ms = ms(t0);
 
     let work_dir = tempdir().context("failed to create a temporary directory")?;
     let params = ProverParams::new(work_dir.path(), witness.as_ptr() as *const u8)
         .context("failed to create groth16 prover parameters")?;
     risc0_groth16_sys::intel_prove(&params, &setup).context("groth16 prove failed")?;
+    if verbose {
+        eprintln!(
+            "[groth16-intel] witness={witness_ms:.1}ms key loaded={loaded_ms:.1}ms              proved={:.1}ms",
+            ms(t0)
+        );
+    }
 
     let contents = std::fs::read_to_string(params.proof_path.as_path())
         .context("failed to read the groth16 proof")?;

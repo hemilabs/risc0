@@ -1138,15 +1138,37 @@ impl ProverImpl {
             super::release_hal_buffers();
         }
 
-        for proof_request in session.pending_keccaks.iter() {
+        let t_keccaks = std::time::Instant::now();
+        for (i, proof_request) in session.pending_keccaks.iter().enumerate() {
+            let t_keccak = std::time::Instant::now();
             let receipt = prove_keccak(proof_request).context("prove keccak")?;
+            let prove_ms = t_keccak.elapsed().as_secs_f64() * 1000.0;
             receipt.verify_integrity_with_context(&keccak_ctx)?;
             tracing::debug!("adding keccak assumption: {}", receipt.claim.digest());
+            let t_insert = std::time::Instant::now();
             keccak_receipts.insert(receipt)?;
+            if *VERBOSE {
+                eprintln!(
+                    "[keccak] {i}: po2={} prove+lift={prove_ms:.1}ms insert={:.1}ms total={:.1}ms",
+                    proof_request.po2,
+                    t_insert.elapsed().as_secs_f64() * 1000.0,
+                    t_keccak.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
         }
 
         // NOTE: Calling keccak_receipts.root() proves the union tree.
-        if let Ok(root_receipt) = keccak_receipts.root() {
+        let t_root = std::time::Instant::now();
+        let keccak_root = keccak_receipts.root();
+        if *VERBOSE && !session.pending_keccaks.is_empty() {
+            eprintln!(
+                "[keccak] {} proofs: root={:.1}ms total={:.1}ms",
+                session.pending_keccaks.len(),
+                t_root.elapsed().as_secs_f64() * 1000.0,
+                t_keccaks.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
+        if let Ok(root_receipt) = keccak_root {
             let assumption = Assumption {
                 claim: root_receipt.claim.digest(),
                 control_root: root_receipt.control_root()?,
