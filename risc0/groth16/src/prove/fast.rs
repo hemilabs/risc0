@@ -48,6 +48,7 @@ use circom_witnesscalc::{
     graph::{Node, Nodes, NodesStorage, Operation, VecNodes},
     storage::proto_deserializer::deserialize_witnesscalc_graph_from_bytes,
 };
+use rayon::prelude::*;
 use risc0_core::field::baby_bear::BabyBearElem;
 use risc0_zkp::core::{
     digest::{Digest, DIGEST_WORDS},
@@ -260,9 +261,10 @@ fn witness_elements(prog: &Program, inputs: &[U254]) -> Result<Vec<wtns_file::Fi
             },
         };
     }
+    // In parallel: 5.6M conversions out of Montgomery form.
     Ok(prog
         .signals
-        .iter()
+        .par_iter()
         .map(|&i| wtns_file::FieldElement::from(to_u(&v[i]).to_le_bytes::<32>()))
         .collect())
 }

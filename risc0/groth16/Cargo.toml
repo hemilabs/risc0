@@ -68,6 +68,7 @@ default = ["std"]
 # (src/prove/fast.rs); RISC0_GROTH16_INTEL_PROVER=docker selects the pre-started Docker prover.
 intel = [
   "dep:circom-witnesscalc",
+  "dep:rayon",
   "dep:risc0-groth16-sys",
   "dep:sha2",
   "dep:wtns-file",
