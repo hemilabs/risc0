@@ -652,8 +652,22 @@ struct HostAccumContext {
 
   void calcPrefixProducts() {
     nvtx3::scoped_range range("calcPrefixProducts");
+#ifdef SPPARK_NO_COOPERATIVE_LAUNCH
+    // sppark's prefix_op needs a cooperative launch, which this platform has not (see sppark's
+    // util/cuda2hip.hpp): scan on the host, as the HIP HAL's prefix_products does.
+    CUDA_OK(cudaStreamSynchronize(stream));
+    std::vector<FpExt> accum(ctx->workCycles);
+    CUDA_OK(cudaMemcpy(
+        accum.data(), ctx->accum, accum.size() * sizeof(FpExt), cudaMemcpyDeviceToHost));
+    for (size_t i = 1; i < accum.size(); i++) {
+      accum[i] = accum[i - 1] * accum[i];
+    }
+    CUDA_OK(cudaMemcpy(
+        ctx->accum, accum.data(), accum.size() * sizeof(FpExt), cudaMemcpyHostToDevice));
+#else
     sppark::calcPrefixProducts(ctx->accum, ctx->workCycles);
     CUDA_OK(cudaStreamSynchronize(stream));
+#endif
   }
 
   void verifyAccum() {
