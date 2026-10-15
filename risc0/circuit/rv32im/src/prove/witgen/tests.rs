@@ -74,11 +74,16 @@ fn fwd_rev_ab_test(program: Program) {
     .unwrap();
 
     cfg_if::cfg_if! {
-        if #[cfg(any(feature = "cuda", feature = "rocm"))] {
+        if #[cfg(feature = "cuda")] {
             use risc0_zkp::hal::cuda::CudaHalPoseidon2;
             use crate::prove::hal::cuda::CudaCircuitHalPoseidon2;
             let hal = std::sync::Arc::new(CudaHalPoseidon2::new());
             let circuit_hal = CudaCircuitHalPoseidon2::new(hal.clone());
+        } else if #[cfg(feature = "rocm")] {
+            use risc0_zkp::hal::hip::HipHalPoseidon2;
+            use crate::prove::hal::hip::HipCircuitHalPoseidon2;
+            let hal = std::sync::Arc::new(HipHalPoseidon2::new());
+            let circuit_hal = HipCircuitHalPoseidon2::new(hal.clone());
         // } else if #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), target_os = "ios"))] {
         //     use risc0_zkp::hal::metal::MetalHalSha256;
         //     use crate::prove::hal::metal::MetalCircuitHal;

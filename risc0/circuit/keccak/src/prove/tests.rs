@@ -51,11 +51,16 @@ fn host_witness() {
 #[test]
 fn fwd_rev_ab() {
     cfg_if! {
-        if #[cfg(any(feature = "cuda", feature = "rocm"))] {
+        if #[cfg(feature = "cuda")] {
             use risc0_zkp::hal::cuda::CudaHalPoseidon2;
             use crate::prove::hal::cuda::CudaCircuitHalPoseidon2;
             let hal = Rc::new(CudaHalPoseidon2::new());
             let circuit_hal = CudaCircuitHalPoseidon2::new(hal.clone());
+        } else if #[cfg(feature = "rocm")] {
+            use risc0_zkp::hal::hip::HipHalPoseidon2;
+            use crate::prove::hal::hip::HipCircuitHalPoseidon2;
+            let hal = Rc::new(HipHalPoseidon2::new());
+            let circuit_hal = HipCircuitHalPoseidon2::new(hal.clone());
         } else {
             use risc0_zkp::{core::hash::sha::Sha256HashSuite, hal::cpu::CpuHal};
             use crate::prove::hal::cpu::CpuCircuitHal;
