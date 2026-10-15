@@ -24,6 +24,8 @@ mod fast;
 mod hip;
 mod seal_format;
 mod seal_to_json;
+#[cfg(feature = "cuda")]
+mod witness_fast;
 
 use anyhow::Result;
 

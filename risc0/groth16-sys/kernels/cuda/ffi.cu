@@ -184,6 +184,29 @@ static int current_device() {
   return dev;
 }
 
+// A pinned host buffer of at least `bytes` (one per process, grown as needed), for the
+// witness: it uploads in one fast DMA. The Rust caller (risc0_groth16_sys::host_buffer)
+// serializes its users; growing frees the old buffer.
+extern "C" void* risc0_groth16_cuda_host_buffer(size_t bytes) {
+  static std::mutex m;
+  static void* buf = nullptr;
+  static size_t cap = 0;
+  std::lock_guard<std::mutex> lock(m);
+  if (bytes > cap) {
+    if (buf) {
+      cudaFreeHost(buf);
+    }
+    buf = nullptr;
+    cap = 0;
+    if (cudaMallocHost(&buf, bytes) != cudaSuccess) {
+      buf = nullptr;
+      return nullptr;
+    }
+    cap = bytes;
+  }
+  return buf;
+}
+
 extern "C" const char* risc0_groth16_cuda_preload(SetupParams* setup_params) {
   try {
     int dev = current_device();
