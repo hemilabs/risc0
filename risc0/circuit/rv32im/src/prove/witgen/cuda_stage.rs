@@ -34,7 +34,11 @@ use risc0_circuit_rv32im_sys::{
 };
 use risc0_sys::ffi_wrap;
 
-use super::preflight::{Back, PreflightTrace};
+use super::{
+    bigint::BigIntState,
+    preflight::{Back, PreflightTrace},
+};
+use crate::execute::{poseidon2::Poseidon2State, sha2::Sha2State};
 use crate::zirgen::circuit::ExtVal;
 
 /// The rv32im witgen staging feature: pinned staging of the preflight trace on the preflight
@@ -170,6 +174,12 @@ fn take_slot(len: usize) -> Option<(*mut u8, usize)> {
 
 fn par_copy(dst: *mut u8, src: &[u8]) {
     const CHUNK: usize = 4 << 20;
+    // One serial copy unless RISC0_CUDA_PREFLIGHT_V3=0 (see `SERIAL_PREFLIGHT`).
+    if *super::SERIAL_PREFLIGHT {
+        // SAFETY: `dst` has room for `src` (see `stage`).
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len()) };
+        return;
+    }
     let dst = dst as usize;
     src.par_chunks(CHUNK)
         .enumerate()
@@ -221,6 +231,7 @@ type TraceVecs = (
     Vec<RawMemoryTransaction>,
     Vec<u8>,
     Vec<Back>,
+    (Vec<Poseidon2State>, Vec<Sha2State>, Vec<BigIntState>),
 );
 static TRACE_POOL: Mutex<Vec<TraceVecs>> = Mutex::new(Vec::new());
 
@@ -230,7 +241,7 @@ pub(crate) fn recycled_trace(total_cycles: usize, rand_z: ExtVal) -> PreflightTr
     } else {
         None
     };
-    let (mut cycles, mut txns, bigint_bytes, mut backs) = vecs.unwrap_or_default();
+    let (mut cycles, mut txns, bigint_bytes, mut backs, side) = vecs.unwrap_or_default();
     // A fresh (not recycled) trace: reserve it up front and back it with huge pages before
     // the first touch (see `advise_huge`).
     let fresh = cycles.capacity() == 0;
@@ -248,6 +259,7 @@ pub(crate) fn recycled_trace(total_cycles: usize, rand_z: ExtVal) -> PreflightTr
     trace.txns = txns;
     trace.bigint_bytes = bigint_bytes;
     trace.backs = backs;
+    (trace.p2_states, trace.sha2_states, trace.bigint_states) = side;
     trace.rand_z = rand_z;
     trace
 }
@@ -261,11 +273,19 @@ pub(crate) fn recycle_trace(trace: &mut PreflightTrace) {
         std::mem::take(&mut trace.txns),
         std::mem::take(&mut trace.bigint_bytes),
         std::mem::take(&mut trace.backs),
+        (
+            std::mem::take(&mut trace.p2_states),
+            std::mem::take(&mut trace.sha2_states),
+            std::mem::take(&mut trace.bigint_states),
+        ),
     );
     vecs.0.clear();
     vecs.1.clear();
     vecs.2.clear();
     vecs.3.clear();
+    vecs.4 .0.clear();
+    vecs.4 .1.clear();
+    vecs.4 .2.clear();
     let mut pool = TRACE_POOL.lock().unwrap();
     if pool.len() < 2 {
         pool.push(vecs);

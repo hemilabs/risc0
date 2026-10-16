@@ -414,7 +414,8 @@ where
         let mut bigint_accum = BigIntAccum::new(last_mix);
 
         for &row in &self.bigint_rows {
-            if let Back::BigInt(state) = &self.trace.backs[row] {
+            if let Back::BigInt(idx) = self.trace.backs[row] {
+                let state = &self.trace.bigint_states[idx as usize];
                 bigint_accum.step(state)?;
                 for (col, value) in zip(BigIntAccumState::offsets(), bigint_accum.state.as_array())
                 {
@@ -488,9 +489,25 @@ where
     }
 }
 
+/// Serial preflight post-processing on the preflight thread (RISC0_CUDA_PREFLIGHT_V3=0 restores
+/// the rayon versions): the injector build when the cycle columns are deferred, and the pinned
+/// staging copy (`cuda_stage`). The preflight thread runs beside the proving thread's own rayon
+/// work, and on a loaded host the rayon versions waited for busy workers: at +32 runnable threads
+/// the parallel injector took 54-106 ms vs 2.6 ms serial (only ~0.1 entries per row remain once
+/// the cycle columns are deferred), and the parallel stage copy 29.6 vs 15.5 ms. On a quiet host
+/// the parallel versions win by under 2 ms, off the critical path.
+pub(crate) static SERIAL_PREFLIGHT: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("RISC0_CUDA_PREFLIGHT_V3").as_deref() != Ok("0"));
+
 fn build_injector(trace: &PreflightTrace, cycles: usize) -> (Injector, Vec<usize>) {
     scope!("build_injector");
+    if trace.cycle_cols_deferred && *SERIAL_PREFLIGHT {
+        return build_injector_serial(trace, cycles);
+    }
+    build_injector_parallel(trace, cycles)
+}
 
+fn build_injector_parallel(trace: &PreflightTrace, cycles: usize) -> (Injector, Vec<usize>) {
     const CYCLE_COL: usize = LAYOUT_TOP.cycle._super.offset;
     const NEXT_PC_LOW: usize = LAYOUT_TOP.next_pc_low._super.offset;
     const NEXT_PC_HIGH: usize = LAYOUT_TOP.next_pc_high._super.offset;
@@ -602,12 +619,14 @@ fn build_injector(trace: &PreflightTrace, cycles: usize) -> (Injector, Vec<usize
                 set(ECALL_S1, *s1);
                 set(ECALL_S2, *s2);
             }
-            Back::Poseidon2(p2_state) => {
+            Back::Poseidon2(idx) => {
+                let p2_state = &trace.p2_states[*idx as usize];
                 for (col, value) in zip(Poseidon2State::offsets(), p2_state.as_array()) {
                     set(col, value);
                 }
             }
-            Back::Sha2(sha2_state) => {
+            Back::Sha2(idx) => {
+                let sha2_state = &trace.sha2_states[*idx as usize];
                 for (col, value) in zip(Sha2State::fp_offsets(), sha2_state.fp_array()) {
                     set(col, value);
                 }
@@ -615,7 +634,8 @@ fn build_injector(trace: &PreflightTrace, cycles: usize) -> (Injector, Vec<usize
                     set_bits(col, value);
                 }
             }
-            Back::BigInt(state) => {
+            Back::BigInt(idx) => {
+                let state = &trace.bigint_states[*idx as usize];
                 for (col, value) in zip(BigIntState::offsets(), state.as_array()) {
                     set(col, value);
                 }
@@ -636,6 +656,74 @@ fn build_injector(trace: &PreflightTrace, cycles: usize) -> (Injector, Vec<usize
     // per-row order; the scatter kernel never needs the row number.
     if !cycle_cols {
         index.dedup();
+    }
+
+    (
+        Injector {
+            rows: cycles,
+            offsets,
+            values,
+            index,
+            bit_data,
+        },
+        bigint_rows,
+    )
+}
+
+/// [`build_injector`] without the cycle columns, in one serial pass: the same entries in the same
+/// (row) order, and the same deduplicated row bounds.
+fn build_injector_serial(trace: &PreflightTrace, cycles: usize) -> (Injector, Vec<usize>) {
+    const ECALL_S0: usize = LAYOUT_TOP.inst_result.arm8.s0._super.offset;
+    const ECALL_S1: usize = LAYOUT_TOP.inst_result.arm8.s1._super.offset;
+    const ECALL_S2: usize = LAYOUT_TOP.inst_result.arm8.s2._super.offset;
+    debug_assert!(trace.cycle_cols_deferred);
+
+    let mut offsets = Vec::<u32>::new();
+    let mut values = Vec::<Val>::new();
+    let mut bit_data = Vec::<u32>::new();
+    let mut bigint_rows = Vec::new();
+    // Row bounds, deduplicated as `index.dedup()` does in the parallel version: a bound is
+    // pushed only when it differs from the previous one (rows with entries end a run).
+    let mut index = vec![0u32];
+    for (row, back) in trace.backs.iter().enumerate() {
+        let mut set = |col: usize, value: u32| {
+            offsets.push((col * cycles + row) as u32);
+            values.push(Val::new(value));
+        };
+        match back {
+            Back::None => continue,
+            Back::Ecall(s0, s1, s2) => {
+                set(ECALL_S0, *s0);
+                set(ECALL_S1, *s1);
+                set(ECALL_S2, *s2);
+            }
+            Back::Poseidon2(idx) => {
+                let p2_state = &trace.p2_states[*idx as usize];
+                for (col, value) in zip(Poseidon2State::offsets(), p2_state.as_array()) {
+                    set(col, value);
+                }
+            }
+            Back::Sha2(idx) => {
+                let sha2_state = &trace.sha2_states[*idx as usize];
+                for (col, value) in zip(Sha2State::fp_offsets(), sha2_state.fp_array()) {
+                    set(col, value);
+                }
+                for (col, value) in zip(Sha2State::u32_offsets(), sha2_state.u32_array()) {
+                    bit_data.extend_from_slice(&[row as u32, col as u32, value]);
+                }
+            }
+            Back::BigInt(idx) => {
+                bigint_rows.push(row);
+                let state = &trace.bigint_states[*idx as usize];
+                for (col, value) in zip(BigIntState::offsets(), state.as_array()) {
+                    set(col, value);
+                }
+            }
+        }
+        let end = offsets.len() as u32;
+        if *index.last().unwrap() != end {
+            index.push(end);
+        }
     }
 
     (
