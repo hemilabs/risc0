@@ -170,7 +170,10 @@ fn build_rocm_kernels() {
 /// directory can't go on the include path: its `cuda.h` would shadow the toolkit's.
 fn thp_pinned_define() -> String {
     let root = PathBuf::from(env::var("DEP_RISC0_SYS_CUDA_ROOT").unwrap());
-    let path = root.join("thp_pinned.h").to_string_lossy().into_owned();
-    println!("cargo:rerun-if-changed={path}");
+    let path = root.join("thp_pinned.h");
+    println!("cargo:rerun-if-changed={}", path.display());
+    // Forward slashes: inside the quoted header name a Windows backslash would be read as an
+    // escape by the preprocessor (both work as separators there).
+    let path = path.to_string_lossy().replace('\\', "/");
     format!("-DRISC0_THP_PINNED_H=\"{path}\"")
 }
