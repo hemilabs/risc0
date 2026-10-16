@@ -228,6 +228,8 @@ pub trait ProverServer: private::Sealed {
 
         // Hand the GPU to the Groth16 prover, then take it back. See `release_hal_buffers`. The
         // first release runs while the wrap computes its witness on another thread.
+        #[cfg(feature = "rocm")]
+        prover_impl::release_cached_provers();
         let t2 = std::time::Instant::now();
         let seal = shrink_wrap_with(&seal_bytes, release_hal_buffers)?.to_vec();
         release_hal_buffers();

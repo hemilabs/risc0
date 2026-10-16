@@ -45,6 +45,28 @@ impl Drop for DrainSegmentProverOnExit {
     }
 }
 
+/// Drop this thread's cached segment prover and the device buffers it keeps between segments
+/// (see `release_cached_provers`). Only between sessions: the prover must be idle.
+#[cfg(feature = "rocm")]
+fn release_cached_segment_prover() {
+    CACHED_SEGMENT_PROVER.with(|cell| {
+        if let Ok(mut borrow) = cell.try_borrow_mut() {
+            *borrow = None;
+        }
+    });
+}
+
+/// Before the Groth16 wrap on ROCm, drop the provers cached between proofs (this thread's
+/// segment prover and recursion provers), then the HAL's pool. On an RX 9070 XT (16 GB,
+/// Windows) the wrap's ~7 GB proving key beside those long-lived buffers made the driver move
+/// ~2 GB of them into shared system memory, where they stayed: every later session ran ~2.5x
+/// slower. Rebuilt by the next session, in device memory.
+#[cfg(feature = "rocm")]
+pub(crate) fn release_cached_provers() {
+    release_cached_segment_prover();
+    risc0_circuit_recursion::prove::release_cached_provers();
+}
+
 fn with_segment_prover<R>(f: impl FnOnce(&dyn SegmentProver) -> Result<R>) -> Result<R> {
     let _gpu = super::exclusive_gpu();
     CACHED_SEGMENT_PROVER.with(|cell| {
@@ -1355,6 +1377,8 @@ impl ProverImpl {
             let seal_bytes = ident_receipt.get_seal_bytes();
             // See `release_hal_buffers`: the wrap cannot reclaim what the STARK HAL is caching.
             // Released while the wrap computes its witness on another thread.
+            #[cfg(feature = "rocm")]
+            release_cached_provers();
             let seal = shrink_wrap_with(&seal_bytes, super::release_hal_buffers)?.to_vec();
             super::release_hal_buffers();
             let wrap_ms = t0.elapsed().as_secs_f64() * 1000.0;

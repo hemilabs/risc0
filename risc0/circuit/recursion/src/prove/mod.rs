@@ -123,6 +123,12 @@ pub fn cuda_warmup() {
     let _ = risc0_sys::ffi_wrap(|| unsafe { risc0_circuit_recursion_cuda_warmup_eval_check() });
 }
 
+/// Drop this thread's cached recursion provers, and with them the device buffers they keep
+/// between proofs (each program's committed ctrl group). The next proof rebuilds them.
+pub fn release_cached_provers() {
+    PROVER_CACHE.with(|cache| cache.borrow_mut().clear());
+}
+
 /// Test hook: while on, each recursion witness generated with host-executed chains is
 /// regenerated on the device without them and compared (an error if they differ). Returns how
 /// many witnesses were compared so far.
