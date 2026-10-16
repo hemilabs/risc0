@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""accfirst_cuda.py: CUDA port of round-7 accfirst. Slices the LogUp/accum block (tail of
+"""accfirst_cuda.py: CUDA port of the "accum block first" eval_check pass. Slices the LogUp/accum block (tail of
 rv32im_v2_3 from the first accum load after the accumulator x1102, plus v2_2..v2_0 via the tail
 call) into rk_accblk(); v2_3 returns x1102, so poly_fp() = main block and
 tot = poly_fp() + rk_accblk() (the accumulator enters the tail only additively; the tail gets

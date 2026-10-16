@@ -224,7 +224,7 @@ fn take_slot(len: usize) -> Option<(*mut u8, usize)> {
 
 fn par_copy(dst: *mut u8, src: &[u8]) {
     const CHUNK: usize = 4 << 20;
-    // One serial copy unless RISC0_CUDA_PREFLIGHT_V3=0 (see `SERIAL_PREFLIGHT`).
+    // One serial copy unless RISC0_CUDA_SERIAL_PREFLIGHT=0 (see `SERIAL_PREFLIGHT`).
     if *super::SERIAL_PREFLIGHT {
         // SAFETY: `dst` has room for `src` (see `stage`).
         unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len()) };

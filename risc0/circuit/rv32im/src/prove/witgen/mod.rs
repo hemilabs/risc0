@@ -489,15 +489,15 @@ where
     }
 }
 
-/// Serial preflight post-processing on the preflight thread (RISC0_CUDA_PREFLIGHT_V3=0 restores
-/// the rayon versions): the injector build when the cycle columns are deferred, and the pinned
+/// Serial preflight post-processing on the preflight thread (RISC0_CUDA_SERIAL_PREFLIGHT=0
+/// restores the rayon versions): the injector build when the cycle columns are deferred, and the pinned
 /// staging copy (`cuda_stage`). The preflight thread runs beside the proving thread's own rayon
 /// work, and on a loaded host the rayon versions waited for busy workers: at +32 runnable threads
 /// the parallel injector took 54-106 ms vs 2.6 ms serial (only ~0.1 entries per row remain once
 /// the cycle columns are deferred), and the parallel stage copy 29.6 vs 15.5 ms. On a quiet host
 /// the parallel versions win by under 2 ms, off the critical path.
 pub(crate) static SERIAL_PREFLIGHT: LazyLock<bool> =
-    LazyLock::new(|| std::env::var("RISC0_CUDA_PREFLIGHT_V3").as_deref() != Ok("0"));
+    LazyLock::new(|| std::env::var("RISC0_CUDA_SERIAL_PREFLIGHT").as_deref() != Ok("0"));
 
 fn build_injector(trace: &PreflightTrace, cycles: usize) -> (Injector, Vec<usize>) {
     scope!("build_injector");

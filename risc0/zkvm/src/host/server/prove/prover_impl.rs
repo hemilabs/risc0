@@ -553,14 +553,14 @@ impl ProverImpl {
         #[cfg(not(any(feature = "cuda", feature = "rocm")))]
         let mut warmup_handle: Option<std::thread::JoinHandle<()>> = None;
 
-        // Preload circom graph on background thread so the ~728ms file read + parse
-        // overlaps with segment proving and recursion.  Only needed for Groth16.
         // Load the Groth16 proving key while the STARK proves (the loader starts once segment
         // 0's prove_begin returns, see `prestart_key_go`).
         #[cfg(feature = "cuda")]
         if self.opts.receipt_kind == ReceiptKind::Groth16 {
             risc0_groth16::prove::prestart_key();
         }
+        // Preload circom graph on background thread so the ~728ms file read + parse
+        // overlaps with segment proving and recursion.  Only needed for Groth16.
         #[cfg(any(feature = "cuda", feature = "rocm", feature = "intel"))]
         let _graph_preload = if self.opts.receipt_kind == ReceiptKind::Groth16 {
             Some(std::thread::spawn(|| {

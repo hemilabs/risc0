@@ -134,7 +134,9 @@ pub fn set_host_chains_check(on: bool) -> usize {
 
 /// The recursion host-side preparation optimizations: host chains split across the preflight,
 /// page-locked staging of the witgen inputs (CUDA) and the fast host Poseidon2 permutation of the
-/// preflight. On unless `RISC0_CUDA_REC_PREP=0`.
+/// preflight (p2fast, bit-identical). On unless `RISC0_CUDA_REC_PREP=0`. Despite the name the
+/// switch is read on every build, not only with CUDA: p2fast serves the CPU and other GPU
+/// backends' recursion preflight too, and the switch turns it off there as well.
 pub(crate) fn host_prep_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var("RISC0_CUDA_REC_PREP").as_deref() != Ok("0"));
