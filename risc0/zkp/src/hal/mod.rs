@@ -552,7 +552,7 @@ mod testutil {
         let mut rng = rand::rng();
         let hal_cpu = CpuHal::new(hal_gpu.get_hash_suite().clone());
         let hal = DualHal::new(Rc::new(hal_cpu), Rc::new(hal_gpu));
-        for (po2, count) in [(20, 3), (21, 2)] {
+        for (po2, count) in [(16, 5), (17, 3), (18, 3), (19, 2), (20, 3), (21, 2)] {
             let steps = 1 << po2;
             let input = generate_elem(&hal, &mut rng, count * steps);
             let output = hal.alloc_elem("output", count * steps * INV_RATE);
@@ -800,6 +800,9 @@ mod testutil {
             (20, 9),
             (21, 3),
             (22, 1),
+            (17, 7),
+            (19, 3),
+            (18, 33),
         ] {
             assert!(hal_gpu.has_commit_coeffs_lde(po2));
             let size = (1 << po2) * count;

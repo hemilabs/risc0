@@ -1,14 +1,18 @@
-// Two-pass (four-step) fused commit NTT for lg_domain_size 20..22, lg_blowup 2 (CUDA only).
+// Four-step fused commit NTT ("nttq", C2-R2 tuning) for lg_domain_size 16..21, lg_blowup 2 (CUDA only).
 //   per column: W (evaluations) --colpass--> T1 --rowpass (* n^-1 * g^k)--> C (natural coefficients)
-//               C zero-padded to N --colpass--> T2 --rowpass--> E (natural-order LDE)
-// Each pass computes batched line DFTs of length L = 2^LOGL (1024..4096) as 16 x 16 x P3 stages in
-// registers with two shared-memory exchanges (Stockham), TB lines per block; the column pass
-// multiplies the four-step twiddle w_N^(col*k). All arithmetic is sppark's canonical Montgomery
-// bb31, so the output equals the radix-2 path bit for bit.
-// The forward passes run one column at a time, alternating between two side streams with their own
-// T2 scratch, so T2 stays L2-resident and the kernels' tails overlap; the side streams are joined
-// back into the gpu stream before returning.
+//               C (rows < Lc/4 of the [Lc][Lr] LDE matrix) --coset colpass--> T2 --rowpass--> E
+// Each pass computes batched line DFTs of length L = 2^LOGL (256..2048) as 16 x 16 x P3 stages in
+// registers with two shared-memory exchanges, TB lines per block (512-thread blocks where possible).
+// The forward column pass splits the zero-padded column DFT of length Lc into its 4 cosets
+// k = 4a + b (blockIdx.z = b): DFT_{Lc/4}(x_m * w_Lc^(m b)), so it reads only the nonzero rows.
+// Four-step twiddles and zk-shift factors are chained per thread (one table gather per thread).
+// Scratch T1/T2 lines are discarded from L2 after their last read (no write-back); the final LDE
+// is written with streaming stores. All arithmetic is sppark's canonical Montgomery bb31, so the
+// output equals the radix-2 path bit for bit.
+// The forward passes run CHF columns at a time, alternating between NS side streams with their own
+// T2 scratch (L2-resident); the side streams are joined back into the gpu stream before returning.
 #pragma once
+#include <mutex>
 
 namespace nttq {
 
@@ -61,22 +65,34 @@ struct LineTabs { const fr_t* r16; const fr_t* rP3; const fr_t* t2; const fr_t* 
 
 template<int LOGL, int TB> struct Smem {
     static constexpr int L = 1 << LOGL;
-    static constexpr int LS = L + L / 32 + 32 / TB;  // padded line stride
+    static constexpr int LS = L + L / 32 + (32 / TB > 0 ? 32 / TB : 1);  // padded line stride
+    static constexpr int TW = 256 + 256 * (1 << (LOGL - 8));            // t2 + t3 staged after the lines
     __device__ static __forceinline__ int a(int i) { return i + (i >> 5); }
 };
 
-// MODE 0: column pass. Matrix [L rows][S = 2^lgX cols], lines = columns; only rows < rows_in are
-//         read (rows_in == L/4: zero-padded expand). out[k*S + col] = DFT_L(col)[k] * w_N^(col*k).
-// MODE 1: row pass. Matrix [R = 2^lgX rows][L cols], lines = rows.
-//         out[row + R*k] = DFT_L(row)[k] (* scale * lo[i & 1023] * hi[i >> 10], i = row + R*k).
-template<int LOGL, int TB, int MODE>
-__global__ void __launch_bounds__(TB * (1 << LOGL) / 16)
+__device__ __forceinline__ fr_t twv(const Tw& tw, unsigned e) {
+    e &= (1u << tw.lgN) - 1;
+    return tw.A[e & 4095] * tw.B[e >> 12];
+}
+
+enum : unsigned { F_DISCARD_IN = 1, F_CS_OUT = 2 };
+#ifndef __HIPCC__
+__device__ __forceinline__ void st_cs(fr_t* p, fr_t x) { asm volatile("st.global.cs.u32 [%0], %1;" :: "l"(p), "r"(*(uint32_t*)&x) : "memory"); }
+// the 128-byte line's contents become undefined; it is dropped from L2 without a write-back
+__device__ __forceinline__ void discard_l2(const void* p) { asm volatile("discard.global.L2 [%0], 128;" :: "l"(p) : "memory"); }
+#else
+__device__ __forceinline__ void st_cs(fr_t* p, fr_t x) { *p = x; }
+__device__ __forceinline__ void discard_l2(const void*) {}
+#endif
+
+template<int LOGL, int TB, int MODE, int MINB>
+__global__ void __launch_bounds__(TB * (1 << LOGL) / 16, MINB)
 pass_k(const fr_t* __restrict__ in, fr_t* __restrict__ out, size_t ics, size_t ocs,
        unsigned lgX, unsigned rows_in, LineTabs T, Tw tw,
-       const fr_t* __restrict__ lo, const fr_t* __restrict__ hi, fr_t scale)
+       const fr_t* __restrict__ lo, const fr_t* __restrict__ hi, fr_t scale, unsigned flags)
 {
     constexpr int L = 1 << LOGL, LOGP3 = LOGL - 8, P3 = 1 << LOGP3;
-    static_assert(LOGP3 >= 1 && LOGP3 <= 4, "LOGL 9..12");
+    static_assert(LOGP3 >= 0 && LOGP3 <= 4, "LOGL 8..12");
     using SM = Smem<LOGL, TB>;
     constexpr int NT = TB * L / 16;
     constexpr int LP1 = L / 16;
@@ -85,15 +101,20 @@ pass_k(const fr_t* __restrict__ in, fr_t* __restrict__ out, size_t ics, size_t o
     out += blockIdx.y * ocs;
     const size_t base0 = (size_t)blockIdx.x * TB;
     const int tid = threadIdx.x;
+    const unsigned bz = MODE == 2 ? blockIdx.z : 0;
 
     fr_t r16[8];
     #pragma unroll
     for (int e = 0; e < 8; e++) r16[e] = T.r16[e];
+    fr_t* st2 = smem + TB * SM::LS;
+    fr_t* st3 = st2 + 256;
+    for (int i = tid; i < 256; i += NT) st2[i] = T.t2[i];
+    for (int i = tid; i < 256 * P3; i += NT) st3[i] = T.t3[i];
+    const fr_t* T2p = st2; const fr_t* T3p = st3;
 
-    // stage 1 (Ns = 1, P = 16): global -> registers -> smem
     {
         int c, j;
-        if (MODE == 0) { c = tid % TB; j = tid / TB; }
+        if (MODE != 1) { c = tid % TB; j = tid / TB; }
         else           { c = tid / LP1; j = tid % LP1; }
         fr_t v[16];
         if (MODE == 0) {
@@ -102,7 +123,6 @@ pass_k(const fr_t* __restrict__ in, fr_t* __restrict__ out, size_t ics, size_t o
             if (rows_in == L / 4) {
                 #pragma unroll
                 for (int m = 0; m < 4; m++) v[m] = src[(size_t)m * LP1 * S];
-                // only v[0..3] nonzero: X[4a+b] = DFT4_a(x_m * w16^(m*b))
                 fr_t x1 = v[1], x2 = v[2], x3 = v[3], x0 = v[0];
                 fr_t r4[2] = {r16[0], r16[4]};
                 #pragma unroll
@@ -118,9 +138,26 @@ pass_k(const fr_t* __restrict__ in, fr_t* __restrict__ out, size_t ics, size_t o
                 }
             } else {
                 #pragma unroll
+                #pragma unroll
                 for (int m = 0; m < 16; m++) v[m] = src[(size_t)m * LP1 * S];
                 reg_dft<4>(v, r16);
             }
+        } else if (MODE == 2) {
+            const size_t S = (size_t)1 << lgX;
+            const fr_t* src = in + base0 + c + (size_t)j * S;
+            #pragma unroll
+            for (int m = 0; m < 16; m++) v[m] = src[(size_t)m * LP1 * S];
+            if (bz != 0) {
+                // twist x_row *= w_Lc^(row*b) = w_N^(row*b*S), row = j + m*LP1
+                fr_t t = twv(tw, (unsigned)(j * bz) << lgX);
+                fr_t st = twv(tw, (unsigned)(LP1 * bz) << lgX);
+                #pragma unroll
+                for (int m = 0; m < 16; m++) {
+                    v[m] = v[m] * t;
+                    if (m + 1 < 16) t = t * st;
+                }
+            }
+            reg_dft<4>(v, r16);
         } else {
             const fr_t* src = in + (base0 + c) * L;
             #pragma unroll
@@ -132,7 +169,12 @@ pass_k(const fr_t* __restrict__ in, fr_t* __restrict__ out, size_t ics, size_t o
         for (int m = 0; m < 16; m++) sl[SM::a(j * 16 + m)] = v[m];
     }
     __syncthreads();
-    // stage 2 (Ns = 16, P = 16): smem -> smem
+    if (MODE == 1 && (flags & F_DISCARD_IN)) {
+        // the block's input rows [base0, base0 + TB) * L are contiguous and dead now
+        constexpr int NL = TB * L / 32;               // 128-byte lines
+        const char* b = (const char*)(in + base0 * L);
+        for (int i = tid; i < NL; i += NT) discard_l2(b + (size_t)i * 128);
+    }
     {
         int c = tid / LP1, j = tid % LP1, k = j & 15;
         fr_t* sl = smem + c * SM::LS;
@@ -140,7 +182,7 @@ pass_k(const fr_t* __restrict__ in, fr_t* __restrict__ out, size_t ics, size_t o
         #pragma unroll
         for (int m = 0; m < 16; m++) v[m] = sl[SM::a(j + m * LP1)];
         #pragma unroll
-        for (int m = 1; m < 16; m++) v[m] = v[m] * T.t2[m * 16 + k];
+        for (int m = 1; m < 16; m++) v[m] = v[m] * T2p[m * 16 + k];
         reg_dft<4>(v, r16);
         __syncthreads();
         int b = (j >> 4) * 256 + k;
@@ -148,17 +190,28 @@ pass_k(const fr_t* __restrict__ in, fr_t* __restrict__ out, size_t ics, size_t o
         for (int m = 0; m < 16; m++) sl[SM::a(b + m * 16)] = v[m];
     }
     __syncthreads();
-    // stage 3 (Ns = 256, P = P3): smem -> registers -> global
     {
-        fr_t rP[P3 / 2];
+        fr_t rP[P3 / 2 > 0 ? P3 / 2 : 1];
         #pragma unroll
         for (int e = 0; e < P3 / 2; e++) rP[e] = T.rP3[e];
         constexpr int ITEMS = TB * 256, IPT = ITEMS / NT;
-        const unsigned Nmask = (1u << tw.lgN) - 1;
-        fr_t step;                                       // w_N^(256*col); col is fixed per thread
-        if (MODE == 0) {
-            unsigned e = ((unsigned)(base0 + tid % TB) * 256u) & Nmask;
-            step = tw.A[e & 4095] * tw.B[e >> 12];
+        constexpr unsigned KM = MODE == 2 ? 4 : 1;
+        fr_t step, tI, sI, gI, gsI, gs;
+        {
+            const int c0 = tid % TB, j0 = tid / TB;
+            constexpr unsigned JS = NT / TB;                 // j advance per item
+            if (MODE != 1) {
+                unsigned col = (unsigned)(base0 + c0);
+                step = twv(tw, col * (256u * KM));
+                tI = twv(tw, col * ((unsigned)j0 * KM + bz));
+                sI = twv(tw, col * (JS * KM));
+            } else if (lo) {
+                size_t k0 = base0 + c0 + ((size_t)j0 << lgX);
+                gI = scale * (lo[k0 & 1023] * hi[k0 >> 10]);
+                size_t ki = (size_t)JS << lgX, ks = (size_t)256 << lgX;
+                gsI = lo[ki & 1023] * hi[ki >> 10];
+                gs = lo[ks & 1023] * hi[ks >> 10];
+            }
         }
         #pragma unroll
         for (int it = 0; it < IPT; it++) {
@@ -169,26 +222,26 @@ pass_k(const fr_t* __restrict__ in, fr_t* __restrict__ out, size_t ics, size_t o
             #pragma unroll
             for (int m = 0; m < P3; m++) v[m] = sl[SM::a(j + m * 256)];
             #pragma unroll
-            for (int m = 1; m < P3; m++) v[m] = v[m] * T.t3[m * 256 + j];
+            for (int m = 1; m < P3; m++) v[m] = v[m] * T3p[m * 256 + j];
             reg_dft<LOGP3>(v, rP);
-            fr_t t;
-            if (MODE == 0) {
-                unsigned e = ((unsigned)(base0 + c) * (unsigned)j) & Nmask;
-                t = tw.A[e & 4095] * tw.B[e >> 12];
-            }
+            fr_t t = tI, g = gI;
             #pragma unroll
             for (int m = 0; m < P3; m++) {
-                unsigned k = j + m * 256;
+                unsigned k = (j + m * 256) * KM + bz;
                 fr_t x = v[m];
-                if (MODE == 0) {
+                if (MODE != 1) {
                     x = x * t;
                     if (m + 1 < P3) t = t * step;
                     out[((size_t)k << lgX) + base0 + c] = x;
                 } else {
                     size_t kk = base0 + c + ((size_t)k << lgX);
-                    if (lo) x = x * scale * (lo[kk & 1023] * hi[kk >> 10]);
-                    out[kk] = x;
+                    if (lo) { x = x * g; if (m + 1 < P3) g = g * gs; }
+                    if (flags & F_CS_OUT) st_cs(out + kk, x); else out[kk] = x;
                 }
+            }
+            if (it + 1 < IPT) {
+                if (MODE != 1) tI = tI * sI;
+                else if (lo) gI = gI * gsI;
             }
         }
     }
@@ -211,11 +264,6 @@ __global__ void k_line_tabs(fr_t* r16, fr_t* rP3, fr_t* t2, fr_t* t3, fr_t wN, i
     if (t < 256 * P3) { int m = t / 256, k = t % 256; t3[t] = wL ^ (unsigned)(k * m); }
 }
 
-struct Tables {
-    LineTabs col, row;
-    fr_t* A = nullptr; fr_t* B = nullptr;
-    unsigned lgN, lgLc, lgLr;
-};
 
 static LineTabs make_line(const gpu_t& gpu, fr_t w, unsigned lgN, unsigned LOGL)
 {
@@ -230,19 +278,54 @@ static LineTabs make_line(const gpu_t& gpu, fr_t w, unsigned lgN, unsigned LOGL)
     return LineTabs{r16, rP3, t2, t3};
 }
 
-// lgN in 20..24: line sizes lgN/2 and lgN - lgN/2 are in 10..12
-static const Tables& tables(const gpu_t& gpu, unsigned lgN, bool inverse)
+template<int LOGL, int TB, int MODE, int MINB>
+static void launch(cudaStream_t st, unsigned cols, const fr_t* in, fr_t* out, size_t ics, size_t ocs,
+                   unsigned lgX, unsigned rows_in, const LineTabs& LT, Tw tw,
+                   const fr_t* lo, const fr_t* hi, fr_t scale, unsigned flags)
 {
-    static Tables tabs[16][2][32];
+    constexpr int L = 1 << LOGL;
+    const size_t sh = ((size_t)TB * Smem<LOGL, TB>::LS + Smem<LOGL, TB>::TW) * sizeof(fr_t);
+    static std::once_flag once;
+    std::call_once(once, [&] {
+        CUDA_OK(cudaFuncSetAttribute(pass_k<LOGL, TB, MODE, MINB>,
+                                     cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sh));
+    });
+    dim3 grid((unsigned)(((size_t)1 << lgX) / TB), cols, MODE == 2 ? 4 : 1);
+    pass_k<LOGL, TB, MODE, MINB><<<grid, TB * L / 16, sh, st>>>(in, out, ics, ocs, lgX, rows_in, LT, tw,
+                                                                lo, hi, scale, flags);
+    CUDA_OK(cudaGetLastError());
+}
+
+template<int MODE>
+static void pass(cudaStream_t st, unsigned LOGL, unsigned TB, unsigned cols, const fr_t* in, fr_t* out,
+                 size_t ics, size_t ocs, unsigned lgX, unsigned rows_in, const LineTabs& LT, Tw tw,
+                 const fr_t* lo = nullptr, const fr_t* hi = nullptr, fr_t scale = fr_t(1), unsigned flags = 0)
+{
+#define NTTQ_INST(LL, TT, MB) if (LOGL == LL && TB == TT) { launch<LL, TT, MODE, MB>(st, cols, in, out, ics, ocs, lgX, rows_in, LT, tw, lo, hi, scale, flags); return; }
+    NTTQ_INST(8, 16, 4) NTTQ_INST(8, 32, 2) NTTQ_INST(9, 16, 2) NTTQ_INST(9, 32, 1)
+    NTTQ_INST(9, 8, 3) NTTQ_INST(10, 8, 2) NTTQ_INST(11, 8, 1)
+#undef NTTQ_INST
+    throw cuda_error(cudaErrorInvalidValue, "nttq: no instance");
+}
+
+struct Tables {
+    LineTabs col, row;
+    fr_t* A = nullptr; fr_t* B = nullptr;
+    unsigned lgN, lgLc, lgLr;
+};
+// lgN = lgLc + lgLr; the column line has length 2^colL (colL = lgLc, or lgLc - 2 for the coset pass)
+static const Tables& tables(const gpu_t& gpu, unsigned lgN, unsigned lgLr, unsigned colL, bool inverse)
+{
+    static Tables tabs[16][2][24][13];
     static std::mutex mtx;
     std::lock_guard<std::mutex> lock(mtx);
-    Tables& T = tabs[gpu.id()][inverse][lgN];
+    Tables& T = tabs[gpu.id()][inverse][lgN][lgLr];
     if (T.A == nullptr) {
         const fr_t* roots = inverse ? inverse_roots_of_unity : forward_roots_of_unity;
-        T.lgN = lgN; T.lgLr = lgN / 2; T.lgLc = lgN - T.lgLr;
-        T.col = make_line(gpu, roots[lgN], lgN, T.lgLc);
-        T.row = make_line(gpu, roots[lgN], lgN, T.lgLr);
-        size_t nB = (size_t)1 << (lgN - 12);
+        T.lgN = lgN; T.lgLr = lgLr; T.lgLc = lgN - lgLr;
+        T.col = make_line(gpu, roots[lgN], lgN, colL);
+        T.row = make_line(gpu, roots[lgN], lgN, lgLr);
+        size_t nB = lgN > 12 ? (size_t)1 << (lgN - 12) : 1;
         fr_t *A, *B;
         CUDA_OK(cudaMalloc(&A, 4096 * sizeof(fr_t)));
         CUDA_OK(cudaMalloc(&B, nB * sizeof(fr_t)));
@@ -256,45 +339,32 @@ static const Tables& tables(const gpu_t& gpu, unsigned lgN, bool inverse)
     return T;
 }
 
-template<int LOGL, int TB, int MODE>
-static void launch(cudaStream_t st, unsigned cols, const fr_t* in, fr_t* out, size_t ics, size_t ocs,
-                   unsigned lgX, unsigned rows_in, const LineTabs& LT, Tw tw,
-                   const fr_t* lo, const fr_t* hi, fr_t scale)
-{
-    constexpr int L = 1 << LOGL;
-    const size_t sh = (size_t)TB * Smem<LOGL, TB>::LS * sizeof(fr_t);
-    static std::once_flag once;
-    std::call_once(once, [&] {
-        CUDA_OK(cudaFuncSetAttribute(pass_k<LOGL, TB, MODE>,
-                                     cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sh));
-    });
-    dim3 grid((unsigned)(((size_t)1 << lgX) / TB), cols);
-    pass_k<LOGL, TB, MODE><<<grid, TB * L / 16, sh, st>>>(in, out, ics, ocs, lgX, rows_in, LT, tw,
-                                                          lo, hi, scale);
-    CUDA_OK(cudaGetLastError());
-}
-
-// TB per line size: 16 lines of 1024, 8 of 2048, 4 of 4096 (1024 threads, <= 68 KB smem).
-template<int MODE>
-static void pass(cudaStream_t st, unsigned LOGL, unsigned cols, const fr_t* in, fr_t* out,
-                 size_t ics, size_t ocs, unsigned lgX, unsigned rows_in, const LineTabs& LT, Tw tw,
-                 const fr_t* lo = nullptr, const fr_t* hi = nullptr, fr_t scale = fr_t(1))
-{
-    switch (LOGL) {
-    case 10: launch<10, 16, MODE>(st, cols, in, out, ics, ocs, lgX, rows_in, LT, tw, lo, hi, scale); break;
-    case 11: launch<11, 8, MODE>(st, cols, in, out, ics, ocs, lgX, rows_in, LT, tw, lo, hi, scale); break;
-    case 12: launch<12, 4, MODE>(st, cols, in, out, ics, ocs, lgX, rows_in, LT, tw, lo, hi, scale); break;
-    default: throw cuda_error(cudaErrorInvalidValue, "nttq: line size");
+// Per-size schedule (measured on RTX 5090, C2-R2): inverse row line 2^IR (column 2^(lg-IR)),
+// forward row line 2^FR (coset column 2^(lg-FR)), TB per pass, side streams, columns per forward
+// launch, columns per inverse chunk.
+struct Cfg { unsigned IR, FR, ITC, ITR, FTC, FTR, NS, CHF, CHI; };
+static Cfg cfg(unsigned lg) {
+    switch (lg) {
+    case 16: return Cfg{8, 8, 16, 16, 16, 16, 0, 32, 32};
+    case 17: return Cfg{8, 9, 32, 32, 16, 16, 0, 32, 32};
+    case 18: return Cfg{9, 10, 16, 16, 16, 8, 2, 2, 8};
+    case 19: return Cfg{10, 10, 8, 8, 16, 8, 2, 1, 2};
+    case 20: return Cfg{10, 10, 8, 8, 8, 8, 2, 1, 2};
+    default: return Cfg{10, 10, 8, 8, 8, 8, 2, 1, 1};   // 21
     }
 }
 
-// lg22: 1.01x (no gain) for 256 MB of scratch, so lg 20-21 only.
-static bool supported(unsigned lg, unsigned lgB) { return lgB == 2 && lg >= 20 && lg <= 21; }
+static bool supported(unsigned lg, unsigned lgB) { return lgB == 2 && lg >= 16 && lg <= 21; }
 
 static bool enabled() {
     static int on = -1;
     if (on < 0) { const char* e = getenv("RISC0_CUDA_NTTQ"); on = (e && e[0] == '0') ? 0 : 1; }
     return on == 1;
+}
+static bool enabled_lde() {
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("RISC0_CUDA_NTTQ_LDE"); on = (e && e[0] == '0') ? 0 : 1; }
+    return on == 1 && enabled();
 }
 
 struct Side {
@@ -304,19 +374,11 @@ struct Side {
     fr_t* T2[2] = {};
     size_t t2_elems = 0;
 };
-
-// C (natural shifted coefficients) and E (LDE) of `cols` columns of W; W unchanged.
-// lo/hi: zk-shift factor tables (nttx_tables), so lo[k & 1023] * hi[k >> 10] = g^k.
-static void commit(const gpu_t& gpu, fr_t* C, fr_t* E, const fr_t* W, unsigned lg, unsigned lgB,
-                   unsigned cols, const fr_t* lo, const fr_t* hi)
+// one Side per device shared by commit and forward (both hold the mutex and join before returning)
+static std::mutex side_mtx;
+static Side& side(const gpu_t& gpu, size_t t2_elems)
 {
     static Side sides[16];
-    static std::mutex mtx;
-    const unsigned lgN = lg + lgB;
-    const size_t n = (size_t)1 << lg, N = n << lgB;
-    const Tables& I = tables(gpu, lg, true);
-    const Tables& F = tables(gpu, lgN, false);
-    std::lock_guard<std::mutex> lock(mtx);
     Side& S = sides[gpu.id()];
     if (S.s[0] == nullptr) {
         for (int i = 0; i < 2; i++) {
@@ -325,36 +387,66 @@ static void commit(const gpu_t& gpu, fr_t* C, fr_t* E, const fr_t* W, unsigned l
         }
         CUDA_OK(cudaEventCreateWithFlags(&S.inv, cudaEventDisableTiming));
     }
-    if (S.t2_elems < N) {
-        // previous users of T2 finished: every commit joins the side streams before returning
+    if (S.t2_elems < t2_elems) {
+        // earlier commits/forwards may still be running on the gpu stream (NS == 0) or the side
+        // streams: wait for them before freeing T2
+        CUDA_OK(cudaStreamSynchronize(gpu));
+        for (int i = 0; i < 2; i++) CUDA_OK(cudaStreamSynchronize(S.s[i]));
         for (int i = 0; i < 2; i++) {
             if (S.T2[i]) CUDA_OK(cudaFree(S.T2[i]));
-            CUDA_OK(cudaMalloc(&S.T2[i], N * sizeof(fr_t)));
+            CUDA_OK(cudaMalloc(&S.T2[i], t2_elems * sizeof(fr_t)));
         }
-        S.t2_elems = N;
+        S.t2_elems = t2_elems;
     }
+    return S;
+}
+
+// forward LDE of `cols` natural-order coefficient columns Cn into E (issued on stream s)
+static void fwd_cols(cudaStream_t s, const Tables& F, const Cfg& G, fr_t* T2, unsigned lg, unsigned kf,
+                     const fr_t* Cn, fr_t* E)
+{
+    const unsigned lgN = lg + 2;
+    const size_t n = (size_t)1 << lg, N = n << 2;
+    pass<2>(s, lg - F.lgLr, G.FTC, kf, Cn, T2, n, N, F.lgLr, 0, F.col, Tw{F.A, F.B, lgN});
+    pass<1>(s, F.lgLr, G.FTR, kf, T2, E, N, N, F.lgLc, 0, F.row, Tw{nullptr, nullptr, 0},
+            nullptr, nullptr, fr_t(1), F_DISCARD_IN | F_CS_OUT);
+}
+
+// C (natural shifted coefficients) and E (LDE) of `cols` columns of W; W unchanged.
+// lo/hi: zk-shift factor tables (nttx_tables), so lo[k & 1023] * hi[k >> 10] = g^k.
+static void commit(const gpu_t& gpu, fr_t* C, fr_t* E, const fr_t* W, unsigned lg, unsigned lgB,
+                   unsigned cols, const fr_t* lo, const fr_t* hi)
+{
+    const Cfg G = cfg(lg);
+    const unsigned lgN = lg + lgB;
+    const size_t n = (size_t)1 << lg, N = n << lgB;
+    const Tables& I = tables(gpu, lg, G.IR, lg - G.IR, true);
+    const Tables& F = tables(gpu, lgN, G.FR, lg - G.FR, false);
+    std::lock_guard<std::mutex> lock(side_mtx);
+    Side& S = side(gpu, N * G.CHF);
     cudaStream_t st = gpu;
     const fr_t ninv = domain_size_inverse[lg];
-    constexpr unsigned CHI = 8;
     unsigned rr = 0;
-    for (unsigned c0 = 0; c0 < cols; c0 += CHI) {
-        const unsigned k = std::min(CHI, cols - c0);
+    for (unsigned c0 = 0; c0 < cols; c0 += G.CHI) {
+        const unsigned k = std::min(G.CHI, cols - c0);
         // T1 lives in E of these columns: their forward passes are only issued below.
         fr_t* T1 = E + c0 * N;
-        pass<0>(st, I.lgLc, k, W + c0 * n, T1, n, n, I.lgLr, 1u << I.lgLc, I.col, Tw{I.A, I.B, lg});
-        pass<1>(st, I.lgLr, k, T1, C + c0 * n, n, n, I.lgLc, 0, I.row, Tw{nullptr, nullptr, 0},
-                lo, hi, ninv);
+        pass<0>(st, I.lgLc, G.ITC, k, W + c0 * n, T1, n, n, I.lgLr, 1u << I.lgLc, I.col, Tw{I.A, I.B, lg});
+        pass<1>(st, I.lgLr, G.ITR, k, T1, C + c0 * n, n, n, I.lgLc, 0, I.row, Tw{nullptr, nullptr, 0},
+                lo, hi, ninv, F_DISCARD_IN);
+        if (G.NS == 0) {
+            for (unsigned c = c0; c < c0 + k; c += G.CHF)
+                fwd_cols(st, F, G, S.T2[0], lg, std::min(G.CHF, c0 + k - c), C + c * n, E + c * N);
+            continue;
+        }
         CUDA_OK(cudaEventRecord(S.inv, st));
         for (int i = 0; i < 2; i++) CUDA_OK(cudaStreamWaitEvent(S.s[i], S.inv, 0));
-        for (unsigned c = c0; c < c0 + k; c++) {
+        for (unsigned c = c0; c < c0 + k; c += G.CHF) {
             const unsigned x = rr++ & 1;
-            pass<0>(S.s[x], F.lgLc, 1, C + c * n, S.T2[x], n, N, F.lgLr, (unsigned)(n >> F.lgLr),
-                    F.col, Tw{F.A, F.B, lgN});
-            pass<1>(S.s[x], F.lgLr, 1, S.T2[x], E + c * N, N, N, F.lgLc, 0, F.row,
-                    Tw{nullptr, nullptr, 0});
+            fwd_cols(S.s[x], F, G, S.T2[x], lg, std::min(G.CHF, c0 + k - c), C + c * n, E + c * N);
         }
     }
-    for (int i = 0; i < 2; i++) {
+    if (G.NS) for (int i = 0; i < 2; i++) {
         CUDA_OK(cudaEventRecord(S.ev[i], S.s[i]));
         CUDA_OK(cudaStreamWaitEvent(st, S.ev[i], 0));
     }
@@ -363,46 +455,29 @@ static void commit(const gpu_t& gpu, fr_t* C, fr_t* E, const fr_t* W, unsigned l
 // E = LDE of natural-order coefficients Cn (cols columns), same scheme as commit's forward half.
 static void forward(const gpu_t& gpu, fr_t* E, const fr_t* Cn, unsigned lg, unsigned lgB, unsigned cols)
 {
-    static Side sides[16];
-    static std::mutex mtx;
+    const Cfg G = cfg(lg);
     const unsigned lgN = lg + lgB;
     const size_t n = (size_t)1 << lg, N = n << lgB;
-    const Tables& F = tables(gpu, lgN, false);
-    std::lock_guard<std::mutex> lock(mtx);
-    Side& S = sides[gpu.id()];
-    if (S.s[0] == nullptr) {
-        for (int i = 0; i < 2; i++) {
-            CUDA_OK(cudaStreamCreateWithFlags(&S.s[i], cudaStreamNonBlocking));
-            CUDA_OK(cudaEventCreateWithFlags(&S.ev[i], cudaEventDisableTiming));
-        }
-        CUDA_OK(cudaEventCreateWithFlags(&S.inv, cudaEventDisableTiming));
-    }
-    if (S.t2_elems < N) {
-        for (int i = 0; i < 2; i++) {
-            if (S.T2[i]) CUDA_OK(cudaFree(S.T2[i]));
-            CUDA_OK(cudaMalloc(&S.T2[i], N * sizeof(fr_t)));
-        }
-        S.t2_elems = N;
-    }
+    const Tables& F = tables(gpu, lgN, G.FR, lg - G.FR, false);
+    std::lock_guard<std::mutex> lock(side_mtx);
+    Side& S = side(gpu, N * G.CHF);
     cudaStream_t st = gpu;
+    if (G.NS == 0) {
+        for (unsigned c = 0; c < cols; c += G.CHF)
+            fwd_cols(st, F, G, S.T2[0], lg, std::min(G.CHF, cols - c), Cn + c * n, E + c * N);
+        return;
+    }
     CUDA_OK(cudaEventRecord(S.inv, st));
     for (int i = 0; i < 2; i++) CUDA_OK(cudaStreamWaitEvent(S.s[i], S.inv, 0));
-    for (unsigned c = 0; c < cols; c++) {
-        const unsigned x = c & 1;
-        pass<0>(S.s[x], F.lgLc, 1, Cn + c * n, S.T2[x], n, N, F.lgLr, (unsigned)(n >> F.lgLr),
-                F.col, Tw{F.A, F.B, lgN});
-        pass<1>(S.s[x], F.lgLr, 1, S.T2[x], E + c * N, N, N, F.lgLc, 0, F.row, Tw{nullptr, nullptr, 0});
+    unsigned rr = 0;
+    for (unsigned c = 0; c < cols; c += G.CHF) {
+        const unsigned x = rr++ & 1;
+        fwd_cols(S.s[x], F, G, S.T2[x], lg, std::min(G.CHF, cols - c), Cn + c * n, E + c * N);
     }
     for (int i = 0; i < 2; i++) {
         CUDA_OK(cudaEventRecord(S.ev[i], S.s[i]));
         CUDA_OK(cudaStreamWaitEvent(st, S.ev[i], 0));
     }
-}
-
-static bool enabled_lde() {
-    static int on = -1;
-    if (on < 0) { const char* e = getenv("RISC0_CUDA_NTTQ_LDE"); on = (e && e[0] == '0') ? 0 : 1; }
-    return on == 1 && enabled();
 }
 
 } // namespace nttq
