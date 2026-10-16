@@ -24,21 +24,47 @@ use risc0_build_kernel::{KernelBuild, KernelType};
 compile_error!("Features 'cuda' and 'rocm' are mutually exclusive. Enable only one GPU backend.");
 
 fn main() {
-    if env::var("CARGO_FEATURE_CUDA").is_ok() {
-        build_cuda_kernels();
+    let cuda = env::var("CARGO_FEATURE_CUDA").is_ok();
+    let rocm = env::var("CARGO_FEATURE_ROCM").is_ok();
+
+    // Set the GPU builds' environment before any thread starts: the CPU build below runs
+    // concurrently and reads the environment.
+    if (cuda || rocm) && env::var("RISC0_SKIP_BUILD_KERNELS").is_err() {
+        env::set_var("SCCACHE_IDLE_TIMEOUT", "0");
+        if rocm {
+            env::set_var("HIP_PLATFORM", "amd");
+        }
     }
 
-    if env::var("CARGO_FEATURE_ROCM").is_ok() {
-        build_rocm_kernels();
-    }
+    // The CPU kernels (rust_poly_fp_<n>.cpp, ~7 MB of generated C++ each, up to ~20 min of -O3
+    // per file) and the GPU kernels share nothing, so build them concurrently instead of one
+    // after the other: each takes about as long as the other.
+    std::thread::scope(|scope| {
+        scope.spawn(build_cpu_kernels);
 
-    build_cpu_kernels();
+        if cuda {
+            build_cuda_kernels();
+        }
+
+        if rocm {
+            build_rocm_kernels();
+        }
+    });
 }
 
 fn build_cpu_kernels() {
     rerun_if_changed("kernels/cxx");
+    // rust_poly_fp_<n>.cpp, the generated constraint polynomial, are ~7 MB each and take far
+    // longer to compile than everything else here: start them at once, each on its own thread.
+    let (poly_fp, rest): (Vec<PathBuf>, Vec<PathBuf>) =
+        glob_paths("kernels/cxx/*.cpp").into_iter().partition(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("rust_poly_fp_"))
+        });
     KernelBuild::new(KernelType::Cpp)
-        .files(glob_paths("kernels/cxx/*.cpp"))
+        .files(rest)
+        .files_on_own_threads(poly_fp)
         .include(env::var("DEP_RISC0_SYS_CXX_ROOT").unwrap())
         .compile("risc0_keccak_cpu");
 }
@@ -63,8 +89,6 @@ fn build_cuda_kernels() {
         println!("cargo:{}={}", output, out_path.display());
         return;
     }
-
-    env::set_var("SCCACHE_IDLE_TIMEOUT", "0");
 
     let cuda_root = env::var("DEP_RISC0_SYS_CUDA_ROOT").unwrap();
     let sppark_root = env::var("DEP_SPPARK_ROOT").unwrap();
@@ -152,54 +176,60 @@ fn build_cuda_kernels() {
         &risc0_build_kernel::nvcc_environment_key(),
         &native_key,
     ]);
-    risc0_build_kernel::cached_compile(
-        &cache_dir,
-        "eval_check_scratch",
-        obj_ext,
-        &key,
-        &eval_check_obj,
-        |out| {
-            let status = cmd
-                .arg("-o")
-                .arg(out)
-                .status()
-                .expect("failed to run nvcc for eval_check_scratch.cu");
-            assert!(status.success(), "nvcc failed for eval_check_scratch.cu");
-        },
-    );
+    // eval_check is a single ptxas run of ~25 min, the -dc compile of the step files below
+    // about 8: run it on its own thread, concurrently with them, instead of before them.
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            risc0_build_kernel::cached_compile(
+                &cache_dir,
+                "eval_check_scratch",
+                obj_ext,
+                &key,
+                &eval_check_obj,
+                |out| {
+                    let status = cmd
+                        .arg("-o")
+                        .arg(out)
+                        .status()
+                        .expect("failed to run nvcc for eval_check_scratch.cu");
+                    assert!(status.success(), "nvcc failed for eval_check_scratch.cu");
+                },
+            );
+        });
 
-    // Step 2: everything else with --device-c, as before. eval_check_*.cu and ffi_supra.cu are
-    // in the translation unit above (ROCm still builds ffi_supra.cu).
-    let mut build = cc::Build::new();
-    build
-        .cuda(true)
-        .cudart("static")
-        .debug(false)
-        .flag("-diag-suppress=177")
-        .flag("-diag-suppress=550")
-        .flag("-diag-suppress=2922")
-        .flag(risc0_build_kernel::cuda_cxx_std_flag())
-        .include(&cuda_root)
-        .include(&sppark_root);
-    // GCC/Clang warning flags; cl.exe, nvcc's host compiler on MSVC, rejects them.
-    if msvc {
-        risc0_build_kernel::msvc_cuda_build_setup(&mut build);
-    } else {
+        // Step 2: everything else with --device-c, as before. eval_check_*.cu and ffi_supra.cu
+        // are in the translation unit above (ROCm still builds ffi_supra.cu).
+        let mut build = cc::Build::new();
         build
-            .flag("-Xcompiler")
-            .flag("-Wno-unused-function,-Wno-unused-parameter");
-    }
-    if use_native_arch {
-        build.flag("-arch=native");
-    }
-    let cuda_files: Vec<PathBuf> = glob_paths("kernels/cuda/*.cu")
-        .into_iter()
-        .filter(|p| {
-            let name = p.file_name().unwrap().to_str().unwrap();
-            !(name == "ffi_supra.cu" || name.starts_with("eval_check_"))
-        })
-        .collect();
-    build.files(cuda_files).compile(output);
+            .cuda(true)
+            .cudart("static")
+            .debug(false)
+            .flag("-diag-suppress=177")
+            .flag("-diag-suppress=550")
+            .flag("-diag-suppress=2922")
+            .flag(risc0_build_kernel::cuda_cxx_std_flag())
+            .include(&cuda_root)
+            .include(&sppark_root);
+        // GCC/Clang warning flags; cl.exe, nvcc's host compiler on MSVC, rejects them.
+        if msvc {
+            risc0_build_kernel::msvc_cuda_build_setup(&mut build);
+        } else {
+            build
+                .flag("-Xcompiler")
+                .flag("-Wno-unused-function,-Wno-unused-parameter");
+        }
+        if use_native_arch {
+            build.flag("-arch=native");
+        }
+        let cuda_files: Vec<PathBuf> = glob_paths("kernels/cuda/*.cu")
+            .into_iter()
+            .filter(|p| {
+                let name = p.file_name().unwrap().to_str().unwrap();
+                !(name == "ffi_supra.cu" || name.starts_with("eval_check_"))
+            })
+            .collect();
+        build.files(cuda_files).compile(output);
+    });
 
     // Step 3: add the eval_check object to the archive.
     risc0_build_kernel::add_to_static_lib(&out_dir, output, &[eval_check_obj]);
@@ -350,9 +380,6 @@ fn build_rocm_kernels() {
         println!("cargo:{}={}", output, out_path.display());
         return;
     }
-
-    env::set_var("SCCACHE_IDLE_TIMEOUT", "0");
-    env::set_var("HIP_PLATFORM", "amd");
 
     let sppark_root = env::var("DEP_SPPARK_ROOT").unwrap();
     let cuda_root = env::var("DEP_RISC0_SYS_CUDA_ROOT").unwrap();

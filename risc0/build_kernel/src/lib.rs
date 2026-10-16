@@ -39,6 +39,7 @@ pub struct KernelBuild {
     kernel_type: KernelType,
     flags: Vec<String>,
     files: Vec<PathBuf>,
+    own_thread_files: Vec<PathBuf>,
     inc_dirs: Vec<PathBuf>,
     deps: Vec<PathBuf>,
 }
@@ -49,6 +50,7 @@ impl KernelBuild {
             kernel_type,
             flags: Vec::new(),
             files: Vec::new(),
+            own_thread_files: Vec::new(),
             inc_dirs: Vec::new(),
             deps: Vec::new(),
         }
@@ -81,6 +83,26 @@ impl KernelBuild {
         for file in p.into_iter() {
             self.file(file);
         }
+        self
+    }
+
+    /// Add files which will be compiled (C++ only) each on a thread of its own, started before
+    /// the other files and outside cargo's jobserver, with the same command `cc` would run.
+    ///
+    /// For a few huge generated files on the critical path of the build: through the
+    /// jobserver they wait for tokens other crates hold, and can start long after the rest of
+    /// the build script's work.
+    pub fn files_on_own_threads<P>(&mut self, p: P) -> &mut KernelBuild
+    where
+        P: IntoIterator,
+        P::Item: AsRef<Path>,
+    {
+        assert!(
+            self.kernel_type == KernelType::Cpp,
+            "files_on_own_threads is only supported for C++ kernels"
+        );
+        self.own_thread_files
+            .extend(p.into_iter().map(|f| f.as_ref().to_path_buf()));
         self
     }
 
@@ -118,7 +140,7 @@ impl KernelBuild {
 
     pub fn compile(&mut self, output: &str) {
         println!("cargo:rerun-if-env-changed=RISC0_SKIP_BUILD_KERNELS");
-        for src in self.files.iter() {
+        for src in self.files.iter().chain(&self.own_thread_files) {
             rerun_if_changed(src);
         }
         for dep in self.deps.iter() {
@@ -152,12 +174,55 @@ impl KernelBuild {
         build
             .cpp(true)
             .debug(false)
-            .files(&self.files)
             .includes(&self.inc_dirs)
             .flag_if_supported("-fno-var-tracking")
             .flag_if_supported("-fno-var-tracking-assignments")
-            .flag_if_supported("-g0")
-            .compile(output);
+            .flag_if_supported("-g0");
+        if self.own_thread_files.is_empty() {
+            build.files(&self.files).compile(output);
+            return;
+        }
+        assert!(
+            !self.files.is_empty(),
+            "files_on_own_threads needs at least one other file for cc to archive"
+        );
+
+        let out_dir = env::var("OUT_DIR").map(PathBuf::from).unwrap();
+        let obj_dir = out_dir.join("own_thread");
+        fs::create_dir_all(&obj_dir).unwrap();
+        let msvc = is_msvc_target();
+        let objs = std::thread::scope(|scope| {
+            let threads: Vec<_> = self
+                .own_thread_files
+                .iter()
+                .map(|src| {
+                    let obj = obj_dir
+                        .join(src.file_stem().unwrap())
+                        .with_extension(object_extension());
+                    // The arguments `cc` passes for each of its files, after the flags.
+                    let mut cmd = build.get_compiler().to_command();
+                    if msvc {
+                        cmd.arg(format!("-Fo{}", obj.display()));
+                    } else {
+                        cmd.arg("-o").arg(&obj);
+                    }
+                    cmd.arg("-c").arg(src);
+                    scope.spawn(move || {
+                        let status = cmd.status().unwrap_or_else(|e| {
+                            panic!("failed to run the C++ compiler for {}: {e}", src.display())
+                        });
+                        assert!(status.success(), "failed to compile {}", src.display());
+                        obj
+                    })
+                })
+                .collect();
+            build.files(&self.files).compile(output);
+            threads
+                .into_iter()
+                .map(|t| t.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        add_to_static_lib(&out_dir, output, &objs);
     }
 
     fn compile_cuda(&mut self, output: &str) {
