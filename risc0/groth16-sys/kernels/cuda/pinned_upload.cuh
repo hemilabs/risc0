@@ -54,6 +54,7 @@ class key_stager {
   char* bufs[NTHR * NB] = {};
   cudaEvent_t ev[NTHR * NB] = {};
   cudaStream_t st[NTHR] = {};
+  int device = -1;  // the streams' and events' device
 
   static std::mutex& inst_mu() { static std::mutex m; return m; }
   static key_stager*& inst() { static key_stager* s = nullptr; return s; }
@@ -61,6 +62,7 @@ class key_stager {
 public:
   key_stager() {
     try {
+      CUDA_OK(cudaGetDevice(&device));
       pool.alloc(NTHR * NB * CH);
       for (int i = 0; i < NTHR * NB; i++) {
         bufs[i] = (char*)pool.ptr + i * CH;
@@ -75,20 +77,30 @@ public:
   }
   ~key_stager() { release(); }
   // The process-wide stager, created on first use (risc0_groth16_cuda_stager_init creates it at
-  // the start of a Groth16 session, while the STARK is still host-bound). Lives until destroy();
+  // the start of a Groth16 session, while the STARK is still host-bound). Lives until take();
   // never destroyed at exit (like the cached SRS), avoiding teardown ordering issues. Users hold
   // cached_mutex while they use the returned reference.
+  // Its streams belong to the device current at creation: on another device a new one replaces
+  // it (the pinned memory is portable, but streams and events are not).
   static key_stager& get() {
     std::lock_guard<std::mutex> lk(inst_mu());
+    int dev = 0;
+    CUDA_OK(cudaGetDevice(&dev));
+    if (inst() && inst()->device != dev) {
+      delete inst();
+      inst() = nullptr;
+    }
     if (!inst()) inst() = new key_stager();
     return *inst();
   }
-  // Free the stager's pinned memory, streams and events (caller holds cached_mutex, so no upload is
-  // in flight); the next get() creates a new one.
-  static void destroy() {
+  // Detach the stager (caller holds cached_mutex, so no upload is in flight); the next get()
+  // creates a new one. The caller deletes the result outside cached_mutex: freeing the pinned
+  // memory waits for the whole device (ThpPinned::free_pinned).
+  static key_stager* take() {
     std::lock_guard<std::mutex> lk(inst_mu());
-    delete inst();
+    key_stager* s = inst();
     inst() = nullptr;
+    return s;
   }
   // Copies `bytes` from host `src` to device `dst`; returns when the data is on the device
   // (every chunk's copy has completed, so `src` may be unmapped afterwards).

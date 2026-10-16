@@ -252,10 +252,14 @@ extern "C" const char* risc0_groth16_cuda_stager_init(size_t min_total_vram, int
 // the key prestart gave up (both are recreated on demand). The Rust caller holds the witness
 // buffer's lock.
 extern "C" void risc0_groth16_cuda_pinned_release() {
+  key_stager* stager;
   {
     std::lock_guard<std::mutex> lock(cached_mutex);
-    key_stager::destroy();
+    stager = key_stager::take();
   }
+  // Outside cached_mutex: unpinning waits for the whole device (ThpPinned::free_pinned), and a
+  // preload for another device should not wait for that.
+  delete stager;
   std::lock_guard<std::mutex> lock(g16_witness_buf_mu);
   g16_witness_buf.free_pinned();
 }

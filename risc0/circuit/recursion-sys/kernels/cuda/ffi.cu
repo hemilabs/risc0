@@ -722,7 +722,8 @@ const char* risc0_circuit_recursion_cuda_warmup() {
     if (recAsync()) {
       // The first parStepExec launch paid ~4 ms growing the context's local-memory
       // reservation on the GPU thread (its stack frame exceeds every earlier kernel's); grow it
-      // here, at process start, instead.
+      // here, at process start, instead. For the current device, the HAL's (device 0); on any
+      // other the driver still grows it at the first launch, as before.
       size_t need = 0;
       for (const void* f : {(const void*)parStepExec, (const void*)injectWomBacks,
                             (const void*)parStepVerifyWom, (const void*)parStepComputeAccum,

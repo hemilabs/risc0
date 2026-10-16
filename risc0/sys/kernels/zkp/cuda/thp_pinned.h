@@ -22,7 +22,8 @@
 // MADV_HUGEPAGE, populated one huge page per madvise call (so the process mmap lock is never held
 // for long), then registered with cudaHostRegister: ~11 + 1.7 ms for 200 MB, with the same H2D
 // bandwidth (28.7 GB/s). Falls back to cudaHostAlloc when THP or registration is unavailable, on
-// HIP, or with RISC0_CUDA_THP=0.
+// HIP, or with RISC0_CUDA_THP=0. Either way the memory is portable (pinned for every CUDA
+// context, not just the calling thread's current device's).
 
 #include <cstddef>
 #include <cstdint>
@@ -39,25 +40,32 @@ struct ThpPinned {
   void* raw = nullptr; // mmap base (THP path only)
   size_t raw_bytes = 0;
 
-  // Replace the buffer with one of at least `n` bytes. Frees the old one first, synchronizing the
-  // device as the cudaFreeHost this replaces did.
+  // Replace the buffer with one of at least `n` bytes. Frees the old one first (see free_pinned).
   void alloc(size_t n) {
     free_pinned();
 #ifdef RISC0_THP_PINNED
     if (thp_enabled() && thp_alloc(n)) return;
 #endif
     void* p = nullptr;
-    CUDA_OK(cudaHostAlloc(&p, n, cudaHostAllocDefault));
+    CUDA_OK(cudaHostAlloc(&p, n, cudaHostAllocPortable));
     ptr = p;
     bytes = n;
   }
 
+  // Unpins and frees the buffer. Invariant: the caller has waited (stream or event sync) for
+  // every async copy from or to it; nothing may be queued that still uses it.
+  //
+  // Measured on driver 595 (opt-artifacts cuda/land/fix/unreg): cudaHostUnregister, like
+  // cudaFreeHost, waits until the whole device is idle, not only for copies touching the buffer,
+  // and holds a driver lock while it waits, so other threads' kernel launches block for as long
+  // (252 ms behind a 280 ms kernel). The cudaDeviceSynchronize first waits WITHOUT that lock
+  // (other threads keep launching), leaving the unregister only the work queued meanwhile. So
+  // this is a device-wide wait either way: keep it off the proving path (the pools retire
+  // buffers and unpin them from the HAL's release hooks).
   void free_pinned() {
     if (!ptr) return;
 #ifdef RISC0_THP_PINNED
     if (raw) {
-      // cudaFreeHost synchronizes the device; cudaHostUnregister + munmap do not. Wait for any
-      // in-flight async copy from this buffer before unmapping it.
       cudaDeviceSynchronize();
       cudaHostUnregister(ptr);
       munmap(raw, raw_bytes);
@@ -94,7 +102,7 @@ private:
         for (size_t i = off; i < off + huge; i += 4096) p[i] = 0;
       }
     }
-    if (cudaHostRegister(p, len, cudaHostRegisterDefault) != cudaSuccess) {
+    if (cudaHostRegister(p, len, cudaHostRegisterPortable) != cudaSuccess) {
       (void)cudaGetLastError();
       munmap(r, len + huge);
       return false;
