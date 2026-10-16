@@ -1977,7 +1977,44 @@ mod rec_pipe {
     use std::thread::JoinHandle;
     use std::time::Instant;
 
-    pub(super) type Prep = JoinHandle<Result<(Job, f64)>>;
+    /// A recursion proof's preparation thread (preflight + host chains; CPU only). Joined when
+    /// dropped, so that on error paths no preparation outlives the proving call that started it.
+    pub(super) struct Prep(Option<JoinHandle<Result<(Job, f64)>>>);
+
+    impl Prep {
+        fn spawn(f: impl FnOnce() -> Result<(Job, f64)> + Send + 'static) -> Self {
+            Self(Some(std::thread::spawn(f)))
+        }
+
+        fn is_finished(&self) -> bool {
+            self.0.as_ref().is_none_or(|h| h.is_finished())
+        }
+
+        fn join(mut self) -> Result<(Job, f64)> {
+            let h = self.0.take().ok_or_else(|| anyhow!("recursion preparation already joined"))?;
+            h.join().map_err(|_| anyhow!("recursion preparation panicked"))?
+        }
+    }
+
+    impl Drop for Prep {
+        fn drop(&mut self) {
+            if let Some(h) = self.0.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    /// Closes a streaming join's input when dropped. The join's preparation thread blocks in
+    /// `InputStream::pull` until the right input is fed and the stream closed; if the pipe fails
+    /// before (or while) feeding it, closing makes the preparation fail and exit instead of
+    /// waiting forever. Closing an already closed stream is a no-op.
+    struct CloseOnDrop(Arc<InputStream>);
+
+    impl Drop for CloseOnDrop {
+        fn drop(&mut self) {
+            self.0.close();
+        }
+    }
 
     pub(super) fn mode() -> u32 {
         std::env::var("RISC0_C2_REC_INTERLEAVE")
@@ -2007,7 +2044,7 @@ mod rec_pipe {
 
     pub(super) fn spawn_lift_prep(seal_receipt: SegmentReceipt, opts: ProverOpts) -> Prep {
         let _ = *T0;
-        std::thread::spawn(move || {
+        Prep::spawn(move || {
             let t = Instant::now();
             let mut p = Job::new_lift(&seal_receipt, opts)?;
             p.prepare()?;
@@ -2016,11 +2053,12 @@ mod rec_pipe {
     }
 
     struct PendingJoin {
+        /// Streaming: the stream and the left receipt, until `b` is fed. Declared before `prep`
+        /// so that on drop the stream is closed before the preparation thread is joined.
+        feed: Option<(CloseOnDrop, SuccinctReceipt<ReceiptClaim>)>,
         prep: Prep,
         /// Joined claim, once `b` is known.
         claim: Option<ReceiptClaim>,
-        /// Streaming: the stream and the left receipt, until `b` is fed.
-        feed: Option<(Arc<InputStream>, SuccinctReceipt<ReceiptClaim>)>,
         a_claim: MaybePruned<ReceiptClaim>,
         idx: usize,
     }
@@ -2094,7 +2132,7 @@ mod rec_pipe {
             }
             let Some(b) = self.lifted.remove(&j.idx) else { return Ok(()) };
             let (stream, a) = j.feed.take().unwrap();
-            Job::feed_join_b(&stream, &a, &b)?;
+            Job::feed_join_b(&stream.0, &a, &b)?;
             j.claim = Some(j.a_claim.join(&b.claim)?.value()?);
             if *VERBOSE {
                 eprintln!("[c2_rec] join ->{} fed b at {:.1}", j.idx, now_ms());
@@ -2120,7 +2158,7 @@ mod rec_pipe {
                 let claim = a.claim.join(&b.claim)?.value()?;
                 let opts = self.opts.clone();
                 let a_claim = a.claim.clone();
-                let h = std::thread::spawn(move || {
+                let h = Prep::spawn(move || {
                     let t = Instant::now();
                     let mut p = Job::new_join(&a, &b, opts)?;
                     p.prepare()?;
@@ -2135,7 +2173,8 @@ mod rec_pipe {
                 let a = self.acc.take().unwrap();
                 let a_claim = a.claim.clone();
                 let (job, stream) = Job::new_join_streaming(&a, self.opts.clone())?;
-                let h = std::thread::spawn(move || {
+                let stream = CloseOnDrop(stream);
+                let h = Prep::spawn(move || {
                     let t = Instant::now();
                     let mut p = job;
                     p.prepare()?;
@@ -2161,7 +2200,7 @@ mod rec_pipe {
             if join_ready {
                 let j = self.join.take().unwrap();
                 let claim = j.claim.unwrap();
-                let (mut job, prep_ms) = j.prep.join().map_err(|_| anyhow!("join prep panicked"))??;
+                let (mut job, prep_ms) = j.prep.join()?;
                 self.warm();
                 let t = Instant::now();
                 let at = now_ms();
@@ -2200,7 +2239,7 @@ mod rec_pipe {
                     Some(c) => c,
                     None => self.last_claim.clone().unwrap(),
                 };
-                let (mut job, prep_ms) = h.join().map_err(|_| anyhow!("lift prep panicked"))??;
+                let (mut job, prep_ms) = h.join()?;
                 self.warm();
                 let t = Instant::now();
                 let at = now_ms();
@@ -2279,17 +2318,6 @@ mod rec_pipe {
                 );
             }
             self.acc.take().ok_or_else(|| anyhow!("c2 rec pipe: no receipt"))
-        }
-    }
-
-    impl Drop for RecPipe {
-        /// Error paths: a streaming join's preparation thread blocks until its input stream is
-        /// closed; close it so the detached thread finishes (with an error) instead of leaking.
-        /// Lift preparation threads are CPU-only and finish on their own.
-        fn drop(&mut self) {
-            if let Some((stream, _)) = self.join.as_mut().and_then(|j| j.feed.take()) {
-                stream.close();
-            }
         }
     }
 }
