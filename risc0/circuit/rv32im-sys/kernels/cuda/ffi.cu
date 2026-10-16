@@ -721,8 +721,14 @@ const char* risc0_circuit_rv32im_cuda_witgen(uint32_t mode,
 // Copy a staged trace (`bytes` at pinned `staged`, identified by `id`) to its device slot on a
 // side stream, overlapping the GPU work in flight; the witgen that consumes it waits for the
 // copy. Called on the proving thread (it holds the GPU lock).
-const char* risc0_circuit_rv32im_cuda_prefetch(const uint8_t* staged, size_t bytes, uint64_t id) {
+//
+// `out_ev` (nullable): if a copy was enqueued, receives a new event recorded after it. The
+// owner of the pinned buffer must cudaEventSynchronize it (risc0_circuit_rv32im_cuda_event_wait)
+// before the buffer is reused or freed: the DMA reads the pinned memory asynchronously.
+const char* risc0_circuit_rv32im_cuda_prefetch(const uint8_t* staged, size_t bytes, uint64_t id,
+                                               void** out_ev) {
   try {
+    if (out_ev) *out_ev = nullptr;
     DevSlot* sl = getDevSlot(staged);
     if (sl->ready && sl->id == id) return nullptr;
     if (sl == get_cache().a_slot) return nullptr;  // in use by the current segment
@@ -731,8 +737,30 @@ const char* risc0_circuit_rv32im_cuda_prefetch(const uint8_t* staged, size_t byt
     if (sl->released) CUDA_OK(cudaStreamWaitEvent(cs, sl->releasedEv, 0));
     CUDA_OK(cudaMemcpyAsync(sl->dev, staged, bytes, cudaMemcpyHostToDevice, cs));
     CUDA_OK(cudaEventRecord(sl->readyEv, cs));
+    if (out_ev) {
+      cudaEvent_t ev;
+      CUDA_OK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+      CUDA_OK(cudaEventRecord(ev, cs));
+      *out_ev = (void*)ev;
+    }
     sl->id = id;
     sl->ready = true;
+  } catch (const std::exception& err) {
+    return strdup(err.what());
+  } catch (...) {
+    return strdup("Generic exception");
+  }
+  return nullptr;
+}
+
+// Wait for and destroy an event returned by risc0_circuit_rv32im_cuda_prefetch. Thread-safe
+// (called from whichever thread drops the staged trace).
+const char* risc0_circuit_rv32im_cuda_event_wait(void* ev) {
+  try {
+    if (ev) {
+      CUDA_OK(cudaEventSynchronize((cudaEvent_t)ev));
+      CUDA_OK(cudaEventDestroy((cudaEvent_t)ev));
+    }
   } catch (const std::exception& err) {
     return strdup(err.what());
   } catch (...) {

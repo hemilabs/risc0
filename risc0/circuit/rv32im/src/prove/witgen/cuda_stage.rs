@@ -28,8 +28,8 @@ use std::sync::{
 
 use rayon::prelude::*;
 use risc0_circuit_rv32im_sys::{
-    risc0_circuit_rv32im_cuda_host_alloc, risc0_circuit_rv32im_cuda_host_free,
-    risc0_circuit_rv32im_cuda_prefetch,
+    risc0_circuit_rv32im_cuda_event_wait, risc0_circuit_rv32im_cuda_host_alloc,
+    risc0_circuit_rv32im_cuda_host_free, risc0_circuit_rv32im_cuda_prefetch,
     RawMemoryTransaction, RawPreflightCycle,
 };
 use risc0_sys::ffi_wrap;
@@ -51,6 +51,9 @@ pub(crate) struct StagedTrace {
     lens: [usize; 3],
     /// Unique per staging (the device copy is matched by it, not by address).
     pub(crate) id: u64,
+    /// Event recorded after this slot's prefetch copy (0: none). The DMA reads the pinned
+    /// slot asynchronously, so Drop waits for it before the slot goes back to the pool.
+    copy_ev: Mutex<usize>,
 }
 
 /// Prefetch on unless RISC0_C2_NOPREFETCH is set (A/B switch).
@@ -74,11 +77,19 @@ pub(crate) fn prefetch_ready() {
         // Dropped (already proved): nothing to do.
         if let Some(staged) = weak.upgrade() {
             let total: usize = staged.lens.iter().sum();
+            let mut ev: *mut std::ffi::c_void = std::ptr::null_mut();
             if let Err(err) = ffi_wrap(|| unsafe {
-                risc0_circuit_rv32im_cuda_prefetch(staged.ptr, total, staged.id)
+                risc0_circuit_rv32im_cuda_prefetch(staged.ptr, total, staged.id, &mut ev)
             }) {
                 tracing::debug!("cuda_stage: prefetch failed: {err}");
             }
+            if !ev.is_null() {
+                let old = std::mem::replace(&mut *staged.copy_ev.lock().unwrap(), ev as usize);
+                if old != 0 {
+                    let _ = ffi_wrap(|| unsafe { risc0_circuit_rv32im_cuda_event_wait(old as *mut _) });
+                }
+            }
+            // `staged` (the Arc) may be the last reference: its Drop waits for the copy.
         }
     }
 }
@@ -96,6 +107,16 @@ impl StagedTrace {
 
 impl Drop for StagedTrace {
     fn drop(&mut self) {
+        // The prefetch DMA may still be reading the slot (e.g. a trace dropped unproven on an
+        // error path): wait for it before another trace can be staged into the slot.
+        let ev = *self.copy_ev.get_mut().unwrap_or_else(|e| e.into_inner());
+        if ev != 0 {
+            if let Err(err) = ffi_wrap(|| unsafe { risc0_circuit_rv32im_cuda_event_wait(ev as *mut _) }) {
+                // Don't recycle a slot that may still be read by the device.
+                tracing::warn!("cuda_stage: prefetch event wait failed: {err}; leaking slot");
+                return;
+            }
+        }
         POOL.lock().unwrap().push((self.ptr as usize, self.cap));
     }
 }
@@ -178,6 +199,7 @@ pub(crate) fn stage(trace: &PreflightTrace) -> Option<Arc<StagedTrace>> {
         cap,
         lens,
         id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+        copy_ev: Mutex::new(0),
     });
     if *PREFETCH {
         READY.lock().unwrap().push(Arc::downgrade(&staged));

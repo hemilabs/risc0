@@ -166,6 +166,12 @@ extern "C" {
         staged: *const u8,
         bytes: usize,
         id: u64,
+        out_ev: *mut *mut std::ffi::c_void,
+    ) -> *const std::os::raw::c_char;
+
+    /// Wait for and destroy an event returned by `risc0_circuit_rv32im_cuda_prefetch`.
+    pub fn risc0_circuit_rv32im_cuda_event_wait(
+        ev: *mut std::ffi::c_void,
     ) -> *const std::os::raw::c_char;
 
     pub fn risc0_circuit_rv32im_cuda_host_alloc(
