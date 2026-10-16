@@ -499,8 +499,10 @@ pub(crate) fn exclusive_gpu() -> impl Sized {}
 /// so it fits beside what the STARK left behind, and AFTER it so the next proof's STARK is not
 /// competing with the wrap's freed scratch.
 ///
-/// Not called on ROCm, whose HAL has the same pool and its own `clear_buffer_pool`: that path was not
-/// tested when this was added.
+/// On ROCm the HAL has the same pool, released by its own `clear_buffer_pool`. On Windows a HIP
+/// allocation beyond the card's memory does not fail but spills into shared system memory, so
+/// without this a session's keccak proofs ran beside the segments' cached buffers on an RX 9070 XT
+/// (16 GB), with up to 12.5 GB spilled and each keccak eval_check at ~7x its time.
 ///
 /// On Intel the HAL's pool (capped at 16 GiB) is released the same way: neither the Groth16 prover
 /// nor the keccak eval_check allocates through it. Without this, a session's keccak proofs and its
@@ -509,6 +511,8 @@ pub(crate) fn exclusive_gpu() -> impl Sized {}
 pub(crate) fn release_hal_buffers() {
     #[cfg(feature = "cuda")]
     risc0_zkp::hal::cuda::clear_buffer_pool();
+    #[cfg(feature = "rocm")]
+    risc0_zkp::hal::hip::clear_buffer_pool();
     #[cfg(feature = "intel")]
     risc0_zkp::hal::intel::release_idle_buffers();
 }
