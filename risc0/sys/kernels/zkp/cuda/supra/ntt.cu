@@ -136,6 +136,24 @@ extern "C" RustError::by_value sppark_batch_expand(
   return RustError{cudaSuccess};
 }
 
+#ifdef __HIPCC__
+// On ROCm the per-column loops below run as batched launches instead (blockIdx.y picks the
+// column): one launch per pass for all columns rather than one per column, which on Windows HIP
+// cost more in launch overhead than the work in small columns (keccak commits ~1100 columns).
+// Chunked so a launch stays within gridDim.y and sppark's 32-bit column offset
+// (`(index_t)blockIdx.y * col_stride`).
+template <class F>
+static void for_column_batches(uint32_t poly_count, uint64_t col_stride, F launch) {
+  uint64_t max_cols = 0xffffffffull / col_stride;
+  if (max_cols > 65535)
+    max_cols = 65535;
+  for (uint32_t i = 0; i < poly_count; i += (uint32_t)max_cols) {
+    uint32_t n = poly_count - i < max_cols ? poly_count - i : (uint32_t)max_cols;
+    launch(i, n);
+  }
+}
+#endif
+
 extern "C" RustError::by_value
 sppark_batch_NTT(fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly_count) {
   if (lg_domain_size == 0)
@@ -146,6 +164,13 @@ sppark_batch_NTT(fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly_count) {
   const gpu_t& gpu = select_gpu(-1);
 
   try {
+#ifdef __HIPCC__
+    for_column_batches(poly_count, domain_size, [&](uint32_t i, uint32_t n) {
+      NTT::Base_dev_ptr_batch(gpu, &d_inout[(uint64_t)i * domain_size], lg_domain_size,
+                              NTT::InputOutputOrder::RN, NTT::Direction::forward,
+                              NTT::Type::standard, n, domain_size);
+    });
+#else
     // Process each polynomial sequentially on the same stream
     for (uint32_t i = 0; i < poly_count; i++) {
       NTT::Base_dev_ptr(gpu, &d_inout[(uint64_t)i * domain_size],
@@ -154,6 +179,7 @@ sppark_batch_NTT(fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly_count) {
                         NTT::Direction::forward,
                         NTT::Type::standard);
     }
+#endif
 
     gpu.sync();
   } catch (const cuda_error& e) {
@@ -176,6 +202,13 @@ sppark_batch_iNTT(fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly_count) {
   const gpu_t& gpu = select_gpu(-1);
 
   try {
+#ifdef __HIPCC__
+    for_column_batches(poly_count, domain_size, [&](uint32_t i, uint32_t n) {
+      NTT::Base_dev_ptr_batch(gpu, &d_inout[(uint64_t)i * domain_size], lg_domain_size,
+                              NTT::InputOutputOrder::NR, NTT::Direction::inverse,
+                              NTT::Type::standard, n, domain_size);
+    });
+#else
     for (uint32_t i = 0; i < poly_count; i++) {
       NTT::Base_dev_ptr(gpu, &d_inout[(uint64_t)i * domain_size],
                         lg_domain_size,
@@ -183,6 +216,7 @@ sppark_batch_iNTT(fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly_count) {
                         NTT::Direction::inverse,
                         NTT::Type::standard);
     }
+#endif
 
     gpu.sync();
   } catch (const cuda_error& e) {
@@ -205,10 +239,17 @@ sppark_batch_zk_shift(fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly_coun
   const gpu_t& gpu = select_gpu(-1);
 
   try {
+#ifdef __HIPCC__
+    for_column_batches(poly_count, domain_size, [&](uint32_t i, uint32_t n) {
+      NTT::LDE_powers_batch(gpu, &d_inout[(uint64_t)i * domain_size], lg_domain_size, n,
+                            domain_size);
+    });
+#else
     // Apply ZK shift per polynomial
     for (uint32_t i = 0; i < poly_count; i++) {
       NTT::LDE_powers(gpu, &d_inout[(uint64_t)i * domain_size], lg_domain_size);
     }
+#endif
 
     gpu.sync();
   } catch (const cuda_error& e) {
@@ -231,6 +272,14 @@ sppark_batch_iNTT_zk_shift(fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly
   const gpu_t& gpu = select_gpu(-1);
 
   try {
+#ifdef __HIPCC__
+    for_column_batches(poly_count, domain_size, [&](uint32_t i, uint32_t n) {
+      fr_t* cols = &d_inout[(uint64_t)i * domain_size];
+      NTT::Base_dev_ptr_batch(gpu, cols, lg_domain_size, NTT::InputOutputOrder::NR,
+                              NTT::Direction::inverse, NTT::Type::standard, n, domain_size);
+      NTT::LDE_powers_batch(gpu, cols, lg_domain_size, n, domain_size);
+    });
+#else
     // iNTT + ZK shift per polynomial
     for (uint32_t i = 0; i < poly_count; i++) {
       NTT::Base_dev_ptr(gpu, &d_inout[(uint64_t)i * domain_size],
@@ -240,6 +289,7 @@ sppark_batch_iNTT_zk_shift(fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly
                         NTT::Type::standard);
       NTT::LDE_powers(gpu, &d_inout[(uint64_t)i * domain_size], lg_domain_size);
     }
+#endif
 
     gpu.sync();
   } catch (const cuda_error& e) {
@@ -279,6 +329,13 @@ sppark_batch_expand_NTT(fr_t* d_out, fr_t* d_in,
     // Batched expand: single kernel for all columns
     launch_batch_expand(gpu, d_out, d_in, domain_size, lg_domain_size, lg_blowup, poly_count);
 
+#ifdef __HIPCC__
+    for_column_batches(poly_count, ext_domain_size, [&](uint32_t i, uint32_t n) {
+      NTT::Base_dev_ptr_batch(gpu, &d_out[(uint64_t)i * ext_domain_size], lg_ext,
+                              NTT::InputOutputOrder::RN, NTT::Direction::forward,
+                              NTT::Type::standard, n, ext_domain_size);
+    });
+#else
     // Forward NTT per polynomial on the extended domain
     for (uint32_t i = 0; i < poly_count; i++) {
       NTT::Base_dev_ptr(gpu, &d_out[(uint64_t)i * ext_domain_size],
@@ -287,6 +344,7 @@ sppark_batch_expand_NTT(fr_t* d_out, fr_t* d_in,
                         NTT::Direction::forward,
                         NTT::Type::standard);
     }
+#endif
 
     gpu.sync();
   } catch (const cuda_error& e) {
