@@ -7164,6 +7164,7 @@ dependencies = [
  "anyhow",
  "blst",
  "risc0-build-kernel",
+ "risc0-sys",
  "sppark",
  "test-log",
  "tracing",

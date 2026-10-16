@@ -132,6 +132,21 @@ pub fn release_srs() -> Result<()> {
     }
 }
 
+/// Like [shrink_wrap], but runs `pre_gpu` on the calling thread while the witness is computed on
+/// a helper thread (CUDA; elsewhere `pre_gpu` runs first). `pre_gpu` has returned before the GPU
+/// part of the wrap starts. Used to overlap releasing the STARK HAL's buffer pool (thread-local,
+/// ~35 ms of frees) with the CPU-only witness generation.
+pub fn shrink_wrap_with(identity_p254_seal_bytes: &[u8], pre_gpu: impl FnOnce()) -> Result<Seal> {
+    cfg_if::cfg_if! {
+        if #[cfg(feature = "cuda")] {
+            self::cuda::shrink_wrap_with(identity_p254_seal_bytes, pre_gpu)
+        } else {
+            pre_gpu();
+            shrink_wrap(identity_p254_seal_bytes)
+        }
+    }
+}
+
 /// Produce a Groth16 proof from an `identity_p254` seal.
 pub fn shrink_wrap(identity_p254_seal_bytes: &[u8]) -> Result<Seal> {
     cfg_if::cfg_if! {

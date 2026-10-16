@@ -192,26 +192,53 @@ static int current_device() {
 }
 
 // A pinned host buffer of at least `bytes` (one per process, grown as needed), for the
-// witness: it uploads in one fast DMA. The Rust caller (risc0_groth16_sys::host_buffer)
-// serializes its users; growing frees the old buffer.
+// witness: it uploads in one fast DMA. THP-backed (ThpPinned): pinning 180 MB takes ~13 ms instead
+// of ~40-140 ms of cudaHostAlloc holding the driver lock. The Rust caller
+// (risc0_groth16_sys::host_buffer) serializes its users; growing frees the old buffer.
+static ThpPinned g16_witness_buf;
+static std::mutex g16_witness_buf_mu;
+
 extern "C" void* risc0_groth16_cuda_host_buffer(size_t bytes) {
-  static std::mutex m;
-  static void* buf = nullptr;
-  static size_t cap = 0;
-  std::lock_guard<std::mutex> lock(m);
-  if (bytes > cap) {
-    if (buf) {
-      cudaFreeHost(buf);
-    }
-    buf = nullptr;
-    cap = 0;
-    if (cudaMallocHost(&buf, bytes) != cudaSuccess) {
-      buf = nullptr;
+  std::lock_guard<std::mutex> lock(g16_witness_buf_mu);
+  if (bytes > g16_witness_buf.bytes) {
+    try {
+      g16_witness_buf.alloc(bytes);
+    } catch (...) {
+      g16_witness_buf.free_pinned();
       return nullptr;
     }
-    cap = bytes;
   }
-  return buf;
+  return g16_witness_buf.ptr;
+}
+
+// C2-R3: create the pinned upload stager (130 MB, streams, events) now, at the start of a Groth16
+// session while the STARK's first segment is still host-bound, instead of when the key loader
+// starts (by then the STARK is GPU-bound, and the registration stalls its launches). Skipped
+// (*created = 0) on a card with less than `min_total_vram` bytes, where the key isn't prestarted.
+extern "C" const char* risc0_groth16_cuda_stager_init(size_t min_total_vram, int* created) {
+  *created = 0;
+  try {
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess || total_b < min_total_vram)
+      return nullptr;
+    (void)c2_stager::get();
+    *created = 1;
+  } catch (const std::exception& err) {
+    return strdup(err.what());
+  }
+  return nullptr;
+}
+
+// C2-R3: free what risc0_groth16_cuda_stager_init and an early witness-buffer pin allocated, when
+// the key prestart gave up (both are recreated on demand). The Rust caller holds the witness
+// buffer's lock.
+extern "C" void risc0_groth16_cuda_pinned_release() {
+  {
+    std::lock_guard<std::mutex> lock(cached_mutex);
+    c2_stager::destroy();
+  }
+  std::lock_guard<std::mutex> lock(g16_witness_buf_mu);
+  g16_witness_buf.free_pinned();
 }
 
 extern "C" const char* risc0_groth16_cuda_preload(SetupParams* setup_params) {

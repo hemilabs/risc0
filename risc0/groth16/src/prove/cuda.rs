@@ -188,6 +188,17 @@ pub(crate) fn cold_path_enabled() -> bool {
     *ON
 }
 
+/// The Groth16 tail (C2-R3): the key loader's pinned buffers allocated at session start
+/// (`pin_early`), the witness computed beside `shrink_wrap_with`'s `pre_gpu`, and, in the CUDA
+/// library, the deferred-collect / 4-window sort / split-integrate MSMs. The zkvm prover also
+/// verifies the succinct receipt beside the Groth16 wrap. On by default; `RISC0_CUDA_G16_TAIL=0`
+/// disables all of them (the same switch is read by the CUDA library and the zkvm prover).
+pub(crate) fn tail_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("RISC0_CUDA_G16_TAIL").as_deref() != Ok("0"));
+    *ON
+}
+
 /// Minimum device memory for `prestart_key`: the key sits beside a STARK proof (peak
 /// 27.0-27.5 GB at po2=21 with the key loaded).
 const PRESTART_MIN_VRAM: usize = 30 << 30;
@@ -207,6 +218,10 @@ pub(crate) fn prestart_key() {
         let _ = preload_graph();
     });
     std::thread::spawn(|| {
+        // The pinned allocations (the key loader's upload stager and the witness buffer) come
+        // first, at time zero while the first segment is still host-bound: each pin holds the
+        // CUDA driver lock and, landing in a GPU-bound segment, stalls the STARK's launches.
+        let pinned_early = pin_early();
         // Let the first STARK segment's cold allocations and uploads go first.
         {
             let (m, cv) = &PRESTART_GO;
@@ -229,10 +244,19 @@ pub(crate) fn prestart_key() {
             let setup = SetupParams::new(root_dir)?;
             let len = risc0_groth16_sys::prestart(&setup, PRESTART_MIN_VRAM)?;
             if let Some(len) = len {
-                drop(risc0_groth16_sys::host_buffer(len * 32)?);
+                witness_len_cache_write(len);
+                // Pin the witness buffer now unless pin_early already pinned this size.
+                if pinned_early != Some(len) {
+                    drop(risc0_groth16_sys::host_buffer(len * 32)?);
+                }
             }
             Ok(len)
         })();
+        // The key isn't prestarted (small card, missing files, error): don't keep what
+        // pin_early allocated for it; the wrap allocates on demand as without the prestart.
+        if pinned_early.is_some() && !matches!(r, Ok(Some(_))) {
+            risc0_groth16_sys::pinned_release();
+        }
         tracing::debug!(
             "groth16: prestart_key done in {:.1}ms (bit set wait {:.1}ms): {:?}",
             t.elapsed().as_secs_f64() * 1e3,
@@ -243,6 +267,75 @@ pub(crate) fn prestart_key() {
             tracing::warn!("groth16 key prestart failed (non-fatal): {e:#}");
         }
     });
+}
+
+/// Create the key loader's pinned upload stager and pin the witness buffer at the length cached
+/// by the previous run (none on a first-ever run: then the loader pins it once the key is loaded,
+/// as before). Returns the witness length pinned, `Some(0)` if only the stager was created, and
+/// `None` if nothing was allocated (tail switch off, a card below `PRESTART_MIN_VRAM`, or an
+/// error).
+fn pin_early() -> Option<usize> {
+    if !tail_enabled() {
+        return None;
+    }
+    let t = std::time::Instant::now();
+    match risc0_groth16_sys::stager_init(PRESTART_MIN_VRAM) {
+        Ok(true) => {}
+        Ok(false) => return None,
+        Err(e) => {
+            tracing::warn!("groth16 stager init failed (non-fatal): {e:#}");
+            return None;
+        }
+    }
+    let len = witness_len_cache_read()
+        .filter(|&len| risc0_groth16_sys::host_buffer(len * 32).is_ok())
+        .unwrap_or(0);
+    tracing::debug!(
+        "groth16: pin_early {:.1}ms, witness buffer pinned for {len} signals",
+        t.elapsed().as_secs_f64() * 1e3
+    );
+    Some(len)
+}
+
+/// `witness_len` in the Groth16 cache directory, the split-MSM corrections cache's:
+/// RISC0_G16_CACHE_DIR, else $XDG_CACHE_HOME/risc0-groth16, else ~/.cache/risc0-groth16.
+fn witness_len_cache_path() -> Option<std::path::PathBuf> {
+    let dir = std::env::var_os("RISC0_G16_CACHE_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("XDG_CACHE_HOME")
+                .map(|x| std::path::PathBuf::from(x).join("risc0-groth16"))
+        })
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(".cache/risc0-groth16"))
+        })?;
+    Some(dir.join("witness_len"))
+}
+
+fn witness_len_cache_read() -> Option<usize> {
+    let s = std::fs::read_to_string(witness_len_cache_path()?).ok()?;
+    let v: usize = s.trim().parse().ok()?;
+    // At most 2^28 signals (8 GB of witness): anything else is not ours.
+    (v > 0 && v < (1 << 28)).then_some(v)
+}
+
+/// Write `len` through a temporary file and a rename, so concurrent processes never read a
+/// partial value. A stale value only costs a regrow.
+fn witness_len_cache_write(len: usize) {
+    if witness_len_cache_read() == Some(len) {
+        return;
+    }
+    let Some(path) = witness_len_cache_path() else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    if std::fs::write(&tmp, format!("{len}\n")).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 static PRESTART_GO: (std::sync::Mutex<bool>, std::sync::Condvar) =
@@ -265,6 +358,21 @@ pub(crate) fn release_srs() -> Result<()> {
 }
 
 pub(crate) fn shrink_wrap(seal_bytes: &[u8]) -> Result<Seal> {
+    shrink_wrap_with(seal_bytes, || {})
+}
+
+/// [shrink_wrap], running `pre_gpu` on the calling thread while the witness is computed on a
+/// scoped helper thread (with the tail switch off, `pre_gpu` runs first). `pre_gpu` has returned
+/// before the GPU part of the wrap starts.
+pub(crate) fn shrink_wrap_with(seal_bytes: &[u8], pre_gpu: impl FnOnce()) -> Result<Seal> {
+    if !tail_enabled() {
+        pre_gpu();
+        return shrink_wrap_inner(seal_bytes, || {});
+    }
+    shrink_wrap_inner(seal_bytes, pre_gpu)
+}
+
+fn shrink_wrap_inner(seal_bytes: &[u8], pre_gpu: impl FnOnce()) -> Result<Seal> {
     tracing::info!("shrink_wrap: {} seal bytes", seal_bytes.len());
 
     let root_dir = get_root_dir()?;
@@ -287,8 +395,15 @@ pub(crate) fn shrink_wrap(seal_bytes: &[u8]) -> Result<Seal> {
     };
 
     let witness_params = WitnessParams::new(root_dir);
-    let graph = get_cached_graph(&witness_params.graph_path);
-    let witness = calc_witness(graph, &inputs).context("failed to calculate groth16 witness")?;
+    // The graph (parsed in the background since the session started) is waited for on the
+    // helper thread too, so `pre_gpu` also overlaps that wait.
+    let witness = std::thread::scope(|sc| {
+        let h = sc.spawn(|| calc_witness(get_cached_graph(&witness_params.graph_path), &inputs));
+        pre_gpu();
+        h.join()
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("groth16 witness thread panicked")))
+    })
+    .context("failed to calculate groth16 witness")?;
 
     // Wait for SRS preload to complete before taking the GPU lock.
     let _ = srs_preload.join();

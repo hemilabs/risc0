@@ -37,6 +37,7 @@ fn build_cuda_kernels() {
         .flag("-D__ADX__")
         .include(env::var("DEP_BLST_C_SRC").unwrap())
         .include(env::var("DEP_SPPARK_ROOT").unwrap())
+        .flag(&thp_pinned_define())
         .compile("risc0_groth16_cuda");
 
     println!("cargo:rustc-link-lib=static=blst");
@@ -83,6 +84,8 @@ fn build_rocm_kernels() {
         &sppark_root,
         "-D__ADX__",
     ];
+    let thp_define = thp_pinned_define();
+    base_flags.push(&thp_define);
 
     if env::var("CARGO_FEATURE_SETUP").is_ok() {
         base_flags.push("-DSRS_READ_COEFFS");
@@ -161,4 +164,13 @@ fn build_rocm_kernels() {
 
     // Link HIP runtime
     risc0_build_kernel::emit_rocm_lib_link();
+}
+
+/// `-DRISC0_THP_PINNED_H="<risc0-sys>/kernels/zkp/cuda/thp_pinned.h"` (see c2_upload.cuh). That
+/// directory can't go on the include path: its `cuda.h` would shadow the toolkit's.
+fn thp_pinned_define() -> String {
+    let root = PathBuf::from(env::var("DEP_RISC0_SYS_CUDA_ROOT").unwrap());
+    let path = root.join("thp_pinned.h").to_string_lossy().into_owned();
+    println!("cargo:rerun-if-changed={path}");
+    format!("-DRISC0_THP_PINNED_H=\"{path}\"")
 }
