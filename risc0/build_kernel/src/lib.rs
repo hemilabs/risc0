@@ -500,6 +500,17 @@ pub fn nvcc_command() -> Command {
     cmd
 }
 
+/// The `-ccbin` argument for a direct nvcc invocation with a GCC/Clang host compiler: the
+/// compiler named by `NVCC_CCBIN` when set (as for the `cc` builds, where nvcc reads it), else
+/// `c++`. Part of the command, so a cache keyed by [`command_key`] follows it.
+pub fn nvcc_ccbin_arg() -> String {
+    println!("cargo:rerun-if-env-changed=NVCC_CCBIN");
+    match env::var("NVCC_CCBIN") {
+        Ok(ccbin) if !ccbin.is_empty() => format!("-ccbin={ccbin}"),
+        _ => "-ccbin=c++".to_string(),
+    }
+}
+
 /// The C++ standard flag for nvcc. The generated circuit layouts (e.g.
 /// keccak-sys's `layout.cu.inc`) use designated initializers, a C++20 feature
 /// that GCC/Clang also accept in C++17 mode; MSVC, and nvcc's front end in MSVC

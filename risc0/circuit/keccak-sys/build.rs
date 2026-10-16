@@ -118,7 +118,7 @@ fn build_cuda_kernels() {
     let mut cmd = risc0_build_kernel::nvcc_command();
     cmd.current_dir(&kernel_dir);
     if !msvc {
-        cmd.arg("-ccbin=c++")
+        cmd.arg(risc0_build_kernel::nvcc_ccbin_arg())
             .arg("-Xcompiler")
             .arg("-O3,-ffunction-sections,-fdata-sections,-fPIC")
             .arg("-Xcompiler")
