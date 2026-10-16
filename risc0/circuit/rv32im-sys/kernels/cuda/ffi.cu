@@ -862,6 +862,17 @@ const char* risc0_circuit_rv32im_cuda_host_free(void* ptr) {
   return nullptr;
 }
 
+// Error path of witgen: copies from the caller's pinned staging buffer (`staged`) or from pf_pin
+// may already be queued. The caller may recycle or free `staged` as soon as the error returns, so
+// wait for the queued work first (errors ignored: the original error is reported).
+static void witgenErrorSync() noexcept {
+  try {
+    (void)cudaStreamSynchronize(getPersistentStream());
+  } catch (...) {
+  }
+  (void)cudaGetLastError();
+}
+
 // `staged` (nullable): pinned cycles|txns|bigintBytes, see setup_exec. `cycle_cols` (nullable):
 // the five data columns of injectCycleCols, which the host injector then left out.
 const char* risc0_circuit_rv32im_cuda_witgen_v2(uint32_t mode,
@@ -931,8 +942,10 @@ const char* risc0_circuit_rv32im_cuda_witgen_v2(uint32_t mode,
             std::chrono::duration<double, std::milli>(t1 - t0).count(),
             std::chrono::duration<double, std::milli>(t2 - t1).count());
   } catch (const std::exception& err) {
+    witgenErrorSync();
     return strdup(err.what());
   } catch (...) {
+    witgenErrorSync();
     return strdup("Generic exception");
   }
   return nullptr;

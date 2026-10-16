@@ -17,6 +17,7 @@
 #include "fp.h"
 #include "fpext.h"
 #include "kernels.h"
+#include "thp_pinned.h"
 
 #ifndef __HIPCC__
 #include "vendor/nvtx3/nvtx3.hpp"
@@ -35,6 +36,9 @@ namespace cuda { namespace std { using ::std::array; } }
 #include <cuda_runtime.h>
 #endif
 #include <exception>
+#include <mutex>
+#include <stdexcept>
+#include <unordered_map>
 #ifdef _WIN32
 #include <mutex>
 #include <vector>
@@ -601,21 +605,46 @@ const char* risc0_circuit_recursion_cuda_warmup() {
   return nullptr;
 }
 
-// C2-R2: page-locked host memory for the recursion witgen inputs (prepared off the GPU thread).
+// Page-locked host memory for the recursion witgen inputs (prepared off the GPU thread), backed
+// by huge pages (ThpPinned): cudaHostAlloc pins 4 KB pages while holding the driver lock, which
+// stalls the proving thread's CUDA calls.
+static std::mutex g_host_bufs_mu;
+static std::unordered_map<void*, ThpPinned>& hostBufs() {
+  static std::unordered_map<void*, ThpPinned> m;
+  return m;
+}
+
 const char* risc0_circuit_recursion_cuda_host_alloc(size_t bytes, void** out) {
+  *out = nullptr;
   try {
-    CUDA_OK(cudaHostAlloc(out, bytes, cudaHostAllocDefault));
+    ThpPinned p;
+    p.alloc(bytes);
+    std::lock_guard<std::mutex> lk(g_host_bufs_mu);
+    hostBufs()[p.ptr] = p;
+    *out = p.ptr;
   } catch (const std::exception& err) {
     return strdup(err.what());
+  } catch (...) {
+    return strdup("Generic exception");
   }
   return nullptr;
 }
 
-const char* risc0_circuit_recursion_cuda_host_free(void* p) {
+const char* risc0_circuit_recursion_cuda_host_free(void* ptr) {
   try {
-    CUDA_OK(cudaFreeHost(p));
+    ThpPinned p;
+    {
+      std::lock_guard<std::mutex> lk(g_host_bufs_mu);
+      auto it = hostBufs().find(ptr);
+      if (it == hostBufs().end()) throw std::runtime_error("host_free: unknown pointer");
+      p = it->second;
+      hostBufs().erase(it);
+    }
+    p.free_pinned(); // synchronizes the device first, like cudaFreeHost
   } catch (const std::exception& err) {
     return strdup(err.what());
+  } catch (...) {
+    return strdup("Generic exception");
   }
   return nullptr;
 }
