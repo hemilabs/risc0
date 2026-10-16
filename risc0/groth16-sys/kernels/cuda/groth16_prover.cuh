@@ -61,6 +61,11 @@ static bool g16_tail_enabled() {
   return on;
 #endif
 }
+// Diagnostics on stderr with RISC0_VERBOSE set (as in rv32im-sys's CUDA library).
+static bool g16_verbose() {
+  static const bool on = getenv("RISC0_VERBOSE") != nullptr;
+  return on;
+}
 // The bit set S of the split MSMs (risc0_groth16_cuda_set_bit_signals, derived from the witness
 // graph by the Rust side).
 static std::mutex g16_bits_mu;
@@ -454,7 +459,8 @@ public:
     gpu.DtoH(&bc, &sp_c.acc[0], 1);
     gpu.sync();
     if (bad != 0) {
-      fprintf(stderr, "groth16: %d bit-split scalars are not 0/1; using the full MSMs\n", bad);
+      if (g16_verbose())
+        fprintf(stderr, "groth16: %d bit-split scalars are not 0/1; using the full MSMs\n", bad);
       return false;
     }
     if (g16_tail_enabled()) {
