@@ -145,6 +145,39 @@ extern "C" {
     pub fn risc0_circuit_rv32im_cuda_eval_check_dep() -> *const std::os::raw::c_char;
 }
 
+#[cfg(feature = "cuda")]
+extern "C" {
+    /// Witgen with an optional pinned staging buffer holding cycles|txns|bigint_bytes back to
+    /// back (`staged`, kept alive by the caller until the witgen's stream work is done), and
+    /// optional device-side injection of the five per-cycle columns (`cycle_cols`: cycle,
+    /// next_pc_low, next_pc_high, next_state, next_machine_mode).
+    pub fn risc0_circuit_rv32im_cuda_witgen_v2(
+        mode: u32,
+        buffers: *const RawExecBuffers,
+        preflight: *const RawPreflightTrace,
+        cycles: u32,
+        staged: *const u8,
+        cycle_cols: *const u32,
+        staged_id: u64,
+    ) -> *const std::os::raw::c_char;
+
+    /// Copy a staged trace to the device on a side stream (see ffi.cu).
+    pub fn risc0_circuit_rv32im_cuda_prefetch(
+        staged: *const u8,
+        bytes: usize,
+        id: u64,
+    ) -> *const std::os::raw::c_char;
+
+    pub fn risc0_circuit_rv32im_cuda_host_alloc(
+        bytes: usize,
+        out: *mut *mut std::ffi::c_void,
+    ) -> *const std::os::raw::c_char;
+
+    pub fn risc0_circuit_rv32im_cuda_host_free(
+        ptr: *mut std::ffi::c_void,
+    ) -> *const std::os::raw::c_char;
+}
+
 #[cfg(feature = "intel")]
 extern "C" {
     pub fn risc0_circuit_rv32im_intel_eval_check(

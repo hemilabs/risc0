@@ -105,6 +105,12 @@ pub(crate) enum StepMode {
 }
 
 pub(crate) trait CircuitWitnessGenerator<H: Hal> {
+    /// Whether `generate_witness` writes the per-cycle columns (witgen::CYCLE_COLS) itself
+    /// when the trace defers them (`PreflightTrace::cycle_cols_deferred`).
+    fn writes_cycle_cols(&self) -> bool {
+        false
+    }
+
     fn generate_witness(
         &self,
         mode: StepMode,

@@ -14,6 +14,8 @@
 
 pub(crate) mod bigint;
 pub(crate) mod byte_poly;
+#[cfg(feature = "cuda")]
+pub(crate) mod cuda_stage;
 pub(crate) mod paged_map;
 pub(crate) mod poseidon2;
 pub(crate) mod preflight;
@@ -26,6 +28,23 @@ use std::{iter::zip, sync::LazyLock};
 use anyhow::{Context, Result};
 
 static VERBOSE: LazyLock<bool> = LazyLock::new(|| std::env::var("RISC0_VERBOSE").is_ok());
+
+/// On CUDA the witgen kernel writes the five per-cycle columns (CYCLE_COLS) from the uploaded
+/// cycles, so the host injector leaves them out (5 of its ~5.1 entries per row at po2=20).
+/// RISC0_C2_HOSTCOLS=1 keeps them in the injector (A/B switch).
+static DEFER_CYCLE_COLS: LazyLock<bool> = LazyLock::new(|| {
+    cfg!(feature = "cuda") && std::env::var_os("RISC0_C2_HOSTCOLS").is_none()
+});
+
+/// Data columns set for every row from its preflight cycle: cycle, next_pc_low, next_pc_high,
+/// next_state, next_machine_mode (in this order; the CUDA kernel takes them as such).
+pub(crate) const CYCLE_COLS: [u32; 5] = [
+    LAYOUT_TOP.cycle._super.offset as u32,
+    LAYOUT_TOP.next_pc_low._super.offset as u32,
+    LAYOUT_TOP.next_pc_high._super.offset as u32,
+    LAYOUT_TOP.next_state_0._super.offset as u32,
+    LAYOUT_TOP.next_machine_mode._super.offset as u32,
+];
 use preflight::PreflightTrace;
 use rayon::prelude::*;
 use risc0_binfmt::{PovwNonce, WordAddr};
@@ -68,7 +87,9 @@ impl PreflightResults {
     pub fn new(segment: &Segment, rand_z: ExtVal) -> Result<Self> {
         scope!("preflight_result_new");
 
+        let tp0 = std::time::Instant::now();
         let trace = segment.preflight(rand_z)?;
+        let tp1 = std::time::Instant::now();
 
         tracing::trace!("{segment:#?}");
         tracing::trace!("{trace:#?}");
@@ -78,7 +99,25 @@ impl PreflightResults {
         let cycles = 1 << segment.po2;
 
         let global = build_global_vec(segment, &trace);
+        let mut trace = trace;
+        trace.cycle_cols_deferred = *DEFER_CYCLE_COLS;
         let (injector, bigint_rows) = build_injector(&trace, cycles);
+        // Stage the trace for the GPU upload here, on the preflight thread, off the critical path.
+        let tp2 = std::time::Instant::now();
+        #[cfg(feature = "cuda")]
+        {
+            trace.staged = cuda_stage::stage(&trace);
+        }
+        if *VERBOSE {
+            eprintln!(
+                "    [preflight_new] preflight={:.1}ms global+injector={:.1}ms stage={:.1}ms (cycles={} txns={})",
+                (tp1 - tp0).as_secs_f64() * 1000.0,
+                (tp2 - tp1).as_secs_f64() * 1000.0,
+                tp2.elapsed().as_secs_f64() * 1000.0,
+                trace.cycles.len(),
+                trace.txns.len(),
+            );
+        }
 
         Ok(Self {
             global,
@@ -291,6 +330,20 @@ where
         if let Some(ref pd) = pre_data_buf {
             hal.scatter_bits(&pd.buf, &injector.bit_data, cycles as u32);
         }
+        // The injector left out the per-cycle columns: write them from the host where the
+        // circuit HAL doesn't (and always into pre_data), after the back entries as before.
+        if trace.cycle_cols_deferred {
+            let host_data = !circuit_hal.writes_cycle_cols();
+            if host_data || pre_data_buf.is_some() {
+                let cols = build_cycle_col_injector(trace, cycles);
+                if host_data {
+                    hal.scatter(&data.buf, &cols.index, &cols.offsets, &cols.values);
+                }
+                if let Some(ref pd) = pre_data_buf {
+                    hal.scatter(&pd.buf, &cols.index, &cols.offsets, &cols.values);
+                }
+            }
+        }
         let tw4 = std::time::Instant::now();
         if *VERBOSE {
             eprintln!("      [scatter_detail] s1={:.1}ms s2={:.1}ms sb1={:.1}ms sb2={:.1}ms total={:.1}ms",
@@ -446,6 +499,8 @@ fn build_injector(trace: &PreflightTrace, cycles: usize) -> (Injector, Vec<usize
     const SET_CYCLE_COUNT: u32 = 5;
 
     let n = trace.backs.len();
+    let cycle_cols = !trace.cycle_cols_deferred;
+    let set_cycle_count = if cycle_cols { SET_CYCLE_COUNT } else { 0 };
 
     // Steps 1+2: Compute exclusive prefix sums in a single pass.
     // scatter entries (without SHA2 u32 bit decomposition — those go to bit_data)
@@ -459,7 +514,7 @@ fn build_injector(trace: &PreflightTrace, cycles: usize) -> (Injector, Vec<usize
     // Pre-extract BigInt row indices for accum phase (avoids 1M-entry scan later)
     let mut bigint_rows = Vec::new();
     for (row, back) in trace.backs.iter().enumerate() {
-        total += SET_CYCLE_COUNT
+        total += set_cycle_count
             + match back {
                 Back::None => 0,
                 Back::Ecall(..) => 3,
@@ -559,12 +614,21 @@ fn build_injector(trace: &PreflightTrace, cycles: usize) -> (Injector, Vec<usize
             }
         }
 
-        set(CYCLE_COL, row as u32);
-        set(NEXT_PC_LOW, cycle.pc & 0xffff);
-        set(NEXT_PC_HIGH, cycle.pc >> 16);
-        set(NEXT_STATE, cycle.state);
-        set(NEXT_MACHINE_MODE, cycle.machine_mode as u32);
+        if cycle_cols {
+            set(CYCLE_COL, row as u32);
+            set(NEXT_PC_LOW, cycle.pc & 0xffff);
+            set(NEXT_PC_HIGH, cycle.pc >> 16);
+            set(NEXT_STATE, cycle.state);
+            set(NEXT_MACHINE_MODE, cycle.machine_mode as u32);
+        }
     });
+
+    // Rows without entries (most of them once the cycle columns are left out) add nothing to
+    // the scatter but one thread each: drop their (repeated) bounds. Same writes in the same
+    // per-row order; the scatter kernel never needs the row number.
+    if !cycle_cols {
+        index.dedup();
+    }
 
     (
         Injector {
@@ -576,6 +640,39 @@ fn build_injector(trace: &PreflightTrace, cycles: usize) -> (Injector, Vec<usize
         },
         bigint_rows,
     )
+}
+
+/// The per-cycle columns (CYCLE_COLS) as an injector, for HALs that don't write them.
+fn build_cycle_col_injector(trace: &PreflightTrace, cycles: usize) -> Injector {
+    let n = trace.cycles.len();
+    let index: Vec<u32> = (0..=n).map(|row| (row * CYCLE_COLS.len()) as u32).collect();
+    let mut offsets = vec![0u32; n * CYCLE_COLS.len()];
+    let mut values = vec![Val::ZERO; n * CYCLE_COLS.len()];
+    offsets
+        .par_chunks_mut(CYCLE_COLS.len())
+        .zip(values.par_chunks_mut(CYCLE_COLS.len()))
+        .enumerate()
+        .for_each(|(row, (offs, vals))| {
+            let cycle = &trace.cycles[row];
+            let v = [
+                row as u32,
+                cycle.pc & 0xffff,
+                cycle.pc >> 16,
+                cycle.state,
+                cycle.machine_mode as u32,
+            ];
+            for i in 0..CYCLE_COLS.len() {
+                offs[i] = (CYCLE_COLS[i] as usize * cycles + row) as u32;
+                vals[i] = Val::new(v[i]);
+            }
+        });
+    Injector {
+        rows: cycles,
+        offsets,
+        values,
+        index,
+        bit_data: vec![],
+    }
 }
 
 fn build_global_vec(segment: &Segment, trace: &PreflightTrace) -> Vec<Val> {

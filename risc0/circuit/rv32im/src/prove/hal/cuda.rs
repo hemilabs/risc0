@@ -17,7 +17,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use risc0_circuit_rv32im_sys::{
     risc0_circuit_rv32im_cuda_accum, risc0_circuit_rv32im_cuda_eval_check,
-    risc0_circuit_rv32im_cuda_witgen, RawAccumBuffers, RawBuffer, RawExecBuffers,
+    risc0_circuit_rv32im_cuda_witgen_v2, RawAccumBuffers, RawBuffer, RawExecBuffers,
     RawPreflightTrace,
 };
 use risc0_core::{
@@ -58,6 +58,10 @@ impl<CH: CudaHash> CudaCircuitHal<CH> {
 }
 
 impl<CH: CudaHash> CircuitWitnessGenerator<CudaHal<CH>> for CudaCircuitHal<CH> {
+    fn writes_cycle_cols(&self) -> bool {
+        true
+    }
+
     fn generate_witness(
         &self,
         mode: StepMode,
@@ -96,6 +100,17 @@ impl<CH: CudaHash> CircuitWitnessGenerator<CudaHal<CH>> for CudaCircuitHal<CH> {
             },
         };
 
+        // The staged slot is owned by `preflight` (the trace), which outlives the stream work.
+        let (staged, staged_id) = preflight
+            .staged
+            .as_ref()
+            .and_then(|s| s.ptr_for(preflight).map(|p| (p, s.id)))
+            .unwrap_or((std::ptr::null(), 0));
+        let cycle_cols = if preflight.cycle_cols_deferred {
+            crate::prove::witgen::CYCLE_COLS.as_ptr()
+        } else {
+            std::ptr::null()
+        };
         let preflight = RawPreflightTrace {
             cycles: preflight.cycles.as_ptr(),
             txns: preflight.txns.as_ptr(),
@@ -105,7 +120,15 @@ impl<CH: CudaHash> CircuitWitnessGenerator<CudaHal<CH>> for CudaCircuitHal<CH> {
             table_split_cycle: preflight.table_split_cycle,
         };
         ffi_wrap(|| unsafe {
-            risc0_circuit_rv32im_cuda_witgen(mode as u32, &buffers, &preflight, cycles as u32)
+            risc0_circuit_rv32im_cuda_witgen_v2(
+                mode as u32,
+                &buffers,
+                &preflight,
+                cycles as u32,
+                staged,
+                cycle_cols,
+                staged_id,
+            )
         })
     }
 }
@@ -243,6 +266,9 @@ impl<CH: CudaHash> CircuitHal<CudaHal<CH>> for CudaCircuitHal<CH> {
             fn risc0_circuit_rv32im_cuda_eval_check_dep() -> *const std::os::raw::c_char;
         }
         risc0_sys::ffi_wrap(|| unsafe { risc0_circuit_rv32im_cuda_eval_check_dep() }).unwrap();
+        // eval_check is done: copy the next segment's staged preflight (if the preflight thread
+        // has finished it) while this segment's finalize kernels run.
+        crate::prove::witgen::cuda_stage::prefetch_ready();
     }
 }
 

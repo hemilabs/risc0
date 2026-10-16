@@ -40,6 +40,7 @@ namespace nvtx3 { struct scoped_range { scoped_range(const char*) {} }; }
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 #include <string.h>
 
 #ifdef __HIPCC__
@@ -52,6 +53,8 @@ namespace cuda { namespace std { using ::std::array; } }
 #include <thrust/execution_policy.h>
 #include <thrust/scan.h>
 #include <thrust/sort.h>
+#include <cub/device/device_radix_sort.cuh>
+#include <cub/device/device_scan.cuh>
 #endif
 
 static bool g_verbose = (std::getenv("RISC0_VERBOSE") != nullptr);
@@ -63,6 +66,25 @@ namespace risc0::circuit::rv32im_v2::cuda {
 struct AddOp {
   __device__ __forceinline__ Fp operator()(const Fp& a, const Fp& b) const { return a + b; }
 };
+#else
+struct FpAddOp {
+  __device__ __forceinline__ Fp operator()(const Fp& a, const Fp& b) const { return a + b; }
+};
+
+// Grow-only per-device CUB temp storage. thrust's temporary allocator does cudaMalloc/cudaFree
+// per call (even with par_nosync) and cudaFree synchronizes: the host blocked for the whole of
+// stepAccum and the GPU idled around each call (5 per segment).
+static void* cubTemp(size_t bytes) {
+  static void* s_ptr[16] = {};
+  static size_t s_cap[16] = {};
+  int dev = getCachedDevice();
+  if (bytes > s_cap[dev]) {
+    if (s_ptr[dev]) CUDA_OK(cudaFree(s_ptr[dev]));
+    CUDA_OK(cudaMalloc(&s_ptr[dev], bytes));
+    s_cap[dev] = bytes;
+  }
+  return s_ptr[dev];
+}
 #endif
 
 constexpr size_t kUserAccumSplit = kLayout_TopAccum.columns[0].col;
@@ -97,6 +119,63 @@ struct DeviceAccumContext {
   LookupTables* tables;
 };
 
+// Device copies of staged (pinned) preflight traces, one grow-only device buffer per pinned
+// slot. A staged trace's copy is either prefetched on a side stream while the previous
+// segment's finalize runs (risc0_circuit_rv32im_cuda_prefetch), or made on the main stream in
+// setup_exec. `releasedEv` is recorded after the last kernel that reads the slot (accum), and a
+// later prefetch into the same slot waits for it. `id` identifies the staged trace whose bytes
+// the slot holds (pinned addresses can be reused after a regrow).
+struct DevSlot {
+  const uint8_t* pinned = nullptr;
+  uint8_t* dev = nullptr;
+  size_t cap = 0;
+  uint64_t id = 0;
+  bool ready = false;  // prefetched for `id`, not yet consumed
+  bool released = false;
+  cudaEvent_t readyEv = nullptr;
+  cudaEvent_t releasedEv = nullptr;
+};
+
+static DevSlot* getDevSlot(const uint8_t* pinned) {
+  static DevSlot s_slots[16][8];
+  int dev = getCachedDevice();
+  DevSlot* freeSlot = nullptr;
+  for (auto& sl : s_slots[dev]) {
+    if (sl.pinned == pinned) return &sl;
+    if (!sl.pinned && !freeSlot) freeSlot = &sl;
+  }
+  if (!freeSlot) {
+    // More pinned slots than expected (regrows): recycle the least useful one (not ready).
+    for (auto& sl : s_slots[dev]) {
+      if (!sl.ready) { freeSlot = &sl; break; }
+    }
+    if (!freeSlot) throw std::runtime_error("rv32im prefetch: no free device slot");
+  }
+  freeSlot->pinned = pinned;
+  freeSlot->ready = false;
+  if (!freeSlot->readyEv) {
+    CUDA_OK(cudaEventCreateWithFlags(&freeSlot->readyEv, cudaEventDisableTiming));
+    CUDA_OK(cudaEventCreateWithFlags(&freeSlot->releasedEv, cudaEventDisableTiming));
+  }
+  return freeSlot;
+}
+
+static void growDevSlot(DevSlot* sl, size_t bytes) {
+  if (bytes > sl->cap) {
+    // cudaFree synchronizes the device, so no pending copy or kernel still uses the old buffer.
+    if (sl->dev) CUDA_OK(cudaFree(sl->dev));
+    CUDA_OK(cudaMalloc(&sl->dev, bytes));
+    sl->cap = bytes;
+  }
+}
+
+static cudaStream_t getCopyStream() {
+  static cudaStream_t s_streams[16] = {};
+  int dev = getCachedDevice();
+  if (!s_streams[dev]) CUDA_OK(cudaStreamCreateWithFlags(&s_streams[dev], cudaStreamNonBlocking));
+  return s_streams[dev];
+}
+
 // Static cache for device-side allocations that persist across segments.
 // Eliminates ~42 cudaMallocAsync/cudaFreeAsync pairs per segment and avoids
 // re-uploading ~18MB of preflight data in the accum phase (which doesn't use it).
@@ -129,6 +208,12 @@ struct DeviceCache {
   size_t txns_capacity = 0;
   uint8_t* d_bigintBytes = nullptr;
   size_t bigintBytes_capacity = 0;
+
+  // The device preflight of the current segment: the own buffers above, or a DevSlot.
+  PreflightCycle* a_cycles = nullptr;
+  MemoryTransaction* a_txns = nullptr;
+  uint8_t* a_bigintBytes = nullptr;
+  DevSlot* a_slot = nullptr;
 
   // Persistent pinned host staging buffer for preflight data uploads (grow-only).
   // Avoids HIP's slow pageable memory staging path for large H2D copies.
@@ -206,10 +291,13 @@ struct DeviceCache {
   }
 
   // Setup exec context: upload buffers + preflight data + zero tables
+  // `staged`: optional pinned host buffer that already holds cycles|txns|bigintBytes in the
+  // layout below (filled off the critical path by the preflight thread); the caller keeps it
+  // alive until the stream has passed the copies.
   DeviceExecContext* setup_exec(ExecBuffers* buffers, PreflightTrace* preflight,
-                                size_t lastCycle, cudaStream_t stream) {
+                                size_t lastCycle, cudaStream_t stream,
+                                const char* staged = nullptr, uint64_t staged_id = 0) {
     init(stream);
-    ensure_preflight(stream, lastCycle, preflight->txnsLen, preflight->bigintBytesLen);
 
     // Upload buffer descriptors
     CUDA_OK(cudaMemcpyAsync(d_exec_data, &buffers->data, sizeof(Buffer), cudaMemcpyHostToDevice, stream));
@@ -222,6 +310,30 @@ struct DeviceCache {
     size_t bigint_bytes = preflight->bigintBytesLen;
     size_t total_pf_bytes = cycles_bytes + txns_bytes + bigint_bytes;
 
+    char* pin = const_cast<char*>(staged);
+    a_slot = nullptr;
+    if (pin) {
+      DevSlot* sl = getDevSlot(reinterpret_cast<const uint8_t*>(pin));
+      if (sl->ready && sl->id == staged_id && sl->cap >= total_pf_bytes) {
+        // Prefetched on the copy stream.
+        CUDA_OK(cudaStreamWaitEvent(stream, sl->readyEv, 0));
+      } else {
+        // A stale prefetch (another trace at this address) may still be writing the slot.
+        if (sl->ready) CUDA_OK(cudaStreamWaitEvent(stream, sl->readyEv, 0));
+        growDevSlot(sl, total_pf_bytes);
+        CUDA_OK(cudaMemcpyAsync(sl->dev, pin, total_pf_bytes, cudaMemcpyHostToDevice, stream));
+        sl->id = staged_id;
+      }
+      sl->ready = false;
+      a_slot = sl;
+      a_cycles = reinterpret_cast<PreflightCycle*>(sl->dev);
+      a_txns = reinterpret_cast<MemoryTransaction*>(sl->dev + cycles_bytes);
+      a_bigintBytes = sl->dev + cycles_bytes + txns_bytes;
+    } else {
+    ensure_preflight(stream, lastCycle, preflight->txnsLen, preflight->bigintBytesLen);
+    a_cycles = d_cycles;
+    a_txns = d_txns;
+    a_bigintBytes = d_bigintBytes;
     // Grow pinned staging buffer if needed.
     // Grow with 25% headroom: the trace grows over the first segments, and every regrow
     // costs ~20 ms of pinning on the critical path plus cudaFreeHost's implicit device
@@ -234,7 +346,7 @@ struct DeviceCache {
     }
 
     // Copy to pinned staging (fast CPU memcpy).
-    char* pin = (char*)h_pinned_preflight;
+    pin = (char*)h_pinned_preflight;
     memcpy(pin, preflight->cycles, cycles_bytes);
     memcpy(pin + cycles_bytes, preflight->txns, txns_bytes);
     if (bigint_bytes > 0) {
@@ -247,12 +359,13 @@ struct DeviceCache {
     if (bigint_bytes > 0) {
       CUDA_OK(cudaMemcpyAsync(d_bigintBytes, pin + cycles_bytes + txns_bytes, bigint_bytes, cudaMemcpyHostToDevice, stream));
     }
+    }
 
     // Build and upload PreflightTrace descriptor
     PreflightTrace h_pf;
-    h_pf.cycles = d_cycles;
-    h_pf.txns = d_txns;
-    h_pf.bigintBytes = d_bigintBytes;
+    h_pf.cycles = a_cycles;
+    h_pf.txns = a_txns;
+    h_pf.bigintBytes = a_bigintBytes;
     h_pf.txnsLen = preflight->txnsLen;
     h_pf.bigintBytesLen = preflight->bigintBytesLen;
     h_pf.tableSplitCycle = preflight->tableSplitCycle;
@@ -292,9 +405,9 @@ struct DeviceCache {
     // Reuse preflight descriptor from exec phase (already on device)
     // Just update tableSplitCycle in case it changed (it shouldn't, but be safe)
     PreflightTrace h_pf;
-    h_pf.cycles = d_cycles;
-    h_pf.txns = d_txns;
-    h_pf.bigintBytes = d_bigintBytes;
+    h_pf.cycles = a_cycles;
+    h_pf.txns = a_txns;
+    h_pf.bigintBytes = a_bigintBytes;
     h_pf.txnsLen = preflight->txnsLen;
     h_pf.bigintBytesLen = preflight->bigintBytesLen;
     h_pf.tableSplitCycle = preflight->tableSplitCycle;
@@ -485,6 +598,25 @@ __device__ void nextStep(DeviceExecContext* ctx, uint32_t cycle) {
   step_Top(execCtx, &data, &global);
 }
 
+// The five per-cycle columns the host injector used to scatter for every row (cycle, next pc
+// low/high, next state, next machine mode), written from the uploaded preflight cycles. Runs
+// after the back scatter and before par_stepExec, so the same values win as before (the host
+// injector set these after the back entries of the same row).
+__global__ void injectCycleCols(Fp* data, const PreflightCycle* cycles, uint32_t n, uint32_t rows,
+                                uint32_t cCycle, uint32_t cPcLow, uint32_t cPcHigh,
+                                uint32_t cState, uint32_t cMode) {
+  uint32_t row = blockDim.x * blockIdx.x + threadIdx.x;
+  if (row >= n) {
+    return;
+  }
+  const PreflightCycle& c = cycles[row];
+  data[size_t(cCycle) * rows + row] = Fp(row);
+  data[size_t(cPcLow) * rows + row] = Fp(c.pc & 0xffff);
+  data[size_t(cPcHigh) * rows + row] = Fp(c.pc >> 16);
+  data[size_t(cState) * rows + row] = Fp(c.state);
+  data[size_t(cMode) * rows + row] = Fp(uint32_t(c.machineMode));
+}
+
 __global__ void par_stepExec(DeviceExecContext* ctx, uint32_t start, uint32_t count) {
   uint32_t cycle = blockDim.x * blockIdx.x + threadIdx.x;
   if (cycle >= count) {
@@ -571,16 +703,92 @@ extern "C" {
 
 using namespace risc0::circuit::rv32im_v2::cuda;
 
+const char* risc0_circuit_rv32im_cuda_witgen_v2(uint32_t mode,
+                                                ExecBuffers* buffers,
+                                                PreflightTrace* preflight,
+                                                uint32_t lastCycle,
+                                                const uint8_t* staged,
+                                                const uint32_t* cycle_cols,
+                                                uint64_t staged_id);
+
 const char* risc0_circuit_rv32im_cuda_witgen(uint32_t mode,
                                              ExecBuffers* buffers,
                                              PreflightTrace* preflight,
                                              uint32_t lastCycle) {
+  return risc0_circuit_rv32im_cuda_witgen_v2(mode, buffers, preflight, lastCycle, nullptr, nullptr, 0);
+}
+
+// Copy a staged trace (`bytes` at pinned `staged`, identified by `id`) to its device slot on a
+// side stream, overlapping the GPU work in flight; the witgen that consumes it waits for the
+// copy. Called on the proving thread (it holds the GPU lock).
+const char* risc0_circuit_rv32im_cuda_prefetch(const uint8_t* staged, size_t bytes, uint64_t id) {
+  try {
+    DevSlot* sl = getDevSlot(staged);
+    if (sl->ready && sl->id == id) return nullptr;
+    if (sl == get_cache().a_slot) return nullptr;  // in use by the current segment
+    growDevSlot(sl, bytes);
+    cudaStream_t cs = getCopyStream();
+    if (sl->released) CUDA_OK(cudaStreamWaitEvent(cs, sl->releasedEv, 0));
+    CUDA_OK(cudaMemcpyAsync(sl->dev, staged, bytes, cudaMemcpyHostToDevice, cs));
+    CUDA_OK(cudaEventRecord(sl->readyEv, cs));
+    sl->id = id;
+    sl->ready = true;
+  } catch (const std::exception& err) {
+    return strdup(err.what());
+  } catch (...) {
+    return strdup("Generic exception");
+  }
+  return nullptr;
+}
+
+// Pinned host memory for the preflight staging slots (filled by the preflight thread).
+const char* risc0_circuit_rv32im_cuda_host_alloc(size_t bytes, void** out) {
+  try {
+    CUDA_OK(cudaHostAlloc(out, bytes, cudaHostAllocDefault));
+  } catch (const std::exception& err) {
+    *out = nullptr;
+    return strdup(err.what());
+  } catch (...) {
+    *out = nullptr;
+    return strdup("Generic exception");
+  }
+  return nullptr;
+}
+
+const char* risc0_circuit_rv32im_cuda_host_free(void* ptr) {
+  try {
+    CUDA_OK(cudaFreeHost(ptr));
+  } catch (const std::exception& err) {
+    return strdup(err.what());
+  } catch (...) {
+    return strdup("Generic exception");
+  }
+  return nullptr;
+}
+
+// `staged` (nullable): pinned cycles|txns|bigintBytes, see setup_exec. `cycle_cols` (nullable):
+// the five data columns of injectCycleCols, which the host injector then left out.
+const char* risc0_circuit_rv32im_cuda_witgen_v2(uint32_t mode,
+                                                ExecBuffers* buffers,
+                                                PreflightTrace* preflight,
+                                                uint32_t lastCycle,
+                                                const uint8_t* staged,
+                                                const uint32_t* cycle_cols,
+                                                uint64_t staged_id) {
   try {
     cudaStream_t stream = getPersistentStream();
     auto t0 = std::chrono::steady_clock::now();
-    DeviceExecContext* d_ctx = get_cache().setup_exec(buffers, preflight, lastCycle, stream);
+    DeviceExecContext* d_ctx = get_cache().setup_exec(
+        buffers, preflight, lastCycle, stream, reinterpret_cast<const char*>(staged), staged_id);
     auto t1 = std::chrono::steady_clock::now();
     size_t split = preflight->tableSplitCycle;
+    if (cycle_cols) {
+      auto cfg = getSimpleConfig(lastCycle);
+      injectCycleCols<<<cfg.grid, cfg.block, 0, stream>>>(
+          buffers->data.buf, get_cache().a_cycles, lastCycle, buffers->data.rows,
+          cycle_cols[0], cycle_cols[1], cycle_cols[2], cycle_cols[3], cycle_cols[4]);
+      CUDA_OK(cudaGetLastError());
+    }
 
     switch (mode) {
     case kStepModeParallel: {
@@ -641,20 +849,31 @@ const char* risc0_circuit_rv32im_cuda_accum(AccumBuffers* buffers,
 #ifndef __HIPCC__
       static uint8_t* s_keys[16] = {};
       static uint32_t* s_perm[16] = {};
+      static uint8_t* s_keys2[16] = {};
+      static uint32_t* s_perm2[16] = {};
       static size_t s_cap[16] = {};
       {
         int dev = getCachedDevice();
         if (lastCycle > s_cap[dev]) {
           if (s_keys[dev]) CUDA_OK(cudaFree(s_keys[dev]));
           if (s_perm[dev]) CUDA_OK(cudaFree(s_perm[dev]));
+          if (s_keys2[dev]) CUDA_OK(cudaFree(s_keys2[dev]));
+          if (s_perm2[dev]) CUDA_OK(cudaFree(s_perm2[dev]));
           CUDA_OK(cudaMalloc(&s_keys[dev], lastCycle));
           CUDA_OK(cudaMalloc(&s_perm[dev], lastCycle * sizeof(uint32_t)));
+          CUDA_OK(cudaMalloc(&s_keys2[dev], lastCycle));
+          CUDA_OK(cudaMalloc(&s_perm2[dev], lastCycle * sizeof(uint32_t)));
           s_cap[dev] = lastCycle;
         }
-        majorKeys<<<cfg.grid, cfg.block, 0, stream>>>(get_cache().d_cycles, s_keys[dev], s_perm[dev], lastCycle);
-        auto kpolicy = thrust::cuda::par_nosync.on(stream);
-        thrust::stable_sort_by_key(kpolicy, s_keys[dev], s_keys[dev] + lastCycle, s_perm[dev]);
-        perm = s_perm[dev];
+        majorKeys<<<cfg.grid, cfg.block, 0, stream>>>(get_cache().a_cycles, s_keys[dev], s_perm[dev], lastCycle);
+        // Stable LSD radix sort on the 8-bit keys: the same permutation as
+        // thrust::stable_sort_by_key.
+        cub::DoubleBuffer<uint8_t> dk(s_keys[dev], s_keys2[dev]);
+        cub::DoubleBuffer<uint32_t> dv(s_perm[dev], s_perm2[dev]);
+        size_t tb = 0;
+        CUDA_OK(cub::DeviceRadixSort::SortPairs(nullptr, tb, dk, dv, (int)lastCycle, 0, 8, stream));
+        CUDA_OK(cub::DeviceRadixSort::SortPairs(cubTemp(tb), tb, dk, dv, (int)lastCycle, 0, 8, stream));
+        perm = dv.Current();
       }
 #endif
       stepAccum<<<cfg.grid, cfg.block, 0, stream>>>(d_ctx, lastCycle, perm);
@@ -683,18 +902,26 @@ const char* risc0_circuit_rv32im_cuda_accum(AccumBuffers* buffers,
         }
       }
 #else
-      for (size_t j = 0; j < 4; j++) {
-        size_t col = buffers->accum.cols - 4 + j;
-        Fp* itBegin = buffers->accum.buf + col * rows;
-        Fp* itEnd = buffers->accum.buf + col * rows + lastCycle;
-        // par_nosync (CUDA 12.2+) uses cudaMallocAsync for temp storage instead
-        // of cudaMalloc, avoiding implicit device-wide synchronization per scan call.
-        auto policy = thrust::cuda::par_nosync.on(stream);
-        thrust::inclusive_scan(policy, itBegin, itEnd, itBegin);
+      {
+        size_t tb = 0;
+        Fp* col0 = buffers->accum.buf + (buffers->accum.cols - 4) * rows;
+        CUDA_OK(cub::DeviceScan::InclusiveScan(nullptr, tb, col0, col0, FpAddOp(), (int)lastCycle, stream));
+        void* temp = cubTemp(tb);
+        for (size_t j = 0; j < 4; j++) {
+          size_t col = buffers->accum.cols - 4 + j;
+          Fp* itBegin = buffers->accum.buf + col * rows;
+          // Fp addition is associative and exact, so any scan order gives the same sums.
+          CUDA_OK(cub::DeviceScan::InclusiveScan(temp, tb, itBegin, itBegin, FpAddOp(), (int)lastCycle, stream));
+        }
       }
 #endif
 
       finalizeAccum<<<cfg.grid, cfg.block, 0, stream>>>(d_ctx, lastCycle);
+      // Last reader of this segment's device preflight: a prefetch into its slot waits for this.
+      if (DevSlot* sl = get_cache().a_slot) {
+        CUDA_OK(cudaEventRecord(sl->releasedEv, stream));
+        sl->released = true;
+      }
     }
     auto t2 = std::chrono::steady_clock::now();
     if (g_verbose) fprintf(stderr, "      [ffi_accum] ctx_setup: %.1fms, kernels: %.1fms\n",

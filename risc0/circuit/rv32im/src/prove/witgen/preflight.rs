@@ -67,6 +67,20 @@ pub(crate) struct PreflightTrace {
     pub backs: Vec<Back>,
     pub table_split_cycle: u32,
     pub rand_z: ExtVal,
+    /// Pinned copy of cycles|txns|bigint_bytes for the CUDA witgen upload (see cuda_stage).
+    #[cfg(feature = "cuda")]
+    #[debug(skip)]
+    pub staged: Option<std::sync::Arc<super::cuda_stage::StagedTrace>>,
+    /// The injector left out the five per-cycle columns (CYCLE_COLS): witgen writes them.
+    pub cycle_cols_deferred: bool,
+}
+
+// Return the big vectors for reuse by a later segment's preflight (see cuda_stage).
+#[cfg(feature = "cuda")]
+impl Drop for PreflightTrace {
+    fn drop(&mut self) {
+        super::cuda_stage::recycle_trace(self);
+    }
 }
 
 pub(crate) struct Preflight<'a> {
@@ -133,13 +147,17 @@ impl<'a> Preflight<'a> {
                 page_memory.insert(&(node_addr + i), digest.as_words()[i]);
             }
         }
+        #[cfg(feature = "cuda")]
+        let trace = super::cuda_stage::recycled_trace(total_cycles, rand_z);
+        #[cfg(not(feature = "cuda"))]
+        let trace = PreflightTrace {
+            cycles: Vec::with_capacity(total_cycles),
+            backs: Vec::with_capacity(total_cycles),
+            rand_z,
+            ..Default::default()
+        };
         Self {
-            trace: PreflightTrace {
-                cycles: Vec::with_capacity(total_cycles),
-                backs: Vec::with_capacity(total_cycles),
-                rand_z,
-                ..Default::default()
-            },
+            trace,
             segment,
             pager: PagedMemory::new(
                 segment.partial_image.clone(),
