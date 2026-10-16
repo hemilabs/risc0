@@ -14,8 +14,8 @@
 
 // CUDA only: parStepComputeAccum / parStepVerifyAccum with the generated step function
 // force-inlined into the kernel (step_*_inl.cuh are step_compute_accum.cu /
-// step_verify_accum.cu with the function made static __forceinline__, see the sed lines
-// in the commit message). Built in the unrestricted-register group (no -maxrregcount=96):
+// step_verify_accum.cu with the function made static __forceinline__, written by
+// accum_inl_gen.py). Built in the unrestricted-register group (no -maxrregcount=96):
 // cross-TU calls at 96 registers spilled ~14 KB per thread.
 #ifndef __HIPCC__
 #include "cuda.h"
