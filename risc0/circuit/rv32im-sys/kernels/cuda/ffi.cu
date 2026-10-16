@@ -1124,6 +1124,8 @@ const char* risc0_circuit_rv32im_cuda_warmup() {
     par_stepExec<<<1, 1, 0, stream>>>(nullptr, 0, 0);
     stepAccum<<<1, 1, 0, stream>>>(nullptr, 0);
     finalizeAccum<<<1, 1, 0, stream>>>(nullptr, 0);
+    injectCycleCols<<<1, 1, 0, stream>>>(nullptr, nullptr, 0, 0, 0, 0, 0, 0, 0);
+    majorKeys<<<1, 1, 0, stream>>>(nullptr, nullptr, nullptr, 0, 0);
 #ifndef __HIPCC__
     risc0_rv32im_launch_stepAccumTU(1, 1, stream, nullptr, 0, nullptr);
     risc0_rv32im_launch_par_stepExecTU(1, 1, stream, nullptr, 0, 0);
