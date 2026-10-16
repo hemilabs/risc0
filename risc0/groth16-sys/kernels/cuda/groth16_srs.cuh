@@ -197,9 +197,9 @@ private:
 
 public:
   // Set once a prover has permuted a/b_g1/b_g2/c in place for the bit-split MSMs.
-  mutable bool c2_permuted = false;
+  mutable bool split_permuted = false;
   // FNV-1a of sampled bytes of the point sections (keys the split-correction cache).
-  uint64_t c2_salt = 0;
+  uint64_t points_salt = 0;
 
   SRS(size_t gpu_id, const char* srs_path) : gpu(select_gpu(gpu_id)), srs_path(srs_path) {
     struct {
@@ -362,11 +362,11 @@ public:
           for (size_t i = 0; i < 4096; i++) { h ^= srs_ptr[o + i]; h *= 0x100000001b3ull; }
         }
         h ^= srs_file_size; h *= 0x100000001b3ull;
-        c2_salt = h;
+        points_salt = h;
       }
       if (g16_staged()) {
         ld.sync();  // the allocations
-        c2_stager& sg = c2_stager::get();
+        key_stager& sg = key_stager::get();
         sg.upload(&h[0], srs_ptr + data.h.off, h_size * sizeof(affine_t));
         sg.upload(&a[0], srs_ptr + data.a.off, a_size * sizeof(affine_t));
         sg.upload(&b_g1[0], srs_ptr + data.b_g1.off, b_g1_size * sizeof(affine_t));

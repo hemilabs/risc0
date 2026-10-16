@@ -267,7 +267,7 @@ public:
     stream_t ld{gpu.id()};
     try {
 #ifndef __HIPCC__
-      if (g16_cold_enabled() && c2_compact_load(ld, _ptr, file_size)) {
+      if (g16_cold_enabled() && compact_load(ld, _ptr, file_size)) {
         munmap(const_cast<byte*>(_ptr), file_size);
         return;
       }
@@ -294,14 +294,14 @@ public:
       const byte* ptr = _ptr + 4 * sizeof(size_t);
       if (g16_staged()) {
         ld.sync();
-        c2_stager& sg = c2_stager::get();
+        key_stager& sg = key_stager::get();
         sg.upload(&d_coeffs[0], ptr, (d_coeffs_a.size() + d_coeffs_b.size()) * sizeof(coeff_t));
       } else
       ld.HtoD(&d_coeffs[0], (coeff_t*)&ptr[0], d_coeffs_a.size() + d_coeffs_b.size());
 
       ptr += (d_coeffs_a.size() + d_coeffs_b.size()) * sizeof(coeff_t);
       if (g16_staged())
-        c2_stager::get().upload(&d_independent_indices[0], ptr,
+        key_stager::get().upload(&d_independent_indices[0], ptr,
                                 (d_ind_idx_a.size() + d_ind_idx_b.size()) * sizeof(uint32_t));
       else
       ld.HtoD(
@@ -372,11 +372,11 @@ public:
 #endif // _WIN32
 
 #ifndef __HIPCC__
-  struct c2_cmp_hdr {
+  struct compact_hdr {
     char magic[8];
     uint64_t key, ca, cb, ua, ub, ntab;
   };
-  static std::string c2_cmp_path(uint64_t key) {
+  static std::string compact_cache_path(uint64_t key) {
     std::string dir;
     if (const char* d = getenv("RISC0_G16_CACHE_DIR")) dir = d;
     else if (const char* x = getenv("XDG_CACHE_HOME")) dir = std::string(x) + "/risc0-groth16";
@@ -388,17 +388,17 @@ public:
     snprintf(name, sizeof name, "/coeffs_compact_%016llx.bin", (unsigned long long)key);
     return dir + name;
   }
-  void c2_up(stream_t& ld, void* dst, const void* src, size_t bytes) {
+  void compact_upload(stream_t& ld, void* dst, const void* src, size_t bytes) {
     if (g16_staged()) {
       ld.sync();
-      c2_stager::get().upload(dst, src, bytes);
+      key_stager::get().upload(dst, src, bytes);
     } else {
       CUDA_OK(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, ld));
       ld.sync();
     }
   }
   // Loads the compact form (building and caching it from the mmap'd original if needed).
-  bool c2_compact_load(stream_t& ld, const byte* orig, size_t orig_size) {
+  bool compact_load(stream_t& ld, const byte* orig, size_t orig_size) {
     const size_t* h = (const size_t*)orig;
     size_t ca = h[0], cb = h[1], ua = h[2], ub = h[3], n = ca + cb;
     if (orig_size != 32 + n * sizeof(coeff_t) + (ua + ub) * 4) return false;
@@ -408,7 +408,7 @@ public:
       for (size_t i = 0; i < 4096; i++) { key ^= orig[o + i]; key *= 0x100000001b3ull; }
     }
     key ^= orig_size; key *= 0x100000001b3ull;
-    std::string path = c2_cmp_path(key);
+    std::string path = compact_cache_path(key);
     if (path.empty()) return false;
     const coeff_t* co = (const coeff_t*)(orig + 32);
     const uint32_t* ind = (const uint32_t*)(orig + 32 + n * sizeof(coeff_t));
@@ -424,10 +424,10 @@ public:
       close(fd);
       if (cp == MAP_FAILED) cp = nullptr;
     }
-    const c2_cmp_hdr* ch = (const c2_cmp_hdr*)cp;
-    bool ok = cp && csz >= sizeof(c2_cmp_hdr) && !memcmp(ch->magic, "C2CMP001", 8) && ch->key == key &&
+    const compact_hdr* ch = (const compact_hdr*)cp;
+    bool ok = cp && csz >= sizeof(compact_hdr) && !memcmp(ch->magic, "C2CMP001", 8) && ch->key == key &&
               ch->ca == ca && ch->cb == cb && ch->ua == ua && ch->ub == ub &&
-              csz == sizeof(c2_cmp_hdr) + n * 8 + ch->ntab * sizeof(fr_t) + (ua + ub) * 8;
+              csz == sizeof(compact_hdr) + n * 8 + ch->ntab * sizeof(fr_t) + (ua + ub) * 8;
     std::vector<byte> built;
     if (!ok) {
       if (cp) munmap(const_cast<byte*>(cp), csz);
@@ -450,7 +450,7 @@ public:
       std::vector<uint32_t> rowc(ua + ub, 0);
       for (size_t r = 0; r + 1 < ua; r++) rowc[r] = co[ind[r]].c;
       for (size_t r = 0; r + 1 < ub; r++) rowc[ua + r] = co[ca + ind[ua + r]].c;
-      c2_cmp_hdr hd;
+      compact_hdr hd;
       memcpy(hd.magic, "C2CMP001", 8);
       hd.key = key; hd.ca = ca; hd.cb = cb; hd.ua = ua; hd.ub = ub; hd.ntab = table.size();
       csz = sizeof hd + n * 8 + table.size() * sizeof(fr_t) + (ua + ub) * 8;
@@ -467,19 +467,19 @@ public:
         good = (fclose(f) == 0) && good;
         if (good) rename(tmp.c_str(), path.c_str()); else remove(tmp.c_str());
       }
-      ch = (const c2_cmp_hdr*)built.data();
+      ch = (const compact_hdr*)built.data();
     }
     const byte* base = cp ? cp : built.data();
-    ch = (const c2_cmp_hdr*)base;
-    const byte* p = base + sizeof(c2_cmp_hdr);
+    ch = (const compact_hdr*)base;
+    const byte* p = base + sizeof(compact_hdr);
     d_cs = gpu_ptr_t<uint2>((uint2*)ld.Dmalloc(n * 8));
     d_table = gpu_ptr_t<fr_t>((fr_t*)ld.Dmalloc(ch->ntab * sizeof(fr_t)));
     d_rowc = gpu_ptr_t<uint32_t>((uint32_t*)ld.Dmalloc((ua + ub) * 4));
     d_independent_indices = gpu_ptr_t<uint32_t>((uint32_t*)ld.Dmalloc((ua + ub) * 4));
-    c2_up(ld, &d_cs[0], p, n * 8); p += n * 8;
-    c2_up(ld, &d_table[0], p, ch->ntab * sizeof(fr_t)); p += ch->ntab * sizeof(fr_t);
-    c2_up(ld, &d_rowc[0], p, (ua + ub) * 4); p += (ua + ub) * 4;
-    c2_up(ld, &d_independent_indices[0], p, (ua + ub) * 4);
+    compact_upload(ld, &d_cs[0], p, n * 8); p += n * 8;
+    compact_upload(ld, &d_table[0], p, ch->ntab * sizeof(fr_t)); p += ch->ntab * sizeof(fr_t);
+    compact_upload(ld, &d_rowc[0], p, (ua + ub) * 4); p += (ua + ub) * 4;
+    compact_upload(ld, &d_independent_indices[0], p, (ua + ub) * 4);
     ld.sync();
     if (cp) munmap(const_cast<byte*>(cp), csz);
     d_ind_idx_a = slice_t<uint32_t>(&d_independent_indices[0], ua);

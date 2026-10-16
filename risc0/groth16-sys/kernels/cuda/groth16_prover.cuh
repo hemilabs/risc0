@@ -35,9 +35,9 @@ __global__ __launch_bounds__(512) void witness_into_poly(fr_t* out,
 #include <fstream>
 #include <random>
 #ifndef __HIPCC__
-#include "c2_split.cuh"
+#include "msm_bit_split.cuh"
 #endif
-// Tuned MSM batching (cold path, see g16_cold_enabled; msm_c2 only).
+// Tuned MSM batching (cold path, see g16_cold_enabled; msm_groth16 only).
 static bool g16_tune() {
 #ifdef __HIPCC__
   return false;
@@ -45,10 +45,11 @@ static bool g16_tune() {
   return g16_cold_enabled();
 #endif
 }
-// Groth16 tail (msm_c2 only): each MSM's host collect overlaps the next MSM's GPU work
+// Groth16 tail (msm_groth16 only): each MSM's host collect overlaps the next MSM's GPU work
 // (deferred collect), 4 windows per sort launch, split integrate (K = 8). Group-element identical
-// results. Also gates PIN_EARLY, DRAIN_OVERLAP and PARVERIFY on the Rust side:
-// RISC0_CUDA_G16_TAIL=0 disables all of them.
+// results. The same switch also gates, on the Rust side, the key stager and witness buffer pinned
+// at session start, the witness computed while the STARK HAL's pool is released, and the
+// succinct receipt verified beside the wrap: RISC0_CUDA_G16_TAIL=0 disables all of them.
 static bool g16_tail_enabled() {
 #ifdef __HIPCC__
   return false;
@@ -267,26 +268,26 @@ public:
   gpu_ptr_t<fr_t> d_witness;
 
 #ifndef __HIPCC__
-  // Bit-split MSMs (c2_split.cuh), with the bit set from risc0_groth16_cuda_set_bit_signals.
+  // Bit-split MSMs (msm_bit_split.cuh), with the bit set from risc0_groth16_cuda_set_bit_signals.
   // The SRS points of a, b_g1, b_g2 (over [0,n)) and c (over [0,c_size)) are permuted IN PLACE
   // to [non-bit | bit] order (no extra 1.8 GB copies); the corrections -MSM(P_nb, f_nb) are
   // cached in a small file (keyed by the permutation, the sizes, sampled SRS bytes and the fuzz),
   // so a cold init costs no MSMs. The fallback path runs on the permuted points with permuted
   // scalars.
-  bool c2_on = false;
-  size_t c2_nb = 0, c2_nn = 0, c2_nb_c = 0, c2_nn_c = 0, c2_off_c = 0;
-  gpu_ptr_t<uint32_t> c2_perm, c2_perm_c;   // [nbidx | bidx]
-  gpu_ptr_t<fr_t> c2_sn, c2_sn_c;           // permuted scalars (w + f); [0,nn) used by split
-  gpu_ptr_t<int> c2_bad;
-  c2_split_t<bucket_t, point_t, affine_t> sp_a, sp_b1, sp_c;
-  c2_split_t<bucket_fp2_t, point_fp2_t, affine_fp2_t> sp_b2;
+  bool split_on = false;
+  size_t split_nb = 0, split_nn = 0, split_nb_c = 0, split_nn_c = 0, split_off_c = 0;
+  gpu_ptr_t<uint32_t> split_perm, split_perm_c;   // [nbidx | bidx]
+  gpu_ptr_t<fr_t> split_sn, split_sn_c;           // permuted scalars (w + f); [0,nn) used by split
+  gpu_ptr_t<int> split_bad;
+  msm_split_t<bucket_t, point_t, affine_t> sp_a, sp_b1, sp_c;
+  msm_split_t<bucket_fp2_t, point_fp2_t, affine_fp2_t> sp_b2;
 
-  static uint64_t c2_fnv(uint64_t h, const void* p, size_t n) {
+  static uint64_t fnv1a(uint64_t h, const void* p, size_t n) {
     const uint8_t* b = (const uint8_t*)p;
     for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 0x100000001b3ull; }
     return h;
   }
-  static std::string c2_cache_path(uint64_t key) {
+  static std::string corr_cache_path(uint64_t key) {
     std::string dir;
     if (const char* d = getenv("RISC0_G16_CACHE_DIR")) dir = d;
     else if (const char* x = getenv("XDG_CACHE_HOME")) dir = std::string(x) + "/risc0-groth16";
@@ -296,29 +297,29 @@ public:
     snprintf(name, sizeof name, "/split_corr_%016llx.bin", (unsigned long long)key);
     return dir + name;
   }
-  struct c2_corr_file {
+  struct corr_file_t {
     char magic[8];
     uint64_t key;
     point_t a, b1, c;
     point_fp2_t b2;
   };
-  bool c2_load_corr(const std::string& path, uint64_t key) {
+  bool load_corr(const std::string& path, uint64_t key) {
     if (path.empty()) return false;
     std::ifstream f(path, std::ios::binary);
     if (!f.is_open()) return false;
-    c2_corr_file cf;
+    corr_file_t cf;
     f.read((char*)&cf, sizeof cf);
     if (f.gcount() != (std::streamsize)sizeof cf || memcmp(cf.magic, "C2CORR01", 8) || cf.key != key)
       return false;
     sp_a.corr = cf.a; sp_b1.corr = cf.b1; sp_c.corr = cf.c; sp_b2.corr = cf.b2;
     return true;
   }
-  void c2_store_corr(const std::string& path, uint64_t key) {
+  void store_corr(const std::string& path, uint64_t key) {
     if (path.empty()) return;
     std::string dir = path.substr(0, path.rfind('/'));
     for (size_t i = 1; i <= dir.size(); i++)
       if (i == dir.size() || dir[i] == '/') mkdir(dir.substr(0, i).c_str(), 0755);
-    c2_corr_file cf;
+    corr_file_t cf;
     memcpy(cf.magic, "C2CORR01", 8);
     cf.key = key; cf.a = sp_a.corr; cf.b1 = sp_b1.corr; cf.c = sp_c.corr; cf.b2 = sp_b2.corr;
     std::string tmp = path + ".tmp" + std::to_string(getpid());
@@ -330,7 +331,7 @@ public:
     rename(tmp.c_str(), path.c_str());
   }
 
-  void c2_init() {
+  void split_init() {
     // Cards with >= 28 GB only (the split raises the peak from 19.9 to 24.4 GB).
     if (!g16_cold_enabled()) return;
     {
@@ -348,7 +349,7 @@ public:
     if (srs.get_a_size() != n || srs.get_b_g1_size() != n || srs.get_b_g2_size() != n ||
         srs.get_c_size() > n)
       return;
-    if (srs.c2_permuted)
+    if (srs.split_permuted)
       throw sppark_error{EINVAL, "groth16: SRS points already permuted by an earlier prover: "};
     std::vector<uint8_t> isb(n, 0);
     for (uint32_t i : bidx) {
@@ -356,14 +357,14 @@ public:
         throw sppark_error{EINVAL, "groth16: bad bit signal index: "};
       isb[i] = 1;
     }
-    c2_off_c = n - srs.get_c_size();
+    split_off_c = n - srs.get_c_size();
     std::vector<uint32_t> b, nb, bc, nbc;
     for (uint32_t i = 0; i < n; i++) {
       (isb[i] ? b : nb).push_back(i);
-      if (i >= c2_off_c)
-        (isb[i] ? bc : nbc).push_back(i - c2_off_c);
+      if (i >= split_off_c)
+        (isb[i] ? bc : nbc).push_back(i - split_off_c);
     }
-    c2_nb = b.size(); c2_nn = nb.size(); c2_nb_c = bc.size(); c2_nn_c = nbc.size();
+    split_nb = b.size(); split_nn = nb.size(); split_nb_c = bc.size(); split_nn_c = nbc.size();
     std::vector<uint32_t> perm(nb), perm_c(nbc);
     perm.insert(perm.end(), b.begin(), b.end());
     perm_c.insert(perm_c.end(), bc.begin(), bc.end());
@@ -371,68 +372,68 @@ public:
       d = gpu_ptr_t<uint32_t>((uint32_t*)gpu.Dmalloc(v.size() * sizeof(uint32_t)));
       gpu.sync();
       if (g16_staged())
-        c2_stager::get().upload(&d[0], v.data(), v.size() * sizeof(uint32_t));
+        key_stager::get().upload(&d[0], v.data(), v.size() * sizeof(uint32_t));
       else {
         gpu.HtoD(&d[0], v.data(), v.size());
         gpu.sync();
       }
     };
-    up(c2_perm, perm); up(c2_perm_c, perm_c);
+    up(split_perm, perm); up(split_perm_c, perm_c);
     auto fr_alloc = [&](size_t k) { return gpu_ptr_t<fr_t>((fr_t*)gpu.Dmalloc(k * sizeof(fr_t))); };
-    c2_sn = fr_alloc(n); c2_sn_c = fr_alloc(srs.get_c_size());
-    c2_bad = gpu_ptr_t<int>((int*)gpu.Dmalloc(sizeof(int)));
+    split_sn = fr_alloc(n); split_sn_c = fr_alloc(srs.get_c_size());
+    split_bad = gpu_ptr_t<int>((int*)gpu.Dmalloc(sizeof(int)));
 
-    // Cache key: the permutation, the sizes and a sample of the SRS file (srs.c2_salt).
+    // Cache key: the permutation, the sizes and a sample of the SRS file (srs.points_salt).
     uint64_t key = 0xcbf29ce484222325ull;
-    key = c2_fnv(key, perm.data(), perm.size() * 4);
-    key = c2_fnv(key, perm_c.data(), perm_c.size() * 4);
+    key = fnv1a(key, perm.data(), perm.size() * 4);
+    key = fnv1a(key, perm_c.data(), perm_c.size() * 4);
     size_t sizes[3] = {n, srs.get_c_size(), srs.get_num_public()};
-    key = c2_fnv(key, sizes, sizeof sizes);
-    key = c2_fnv(key, &srs.c2_salt, sizeof srs.c2_salt);
-    key = c2_fnv(key, &fuzzed_results, sizeof fuzzed_results);
+    key = fnv1a(key, sizes, sizeof sizes);
+    key = fnv1a(key, &srs.points_salt, sizeof srs.points_salt);
+    key = fnv1a(key, &fuzzed_results, sizeof fuzzed_results);
 
     // Permute in place (from here on the SRS is in split order).
-    srs.c2_permuted = true;
-    sp_a.template init<64, 1>(gpu, (affine_t*)&srs.get_a()[0], &c2_perm[0], n, c2_nn);
-    sp_b1.template init<64, 1>(gpu, (affine_t*)&srs.get_b_g1()[0], &c2_perm[0], n, c2_nn);
-    sp_b2.template init<128, 2>(gpu, (affine_fp2_t*)&srs.get_b_g2()[0], &c2_perm[0], n, c2_nn);
-    sp_c.template init<64, 1>(gpu, (affine_t*)&srs.get_c()[0], &c2_perm_c[0], srs.get_c_size(), c2_nn_c);
+    srs.split_permuted = true;
+    sp_a.template init<64, 1>(gpu, (affine_t*)&srs.get_a()[0], &split_perm[0], n, split_nn);
+    sp_b1.template init<64, 1>(gpu, (affine_t*)&srs.get_b_g1()[0], &split_perm[0], n, split_nn);
+    sp_b2.template init<128, 2>(gpu, (affine_fp2_t*)&srs.get_b_g2()[0], &split_perm[0], n, split_nn);
+    sp_c.template init<64, 1>(gpu, (affine_t*)&srs.get_c()[0], &split_perm_c[0], srs.get_c_size(), split_nn_c);
     gpu.sync();
 
-    std::string cpath = c2_cache_path(key);
-    bool cached = c2_load_corr(cpath, key);
+    std::string cpath = corr_cache_path(key);
+    bool cached = load_corr(cpath, key);
     if (!cached) {
-      // corr = -MSM(P_nb, f_nb); c2_sn / c2_sn_c are scratch here.
-      c2_gather_add<<<gpu.sm_count() * 4, 256, 0, gpu>>>(&c2_sn[0], &d_fuzz[0], nullptr, &c2_perm[0], c2_nn);
-      c2_gather_add<<<gpu.sm_count() * 4, 256, 0, gpu>>>(&c2_sn_c[0], &d_fuzz[c2_off_c], nullptr, &c2_perm_c[0], c2_nn_c);
+      // corr = -MSM(P_nb, f_nb); split_sn / split_sn_c are scratch here.
+      split_gather_add<<<gpu.sm_count() * 4, 256, 0, gpu>>>(&split_sn[0], &d_fuzz[0], nullptr, &split_perm[0], split_nn);
+      split_gather_add<<<gpu.sm_count() * 4, 256, 0, gpu>>>(&split_sn_c[0], &d_fuzz[split_off_c], nullptr, &split_perm_c[0], split_nn_c);
       CUDA_OK(cudaGetLastError());
       gpu.sync();
-      msm_ok(msm_g1.invoke(sp_a.corr, dev_ptr_t<affine_t>{sp_a.pn}, c2_nn, c2_sn, false), "c2 fuzz a");
-      msm_ok(msm_g1.invoke(sp_b1.corr, dev_ptr_t<affine_t>{sp_b1.pn}, c2_nn, c2_sn, false), "c2 fuzz b_g1");
-      msm_ok(msm_g2.invoke(sp_b2.corr, dev_ptr_t<affine_fp2_t>{sp_b2.pn}, c2_nn, c2_sn, false), "c2 fuzz b_g2");
-      msm_ok(msm_g1.invoke(sp_c.corr, dev_ptr_t<affine_t>{sp_c.pn}, c2_nn_c, c2_sn_c, false), "c2 fuzz c");
+      msm_ok(msm_g1.invoke(sp_a.corr, dev_ptr_t<affine_t>{sp_a.pn}, split_nn, split_sn, false), "split fuzz a");
+      msm_ok(msm_g1.invoke(sp_b1.corr, dev_ptr_t<affine_t>{sp_b1.pn}, split_nn, split_sn, false), "split fuzz b_g1");
+      msm_ok(msm_g2.invoke(sp_b2.corr, dev_ptr_t<affine_fp2_t>{sp_b2.pn}, split_nn, split_sn, false), "split fuzz b_g2");
+      msm_ok(msm_g1.invoke(sp_c.corr, dev_ptr_t<affine_t>{sp_c.pn}, split_nn_c, split_sn_c, false), "split fuzz c");
       sp_a.corr.cneg(true); sp_b1.corr.cneg(true); sp_b2.corr.cneg(true); sp_c.corr.cneg(true);
-      c2_store_corr(cpath, key);
+      store_corr(cpath, key);
     }
-    c2_on = true;
+    split_on = true;
   }
 
-  // true if the split MSMs ran (all S scalars were 0/1); false: the caller runs c2_full_msms
-  bool c2_msms(msm_results& results) {
-    const uint32_t* bidx = &c2_perm[c2_nn];
-    const uint32_t* bidx_c = &c2_perm_c[c2_nn_c];
-    cudaMemsetAsync(&c2_bad[0], 0, sizeof(int), gpu);
-    sp_a.template bit_sum<1>(gpu, &c2_bad[0], &d_witness[0], bidx, c2_nb);
-    sp_b1.template bit_sum<1>(gpu, &c2_bad[0], &d_witness[0], bidx, c2_nb);
-    sp_b2.template bit_sum<2>(gpu, &c2_bad[0], &d_witness[0], bidx, c2_nb);
-    sp_c.template bit_sum<1>(gpu, &c2_bad[0], &d_witness[c2_off_c], bidx_c, c2_nb_c);
-    c2_gather_add<<<gpu.sm_count() * 4, 256, 0, gpu>>>(&c2_sn[0], &d_witness[0], &d_fuzz[0], &c2_perm[0], c2_nn);
-    c2_gather_add<<<gpu.sm_count() * 4, 256, 0, gpu>>>(&c2_sn_c[0], &d_witness[c2_off_c], &d_fuzz[c2_off_c], &c2_perm_c[0], c2_nn_c);
+  // true if the split MSMs ran (all S scalars were 0/1); false: the caller runs permuted_full_msms
+  bool split_msms(msm_results& results) {
+    const uint32_t* bidx = &split_perm[split_nn];
+    const uint32_t* bidx_c = &split_perm_c[split_nn_c];
+    cudaMemsetAsync(&split_bad[0], 0, sizeof(int), gpu);
+    sp_a.template bit_sum<1>(gpu, &split_bad[0], &d_witness[0], bidx, split_nb);
+    sp_b1.template bit_sum<1>(gpu, &split_bad[0], &d_witness[0], bidx, split_nb);
+    sp_b2.template bit_sum<2>(gpu, &split_bad[0], &d_witness[0], bidx, split_nb);
+    sp_c.template bit_sum<1>(gpu, &split_bad[0], &d_witness[split_off_c], bidx_c, split_nb_c);
+    split_gather_add<<<gpu.sm_count() * 4, 256, 0, gpu>>>(&split_sn[0], &d_witness[0], &d_fuzz[0], &split_perm[0], split_nn);
+    split_gather_add<<<gpu.sm_count() * 4, 256, 0, gpu>>>(&split_sn_c[0], &d_witness[split_off_c], &d_fuzz[split_off_c], &split_perm_c[0], split_nn_c);
     CUDA_OK(cudaGetLastError());
     int bad = -1;
     bucket_t ba, bb1, bc;
     bucket_fp2_t bb2;
-    gpu.DtoH(&bad, &c2_bad[0], 1);
+    gpu.DtoH(&bad, &split_bad[0], 1);
     gpu.DtoH(&ba, &sp_a.acc[0], 1);
     gpu.DtoH(&bb1, &sp_b1.acc[0], 1);
     gpu.DtoH(&bb2, &sp_b2.acc[0], 1);
@@ -452,13 +453,13 @@ public:
           if (t.joinable()) t.join();
       };
       try {
-        msm_ok(msm_g1.invoke_defer(pa, dev_ptr_t<affine_t>{sp_a.pn}, c2_nn, c2_sn, false), "a");
+        msm_ok(msm_g1.invoke_defer(pa, dev_ptr_t<affine_t>{sp_a.pn}, split_nn, split_sn, false), "a");
         th.emplace_back([&] { msm_g1.finish(results.a, pa); });
-        msm_ok(msm_g1.invoke_defer(pb1, dev_ptr_t<affine_t>{sp_b1.pn}, c2_nn, c2_sn, false), "b_g1");
+        msm_ok(msm_g1.invoke_defer(pb1, dev_ptr_t<affine_t>{sp_b1.pn}, split_nn, split_sn, false), "b_g1");
         th.emplace_back([&] { msm_g1.finish(results.b_g1, pb1); });
-        msm_ok(msm_g2.invoke_defer(pb2, dev_ptr_t<affine_fp2_t>{sp_b2.pn}, c2_nn, c2_sn, false), "b_g2");
+        msm_ok(msm_g2.invoke_defer(pb2, dev_ptr_t<affine_fp2_t>{sp_b2.pn}, split_nn, split_sn, false), "b_g2");
         th.emplace_back([&] { msm_g2.finish(results.b_g2, pb2); });
-        msm_ok(msm_g1.invoke_defer(pc, dev_ptr_t<affine_t>{sp_c.pn}, c2_nn_c, c2_sn_c, false), "c");
+        msm_ok(msm_g1.invoke_defer(pc, dev_ptr_t<affine_t>{sp_c.pn}, split_nn_c, split_sn_c, false), "c");
         th.emplace_back([&] { msm_g1.finish(results.c, pc); });
       } catch (...) {
         join_all();
@@ -466,10 +467,10 @@ public:
       }
       join_all();
     } else {
-      msm_ok(msm_g1.invoke(results.a, dev_ptr_t<affine_t>{sp_a.pn}, c2_nn, c2_sn, false), "a");
-      msm_ok(msm_g1.invoke(results.b_g1, dev_ptr_t<affine_t>{sp_b1.pn}, c2_nn, c2_sn, false), "b_g1");
-      msm_ok(msm_g2.invoke(results.b_g2, dev_ptr_t<affine_fp2_t>{sp_b2.pn}, c2_nn, c2_sn, false), "b_g2");
-      msm_ok(msm_g1.invoke(results.c, dev_ptr_t<affine_t>{sp_c.pn}, c2_nn_c, c2_sn_c, false), "c");
+      msm_ok(msm_g1.invoke(results.a, dev_ptr_t<affine_t>{sp_a.pn}, split_nn, split_sn, false), "a");
+      msm_ok(msm_g1.invoke(results.b_g1, dev_ptr_t<affine_t>{sp_b1.pn}, split_nn, split_sn, false), "b_g1");
+      msm_ok(msm_g2.invoke(results.b_g2, dev_ptr_t<affine_fp2_t>{sp_b2.pn}, split_nn, split_sn, false), "b_g2");
+      msm_ok(msm_g1.invoke(results.c, dev_ptr_t<affine_t>{sp_c.pn}, split_nn_c, split_sn_c, false), "c");
     }
     point_t p;
     p = ba; results.a.add(p); results.a.add(sp_a.corr);
@@ -481,16 +482,16 @@ public:
   }
 
   // The unsplit MSMs over the permuted points: scalars (w + f) permuted the same way.
-  void c2_full_msms(msm_results& results) {
+  void permuted_full_msms(msm_results& results) {
     size_t n = witness_size, nc = srs.get_c_size();
-    c2_gather_add<<<gpu.sm_count() * 4, 256, 0, gpu>>>(&c2_sn[0], &d_witness[0], &d_fuzz[0], &c2_perm[0], n);
-    c2_gather_add<<<gpu.sm_count() * 4, 256, 0, gpu>>>(&c2_sn_c[0], &d_witness[c2_off_c], &d_fuzz[c2_off_c], &c2_perm_c[0], nc);
+    split_gather_add<<<gpu.sm_count() * 4, 256, 0, gpu>>>(&split_sn[0], &d_witness[0], &d_fuzz[0], &split_perm[0], n);
+    split_gather_add<<<gpu.sm_count() * 4, 256, 0, gpu>>>(&split_sn_c[0], &d_witness[split_off_c], &d_fuzz[split_off_c], &split_perm_c[0], nc);
     CUDA_OK(cudaGetLastError());
     gpu.sync();
-    msm_ok(msm_g1.invoke(results.a, dev_ptr_t<affine_t>{sp_a.pn}, n, c2_sn, false), "a");
-    msm_ok(msm_g1.invoke(results.b_g1, dev_ptr_t<affine_t>{sp_b1.pn}, n, c2_sn, false), "b_g1");
-    msm_ok(msm_g2.invoke(results.b_g2, dev_ptr_t<affine_fp2_t>{sp_b2.pn}, n, c2_sn, false), "b_g2");
-    msm_ok(msm_g1.invoke(results.c, dev_ptr_t<affine_t>{sp_c.pn}, nc, c2_sn_c, false), "c");
+    msm_ok(msm_g1.invoke(results.a, dev_ptr_t<affine_t>{sp_a.pn}, n, split_sn, false), "a");
+    msm_ok(msm_g1.invoke(results.b_g1, dev_ptr_t<affine_t>{sp_b1.pn}, n, split_sn, false), "b_g1");
+    msm_ok(msm_g2.invoke(results.b_g2, dev_ptr_t<affine_fp2_t>{sp_b2.pn}, n, split_sn, false), "b_g2");
+    msm_ok(msm_g1.invoke(results.c, dev_ptr_t<affine_t>{sp_c.pn}, nc, split_sn_c, false), "c");
     results.a.add(fuzzed_results.a);
     results.b_g1.add(fuzzed_results.b_g1);
     results.b_g2.add(fuzzed_results.b_g2);
@@ -601,7 +602,7 @@ public:
 
     fuzzed_results = read_fuzzed_results_from_file(fuzzed_results_file);
 #ifndef __HIPCC__
-    c2_init();
+    split_init();
 #endif
   }
 
@@ -728,13 +729,13 @@ public:
 
       bool split_done = false;
 #ifndef __HIPCC__
-      if (c2_on)
-        split_done = c2_msms(results);
+      if (split_on)
+        split_done = split_msms(results);
 #endif
       if (th_h.joinable()) th_h.join();
 #ifndef __HIPCC__
-      if (c2_on && !split_done) {
-        c2_full_msms(results);
+      if (split_on && !split_done) {
+        permuted_full_msms(results);
       } else
 #endif
       if (!split_done) {

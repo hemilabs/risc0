@@ -10,11 +10,11 @@
 #include <fstream>
 #include <vector>
 
-template <int W> struct c2_blob_t { uint4 v[W]; };
+template <int W> struct split_blob_t { uint4 v[W]; };
 
 template <int BYTES>
-__global__ void c2_gather_pts(void* out_, const void* in_, const uint32_t* idx, size_t n) {
-  typedef c2_blob_t<BYTES / 16> B;
+__global__ void split_gather_pts(void* out_, const void* in_, const uint32_t* idx, size_t n) {
+  typedef split_blob_t<BYTES / 16> B;
   B* out = (B*)out_;
   const B* in = (const B*)in_;
   for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n;
@@ -23,7 +23,7 @@ __global__ void c2_gather_pts(void* out_, const void* in_, const uint32_t* idx, 
 }
 
 // out[i] = w[idx[i]] + f[idx[i]] (f may be null)
-__global__ void c2_gather_add(fr_t* out, const fr_t* w, const fr_t* f, const uint32_t* idx, size_t n) {
+__global__ void split_gather_add(fr_t* out, const fr_t* w, const fr_t* f, const uint32_t* idx, size_t n) {
   for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n;
        i += (size_t)gridDim.x * blockDim.x) {
     uint32_t j = idx[i];
@@ -38,7 +38,7 @@ __global__ void c2_gather_add(fr_t* out, const fr_t* w, const fr_t* f, const uin
 template <class bucket_t,
           class affine_h = typename bucket_t::affine_t::mem_t,
           class bucket_h = typename bucket_t::mem_t>
-__global__ void c2_bit_sum(bucket_h* out, int* bad, const affine_h* pts, const fr_t* w,
+__global__ void split_bit_sum(bucket_h* out, int* bad, const affine_h* pts, const fr_t* w,
                            const uint32_t* idx, size_t n) {
 #ifdef __CUDA_ARCH__
   typedef typename bucket_t::affine_t affine_t;
@@ -64,7 +64,7 @@ __global__ void c2_bit_sum(bucket_h* out, int* bad, const affine_h* pts, const f
 }
 
 template <class bucket_t, class bucket_h = typename bucket_t::mem_t>
-__global__ void c2_reduce_step(bucket_h* buf, size_t half, size_t cnt) {
+__global__ void split_reduce_step(bucket_h* buf, size_t half, size_t cnt) {
 #ifdef __CUDA_ARCH__
   size_t i = (blockIdx.x * (size_t)blockDim.x + threadIdx.x) / bucket_t::degree;
   if (i < cnt) {
@@ -80,7 +80,7 @@ __global__ void c2_reduce_step(bucket_h* buf, size_t half, size_t cnt) {
 
 // One MSM's split state: views into the in-place permuted points and -MSM(P_nb, f_nb).
 template <class bucket_t, class point_t, class affine_t>
-struct c2_split_t {
+struct msm_split_t {
   affine_t* pn = nullptr;           // non-bit points: pts[0, nn)
   affine_t* pb = nullptr;           // bit points: pts[nn, n)
   gpu_ptr_t<typename bucket_t::mem_t> acc;
@@ -93,7 +93,7 @@ struct c2_split_t {
   void init(const gpu_t& gpu, affine_t* pts, const uint32_t* d_perm, size_t n, size_t nn) {
     {
       affine_t* tmp = (affine_t*)gpu.Dmalloc(n * sizeof(affine_t));
-      c2_gather_pts<PTB><<<gpu.sm_count() * 4, 256, 0, gpu>>>(tmp, pts, d_perm, n);
+      split_gather_pts<PTB><<<gpu.sm_count() * 4, 256, 0, gpu>>>(tmp, pts, d_perm, n);
       CUDA_OK(cudaGetLastError());
       CUDA_OK(cudaMemcpyAsync(pts, tmp, n * sizeof(affine_t), cudaMemcpyDeviceToDevice, gpu));
       gpu.Dfree(tmp);
@@ -110,11 +110,11 @@ struct c2_split_t {
   // launches the bit sum + reduction on `gpu`; acc[0] holds the sum
   template <int DEG>
   void bit_sum(const gpu_t& gpu, int* d_bad, const fr_t* w, const uint32_t* d_bidx, size_t nb) {
-    c2_bit_sum<bucket_t><<<gpu.sm_count() * 2, 256, 0, gpu>>>(
+    split_bit_sum<bucket_t><<<gpu.sm_count() * 2, 256, 0, gpu>>>(
         &acc[0], d_bad, (const typename affine_t::mem_t*)pb, w, d_bidx, nb);
     for (size_t m = nthr; m > 1;) {
       size_t h = (m + 1) / 2;
-      c2_reduce_step<bucket_t><<<(h * DEG + 255) / 256, 256, 0, gpu>>>(&acc[0], h, m - h);
+      split_reduce_step<bucket_t><<<(h * DEG + 255) / 256, 256, 0, gpu>>>(&acc[0], h, m - h);
       m = h;
     }
     CUDA_OK(cudaGetLastError());

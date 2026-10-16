@@ -166,7 +166,7 @@ fn build_rocm_kernels() {
     risc0_build_kernel::emit_rocm_lib_link();
 }
 
-/// `-DRISC0_THP_PINNED_H="<risc0-sys>/kernels/zkp/cuda/thp_pinned.h"` (see c2_upload.cuh). That
+/// `-DRISC0_THP_PINNED_H="<risc0-sys>/kernels/zkp/cuda/thp_pinned.h"` (see pinned_upload.cuh). That
 /// directory can't go on the include path: its `cuda.h` would shadow the toolkit's.
 fn thp_pinned_define() -> String {
     let root = PathBuf::from(env::var("DEP_RISC0_SYS_CUDA_ROOT").unwrap());

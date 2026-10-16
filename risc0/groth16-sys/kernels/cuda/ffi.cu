@@ -33,9 +33,9 @@ typedef fr_t scalar_t;
 #define SPPARK_DONT_INSTANTIATE_TEMPLATES
 #endif
 #ifdef __HIPCC__
-#include "msm/pippenger.cuh" // msm_c2 is CUDA-only (inline PTX, <cuda.h>)
+#include "msm/pippenger.cuh" // msm_groth16 is CUDA-only (inline PTX, <cuda.h>)
 #else
-#include "msm_c2/pippenger.cuh"
+#include "msm_groth16/pippenger.cuh"
 #endif
 
 #ifdef __HIPCC__
@@ -75,7 +75,7 @@ using namespace sppark::bn254;
 
 #include "util.cuh"
 
-#include "c2_upload.cuh"
+#include "pinned_upload.cuh"
 #include "groth16_coeffs.cuh"
 #include "groth16_srs.cuh"
 #include "groth16_prover.cuh"
@@ -221,7 +221,7 @@ extern "C" const char* risc0_groth16_cuda_stager_init(size_t min_total_vram, int
     size_t free_b = 0, total_b = 0;
     if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess || total_b < min_total_vram)
       return nullptr;
-    (void)c2_stager::get();
+    (void)key_stager::get();
     *created = 1;
   } catch (const std::exception& err) {
     return strdup(err.what());
@@ -235,7 +235,7 @@ extern "C" const char* risc0_groth16_cuda_stager_init(size_t min_total_vram, int
 extern "C" void risc0_groth16_cuda_pinned_release() {
   {
     std::lock_guard<std::mutex> lock(cached_mutex);
-    c2_stager::destroy();
+    key_stager::destroy();
   }
   std::lock_guard<std::mutex> lock(g16_witness_buf_mu);
   g16_witness_buf.free_pinned();

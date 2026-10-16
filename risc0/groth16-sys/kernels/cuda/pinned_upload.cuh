@@ -41,7 +41,7 @@ static std::atomic<bool> g16_staged_upload{false};
 
 static bool g16_staged() { return g16_staged_upload.load(); }
 
-class c2_stager {
+class key_stager {
   static constexpr size_t CH = 16 << 20;
   static constexpr int NTHR = 4, NB = 2;
   ThpPinned pool;  // NTHR * NB chunk buffers (one THP-backed registration)
@@ -50,10 +50,10 @@ class c2_stager {
   cudaStream_t st[NTHR] = {};
 
   static std::mutex& inst_mu() { static std::mutex m; return m; }
-  static c2_stager*& inst() { static c2_stager* s = nullptr; return s; }
+  static key_stager*& inst() { static key_stager* s = nullptr; return s; }
 
 public:
-  c2_stager() {
+  key_stager() {
     try {
       pool.alloc(NTHR * NB * CH);
       for (int i = 0; i < NTHR * NB; i++) {
@@ -67,14 +67,14 @@ public:
       throw;
     }
   }
-  ~c2_stager() { release(); }
+  ~key_stager() { release(); }
   // The process-wide stager, created on first use (risc0_groth16_cuda_stager_init creates it at
   // the start of a Groth16 session, while the STARK is still host-bound). Lives until destroy();
   // never destroyed at exit (like the cached SRS), avoiding teardown ordering issues. Users hold
   // cached_mutex while they use the returned reference.
-  static c2_stager& get() {
+  static key_stager& get() {
     std::lock_guard<std::mutex> lk(inst_mu());
-    if (!inst()) inst() = new c2_stager();
+    if (!inst()) inst() = new key_stager();
     return *inst();
   }
   // Free the stager's pinned memory, streams and events (caller holds cached_mutex, so no upload is
