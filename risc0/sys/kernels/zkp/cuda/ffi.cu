@@ -25,7 +25,7 @@
 #include <exception>
 
 #ifndef __HIPCC__
-// eval_u v2 and mix v2 (kernels.cu; CUDA only: eval_u v2 assumes 32-lane warps)
+// eval_u v2 (kernels.cu; CUDA only: it assumes 32-lane warps)
 #define EU_J 16
 #define EU_THREADS 256
 __global__ void eu2_pows(FpExt* pw, FpExt* ps, const FpExt* xs, uint32_t S, uint32_t chunk);
@@ -33,12 +33,12 @@ __global__ void eu2_main(FpExt* partial, const Fp* __restrict__ coeffs, const ui
                          const FpExt* __restrict__ xs, const FpExt* __restrict__ pw,
                          const FpExt* __restrict__ ps, uint32_t deg, uint32_t chunk);
 __global__ void eu2_reduce(FpExt* out, const FpExt* partial, uint32_t S);
+#endif
 __global__ void mix_poly_coeffs_v2(FpExt* __restrict__ out, const Fp* __restrict__ in,
                                    const uint32_t* __restrict__ combos,
                                    const FpExt* __restrict__ mixStart,
                                    const FpExt* __restrict__ mix, const uint32_t inputSize,
                                    const uint32_t count);
-#endif
 __global__ void gather_samples(Fp* dst, const Fp* src, const uint32_t* idxs, const uint32_t n,
                                const uint32_t size, const uint32_t stride);
 __global__ void combos_sub(FpExt* combos, const FpExt* deltas, const uint32_t* offsets,
@@ -172,13 +172,11 @@ const char* risc0_zkp_cuda_mix_poly_coeffs(FpExt* out,
                                            const FpExt* mix,
                                            const uint32_t inputSize,
                                            const uint32_t count) {
-#ifndef __HIPCC__
   // v2 keeps the mix powers and combo ids in shared memory (20 bytes per input).
   if (inputSize <= 2048) {
     return launchKernel(mix_poly_coeffs_v2, count, inputSize * (sizeof(FpExt) + sizeof(uint32_t)),
                         out, in, combos, mixStart, mix, inputSize, count);
   }
-#endif
   return launchKernel(mix_poly_coeffs, count, inputSize * sizeof(FpExt),
                       out, in, combos, mixStart, mix, inputSize, count);
 }

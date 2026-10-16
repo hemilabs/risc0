@@ -310,8 +310,7 @@ __global__ void eu2_reduce(FpExt* out, const FpExt* partial, uint32_t S) {
 #endif // __HIPCC__
 
 
-#ifndef __HIPCC__
-// ---- mix_poly_coeffs v2 (CUDA only, like eval_u v2: untested on ROCm) ----
+// ---- mix_poly_coeffs v2 (CUDA and ROCm; no warp-size assumptions) ----
 // one RMW of `out` per run of equal combo ids (instead of one per input),
 // lazy pair REDC for the FpExt x Fp products, parallel mix-power table in shared memory.
 // Exact field arithmetic with canonical outputs => bit-identical to the original kernel.
@@ -377,9 +376,6 @@ __global__ void __launch_bounds__(256) mix_poly_coeffs_v2(FpExt* __restrict__ ou
     }
   }
 }
-
-
-#endif // __HIPCC__
 
 // ---- batched gather_sample (all FRI queries of one tree in one launch) ----
 __global__ void gather_samples(Fp* dst, const Fp* src, const uint32_t* idxs, const uint32_t n,
