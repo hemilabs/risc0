@@ -46,4 +46,16 @@ void risc0_recursion_launch_accum_inl(int verify, unsigned grid, unsigned block,
     parStepComputeAccumInl<<<grid, block, 0, stream>>>(ctx);
   }
 }
+
+// Warmup (off the GPU thread): loads both kernels and returns their largest per-thread local
+// memory size, so the caller can pre-grow the context's stack reservation.
+size_t risc0_recursion_accum_inl_warmup() {
+  size_t need = 0;
+  for (const void* f : {(const void*)parStepComputeAccumInl, (const void*)parStepVerifyAccumInl}) {
+    cudaFuncAttributes attr;
+    CUDA_OK(cudaFuncGetAttributes(&attr, f));
+    need = attr.localSizeBytes > need ? attr.localSizeBytes : need;
+  }
+  return need;
+}
 #endif
