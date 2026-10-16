@@ -21,6 +21,11 @@
 // can't go on the include path, its cuda.h would shadow the toolkit's).
 #include RISC0_THP_PINNED_H
 
+#ifdef __HIPCC__
+// Not aliased by sppark's cuda2hip.hpp.
+static const auto cudaEventSynchronize = hipEventSynchronize;
+#endif
+
 // The Groth16 cold-path optimizations (background key load, compact coefficients, bit-split
 // MSMs, tuned MSM batching): on unless RISC0_CUDA_G16_COLD=0 (also read by the Rust side).
 static bool g16_cold_enabled() {
