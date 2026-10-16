@@ -121,33 +121,39 @@ fn get_cached_graph(graph_path: &Path) -> &'static CachedGraph {
         let (nodes, signals, input_mapping) =
             deserialize_witnesscalc_graph_from_bytes(&graph_bytes)
                 .expect("failed to deserialize circom graph");
-        if let Some(vn) = nodes.as_any().downcast_ref::<Nodes<U254, VecNodes>>() {
-            let _ = BIT_SIGNALS.set(bit_signals(vn, &signals));
-        } else {
-            let _ = BIT_SIGNALS.set(Vec::new());
-        }
-        let fast = nodes
-            .as_any()
-            .downcast_ref::<Nodes<U254, VecNodes>>()
-            .and_then(|nodes| super::witness_fast::compile(nodes, &signals));
+        // The bit set and the two evaluator compiles only read the graph: run them side by side
+        // (witness_par::compile alone is ~0.7 s, and the graph is on the Groth16 critical path
+        // when it is not ready by the end of the STARK).
+        let vn = nodes.as_any().downcast_ref::<Nodes<U254, VecNodes>>();
+        let (bits, fast, par) = std::thread::scope(|s| {
+            let par = s.spawn(|| {
+                if !cold_path_enabled() {
+                    return None;
+                }
+                let t = std::time::Instant::now();
+                let par = vn.and_then(|nodes| super::witness_par::compile(nodes, &signals));
+                tracing::debug!(
+                    "groth16: witness_par compile {:.1}ms ok={}",
+                    t.elapsed().as_secs_f64() * 1e3,
+                    par.is_some()
+                );
+                par
+            });
+            let bits = s.spawn(|| {
+                vn.map(|nodes| bit_signals(nodes, &signals))
+                    .unwrap_or_default()
+            });
+            let fast = vn.and_then(|nodes| super::witness_fast::compile(nodes, &signals));
+            (
+                bits.join().expect("groth16 bit-set derivation panicked"),
+                fast,
+                par.join().expect("groth16 witness_par compile panicked"),
+            )
+        });
+        let _ = BIT_SIGNALS.set(bits);
         if fast.is_none() {
             tracing::warn!("groth16: the fast witness evaluator does not support this graph");
         }
-        let par = if cold_path_enabled() {
-            let t = std::time::Instant::now();
-            let par = nodes
-                .as_any()
-                .downcast_ref::<Nodes<U254, VecNodes>>()
-                .and_then(|nodes| super::witness_par::compile(nodes, &signals));
-            tracing::debug!(
-                "groth16: witness_par compile {:.1}ms ok={}",
-                t.elapsed().as_secs_f64() * 1e3,
-                par.is_some()
-            );
-            par
-        } else {
-            None
-        };
         CachedGraph {
             nodes,
             signals,
@@ -188,7 +194,7 @@ pub(crate) fn cold_path_enabled() -> bool {
     *ON
 }
 
-/// The Groth16 tail (C2-R3): the key loader's pinned buffers allocated at session start
+/// The Groth16 tail: the key loader's pinned buffers allocated at session start
 /// (`pin_early`), the witness computed beside `shrink_wrap_with`'s `pre_gpu`, and, in the CUDA
 /// library, the deferred-collect / 4-window sort / split-integrate MSMs. The zkvm prover also
 /// verifies the succinct receipt beside the Groth16 wrap. On by default; `RISC0_CUDA_G16_TAIL=0`
