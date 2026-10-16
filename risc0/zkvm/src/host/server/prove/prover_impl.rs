@@ -828,6 +828,39 @@ impl ProverImpl {
         // Complete the last segment's deferred finalize.
         let last_seal = with_segment_prover(|sp| sp.prove_end())?;
 
+        // Build the last segment's receipt and verify it on its own thread while the
+        // second-to-last one (started after the previous prove_begin) finishes verifying: the two
+        // CPU verifications overlap instead of running back to back at the end of the session
+        // (12 ms at po2=20, 24 ms at po2=21).
+        let last_receipt = {
+            let (last_po2, last_seg_idx, last_output, last_hashfn) = prev_seal_meta
+                .take()
+                .ok_or_else(|| anyhow!("segment pipeline: seal without metadata"))?;
+            let mut claim = ReceiptClaim::decode_from_seal_v2(&last_seal, Some(last_po2))?;
+            claim.output = last_output.into();
+            SegmentReceipt {
+                seal: last_seal,
+                index: last_seg_idx,
+                hashfn: last_hashfn,
+                claim,
+                verifier_parameters: seg_verifier_params_digest,
+            }
+        };
+        let last_verify = {
+            let params = verify_params.clone();
+            std::thread::spawn(move || -> Result<SegmentReceipt> {
+                if !skip_verify {
+                    last_receipt
+                        .verify_integrity_with_context(&VerifierContext {
+                            segment_verifier_parameters: params,
+                            ..VerifierContext::empty()
+                        })
+                        .with_context(|| format!("verify segment (last) {}", last_receipt.index))?;
+                }
+                Ok(last_receipt)
+            })
+        };
+
         // Collect the second-to-last receipt (if any).
         if let Some(handle) = pending_receipt.take() {
             let receipt = handle
@@ -840,30 +873,12 @@ impl ProverImpl {
             segments.push(receipt);
         }
 
-        // Process the last segment's seal.
-        {
-            let (last_po2, last_seg_idx, last_output, last_hashfn) = prev_seal_meta
-                .take()
-                .ok_or_else(|| anyhow!("segment pipeline: seal without metadata"))?;
-            let mut claim = ReceiptClaim::decode_from_seal_v2(&last_seal, Some(last_po2))?;
-            claim.output = last_output.into();
-            let receipt = SegmentReceipt {
-                seal: last_seal,
-                index: last_seg_idx,
-                hashfn: last_hashfn,
-                claim,
-                verifier_parameters: seg_verifier_params_digest,
-            };
-            if !skip_verify {
-                receipt
-                    .verify_integrity_with_context(&VerifierContext {
-                        segment_verifier_parameters: verify_params.clone(),
-                        ..VerifierContext::empty()
-                    })
-                    .with_context(|| format!("verify segment (last) {}", receipt.index))?;
-            }
-            segments.push(receipt);
-        }
+        // The last segment's receipt.
+        segments.push(
+            last_verify
+                .join()
+                .map_err(|_| anyhow!("receipt thread panicked"))??,
+        );
 
         let (assumptions, session_assumption_receipts): (Vec<_>, Vec<_>) =
             session.assumptions.iter().cloned().unzip();
