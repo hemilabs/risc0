@@ -1873,6 +1873,11 @@ mod tests {
     }
 
     #[test]
+    fn batch_expand_into_evaluate_ntt_large() {
+        testutil::batch_expand_into_evaluate_ntt_large(CudaHalSha256::new());
+    }
+
+    #[test]
     fn batch_interpolate_ntt() {
         testutil::batch_interpolate_ntt(CudaHalSha256::new());
     }

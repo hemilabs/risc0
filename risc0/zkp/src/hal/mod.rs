@@ -548,6 +548,20 @@ mod testutil {
         hal.batch_expand_into_evaluate_ntt(&output, &input, count, expand_bits);
     }
 
+    pub(crate) fn batch_expand_into_evaluate_ntt_large<H: Hal>(hal_gpu: H) {
+        let mut rng = rand::rng();
+        let hal_cpu = CpuHal::new(hal_gpu.get_hash_suite().clone());
+        let hal = DualHal::new(Rc::new(hal_cpu), Rc::new(hal_gpu));
+        for (po2, count) in [(20, 3), (21, 2)] {
+            let steps = 1 << po2;
+            let input = generate_elem(&hal, &mut rng, count * steps);
+            let output = hal.alloc_elem("output", count * steps * INV_RATE);
+            hal.batch_expand_into_evaluate_ntt(&output, &input, count, 2);
+            // a second call checks that the input was left unchanged
+            hal.batch_expand_into_evaluate_ntt(&output, &input, count, 2);
+        }
+    }
+
     pub(crate) fn batch_interpolate_ntt<H: Hal>(hal_gpu: H) {
         let mut rng = rand::rng();
         let hal_cpu = CpuHal::new(hal_gpu.get_hash_suite().clone());
@@ -783,6 +797,9 @@ mod testutil {
             (16, 211),
             (18, 5),
             (21, 2),
+            (20, 9),
+            (21, 3),
+            (22, 1),
         ] {
             assert!(hal_gpu.has_commit_coeffs_lde(po2));
             let size = (1 << po2) * count;
