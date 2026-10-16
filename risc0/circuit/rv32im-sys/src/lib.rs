@@ -136,6 +136,10 @@ extern "C" {
     ) -> *const std::os::raw::c_char;
 
     pub fn risc0_circuit_rv32im_cuda_warmup() -> *const std::os::raw::c_char;
+
+    /// 1 when `risc0_circuit_rv32im_cuda_accum` also zeroizes (INVALID -> 0) the
+    /// accum buffer (RISC0_ACCUM_FZ, default on), so the caller skips its own zeroize.
+    pub fn risc0_circuit_rv32im_cuda_accum_zeroizes() -> std::os::raw::c_int;
     pub fn risc0_circuit_rv32im_cuda_warmup_eval_check() -> *const std::os::raw::c_char;
 
     /// Make the persistent stream wait for the eval_check stream to complete.

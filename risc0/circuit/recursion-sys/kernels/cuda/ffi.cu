@@ -173,6 +173,15 @@ __global__ void fwdStepVerifyWom(ExecContext* ctx) {
   }
 }
 
+#ifndef __HIPCC__
+void risc0_recursion_launch_accum_inl(int verify, unsigned grid, unsigned block, cudaStream_t stream,
+                                      AccumContext* ctx);
+static bool accumInl() {
+  static const bool on = !getenv("RISC0_REC_ACCUM_INL") || atoi(getenv("RISC0_REC_ACCUM_INL")) != 0;
+  return on;
+}
+#endif
+
 __global__ void parStepComputeAccum(AccumContext* ctx) {
   uint32_t cycle = blockDim.x * blockIdx.x + threadIdx.x;
   if (cycle < ctx->workCycles) {
@@ -502,6 +511,11 @@ struct HostAccumContext {
 
   void computeAccum() {
     nvtx3::scoped_range range("computeAccum");
+#ifndef __HIPCC__
+    if (accumInl()) {
+      risc0_recursion_launch_accum_inl(0, cfg.grid.x, cfg.block.x, stream, ctx);
+    } else
+#endif
     parStepComputeAccum<<<cfg.grid, cfg.block, 0, stream>>>(ctx);
     CUDA_OK(cudaStreamSynchronize(stream));
   }
@@ -515,6 +529,11 @@ struct HostAccumContext {
   void verifyAccum() {
     nvtx3::scoped_range range("verifyAccum");
     CUDA_OK(cudaDeviceSynchronize());
+#ifndef __HIPCC__
+    if (accumInl()) {
+      risc0_recursion_launch_accum_inl(1, cfg.grid.x, cfg.block.x, stream, ctx);
+    } else
+#endif
     parStepVerifyAccum<<<cfg.grid, cfg.block, 0, stream>>>(ctx);
     CUDA_OK(cudaStreamSynchronize(stream));
   }

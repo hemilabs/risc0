@@ -57,6 +57,10 @@ namespace cuda { namespace std { using ::std::array; } }
 #include <cub/device/device_scan.cuh>
 #endif
 
+#ifndef __HIPCC__
+void risc0_rv32im_launch_stepAccumTU(unsigned, unsigned, cudaStream_t, void*, uint32_t, const uint32_t*);
+void risc0_rv32im_launch_par_stepExecTU(unsigned, unsigned, cudaStream_t, void*, uint32_t, uint32_t);
+#endif
 static bool g_verbose = (std::getenv("RISC0_VERBOSE") != nullptr);
 
 namespace risc0::circuit::rv32im_v2::cuda {
@@ -662,14 +666,57 @@ __global__ void stepAccum(DeviceAccumContext* ctx, uint32_t count, const uint32_
   step_TopAccum(execCtx, &accum, &data, &global, &mix);
 }
 
-// keys[i] = cycles[i].major, vals[i] = i: the input of stepAccum's cycle sort.
-__global__ void majorKeys(const PreflightCycle* cycles, uint8_t* keys, uint32_t* vals, uint32_t n) {
+// keys[i] = (i >> winBits) << 8 | cycles[i].major, vals[i] = i: the input of stepAccum's cycle
+// sort. Grouping by major only within 2^winBits-row windows keeps the rows each window's warps
+// touch (~14 MB of data/accum columns at 2^14) L2-resident across the per-major passes; a
+// global sort by major re-fetched each data sector from DRAM once per major (1.8 GB/segment).
+__global__ void majorKeys(const PreflightCycle* cycles, uint32_t* keys, uint32_t* vals, uint32_t n,
+                          uint32_t winBits) {
   uint32_t i = blockDim.x * blockIdx.x + threadIdx.x;
   if (i < n) {
-    keys[i] = cycles[i].major;
+    keys[i] = (winBits < 32 ? ((i >> winBits) << 8) : 0u) | cycles[i].major;
     vals[i] = i;
   }
 }
+
+#ifndef __HIPCC__
+// finalizeAccum fused with eltwise_zeroize_fp(accum) (INVALID -> 0), one pass over all rows.
+// Same result as finalizeAccum followed by the zeroize: machine cells are finalized then
+// zeroized, every other cell is only zeroized. prev[] (last 4 columns, row back1) is read raw
+// while row back1's thread may zeroize it concurrently; those cells are inclusive-scan outputs
+// and never INVALID, so the zeroize cannot change them.
+__global__ void finalizeZeroizeAccum(DeviceAccumContext* ctx, uint32_t lastCycle) {
+  uint32_t cycle = blockDim.x * blockIdx.x + threadIdx.x;
+  if (!ctx) return;
+  Buffer& accum = *ctx->accum;
+  const size_t rows = accum.rows, cols = accum.cols;
+  if (cycle >= rows) return;
+  Fp* buf = accum.buf;
+  auto z = [&](size_t i) { if (buf[i].asRaw() == Fp::INVALID) buf[i] = Fp(); };
+  if (cycle < lastCycle) {
+    size_t machineColumns = (cols - kUserAccumSplit) / 4;
+    size_t back1 = (cycle + lastCycle - 1) % lastCycle;
+    Fp prev[4];
+    for (int k = 0; k < 4; k++) prev[k] = buf[(cols - 4 + k) * rows + back1];
+    for (size_t j = 0; j < machineColumns - 1; j++) {
+#pragma unroll
+      for (int k = 0; k < 4; k++) {
+        size_t i = (kUserAccumSplit + j * 4 + k) * rows + cycle;
+        Fp v = buf[i] + prev[k];
+        buf[i] = v.asRaw() == Fp::INVALID ? Fp() : v;
+      }
+    }
+    for (size_t c = 0; c < kUserAccumSplit; c++) z(c * rows + cycle);
+    for (size_t c = kUserAccumSplit + (machineColumns - 1) * 4; c < cols; c++) z(c * rows + cycle);
+  } else {
+    for (size_t c = 0; c < cols; c++) z(c * rows + cycle);
+  }
+}
+static bool accumFz() {
+  static const bool on = !getenv("RISC0_ACCUM_FZ") || atoi(getenv("RISC0_ACCUM_FZ")) != 0;
+  return on;
+}
+#endif
 
 __global__ void finalizeAccum(DeviceAccumContext* ctx, uint32_t lastCycle) {
   uint32_t cycle = blockDim.x * blockIdx.x + threadIdx.x;
@@ -825,8 +872,22 @@ const char* risc0_circuit_rv32im_cuda_witgen_v2(uint32_t mode,
         nvtx3::scoped_range range("par_stepExec");
         auto cfg1 = getSimpleConfig(split);
         auto cfg2 = getSimpleConfig(phase2Count);
-        par_stepExec<<<cfg1.grid, cfg1.block, 0, stream>>>(d_ctx, 0, split);
-        par_stepExec<<<cfg2.grid, cfg2.block, 0, stream>>>(d_ctx, split, phase2Count);
+#ifndef __HIPCC__
+        // witgen_tu.cu: step_Top's call graph as static (noinline) functions in a standalone TU,
+        // power-of-two rows only. Kept noinline on purpose: the fully inlined build reorders the
+        // back-row loads of rows written by neighbouring threads (latent race) and is not bit-exact.
+        static const bool s_witgen_tu = !getenv("RISC0_WITGEN_TU") || atoi(getenv("RISC0_WITGEN_TU")) != 0;
+        auto pow2 = [](size_t r) { return r && (r & (r - 1)) == 0; };
+        if (s_witgen_tu && pow2(buffers->data.rows) &&
+            pow2(buffers->pre_data.rows ? buffers->pre_data.rows : buffers->data.rows)) {
+          risc0_rv32im_launch_par_stepExecTU(cfg1.grid.x, cfg1.block.x, stream, d_ctx, 0, split);
+          risc0_rv32im_launch_par_stepExecTU(cfg2.grid.x, cfg2.block.x, stream, d_ctx, split, phase2Count);
+        } else
+#endif
+        {
+          par_stepExec<<<cfg1.grid, cfg1.block, 0, stream>>>(d_ctx, 0, split);
+          par_stepExec<<<cfg2.grid, cfg2.block, 0, stream>>>(d_ctx, split, phase2Count);
+        }
       }
     } break;
     case kStepModeSeqForward:
@@ -875,9 +936,12 @@ const char* risc0_circuit_rv32im_cuda_accum(AccumBuffers* buffers,
       // per device; callers hold the process-wide GPU lock (risc0_zkp::hal::cuda::exclusive).
       uint32_t* perm = nullptr;
 #ifndef __HIPCC__
-      static uint8_t* s_keys[16] = {};
+      static uint32_t* s_keys[16] = {};
       static uint32_t* s_perm[16] = {};
-      static uint8_t* s_keys2[16] = {};
+      static uint32_t* s_keys2[16] = {};
+      // RISC0_ACCUM_SORT_WIN=0 restores the global (8-bit) sort by major.
+      static const uint32_t s_win =
+          getenv("RISC0_ACCUM_SORT_WIN") ? atoi(getenv("RISC0_ACCUM_SORT_WIN")) : 14;
       static uint32_t* s_perm2[16] = {};
       static size_t s_cap[16] = {};
       {
@@ -887,22 +951,35 @@ const char* risc0_circuit_rv32im_cuda_accum(AccumBuffers* buffers,
           if (s_perm[dev]) CUDA_OK(cudaFree(s_perm[dev]));
           if (s_keys2[dev]) CUDA_OK(cudaFree(s_keys2[dev]));
           if (s_perm2[dev]) CUDA_OK(cudaFree(s_perm2[dev]));
-          CUDA_OK(cudaMalloc(&s_keys[dev], lastCycle));
+          CUDA_OK(cudaMalloc(&s_keys[dev], lastCycle * sizeof(uint32_t)));
           CUDA_OK(cudaMalloc(&s_perm[dev], lastCycle * sizeof(uint32_t)));
-          CUDA_OK(cudaMalloc(&s_keys2[dev], lastCycle));
+          CUDA_OK(cudaMalloc(&s_keys2[dev], lastCycle * sizeof(uint32_t)));
           CUDA_OK(cudaMalloc(&s_perm2[dev], lastCycle * sizeof(uint32_t)));
           s_cap[dev] = lastCycle;
         }
-        majorKeys<<<cfg.grid, cfg.block, 0, stream>>>(get_cache().a_cycles, s_keys[dev], s_perm[dev], lastCycle);
-        // Stable LSD radix sort on the 8-bit keys: the same permutation as
-        // thrust::stable_sort_by_key.
-        cub::DoubleBuffer<uint8_t> dk(s_keys[dev], s_keys2[dev]);
+        const uint32_t win = s_win ? s_win : 32;
+        majorKeys<<<cfg.grid, cfg.block, 0, stream>>>(get_cache().a_cycles, s_keys[dev], s_perm[dev], lastCycle, win);
+        // Stable LSD radix sort on the (window, major) keys, only over the key bits in use:
+        // the same permutation as thrust::stable_sort_by_key on the full keys.
+        uint32_t maxWin = (win < 32 && lastCycle) ? ((lastCycle - 1) >> win) : 0;
+        int endBit = 8;
+        while (maxWin) { endBit++; maxWin >>= 1; }
+        cub::DoubleBuffer<uint32_t> dk(s_keys[dev], s_keys2[dev]);
         cub::DoubleBuffer<uint32_t> dv(s_perm[dev], s_perm2[dev]);
         size_t tb = 0;
-        CUDA_OK(cub::DeviceRadixSort::SortPairs(nullptr, tb, dk, dv, (int)lastCycle, 0, 8, stream));
-        CUDA_OK(cub::DeviceRadixSort::SortPairs(cubTemp(tb), tb, dk, dv, (int)lastCycle, 0, 8, stream));
+        CUDA_OK(cub::DeviceRadixSort::SortPairs(nullptr, tb, dk, dv, (int)lastCycle, 0, endBit, stream));
+        CUDA_OK(cub::DeviceRadixSort::SortPairs(cubTemp(tb), tb, dk, dv, (int)lastCycle, 0, endBit, stream));
         perm = dv.Current();
       }
+#endif
+#ifndef __HIPCC__
+      // accum_tu.cu: the stepAccum call graph force-inlined in a whole-program TU (no ABI
+      // calls or stack-resident buffer objects); needs power-of-two rows (RISC0_ROWS_POW2).
+      static const bool s_accum_tu = !getenv("RISC0_ACCUM_TU") || atoi(getenv("RISC0_ACCUM_TU")) != 0;
+      auto pow2 = [](size_t r) { return r && (r & (r - 1)) == 0; };
+      if (s_accum_tu && pow2(buffers->data.rows) && pow2(buffers->accum.rows)) {
+        risc0_rv32im_launch_stepAccumTU(cfg.grid.x, cfg.block.x, stream, d_ctx, lastCycle, perm);
+      } else
 #endif
       stepAccum<<<cfg.grid, cfg.block, 0, stream>>>(d_ctx, lastCycle, perm);
 
@@ -944,6 +1021,12 @@ const char* risc0_circuit_rv32im_cuda_accum(AccumBuffers* buffers,
       }
 #endif
 
+#ifndef __HIPCC__
+      if (accumFz()) {
+        auto cfgz = getSimpleConfig(rows);
+        finalizeZeroizeAccum<<<cfgz.grid, cfgz.block, 0, stream>>>(d_ctx, lastCycle);
+      } else
+#endif
       finalizeAccum<<<cfg.grid, cfg.block, 0, stream>>>(d_ctx, lastCycle);
       // Last reader of this segment's device preflight: a prefetch into its slot waits for this.
       if (DevSlot* sl = get_cache().a_slot) {
@@ -964,6 +1047,16 @@ const char* risc0_circuit_rv32im_cuda_accum(AccumBuffers* buffers,
   return nullptr;
 }
 
+// 1 when risc0_circuit_rv32im_cuda_accum also zeroizes accum (finalizeZeroizeAccum), so the
+// caller skips its separate eltwise_zeroize of the accum buffer.
+int risc0_circuit_rv32im_cuda_accum_zeroizes() {
+#ifndef __HIPCC__
+  return accumFz() ? 1 : 0;
+#else
+  return 0;
+#endif
+}
+
 const char* risc0_circuit_rv32im_cuda_warmup() {
   try {
     cudaStream_t stream = getPersistentStream();
@@ -973,6 +1066,11 @@ const char* risc0_circuit_rv32im_cuda_warmup() {
     par_stepExec<<<1, 1, 0, stream>>>(nullptr, 0, 0);
     stepAccum<<<1, 1, 0, stream>>>(nullptr, 0);
     finalizeAccum<<<1, 1, 0, stream>>>(nullptr, 0);
+#ifndef __HIPCC__
+    risc0_rv32im_launch_stepAccumTU(1, 1, stream, nullptr, 0, nullptr);
+    risc0_rv32im_launch_par_stepExecTU(1, 1, stream, nullptr, 0, 0);
+    finalizeZeroizeAccum<<<1, 1, 0, stream>>>(nullptr, 0);
+#endif
     CUDA_OK(cudaStreamSynchronize(stream));
   } catch (const std::exception& err) {
     return strdup(err.what());

@@ -185,6 +185,10 @@ impl<CH: CudaHash> CircuitAccumulator<CudaHal<CH>> for CudaCircuitHal<CH> {
         };
         ffi_wrap(|| unsafe { risc0_circuit_rv32im_cuda_accum(&buffers, &preflight, cycles as u32) })
     }
+
+    fn step_accum_zeroizes(&self) -> bool {
+        unsafe { risc0_circuit_rv32im_sys::risc0_circuit_rv32im_cuda_accum_zeroizes() != 0 }
+    }
 }
 
 impl<CH: CudaHash> CircuitHal<CudaHal<CH>> for CudaCircuitHal<CH> {

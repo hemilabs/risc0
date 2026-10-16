@@ -305,6 +305,7 @@ fn build_cuda_kernels() {
 
     KernelBuild::new(KernelType::Cuda)
         .file("kernels/cuda/eval_check.cu")
+        .file("kernels/cuda/accum_inl.cu")
         .file("kernels/cuda/ffi_supra.cu")
         .file("kernels/cuda/sppark.cu")
         .deps(["kernels/cuda"])

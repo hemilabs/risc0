@@ -130,6 +130,11 @@ pub(crate) trait CircuitAccumulator<H: Hal> {
         global: &MetaBuffer<H>,
         mix: &MetaBuffer<H>,
     ) -> Result<()>;
+
+    /// Whether `step_accum` already leaves the accum buffer zeroized (INVALID -> 0).
+    fn step_accum_zeroizes(&self) -> bool {
+        false
+    }
 }
 
 pub(crate) struct SegmentProverImpl<H, C, F>

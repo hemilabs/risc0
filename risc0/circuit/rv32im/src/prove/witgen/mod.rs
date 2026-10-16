@@ -464,9 +464,11 @@ where
             );
         }
 
-        scope!("zeroize(accum)", {
-            hal.eltwise_zeroize_elem(&accum_buf.buf);
-        });
+        if !circuit_hal.step_accum_zeroizes() {
+            scope!("zeroize(accum)", {
+                hal.eltwise_zeroize_elem(&accum_buf.buf);
+            });
+        }
         if *VERBOSE {
             eprintln!(
                 "    [accum] zeroize: {:.1}ms",
