@@ -876,6 +876,8 @@ impl ProverImpl {
             let output = results.output;
             let hashfn = self.opts.hashfn.clone();
 
+            release_pool_on_po2_growth(po2);
+
             // GPU prove_begin: main phase (overlapping with prev eval_check) +
             // complete prev deferred finalize + launch eval_check for this segment.
             // Returns the PREVIOUS segment's seal (None on first call).
@@ -1474,6 +1476,7 @@ impl ProverServer for ProverImpl {
         );
 
         let po2 = preflight_results.inner.po2();
+        release_pool_on_po2_growth(po2);
         let t_psc = std::time::Instant::now();
         let seal = with_segment_prover(|sp| sp.prove_core(preflight_results.inner))?;
         if *VERBOSE {
@@ -1936,6 +1939,26 @@ fn check_claims(
         );
     }
     Ok(())
+}
+
+/// The HAL's buffer pool keeps up to (total VRAM - 8 GB) of freed buffers, sized for the po2 it
+/// last proved. When a larger po2 follows in the same process, those cached buffers do not fit
+/// the new sizes and, with the new working set, exhausted the device for allocations made
+/// outside the pool (nttq's T2, eval_check's scratch): composite 20,21 in one process failed
+/// with "out of memory". Release the pool once per po2 increase (the calling thread's pool:
+/// segment proving runs on this thread).
+fn release_pool_on_po2_growth(po2: u32) {
+    #[cfg(feature = "cuda")]
+    {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static MAX_PO2: AtomicU32 = AtomicU32::new(0);
+        let prev = MAX_PO2.fetch_max(po2, Ordering::SeqCst);
+        if prev != 0 && po2 > prev {
+            super::release_hal_buffers();
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    let _ = po2;
 }
 
 /// C2 prototype: lift (and left-fold join) segment receipts on the main thread between segment
