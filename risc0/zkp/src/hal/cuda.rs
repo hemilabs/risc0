@@ -316,17 +316,13 @@ impl CudaHash for CudaHashSha256 {
     }
 }
 
-/// Wait, on the host, for everything queued on the risc0 persistent stream.
-///
-/// sppark's kernels (the hashes, NTTs, zk_shift) run on sppark's own non-blocking stream, which is
-/// not ordered after the persistent stream. Anything they read that a risc0 kernel wrote has to be
-/// complete first, or they read it half-written.
 /// `DeviceBuffer::copy_from` from pageable memory (cuMemcpyHtoD) returns once the data is in the
 /// driver's staging buffer; the DMA to the device may still be in flight on the legacy stream.
 /// Kernels on the persistent stream (a blocking stream) are ordered after it, but sppark's
 /// kernels run on non-blocking streams and could read the buffer before the copy lands
 /// (hash_fold_tree read stale leaves about 1 run in 10 at 2^14 leaves). Wait for the legacy
-/// stream, which holds only that copy.
+/// stream, which holds only that copy. `set_32` (cuMemsetD32) is asynchronous on the legacy
+/// stream as well and gets the same wait.
 fn wait_pageable_upload() {
     let res = unsafe { cust::sys::cuStreamSynchronize(std::ptr::null_mut()) };
     assert_eq!(
@@ -336,6 +332,11 @@ fn wait_pageable_upload() {
     );
 }
 
+/// Wait, on the host, for everything queued on the risc0 persistent stream.
+///
+/// sppark's kernels (the hashes, NTTs, zk_shift) run on sppark's own non-blocking stream, which is
+/// not ordered after the persistent stream. Anything they read that a risc0 kernel wrote has to be
+/// complete first, or they read it half-written.
 fn sync_persistent_stream() {
     extern "C" {
         fn risc0_zkp_cuda_sync_stream() -> *const std::os::raw::c_char;
@@ -810,6 +811,7 @@ impl RawBuffer {
 
     pub fn set_u32(&mut self, value: u32) {
         self.buf.set_32(value).unwrap();
+        wait_pageable_upload();
     }
 }
 
