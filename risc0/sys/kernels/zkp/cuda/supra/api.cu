@@ -437,6 +437,64 @@ supra_poly_divide_multi(fr4_t* combos_base, size_t stride,
       return RustError{cudaSuccess};
     }
 #endif
+#ifdef SPPARK_NO_COOPERATIVE_LAUNCH
+    // Without cooperative launch each division runs as one block (see div_by_x_minus_z), so run
+    // the combos' independent chains concurrently, one stream each, after the work queued on
+    // gpu's stream. Each remainder is copied on the device as its division finishes, and all of
+    // them to the host once at the end: a pageable device-to-host copy per division would block
+    // the host between launches.
+    (void)sm_count;
+    constexpr uint32_t kStreams = 8;
+    int dev = 0;
+    CUDA_OK(cudaGetDevice(&dev));
+    static cudaStream_t side[16][kStreams] = {};
+    static cudaEvent_t done[16][kStreams] = {};
+    static cudaEvent_t ready[16] = {};
+    static fr4_t* d_rem[16] = {};
+    static size_t d_rem_cap[16] = {};
+    if (!ready[dev]) {
+      CUDA_OK(cudaEventCreateWithFlags(&ready[dev], cudaEventDisableTiming));
+      for (uint32_t k = 0; k < kStreams; k++) {
+        CUDA_OK(cudaStreamCreateWithFlags(&side[dev][k], cudaStreamNonBlocking));
+        CUDA_OK(cudaEventCreateWithFlags(&done[dev][k], cudaEventDisableTiming));
+      }
+    }
+    size_t total_pows = 0;
+    for (uint32_t c = 0; c < num_combos; c++)
+      total_pows += pows_per_combo[c];
+    if (total_pows > d_rem_cap[dev]) {
+      if (d_rem[dev])
+        CUDA_OK(cudaFree(d_rem[dev]));
+      CUDA_OK(cudaMalloc(&d_rem[dev], total_pows * sizeof(fr4_t)));
+      d_rem_cap[dev] = total_pows;
+    }
+    struct one_stream {
+      cudaStream_t s;
+      int sm_count() const { return 1; }
+      operator cudaStream_t() const { return s; }
+    };
+    CUDA_OK(cudaEventRecord(ready[dev], gpu));
+    uint32_t used = num_combos < kStreams ? num_combos : kStreams;
+    for (uint32_t k = 0; k < used; k++)
+      CUDA_OK(cudaStreamWaitEvent(side[dev][k], ready[dev], 0));
+    size_t pows_offset = 0;
+    for (uint32_t c = 0; c < num_combos; c++) {
+      one_stream s{side[dev][c % kStreams]};
+      fr4_t* slice = combos_base + combo_indices[c] * stride;
+      for (uint32_t d = 0; d < pows_per_combo[c]; d++) {
+        div_by_x_minus_z<true>(slice, stride, all_pows[pows_offset + d], s, 1);
+        CUDA_OK(cudaMemcpyAsync(&d_rem[dev][pows_offset + d], &slice[stride - 1], sizeof(fr4_t),
+                                cudaMemcpyDeviceToDevice, s.s));
+      }
+      pows_offset += pows_per_combo[c];
+    }
+    for (uint32_t k = 0; k < used; k++) {
+      CUDA_OK(cudaEventRecord(done[dev][k], side[dev][k]));
+      CUDA_OK(cudaStreamWaitEvent(gpu, done[dev][k], 0));
+    }
+    gpu.DtoH(remainders, d_rem[dev], total_pows);
+    gpu.sync();
+#else
     size_t pows_offset = 0;
     for (uint32_t c = 0; c < num_combos; c++) {
       fr4_t* slice = combos_base + combo_indices[c] * stride;
@@ -447,6 +505,7 @@ supra_poly_divide_multi(fr4_t* combos_base, size_t stride,
       pows_offset += pows_per_combo[c];
     }
     gpu.sync();
+#endif
   } catch (const cuda_error& e) {
     gpu.sync();
     return RustError{e.code(), e.what()};
