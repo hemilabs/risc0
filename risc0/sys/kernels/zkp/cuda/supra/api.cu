@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <ff/alt_bn128.hpp>
 #include <ff/baby_bear.hpp>
 #include <util/gpu_t.cuh>
@@ -10,6 +11,7 @@
 #ifndef __HIPCC__
 // CUDA uses the lazy-reduction Poseidon2 kernels (pv.cuh); ROCm keeps poseidon2.cuh's.
 #include "pv.cuh"
+#include "mdiv.cuh"
 #define PV_BLOCK 128
 #endif
 #if defined(__HIPCC__) && !defined(__HIP_DEVICE_COMPILE__)
@@ -379,6 +381,13 @@ supra_poly_divide_multi(fr4_t* combos_base, size_t stride,
   const fr4_t* all_pows = reinterpret_cast<const fr4_t*>(all_pows_raw);
 
   try {
+#ifndef __HIPCC__
+    // Fused multi-root division (bit-identical to the loop below; one sync).
+    if (mdiv_supported(stride, num_combos, pows_per_combo) && !std::getenv("RISC0_MDIV_OFF")) {
+      mdiv_run(combos_base, stride, combo_indices, pows_per_combo, all_pows, num_combos, remainders, gpu);
+      return RustError{cudaSuccess};
+    }
+#endif
     size_t pows_offset = 0;
     for (uint32_t c = 0; c < num_combos; c++) {
       fr4_t* slice = combos_base + combo_indices[c] * stride;
