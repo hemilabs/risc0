@@ -39,6 +39,10 @@ impl<T> DevicePointer<T> {
 pub use sppark::Error as SpparkError;
 
 extern "C" {
+    /// Registers the function that raw device allocations in the kernel libraries call when
+    /// cudaMalloc runs out of memory, before retrying once (see `device_alloc.h`).
+    pub fn risc0_zkp_cuda_set_oom_hook(hook: extern "C" fn());
+
     pub fn sppark_init() -> sppark::Error;
     pub fn sppark_poseidon2_init() -> sppark::Error;
 

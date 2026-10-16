@@ -16,6 +16,7 @@
 #include "steps.cuh"
 #include "witgen.h"
 #include "thp_pinned.h"
+#include "device_alloc.h"
 
 #ifndef __HIPCC__
 #if defined(__clang__)
@@ -89,7 +90,9 @@ static void* cubTemp(size_t bytes) {
   int dev = getCachedDevice();
   if (bytes > s_cap[dev]) {
     if (s_ptr[dev]) CUDA_OK(cudaFree(s_ptr[dev]));
-    CUDA_OK(cudaMalloc(&s_ptr[dev], bytes));
+    s_ptr[dev] = nullptr;
+    s_cap[dev] = 0;
+    CUDA_OK(risc0_cuda_malloc(&s_ptr[dev], bytes));
     s_cap[dev] = bytes;
   }
   return s_ptr[dev];
@@ -173,7 +176,9 @@ static void growDevSlot(DevSlot* sl, size_t bytes) {
   if (bytes > sl->cap) {
     // cudaFree synchronizes the device, so no pending copy or kernel still uses the old buffer.
     if (sl->dev) CUDA_OK(cudaFree(sl->dev));
-    CUDA_OK(cudaMalloc(&sl->dev, bytes));
+    sl->dev = nullptr;
+    sl->cap = 0;
+    CUDA_OK(risc0_cuda_malloc(&sl->dev, bytes));
     sl->cap = bytes;
   }
 }
@@ -985,10 +990,12 @@ const char* risc0_circuit_rv32im_cuda_accum(AccumBuffers* buffers,
           if (s_perm[dev]) CUDA_OK(cudaFree(s_perm[dev]));
           if (s_keys2[dev]) CUDA_OK(cudaFree(s_keys2[dev]));
           if (s_perm2[dev]) CUDA_OK(cudaFree(s_perm2[dev]));
-          CUDA_OK(cudaMalloc(&s_keys[dev], lastCycle * sizeof(uint32_t)));
-          CUDA_OK(cudaMalloc(&s_perm[dev], lastCycle * sizeof(uint32_t)));
-          CUDA_OK(cudaMalloc(&s_keys2[dev], lastCycle * sizeof(uint32_t)));
-          CUDA_OK(cudaMalloc(&s_perm2[dev], lastCycle * sizeof(uint32_t)));
+          s_keys[dev] = s_perm[dev] = s_keys2[dev] = s_perm2[dev] = nullptr;
+          s_cap[dev] = 0;
+          CUDA_OK(risc0_cuda_malloc(&s_keys[dev], lastCycle * sizeof(uint32_t)));
+          CUDA_OK(risc0_cuda_malloc(&s_perm[dev], lastCycle * sizeof(uint32_t)));
+          CUDA_OK(risc0_cuda_malloc(&s_keys2[dev], lastCycle * sizeof(uint32_t)));
+          CUDA_OK(risc0_cuda_malloc(&s_perm2[dev], lastCycle * sizeof(uint32_t)));
           s_cap[dev] = lastCycle;
         }
         const uint32_t win = s_win ? s_win : 32;

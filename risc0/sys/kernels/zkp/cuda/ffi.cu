@@ -19,6 +19,7 @@
 
 #include "vendor/nvtx3/nvtx3.hpp"
 #include "thp_pinned.h"
+#include "device_alloc.h"
 
 #include <cstdint>
 #include <exception>
@@ -44,6 +45,10 @@ __global__ void combos_sub(FpExt* combos, const FpExt* deltas, const uint32_t* o
                            const uint32_t count);
 
 extern "C" {
+
+void risc0_zkp_cuda_set_oom_hook(void (*hook)()) {
+  risc0_cuda_oom_hook = hook;
+}
 
 // Trigger CUDA module loading for risc0-zkp kernels (eltwise, sha, etc.)
 // by launching a dummy kernel. All kernels in this compilation unit share

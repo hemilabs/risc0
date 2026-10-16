@@ -13,6 +13,7 @@
 // T2 scratch (L2-resident); the side streams are joined back into the gpu stream before returning.
 #pragma once
 #include <mutex>
+#include "../device_alloc.h"
 
 namespace nttq {
 
@@ -269,10 +270,10 @@ static LineTabs make_line(const gpu_t& gpu, fr_t w, unsigned lgN, unsigned LOGL)
 {
     fr_t *r16, *rP3, *t2, *t3;
     int P3 = 1 << (LOGL - 8);
-    CUDA_OK(cudaMalloc(&r16, 32 * sizeof(fr_t)));
-    CUDA_OK(cudaMalloc(&rP3, 8 * sizeof(fr_t)));
-    CUDA_OK(cudaMalloc(&t2, 256 * sizeof(fr_t)));
-    CUDA_OK(cudaMalloc(&t3, 256 * P3 * sizeof(fr_t)));
+    CUDA_OK(risc0_cuda_malloc(&r16, 32 * sizeof(fr_t)));
+    CUDA_OK(risc0_cuda_malloc(&rP3, 8 * sizeof(fr_t)));
+    CUDA_OK(risc0_cuda_malloc(&t2, 256 * sizeof(fr_t)));
+    CUDA_OK(risc0_cuda_malloc(&t3, 256 * P3 * sizeof(fr_t)));
     k_line_tabs<<<(256 * P3 + 255) / 256, 256, 0, gpu>>>(r16, rP3, t2, t3, w, (int)lgN, (int)LOGL);
     CUDA_OK(cudaGetLastError());
     return LineTabs{r16, rP3, t2, t3};
@@ -285,8 +286,11 @@ static void launch(cudaStream_t st, unsigned cols, const fr_t* in, fr_t* out, si
 {
     constexpr int L = 1 << LOGL;
     const size_t sh = ((size_t)TB * Smem<LOGL, TB>::LS + Smem<LOGL, TB>::TW) * sizeof(fr_t);
-    static std::once_flag once;
-    std::call_once(once, [&] {
+    // per device: the attribute is device state
+    static std::once_flag once[16];
+    int dev;
+    CUDA_OK(cudaGetDevice(&dev));
+    std::call_once(once[dev], [&] {
         CUDA_OK(cudaFuncSetAttribute(pass_k<LOGL, TB, MODE, MINB>,
                                      cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sh));
     });
@@ -327,8 +331,8 @@ static const Tables& tables(const gpu_t& gpu, unsigned lgN, unsigned lgLr, unsig
         T.row = make_line(gpu, roots[lgN], lgN, lgLr);
         size_t nB = lgN > 12 ? (size_t)1 << (lgN - 12) : 1;
         fr_t *A, *B;
-        CUDA_OK(cudaMalloc(&A, 4096 * sizeof(fr_t)));
-        CUDA_OK(cudaMalloc(&B, nB * sizeof(fr_t)));
+        CUDA_OK(risc0_cuda_malloc(&A, 4096 * sizeof(fr_t)));
+        CUDA_OK(risc0_cuda_malloc(&B, nB * sizeof(fr_t)));
         k_pow_table<<<16, 256, 0, gpu>>>(A, roots[lgN], 4096, 1);
         k_pow_table<<<(unsigned)((nB + 255) / 256), 256, 0, gpu>>>(B, roots[lgN], (unsigned)nB, 4096);
         CUDA_OK(cudaGetLastError());
@@ -367,36 +371,42 @@ static bool enabled_lde() {
     return on == 1 && enabled();
 }
 
+// Scratch T2 of the forward passes: one allocation sized for the largest schedule below, made on
+// first use and never regrown. A regrow at a po2 increase came after the HAL's buffer pool and the
+// new working set had filled the device, and failed (composite 20,21 in one process).
+// NS == 0 uses T2[0] only (N * CHF elements); NS > 0 alternates T2[0] and T2[1].
+static size_t t2_elems(unsigned lg)
+{
+    const Cfg G = cfg(lg);
+    return ((size_t)4 << lg) * G.CHF * (G.NS ? 2 : 1);
+}
+static size_t t2_capacity()
+{
+    size_t m = 0;
+    for (unsigned lg = 16; lg <= 21; lg++) m = std::max(m, t2_elems(lg));
+    return m;
+}
+
 struct Side {
     cudaStream_t s[2] = {};
     cudaEvent_t ev[2] = {};
     cudaEvent_t inv = {};
-    fr_t* T2[2] = {};
-    size_t t2_elems = 0;
+    fr_t* T2 = nullptr;
+    fr_t* t2(unsigned lg, unsigned x) const { return T2 + x * (t2_elems(lg) / 2); }
 };
 // one Side per device shared by commit and forward (both hold the mutex and join before returning)
 static std::mutex side_mtx;
-static Side& side(const gpu_t& gpu, size_t t2_elems)
+static Side& side(const gpu_t& gpu)
 {
     static Side sides[16];
     Side& S = sides[gpu.id()];
     if (S.s[0] == nullptr) {
+        CUDA_OK(risc0_cuda_malloc(&S.T2, t2_capacity() * sizeof(fr_t)));
         for (int i = 0; i < 2; i++) {
             CUDA_OK(cudaStreamCreateWithFlags(&S.s[i], cudaStreamNonBlocking));
             CUDA_OK(cudaEventCreateWithFlags(&S.ev[i], cudaEventDisableTiming));
         }
         CUDA_OK(cudaEventCreateWithFlags(&S.inv, cudaEventDisableTiming));
-    }
-    if (S.t2_elems < t2_elems) {
-        // earlier commits/forwards may still be running on the gpu stream (NS == 0) or the side
-        // streams: wait for them before freeing T2
-        CUDA_OK(cudaStreamSynchronize(gpu));
-        for (int i = 0; i < 2; i++) CUDA_OK(cudaStreamSynchronize(S.s[i]));
-        for (int i = 0; i < 2; i++) {
-            if (S.T2[i]) CUDA_OK(cudaFree(S.T2[i]));
-            CUDA_OK(cudaMalloc(&S.T2[i], t2_elems * sizeof(fr_t)));
-        }
-        S.t2_elems = t2_elems;
     }
     return S;
 }
@@ -423,7 +433,7 @@ static void commit(const gpu_t& gpu, fr_t* C, fr_t* E, const fr_t* W, unsigned l
     const Tables& I = tables(gpu, lg, G.IR, lg - G.IR, true);
     const Tables& F = tables(gpu, lgN, G.FR, lg - G.FR, false);
     std::lock_guard<std::mutex> lock(side_mtx);
-    Side& S = side(gpu, N * G.CHF);
+    Side& S = side(gpu);
     cudaStream_t st = gpu;
     const fr_t ninv = domain_size_inverse[lg];
     unsigned rr = 0;
@@ -436,14 +446,14 @@ static void commit(const gpu_t& gpu, fr_t* C, fr_t* E, const fr_t* W, unsigned l
                 lo, hi, ninv, F_DISCARD_IN);
         if (G.NS == 0) {
             for (unsigned c = c0; c < c0 + k; c += G.CHF)
-                fwd_cols(st, F, G, S.T2[0], lg, std::min(G.CHF, c0 + k - c), C + c * n, E + c * N);
+                fwd_cols(st, F, G, S.t2(lg, 0), lg, std::min(G.CHF, c0 + k - c), C + c * n, E + c * N);
             continue;
         }
         CUDA_OK(cudaEventRecord(S.inv, st));
         for (int i = 0; i < 2; i++) CUDA_OK(cudaStreamWaitEvent(S.s[i], S.inv, 0));
         for (unsigned c = c0; c < c0 + k; c += G.CHF) {
             const unsigned x = rr++ & 1;
-            fwd_cols(S.s[x], F, G, S.T2[x], lg, std::min(G.CHF, c0 + k - c), C + c * n, E + c * N);
+            fwd_cols(S.s[x], F, G, S.t2(lg, x), lg, std::min(G.CHF, c0 + k - c), C + c * n, E + c * N);
         }
     }
     if (G.NS) for (int i = 0; i < 2; i++) {
@@ -460,11 +470,11 @@ static void forward(const gpu_t& gpu, fr_t* E, const fr_t* Cn, unsigned lg, unsi
     const size_t n = (size_t)1 << lg, N = n << lgB;
     const Tables& F = tables(gpu, lgN, G.FR, lg - G.FR, false);
     std::lock_guard<std::mutex> lock(side_mtx);
-    Side& S = side(gpu, N * G.CHF);
+    Side& S = side(gpu);
     cudaStream_t st = gpu;
     if (G.NS == 0) {
         for (unsigned c = 0; c < cols; c += G.CHF)
-            fwd_cols(st, F, G, S.T2[0], lg, std::min(G.CHF, cols - c), Cn + c * n, E + c * N);
+            fwd_cols(st, F, G, S.t2(lg, 0), lg, std::min(G.CHF, cols - c), Cn + c * n, E + c * N);
         return;
     }
     CUDA_OK(cudaEventRecord(S.inv, st));
@@ -472,7 +482,7 @@ static void forward(const gpu_t& gpu, fr_t* E, const fr_t* Cn, unsigned lg, unsi
     unsigned rr = 0;
     for (unsigned c = 0; c < cols; c += G.CHF) {
         const unsigned x = rr++ & 1;
-        fwd_cols(S.s[x], F, G, S.T2[x], lg, std::min(G.CHF, cols - c), Cn + c * n, E + c * N);
+        fwd_cols(S.s[x], F, G, S.t2(lg, x), lg, std::min(G.CHF, cols - c), Cn + c * n, E + c * N);
     }
     for (int i = 0; i < 2; i++) {
         CUDA_OK(cudaEventRecord(S.ev[i], S.s[i]));

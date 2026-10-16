@@ -143,6 +143,37 @@ fn trim_cuda_mempool() {
     }
 }
 
+/// Called by raw device allocations in the kernel libraries (`risc0_cuda_malloc` in
+/// `device_alloc.h`: nttq scratch, the rv32im preflight slots, sort keys) when cudaMalloc fails:
+/// releases this thread's cached buffers and trims the mempool, so the allocation can be retried,
+/// as `RawBuffer::new` does for the HAL's own allocations. Those callers run on the proving
+/// thread, which owns the pool that holds the memory.
+extern "C" fn drain_pool_on_oom() {
+    let _ = std::panic::catch_unwind(|| {
+        let released = BUFFER_POOL
+            .try_with(|pool| {
+                pool.try_borrow_mut()
+                    .map(|mut pool| {
+                        let cached = pool.total_cached;
+                        pool.drain();
+                        cached
+                    })
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        trim_cuda_mempool();
+        tracing::debug!(
+            "raw device allocation failed: released {:.2} GiB of cached buffers, retrying",
+            released as f64 / (1u64 << 30) as f64
+        );
+    });
+}
+
+fn register_oom_hook() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe { risc0_sys::cuda::risc0_zkp_cuda_set_oom_hook(drain_pool_on_oom) });
+}
+
 /// Release every device buffer this thread's `BUFFER_POOL` is caching, and trim the CUDA
 /// stream-ordered mempool back to the driver. The CUDA counterpart of `hal::hip::clear_buffer_pool`.
 ///
@@ -972,6 +1003,7 @@ impl<CH: CudaHash + ?Sized> CudaHal<CH> {
             fn risc0_zkp_cuda_warmup() -> *const std::os::raw::c_char;
         }
         let _ = ffi_wrap(|| unsafe { risc0_zkp_cuda_warmup() });
+        register_oom_hook();
 
         let mut hal = Self {
             max_threads: max_threads as u32,
