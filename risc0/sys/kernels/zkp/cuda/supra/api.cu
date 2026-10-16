@@ -13,6 +13,8 @@
 #include "pv.cuh"
 #include "mdiv.cuh"
 #define PV_BLOCK 128
+// Latency-bound small levels / row counts: warp- and quad-per-permutation kernels.
+#include "pv_small.cuh"
 #endif
 #if defined(__HIPCC__) && !defined(__HIP_DEVICE_COMPILE__)
 // HIP host pass: blst_256_t::operator[] is private, causing errors in
@@ -109,9 +111,11 @@ sppark_poseidon2_fold(poseidon_out_t* d_out, const poseidon_in_t* d_in, size_t n
   try {
     (void)cudaGetLastError(); // consume any stale async errors
 #ifndef __HIPCC__
-    size_t bs = num_hashes < PV_BLOCK ? num_hashes : PV_BLOCK;
-    pv::fold_k<<<(num_hashes + bs - 1) / bs, bs, 0, gpu>>>(
-        (uint4*)d_out, (const uint4*)d_in, (uint32_t)num_hashes);
+    if (!pvs::fold(gpu, (uint32_t*)d_out, (const uint32_t*)d_in, (uint32_t)num_hashes)) {
+      size_t bs = num_hashes < PV_BLOCK ? num_hashes : PV_BLOCK;
+      pv::fold_k<<<(num_hashes + bs - 1) / bs, bs, 0, gpu>>>(
+          (uint4*)d_out, (const uint4*)d_in, (uint32_t)num_hashes);
+    }
 #else
     _poseidon2_fold<<<num_blocks, block_size, 0, gpu>>>(d_out, d_in, num_hashes);
 #endif
@@ -144,9 +148,12 @@ sppark_poseidon2_fold_tree(poseidon_out_t* nodes, uint32_t layers) {
     for (int i = layers - 1; i >= 0; i--) {
       uint32_t layer_size = 1u << i;
 #ifndef __HIPCC__
-      uint32_t bs = layer_size < PV_BLOCK ? layer_size : PV_BLOCK;
-      pv::fold_k<<<(layer_size + bs - 1) / bs, bs, 0, gpu>>>(
-          (uint4*)(nodes + layer_size), (const uint4*)(nodes + 2 * layer_size), layer_size);
+      if (!pvs::fold(gpu, (uint32_t*)(nodes + layer_size), (const uint32_t*)(nodes + 2 * layer_size),
+                     layer_size)) {
+        uint32_t bs = layer_size < PV_BLOCK ? layer_size : PV_BLOCK;
+        pv::fold_k<<<(layer_size + bs - 1) / bs, bs, 0, gpu>>>(
+            (uint4*)(nodes + layer_size), (const uint4*)(nodes + 2 * layer_size), layer_size);
+      }
 #else
       size_t block_size = layer_size < P2_BLOCK ? layer_size : P2_BLOCK;
       size_t num_blocks = layer_size < P2_BLOCK ? 1 : layer_size / P2_BLOCK;
@@ -185,9 +192,11 @@ sppark_poseidon2_rows(poseidon_out_t* d_out, const fr_t* d_in, uint32_t count, u
   try {
     (void)cudaGetLastError(); // consume any stale async errors
 #ifndef __HIPCC__
-    uint32_t bs = count < PV_BLOCK ? count : PV_BLOCK;
-    pv::rows_k<<<(count + bs - 1) / bs, bs, 0, gpu>>>(
-        (uint4*)d_out, (const uint32_t*)d_in, count, col_size);
+    if (!pvs::rows(gpu, (uint32_t*)d_out, (const uint32_t*)d_in, count, col_size)) {
+      uint32_t bs = count < PV_BLOCK ? count : PV_BLOCK;
+      pv::rows_k<<<(count + bs - 1) / bs, bs, 0, gpu>>>(
+          (uint4*)d_out, (const uint32_t*)d_in, count, col_size);
+    }
 #else
     _poseidon2_rows<<<num_blocks, block_size, 0, gpu>>>(d_out, d_in, count, col_size);
 #endif
