@@ -552,7 +552,7 @@ fn build_rocm_kernels() {
     // Step 1: Compile eval_check standalone with hipcc: the evalfast kernel
     // (eval_check_ef_hip.cu, see its header) unless RISC0_HIP_EVAL_CHECK=combined selects the original
     // eval_check_combined.cu. On an RX 9070 XT (gfx1201) evalfast needs 9.3 KB of scratch per
-    // lane against the original's 16.8 KB, and a po2 20 eval_check takes 392 ms against 845 ms.
+    // lane against the original's 16.8 KB, and a po2 20 eval_check takes ~470 ms against 845 ms.
     // For the original, -mllvm -amdgpu-early-inline-all=false prevents OOM on this large kernel
     // (21 functions, 2154 column reads).
     //
@@ -604,10 +604,11 @@ fn build_rocm_kernels() {
         "-Wno-unused-parameter",
     ];
     if evalfast {
-        // Measured on an RX 9070 XT at po2 20: 64-wide waves and an occupancy target of 8 blocks
-        // (EF_MINB, the launch bounds' minimum) take eval_check from 603 to 392 ms. Wave32 gains
-        // nothing from the higher target; 6 and 10 blocks are slower than 8.
-        eval_check_flags.extend(["-mwavefrontsize64", "-DEF_MINB=8"]);
+        // Measured on an RX 9070 XT at po2 20: 64-wide waves and an occupancy target of 4 blocks
+        // (EF_MINB, the launch bounds' minimum) take eval_check from 603 to ~470 ms. Not 8, the
+        // fastest (392 ms): ROCm 7.2 miscompiles that combination, and nearly every call after
+        // the first few returns wrong values (5, 6 and 10 were correct in 300 calls each).
+        eval_check_flags.extend(["-mwavefrontsize64", "-DEF_MINB=4"]);
     } else {
         eval_check_flags.extend([
             "-mllvm",
