@@ -14,7 +14,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, ensure, Result};
 use risc0_circuit_recursion_sys::RawPreflightCycle;
 use risc0_core::field::baby_bear::{BabyBearElem as Fp, BabyBearExtElem as FpExt};
 use risc0_zkp::{
@@ -172,21 +172,29 @@ impl Preflight {
         self.stream.is_some()
     }
 
-    fn need(&mut self, n: usize) {
+    /// Make `n` input words available (waiting for the stream if there is one). Fails if the
+    /// input ends first (e.g. the stream was closed early on its producer's error path).
+    fn need(&mut self, n: usize) -> Result<()> {
         if self.input.len() < n {
             if let Some(s) = &self.stream {
                 self.stream_wait_ns += s.pull(&mut self.input, n);
             }
         }
+        ensure!(
+            self.input.len() >= n,
+            "recursion preflight: input ended after {} words, {n} more needed",
+            self.consumed
+        );
         self.consumed += n;
+        Ok(())
     }
 
-    fn read_input_word(&mut self) -> u32 {
-        self.need(1);
-        self.input.pop_front().unwrap()
+    fn read_input_word(&mut self) -> Result<u32> {
+        self.need(1)?;
+        Ok(self.input.pop_front().unwrap())
     }
 
-    fn read_iop_header(&mut self, count: Fp, k_flip: Fp) {
+    fn read_iop_header(&mut self, count: Fp, k_flip: Fp) -> Result<()> {
         let count = count.as_u32() as usize;
         let k_flip = k_flip.as_u32();
         let k = k_flip as usize / 2;
@@ -194,7 +202,7 @@ impl Preflight {
         tracing::trace!("read_iop_header(count: {count}, k: {k}, flip: {flip})");
 
         assert!(self.cur_iop_body.is_empty());
-        self.need(if k == 2 { count } else { k * count });
+        self.need(if k == 2 { count } else { k * count })?;
         if k == 2 {
             self.cur_iop_body.extend(
                 self.input
@@ -216,6 +224,7 @@ impl Preflight {
                 self.cur_iop_body.push_back(poly);
             }
         }
+        Ok(())
     }
 
     fn read_iop_body(&mut self, do_mont: Fp) -> FpExt {
@@ -320,7 +329,7 @@ impl Preflight {
         };
         let mut cycle_input: Vec<u32> = Vec::new();
         for i in 0..WORD_SIZE {
-            let word = self.read_input_word();
+            let word = self.read_input_word()?;
             let bytes = word.to_le_bytes();
             for (j, b) in bytes.iter().enumerate() {
                 let elem_idx = i * WORD_SIZE + j;
@@ -643,7 +652,7 @@ impl Preflight {
             }
             micro_op::READ_IOP_HEADER => {
                 tracing::trace!("iop header {:?} {:?}", args[0], args[1]);
-                self.read_iop_header(args[0], args[1]);
+                self.read_iop_header(args[0], args[1])?;
                 true
             }
             micro_op::READ_IOP_BODY => {

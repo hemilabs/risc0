@@ -299,9 +299,10 @@ impl Prover {
         #[cfg(feature = "cuda")]
         if let Some(h) = early.take() {
             let t0 = std::time::Instant::now();
+            // A panic on the early thread falls back like its error does.
             let first = h
                 .join()
-                .map_err(|_| anyhow::anyhow!("host chains thread panicked"))?;
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("host chains thread panicked")));
             let tw = t0.elapsed().as_secs_f64() * 1e3;
             let t = &preflight.trace;
             let chains = match first {
