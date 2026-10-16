@@ -50,13 +50,21 @@ __global__ void ef_combine(Fp* check, const Fp* scratch, uint32_t domain) {
   for (uint32_t i = 0; i < 4; i++) check[i * domain + cycle] = (check[i * domain + cycle] + scratch[i * domain + cycle]) * quot;
 }
 '''+s[b:]
+# The scratch buffer comes from risc0_cuda_malloc, which drains the HAL's buffer pool and retries
+# when the device is full (device_alloc.h, after "cuda.h").
+s=s.replace('#include "cuda.h"\n', '#include "cuda.h"\n#include "device_alloc.h"\n', 1)
 s=s.replace('#define EF_MINB 3\n','#define EF_MINB 3\n#endif\n#ifndef EF_SPLIT_SHIFT\n#define EF_SPLIT_SHIFT 1\n',1)
 old='''    ef_eval_check<<<grid, block, 0, stream>>>(check, const_cast<Fp*>(data), const_cast<Fp*>(accum),
                                               const_cast<Fp*>(mix), const_cast<Fp*>(out), domain);'''
 new='''    if (b.scratch_n < domain) {
       constexpr size_t EF_SCRATCH_PAD = 4096;
       if (b.scratch_base) CUDA_OK(cudaFree(b.scratch_base));  // synchronizes the device
-      CUDA_OK(cudaMalloc(&b.scratch_base, 4ull * domain * sizeof(Fp) + EF_SCRATCH_PAD));
+      // Reset first: a failed allocation must not leave a dangling buffer that a later, smaller
+      // domain would reuse.
+      b.scratch_base = nullptr;
+      b.scratch = nullptr;
+      b.scratch_n = 0;
+      CUDA_OK(risc0_cuda_malloc(&b.scratch_base, 4ull * domain * sizeof(Fp) + EF_SCRATCH_PAD));
       b.scratch = reinterpret_cast<Fp*>(b.scratch_base + EF_SCRATCH_PAD);
       b.scratch_n = domain;
     }

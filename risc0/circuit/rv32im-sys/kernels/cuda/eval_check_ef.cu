@@ -25724,6 +25724,7 @@ __global__ void ef_combine(Fp* check, const Fp* scratch, uint32_t domain) {
   for (uint32_t i = 0; i < 4; i++) check[i * domain + cycle] = (check[i * domain + cycle] + scratch[i * domain + cycle]) * quot;
 }
 #include "cuda.h"
+#include "device_alloc.h"
 static cudaStream_t getEvalCheckStream() {
   int dev = getCachedDevice();
   static cudaStream_t streams[16] = {};
@@ -25787,7 +25788,12 @@ const char* risc0_circuit_rv32im_cuda_eval_check(Fp* check, const Fp* ctrl, cons
     if (b.scratch_n < domain) {
       constexpr size_t EF_SCRATCH_PAD = 4096;
       if (b.scratch_base) CUDA_OK(cudaFree(b.scratch_base));  // synchronizes the device
-      CUDA_OK(cudaMalloc(&b.scratch_base, 4ull * domain * sizeof(Fp) + EF_SCRATCH_PAD));
+      // Reset first: a failed allocation must not leave a dangling buffer that a later, smaller
+      // domain would reuse.
+      b.scratch_base = nullptr;
+      b.scratch = nullptr;
+      b.scratch_n = 0;
+      CUDA_OK(risc0_cuda_malloc(&b.scratch_base, 4ull * domain * sizeof(Fp) + EF_SCRATCH_PAD));
       b.scratch = reinterpret_cast<Fp*>(b.scratch_base + EF_SCRATCH_PAD);
       b.scratch_n = domain;
     }
