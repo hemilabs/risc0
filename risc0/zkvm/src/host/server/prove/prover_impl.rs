@@ -120,6 +120,23 @@ impl ProverImpl {
                 *warmup = CudaWarmup::Running(spawn_cuda_warmup());
             }
         }
+        // C2-R2 prototype: load the Groth16 proving key while the guest executes.
+        #[cfg(feature = "cuda")]
+        if opts.receipt_kind == ReceiptKind::Groth16
+            && std::env::var("RISC0_G16_EARLY").as_deref() == Ok("new")
+        {
+            risc0_groth16::prove::prestart_key();
+        }
+        // C2-R2: parse the witness graph (and build the parallel schedule) while the guest
+        // executes instead of beside the STARK (RISC0_G16_EARLY_GRAPH=0 disables).
+        #[cfg(feature = "cuda")]
+        if opts.receipt_kind == ReceiptKind::Groth16
+            && std::env::var("RISC0_G16_EARLY_GRAPH").as_deref() != Ok("0")
+        {
+            std::thread::spawn(|| {
+                let _ = risc0_groth16::prove::preload_graph();
+            });
+        }
         Self { opts }
     }
 
@@ -550,6 +567,15 @@ impl ProverImpl {
 
         // Preload circom graph on background thread so the ~728ms file read + parse
         // overlaps with segment proving and recursion.  Only needed for Groth16.
+        // C2-R2: load the Groth16 proving key while the STARK proves (default; the loader
+        // starts once segment 0's prove_begin returns, see `prestart_key_go`).
+        // RISC0_G16_EARLY=new starts it at prover construction, =0 disables it.
+        #[cfg(feature = "cuda")]
+        if self.opts.receipt_kind == ReceiptKind::Groth16
+            && !matches!(std::env::var("RISC0_G16_EARLY").as_deref(), Ok("0") | Ok("new"))
+        {
+            risc0_groth16::prove::prestart_key();
+        }
         #[cfg(any(feature = "cuda", feature = "rocm", feature = "intel"))]
         let _graph_preload = if self.opts.receipt_kind == ReceiptKind::Groth16 {
             Some(std::thread::spawn(|| {
@@ -856,6 +882,13 @@ impl ProverImpl {
             let t_psc = std::time::Instant::now();
             let prev_seal = with_segment_prover(|sp| sp.prove_begin(results.inner))?;
             let prove_begin_ms = t_psc.elapsed().as_secs_f64() * 1000.0;
+            // C2-R2: segment 0's GPU work (incl. its eval_check) is queued: release the Groth16
+            // key loader, so its pinned uploads and cold allocations do not compete with
+            // segment 0's.
+            #[cfg(feature = "cuda")]
+            if self.opts.receipt_kind == ReceiptKind::Groth16 {
+                risc0_groth16::prove::prestart_key_go();
+            }
             // C2-R2 early seal: prove_begin finalizes this segment inline and only holds its
             // seal back; take it now (prove_end just returns it), so this segment's receipt and
             // lift preparation start one iteration earlier.

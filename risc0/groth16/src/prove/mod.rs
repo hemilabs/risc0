@@ -26,6 +26,8 @@ mod seal_format;
 mod seal_to_json;
 #[cfg(feature = "cuda")]
 mod witness_fast;
+#[cfg(feature = "cuda")]
+mod witness_par;
 
 use anyhow::Result;
 
@@ -64,10 +66,29 @@ pub fn prestart_prover() -> Result<()> {
                 self::fast::prestart()?;
             }
             Ok(())
+        } else if #[cfg(feature = "cuda")] {
+            // C2 prototype: load the proving key while identity_p254 runs.
+            if std::env::var_os("RISC0_G16_PRESTART").is_some() {
+                self::cuda::prestart();
+            }
+            Ok(())
         } else {
             Ok(())
         }
     }
+}
+
+/// C2-R2: start loading the Groth16 proving key in the background (CUDA; no-op elsewhere).
+/// The loader waits for [prestart_key_go] (or 2 s), unless RISC0_G16_PRESTART_DELAY_MS is set.
+pub fn prestart_key() {
+    #[cfg(feature = "cuda")]
+    self::cuda::prestart_key();
+}
+
+/// C2-R2: release a pending [prestart_key] loader (no-op if none is waiting).
+pub fn prestart_key_go() {
+    #[cfg(feature = "cuda")]
+    self::cuda::prestart_key_go();
 }
 
 /// Preload the SRS and Groth16 prover into C++ static cache.

@@ -196,6 +196,11 @@ private:
   void operator=(SRS const&) = delete;
 
 public:
+  // C2: set once a prover has permuted a/b_g1/b_g2/c in place for the bit-split MSMs.
+  mutable bool c2_permuted = false;
+  // C2: FNV-1a of sampled bytes of the point sections (keys the split-correction cache).
+  uint64_t c2_salt = 0;
+
   SRS(size_t gpu_id, const char* srs_path) : gpu(select_gpu(gpu_id)), srs_path(srs_path) {
     struct {
       struct {
@@ -230,6 +235,9 @@ public:
     }
 #endif
 
+    // Its own stream: the load may run while other work (identity_p254) uses sppark's zero
+    // stream, which pageable copies would otherwise block for ~0.3 s.
+    stream_t ld{gpu.id()};
     try {
       if (memcmp(srs_ptr, "zkey", 4) != 0) {
         throw sppark_error{EINVAL, "srs file's (\"%s\") type is not \"zkey\": ", srs_path};
@@ -339,28 +347,48 @@ public:
       h_size = data.h.size;
       b_g2_size = data.b_g2.size;
 
-      a = gpu_ptr_t<affine_t>((affine_t*)gpu.Dmalloc(data.a.size * sizeof(affine_t)));
-      b_g1 = gpu_ptr_t<affine_t>((affine_t*)gpu.Dmalloc(data.b_g1.size * sizeof(affine_t)));
-      c = gpu_ptr_t<affine_t>((affine_t*)gpu.Dmalloc(data.c.size * sizeof(affine_t)));
-      h = gpu_ptr_t<affine_t>((affine_t*)gpu.Dmalloc(data.h.size * sizeof(affine_t)));
+      a = gpu_ptr_t<affine_t>((affine_t*)ld.Dmalloc(data.a.size * sizeof(affine_t)));
+      b_g1 = gpu_ptr_t<affine_t>((affine_t*)ld.Dmalloc(data.b_g1.size * sizeof(affine_t)));
+      c = gpu_ptr_t<affine_t>((affine_t*)ld.Dmalloc(data.c.size * sizeof(affine_t)));
+      h = gpu_ptr_t<affine_t>((affine_t*)ld.Dmalloc(data.h.size * sizeof(affine_t)));
       b_g2 = gpu_ptr_t<affine_fp2_t>(
-          (affine_fp2_t*)gpu.Dmalloc(data.b_g2.size * sizeof(affine_fp2_t)));
+          (affine_fp2_t*)ld.Dmalloc(data.b_g2.size * sizeof(affine_fp2_t)));
 
-      gpu.HtoD(&a[0], srs_ptr + data.a.off, a_size);
-      gpu.HtoD(&b_g1[0], srs_ptr + data.b_g1.off, b_g1_size);
-      gpu.HtoD(&c[0], srs_ptr + data.c.off, c_size);
-      gpu.HtoD(&h[0], srs_ptr + data.h.off, h_size);
-      gpu.HtoD(&b_g2[0], srs_ptr + data.b_g2.off, b_g2_size);
+      {
+        uint64_t h = 0xcbf29ce484222325ull;
+        size_t lo = data.a.off, hi = data.h.off + h_size * p1_affine_size;
+        for (size_t k = 0; k < 64; k++) {
+          size_t o = lo + (hi - lo - 4096) / 63 * k;
+          for (size_t i = 0; i < 4096; i++) { h ^= srs_ptr[o + i]; h *= 0x100000001b3ull; }
+        }
+        h ^= srs_file_size; h *= 0x100000001b3ull;
+        c2_salt = h;
+      }
+      if (g16_staged()) {
+        ld.sync();  // the allocations
+        c2_stager& sg = c2_stager::get();
+        sg.upload(&h[0], srs_ptr + data.h.off, h_size * sizeof(affine_t), this->srs_path.c_str(), data.h.off);
+        sg.upload(&a[0], srs_ptr + data.a.off, a_size * sizeof(affine_t), this->srs_path.c_str(), data.a.off);
+        sg.upload(&b_g1[0], srs_ptr + data.b_g1.off, b_g1_size * sizeof(affine_t), this->srs_path.c_str(), data.b_g1.off);
+        sg.upload(&b_g2[0], srs_ptr + data.b_g2.off, b_g2_size * sizeof(affine_fp2_t), this->srs_path.c_str(), data.b_g2.off);
+        sg.upload(&c[0], srs_ptr + data.c.off, c_size * sizeof(affine_t), this->srs_path.c_str(), data.c.off);
+      } else {
+      ld.HtoD(&a[0], srs_ptr + data.a.off, a_size);
+      ld.HtoD(&b_g1[0], srs_ptr + data.b_g1.off, b_g1_size);
+      ld.HtoD(&c[0], srs_ptr + data.c.off, c_size);
+      ld.HtoD(&h[0], srs_ptr + data.h.off, h_size);
+      ld.HtoD(&b_g2[0], srs_ptr + data.b_g2.off, b_g2_size);
+      }
 
 #ifdef SRS_READ_COEFFS
       coeffs.resize(data.coeffs.size);
       read_coeffs(gpu, coeffs, srs_ptr + data.coeffs.off);
 #endif
 
-      gpu.sync();
+      ld.sync();
       munmap(const_cast<byte*>(srs_ptr), srs_file_size);
     } catch (const sppark_error& e) {
-      gpu.sync();
+      ld.sync();
       munmap(const_cast<byte*>(srs_ptr), srs_file_size);
 
       throw;

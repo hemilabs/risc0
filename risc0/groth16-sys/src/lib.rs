@@ -76,6 +76,30 @@ pub fn preload(setup_params: &SetupParams) -> anyhow::Result<()> {
     ffi_wrap(|| unsafe { risc0_groth16_cuda_preload(&setup_params) })
 }
 
+/// C2-R2: load the proving key and build the prover on the current device without taking any
+/// lock other than the cache's, through pinned staging (safe to run beside a STARK proof).
+/// Returns the witness length when it loaded (or found) the key, `None` when skipped because the
+/// card has less than `min_total_vram` bytes.
+#[cfg(feature = "cuda")]
+pub fn prestart(setup_params: &SetupParams, min_total_vram: usize) -> anyhow::Result<Option<usize>> {
+    let raw = RawSetupParams {
+        pcoeffs_path: setup_params.pcoeffs_path.c_str.as_ptr(),
+        fres_path: setup_params.fres_path.c_str.as_ptr(),
+        srs_path: setup_params.srs_path.c_str.as_ptr(),
+    };
+    let mut len: usize = 0;
+    let mut loaded: i32 = 0;
+    ffi_wrap(|| unsafe { risc0_groth16_cuda_prestart(&raw, min_total_vram, &mut len, &mut loaded) })?;
+    Ok((loaded != 0).then_some(len))
+}
+
+/// C2-R2: the witness indices that are always 0/1 (the bit set of the split MSMs), used by the
+/// next prover construction. Takes effect only if set before the prover is built.
+#[cfg(feature = "cuda")]
+pub fn set_bit_signals(bits: &[u32]) {
+    unsafe { risc0_groth16_cuda_set_bit_signals(bits.as_ptr(), bits.len()) }
+}
+
 /// Free the Groth16 prover and SRS cached on the current device, returning their GPU memory. The next
 /// `prove` rebuilds them. See `risc0_groth16_cuda_release`.
 #[cfg(any(feature = "cuda", feature = "rocm"))]
@@ -177,6 +201,17 @@ extern "C" {
 
     #[cfg(any(feature = "cuda", feature = "rocm"))]
     fn risc0_groth16_cuda_release() -> *const c_char;
+
+    #[cfg(feature = "cuda")]
+    fn risc0_groth16_cuda_set_bit_signals(bits: *const u32, len: usize);
+
+    #[cfg(feature = "cuda")]
+    fn risc0_groth16_cuda_prestart(
+        setup: *const RawSetupParams,
+        min_total_vram: usize,
+        witness_len: *mut usize,
+        loaded: *mut i32,
+    ) -> *const c_char;
 
     #[cfg(feature = "cuda")]
     fn risc0_groth16_cuda_host_buffer(bytes: usize) -> *mut u8;

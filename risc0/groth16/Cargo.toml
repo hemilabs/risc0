@@ -47,6 +47,7 @@ all-features = true
 [features]
 cuda = [
   "dep:circom-witnesscalc",
+  "dep:rayon",
   "dep:risc0-groth16-sys",
   "dep:wtns-file",
   "prove",
