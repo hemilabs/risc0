@@ -1228,6 +1228,16 @@ impl ProverImpl {
                 t_keccaks.elapsed().as_secs_f64() * 1000.0,
             );
         }
+        // On ROCm, start the segments' lifts and joins from fresh device memory: the keccak
+        // proofs peak near a 16 GB card's capacity, and on Windows buffers the HAL pooled
+        // through that peak could be in shared system memory. With keccak at po2 18 on an RX
+        // 9070 XT the lifts and joins after it ran ~1.6x slower (recursion data commits 28 ->
+        // 93 ms). The keccak lift programs' cached ctrl groups aren't needed after this either.
+        #[cfg(feature = "rocm")]
+        if !session.pending_keccaks.is_empty() {
+            release_cached_provers();
+            super::release_hal_buffers();
+        }
         if let Ok(root_receipt) = keccak_root {
             let assumption = Assumption {
                 claim: root_receipt.claim.digest(),
