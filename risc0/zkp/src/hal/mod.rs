@@ -692,7 +692,9 @@ mod testutil {
         let mix_start = H::ExtElem::random(&mut rng);
         let mix = H::ExtElem::random(&mut rng);
 
-        let output = hal.alloc_extelem("output", output_size);
+        // Zeroed, as the prover allocates it: mix_poly_coeffs adds into it, and a GPU HAL's
+        // buffer pool can hand back a previous test's buffer.
+        let output = hal.alloc_extelem_zeroed("output", output_size);
         let combos = hal.copy_from_u32("combos", &combos);
         let input = generate_elem(&hal, &mut rng, input_size);
 
