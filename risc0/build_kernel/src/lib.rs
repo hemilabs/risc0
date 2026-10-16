@@ -87,11 +87,12 @@ impl KernelBuild {
     }
 
     /// Add files which will be compiled (C++ only) each on a thread of its own, started before
-    /// the other files and outside cargo's jobserver, with the same command `cc` would run.
+    /// the other files, with the same command `cc` would run.
     ///
-    /// For a few huge generated files on the critical path of the build: through the
-    /// jobserver they wait for tokens other crates hold, and can start long after the rest of
-    /// the build script's work.
+    /// For a few huge generated files on the critical path of the build: through `cc`'s queue
+    /// they could start long after the rest of the build script's work. The first of them runs
+    /// on the build script's own jobserver token, each other one acquires a token of cargo's
+    /// jobserver first, so the build stays within its job limit.
     pub fn files_on_own_threads<P>(&mut self, p: P) -> &mut KernelBuild
     where
         P: IntoIterator,
@@ -191,11 +192,17 @@ impl KernelBuild {
         let obj_dir = out_dir.join("own_thread");
         fs::create_dir_all(&obj_dir).unwrap();
         let msvc = is_msvc_target();
+        // SAFETY: the descriptors named in the environment are the jobserver cargo hands every
+        // build script, open for its whole run (`cc` connects the same way; any number of calls
+        // is allowed). None outside cargo: the threads then run unbounded.
+        let jobserver = unsafe { jobserver::Client::from_env() };
         let objs = std::thread::scope(|scope| {
             let threads: Vec<_> = self
                 .own_thread_files
                 .iter()
-                .map(|src| {
+                .enumerate()
+                .map(|(i, src)| {
+                    let jobserver = jobserver.as_ref();
                     let obj = obj_dir
                         .join(src.file_stem().unwrap())
                         .with_extension(object_extension());
@@ -208,6 +215,10 @@ impl KernelBuild {
                     }
                     cmd.arg("-c").arg(src);
                     scope.spawn(move || {
+                        // The first file uses the token this build script runs on.
+                        let _token = (i > 0)
+                            .then(|| jobserver.and_then(|js| js.acquire().ok()))
+                            .flatten();
                         let status = cmd.status().unwrap_or_else(|e| {
                             panic!("failed to run the C++ compiler for {}: {e}", src.display())
                         });

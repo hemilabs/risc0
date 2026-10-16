@@ -6958,6 +6958,7 @@ dependencies = [
  "cc",
  "directories",
  "hex",
+ "jobserver",
  "rayon",
  "sha2",
  "tempfile",
