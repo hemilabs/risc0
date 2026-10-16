@@ -17,6 +17,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "disk_cache.cuh"
+
 typedef uint8_t byte;
 
 struct coeff_t {
@@ -252,7 +254,11 @@ public:
     }
 
     struct stat st;
-    fstat(pcoeffs_file, &st);
+    if (fstat(pcoeffs_file, &st) != 0) {
+      int err = errno;
+      close(pcoeffs_file);
+      throw sppark_error{err, "fstat(\"%s\") failed: ", file_path};
+    }
     size_t file_size = st.st_size;
 
     const byte* _ptr = (const byte*)mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, pcoeffs_file, 0);
@@ -267,7 +273,7 @@ public:
     stream_t ld{gpu.id()};
     try {
 #ifndef __HIPCC__
-      if (g16_cold_enabled() && compact_load(ld, _ptr, file_size)) {
+      if (g16_cold_enabled() && compact_load(ld, _ptr, file_size, st)) {
         munmap(const_cast<byte*>(_ptr), file_size);
         return;
       }
@@ -371,23 +377,15 @@ public:
   }
 #endif // _WIN32
 
-#ifndef __HIPCC__
+#if !defined(__HIPCC__) && !defined(_WIN32)
+  // The compact cache file (disk_cache.cuh): this header, then (s, value index) per coefficient,
+  // the value table, each row's output index c, and the independent indices.
   struct compact_hdr {
     char magic[8];
-    uint64_t key, ca, cb, ua, ub, ntab;
+    uint32_t version, elem_size;
+    uint64_t key, ca, cb, ua, ub, ntab, sum;
   };
-  static std::string compact_cache_path(uint64_t key) {
-    std::string dir;
-    if (const char* d = getenv("RISC0_G16_CACHE_DIR")) dir = d;
-    else if (const char* x = getenv("XDG_CACHE_HOME")) dir = std::string(x) + "/risc0-groth16";
-    else if (const char* h = getenv("HOME")) dir = std::string(h) + "/.cache/risc0-groth16";
-    else return "";
-    for (size_t i = 1; i <= dir.size(); i++)
-      if (i == dir.size() || dir[i] == '/') mkdir(dir.substr(0, i).c_str(), 0755);
-    char name[64];
-    snprintf(name, sizeof name, "/coeffs_compact_%016llx.bin", (unsigned long long)key);
-    return dir + name;
-  }
+  static constexpr char kCompactMagic[8] = {'R', '0', 'G', '1', '6', 'C', 'P', 'T'};
   void compact_upload(stream_t& ld, void* dst, const void* src, size_t bytes) {
     if (g16_staged()) {
       ld.sync();
@@ -397,18 +395,27 @@ public:
       ld.sync();
     }
   }
-  // Loads the compact form (building and caching it from the mmap'd original if needed).
-  bool compact_load(stream_t& ld, const byte* orig, size_t orig_size) {
+  // Loads the compact form (building and caching it from the mmap'd original `orig`, whose
+  // file is described by `st`, if needed). false: the original isn't in the expected layout.
+  bool compact_load(stream_t& ld, const byte* orig, size_t orig_size, const struct stat& st) {
+    if (orig_size < 4096) return false;
     const size_t* h = (const size_t*)orig;
-    size_t ca = h[0], cb = h[1], ua = h[2], ub = h[3], n = ca + cb;
+    size_t ca = h[0], cb = h[1], ua = h[2], ub = h[3];
+    if (ca > orig_size / sizeof(coeff_t) || cb > orig_size / sizeof(coeff_t) || ua > orig_size / 4 ||
+        ub > orig_size / 4)
+      return false;
+    size_t n = ca + cb;
     if (orig_size != 32 + n * sizeof(coeff_t) + (ua + ub) * 4) return false;
-    uint64_t key = 0xcbf29ce484222325ull;
-    for (size_t k = 0; k < 64; k++) {
-      size_t o = (orig_size - 4096) / 63 * k;
-      for (size_t i = 0; i < 4096; i++) { key ^= orig[o + i]; key *= 0x100000001b3ull; }
-    }
-    key ^= orig_size; key *= 0x100000001b3ull;
-    std::string path = compact_cache_path(key);
+    // Key: the cache format, sampled bytes of the original, and its size, mtime and inode.
+    uint64_t key = g16_cache::kFnvBasis;
+    uint32_t format_id[3] = {g16_cache::kFormatVersion, (uint32_t)sizeof(fr_t), (uint32_t)sizeof(coeff_t)};
+    key = g16_cache::fnv1a(key, format_id, sizeof format_id);
+    for (size_t k = 0; k < 64; k++)
+      key = g16_cache::fnv1a(key, orig + (orig_size - 4096) / 63 * k, 4096);
+    uint64_t fid[5] = {(uint64_t)orig_size, (uint64_t)st.st_mtim.tv_sec,
+                       (uint64_t)st.st_mtim.tv_nsec, (uint64_t)st.st_ino, (uint64_t)st.st_dev};
+    key = g16_cache::fnv1a(key, fid, sizeof fid);
+    std::string path = g16_cache::path("coeffs_compact_", key);
     if (path.empty()) return false;
     const coeff_t* co = (const coeff_t*)(orig + 32);
     const uint32_t* ind = (const uint32_t*)(orig + 32 + n * sizeof(coeff_t));
@@ -417,19 +424,26 @@ public:
     size_t csz = 0;
     int fd = open(path.c_str(), O_RDONLY);
     if (fd >= 0) {
-      struct stat st;
-      fstat(fd, &st);
-      csz = st.st_size;
-      cp = (const byte*)mmap(NULL, csz, PROT_READ, MAP_PRIVATE, fd, 0);
+      struct stat cst;
+      if (fstat(fd, &cst) == 0 && cst.st_size >= (off_t)sizeof(compact_hdr)) {
+        csz = cst.st_size;
+        cp = (const byte*)mmap(NULL, csz, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (cp == MAP_FAILED) cp = nullptr;
+      }
       close(fd);
-      if (cp == MAP_FAILED) cp = nullptr;
     }
     const compact_hdr* ch = (const compact_hdr*)cp;
-    bool ok = cp && csz >= sizeof(compact_hdr) && !memcmp(ch->magic, "C2CMP001", 8) && ch->key == key &&
-              ch->ca == ca && ch->cb == cb && ch->ua == ua && ch->ub == ub &&
-              csz == sizeof(compact_hdr) + n * 8 + ch->ntab * sizeof(fr_t) + (ua + ub) * 8;
+    bool ok = cp && !memcmp(ch->magic, kCompactMagic, 8) &&
+              ch->version == g16_cache::kFormatVersion && ch->elem_size == sizeof(fr_t) &&
+              ch->key == key && ch->ca == ca && ch->cb == cb && ch->ua == ua && ch->ub == ub &&
+              ch->ntab <= n &&
+              csz == sizeof(compact_hdr) + n * 8 + ch->ntab * sizeof(fr_t) + (ua + ub) * 8 &&
+              ch->sum == g16_cache::payload_hash(cp + sizeof(compact_hdr), csz - sizeof(compact_hdr));
     std::vector<byte> built;
     if (!ok) {
+      if (g16_verbose())
+        fprintf(stderr, "groth16: %s compact coefficients cache %s\n", cp ? "rebuilding invalid" : "building",
+                path.c_str());
       if (cp) munmap(const_cast<byte*>(cp), csz);
       cp = nullptr;
       // Build: value table (first-seen order), (s, vidx), row c, indices.
@@ -450,24 +464,25 @@ public:
       std::vector<uint32_t> rowc(ua + ub, 0);
       for (size_t r = 0; r + 1 < ua; r++) rowc[r] = co[ind[r]].c;
       for (size_t r = 0; r + 1 < ub; r++) rowc[ua + r] = co[ca + ind[ua + r]].c;
-      compact_hdr hd;
-      memcpy(hd.magic, "C2CMP001", 8);
+      compact_hdr hd = {};
+      memcpy(hd.magic, kCompactMagic, 8);
+      hd.version = g16_cache::kFormatVersion; hd.elem_size = sizeof(fr_t);
       hd.key = key; hd.ca = ca; hd.cb = cb; hd.ua = ua; hd.ub = ub; hd.ntab = table.size();
       csz = sizeof hd + n * 8 + table.size() * sizeof(fr_t) + (ua + ub) * 8;
       built.resize(csz);
-      byte* w = built.data();
-      memcpy(w, &hd, sizeof hd); w += sizeof hd;
+      byte* w = built.data() + sizeof hd;
       memcpy(w, cs.data(), n * 8); w += n * 8;
       memcpy(w, table.data(), table.size() * sizeof(fr_t)); w += table.size() * sizeof(fr_t);
       memcpy(w, rowc.data(), (ua + ub) * 4); w += (ua + ub) * 4;
       memcpy(w, ind, (ua + ub) * 4);
-      std::string tmp = path + ".tmp" + std::to_string(getpid());
+      hd.sum = g16_cache::payload_hash(built.data() + sizeof hd, csz - sizeof hd);
+      memcpy(built.data(), &hd, sizeof hd);
+      std::string tmp = g16_cache::tmp_path(path);
       if (FILE* f = fopen(tmp.c_str(), "wb")) {
         bool good = fwrite(built.data(), 1, csz, f) == csz;
         good = (fclose(f) == 0) && good;
         if (good) rename(tmp.c_str(), path.c_str()); else remove(tmp.c_str());
       }
-      ch = (const compact_hdr*)built.data();
     }
     const byte* base = cp ? cp : built.data();
     ch = (const compact_hdr*)base;
@@ -490,6 +505,8 @@ public:
     compact = true;
     return true;
   }
+#endif
+#ifndef __HIPCC__
   const uint2* get_cs_a() const { return &d_cs[0]; }
   const uint2* get_cs_b() const { return &d_cs[d_coeffs_a.size()]; }
   const uint32_t* get_rowc_a() const { return &d_rowc[0]; }

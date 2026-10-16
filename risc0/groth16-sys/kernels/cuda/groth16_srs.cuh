@@ -198,7 +198,8 @@ private:
 public:
   // Set once a prover has permuted a/b_g1/b_g2/c in place for the bit-split MSMs.
   mutable bool split_permuted = false;
-  // FNV-1a of sampled bytes of the point sections (keys the split-correction cache).
+  // Identifies the SRS file (sampled point bytes, size, mtime, inode): keys the split-correction
+  // cache.
   uint64_t points_salt = 0;
 
   SRS(size_t gpu_id, const char* srs_path) : gpu(select_gpu(gpu_id)), srs_path(srs_path) {
@@ -220,7 +221,11 @@ public:
     }
 
     struct stat st;
-    fstat(srs_file, &st);
+    if (fstat(srs_file, &st) != 0) {
+      int err = errno;
+      close(srs_file);
+      throw sppark_error{err, "fstat(\"%s\") failed: ", srs_path};
+    }
     size_t srs_file_size = st.st_size;
 
     const byte* srs_ptr =
@@ -355,14 +360,21 @@ public:
           (affine_fp2_t*)ld.Dmalloc(data.b_g2.size * sizeof(affine_fp2_t)));
 
       {
-        uint64_t h = 0xcbf29ce484222325ull;
+        // Identifies the point sections for the split-MSM corrections cache: sampled bytes, and
+        // the file's size (and, where available, mtime and inode).
+        uint64_t h = g16_cache::kFnvBasis;
         size_t lo = data.a.off, hi = data.h.off + h_size * p1_affine_size;
-        for (size_t k = 0; k < 64; k++) {
-          size_t o = lo + (hi - lo - 4096) / 63 * k;
-          for (size_t i = 0; i < 4096; i++) { h ^= srs_ptr[o + i]; h *= 0x100000001b3ull; }
-        }
-        h ^= srs_file_size; h *= 0x100000001b3ull;
-        points_salt = h;
+        size_t span = hi - lo, chunk = std::min<size_t>(4096, span);
+        for (size_t k = 0; k < 64; k++)
+          h = g16_cache::fnv1a(h, srs_ptr + lo + (span - chunk) / 63 * k, chunk);
+        uint64_t fid[5] = {(uint64_t)srs_file_size, 0, 0, 0, 0};
+#ifndef _WIN32
+        fid[1] = (uint64_t)st.st_mtim.tv_sec;
+        fid[2] = (uint64_t)st.st_mtim.tv_nsec;
+        fid[3] = (uint64_t)st.st_ino;
+        fid[4] = (uint64_t)st.st_dev;
+#endif
+        points_salt = g16_cache::fnv1a(h, fid, sizeof fid);
       }
       if (g16_staged()) {
         ld.sync();  // the allocations

@@ -47,7 +47,12 @@ use crate::{
 pub(crate) fn check_groth16_receipt(receipt: &Groth16Receipt<ReceiptClaim>) -> Result<()> {
     receipt
         .verify_integrity_with_context(&VerifierContext::default())
-        .map_err(|e| anyhow!("Groth16 receipt failed verification: {e}"))
+        .map_err(|e| {
+            // A bad seal may come from a damaged derived-data cache of the Groth16 prover:
+            // discard those, so the next wrap rebuilds them instead of failing the same way.
+            risc0_groth16::prove::invalidate_caches();
+            anyhow!("Groth16 receipt failed verification: {e}")
+        })
 }
 
 mod private {

@@ -311,10 +311,10 @@ fn pin_early() -> Option<usize> {
     Some(len)
 }
 
-/// `witness_len` in the Groth16 cache directory, the split-MSM corrections cache's:
+/// The Groth16 cache directory, the CUDA library's (kernels/cuda/disk_cache.cuh):
 /// RISC0_G16_CACHE_DIR, else $XDG_CACHE_HOME/risc0-groth16, else ~/.cache/risc0-groth16.
-fn witness_len_cache_path() -> Option<std::path::PathBuf> {
-    let dir = std::env::var_os("RISC0_G16_CACHE_DIR")
+fn cache_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("RISC0_G16_CACHE_DIR")
         .map(std::path::PathBuf::from)
         .or_else(|| {
             std::env::var_os("XDG_CACHE_HOME")
@@ -323,8 +323,39 @@ fn witness_len_cache_path() -> Option<std::path::PathBuf> {
         .or_else(|| {
             std::env::var_os("HOME")
                 .map(|h| std::path::PathBuf::from(h).join(".cache/risc0-groth16"))
-        })?;
-    Some(dir.join("witness_len"))
+        })
+}
+
+/// `witness_len` in the Groth16 cache directory.
+fn witness_len_cache_path() -> Option<std::path::PathBuf> {
+    Some(cache_dir()?.join("witness_len"))
+}
+
+/// Delete the CUDA library's derived-data caches (compact coefficients, split-MSM corrections)
+/// and drop the prover built from them, so the next wrap rebuilds both from the proving key.
+/// See `prove::invalidate_caches`.
+pub(crate) fn invalidate_caches() {
+    if let Err(e) = release_srs() {
+        tracing::warn!("groth16: release after a failed seal check: {e:#}");
+    }
+    let Some(dir) = cache_dir() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if (name.starts_with("coeffs_compact_") || name.starts_with("split_corr_"))
+            && name.ends_with(".bin")
+        {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => tracing::warn!("groth16: removed cache file {name}"),
+                Err(e) => tracing::warn!("groth16: could not remove cache file {name}: {e}"),
+            }
+        }
+    }
 }
 
 fn witness_len_cache_read() -> Option<usize> {

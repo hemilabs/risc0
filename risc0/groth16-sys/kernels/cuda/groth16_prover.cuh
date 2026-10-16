@@ -61,11 +61,6 @@ static bool g16_tail_enabled() {
   return on;
 #endif
 }
-// Diagnostics on stderr with RISC0_VERBOSE set (as in rv32im-sys's CUDA library).
-static bool g16_verbose() {
-  static const bool on = getenv("RISC0_VERBOSE") != nullptr;
-  return on;
-}
 // The bit set S of the split MSMs (risc0_groth16_cuda_set_bit_signals, derived from the witness
 // graph by the Rust side).
 static std::mutex g16_bits_mu;
@@ -287,51 +282,46 @@ public:
   msm_split_t<bucket_t, point_t, affine_t> sp_a, sp_b1, sp_c;
   msm_split_t<bucket_fp2_t, point_fp2_t, affine_fp2_t> sp_b2;
 
-  static uint64_t fnv1a(uint64_t h, const void* p, size_t n) {
-    const uint8_t* b = (const uint8_t*)p;
-    for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 0x100000001b3ull; }
-    return h;
-  }
-  static std::string corr_cache_path(uint64_t key) {
-    std::string dir;
-    if (const char* d = getenv("RISC0_G16_CACHE_DIR")) dir = d;
-    else if (const char* x = getenv("XDG_CACHE_HOME")) dir = std::string(x) + "/risc0-groth16";
-    else if (const char* h = getenv("HOME")) dir = std::string(h) + "/.cache/risc0-groth16";
-    else return "";
-    char name[64];
-    snprintf(name, sizeof name, "/split_corr_%016llx.bin", (unsigned long long)key);
-    return dir + name;
-  }
+  // The corrections cache file (disk_cache.cuh).
   struct corr_file_t {
     char magic[8];
+    uint32_t version, point_size;
     uint64_t key;
     point_t a, b1, c;
     point_fp2_t b2;
+    uint64_t sum;  // FNV-1a of magic..b2
   };
+  static constexpr char kCorrMagic[8] = {'R', '0', 'G', '1', '6', 'C', 'O', 'R'};
+  static uint64_t corr_sum(const corr_file_t& cf) {
+    return g16_cache::fnv1a(g16_cache::kFnvBasis, &cf, (const char*)&cf.sum - (const char*)&cf);
+  }
   bool load_corr(const std::string& path, uint64_t key) {
     if (path.empty()) return false;
     std::ifstream f(path, std::ios::binary);
     if (!f.is_open()) return false;
     corr_file_t cf;
     f.read((char*)&cf, sizeof cf);
-    if (f.gcount() != (std::streamsize)sizeof cf || memcmp(cf.magic, "C2CORR01", 8) || cf.key != key)
+    if (f.gcount() != (std::streamsize)sizeof cf || memcmp(cf.magic, kCorrMagic, 8) ||
+        cf.version != g16_cache::kFormatVersion || cf.point_size != sizeof(point_t) ||
+        cf.key != key || cf.sum != corr_sum(cf))
       return false;
     sp_a.corr = cf.a; sp_b1.corr = cf.b1; sp_c.corr = cf.c; sp_b2.corr = cf.b2;
     return true;
   }
   void store_corr(const std::string& path, uint64_t key) {
     if (path.empty()) return;
-    std::string dir = path.substr(0, path.rfind('/'));
-    for (size_t i = 1; i <= dir.size(); i++)
-      if (i == dir.size() || dir[i] == '/') mkdir(dir.substr(0, i).c_str(), 0755);
     corr_file_t cf;
-    memcpy(cf.magic, "C2CORR01", 8);
+    memset((void*)&cf, 0, sizeof cf);
+    memcpy(cf.magic, kCorrMagic, 8);
+    cf.version = g16_cache::kFormatVersion;
+    cf.point_size = sizeof(point_t);
     cf.key = key; cf.a = sp_a.corr; cf.b1 = sp_b1.corr; cf.c = sp_c.corr; cf.b2 = sp_b2.corr;
-    std::string tmp = path + ".tmp" + std::to_string(getpid());
+    cf.sum = corr_sum(cf);
+    std::string tmp = g16_cache::tmp_path(path);
     {
       std::ofstream f(tmp, std::ios::binary);
       f.write((const char*)&cf, sizeof cf);
-      if (!f.good()) { remove(tmp.c_str()); return; }
+      if (!f.good()) { f.close(); remove(tmp.c_str()); return; }
     }
     rename(tmp.c_str(), path.c_str());
   }
@@ -408,16 +398,22 @@ public:
       ~dev_scratch() { (void)cudaFreeAsync(p, g); }
     } tmp{gpu, gpu.Dmalloc(n * sizeof(affine_fp2_t))};
 
-    // Cache key: the permutation, the sizes and a sample of the SRS file (srs.points_salt).
-    uint64_t key = 0xcbf29ce484222325ull;
-    key = fnv1a(key, perm.data(), perm.size() * 4);
-    key = fnv1a(key, perm_c.data(), perm_c.size() * 4);
+    // Cache key: the cache format, the permutation, the sizes, the SRS file (srs.points_salt:
+    // sampled bytes, size, mtime, inode) and the fuzz.
+    uint64_t key = g16_cache::kFnvBasis;
+    uint32_t format_id[3] = {g16_cache::kFormatVersion, (uint32_t)sizeof(point_t),
+                       (uint32_t)sizeof(point_fp2_t)};
+    key = g16_cache::fnv1a(key, format_id, sizeof format_id);
+    key = g16_cache::fnv1a(key, perm.data(), perm.size() * 4);
+    key = g16_cache::fnv1a(key, perm_c.data(), perm_c.size() * 4);
     size_t sizes[3] = {n, srs.get_c_size(), srs.get_num_public()};
-    key = fnv1a(key, sizes, sizeof sizes);
-    key = fnv1a(key, &srs.points_salt, sizeof srs.points_salt);
-    key = fnv1a(key, &fuzzed_results, sizeof fuzzed_results);
-    std::string cpath = corr_cache_path(key);
+    key = g16_cache::fnv1a(key, sizes, sizeof sizes);
+    key = g16_cache::fnv1a(key, &srs.points_salt, sizeof srs.points_salt);
+    key = g16_cache::fnv1a(key, &fuzzed_results, sizeof fuzzed_results);
+    std::string cpath = g16_cache::path("split_corr_", key);
     bool cached = load_corr(cpath, key);
+    if (!cached && g16_verbose())
+      fprintf(stderr, "groth16: computing split-MSM corrections (cache %s)\n", cpath.c_str());
     gpu.sync();  // the allocations
 
     // Permute in place: from here on the SRS points are in split order. Anything after this that

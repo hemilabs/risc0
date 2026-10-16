@@ -36,6 +36,12 @@ static bool g16_cold_enabled() {
   return on;
 }
 
+// Diagnostics on stderr with RISC0_VERBOSE set (as in rv32im-sys's CUDA library).
+static bool g16_verbose() {
+  static const bool on = getenv("RISC0_VERBOSE") != nullptr;
+  return on;
+}
+
 // Set once a background key load has run: from then on key uploads use the stager.
 static std::atomic<bool> g16_staged_upload{false};
 

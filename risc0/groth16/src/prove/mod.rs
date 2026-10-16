@@ -132,6 +132,15 @@ pub fn release_srs() -> Result<()> {
     }
 }
 
+/// Discard the Groth16 prover's derived-data caches: the files the CUDA library keeps in its cache
+/// directory (compact coefficients and split-MSM corrections, normally validated by format, key
+/// and checksum) and the prover cached in memory. For a caller whose Groth16 seal failed
+/// verification: the next [shrink_wrap] rebuilds them from the proving key. No-op without CUDA.
+pub fn invalidate_caches() {
+    #[cfg(feature = "cuda")]
+    self::cuda::invalidate_caches();
+}
+
 /// Like [shrink_wrap], but runs `pre_gpu` on the calling thread while the witness is computed on
 /// a helper thread (CUDA; elsewhere `pre_gpu` runs first). `pre_gpu` has returned before the GPU
 /// part of the wrap starts. Used to overlap releasing the STARK HAL's buffer pool (thread-local,
