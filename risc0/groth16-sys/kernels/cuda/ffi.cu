@@ -36,7 +36,11 @@ typedef fr_t scalar_t;
 #ifndef __HIPCC__
 #define SPPARK_DONT_INSTANTIATE_TEMPLATES
 #endif
+#ifdef __HIPCC__
+#include "msm/pippenger.cuh" // msm_c2 is CUDA-only (inline PTX, <cuda.h>)
+#else
 #include "msm_c2/pippenger.cuh"
+#endif
 
 #ifdef __HIPCC__
 // G2 MSM kernel explicit instantiations (G1 handled by pippenger.cuh defaults).

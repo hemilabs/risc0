@@ -51,6 +51,8 @@ namespace nvtx3 { struct scoped_range { scoped_range(const char*) {} }; }
 namespace cuda { namespace std { using ::std::array; } }
 #include <hip/hip_runtime.h>
 #include <hipcub/hipcub.hpp>
+// Not aliased by sppark's cuda2hip.hpp.
+static const auto cudaEventSynchronize = hipEventSynchronize;
 #else
 #include <cuda/std/array>
 #include <thrust/execution_policy.h>
