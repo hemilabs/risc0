@@ -207,11 +207,8 @@ pub(crate) fn try_host_chains_range(
     let mut start = lo;
     let mut num_rows = 0usize;
     for c in lo + 1..=n {
-        let closed = if c == n {
-            complete
-        } else {
-            cycles[c].is_par_safe != 0
-        };
+        // c == n: the end of the trace.
+        let closed = cycles.get(c).map_or(complete, |cy| cy.is_par_safe != 0);
         if closed {
             let len = c - start;
             if len >= min_len {

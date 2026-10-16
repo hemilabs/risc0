@@ -119,8 +119,7 @@ pub(crate) fn compile(nodes: &Nodes<U254, VecNodes>, signals: &[usize]) -> Optio
     }
     let mut fill = comp_off.clone();
     let mut comp_nodes = vec![0u32; comp_off[nc] as usize];
-    for i in 0..n {
-        let c = node_comp[i];
+    for (i, &c) in node_comp.iter().enumerate().take(n) {
         if c != u32::MAX {
             comp_nodes[fill[c as usize] as usize] = i as u32;
             fill[c as usize] += 1;

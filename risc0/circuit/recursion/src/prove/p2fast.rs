@@ -110,8 +110,8 @@ fn mix_canonical(c: &mut [u32; CELLS], k: &Consts) {
     let mut round = 0;
     mext(c);
     for _ in 0..ROUNDS_HALF_FULL {
-        for i in 0..CELLS {
-            c[i] = sbox(add(c[i], k.rc[round * CELLS + i]));
+        for (i, x) in c.iter_mut().enumerate() {
+            *x = sbox(add(*x, k.rc[round * CELLS + i]));
         }
         mext(c);
         round += 1;
@@ -120,14 +120,14 @@ fn mix_canonical(c: &mut [u32; CELLS], k: &Consts) {
         c[0] = sbox(add(c[0], k.rc[round * CELLS]));
         let s: u64 = c.iter().map(|&x| x as u64).sum();
         let s = red(s);
-        for i in 0..CELLS {
-            c[i] = add(s, mul(k.diag[i], c[i]));
+        for (x, &d) in c.iter_mut().zip(k.diag.iter()) {
+            *x = add(s, mul(d, *x));
         }
         round += 1;
     }
     for _ in 0..ROUNDS_HALF_FULL {
-        for i in 0..CELLS {
-            c[i] = sbox(add(c[i], k.rc[round * CELLS + i]));
+        for (i, x) in c.iter_mut().enumerate() {
+            *x = sbox(add(*x, k.rc[round * CELLS + i]));
         }
         mext(c);
         round += 1;

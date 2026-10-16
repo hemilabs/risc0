@@ -329,7 +329,11 @@ impl CudaHash for CudaHashSha256 {
 /// stream, which holds only that copy.
 fn wait_pageable_upload() {
     let res = unsafe { cust::sys::cuStreamSynchronize(std::ptr::null_mut()) };
-    assert_eq!(res, cust::sys::cudaError_enum::CUDA_SUCCESS, "cuStreamSynchronize failed");
+    assert_eq!(
+        res,
+        cust::sys::cudaError_enum::CUDA_SUCCESS,
+        "cuStreamSynchronize failed"
+    );
 }
 
 fn sync_persistent_stream() {

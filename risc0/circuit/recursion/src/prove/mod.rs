@@ -244,9 +244,8 @@ impl Prover {
         let split = false;
         let streaming = preflight_is_streaming(&preflight);
         let split_row = self.program.code_rows() * 3 / 5;
-        let mut early: Option<
-            std::thread::JoinHandle<Result<(Option<witgen::HostChains>, usize)>>,
-        > = None;
+        type EarlyChains = std::thread::JoinHandle<Result<(Option<witgen::HostChains>, usize)>>;
+        let mut early: Option<EarlyChains> = None;
         let mut early_at = 0.0f64;
         for (cycle, row) in self.program.code_by_row().enumerate() {
             preflight.step(cycle, row)?;
@@ -511,12 +510,12 @@ where
             .entry(ctrl_key)
             .or_insert_with(|| ctrl.clone());
         let mut cache = self.cached_ctrl_group.borrow_mut();
-        if !cache.contains_key(&ctrl_key) {
+        if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(ctrl_key) {
             let mut prover = risc0_zkp::prove::Prover::new(self.hal.as_ref(), TAPSET);
             prover.set_po2(program.po2);
             prover.commit_group(REGISTER_GROUP_CTRL, &ctrl);
             if let Some(group) = prover.get_group(REGISTER_GROUP_CTRL).cloned() {
-                cache.insert(ctrl_key, group);
+                e.insert(group);
             }
         }
         tracing::debug!(
