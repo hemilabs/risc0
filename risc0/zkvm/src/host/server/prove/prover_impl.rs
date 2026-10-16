@@ -20,7 +20,6 @@ static VERBOSE: LazyLock<bool> = LazyLock::new(|| std::env::var("RISC0_VERBOSE")
 
 use super::{keccak::prove_keccak, ProverServer};
 use risc0_circuit_rv32im::prove::SegmentProver;
-use risc0_core::field::{baby_bear::BabyBearExtElem as ExtVal, Elem as _};
 
 thread_local! {
     // ManuallyDrop prevents TLS cleanup from dropping CUDA buffers after the CUDA
@@ -211,7 +210,7 @@ impl ProverImpl {
                     segment.po2(),
                     max_po2
                 );
-                let rand_z = ExtVal::random(&mut rand::rng());
+                let rand_z = risc0_circuit_rv32im::prove::preflight_rand_z();
                 let preflight =
                     risc0_circuit_rv32im::prove::PreflightResults::new(&segment.inner, rand_z)?;
                 let po2 = preflight.po2();
@@ -756,11 +755,10 @@ impl ProverImpl {
                 // First segment: compute synchronously.
                 let segment = segment_ref.resolve()?;
                 #[cfg(feature = "cuda")]
-                let results = if rec_pipe::enabled()
-                    && self.opts.receipt_kind != ReceiptKind::Composite
-                {
+                let results = if rec_pipe.is_some() {
                     // Commit the recursion ctrl groups on the idle GPU while the CPU runs the
-                    // first segment's preflight.
+                    // first segment's preflight (for the recursion pipe, which lifts during the
+                    // session).
                     let po2 = segment.po2();
                     let g16 = self.opts.receipt_kind == ReceiptKind::Groth16;
                     let ropts = if self.opts.max_segment_po2 > crate::receipt::DEFAULT_MAX_PO2 {
@@ -781,7 +779,7 @@ impl ProverImpl {
                                 seg_ref.po2(),
                                 max_po2
                             );
-                            let rand_z = ExtVal::random(&mut rand::rng());
+                            let rand_z = risc0_circuit_rv32im::prove::preflight_rand_z();
                             let inner = risc0_circuit_rv32im::prove::PreflightResults::new(
                                 &seg_ref.inner,
                                 rand_z,
@@ -842,7 +840,7 @@ impl ProverImpl {
                         next_segment.po2(),
                         max_po2
                     );
-                    let rand_z = ExtVal::random(&mut rand::rng());
+                    let rand_z = risc0_circuit_rv32im::prove::preflight_rand_z();
                     let inner = risc0_circuit_rv32im::prove::PreflightResults::new(
                         &next_segment.inner,
                         rand_z,
@@ -883,6 +881,12 @@ impl ProverImpl {
             // segment's receipt and lift preparation start one iteration earlier.
             let mut cur_meta = Some((po2, segment_index, output, hashfn));
             let prev_seal = if early_seal {
+                // prove_begin returns no seal in this mode: it finalized the previous segment
+                // when that one began.
+                ensure!(
+                    prev_seal.is_none(),
+                    "segment pipeline: unexpected seal from prove_begin with the early seal"
+                );
                 prev_seal_meta = cur_meta.take();
                 Some(with_segment_prover(|sp| sp.prove_end())?)
             } else {

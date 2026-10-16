@@ -25,6 +25,18 @@ use crate::execute::segment::Segment;
 
 pub use witgen::PreflightResults;
 
+/// The `rand_z` of a segment preflight ([PreflightResults::new]): random, or one with the
+/// `witgen_debug` feature (reproducible witnesses).
+pub fn preflight_rand_z() -> crate::zirgen::circuit::ExtVal {
+    cfg_if! {
+        if #[cfg(feature = "witgen_debug")] {
+            <crate::zirgen::circuit::ExtVal as risc0_core::field::Elem>::ONE
+        } else {
+            <crate::zirgen::circuit::ExtVal as risc0_core::field::Elem>::random(&mut rand::rng())
+        }
+    }
+}
+
 const GLOBAL_MIX: usize = 0;
 const GLOBAL_OUT: usize = 1;
 

@@ -193,15 +193,7 @@ where
     fn preflight(&self, segment: &Segment) -> Result<PreflightResults> {
         scope!("preflight");
 
-        cfg_if::cfg_if! {
-            if #[cfg(feature = "witgen_debug")] {
-                let rand_z = ExtVal::ONE;
-            } else {
-                let mut rng = rand::rng();
-                let rand_z = ExtVal::random(&mut rng);
-            }
-        }
-        PreflightResults::new(segment, rand_z)
+        PreflightResults::new(segment, super::preflight_rand_z())
     }
 
     fn prove_core(&self, preflight_results: PreflightResults) -> Result<Seal> {
