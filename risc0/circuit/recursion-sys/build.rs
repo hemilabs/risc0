@@ -314,6 +314,40 @@ fn build_cuda_kernels() {
         .include(&cxx_root)
         .include(&sppark_root)
         .compile("risc0_recursion_cuda");
+
+    // C2 prototype: the split eval_check, compiled standalone (NO --device-c): relocatable
+    // device code makes it ~25% slower (6.3 vs 4.9 ms per proof).
+    let out_dir = std::path::PathBuf::from(env::var("OUT_DIR").unwrap());
+    let obj = out_dir.join("eval_check_split_standalone.o");
+    let mut cmd = risc0_build_kernel::nvcc_command();
+    cmd.current_dir("kernels/cuda")
+        .arg("-ccbin=c++")
+        .arg("-Xcompiler")
+        .arg("-O3,-fPIC")
+        .arg(risc0_build_kernel::cuda_cxx_std_flag())
+        .arg("-m64")
+        .arg("-Xptxas")
+        .arg("-O3")
+        .arg("-DFEATURE_BABY_BEAR")
+        .arg("-diag-suppress=177,550,2922")
+        .arg("-I")
+        .arg(&cuda_root)
+        .arg("-I")
+        .arg(&cxx_root)
+        .arg("-I")
+        .arg(&sppark_root);
+    if env::var_os("NVCC_PREPEND_FLAGS").is_none() && env::var_os("NVCC_APPEND_FLAGS").is_none() {
+        cmd.arg("-arch=native");
+    }
+    let status = cmd
+        .arg("-c")
+        .arg("eval_check_split.cu")
+        .arg("-o")
+        .arg(&obj)
+        .status()
+        .expect("nvcc eval_check_split.cu");
+    assert!(status.success(), "nvcc failed for eval_check_split.cu");
+    risc0_build_kernel::add_to_static_lib(&out_dir, "risc0_recursion_cuda", &[obj]);
 }
 
 fn build_rocm_kernels() {

@@ -592,7 +592,36 @@ impl ProverImpl {
             .as_ref()
             .ok_or_else(|| anyhow!("segment receipt verifier parameters missing from context"))?
             .digest();
-        let mut pending_receipt: Option<std::thread::JoinHandle<Result<SegmentReceipt>>> = None;
+        #[cfg(feature = "cuda")]
+        type LiftPrepOpt = Option<rec_pipe::Prep>;
+        #[cfg(not(feature = "cuda"))]
+        type LiftPrepOpt = Option<()>;
+        let mut pending_receipt: Option<std::thread::JoinHandle<Result<(SegmentReceipt, LiftPrepOpt)>>> = None;
+        // C2 prototype: lift/join during segment proving (see rec_pipe).
+        #[cfg(feature = "cuda")]
+        let mut rec_pipe: Option<rec_pipe::RecPipe> = {
+            let m = rec_pipe::mode();
+            if m != 0
+                && self.opts.receipt_kind != ReceiptKind::Composite
+                && session.povw_job_id.is_none()
+                && session.assumptions.is_empty()
+                && session.pending_keccaks.is_empty()
+            {
+                let recursion_opts = if self.opts.max_segment_po2 > crate::receipt::DEFAULT_MAX_PO2 {
+                    ProverOpts::from_max_po2(self.opts.max_segment_po2)
+                        .with_receipt_kind(ReceiptKind::Succinct)
+                } else {
+                    ProverOpts::succinct()
+                };
+                Some(rec_pipe::RecPipe::new(recursion_opts, m == 1))
+            } else {
+                None
+            }
+        };
+        #[cfg(feature = "cuda")]
+        let lift_opts: Option<ProverOpts> = rec_pipe.as_ref().map(|p| p.opts());
+        #[cfg(not(feature = "cuda"))]
+        let lift_opts: Option<ProverOpts> = None;
         // Metadata from the previous iteration, paired with the seal returned by prove_begin.
         let mut prev_seal_meta: Option<(u32, u32, Option<Output>, String)> = None;
 
@@ -766,14 +795,22 @@ impl ProverImpl {
             if let Some(seal) = prev_seal {
                 // Collect the background receipt from the segment before that.
                 if let Some(handle) = pending_receipt.take() {
-                    let receipt = handle
+                    let (receipt, _prep) = handle
                         .join()
                         .map_err(|_| anyhow!("receipt thread panicked"))??;
                     // Multi-GPU: send receipt to recursion worker for parallel lift+join
                     if let Some(ref tx) = recursion_tx {
                         let _ = tx.send(receipt.clone());
                     }
+                    #[cfg(feature = "cuda")]
+                    if let (Some(p), Some(prep)) = (rec_pipe.as_mut(), _prep) {
+                        p.add(segments.len(), prep, Some(receipt.claim.clone()));
+                    }
                     segments.push(receipt);
+                    #[cfg(feature = "cuda")]
+                    if let Some(p) = rec_pipe.as_mut() {
+                        p.poll()?;
+                    }
                 }
 
                 // Start background receipt for the PREVIOUS segment.
@@ -783,6 +820,7 @@ impl ProverImpl {
                 let params = verify_params.clone();
                 let vp_digest = seg_verifier_params_digest;
                 let skip_verify_copy = skip_verify;
+                let lift_opts_copy = lift_opts.clone();
                 pending_receipt = Some(std::thread::spawn(move || {
                     let mut claim = ReceiptClaim::decode_from_seal_v2(&seal, Some(prev_po2))?;
                     claim.output = prev_output.into();
@@ -793,6 +831,10 @@ impl ProverImpl {
                         claim,
                         verifier_parameters: vp_digest,
                     };
+                    #[cfg(feature = "cuda")]
+                    let prep = lift_opts_copy.map(|o| rec_pipe::spawn_lift_prep(receipt.clone(), o));
+                    #[cfg(not(feature = "cuda"))]
+                    let prep = { let _ = lift_opts_copy; None };
                     if !skip_verify_copy {
                         receipt
                             .verify_integrity_with_context(&VerifierContext {
@@ -801,7 +843,7 @@ impl ProverImpl {
                             })
                             .with_context(|| format!("verify segment {prev_seg_idx}"))?;
                     }
-                    Ok(receipt)
+                    Ok((receipt, prep))
                 }));
             }
 
@@ -828,57 +870,52 @@ impl ProverImpl {
         // Complete the last segment's deferred finalize.
         let last_seal = with_segment_prover(|sp| sp.prove_end())?;
 
-        // Build the last segment's receipt and verify it on its own thread while the
-        // second-to-last one (started after the previous prove_begin) finishes verifying: the two
-        // CPU verifications overlap instead of running back to back at the end of the session
-        // (12 ms at po2=20, 24 ms at po2=21).
-        let last_receipt = {
-            let (last_po2, last_seg_idx, last_output, last_hashfn) = prev_seal_meta
-                .take()
-                .ok_or_else(|| anyhow!("segment pipeline: seal without metadata"))?;
-            let mut claim = ReceiptClaim::decode_from_seal_v2(&last_seal, Some(last_po2))?;
-            claim.output = last_output.into();
-            SegmentReceipt {
-                seal: last_seal,
-                index: last_seg_idx,
-                hashfn: last_hashfn,
-                claim,
-                verifier_parameters: seg_verifier_params_digest,
-            }
-        };
-        let last_verify = {
-            let params = verify_params.clone();
-            std::thread::spawn(move || -> Result<SegmentReceipt> {
-                if !skip_verify {
-                    last_receipt
-                        .verify_integrity_with_context(&VerifierContext {
-                            segment_verifier_parameters: params,
-                            ..VerifierContext::empty()
-                        })
-                        .with_context(|| format!("verify segment (last) {}", last_receipt.index))?;
-                }
-                Ok(last_receipt)
-            })
-        };
-
         // Collect the second-to-last receipt (if any).
         if let Some(handle) = pending_receipt.take() {
-            let receipt = handle
+            let (receipt, _prep) = handle
                 .join()
                 .map_err(|_| anyhow!("receipt thread panicked"))??;
             // Multi-GPU: send to recursion worker
             if let Some(ref tx) = recursion_tx {
                 let _ = tx.send(receipt.clone());
             }
+            #[cfg(feature = "cuda")]
+            if let (Some(p), Some(prep)) = (rec_pipe.as_mut(), _prep) {
+                p.add(segments.len(), prep, Some(receipt.claim.clone()));
+            }
             segments.push(receipt);
         }
 
-        // The last segment's receipt.
-        segments.push(
-            last_verify
-                .join()
-                .map_err(|_| anyhow!("receipt thread panicked"))??,
-        );
+        // Process the last segment's seal.
+        {
+            let (last_po2, last_seg_idx, last_output, last_hashfn) = prev_seal_meta
+                .take()
+                .ok_or_else(|| anyhow!("segment pipeline: seal without metadata"))?;
+            let mut claim = ReceiptClaim::decode_from_seal_v2(&last_seal, Some(last_po2))?;
+            claim.output = last_output.into();
+            let receipt = SegmentReceipt {
+                seal: last_seal,
+                index: last_seg_idx,
+                hashfn: last_hashfn,
+                claim,
+                verifier_parameters: seg_verifier_params_digest,
+            };
+            // The last lift's claim is the merged one, set when the pipe drains.
+            #[cfg(feature = "cuda")]
+            if let Some(p) = rec_pipe.as_mut() {
+                let o = p.opts();
+                p.add(segments.len(), rec_pipe::spawn_lift_prep(receipt.clone(), o), None);
+            }
+            if !skip_verify {
+                receipt
+                    .verify_integrity_with_context(&VerifierContext {
+                        segment_verifier_parameters: verify_params.clone(),
+                        ..VerifierContext::empty()
+                    })
+                    .with_context(|| format!("verify segment (last) {}", receipt.index))?;
+            }
+            segments.push(receipt);
+        }
 
         let (assumptions, session_assumption_receipts): (Vec<_>, Vec<_>) =
             session.assumptions.iter().cloned().unzip();
@@ -1009,6 +1046,15 @@ impl ProverImpl {
                     let work_receipt = self.composite_to_succinct_povw(&composite_receipt)?;
                     let unwrapped = self.unwrap_povw(&work_receipt)?;
                     (unwrapped, Some(work_receipt), None)
+                }
+                #[cfg(feature = "cuda")]
+                false if rec_pipe.is_some() => {
+                    let n = composite_receipt.segments.len();
+                    let last = composite_receipt.segments.last().unwrap().claim.clone();
+                    let t = std::time::Instant::now();
+                    let r = rec_pipe.take().unwrap().drain(last, n)?;
+                    eprintln!("[composite_to_succinct] c2 rec pipe tail: {:.1}ms", t.elapsed().as_secs_f64() * 1e3);
+                    (r, None, None)
                 }
                 false => (self.composite_to_succinct(&composite_receipt)?, None, None),
             }
@@ -1650,4 +1696,209 @@ fn check_claims(
         );
     }
     Ok(())
+}
+
+/// C2 prototype: lift (and left-fold join) segment receipts on the main thread between segment
+/// proofs, with every preparation (preflight + host chains) on background threads.
+/// RISC0_C2_REC_INTERLEAVE=1: interleave with segment proving; =2: prepare lifts early but run
+/// everything after the last segment (tail scheduling only). Unset/0: the existing path.
+#[cfg(feature = "cuda")]
+mod rec_pipe {
+    use super::*;
+    use crate::host::recursion::prove::{make_succinct_receipt, Prover as Job};
+    use std::collections::BTreeMap;
+    use std::thread::JoinHandle;
+    use std::time::Instant;
+
+    pub(super) type Prep = JoinHandle<Result<(Job, f64)>>;
+
+    pub(super) fn mode() -> u32 {
+        std::env::var("RISC0_C2_REC_INTERLEAVE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    }
+
+    pub(super) fn spawn_lift_prep(seal_receipt: SegmentReceipt, opts: ProverOpts) -> Prep {
+        std::thread::spawn(move || {
+            let t = Instant::now();
+            let mut p = Job::new_lift(&seal_receipt, opts)?;
+            p.prepare()?;
+            Ok((p, t.elapsed().as_secs_f64() * 1e3))
+        })
+    }
+
+    pub(super) struct RecPipe {
+        opts: ProverOpts,
+        pub(super) interleave: bool,
+        lift_preps: BTreeMap<usize, (Prep, Option<ReceiptClaim>)>,
+        lifted: BTreeMap<usize, SuccinctReceipt<ReceiptClaim>>,
+        acc: Option<SuccinctReceipt<ReceiptClaim>>,
+        next: usize,
+        join: Option<(Prep, ReceiptClaim)>,
+        last_claim: Option<ReceiptClaim>,
+        warmed: bool,
+        t0: Instant,
+        gpu_ms: f64,
+    }
+
+    impl RecPipe {
+        pub(super) fn new(opts: ProverOpts, interleave: bool) -> Self {
+            Self {
+                opts,
+                interleave,
+                lift_preps: BTreeMap::new(),
+                lifted: BTreeMap::new(),
+                acc: None,
+                next: 0,
+                join: None,
+                last_claim: None,
+                warmed: false,
+                t0: Instant::now(),
+                gpu_ms: 0.0,
+            }
+        }
+
+        pub(super) fn opts(&self) -> ProverOpts {
+            self.opts.clone()
+        }
+
+        pub(super) fn add(&mut self, idx: usize, prep: Prep, claim: Option<ReceiptClaim>) {
+            self.lift_preps.insert(idx, (prep, claim));
+        }
+
+        fn ms(&self) -> f64 {
+            self.t0.elapsed().as_secs_f64() * 1e3
+        }
+
+        fn warm(&mut self) {
+            if !self.warmed {
+                join_cuda_rec_warmup();
+                self.warmed = true;
+            }
+        }
+
+        fn maybe_start_join(&mut self) -> Result<()> {
+            if self.join.is_some() {
+                return Ok(());
+            }
+            if self.acc.is_none() && self.next == 0 {
+                if let Some(l0) = self.lifted.remove(&0) {
+                    self.acc = Some(l0);
+                    self.next = 1;
+                }
+            }
+            if self.acc.is_some() && self.lifted.contains_key(&self.next) {
+                let a = self.acc.take().unwrap();
+                let b = self.lifted.remove(&self.next).unwrap();
+                let claim = a.claim.join(&b.claim)?.value()?;
+                let opts = self.opts.clone();
+                let h = std::thread::spawn(move || {
+                    let t = Instant::now();
+                    let mut p = Job::new_join(&a, &b, opts)?;
+                    p.prepare()?;
+                    Ok((p, t.elapsed().as_secs_f64() * 1e3))
+                });
+                self.join = Some((h, claim));
+                self.next += 1;
+            }
+            Ok(())
+        }
+
+        /// Run one ready unit of GPU work; with `block`, wait for one if none is ready.
+        /// Returns false when nothing was run (and, with `block`, nothing remains).
+        fn step(&mut self, block: bool) -> Result<bool> {
+            self.maybe_start_join()?;
+            if self.join.as_ref().is_some_and(|(h, _)| h.is_finished()) {
+                let (h, claim) = self.join.take().unwrap();
+                let (mut job, prep_ms) = h.join().map_err(|_| anyhow!("join prep panicked"))??;
+                self.warm();
+                let t = Instant::now();
+                let at = self.ms();
+                let receipt = job.run()?;
+                let decoded = ReceiptClaim::decode(&mut receipt.out_stream())?;
+                let merged = decoded.merge(&claim)?;
+                self.acc = Some(make_succinct_receipt(job, receipt, merged)?);
+                let run_ms = t.elapsed().as_secs_f64() * 1e3;
+                self.gpu_ms += run_ms;
+                if *VERBOSE {
+                    eprintln!("[c2_rec] join ->{} at {at:.1} prep={prep_ms:.1} run={run_ms:.1}", self.next - 1);
+                }
+                return Ok(true);
+            }
+            let ready = self
+                .lift_preps
+                .iter()
+                .find(|(_, (h, c))| h.is_finished() && (c.is_some() || self.last_claim.is_some()))
+                .map(|(k, _)| *k);
+            if let Some(k) = ready {
+                let (h, claim) = self.lift_preps.remove(&k).unwrap();
+                let claim = match claim {
+                    Some(c) => c,
+                    None => self.last_claim.clone().unwrap(),
+                };
+                let (mut job, prep_ms) = h.join().map_err(|_| anyhow!("lift prep panicked"))??;
+                self.warm();
+                let t = Instant::now();
+                let at = self.ms();
+                let receipt = job.run()?;
+                let decoded = ReceiptClaim::decode(&mut receipt.out_stream())?;
+                let merged = decoded.merge(&claim)?;
+                self.lifted.insert(k, make_succinct_receipt(job, receipt, merged)?);
+                let run_ms = t.elapsed().as_secs_f64() * 1e3;
+                self.gpu_ms += run_ms;
+                if *VERBOSE {
+                    eprintln!("[c2_rec] lift {k} at {at:.1} prep={prep_ms:.1} run={run_ms:.1}");
+                }
+                return Ok(true);
+            }
+            if !block {
+                return Ok(false);
+            }
+            if self.join.is_none() && self.lift_preps.is_empty() && self.lifted.is_empty() {
+                return Ok(false);
+            }
+            std::thread::sleep(std::time::Duration::from_micros(100));
+            Ok(true)
+        }
+
+        /// Run all work whose preparation is done, without waiting.
+        pub(super) fn poll(&mut self) -> Result<()> {
+            if !self.interleave {
+                return Ok(());
+            }
+            let t = Instant::now();
+            let mut n = 0;
+            while self.step(false)? {
+                n += 1;
+            }
+            if *VERBOSE && n > 0 {
+                eprintln!(
+                    "[c2_rec] poll ran {n} proofs in {:.1}ms",
+                    t.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            Ok(())
+        }
+
+        pub(super) fn drain(
+            mut self,
+            last_claim: ReceiptClaim,
+            num_segments: usize,
+        ) -> Result<SuccinctReceipt<ReceiptClaim>> {
+            let t = Instant::now();
+            self.last_claim = Some(last_claim);
+            while self.step(true)? {}
+            ensure!(self.next == num_segments || (num_segments == 1 && self.acc.is_some()),
+                "c2 rec pipe: folded {} of {num_segments} segments", self.next);
+            if *VERBOSE {
+                eprintln!(
+                    "[c2_rec] drain {:.1}ms (total recursion run {:.1}ms)",
+                    t.elapsed().as_secs_f64() * 1e3,
+                    self.gpu_ms
+                );
+            }
+            self.acc.ok_or_else(|| anyhow!("c2 rec pipe: no receipt"))
+        }
+    }
 }

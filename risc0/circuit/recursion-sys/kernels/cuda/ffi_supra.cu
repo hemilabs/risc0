@@ -13,11 +13,23 @@
 // limitations under the License.
 
 #include "cuda.h"
+#include <cstdlib>
 #include "supra/fp.h"
 
 extern __constant__ FpExt poly_mix[158];
 
 namespace risc0::circuit::recursion::cuda {
+
+#ifndef __HIPCC__
+// eval_check_split.cu (C2 prototype): the same polynomial in several smaller kernels.
+void eval_check_split(cudaStream_t stream, Fp* check, const Fp* ctrl, const Fp* data, const Fp* accum,
+                      const Fp* mix, const Fp* out, Fp rou, uint32_t po2, uint32_t domain,
+                      const void* poly_mix_host);
+static bool use_split() {
+  static const bool on = [] { const char* e = getenv("RISC0_C2_REC_EC_SPLIT"); return e && e[0] == '1'; }();
+  return on;
+}
+#endif
 
 __device__ FpExt poly_fp(uint32_t idx,
                          uint32_t size,
@@ -88,6 +100,12 @@ extern "C" const char* risc0_circuit_recursion_cuda_eval_check(Fp* check,
       cudaMemcpyToSymbolAsync(poly_mix, poly_mix_staging, sizeof(poly_mix),
                               0, cudaMemcpyHostToDevice, stream);
     }
+#endif
+#ifndef __HIPCC__
+    if (risc0::circuit::recursion::cuda::use_split()) {
+      risc0::circuit::recursion::cuda::eval_check_split(stream, check, ctrl, data, accum, mix, out, rou,
+                                                        po2, domain, poly_mix_pows);
+    } else
 #endif
     risc0::circuit::recursion::cuda::eval_check<<<cfg.grid, cfg.block, 0, stream>>>(
         check, ctrl, data, accum, mix, out, rou, po2, domain);
