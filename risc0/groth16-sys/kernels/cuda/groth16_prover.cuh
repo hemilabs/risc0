@@ -382,6 +382,17 @@ public:
     auto fr_alloc = [&](size_t k) { return gpu_ptr_t<fr_t>((fr_t*)gpu.Dmalloc(k * sizeof(fr_t))); };
     split_sn = fr_alloc(n); split_sn_c = fr_alloc(srs.get_c_size());
     split_bad = gpu_ptr_t<int>((int*)gpu.Dmalloc(sizeof(int)));
+    sp_a.template alloc<1>(gpu);
+    sp_b1.template alloc<1>(gpu);
+    sp_b2.template alloc<2>(gpu);
+    sp_c.template alloc<1>(gpu);
+    // The permutation's staging buffer, sized for the largest points (G2); freed (stream-ordered)
+    // when this returns or throws.
+    struct dev_scratch {
+      const gpu_t& g;
+      void* p;
+      ~dev_scratch() { (void)cudaFreeAsync(p, g); }
+    } tmp{gpu, gpu.Dmalloc(n * sizeof(affine_fp2_t))};
 
     // Cache key: the permutation, the sizes and a sample of the SRS file (srs.points_salt).
     uint64_t key = 0xcbf29ce484222325ull;
@@ -391,17 +402,20 @@ public:
     key = fnv1a(key, sizes, sizeof sizes);
     key = fnv1a(key, &srs.points_salt, sizeof srs.points_salt);
     key = fnv1a(key, &fuzzed_results, sizeof fuzzed_results);
-
-    // Permute in place (from here on the SRS is in split order).
-    srs.split_permuted = true;
-    sp_a.template init<64, 1>(gpu, (affine_t*)&srs.get_a()[0], &split_perm[0], n, split_nn);
-    sp_b1.template init<64, 1>(gpu, (affine_t*)&srs.get_b_g1()[0], &split_perm[0], n, split_nn);
-    sp_b2.template init<128, 2>(gpu, (affine_fp2_t*)&srs.get_b_g2()[0], &split_perm[0], n, split_nn);
-    sp_c.template init<64, 1>(gpu, (affine_t*)&srs.get_c()[0], &split_perm_c[0], srs.get_c_size(), split_nn_c);
-    gpu.sync();
-
     std::string cpath = corr_cache_path(key);
     bool cached = load_corr(cpath, key);
+    gpu.sync();  // the allocations
+
+    // Permute in place: from here on the SRS points are in split order. Anything after this that
+    // throws leaves them permuted; the caller then drops the SRS (build_cached_prover in ffi.cu),
+    // so a later prover reloads it instead of building on the permuted points.
+    srs.split_permuted = true;
+    sp_a.template permute<64>(gpu, (affine_t*)&srs.get_a()[0], &split_perm[0], n, split_nn, tmp.p);
+    sp_b1.template permute<64>(gpu, (affine_t*)&srs.get_b_g1()[0], &split_perm[0], n, split_nn, tmp.p);
+    sp_b2.template permute<128>(gpu, (affine_fp2_t*)&srs.get_b_g2()[0], &split_perm[0], n, split_nn, tmp.p);
+    sp_c.template permute<64>(gpu, (affine_t*)&srs.get_c()[0], &split_perm_c[0], srs.get_c_size(), split_nn_c, tmp.p);
+    gpu.sync();
+
     if (!cached) {
       // corr = -MSM(P_nb, f_nb); split_sn / split_sn_c are scratch here.
       split_gather_add<<<gpu.sm_count() * 4, 256, 0, gpu>>>(&split_sn[0], &d_fuzz[0], nullptr, &split_perm[0], split_nn);

@@ -176,6 +176,25 @@ static groth16_prover* cached_prover[kMaxDevices] = {};
 static std::mutex cached_mutex;
 static std::mutex prove_mutex[kMaxDevices];
 
+// Builds the cached prover for `dev` on its cached SRS (caller holds cached_mutex). A prover whose
+// construction throws after it started permuting the SRS points in place (the split MSMs, see
+// groth16_prover::split_init) leaves them permuted: drop that SRS too, so the next prove reloads
+// it instead of failing on (or building a prover over) permuted points.
+static void build_cached_prover(int dev, const SetupParams* setup_params) {
+  try {
+    cached_prover[dev] = new groth16_prover(
+        *cached_srs[dev], setup_params->pcoeffs_path, setup_params->fres_path);
+  } catch (...) {
+    if (cached_srs[dev]->split_permuted) {
+      // Work queued on the SRS buffers (the permutation) must finish before they are freed.
+      (void)cudaDeviceSynchronize();
+      delete cached_srs[dev];
+      cached_srs[dev] = nullptr;
+    }
+    throw;
+  }
+}
+
 // The current device, checked to index the per-device caches.
 static int current_device() {
   int dev = 0;
@@ -249,8 +268,7 @@ extern "C" const char* risc0_groth16_cuda_preload(SetupParams* setup_params) {
       cached_srs[dev] = new SRS(dev, setup_params->srs_path);
     }
     if (!cached_prover[dev]) {
-      cached_prover[dev] = new groth16_prover(
-          *cached_srs[dev], setup_params->pcoeffs_path, setup_params->fres_path);
+      build_cached_prover(dev, setup_params);
     }
   } catch (const std::exception& err) {
     return strdup(err.what());
@@ -288,8 +306,7 @@ extern "C" const char* risc0_groth16_cuda_prestart(SetupParams* setup_params,
       cached_srs[dev] = new SRS(dev, setup_params->srs_path);
     }
     if (!cached_prover[dev]) {
-      cached_prover[dev] = new groth16_prover(
-          *cached_srs[dev], setup_params->pcoeffs_path, setup_params->fres_path);
+      build_cached_prover(dev, setup_params);
     }
     *witness_len = cached_srs[dev]->get_a_size();
     *loaded = 1;
@@ -321,8 +338,7 @@ extern "C" const char* risc0_groth16_cuda_prove(SetupParams* setup_params,
         cached_srs[dev] = new SRS(dev, setup_params->srs_path);
       }
       if (!cached_prover[dev]) {
-        cached_prover[dev] = new groth16_prover(
-            *cached_srs[dev], setup_params->pcoeffs_path, setup_params->fres_path);
+        build_cached_prover(dev, setup_params);
       }
       prover = cached_prover[dev];
     }

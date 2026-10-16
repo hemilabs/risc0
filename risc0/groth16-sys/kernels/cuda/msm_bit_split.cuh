@@ -87,24 +87,25 @@ struct msm_split_t {
   size_t nthr = 0;
   point_t corr;                     // -MSM(P_nb, f_nb)
 
-  // Permutes pts[0,n) in place to pts[perm[i]] (perm = [non-bit | bit] indices) through a
-  // temporary buffer, all on `gpu`'s stream.
-  template <int PTB, int DEG>
-  void init(const gpu_t& gpu, affine_t* pts, const uint32_t* d_perm, size_t n, size_t nn) {
-    {
-      affine_t* tmp = (affine_t*)gpu.Dmalloc(n * sizeof(affine_t));
-      split_gather_pts<PTB><<<gpu.sm_count() * 4, 256, 0, gpu>>>(tmp, pts, d_perm, n);
-      CUDA_OK(cudaGetLastError());
-      CUDA_OK(cudaMemcpyAsync(pts, tmp, n * sizeof(affine_t), cudaMemcpyDeviceToDevice, gpu));
-      gpu.Dfree(tmp);
-    }
-    pn = pts;
-    pb = pts + nn;
-    // DEG: lanes per point on the device (1 for G1, 2 for G2); the host's bucket_t::degree
-    // is 1 for both, so it is passed explicitly. The buffer is over-allocated 2x.
+  // Allocates the bit-sum buffer. DEG: lanes per point on the device (1 for G1, 2 for G2); the
+  // host's bucket_t::degree is 1 for both, so it is passed explicitly. Over-allocated 2x.
+  template <int DEG>
+  void alloc(const gpu_t& gpu) {
     nthr = (size_t)gpu.sm_count() * 2 * 256 / DEG;
     acc = gpu_ptr_t<typename bucket_t::mem_t>(
         (typename bucket_t::mem_t*)gpu.Dmalloc(2 * nthr * sizeof(bucket_t)));
+  }
+
+  // Permutes pts[0,n) in place to pts[perm[i]] (perm = [non-bit | bit] indices) through `tmp`
+  // (room for n points), all on `gpu`'s stream. Allocates nothing.
+  template <int PTB>
+  void permute(const gpu_t& gpu, affine_t* pts, const uint32_t* d_perm, size_t n, size_t nn,
+               void* tmp) {
+    split_gather_pts<PTB><<<gpu.sm_count() * 4, 256, 0, gpu>>>(tmp, pts, d_perm, n);
+    CUDA_OK(cudaGetLastError());
+    CUDA_OK(cudaMemcpyAsync(pts, tmp, n * sizeof(affine_t), cudaMemcpyDeviceToDevice, gpu));
+    pn = pts;
+    pb = pts + nn;
   }
 
   // launches the bit sum + reduction on `gpu`; acc[0] holds the sum
