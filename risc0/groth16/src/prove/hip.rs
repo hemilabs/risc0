@@ -148,20 +148,26 @@ pub(crate) fn shrink_wrap(seal_bytes: &[u8]) -> Result<Seal> {
     let setup_params_clone =
         SetupParams::new(&root_dir).context("failed to create groth16 setup params for preload")?;
     let preload_handle = std::thread::spawn(move || {
+        let t0 = std::time::Instant::now();
         risc0_zkp::hal::hip::switch_to_device(groth16_device);
-        risc0_groth16_sys::preload(&setup_params_clone)
+        let result = risc0_groth16_sys::preload(&setup_params_clone);
+        (result, t0.elapsed().as_secs_f64() * 1000.0)
     });
 
     // Compute circom witness on CPU (~2s) — overlaps with SRS preload
+    let t0 = std::time::Instant::now();
     let witness_params = WitnessParams::new(&root_dir);
     let witness = calc_witness_binary(&witness_params.graph_path, iop_values)
         .context("failed to calculate groth16 witness")?;
+    let witness_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     // Wait for SRS preload to finish
-    preload_handle
+    let t0 = std::time::Instant::now();
+    let (preloaded, preload_ms) = preload_handle
         .join()
-        .map_err(|_| anyhow::anyhow!("SRS preload thread panicked"))?
-        .context("SRS preload failed")?;
+        .map_err(|_| anyhow::anyhow!("SRS preload thread panicked"))?;
+    preloaded.context("SRS preload failed")?;
+    let preload_wait_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     {
         let _lock = risc0_zkp::hal::hip::singleton_for_device(groth16_device).lock();
@@ -180,7 +186,8 @@ pub(crate) fn shrink_wrap(seal_bytes: &[u8]) -> Result<Seal> {
 
         eprintln!(
             "[groth16_shrink_wrap] rzup={setup_ms:.1}ms seal_convert={seal_convert_ms:.1}ms \
-             clear_pool={clear_ms:.1}ms gpu_prove={prove_ms:.1}ms read_proof={read_ms:.1}ms \
+             clear_pool={clear_ms:.1}ms witness={witness_ms:.1}ms preload={preload_ms:.1}ms \
+             preload_wait={preload_wait_ms:.1}ms gpu_prove={prove_ms:.1}ms read_proof={read_ms:.1}ms \
              device={groth16_device} total={:.1}ms",
             t_total.elapsed().as_secs_f64() * 1000.0,
         );

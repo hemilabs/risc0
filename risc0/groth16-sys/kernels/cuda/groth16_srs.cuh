@@ -1,5 +1,7 @@
 #pragma once
 
+#include "pinned_file.cuh"
+
 #if !defined(__HIP_DEVICE_COMPILE__)
 
 #ifdef _WIN32
@@ -212,7 +214,15 @@ public:
 
 #ifdef _WIN32
     size_t srs_file_size;
+#ifdef GROTH16_PINNED_FILES
+    const byte* srs_ptr = (const byte*)groth16_pinned_file(srs_path, &srs_file_size);
+    const bool srs_pinned = srs_ptr != nullptr;
+    if (!srs_pinned)
+      srs_ptr = srs_map_file(srs_path, &srs_file_size);
+#else
+    const bool srs_pinned = false;
     const byte* srs_ptr = srs_map_file(srs_path, &srs_file_size);
+#endif
 #else
     int srs_file = open(srs_path, O_RDONLY);
 
@@ -398,10 +408,12 @@ public:
 #endif
 
       ld.sync();
-      munmap(const_cast<byte*>(srs_ptr), srs_file_size);
+      if (!srs_pinned)
+        munmap(const_cast<byte*>(srs_ptr), srs_file_size);
     } catch (const sppark_error& e) {
       ld.sync();
-      munmap(const_cast<byte*>(srs_ptr), srs_file_size);
+      if (!srs_pinned)
+        munmap(const_cast<byte*>(srs_ptr), srs_file_size);
 
       throw;
     }
