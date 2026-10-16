@@ -24,11 +24,20 @@
 # split into their terms; leaves are packed into parts of at most GROUP_OPS ops
 # (the measured optimum on sm_120: 6 parts).
 #
+# The split source then goes through ec_lazyredc.py (lazy Montgomery reduction
+# of the poly_mix chains, plus the module warmup entry point), whose pinned
+# counts must match.
+#
 # build.rs compiles the result standalone (not relocatable, which is ~25%
 # slower), so it keeps its own __constant__ poly_mix, filled by
 # eval_check_split() itself. Re-run this after regenerating eval_check.cu;
-# --check (run in CI) fails if eval_check_split.cu is out of date.
+# --check (run in CI) regenerates it from eval_check.cu through both passes and
+# fails if eval_check_split.cu is out of date.
 import os, re, sys
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ec_lazyredc
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, 'eval_check_split.cu')
@@ -213,6 +222,12 @@ void eval_check_split(cudaStream_t stream, Fp* check, const Fp* ctrl, const Fp* 
 } // namespace risc0::circuit::recursion::cuda
 #endif // __HIPCC__
 ''')
+
+new, counts = ec_lazyredc.rewrite(new)
+if counts != ec_lazyredc.EXPECT:
+    sys.exit('eval_check_split: ec_lazyredc counts %s != EXPECT %s (input changed: re-validate with '
+             'the lazy-REDC harness, then update ec_lazyredc.EXPECT)' % (counts, ec_lazyredc.EXPECT))
+STATS += '; lazy REDC: chain terms %d, folds %d, from %d, materialized %d' % counts
 
 try:
     cur = open(OUT, newline='').read()
