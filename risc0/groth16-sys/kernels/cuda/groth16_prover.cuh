@@ -45,7 +45,7 @@ static bool g16_tune() {
   return g16_cold_enabled();
 #endif
 }
-// C2-R3 Groth16 tail (msm_c2 only): each MSM's host collect overlaps the next MSM's GPU work
+// Groth16 tail (msm_c2 only): each MSM's host collect overlaps the next MSM's GPU work
 // (deferred collect), 4 windows per sort launch, split integrate (K = 8). Group-element identical
 // results. Also gates PIN_EARLY, DRAIN_OVERLAP and PARVERIFY on the Rust side:
 // RISC0_CUDA_G16_TAIL=0 disables all of them.
@@ -664,7 +664,7 @@ public:
       }
 
       // witness_into_poly: one row per thread in a grid-stride loop, so the launch shape does not
-      // change the result; 12 x 256-thread blocks per SM beat 1 x 512 (C2-R2 kernel sweep: A+B
+      // change the result; 12 x 256-thread blocks per SM beat 1 x 512 (measured: A+B
       // 4.03 -> 3.63 ms with the compact coefficients).
 #ifndef __HIPCC__
       const unsigned wip_grid = 12 * gpu.sm_count(), wip_block = 256;

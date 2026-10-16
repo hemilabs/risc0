@@ -1233,7 +1233,7 @@ impl ProverImpl {
                 .verify_integrity_with_context(succinct_ctx)
                 .context("verify succinct")
         };
-        // C2-R3 PARVERIFY: for Groth16, verify the succinct receipt on a scoped thread alongside
+        // For Groth16, verify the succinct receipt on a scoped thread alongside
         // succinct_to_groth16 (CPU work beside identity_p254 and the wrap); joined, and its error
         // returned, before the Groth16 receipt is. RISC0_CUDA_G16_TAIL=0 (the Groth16 tail
         // switch, see risc0-groth16) verifies first.

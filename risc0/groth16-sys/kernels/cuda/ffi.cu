@@ -211,7 +211,7 @@ extern "C" void* risc0_groth16_cuda_host_buffer(size_t bytes) {
   return g16_witness_buf.ptr;
 }
 
-// C2-R3: create the pinned upload stager (130 MB, streams, events) now, at the start of a Groth16
+// Create the pinned upload stager (130 MB, streams, events) now, at the start of a Groth16
 // session while the STARK's first segment is still host-bound, instead of when the key loader
 // starts (by then the STARK is GPU-bound, and the registration stalls its launches). Skipped
 // (*created = 0) on a card with less than `min_total_vram` bytes, where the key isn't prestarted.
@@ -229,7 +229,7 @@ extern "C" const char* risc0_groth16_cuda_stager_init(size_t min_total_vram, int
   return nullptr;
 }
 
-// C2-R3: free what risc0_groth16_cuda_stager_init and an early witness-buffer pin allocated, when
+// Free what risc0_groth16_cuda_stager_init and an early witness-buffer pin allocated, when
 // the key prestart gave up (both are recreated on demand). The Rust caller holds the witness
 // buffer's lock.
 extern "C" void risc0_groth16_cuda_pinned_release() {

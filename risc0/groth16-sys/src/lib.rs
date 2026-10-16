@@ -182,7 +182,7 @@ pub fn host_buffer(bytes: usize) -> anyhow::Result<HostBuffer> {
     Ok(HostBuffer { ptr, len: bytes })
 }
 
-/// C2-R3: create the pinned upload stager of the key loader now (see
+/// Create the pinned upload stager of the key loader now (see
 /// `risc0_groth16_cuda_stager_init`). Returns false, allocating nothing, on a card with less than
 /// `min_total_vram` bytes.
 #[cfg(feature = "cuda")]
@@ -192,7 +192,7 @@ pub fn stager_init(min_total_vram: usize) -> anyhow::Result<bool> {
     Ok(created != 0)
 }
 
-/// C2-R3: free the stager and the pinned witness buffer (both are recreated on demand), e.g. when
+/// Free the stager and the pinned witness buffer (both are recreated on demand), e.g. when
 /// they were allocated early for a key prestart that then gave up. Waits for a live [HostBuffer].
 #[cfg(feature = "cuda")]
 pub fn pinned_release() {

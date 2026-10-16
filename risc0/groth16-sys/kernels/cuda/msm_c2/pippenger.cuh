@@ -295,7 +295,7 @@ void integrate(bucket_h buckets_[], uint32_t nwins, uint32_t wbits, uint32_t nbi
     buckets[bid][2*tid+1] = acc;
 }
 #ifndef __HIPCC__
-// C2-R3: ported from C2-R2 kernel-sweep integ/integ.cu (group-element equal to integrate).
+// Split integrate (group-element equal to integrate).
 // ---- split integrate: identical per-thread loop, Nthrbits += log2(K), partials to scratch ----
 template<class bucket_t, class bucket_h = class bucket_t::mem_t>
 __launch_bounds__(256) __global__
@@ -461,7 +461,7 @@ public:
     // 0 = sppark's heuristic (4 batches for ~2^23 points); 1 = one pass when
     // points and scalars are already on the device (no upload to pipeline).
     void set_batch(size_t b) { batch_override = b; }
-    // C2-R3 Groth16 tail (CUDA only, group-element identical results):
+    // Groth16 tail (CUDA only, group-element identical results):
     // sort_y > 2 sorts that many windows per cooperative launch instead of pairs (falls back to
     // pairs when they don't fit co-resident); integ_k > 1 (a power of 2) splits each window's
     // integrate over K blocks plus a combine pass. 0 keeps sppark's kernels.
@@ -602,7 +602,7 @@ private:
     }
 
 public:
-    // C2-R3: deferred host collect. invoke_defer() runs every GPU step and the DtoH of the
+    // Deferred host collect. invoke_defer() runs every GPU step and the DtoH of the
     // per-window results, then returns; finish() does the host-side collect() later, e.g. on
     // another thread while the next MSM runs on the GPU. Same arithmetic, same result.
     // finish() may run concurrently with invoke()/invoke_defer() on the same msm_t: collect()
