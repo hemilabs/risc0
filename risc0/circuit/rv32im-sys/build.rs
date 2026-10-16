@@ -234,25 +234,50 @@ mod stamp {
 compile_error!("Features 'cuda' and 'rocm' are mutually exclusive. Enable only one GPU backend.");
 
 fn main() {
-    if env::var("CARGO_FEATURE_CUDA").is_ok() {
-        build_cuda_kernels();
+    let cuda = env::var("CARGO_FEATURE_CUDA").is_ok();
+    let rocm = env::var("CARGO_FEATURE_ROCM").is_ok();
+
+    // Set the GPU builds' environment before any thread starts: the CPU build below runs
+    // concurrently and reads the environment.
+    if cuda || rocm {
+        env::set_var("SCCACHE_IDLE_TIMEOUT", "0");
+    }
+    if rocm {
+        env::set_var("HIP_PLATFORM", "amd");
     }
 
-    if env::var("CARGO_FEATURE_ROCM").is_ok() {
-        build_rocm_kernels();
-    }
+    // The CPU kernels (rust_poly_fp_<n>.cpp and steps.cpp, 2-4 MB of generated C++ each) and
+    // the GPU kernels share nothing, so build them concurrently instead of one after the other.
+    std::thread::scope(|scope| {
+        scope.spawn(build_cpu_kernels);
 
-    if env::var("CARGO_FEATURE_INTEL").is_ok() {
-        build_intel_kernels();
-    }
+        if cuda {
+            build_cuda_kernels();
+        }
 
-    build_cpu_kernels();
+        if rocm {
+            build_rocm_kernels();
+        }
+
+        if env::var("CARGO_FEATURE_INTEL").is_ok() {
+            build_intel_kernels();
+        }
+    });
 }
 
 fn build_cpu_kernels() {
     rerun_if_changed("kernels/cxx");
+    // The generated constraint polynomial (rust_poly_fp_<n>.cpp) and steps.cpp take far longer
+    // to compile than the rest: start them at once, each on its own thread.
+    let (big, rest): (Vec<PathBuf>, Vec<PathBuf>) =
+        glob_paths("kernels/cxx/*.cpp").into_iter().partition(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("rust_poly_fp_") || n == "steps.cpp")
+        });
     KernelBuild::new(KernelType::Cpp)
-        .files(glob_paths("kernels/cxx/*.cpp"))
+        .files(rest)
+        .files_on_own_threads(big)
         .deps(glob_paths("kernels/cxx/*.h"))
         .deps(glob_paths("kernels/cxx/*.cpp.inc"))
         .deps(glob_paths("kernels/cxx/*.h.inc"))
@@ -267,8 +292,6 @@ fn build_cuda_kernels() {
     println!("cargo:rerun-if-env-changed=NVCC_PREPEND_FLAGS");
     println!("cargo:rerun-if-env-changed=SCCACHE_RECACHE");
     rerun_if_changed("kernels/cuda");
-
-    env::set_var("SCCACHE_IDLE_TIMEOUT", "0");
 
     if env::var("RISC0_SKIP_BUILD_KERNELS").is_ok() {
         let out_dir = env::var("OUT_DIR").map(PathBuf::from).unwrap();
@@ -504,9 +527,6 @@ fn build_rocm_kernels() {
     println!("cargo:rerun-if-env-changed=RISC0_POLY_FP_CSE_MIN_SHARE");
     println!("cargo:rerun-if-env-changed=RISC0_LSC_HINTS");
     rerun_if_changed("kernels/cuda");
-
-    env::set_var("SCCACHE_IDLE_TIMEOUT", "0");
-    env::set_var("HIP_PLATFORM", "amd");
 
     if env::var("RISC0_SKIP_BUILD_KERNELS").is_ok() {
         let out_dir = env::var("OUT_DIR").map(PathBuf::from).unwrap();

@@ -260,25 +260,45 @@ fn compute_recursion_intel_hash(cxx_root: &str, icpx_version: &str) -> String {
 compile_error!("Features 'cuda' and 'rocm' are mutually exclusive. Enable only one GPU backend.");
 
 fn main() {
-    build_cpu_kernels();
+    let rocm = env::var("CARGO_FEATURE_ROCM").is_ok();
 
-    if env::var("CARGO_FEATURE_CUDA").is_ok() {
-        build_cuda_kernels();
+    // Set the GPU builds' environment before any thread starts: the CPU build below runs
+    // concurrently and reads the environment.
+    if rocm {
+        env::set_var("HIP_PLATFORM", "amd");
     }
 
-    if env::var("CARGO_FEATURE_ROCM").is_ok() {
-        build_rocm_kernels();
-    }
+    // The CPU and GPU kernels share nothing, so build them concurrently.
+    std::thread::scope(|scope| {
+        scope.spawn(build_cpu_kernels);
 
-    if env::var("CARGO_FEATURE_INTEL").is_ok() {
-        build_intel_kernels();
-    }
+        if env::var("CARGO_FEATURE_CUDA").is_ok() {
+            build_cuda_kernels();
+        }
+
+        if rocm {
+            build_rocm_kernels();
+        }
+
+        if env::var("CARGO_FEATURE_INTEL").is_ok() {
+            build_intel_kernels();
+        }
+    });
 }
 
 fn build_cpu_kernels() {
     rerun_if_changed("kernels/cxx");
+    // step_exec.cpp and poly_fp.cpp (1-2 MB of generated C++) take far longer to compile than
+    // the rest: start them at once, each on its own thread.
+    let (big, rest): (Vec<PathBuf>, Vec<PathBuf>) =
+        glob_paths("kernels/cxx/*.cpp").into_iter().partition(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n == "step_exec.cpp" || n == "poly_fp.cpp")
+        });
     KernelBuild::new(KernelType::Cpp)
-        .files(glob_paths("kernels/cxx/*.cpp"))
+        .files(rest)
+        .files_on_own_threads(big)
         .include(env::var("DEP_RISC0_SYS_CXX_ROOT").unwrap())
         .compile("risc0_recursion_cpu");
 }
@@ -355,8 +375,6 @@ fn build_rocm_kernels() {
     let output = "risc0_recursion_cuda";
     rerun_if_changed("kernels/cuda");
     println!("cargo:rerun-if-env-changed=RISC0_HIP_ARCH");
-
-    env::set_var("HIP_PLATFORM", "amd");
 
     let sppark_root = env::var("DEP_SPPARK_ROOT").unwrap();
     let cuda_root = env::var("DEP_RISC0_SYS_CUDA_ROOT").unwrap();
