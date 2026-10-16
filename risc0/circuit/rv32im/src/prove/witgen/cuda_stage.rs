@@ -20,6 +20,14 @@
 //! buffers, and the trace owns the slot ([`PreflightTrace::staged`]) until it is dropped (after
 //! the eval_check launch, long after the stream has passed the H2D copies, which precede the
 //! globals readback in `WitnessGenerator::header`).
+//!
+//! The pools here are process-wide: the CUDA HAL proves on one device per process (device 0;
+//! hosts with several GPUs run a process per GPU with `CUDA_VISIBLE_DEVICES`, as r0vm does). If a
+//! thread proves with another device current anyway, the CUDA library stops using the staged
+//! traces and [`enabled`] turns off (see `stagingDeviceOk` in ffi.cu); the pinned memory is
+//! registered portable, so a trace staged before that is still valid in any context.
+//!
+//! [`release`] (a HAL release hook) frees what the pools hold.
 
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -29,8 +37,9 @@ use std::sync::{
 use rayon::prelude::*;
 use risc0_circuit_rv32im_sys::{
     risc0_circuit_rv32im_cuda_event_wait, risc0_circuit_rv32im_cuda_host_alloc,
-    risc0_circuit_rv32im_cuda_host_free, risc0_circuit_rv32im_cuda_prefetch, RawMemoryTransaction,
-    RawPreflightCycle,
+    risc0_circuit_rv32im_cuda_host_free, risc0_circuit_rv32im_cuda_prefetch,
+    risc0_circuit_rv32im_cuda_release_slots, risc0_circuit_rv32im_cuda_staging_disabled,
+    RawMemoryTransaction, RawPreflightCycle,
 };
 use risc0_sys::ffi_wrap;
 
@@ -48,11 +57,44 @@ use crate::zirgen::circuit::ExtVal;
 pub(crate) fn enabled() -> bool {
     static ON: LazyLock<bool> =
         LazyLock::new(|| std::env::var("RISC0_CUDA_WITGEN_STAGE").as_deref() != Ok("0"));
-    *ON
+    *ON && unsafe { risc0_circuit_rv32im_cuda_staging_disabled() } == 0
 }
 
 /// Free pinned slots: (address, capacity).
 static POOL: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// Pinned slots too small for the current traces, freed by [`release`] rather than when they are
+/// replaced: unpinning waits for the whole device while holding a driver lock, which would
+/// stall the proving thread's launches mid-segment (see `ThpPinned::free_pinned`).
+static RETIRED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+const MAX_RETIRED: usize = 4;
+
+/// HAL release hook (`risc0_zkp::hal::cuda::register_release_hook`): the device buffers of the
+/// staged-trace slots not in use, and, unless `device_only`, the pinned slots, the recycled
+/// trace vectors and word-transaction maps (all rebuilt on demand). Never blocks on the pools'
+/// locks.
+pub(crate) fn release(device_only: bool) {
+    if let Err(err) = ffi_wrap(|| unsafe { risc0_circuit_rv32im_cuda_release_slots() }) {
+        tracing::debug!("cuda_stage: release_slots failed: {err}");
+    }
+    if device_only {
+        return;
+    }
+    let mut free: Vec<usize> = Vec::new();
+    if let Ok(mut pool) = POOL.try_lock() {
+        free.extend(pool.drain(..).map(|(ptr, _)| ptr));
+    }
+    if let Ok(mut retired) = RETIRED.try_lock() {
+        free.append(&mut retired);
+    }
+    for ptr in free {
+        let _ = ffi_wrap(|| unsafe { risc0_circuit_rv32im_cuda_host_free(ptr as *mut _) });
+    }
+    if let Ok(mut pool) = TRACE_POOL.try_lock() {
+        pool.clear();
+    }
+    super::paged_map::WordTxnMap::trim_pool();
+}
 
 pub(crate) struct StagedTrace {
     ptr: *mut u8,
@@ -153,8 +195,16 @@ fn take_slot(len: usize) -> Option<(*mut u8, usize)> {
             }
         }
     };
-    for (ptr, _) in stale {
-        // cudaFreeHost synchronizes the device; this runs on the preflight thread.
+    let mut overflow = Vec::new();
+    {
+        let mut retired = RETIRED.lock().unwrap();
+        retired.extend(stale.into_iter().map(|(ptr, _)| ptr));
+        // Bounded: the traces stop growing after the first segments, so this is rare.
+        while retired.len() > MAX_RETIRED {
+            overflow.push(retired.remove(0));
+        }
+    }
+    for ptr in overflow {
         let _ = ffi_wrap(|| unsafe { risc0_circuit_rv32im_cuda_host_free(ptr as *mut _) });
     }
     if let Some((ptr, cap)) = found {

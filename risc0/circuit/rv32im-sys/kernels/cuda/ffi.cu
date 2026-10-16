@@ -43,6 +43,7 @@ namespace nvtx3 { struct scoped_range { scoped_range(const char*) {} }; }
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
+#include <atomic>
 #include <mutex>
 #include <unordered_map>
 #include <string.h>
@@ -144,12 +145,32 @@ struct DevSlot {
   uint64_t id = 0;
   bool ready = false;  // prefetched for `id`, not yet consumed
   bool released = false;
+  bool in_use = false;  // the current segment's device preflight (setup_exec .. accum)
   cudaEvent_t readyEv = nullptr;
   cudaEvent_t releasedEv = nullptr;
 };
 
+// Guards the slots. Recursive: a slot's device allocation can run the HAL's out-of-memory hook,
+// which calls risc0_circuit_rv32im_cuda_release_slots on the same thread.
+static std::recursive_mutex g_slots_mu;
+static DevSlot s_slots[16][8];
+
+// Staging targets the process's CUDA device (getCachedDevice, like the rest of this library;
+// the HAL proves on device 0). If a thread proves with another device current, the staged
+// traces (pinned in another context) and their device slots are not used from then on: setup_exec
+// stages on the proving thread as without staging.
+static std::atomic<bool> g_staging_off{false};
+static bool stagingDeviceOk() {
+  if (g_staging_off.load(std::memory_order_relaxed)) return false;
+  int cur = 0;
+  if (cudaGetDevice(&cur) != cudaSuccess || cur != getCachedDevice()) {
+    g_staging_off = true;
+    return false;
+  }
+  return true;
+}
+
 static DevSlot* getDevSlot(const uint8_t* pinned) {
-  static DevSlot s_slots[16][8];
   int dev = getCachedDevice();
   DevSlot* freeSlot = nullptr;
   for (auto& sl : s_slots[dev]) {
@@ -159,7 +180,7 @@ static DevSlot* getDevSlot(const uint8_t* pinned) {
   if (!freeSlot) {
     // More pinned slots than expected (regrows): recycle the least useful one (not ready).
     for (auto& sl : s_slots[dev]) {
-      if (!sl.ready) { freeSlot = &sl; break; }
+      if (!sl.ready && !sl.in_use) { freeSlot = &sl; break; }
     }
     if (!freeSlot) throw std::runtime_error("rv32im prefetch: no free device slot");
   }
@@ -323,9 +344,11 @@ struct DeviceCache {
     size_t bigint_bytes = preflight->bigintBytesLen;
     size_t total_pf_bytes = cycles_bytes + txns_bytes + bigint_bytes;
 
-    char* pin = const_cast<char*>(staged);
+    char* pin = stagingDeviceOk() ? const_cast<char*>(staged) : nullptr;
     a_slot = nullptr;
+    std::unique_lock<std::recursive_mutex> slots_lk(g_slots_mu, std::defer_lock);
     if (pin) {
+      slots_lk.lock();
       DevSlot* sl = getDevSlot(reinterpret_cast<const uint8_t*>(pin));
       if (sl->ready && sl->id == staged_id && sl->cap >= total_pf_bytes) {
         // Prefetched on the copy stream.
@@ -338,6 +361,7 @@ struct DeviceCache {
         sl->id = staged_id;
       }
       sl->ready = false;
+      sl->in_use = true;
       a_slot = sl;
       a_cycles = reinterpret_cast<PreflightCycle*>(sl->dev);
       a_txns = reinterpret_cast<MemoryTransaction*>(sl->dev + cycles_bytes);
@@ -795,30 +819,74 @@ const char* risc0_circuit_rv32im_cuda_witgen(uint32_t mode,
 // before the buffer is reused or freed: the DMA reads the pinned memory asynchronously.
 const char* risc0_circuit_rv32im_cuda_prefetch(const uint8_t* staged, size_t bytes, uint64_t id,
                                                void** out_ev) {
+  cudaStream_t cs = nullptr;
   try {
     if (out_ev) *out_ev = nullptr;
+    if (!stagingDeviceOk()) return nullptr;
+    std::lock_guard<std::recursive_mutex> lk(g_slots_mu);
     DevSlot* sl = getDevSlot(staged);
     if (sl->ready && sl->id == id) return nullptr;
-    if (sl == get_cache().a_slot) return nullptr;  // in use by the current segment
+    if (sl->in_use || sl == get_cache().a_slot) return nullptr;  // the current segment's
     growDevSlot(sl, bytes);
-    cudaStream_t cs = getCopyStream();
+    cs = getCopyStream();
+    // Created before the copy is queued: once it is, the caller must get an event to wait for.
+    cudaEvent_t ev = nullptr;
+    if (out_ev) CUDA_OK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
     if (sl->released) CUDA_OK(cudaStreamWaitEvent(cs, sl->releasedEv, 0));
+    sl->ready = false;
     CUDA_OK(cudaMemcpyAsync(sl->dev, staged, bytes, cudaMemcpyHostToDevice, cs));
-    CUDA_OK(cudaEventRecord(sl->readyEv, cs));
     if (out_ev) {
-      cudaEvent_t ev;
-      CUDA_OK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
-      CUDA_OK(cudaEventRecord(ev, cs));
       *out_ev = (void*)ev;
+      CUDA_OK(cudaEventRecord(ev, cs));
     }
+    CUDA_OK(cudaEventRecord(sl->readyEv, cs));
     sl->id = id;
     sl->ready = true;
+  } catch (const std::exception& err) {
+    // A copy from `staged` may be queued, and the caller may recycle it once this returns.
+    if (cs) (void)cudaStreamSynchronize(cs);
+    if (out_ev && *out_ev) {
+      (void)cudaEventDestroy((cudaEvent_t)*out_ev);
+      *out_ev = nullptr;
+    }
+    return strdup(err.what());
+  } catch (...) {
+    if (cs) (void)cudaStreamSynchronize(cs);
+    if (out_ev && *out_ev) {
+      (void)cudaEventDestroy((cudaEvent_t)*out_ev);
+      *out_ev = nullptr;
+    }
+    return strdup("Generic exception");
+  }
+  return nullptr;
+}
+
+// Free the device buffers of the staged-trace slots that the current segment is not using
+// (they are reallocated on demand). Called through the HAL's release hooks: by
+// clear_buffer_pool, and when a raw device allocation fails. cudaFree waits for the device, so
+// no copy into a freed slot is still in flight.
+const char* risc0_circuit_rv32im_cuda_release_slots() {
+  try {
+    std::lock_guard<std::recursive_mutex> lk(g_slots_mu);
+    for (auto& sl : s_slots[getCachedDevice()]) {
+      if (sl.in_use || !sl.dev) continue;
+      CUDA_OK(cudaFree(sl.dev));
+      sl.dev = nullptr;
+      sl.cap = 0;
+      sl.ready = false;
+    }
   } catch (const std::exception& err) {
     return strdup(err.what());
   } catch (...) {
     return strdup("Generic exception");
   }
   return nullptr;
+}
+
+// 1 once staging was turned off because a thread proved with another device current (see
+// stagingDeviceOk); the Rust side then stops staging traces.
+int risc0_circuit_rv32im_cuda_staging_disabled() {
+  return g_staging_off.load() ? 1 : 0;
 }
 
 // Wait for and destroy an event returned by risc0_circuit_rv32im_cuda_prefetch. Thread-safe
@@ -873,7 +941,18 @@ const char* risc0_circuit_rv32im_cuda_host_free(void* ptr) {
       p = it->second;
       hostSlots().erase(it);
     }
-    p.free_pinned();  // synchronizes the device first, like cudaFreeHost
+    {
+      // Its device slot (if any) loses its owner: the next staged trace without one reuses the
+      // device buffer, and risc0_circuit_rv32im_cuda_release_slots frees it.
+      std::lock_guard<std::recursive_mutex> lk(g_slots_mu);
+      for (auto& sl : s_slots[getCachedDevice()]) {
+        if (sl.pinned == ptr && !sl.in_use) {
+          sl.pinned = nullptr;
+          sl.ready = false;
+        }
+      }
+    }
+    p.free_pinned();  // see ThpPinned::free_pinned
   } catch (const std::exception& err) {
     return strdup(err.what());
   } catch (...) {
@@ -1086,8 +1165,10 @@ const char* risc0_circuit_rv32im_cuda_accum(AccumBuffers* buffers,
 #endif
       // Last reader of this segment's device preflight: a prefetch into its slot waits for this.
       if (DevSlot* sl = get_cache().a_slot) {
+        std::lock_guard<std::recursive_mutex> lk(g_slots_mu);
         CUDA_OK(cudaEventRecord(sl->releasedEv, stream));
         sl->released = true;
+        sl->in_use = false;
       }
     }
     auto t2 = std::chrono::steady_clock::now();

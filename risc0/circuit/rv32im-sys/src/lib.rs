@@ -186,6 +186,12 @@ extern "C" {
     pub fn risc0_circuit_rv32im_cuda_host_free(
         ptr: *mut std::ffi::c_void,
     ) -> *const std::os::raw::c_char;
+
+    /// Free the device buffers of the staged-trace slots not in use (see ffi.cu).
+    pub fn risc0_circuit_rv32im_cuda_release_slots() -> *const std::os::raw::c_char;
+
+    /// 1 once staging is off because a thread proved with another device current.
+    pub fn risc0_circuit_rv32im_cuda_staging_disabled() -> i32;
 }
 
 #[cfg(feature = "intel")]

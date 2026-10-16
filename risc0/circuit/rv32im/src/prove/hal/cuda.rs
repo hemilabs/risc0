@@ -53,6 +53,7 @@ pub struct CudaCircuitHal<CH: CudaHash> {
 
 impl<CH: CudaHash> CudaCircuitHal<CH> {
     pub fn new(_hal: Arc<CudaHal<CH>>) -> Self {
+        risc0_zkp::hal::cuda::register_release_hook(super::super::witgen::cuda_stage::release);
         Self { _hal }
     }
 }

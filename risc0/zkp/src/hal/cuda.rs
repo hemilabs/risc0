@@ -58,6 +58,8 @@ const BUFFER_POOL_MAX_BYTES: usize = 16 << 30; // 16 GB (floor of the cap)
 const BUFFER_POOL_HEADROOM: usize = 8 << 30; // 8 GB
 
 /// Cap on the bytes of large buffers the pool caches: max(16 GB, device total - 8 GB), i.e.
+/// (of device 0, the HAL's only device: see `CudaHal::new_from_hash`; hosts with several GPUs run a
+/// process per GPU with `CUDA_VISIBLE_DEVICES`, as r0vm does),
 /// 24 GB on a 32 GB card, where the fixed 16 GB cap freed (and later re-allocated with a cold
 /// cuMemAlloc) part of a po2=21 segment's working set every segment. RISC0_CUDA_POOL_MAX_GB
 /// overrides it (16 = the previous behavior). Evaluated on the first push, when a context is
@@ -150,6 +152,7 @@ fn trim_cuda_mempool() {
 /// thread, which owns the pool that holds the memory.
 extern "C" fn drain_pool_on_oom() {
     let _ = std::panic::catch_unwind(|| {
+        run_release_hooks(true);
         let released = BUFFER_POOL
             .try_with(|pool| {
                 pool.try_borrow_mut()
@@ -167,6 +170,33 @@ extern "C" fn drain_pool_on_oom() {
             released as f64 / (1u64 << 30) as f64
         );
     });
+}
+
+/// Caches kept outside this HAL's pool by the circuit crates: device scratch of their kernel
+/// libraries, and host staging pools (pinned buffers, recycled trace vectors).
+static RELEASE_HOOKS: std::sync::Mutex<Vec<fn(bool)>> = std::sync::Mutex::new(Vec::new());
+
+/// Register `hook` (once; repeated registrations of the same function are ignored) to release a
+/// cache that `clear_buffer_pool` cannot see. It is called with `device_only = false` by
+/// [clear_buffer_pool] (free everything that can be rebuilt: device scratch not in use, host
+/// pools), and with `device_only = true` when a raw device allocation fails on the proving thread
+/// (free device memory not in use right now). It must not block on locks its own code may hold
+/// around a device allocation (use `try_lock`).
+pub fn register_release_hook(hook: fn(bool)) {
+    let mut hooks = RELEASE_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
+    if !hooks.iter().any(|h| std::ptr::fn_addr_eq(*h, hook)) {
+        hooks.push(hook);
+    }
+}
+
+fn run_release_hooks(device_only: bool) {
+    let hooks = RELEASE_HOOKS
+        .try_lock()
+        .map(|h| h.clone())
+        .unwrap_or_default();
+    for hook in hooks {
+        hook(device_only);
+    }
 }
 
 fn register_oom_hook() {
@@ -187,6 +217,7 @@ fn register_oom_hook() {
 ///
 /// Thread-local, like the pool: it releases only what the CALLING thread cached.
 pub fn clear_buffer_pool() {
+    run_release_hooks(false);
     let released = BUFFER_POOL.with(|pool| {
         let mut pool = pool.borrow_mut();
         let cached = pool.total_cached;

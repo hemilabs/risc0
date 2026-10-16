@@ -5,7 +5,10 @@
 // segments, where the driver's bounce-buffer copies compete with the next segment's host work.
 // From page-locked memory they run at full PCIe rate. Buffers come from a small process-wide pool
 // and go back to it when the preflight that owns them is dropped (after its witgen call, which
-// synchronizes, so no copy from them can still be in flight).
+// synchronizes, so no copy from them can still be in flight). Buffers beyond the pool's capacity
+// are only unpinned by `release` (a HAL release hook, e.g. clear_buffer_pool), not where they are
+// dropped: unpinning waits for the whole device while holding a driver lock, which would stall
+// the proving thread mid-segment (see ThpPinned::free_pinned).
 
 use std::sync::Mutex;
 
@@ -22,6 +25,32 @@ pub(crate) struct Pinned {
 
 static POOL: Mutex<Vec<Pinned>> = Mutex::new(Vec::new());
 const POOL_CAP: usize = 6;
+/// Buffers dropped while the pool was full, unpinned by [release].
+static RETIRED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+const MAX_RETIRED: usize = 4;
+
+fn host_free(ptr: usize) {
+    let p = ptr as *mut std::ffi::c_void;
+    let _ = risc0_sys::ffi_wrap(|| unsafe { risc0_circuit_recursion_cuda_host_free(p) });
+}
+
+/// HAL release hook (`risc0_zkp::hal::cuda::register_release_hook`): unless `device_only`,
+/// unpin the pooled and retired buffers (re-pinned on demand). Never blocks on the pool's lock.
+pub(crate) fn release(device_only: bool) {
+    if device_only {
+        return;
+    }
+    let mut free: Vec<usize> = Vec::new();
+    if let Ok(mut pool) = POOL.try_lock() {
+        for mut b in pool.drain(..) {
+            free.push(std::mem::take(&mut b.ptr));
+        }
+    }
+    if let Ok(mut retired) = RETIRED.try_lock() {
+        free.append(&mut retired);
+    }
+    free.into_iter().for_each(host_free);
+}
 
 impl Pinned {
     fn take(bytes: usize) -> Option<Pinned> {
@@ -58,17 +87,36 @@ impl Drop for Pinned {
         if self.ptr == 0 {
             return;
         }
-        let mut pool = POOL.lock().unwrap();
-        if pool.len() < POOL_CAP {
-            pool.push(Pinned {
-                ptr: self.ptr,
-                cap: self.cap,
-            });
-        } else {
-            let p = self.ptr as *mut std::ffi::c_void;
-            let _ = risc0_sys::ffi_wrap(|| unsafe { risc0_circuit_recursion_cuda_host_free(p) });
+        let mut evicted = self.ptr;
+        {
+            let mut pool = POOL.lock().unwrap();
+            if pool.len() < POOL_CAP {
+                pool.push(Pinned {
+                    ptr: self.ptr,
+                    cap: self.cap,
+                });
+                evicted = 0;
+            } else if let Some(small) = pool.iter_mut().filter(|b| b.cap < self.cap).min_by_key(|b| b.cap) {
+                // Keep the larger buffer: later jobs of this size then find one.
+                evicted = std::mem::replace(&mut small.ptr, self.ptr);
+                small.cap = self.cap;
+            }
         }
         self.ptr = 0;
+        if evicted != 0 {
+            let mut overflow = 0;
+            {
+                let mut retired = RETIRED.lock().unwrap();
+                retired.push(evicted);
+                // Bounded (rare: only while job sizes keep growing).
+                if retired.len() > MAX_RETIRED {
+                    overflow = retired.remove(0);
+                }
+            }
+            if overflow != 0 {
+                host_free(overflow);
+            }
+        }
     }
 }
 

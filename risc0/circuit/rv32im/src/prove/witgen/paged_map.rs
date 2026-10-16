@@ -180,6 +180,14 @@ impl WordTxnMap {
         }
     }
 
+    /// Drop the pooled maps (see `cuda_stage::release`). Never blocks.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub fn trim_pool() {
+        if let Ok(mut pool) = WORD_TXN_POOL.try_lock() {
+            pool.clear();
+        }
+    }
+
     /// Reset this map and return it to the pool.
     pub fn recycle(mut self) {
         if self.high.is_empty() {
