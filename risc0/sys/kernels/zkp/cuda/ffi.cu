@@ -24,8 +24,7 @@
 #include <cstdint>
 #include <exception>
 
-#ifndef __HIPCC__
-// eval_u v2 (kernels.cu; CUDA only: it assumes 32-lane warps)
+// eval_u v2 (kernels.cu)
 #define EU_J 16
 #define EU_THREADS 256
 __global__ void eu2_pows(FpExt* pw, FpExt* ps, const FpExt* xs, uint32_t S, uint32_t chunk);
@@ -33,7 +32,6 @@ __global__ void eu2_main(FpExt* partial, const Fp* __restrict__ coeffs, const ui
                          const FpExt* __restrict__ xs, const FpExt* __restrict__ pw,
                          const FpExt* __restrict__ ps, uint32_t deg, uint32_t chunk);
 __global__ void eu2_reduce(FpExt* out, const FpExt* partial, uint32_t S);
-#endif
 __global__ void mix_poly_coeffs_v2(FpExt* __restrict__ out, const Fp* __restrict__ in,
                                    const uint32_t* __restrict__ combos,
                                    const FpExt* __restrict__ mixStart,
@@ -206,9 +204,6 @@ const char* risc0_zkp_cuda_batch_evaluate_any(FpExt* out,
                                               const uint32_t count,
                                               const uint32_t deg,
                                               const uint32_t nEvals) {
-#ifdef __HIPCC__
-  return launchKernel(batch_evaluate_any, count, shared_size, out, coeffs, which, xs, deg);
-#else
   // eval_u v2: split-K over (chunk, eval point) with per-point power tables. Falls back to
   // the original kernel for small or unaligned inputs.
   const uint32_t minChunk = EU_J * EU_THREADS;
@@ -224,11 +219,29 @@ const char* risc0_zkp_cuda_batch_evaluate_any(FpExt* out,
     while (S < maxS && (uint64_t)S * nEvals < targetBlocks)
       S <<= 1;
     uint32_t chunk = deg / S;
-    // Stream-ordered scratch: safe against concurrent callers sharing the stream.
     size_t pwBytes = (size_t)nEvals * EU_THREADS * sizeof(FpExt);
     size_t psBytes = (size_t)nEvals * S * sizeof(FpExt);
     char* scratch = nullptr;
+#ifdef __HIPCC__
+    // A grow-only scratch buffer per device instead of the stream-ordered pool: the launches
+    // that use it are ordered on the persistent stream, and growing frees with an implicit
+    // device sync.
+    {
+      static char* s_scratch[16] = {};
+      static size_t s_scratch_bytes[16] = {};
+      int dev = getCachedDevice();
+      if (pwBytes + 2 * psBytes > s_scratch_bytes[dev]) {
+        if (s_scratch[dev])
+          CUDA_OK(cudaFree(s_scratch[dev]));
+        CUDA_OK(cudaMalloc(&s_scratch[dev], pwBytes + 2 * psBytes));
+        s_scratch_bytes[dev] = pwBytes + 2 * psBytes;
+      }
+      scratch = s_scratch[dev];
+    }
+#else
+    // Stream-ordered scratch: safe against concurrent callers sharing the stream.
     CUDA_OK(cudaMallocAsync(&scratch, pwBytes + 2 * psBytes, stream));
+#endif
     FpExt* pw = reinterpret_cast<FpExt*>(scratch);
     FpExt* ps = reinterpret_cast<FpExt*>(scratch + pwBytes);
     FpExt* part = reinterpret_cast<FpExt*>(scratch + pwBytes + psBytes);
@@ -236,14 +249,15 @@ const char* risc0_zkp_cuda_batch_evaluate_any(FpExt* out,
     eu2_main<<<dim3(S, nEvals), EU_THREADS, 0, stream>>>(part, coeffs, which, xs, pw, ps, deg, chunk);
     eu2_reduce<<<nEvals, 32, 0, stream>>>(out, part, S);
     CUDA_OK(cudaGetLastError());
+#ifndef __HIPCC__
     CUDA_OK(cudaFreeAsync(scratch, stream));
+#endif
   } catch (const std::exception& err) {
     return strdup(err.what());
   } catch (...) {
     return strdup("Generic exception");
   }
   return nullptr;
-#endif
 }
 
 const char* risc0_zkp_cuda_gather_sample(
