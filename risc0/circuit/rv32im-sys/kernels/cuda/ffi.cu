@@ -15,6 +15,7 @@
 #include "cuda.h"
 #include "steps.cuh"
 #include "witgen.h"
+#include "thp_pinned.h"
 
 #ifndef __HIPCC__
 #if defined(__clang__)
@@ -41,6 +42,8 @@ namespace nvtx3 { struct scoped_range { scoped_range(const char*) {} }; }
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
+#include <mutex>
+#include <unordered_map>
 #include <string.h>
 
 #ifdef __HIPCC__
@@ -219,10 +222,9 @@ struct DeviceCache {
   uint8_t* a_bigintBytes = nullptr;
   DevSlot* a_slot = nullptr;
 
-  // Persistent pinned host staging buffer for preflight data uploads (grow-only).
+  // Persistent pinned host staging buffer for preflight data uploads (grow-only, huge pages).
   // Avoids HIP's slow pageable memory staging path for large H2D copies.
-  void* h_pinned_preflight = nullptr;
-  size_t cap_h_pinned_preflight = 0;
+  ThpPinned pf_pin;
 
 
   void init(cudaStream_t stream) {
@@ -342,15 +344,12 @@ struct DeviceCache {
     // Grow with 25% headroom: the trace grows over the first segments, and every regrow
     // costs ~20 ms of pinning on the critical path plus cudaFreeHost's implicit device
     // synchronization.
-    if (total_pf_bytes > cap_h_pinned_preflight) {
-      size_t want = total_pf_bytes + total_pf_bytes / 4;
-      if (h_pinned_preflight) CUDA_OK(cudaFreeHost(h_pinned_preflight));
-      CUDA_OK(cudaHostAlloc(&h_pinned_preflight, want, cudaHostAllocDefault));
-      cap_h_pinned_preflight = want;
+    if (total_pf_bytes > pf_pin.bytes) {
+      pf_pin.alloc(total_pf_bytes + total_pf_bytes / 4);
     }
 
     // Copy to pinned staging (fast CPU memcpy).
-    pin = (char*)h_pinned_preflight;
+    pin = (char*)pf_pin.ptr;
     memcpy(pin, preflight->cycles, cycles_bytes);
     memcpy(pin + cycles_bytes, preflight->txns, txns_bytes);
     if (bigint_bytes > 0) {
@@ -816,10 +815,22 @@ const char* risc0_circuit_rv32im_cuda_event_wait(void* ev) {
   return nullptr;
 }
 
-// Pinned host memory for the preflight staging slots (filled by the preflight thread).
+// Pinned host memory for the preflight staging slots (filled by the preflight thread), backed
+// by huge pages (ThpPinned): cudaHostAlloc of the ~250 MB slots cost 50-85 ms cold while
+// holding the driver lock.
+static std::mutex g_host_slots_mu;
+static std::unordered_map<void*, ThpPinned>& hostSlots() {
+  static std::unordered_map<void*, ThpPinned> m;
+  return m;
+}
+
 const char* risc0_circuit_rv32im_cuda_host_alloc(size_t bytes, void** out) {
   try {
-    CUDA_OK(cudaHostAlloc(out, bytes, cudaHostAllocDefault));
+    ThpPinned p;
+    p.alloc(bytes);
+    *out = p.ptr;
+    std::lock_guard<std::mutex> lk(g_host_slots_mu);
+    hostSlots()[p.ptr] = p;
   } catch (const std::exception& err) {
     *out = nullptr;
     return strdup(err.what());
@@ -832,7 +843,15 @@ const char* risc0_circuit_rv32im_cuda_host_alloc(size_t bytes, void** out) {
 
 const char* risc0_circuit_rv32im_cuda_host_free(void* ptr) {
   try {
-    CUDA_OK(cudaFreeHost(ptr));
+    ThpPinned p;
+    {
+      std::lock_guard<std::mutex> lk(g_host_slots_mu);
+      auto it = hostSlots().find(ptr);
+      if (it == hostSlots().end()) throw std::runtime_error("host_free: unknown pointer");
+      p = it->second;
+      hostSlots().erase(it);
+    }
+    p.free_pinned();  // synchronizes the device first, like cudaFreeHost
   } catch (const std::exception& err) {
     return strdup(err.what());
   } catch (...) {

@@ -507,10 +507,12 @@ fn build_injector(trace: &PreflightTrace, cycles: usize) -> (Injector, Vec<usize
     // Steps 1+2: Compute exclusive prefix sums in a single pass.
     // scatter entries (without SHA2 u32 bit decomposition — those go to bit_data)
     let mut index = Vec::with_capacity(n + 1);
+    advise_huge(&index);
     index.push(0u32);
     let mut total = 0u32;
     // bit entries: each SHA2 u32 becomes one packed (row, base_col, value) triple
     let mut bit_index = Vec::with_capacity(n + 1);
+    advise_huge(&bit_index);
     bit_index.push(0u32);
     let mut bit_total = 0u32;
     // Pre-extract BigInt row indices for accum phase (avoids 1M-entry scan later)
@@ -540,6 +542,8 @@ fn build_injector(trace: &PreflightTrace, cycles: usize) -> (Injector, Vec<usize
     // Step 3: Pre-allocate output arrays (skip zero-fill since every element is overwritten)
     let mut offsets = Vec::<u32>::with_capacity(total);
     let mut values = Vec::<Val>::with_capacity(total);
+    advise_huge(&offsets);
+    advise_huge(&values);
     // SAFETY: All elements [0..total) will be written by the parallel fill below.
     unsafe {
         offsets.set_len(total);
@@ -547,6 +551,7 @@ fn build_injector(trace: &PreflightTrace, cycles: usize) -> (Injector, Vec<usize
     }
     // Packed (row, base_col, value) triples for GPU-side bit decomposition
     let mut bit_data = Vec::<u32>::with_capacity(bit_total * 3);
+    advise_huge(&bit_data);
     unsafe {
         bit_data.set_len(bit_total * 3);
     }
@@ -802,4 +807,44 @@ fn node_addr_to_idx(addr: WordAddr) -> u32 {
 
 fn node_idx_to_addr(idx: u32) -> WordAddr {
     MERKLE_TREE_END_ADDR - idx * DIGEST_WORDS as u32
+}
+
+/// Advise the kernel to back a freshly allocated (not yet touched) vector with transparent huge
+/// pages. The preflight trace and injector vectors are ~250 MB at po2=20, written once per segment;
+/// with 4 KB pages their page faults were ~half of preflight time (preflight body 80 -> 42 ms at
+/// po2=20), and the first segment's preflight is on the critical path. Huge pages also make the
+/// background munmap of the trace short, which otherwise holds the process mmap lock for 10-30 ms
+/// and stalls concurrent driver calls that map memory. Only whole 2 MB pages inside the
+/// allocation are advised; contents are unaffected. RISC0_CUDA_THP=0 disables it. Linux only.
+pub(crate) fn advise_huge<T>(v: &Vec<T>) {
+    #[cfg(target_os = "linux")]
+    {
+        static ON: LazyLock<bool> =
+            LazyLock::new(|| std::env::var("RISC0_CUDA_THP").as_deref() != Ok("0"));
+        const HUGE: usize = 2 << 20;
+        const MADV_HUGEPAGE: std::os::raw::c_int = 14;
+        extern "C" {
+            fn madvise(
+                addr: *mut std::os::raw::c_void,
+                len: usize,
+                advice: std::os::raw::c_int,
+            ) -> std::os::raw::c_int;
+        }
+        let bytes = v.capacity() * std::mem::size_of::<T>();
+        if !*ON || bytes < 2 * HUGE {
+            return;
+        }
+        let start = v.as_ptr() as usize;
+        let lo = (start + HUGE - 1) & !(HUGE - 1);
+        let hi = (start + bytes) & !(HUGE - 1);
+        if hi > lo {
+            // SAFETY: [lo, hi) lies inside the vector's allocation; MADV_HUGEPAGE only changes
+            // how the kernel backs the pages, never their contents.
+            unsafe {
+                madvise(lo as *mut std::os::raw::c_void, hi - lo, MADV_HUGEPAGE);
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = v;
 }

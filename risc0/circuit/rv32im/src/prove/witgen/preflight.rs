@@ -147,14 +147,23 @@ impl<'a> Preflight<'a> {
                 page_memory.insert(&(node_addr + i), digest.as_words()[i]);
             }
         }
+        // Reserve the trace up front and back it with huge pages (see `advise_huge`). SimpleLoop
+        // makes ~4.2 memory transactions per cycle; a segment that makes more grows `txns`.
         #[cfg(feature = "cuda")]
         let trace = super::cuda_stage::recycled_trace(total_cycles, rand_z);
         #[cfg(not(feature = "cuda"))]
-        let trace = PreflightTrace {
-            cycles: Vec::with_capacity(total_cycles),
-            backs: Vec::with_capacity(total_cycles),
-            rand_z,
-            ..Default::default()
+        let trace = {
+            let trace = PreflightTrace {
+                cycles: Vec::with_capacity(total_cycles),
+                txns: Vec::with_capacity(total_cycles * 5),
+                backs: Vec::with_capacity(total_cycles),
+                rand_z,
+                ..Default::default()
+            };
+            super::advise_huge(&trace.cycles);
+            super::advise_huge(&trace.txns);
+            super::advise_huge(&trace.backs);
+            trace
         };
         Self {
             trace,

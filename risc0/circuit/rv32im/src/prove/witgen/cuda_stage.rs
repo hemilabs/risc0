@@ -223,9 +223,18 @@ pub(crate) fn recycled_trace(total_cycles: usize, rand_z: ExtVal) -> PreflightTr
     } else {
         None
     };
-    let (mut cycles, txns, bigint_bytes, mut backs) = vecs.unwrap_or_default();
+    let (mut cycles, mut txns, bigint_bytes, mut backs) = vecs.unwrap_or_default();
+    // A fresh (not recycled) trace: reserve it up front and back it with huge pages before
+    // the first touch (see `advise_huge`).
+    let fresh = cycles.capacity() == 0;
     cycles.reserve(total_cycles);
     backs.reserve(total_cycles);
+    if fresh {
+        txns.reserve(total_cycles * 5);
+        super::advise_huge(&cycles);
+        super::advise_huge(&txns);
+        super::advise_huge(&backs);
+    }
     // (No struct update syntax: PreflightTrace implements Drop.)
     let mut trace = PreflightTrace::default();
     trace.cycles = cycles;

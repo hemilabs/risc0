@@ -18,6 +18,7 @@
 #include "kernels.h"
 
 #include "vendor/nvtx3/nvtx3.hpp"
+#include "thp_pinned.h"
 
 #include <cstdint>
 #include <exception>
@@ -282,9 +283,9 @@ const char* risc0_zkp_cuda_scatter_from_host(Fp* into,
     static Fp* d_values[16] = {};
     static size_t cap_d_index[16] = {}, cap_d_offsets[16] = {}, cap_d_values[16] = {};
 
-    // Per-device persistent pinned host staging buffers (grow-only).
-    static void* h_pinned[16] = {};
-    static size_t cap_h_pinned[16] = {};
+    // Per-device persistent pinned host staging buffers (grow-only with 25% headroom, huge
+    // pages): segment sizes vary by a few percent, and each regrow is a synchronizing free.
+    static ThpPinned h_pinned[16];
 
     size_t index_bytes = index_count * sizeof(uint32_t);
     size_t offsets_bytes = offsets_count * sizeof(uint32_t);
@@ -309,14 +310,12 @@ const char* risc0_zkp_cuda_scatter_from_host(Fp* into,
     }
 
     // Grow pinned host staging buffer if needed.
-    if (total_bytes > cap_h_pinned[dev]) {
-      if (h_pinned[dev]) CUDA_OK(cudaFreeHost(h_pinned[dev]));
-      CUDA_OK(cudaHostAlloc(&h_pinned[dev], total_bytes, cudaHostAllocDefault));
-      cap_h_pinned[dev] = total_bytes;
+    if (total_bytes > h_pinned[dev].bytes) {
+      h_pinned[dev].alloc(total_bytes + total_bytes / 4);
     }
 
     // Copy to pinned staging buffer (fast CPU memcpy).
-    char* pin = (char*)h_pinned[dev];
+    char* pin = (char*)h_pinned[dev].ptr;
     memcpy(pin, h_index, index_bytes);
     memcpy(pin + index_bytes, h_offsets, offsets_bytes);
     memcpy(pin + index_bytes + offsets_bytes, h_values, values_bytes);
@@ -355,9 +354,8 @@ const char* risc0_zkp_cuda_scatter_bits_from_host(Fp* into,
     static uint32_t* d_bitdata[16] = {};
     static size_t cap_d_bitdata[16] = {};
 
-    // Per-device persistent pinned host staging buffer (grow-only).
-    static void* h_pinned_bits[16] = {};
-    static size_t cap_h_pinned_bits[16] = {};
+    // Per-device persistent pinned host staging buffer (grow-only, huge pages).
+    static ThpPinned h_pinned_bits[16];
 
     size_t data_bytes = (size_t)triplet_count * 3 * sizeof(uint32_t);
 
@@ -368,15 +366,13 @@ const char* risc0_zkp_cuda_scatter_bits_from_host(Fp* into,
     }
 
     // Grow pinned host staging buffer if needed.
-    if (data_bytes > cap_h_pinned_bits[dev]) {
-      if (h_pinned_bits[dev]) CUDA_OK(cudaFreeHost(h_pinned_bits[dev]));
-      CUDA_OK(cudaHostAlloc(&h_pinned_bits[dev], data_bytes, cudaHostAllocDefault));
-      cap_h_pinned_bits[dev] = data_bytes;
+    if (data_bytes > h_pinned_bits[dev].bytes) {
+      h_pinned_bits[dev].alloc(data_bytes + data_bytes / 4);
     }
 
     // Copy to pinned staging and do truly async H2D.
-    memcpy(h_pinned_bits[dev], h_data, data_bytes);
-    CUDA_OK(cudaMemcpyAsync(d_bitdata[dev], h_pinned_bits[dev], data_bytes,
+    memcpy(h_pinned_bits[dev].ptr, h_data, data_bytes);
+    CUDA_OK(cudaMemcpyAsync(d_bitdata[dev], h_pinned_bits[dev].ptr, data_bytes,
                             cudaMemcpyHostToDevice, stream));
 
     // Launch scatter_bits kernel on same stream.
