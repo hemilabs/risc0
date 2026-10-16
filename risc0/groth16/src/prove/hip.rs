@@ -105,6 +105,13 @@ fn seal_to_u254_values(seal_bytes: &[u8]) -> Result<Vec<U254>> {
     Ok(values)
 }
 
+/// Free the Groth16 prover and SRS that `shrink_wrap` caches on the GPU (the same cache as on CUDA,
+/// see `risc0_groth16_sys::release`). Without this they hold ~7 GB of an RX 9070 XT (16 GB) for the
+/// life of the process, and on Windows the next proof's STARK spills into shared system memory.
+pub(crate) fn release_srs() -> Result<()> {
+    risc0_groth16_sys::release().context("failed to release the cached groth16 SRS")
+}
+
 pub(crate) fn shrink_wrap(seal_bytes: &[u8]) -> Result<Seal> {
     let t_total = std::time::Instant::now();
     tracing::info!("shrink_wrap: {} seal bytes", seal_bytes.len());

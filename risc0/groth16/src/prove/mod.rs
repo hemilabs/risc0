@@ -139,14 +139,16 @@ pub fn release_srs() -> Result<()> {
     cfg_if::cfg_if! {
         if #[cfg(feature = "cuda")] {
             self::cuda::release_srs()
-        } else if #[cfg(all(feature = "intel", not(feature = "rocm")))] {
+        } else if #[cfg(feature = "rocm")] {
+            self::hip::release_srs()
+        } else if #[cfg(feature = "intel")] {
             if self::intel::enabled() {
                 self::intel::release_srs()
             } else {
                 Ok(())
             }
         } else {
-            // ROCm caches through hip.rs's own path, untested here; docker mode holds nothing.
+            // Docker mode holds nothing.
             Ok(())
         }
     }
