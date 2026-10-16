@@ -96,7 +96,11 @@ impl Drop for Pinned {
                     cap: self.cap,
                 });
                 evicted = 0;
-            } else if let Some(small) = pool.iter_mut().filter(|b| b.cap < self.cap).min_by_key(|b| b.cap) {
+            } else if let Some(small) = pool
+                .iter_mut()
+                .filter(|b| b.cap < self.cap)
+                .min_by_key(|b| b.cap)
+            {
                 // Keep the larger buffer: later jobs of this size then find one.
                 evicted = std::mem::replace(&mut small.ptr, self.ptr);
                 small.cap = self.cap;
