@@ -539,13 +539,19 @@ pub fn msvc_toolkit_include_dir() -> PathBuf {
     let include = cuda_toolkit_dir().join("include");
     let cuda_h = include.join("cuda.h");
     // CUDA 13 moved the CCCL headers (libcudacxx among them) under include/cccl.
-    let cuda_std_array = [include.join("cuda/std/array"), include.join("cccl/cuda/std/array")]
-        .into_iter()
-        .find(|p| p.is_file());
-    assert!(cuda_h.is_file(), "CUDA toolkit header not found at {}", cuda_h.display());
-    let cuda_std_array = cuda_std_array.unwrap_or_else(|| {
-        panic!("<cuda/std/array> not found under {}", include.display())
-    });
+    let cuda_std_array = [
+        include.join("cuda/std/array"),
+        include.join("cccl/cuda/std/array"),
+    ]
+    .into_iter()
+    .find(|p| p.is_file());
+    assert!(
+        cuda_h.is_file(),
+        "CUDA toolkit header not found at {}",
+        cuda_h.display()
+    );
+    let cuda_std_array = cuda_std_array
+        .unwrap_or_else(|| panic!("<cuda/std/array> not found under {}", include.display()));
 
     let dir = PathBuf::from(env::var("OUT_DIR").unwrap()).join("risc0_msvc_include");
     fs::create_dir_all(&dir).unwrap();
@@ -554,7 +560,11 @@ pub fn msvc_toolkit_include_dir() -> PathBuf {
         ("risc0_toolkit_cuda_std_array.h", &cuda_std_array),
     ] {
         let path = target.to_string_lossy().replace('\\', "/");
-        fs::write(dir.join(name), format!("#pragma once\n#include \"{path}\"\n")).unwrap();
+        fs::write(
+            dir.join(name),
+            format!("#pragma once\n#include \"{path}\"\n"),
+        )
+        .unwrap();
     }
     dir
 }
@@ -570,9 +580,9 @@ fn cuda_toolkit_dir() -> PathBuf {
             }
         }
     }
-    env::var("CUDA_PATH").map(PathBuf::from).expect(
-        "cannot locate the CUDA toolkit: set CUDA_PATH, or NVCC to the full path of nvcc",
-    )
+    env::var("CUDA_PATH")
+        .map(PathBuf::from)
+        .expect("cannot locate the CUDA toolkit: set CUDA_PATH, or NVCC to the full path of nvcc")
 }
 
 /// File extension for an object file on the target toolchain.
@@ -599,7 +609,11 @@ pub fn add_to_static_lib(out_dir: &Path, name: &str, objs: &[PathBuf]) {
         }
         cmd.args(objs);
         let status = cmd.status().expect("failed to run lib.exe");
-        assert!(status.success(), "lib.exe failed to build {}", lib.display());
+        assert!(
+            status.success(),
+            "lib.exe failed to build {}",
+            lib.display()
+        );
     } else {
         let lib = out_dir.join(format!("lib{name}.a"));
         let status = Command::new(find_ar_tool())
