@@ -48293,6 +48293,7 @@ __device__ AccumStruct execUser_Accum(ExecContext& ctx,
   AccumStruct x5 = exec_Accum(ctx, x4, arg1_0, layout2);
   return x5;
 }
+#ifdef __HIPCC__  // CUDA: stepAccumA in accum_tu.cu (accum_tu_gen.py)
 __device__ ComponentStruct exec_TopAccum(ExecContext& ctx,
                                          BoundLayout<TopLayout> arg0,
                                          BoundLayout<LayoutAccumLayout> layout1,
@@ -66119,5 +66120,6 @@ __device__ void step_TopAccum(
   ComponentStruct x6 = exec_TopAccum(ctx, x4, x5, global2, mix3);
   return;
 }
+#endif  // __HIPCC__
 
 } // namespace risc0::circuit::rv32im_v2::cuda

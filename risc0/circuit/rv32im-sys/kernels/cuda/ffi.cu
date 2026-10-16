@@ -650,6 +650,8 @@ __global__ void fwd_stepExec(DeviceExecContext* ctx, uint32_t count) {
   }
 }
 
+#ifdef __HIPCC__
+// CUDA runs stepAccumA (accum_tu.cu) instead: steps.cu defines step_TopAccum for ROCm only.
 __global__ void stepAccum(DeviceAccumContext* ctx, uint32_t count, const uint32_t* perm = nullptr) {
   uint32_t cycle = blockDim.x * blockIdx.x + threadIdx.x;
   if (cycle >= count) {
@@ -671,6 +673,7 @@ __global__ void stepAccum(DeviceAccumContext* ctx, uint32_t count, const uint32_
   GlobalBufObj global(globalBuf);
   step_TopAccum(execCtx, &accum, &data, &global, &mix);
 }
+#endif
 
 // keys[i] = (i >> winBits) << 8 | cycles[i].major, vals[i] = i: the input of stepAccum's cycle
 // sort. Grouping by major only within 2^winBits-row windows keeps the rows each window's warps
@@ -723,18 +726,6 @@ __global__ void finalizeZeroizeAccum(DeviceAccumContext* ctx, uint32_t lastCycle
 static bool envOn(const char* name) {
   const char* e = getenv(name);
   return !(e && e[0] == '0');
-}
-
-// The accum kernel feature: stepAccum force-inlined in a whole-program TU (accum_tu.cu), its
-// cycles sorted by major within 2^14-row windows, and finalizeAccum fused with the zeroize. On
-// unless RISC0_CUDA_ACCUM_TU=0 (then: stepAccum, a global sort by major, separate zeroize).
-static bool accumTu() {
-#ifdef __HIPCC__
-  return false;
-#else
-  static const bool on = envOn("RISC0_CUDA_ACCUM_TU");
-  return on;
-#endif
 }
 
 // witgen_tu.cu (par_stepExec's call graph in a standalone noinline TU): on unless
@@ -1001,8 +992,8 @@ const char* risc0_circuit_rv32im_cuda_accum(AccumBuffers* buffers,
       static uint32_t* s_keys[16] = {};
       static uint32_t* s_perm[16] = {};
       static uint32_t* s_keys2[16] = {};
-      // Sort window (rows, log2); without the accum TU feature: one global sort by major.
-      const uint32_t s_win = accumTu() ? 14 : 0;
+      // Sort window (rows, log2): cycles are grouped by major within 2^14-row windows.
+      const uint32_t s_win = 14;
       static uint32_t* s_perm2[16] = {};
       static size_t s_cap[16] = {};
       {
@@ -1037,13 +1028,16 @@ const char* risc0_circuit_rv32im_cuda_accum(AccumBuffers* buffers,
 #endif
 #ifndef __HIPCC__
       // accum_tu.cu: the stepAccum call graph force-inlined in a whole-program TU (no ABI
-      // calls or stack-resident buffer objects); needs power-of-two rows (RISC0_ROWS_POW2).
+      // calls or stack-resident buffer objects), the only accum step CUDA builds carry (see
+      // accum_tu_gen.py). It needs power-of-two rows (RISC0_ROWS_POW2): rows = 2^po2.
       auto pow2 = [](size_t r) { return r && (r & (r - 1)) == 0; };
-      if (accumTu() && pow2(buffers->data.rows) && pow2(buffers->accum.rows)) {
-        risc0_rv32im_launch_stepAccumTU(cfg.grid.x, cfg.block.x, stream, d_ctx, lastCycle, perm);
-      } else
-#endif
+      if (!pow2(buffers->data.rows) || !pow2(buffers->accum.rows)) {
+        throw std::runtime_error("rv32im accum: rows must be a power of two");
+      }
+      risc0_rv32im_launch_stepAccumTU(cfg.grid.x, cfg.block.x, stream, d_ctx, lastCycle, perm);
+#else
       stepAccum<<<cfg.grid, cfg.block, 0, stream>>>(d_ctx, lastCycle, perm);
+#endif
 
       size_t rows = buffers->accum.rows;
 #ifdef __HIPCC__
@@ -1084,12 +1078,12 @@ const char* risc0_circuit_rv32im_cuda_accum(AccumBuffers* buffers,
 #endif
 
 #ifndef __HIPCC__
-      if (accumTu()) {
-        auto cfgz = getSimpleConfig(rows);
-        finalizeZeroizeAccum<<<cfgz.grid, cfgz.block, 0, stream>>>(d_ctx, lastCycle);
-      } else
-#endif
+      // finalizeAccum fused with the INVALID -> 0 zeroize of the accum buffer.
+      auto cfgz = getSimpleConfig(rows);
+      finalizeZeroizeAccum<<<cfgz.grid, cfgz.block, 0, stream>>>(d_ctx, lastCycle);
+#else
       finalizeAccum<<<cfg.grid, cfg.block, 0, stream>>>(d_ctx, lastCycle);
+#endif
       // Last reader of this segment's device preflight: a prefetch into its slot waits for this.
       if (DevSlot* sl = get_cache().a_slot) {
         CUDA_OK(cudaEventRecord(sl->releasedEv, stream));
@@ -1112,7 +1106,11 @@ const char* risc0_circuit_rv32im_cuda_accum(AccumBuffers* buffers,
 // 1 when risc0_circuit_rv32im_cuda_accum also zeroizes accum (finalizeZeroizeAccum), so the
 // caller skips its separate eltwise_zeroize of the accum buffer.
 int risc0_circuit_rv32im_cuda_accum_zeroizes() {
-  return accumTu() ? 1 : 0;
+#ifdef __HIPCC__
+  return 0;
+#else
+  return 1;
+#endif
 }
 
 const char* risc0_circuit_rv32im_cuda_warmup() {
@@ -1122,8 +1120,10 @@ const char* risc0_circuit_rv32im_cuda_warmup() {
     // With count=0: "if (cycle >= count) return;" exits immediately, no memory access.
     // This avoids ~5-10ms of first-launch stalls during the actual proof.
     par_stepExec<<<1, 1, 0, stream>>>(nullptr, 0, 0);
+#ifdef __HIPCC__
     stepAccum<<<1, 1, 0, stream>>>(nullptr, 0);
     finalizeAccum<<<1, 1, 0, stream>>>(nullptr, 0);
+#endif
     injectCycleCols<<<1, 1, 0, stream>>>(nullptr, nullptr, 0, 0, 0, 0, 0, 0, 0);
     majorKeys<<<1, 1, 0, stream>>>(nullptr, nullptr, nullptr, 0, 0);
 #ifndef __HIPCC__

@@ -15,23 +15,44 @@
 
 # usage: accum_tu_gen.py [--check]
 #
-# Writes accum_tu.cu (CUDA only), run after regenerating steps.cu and
-# accum_batchinv.py: the step_TopAccum call graph of steps.cu, renamed (_A
-# suffix) and marked `static __device__ __forceinline__`, plus the stepAccumA
-# kernel and its host launcher. build.rs compiles it as a whole-program TU (not
-# -dc), so the graph is inlined into the kernel with no ABI calls or
-# stack-resident buffer objects. Same statements in the same order: bit-exact by
-# construction.
+# CUDA builds run the rv32im accum step from accum_tu.cu instead of steps.cu.
+# This script, run after regenerating steps.cu and accum_batchinv.py:
 #
-# --check (run in CI) fails if accum_tu.cu is out of date.
+# 1. writes accum_tu.cu: the step_TopAccum call graph of steps.cu, renamed
+#    (_A suffix) and marked `static __device__ __forceinline__`, plus the
+#    stepAccumA kernel and its host launcher. build.rs compiles it as a
+#    whole-program TU (not -dc), so the graph is inlined into the kernel with no
+#    ABI calls or stack-resident buffer objects. Same statements in the same
+#    order: bit-exact by construction.
+# 2. fences exec_TopAccum and step_TopAccum in steps.cu to ROCm builds
+#    (#ifdef __HIPCC__; ROCm has no accum_tu.cu), so the -dc compile of steps.cu
+#    no longer carries the unused relocatable copy (most of its ptxas time).
+#
+# Both edits are idempotent; --check (run in CI) fails if either file is out of
+# date.
 import os, re, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STEPS = os.path.join(HERE, 'steps.cu')
 OUT = os.path.join(HERE, 'accum_tu.cu')
 CHECK = '--check' in sys.argv[1:]
-src = open(STEPS, newline='').read()
+GUARD_OPEN = '#ifdef __HIPCC__  // CUDA: stepAccumA in accum_tu.cu (accum_tu_gen.py)\n'
+GUARD_CLOSE = '#endif  // __HIPCC__\n'
 
+steps = open(STEPS, newline='').read()
+# 2. the guard around exec_TopAccum .. step_TopAccum
+gs = steps.index('__device__ ComponentStruct exec_TopAccum(ExecContext& ctx')
+ge = steps.index('\n}\n', steps.index('\n__device__ void step_TopAccum(', gs)) + 3
+fenced = steps[:gs].endswith(GUARD_OPEN)
+if fenced:
+    assert steps[ge:].startswith(GUARD_CLOSE), 'steps.cu: unbalanced exec_TopAccum guard'
+    new_steps = steps
+else:
+    assert GUARD_OPEN not in steps and GUARD_CLOSE not in steps
+    new_steps = steps[:gs] + GUARD_OPEN + steps[gs:ge] + GUARD_CLOSE + steps[ge:]
+src = new_steps.replace(GUARD_OPEN, '').replace(GUARD_CLOSE, '')
+
+# 1. accum_tu.cu
 ns_open = src.index('namespace risc0::circuit::rv32im_v2::cuda {') + len('namespace risc0::circuit::rv32im_v2::cuda {')
 ns_close = src.rindex('} // namespace risc0::circuit::rv32im_v2::cuda')
 body = src[ns_open:ns_close]
@@ -101,11 +122,16 @@ try:
     old_tu = open(OUT, newline='').read()
 except FileNotFoundError:
     old_tu = ''
+stale = [n for n, old_, new_ in (('steps.cu', steps, new_steps), ('accum_tu.cu', old_tu, new_tu)) if old_ != new_]
 if CHECK:
-    if old_tu != new_tu:
-        sys.exit('accum_tu_gen: accum_tu.cu is out of date; run kernels/cuda/accum_tu_gen.py and commit the result')
-    print('accum_tu_gen: accum_tu.cu is up to date (%d functions)' % len(names))
+    if stale:
+        sys.exit('accum_tu_gen: %s out of date; run kernels/cuda/accum_tu_gen.py and commit the result'
+                 % ' and '.join(stale))
+    print('accum_tu_gen: accum_tu.cu and steps.cu are up to date (%d functions)' % len(names))
 else:
+    if new_steps != steps:
+        open(STEPS, 'w', newline='').write(new_steps)
     open(OUT, 'w', newline='').write(new_tu)
-    print('accum_tu_gen: wrote accum_tu.cu (%d functions, %d lines)'
-          % (len(names), sum(defs[n].count('\n') for n in names)))
+    print('accum_tu_gen: wrote accum_tu.cu (%d functions, %d lines)%s'
+          % (len(names), sum(defs[n].count('\n') for n in names),
+             '' if new_steps == steps else ' and fenced exec_TopAccum in steps.cu'))
