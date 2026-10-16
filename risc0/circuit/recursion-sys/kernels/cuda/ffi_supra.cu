@@ -26,7 +26,7 @@ void eval_check_split(cudaStream_t stream, Fp* check, const Fp* ctrl, const Fp* 
                       const Fp* mix, const Fp* out, Fp rou, uint32_t po2, uint32_t domain,
                       const void* poly_mix_host);
 static bool use_split() {
-  static const bool on = [] { const char* e = getenv("RISC0_C2_REC_EC_SPLIT"); return e && e[0] == '1'; }();
+  static const bool on = [] { const char* e = getenv("RISC0_C2_REC_EC_SPLIT"); return !(e && e[0] == '0'); }();
   return on;
 }
 #endif

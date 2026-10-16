@@ -481,6 +481,13 @@ struct CachedAccumBuffers : AccumBuffersState {
 
 static thread_local CachedAccumBuffers g_accumCache;
 
+__global__ void fillOneExt(FpExt* p, uint32_t n) {
+  uint32_t i = blockDim.x * blockIdx.x + threadIdx.x;
+  if (i < n) {
+    p[i] = FpExt(1);
+  }
+}
+
 struct HostAccumContext {
   AccumContext* ctx;
   CudaStream stream;
@@ -500,9 +507,9 @@ struct HostAccumContext {
     ctx->workCycles = workCycles;
 
     ctx->accum = g_accumCache.accum;
-    std::vector<FpExt> accumInit(workCycles, FpExt(1));
-    CUDA_OK(cudaMemcpy(
-        ctx->accum, accumInit.data(), workCycles * sizeof(FpExt), cudaMemcpyHostToDevice));
+    // C2-R2: fill with FpExt(1) on the device instead of uploading a host vector of ones.
+    fillOneExt<<<(workCycles + 255) / 256, 256, 0, stream>>>(ctx->accum, workCycles);
+    CUDA_OK(cudaGetLastError());
   }
 
   ~HostAccumContext() {
@@ -588,6 +595,25 @@ const char* risc0_circuit_recursion_cuda_warmup() {
     CUDA_OK(cudaFuncGetAttributes(&attr, scatterHostChains));
     CUDA_OK(cudaFuncGetAttributes(&attr, parStepComputeAccum));
     CUDA_OK(cudaFuncGetAttributes(&attr, parStepVerifyAccum));
+  } catch (const std::exception& err) {
+    return strdup(err.what());
+  }
+  return nullptr;
+}
+
+// C2-R2: page-locked host memory for the recursion witgen inputs (prepared off the GPU thread).
+const char* risc0_circuit_recursion_cuda_host_alloc(size_t bytes, void** out) {
+  try {
+    CUDA_OK(cudaHostAlloc(out, bytes, cudaHostAllocDefault));
+  } catch (const std::exception& err) {
+    return strdup(err.what());
+  }
+  return nullptr;
+}
+
+const char* risc0_circuit_recursion_cuda_host_free(void* p) {
+  try {
+    CUDA_OK(cudaFreeHost(p));
   } catch (const std::exception& err) {
     return strdup(err.what());
   }

@@ -147,6 +147,18 @@ pub(crate) struct HostChains {
     pub rows: Vec<u32>,
     pub wom_idx: Vec<u32>,
     pub wom_rows: Vec<u32>,
+    /// C2-R2: addresses of page-locked copies of the five arrays above (same contents).
+    pub pinned: Option<[usize; 5]>,
+}
+
+#[cfg(feature = "cuda")]
+fn pinned_ptr<T>(p: Option<&super::pinned::PinnedTrace>, i: usize) -> Option<*const T> {
+    p.map(|p| p.ptr::<T>(i))
+}
+
+#[cfg(not(feature = "cuda"))]
+fn pinned_ptr<T>(_p: Option<&()>, _i: usize) -> Option<*const T> {
+    None
 }
 
 /// Chains at least this long run on the host.
@@ -172,16 +184,31 @@ pub(crate) fn host_chains(zkr: &Program, preflight: &Preflight) -> Option<HostCh
 }
 
 fn try_host_chains(zkr: &Program, preflight: &Preflight) -> Result<Option<HostChains>> {
+    let t = &preflight.trace;
+    Ok(try_host_chains_range(zkr, &t.wom, &t.cycles, &t.iops, 0, true)?.0)
+}
+
+/// C2-R2: the chains of `cycles[lo..]` (`lo` a chain start). With `complete == false` the trace
+/// is a prefix of a running preflight: the last, possibly unfinished, chain is left out, and the
+/// returned boundary is where a later pass over the full trace must start.
+pub(crate) fn try_host_chains_range(
+    zkr: &Program,
+    wom: &[BabyBearExtElem],
+    cycles: &[risc0_circuit_recursion_sys::RawPreflightCycle],
+    iops: &[BabyBearExtElem],
+    lo: usize,
+    complete: bool,
+) -> Result<(Option<HostChains>, usize)> {
     use risc0_circuit_recursion_sys::risc0_circuit_recursion_cpu_chains;
     let min_len = HOST_CHAIN_MIN_LEN;
-    let cycles = &preflight.trace.cycles;
     let n = cycles.len();
     let mut chains: Vec<u32> = Vec::new();
     let mut heads: Vec<u32> = Vec::new();
-    let mut start = 0usize;
+    let mut start = lo;
     let mut num_rows = 0usize;
-    for c in 1..=n {
-        if c == n || cycles[c].is_par_safe != 0 {
+    for c in lo + 1..=n {
+        let closed = if c == n { complete } else { cycles[c].is_par_safe != 0 };
+        if closed {
             let len = c - start;
             if len >= min_len {
                 chains.push(start as u32);
@@ -192,19 +219,20 @@ fn try_host_chains(zkr: &Program, preflight: &Preflight) -> Result<Option<HostCh
             start = c;
         }
     }
+    let boundary = if complete { n } else { start };
     if heads.is_empty() {
-        return Ok(None);
+        return Ok((None, boundary));
     }
     let total_cycles = 1usize << zkr.po2;
     let data_cols = CIRCUIT.data_size();
     assert_eq!(zkr.code.len(), zkr.code_rows() * zkr.code_size);
     let raw_trace = RawPreflightTrace {
-        wom: preflight.trace.wom.as_ptr(),
+        wom: wom.as_ptr(),
         cycles: cycles.as_ptr(),
-        iops: preflight.trace.iops.as_ptr(),
-        num_woms: preflight.trace.wom.len() as u32,
+        iops: iops.as_ptr(),
+        num_woms: wom.len() as u32,
         num_cycles: n as u32,
-        num_iops: preflight.trace.iops.len() as u32,
+        num_iops: iops.len() as u32,
     };
     let mut out = HostChains {
         heads,
@@ -212,6 +240,7 @@ fn try_host_chains(zkr: &Program, preflight: &Preflight) -> Result<Option<HostCh
         rows: vec![0; num_rows * data_cols],
         wom_idx: vec![0; num_rows],
         wom_rows: vec![0; num_rows * 9 * 5],
+        pinned: None,
     };
     risc0_sys::ffi_wrap(|| unsafe {
         risc0_circuit_recursion_cpu_chains(
@@ -228,7 +257,22 @@ fn try_host_chains(zkr: &Program, preflight: &Preflight) -> Result<Option<HostCh
             out.wom_rows.as_mut_ptr(),
         )
     })?;
-    Ok(Some(out))
+    Ok((Some(out), boundary))
+}
+
+/// C2-R2: concatenate the chains of two disjoint passes.
+pub(crate) fn merge_host_chains(a: Option<HostChains>, b: Option<HostChains>) -> Option<HostChains> {
+    match (a, b) {
+        (None, x) | (x, None) => x,
+        (Some(mut a), Some(b)) => {
+            a.heads.extend(b.heads);
+            a.cycles.extend(b.cycles);
+            a.rows.extend(b.rows);
+            a.wom_idx.extend(b.wom_idx);
+            a.wom_rows.extend(b.wom_rows);
+            Some(a)
+        }
+    }
 }
 
 pub(crate) struct WitnessGenerator<H: Hal> {
@@ -278,10 +322,16 @@ where
         );
 
         let work_cycles = zkr.code_rows() as u32;
+        #[cfg(feature = "cuda")]
+        let pinned_guard = preflight.pinned.lock().unwrap();
+        #[cfg(feature = "cuda")]
+        let pinned = pinned_guard.as_ref();
+        #[cfg(not(feature = "cuda"))]
+        let pinned: Option<&()> = None;
         let raw_trace = RawPreflightTrace {
-            wom: preflight.trace.wom.as_ptr(),
-            cycles: preflight.trace.cycles.as_ptr(),
-            iops: preflight.trace.iops.as_ptr(),
+            wom: pinned_ptr(pinned, 0).unwrap_or(preflight.trace.wom.as_ptr()),
+            cycles: pinned_ptr(pinned, 1).unwrap_or(preflight.trace.cycles.as_ptr()),
+            iops: pinned_ptr(pinned, 2).unwrap_or(preflight.trace.iops.as_ptr()),
             num_woms: preflight.trace.wom.len() as u32,
             num_cycles: work_cycles,
             num_iops: preflight.trace.iops.len() as u32,
@@ -333,6 +383,17 @@ where
             let mut chains = preflight.host_chains.lock().unwrap().take();
             if chains.is_none() && cfg!(feature = "cuda") {
                 chains = host_chains(zkr, preflight);
+            } else if let Some(hc) = chains.as_mut() {
+                // Upload the chain rows from the page-locked copy, if there is one.
+                if let Some(h) = pinned_ptr::<u32>(pinned, 3) {
+                    hc.pinned = Some([
+                        h as usize,
+                        pinned_ptr::<u32>(pinned, 4).unwrap() as usize,
+                        pinned_ptr::<u32>(pinned, 5).unwrap() as usize,
+                        pinned_ptr::<u32>(pinned, 6).unwrap() as usize,
+                        pinned_ptr::<u32>(pinned, 7).unwrap() as usize,
+                    ]);
+                }
             }
             circuit_hal
                 .generate_witness_with_chains(

@@ -21,7 +21,7 @@ use risc0_zkp::{
     core::{
         digest::{DIGEST_SHORTS, DIGEST_WORDS, WORD_SIZE},
         hash::{
-            poseidon2::{poseidon2_mix, CELLS},
+            poseidon2::CELLS,
             sha::SHA256_INIT,
         },
     },
@@ -61,9 +61,49 @@ pub(crate) struct PreflightTrace {
     pub iops: Vec<FpExt>,
 }
 
+static PF_PROF: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("RISC0_C2_PF_PROF").is_some());
+
+/// C2: input words that arrive while the preflight runs (streaming join preflight). The
+/// preflight blocks when it needs more words than it holds until `push` or `close`.
+#[derive(Default)]
+pub struct InputStream {
+    q: std::sync::Mutex<(VecDeque<u32>, bool)>,
+    cv: std::sync::Condvar,
+}
+
+impl InputStream {
+    pub fn push(&self, words: &[u32]) {
+        let mut g = self.q.lock().unwrap();
+        g.0.extend(words.iter().copied());
+        self.cv.notify_all();
+    }
+    pub fn close(&self) {
+        let mut g = self.q.lock().unwrap();
+        g.1 = true;
+        self.cv.notify_all();
+    }
+    /// Move at least `n` words (or all, once closed) into `into`; returns the wait in ns.
+    fn pull(&self, into: &mut VecDeque<u32>, n: usize) -> u64 {
+        let t = std::time::Instant::now();
+        let mut g = self.q.lock().unwrap();
+        while into.len() + g.0.len() < n && !g.1 {
+            g = self.cv.wait(g).unwrap();
+        }
+        into.extend(g.0.drain(..));
+        t.elapsed().as_nanos() as u64
+    }
+}
+
 pub struct Preflight {
     pub(crate) trace: PreflightTrace,
     input: VecDeque<u32>,
+    stream: Option<std::sync::Arc<InputStream>>,
+    /// Nanoseconds spent blocked on `stream`.
+    pub stream_wait_ns: u64,
+    /// Words consumed from the input so far.
+    pub consumed: usize,
+    prof: [(u64, u64); 7],
 
     poseidon2_state: [Fp; CELLS],
     sha_state: [u32; DIGEST_WORDS],
@@ -93,6 +133,10 @@ pub struct Preflight {
     /// Rows of the long sequential witgen chains, executed on the host (see
     /// `witgen::host_chains`), so the GPU witgen does not run them one thread at a time.
     pub(crate) host_chains: std::sync::Mutex<Option<super::witgen::HostChains>>,
+
+    /// C2-R2: page-locked copy of the trace and host chains (RISC0_C2_REC_PIN).
+    #[cfg(feature = "cuda")]
+    pub(crate) pinned: std::sync::Mutex<Option<super::pinned::PinnedTrace>>,
 }
 
 impl Preflight {
@@ -100,6 +144,10 @@ impl Preflight {
         Preflight {
             trace: PreflightTrace::default(),
             input,
+            stream: None,
+            stream_wait_ns: 0,
+            consumed: 0,
+            prof: [(0, 0); 7],
 
             poseidon2_state: [Fp::ZERO; CELLS],
             sha_state: [0; 8],
@@ -116,10 +164,33 @@ impl Preflight {
             iop_idx: 0,
             host_witness: std::sync::Mutex::new(None),
             host_chains: std::sync::Mutex::new(None),
+            #[cfg(feature = "cuda")]
+            pinned: std::sync::Mutex::new(None),
         }
     }
 
+    /// Streaming variant: `input` is the prefix available now, the rest arrives on `stream`.
+    pub fn new_streaming(input: VecDeque<u32>, stream: std::sync::Arc<InputStream>) -> Self {
+        let mut p = Self::new(input);
+        p.stream = Some(stream);
+        p
+    }
+
+    pub fn is_streaming(&self) -> bool {
+        self.stream.is_some()
+    }
+
+    fn need(&mut self, n: usize) {
+        if self.input.len() < n {
+            if let Some(s) = &self.stream {
+                self.stream_wait_ns += s.pull(&mut self.input, n);
+            }
+        }
+        self.consumed += n;
+    }
+
     fn read_input_word(&mut self) -> u32 {
+        self.need(1);
         self.input.pop_front().unwrap()
     }
 
@@ -131,6 +202,7 @@ impl Preflight {
         tracing::trace!("read_iop_header(count: {count}, k: {k}, flip: {flip})");
 
         assert!(self.cur_iop_body.is_empty());
+        self.need(if k == 2 { count } else { k * count });
         if k == 2 {
             self.cur_iop_body.extend(
                 self.input
@@ -190,6 +262,51 @@ impl Preflight {
     }
 
     pub fn step(&mut self, cycle: usize, code: &[Fp]) -> Result<()> {
+        if *PF_PROF {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let t = unsafe { core::arch::x86_64::_rdtsc() };
+                let cat = self.category(code);
+                let r = self.step_inner(cycle, code);
+                let d = unsafe { core::arch::x86_64::_rdtsc() } - t;
+                self.prof[cat].0 += 1;
+                self.prof[cat].1 += d;
+                return r;
+            }
+        }
+        self.step_inner(cycle, code)
+    }
+
+    fn category(&self, code: &[Fp]) -> usize {
+        let sel = &CODE_LAYOUT.code.select;
+        if self.get(code, sel.macro_ops) == Fp::ONE {
+            0
+        } else if self.get(code, sel.micro_ops) == Fp::ONE {
+            1
+        } else if self.get(code, sel.checked_bytes) == Fp::ONE {
+            2
+        } else if self.get(code, sel.poseidon2_load) == Fp::ONE {
+            3
+        } else if self.get(code, sel.poseidon2_full) == Fp::ONE {
+            4
+        } else if self.get(code, sel.poseidon2_partial) == Fp::ONE {
+            5
+        } else {
+            6
+        }
+    }
+
+    pub fn prof_report(&self) -> String {
+        const N: [&str; 7] = ["macro", "micro", "checked_bytes", "p2_load", "p2_full", "p2_partial", "p2_store"];
+        let mut out = String::new();
+        for (i, (n, c)) in self.prof.iter().enumerate() {
+            // rdtsc ticks at ~ the base clock; report raw Mticks and ns/row at 4.3 GHz
+            out += &format!(" {}={}r/{:.2}Mt", N[i], n, *c as f64 / 1e6);
+        }
+        out
+    }
+
+    fn step_inner(&mut self, cycle: usize, code: &[Fp]) -> Result<()> {
         tracing::trace!("top[{cycle}]: {code:?}");
         let is_par_safe = if self.get(code, CODE_LAYOUT.code.select.macro_ops) == Fp::ONE {
             self.macro_op(cycle, code)?
@@ -316,7 +433,7 @@ impl Preflight {
 
     fn poseidon2_partial(&mut self, _cycle: usize) -> Result<bool> {
         tracing::trace!("Poseidon2 partial");
-        poseidon2_mix(&mut self.poseidon2_state);
+        super::p2fast::poseidon2_mix_fast(&mut self.poseidon2_state);
         Ok(false)
     }
 
