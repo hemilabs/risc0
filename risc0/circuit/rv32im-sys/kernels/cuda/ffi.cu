@@ -1104,6 +1104,47 @@ const char* risc0_circuit_rv32im_cuda_accum(AccumBuffers* buffers,
         CUDA_OK(cub::DeviceRadixSort::SortPairs(cubTemp(tb), tb, dk, dv, (int)lastCycle, 0, endBit, stream));
         perm = dv.Current();
       }
+#else
+      // The same order with hipcub's radix sort (stable) over the same (window, major) keys.
+      // Measured on an RX 9070 XT, unsorted stepAccum was ~4x slower per cycle than on an
+      // Arc Pro B70.
+      static uint32_t* s_keys[16][2] = {};
+      static uint32_t* s_perm[16][2] = {};
+      static size_t s_cap[16] = {};
+      static void* s_sort_temp[16] = {};
+      static size_t s_sort_temp_bytes[16] = {};
+      {
+        int dev = getCachedDevice();
+        if (lastCycle > s_cap[dev]) {
+          for (int b = 0; b < 2; b++) {
+            if (s_keys[dev][b]) CUDA_OK(hipFree(s_keys[dev][b]));
+            if (s_perm[dev][b]) CUDA_OK(hipFree(s_perm[dev][b]));
+            CUDA_OK(hipMalloc(&s_keys[dev][b], lastCycle * sizeof(uint32_t)));
+            CUDA_OK(hipMalloc(&s_perm[dev][b], lastCycle * sizeof(uint32_t)));
+          }
+          s_cap[dev] = lastCycle;
+        }
+        // Sort window (rows, log2) as on CUDA: cycles are grouped by major within 2^14 rows.
+        const uint32_t win = 14;
+        majorKeys<<<cfg.grid, cfg.block, 0, stream>>>(
+            get_cache().a_cycles, s_keys[dev][0], s_perm[dev][0], lastCycle, win);
+        uint32_t maxWin = lastCycle ? ((lastCycle - 1) >> win) : 0;
+        int endBit = 8;
+        while (maxWin) { endBit++; maxWin >>= 1; }
+        hipcub::DoubleBuffer<uint32_t> keys(s_keys[dev][0], s_keys[dev][1]);
+        hipcub::DoubleBuffer<uint32_t> vals(s_perm[dev][0], s_perm[dev][1]);
+        size_t temp_bytes = 0;
+        CUDA_OK(hipcub::DeviceRadixSort::SortPairs(
+            nullptr, temp_bytes, keys, vals, int(lastCycle), 0, endBit, stream));
+        if (temp_bytes > s_sort_temp_bytes[dev]) {
+          if (s_sort_temp[dev]) CUDA_OK(hipFree(s_sort_temp[dev]));
+          CUDA_OK(hipMalloc(&s_sort_temp[dev], temp_bytes));
+          s_sort_temp_bytes[dev] = temp_bytes;
+        }
+        CUDA_OK(hipcub::DeviceRadixSort::SortPairs(
+            s_sort_temp[dev], temp_bytes, keys, vals, int(lastCycle), 0, endBit, stream));
+        perm = vals.Current();
+      }
 #endif
 #ifndef __HIPCC__
       // accum_tu.cu: the stepAccum call graph force-inlined in a whole-program TU (no ABI
