@@ -102,8 +102,14 @@ static BIT_SIGNALS: OnceLock<Vec<u32>> = OnceLock::new();
 
 fn bit_signals(nodes: &Nodes<U254, VecNodes>, signals: &[usize]) -> Vec<u32> {
     let one = U254::from(1u64);
+    // Wire 0 is the constant 1 and wires 1..=n_public the public signals: never in S (the CUDA
+    // library drops such indices too, and any out of range or repeated).
+    let num_public = crate::verifying_key().0.gamma_abc_g1.len().saturating_sub(1);
     let mut out = Vec::new();
     for (wi, &si) in signals.iter().enumerate() {
+        if wi <= num_public || wi > u32::MAX as usize {
+            continue;
+        }
         if let Some(Node::Op(Operation::Band, _a, b)) = nodes.nodes.get(si) {
             if let Some(Node::Constant(ci)) = nodes.nodes.get(b) {
                 if nodes.constants[ci] == one {
@@ -112,6 +118,8 @@ fn bit_signals(nodes: &Nodes<U254, VecNodes>, signals: &[usize]) -> Vec<u32> {
             }
         }
     }
+    out.sort_unstable();
+    out.dedup();
     out
 }
 

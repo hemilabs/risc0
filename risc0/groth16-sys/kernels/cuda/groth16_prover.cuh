@@ -356,12 +356,21 @@ public:
       return;
     if (srs.split_permuted)
       throw sppark_error{EINVAL, "groth16: SRS points already permuted by an earlier prover: "};
+    // S only affects speed (every S scalar is checked at prove time): indices that cannot be in
+    // it (out of range, the constant and public signals, duplicates) are dropped, not fatal.
     std::vector<uint8_t> isb(n, 0);
+    size_t nbits = 0;
     for (uint32_t i : bidx) {
-      if (i >= n || isb[i] || i <= srs.get_num_public())
-        throw sppark_error{EINVAL, "groth16: bad bit signal index: "};
+      if (i >= n || i <= srs.get_num_public() || isb[i])
+        continue;
       isb[i] = 1;
+      nbits++;
     }
+    if (nbits != bidx.size() && g16_verbose())
+      fprintf(stderr, "groth16: ignored %zu of %zu bit signal indices\n", bidx.size() - nbits,
+              bidx.size());
+    if (nbits == 0)
+      return;
     split_off_c = n - srs.get_c_size();
     std::vector<uint32_t> b, nb, bc, nbc;
     for (uint32_t i = 0; i < n; i++) {
