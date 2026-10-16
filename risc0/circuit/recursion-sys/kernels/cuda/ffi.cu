@@ -52,8 +52,8 @@ namespace cuda { namespace std { using ::std::array; } }
 #include <map>
 
 // Async recursion witgen (CUDA only; kill switch RISC0_CUDA_REC_WITGEN=0 restores the synchronous
-// path): the witgen uploads go on the context's stream (cudaMemcpyAsync/cudaMemsetAsync) instead
-// of the legacy stream, thrust's temporary storage comes from a per-thread cache and runs on that
+// path): the witgen uploads and the accum's initial ones go on the context's stream
+// (cudaMemcpyAsync/cudaMemsetAsync, a fill kernel) instead of the legacy stream, thrust's temporary storage comes from a per-thread cache and runs on that
 // stream (no cudaMalloc/cudaFree per proof: cudaFree synchronizes the device and both take a
 // driver ioctl that costs ~1 ms when the host is busy), the cached buffers grow with 25%
 // headroom, and the warmup pre-grows the stack reservation and loads the split eval_check module.
@@ -250,7 +250,9 @@ __global__ void fwdStepVerifyWom(ExecContext* ctx) {
 void risc0_recursion_launch_accum_inl(int verify, unsigned grid, unsigned block, cudaStream_t stream,
                                       AccumContext* ctx);
 // accum_inl.cu: the accum steps force-inlined into the kernels, and eval_check split into
-// standalone kernels (ffi_supra.cu): on unless RISC0_CUDA_REC_KERNELS=0.
+// standalone kernels (ffi_supra.cu): on unless RISC0_CUDA_REC_KERNELS=0. The switch selects
+// kernels, not sources: with it off, parStepComputeAccum / parStepVerifyAccum still run the
+// step_*_accum.cu sources with the branch-free asserts (bit-identical results either way).
 static bool accumInl() {
   static const bool on = [] {
     const char* e = getenv("RISC0_CUDA_REC_KERNELS");
@@ -426,18 +428,21 @@ struct HostExecContext {
     if (recAsync()) {
       // Stream-ordered before the witgen kernels. The host arrays (preflight's page-locked
       // staging, or pageable when that is off, which the driver stages before returning) stay
-      // alive until this witgen call returns, after its final stream synchronize.
-      CUDA_OK(cudaMemcpyAsync(ctx->trace->wom, trace->wom, trace->numWoms * sizeof(FpExt),
+      // alive until this witgen call returns, after its final stream synchronize. The device
+      // pointers come from g_execCache, not from ctx / ctx->trace: those are managed memory,
+      // which the host must not touch while work is queued on a device without concurrent
+      // managed access.
+      CUDA_OK(cudaMemcpyAsync(g_execCache.wom, trace->wom, trace->numWoms * sizeof(FpExt),
                               cudaMemcpyHostToDevice, stream));
-      CUDA_OK(cudaMemcpyAsync(ctx->trace->cycles, trace->cycles,
+      CUDA_OK(cudaMemcpyAsync(g_execCache.cycles, trace->cycles,
                               trace->numCycles * sizeof(PreflightCycle), cudaMemcpyHostToDevice,
                               stream));
-      CUDA_OK(cudaMemcpyAsync(ctx->trace->iops, trace->iops, trace->numIops * sizeof(FpExt),
+      CUDA_OK(cudaMemcpyAsync(g_execCache.iops, trace->iops, trace->numIops * sizeof(FpExt),
                               cudaMemcpyHostToDevice, stream));
-      CUDA_OK(cudaMemsetAsync(ctx->womRows, kInvalidPattern,
+      CUDA_OK(cudaMemsetAsync(g_execCache.womRows, kInvalidPattern,
                               trace->numCycles * kMaxWomRowsPerCycle * sizeof(WomArgumentRow),
                               stream));
-      CUDA_OK(cudaMemsetAsync(ctx->womIndex, 0, trace->numCycles * sizeof(uint32_t), stream));
+      CUDA_OK(cudaMemsetAsync(g_execCache.womIndex, 0, trace->numCycles * sizeof(uint32_t), stream));
       return;
     }
     CUDA_OK(cudaMemcpy(
@@ -619,9 +624,15 @@ struct HostAccumContext {
     ctx->workCycles = workCycles;
 
     ctx->accum = g_accumCache.accum;
-    // Fill with FpExt(1) on the device instead of uploading a host vector of ones.
-    fillOneExt<<<(workCycles + 255) / 256, 256, 0, stream>>>(ctx->accum, workCycles);
-    CUDA_OK(cudaGetLastError());
+    if (recAsync()) {
+      // Fill with FpExt(1) on the device instead of uploading a host vector of ones.
+      fillOneExt<<<(workCycles + 255) / 256, 256, 0, stream>>>(g_accumCache.accum, workCycles);
+      CUDA_OK(cudaGetLastError());
+      return;
+    }
+    std::vector<FpExt> accumInit(workCycles, FpExt(1));
+    CUDA_OK(cudaMemcpy(
+        ctx->accum, accumInit.data(), workCycles * sizeof(FpExt), cudaMemcpyHostToDevice));
   }
 
   ~HostAccumContext() {
