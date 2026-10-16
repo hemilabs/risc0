@@ -53,7 +53,27 @@ struct BufferPool {
     total_cached: usize,
 }
 
-const BUFFER_POOL_MAX_BYTES: usize = 16 << 30; // 16 GB
+const BUFFER_POOL_MAX_BYTES: usize = 16 << 30; // 16 GB (floor of the cap)
+/// Headroom the pool cap leaves below the device's total memory.
+const BUFFER_POOL_HEADROOM: usize = 8 << 30; // 8 GB
+
+/// Cap on the bytes of large buffers the pool caches: max(16 GB, device total - 8 GB), i.e.
+/// 24 GB on a 32 GB card, where the fixed 16 GB cap freed (and later re-allocated with a cold
+/// cuMemAlloc) part of a po2=21 segment's working set every segment. RISC0_CUDA_POOL_MAX_GB
+/// overrides it (16 = the previous behavior). Evaluated on the first push, when a context is
+/// current.
+static POOL_MAX: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    if let Some(g) = std::env::var("RISC0_CUDA_POOL_MAX_GB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        return g << 30;
+    }
+    match cust::memory::mem_get_info() {
+        Ok((_free, total)) => BUFFER_POOL_MAX_BYTES.max(total.saturating_sub(BUFFER_POOL_HEADROOM)),
+        Err(_) => BUFFER_POOL_MAX_BYTES,
+    }
+});
 const BUFFER_POOL_SMALL_THRESHOLD: usize = 64 << 10; // 64 KB - always pool small buffers
 
 impl BufferPool {
@@ -77,7 +97,7 @@ impl BufferPool {
     fn push(&mut self, size: usize, buf: DeviceBuffer<u8>) {
         // Always pool small buffers (cuMemFree overhead > storage cost).
         // Only enforce cap for large buffers.
-        if size >= BUFFER_POOL_SMALL_THRESHOLD && self.total_cached + size > BUFFER_POOL_MAX_BYTES {
+        if size >= BUFFER_POOL_SMALL_THRESHOLD && self.total_cached + size > *POOL_MAX {
             drop(buf);
             return;
         }
