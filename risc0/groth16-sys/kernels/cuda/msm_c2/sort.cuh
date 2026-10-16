@@ -373,6 +373,19 @@ __global__ void sort(vec2d_t<uint32_t> inouts, size_t len, uint32_t win,
              wbits, blockIdx.y==0 ? lsbits0 : lsbits1);
 }
 
+#ifndef __HIPCC__
+// C2-R3: Y windows per cooperative launch (blockIdx.y), the top window gets its own lsbits.
+__launch_bounds__(SORT_BLOCKDIM)
+__global__ void sort_y(vec2d_t<uint32_t> inouts, size_t len, uint32_t win,
+                       vec2d_t<uint2> temps, vec2d_t<uint32_t> histograms,
+                       uint32_t wbits, uint32_t topwin, uint32_t lstop)
+{
+    uint32_t w = win + blockIdx.y;
+    sort_row(inouts[w], len, temps[blockIdx.y], histograms[w],
+             wbits, w == topwin ? lstop : wbits);
+}
+#endif
+
 # undef asm
 #endif
 #endif

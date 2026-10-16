@@ -294,6 +294,113 @@ void integrate(bucket_h buckets_[], uint32_t nwins, uint32_t wbits, uint32_t nbi
     buckets[bid][2*tid] = p;
     buckets[bid][2*tid+1] = acc;
 }
+#ifndef __HIPCC__
+// C2-R3: ported from C2-R2 kernel-sweep integ/integ.cu (group-element equal to integrate).
+// ---- split integrate: identical per-thread loop, Nthrbits += log2(K), partials to scratch ----
+template<class bucket_t, class bucket_h = class bucket_t::mem_t>
+__launch_bounds__(256) __global__
+void integrate_split(bucket_h part[], const bucket_h buckets_[], uint32_t wbits, uint32_t nbits, uint32_t lgK)
+{
+    const uint32_t degree = bucket_t::degree;
+    const uint32_t T = blockDim.x / degree;
+    const uint32_t lgT = 31 - __clz(T);
+    const uint32_t K = 1u << lgK;
+    extern __shared__ uint4 scratch_[];
+    auto* scratch = reinterpret_cast<bucket_h*>(scratch_);
+    const uint32_t tid = threadIdx.x / degree;
+    const uint32_t win = blockIdx.x >> lgK, sub = blockIdx.x & (K - 1);
+    const uint32_t g = sub * T + tid;                       // global thread index within the window
+    const bucket_h* row = buckets_ + ((size_t)win << (wbits - 1));
+    uint32_t i = 1U << (wbits - 1 - lgT - lgK);             // L' buckets per thread
+    row += (size_t)g * i;
+
+    uint32_t mask = 0;
+    if ((win + 1) * wbits > nbits) {
+        uint32_t lsbits = nbits - win * wbits;
+        mask = (1U << (wbits - lsbits)) - 1;
+    }
+
+    bucket_t res, acc = row[--i];
+    if (i & mask) {
+        if (sizeof(res) <= 128) res.inf();
+        else                    scratch[tid].inf();
+    } else {
+        if (sizeof(res) <= 128) res = acc;
+        else                    scratch[tid] = acc;
+    }
+    bucket_t p;
+    #pragma unroll 1
+    while (i--) {
+        p = row[i];
+        uint32_t pc = i & mask ? 2 : 0;
+        #pragma unroll 1
+        do {
+            if (sizeof(bucket_t) <= 128) {
+                p.add(acc);
+                if (pc == 1) {
+                    res = p;
+                } else {
+                    acc = p;
+                    if (pc == 0) p = res;
+                }
+            } else {
+                if (LARGE_L1_CODE_CACHE && degree == 1)
+                    p.add(acc);
+                else
+                    p.uadd(acc);
+                if (pc == 1) {
+                    scratch[tid] = p;
+                } else {
+                    acc = p;
+                    if (pc == 0) p = scratch[tid];
+                }
+            }
+        } while (++pc < 2);
+    }
+    // same final register state as sppark: p = res (or scratch), acc = suffix total
+    if (sizeof(bucket_t) > 128) { __syncthreads(); p = scratch[tid]; }
+    bucket_h* out = part + (((size_t)win << (lgT + lgK)) + g) * 2;
+    out[0] = p;
+    out[1] = acc;
+}
+
+// combine: one (window, original thread t0) per thread. res = sum_j res_j + c * sum_j j*acc_j,
+// acc = sum_j acc_j, c = L' / (mask+1) (number of res-sampled positions per sub-range).
+template<class bucket_t, class bucket_h = class bucket_t::mem_t>
+__launch_bounds__(256) __global__
+void integrate_combine(bucket_h buckets_[], const bucket_h part[], uint32_t nwins, uint32_t wbits, uint32_t nbits,
+                       uint32_t lgT, uint32_t lgK)
+{
+    const uint32_t degree = bucket_t::degree;
+    const uint32_t T = 1u << lgT, K = 1u << lgK;
+    uint32_t idx = (blockIdx.x * blockDim.x + threadIdx.x) / degree;
+    if (idx >= nwins * T) return;
+    const uint32_t win = idx >> lgT, t0 = idx & (T - 1);
+    uint32_t mask = 0;
+    if ((win + 1) * wbits > nbits) {
+        uint32_t lsbits = nbits - win * wbits;
+        mask = (1U << (wbits - lsbits)) - 1;
+    }
+    const uint32_t lgL1 = wbits - 1 - lgT - lgK;
+    const uint32_t lgc = lgL1 - (31 - __clz(mask + 1));
+    const bucket_h* pp = part + (((size_t)win << (lgT + lgK)) + (size_t)t0 * K) * 2;
+    bucket_t res = pp[2 * (K - 1)], acc = pp[2 * (K - 1) + 1];
+    bucket_t run = acc, W; W.inf();
+    for (int j = (int)K - 2; j >= 0; j--) {
+        bucket_t r = pp[2 * j], a = pp[2 * j + 1];
+        W.add(run);          // adds sum_{j' > j} acc_j'
+        res.add(r);
+        run.add(a);
+    }
+    acc = run;
+    for (uint32_t d = 0; d < lgc; d++) W.add(W);   // W *= c (xyzz add doubles on equal inputs)
+    res.add(W);
+    bucket_h* row = buckets_ + ((size_t)win << (wbits - 1));
+    row[2 * t0] = res;
+    row[2 * t0 + 1] = acc;
+}
+
+#endif
 #undef asm
 
 #ifndef SPPARK_DONT_INSTANTIATE_TEMPLATES
@@ -330,6 +437,8 @@ class msm_t {
     size_t npoints;
     uint32_t wbits, nwins;
     size_t batch_override = 0;
+    uint32_t tail_sort_y = 0, tail_integ_k = 0;   // set_tail; 0 = sppark's kernels
+    int sort_cap = -1;                             // co-resident sort blocks (lazy)
     bucket_h *d_buckets;
     affine_h *d_points;
     scalar_t *d_scalars;
@@ -352,6 +461,11 @@ public:
     // 0 = sppark's heuristic (4 batches for ~2^23 points); 1 = one pass when
     // points and scalars are already on the device (no upload to pipeline).
     void set_batch(size_t b) { batch_override = b; }
+    // C2-R3 Groth16 tail (CUDA only, group-element identical results):
+    // sort_y > 2 sorts that many windows per cooperative launch instead of pairs (falls back to
+    // pairs when they don't fit co-resident); integ_k > 1 (a power of 2) splits each window's
+    // integrate over K blocks plus a combine pass. 0 keeps sppark's kernels.
+    void set_tail(uint32_t sort_y, uint32_t integ_k) { tail_sort_y = sort_y; tail_integ_k = integ_k; }
     msm_t(const affine_t points[], size_t np,
           size_t ffi_affine_sz = sizeof(affine_t), int device_id = -1)
         : gpu(select_gpu(device_id)), d_points(nullptr), d_scalars(nullptr)
@@ -399,6 +513,34 @@ public:
     }
 
 private:
+#ifndef __HIPCC__
+    // Windows sorted per cooperative launch: tail_sort_y (set_tail) when at least 3 fit
+    // co-resident, else 0 = the original pairs.
+    uint32_t sort_windows(uint32_t grid_size)
+    {
+        if (tail_sort_y <= 2) return 0;
+        if (sort_cap < 0) {
+            int per_sm = 0;
+            if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, sort_y, SORT_BLOCKDIM,
+                    sizeof(uint32_t) << DIGIT_BITS) != cudaSuccess) {
+                (void)cudaGetLastError();
+                per_sm = 0;
+            }
+            sort_cap = per_sm * (int)gpu.sm_count();
+        }
+        uint32_t y = std::min<uint32_t>(tail_sort_y, (uint32_t)sort_cap / grid_size);
+        return y > 2 ? y : 0;
+    }
+    uint32_t sort_rows()
+    {
+        uint32_t gs = gpu.sm_count() / 3;
+        while (gs & (gs - 1)) gs -= (gs & (0 - gs));
+        uint32_t y = sort_windows(gs);
+        return y > 2 ? y : 2;
+    }
+#else
+    uint32_t sort_rows() { return 2; }
+#endif
     void digits(const scalar_t d_scalars[], size_t len,
                 vec2d_t<uint32_t>& d_digits, vec2d_t<uint2>&d_temps, bool mont)
     {
@@ -434,6 +576,17 @@ private:
         // On the other hand a pair of kernels launched in parallel run
         // ~50% slower but sort twice as much data...
         uint32_t top = scalar_t::bit_length() - wbits * (nwins-1);
+#ifndef __HIPCC__
+        if (uint32_t Y = sort_windows(grid_size)) {
+            for (uint32_t w0 = 0; w0 < nwins; w0 += Y) {
+                uint32_t y = std::min(Y, nwins - w0);
+                gpu[2].launch_coop(sort_y, {{grid_size, y}, SORT_BLOCKDIM, shared_sz},
+                                d_digits, len, w0, d_temps, d_hist,
+                                wbits-1, nwins-1, top-1);
+            }
+            return;
+        }
+#endif
         uint32_t win;
         for (win = 0; win < nwins-1; win += 2) {
             gpu[2].launch_coop(sort, {{grid_size, 2}, SORT_BLOCKDIM, shared_sz},
@@ -449,9 +602,28 @@ private:
     }
 
 public:
+    // C2-R3: deferred host collect. invoke_defer() runs every GPU step and the DtoH of the
+    // per-window results, then returns; finish() does the host-side collect() later, e.g. on
+    // another thread while the next MSM runs on the GPU. Same arithmetic, same result.
+    // finish() may run concurrently with invoke()/invoke_defer() on the same msm_t: collect()
+    // reads only nwins, wbits and gpu, which are fixed at construction.
+    struct pending_t {
+        std::vector<result_t> res;
+        std::vector<bucket_t> ones;
+        point_t partial;
+    };
+    void finish(point_t& out, pending_t& d)
+    {
+        point_t p;
+        collect(p, d.res, d.ones);
+        out = d.partial;
+        out.add(p);
+    }
+
     RustError invoke(point_t& out, const affine_t* points_, size_t npoints,
                                    const scalar_t* scalars, bool mont = true,
-                                   size_t ffi_affine_sz = sizeof(affine_t))
+                                   size_t ffi_affine_sz = sizeof(affine_t),
+                                   pending_t* defer = nullptr)
     {
         assert(this->npoints == 0 || npoints <= this->npoints);
 
@@ -473,7 +645,7 @@ public:
             // |scalars| being nullptr means the scalars are pre-loaded to
             // |d_scalars|, otherwise allocate stride.
             size_t temp_sz = scalars ? sizeof(scalar_t) : 0;
-            temp_sz = stride * std::max(2*sizeof(uint2), temp_sz);
+            temp_sz = stride * std::max(sort_rows()*sizeof(uint2), temp_sz);
 
             // |points| being nullptr means the points are pre-loaded to
             // |d_points|, otherwise allocate double-stride.
@@ -483,7 +655,24 @@ public:
 
             size_t digits_sz = nwins * stride * sizeof(uint32_t);
 
-            dev_ptr_t<uint8_t> d_temp{temp_sz + digits_sz + d_point_sz, gpu[2]};
+            // Split integrate with K = 2^lgK sub-ranges per window (set_tail), when every
+            // sub-range still covers at least two buckets per thread.
+            const uint32_t lgT = lg2(MSM_NTHREADS/bucket_t::degree);
+            uint32_t lgK = 0;
+#ifndef __HIPCC__
+            {
+                uint32_t lk = tail_integ_k > 1 ? lg2(tail_integ_k) : 0;
+                uint32_t top_ls = scalar_t::bit_length() - (nwins-1)*wbits;
+                if (lk && (wbits-1) >= lgT+lk+1 && top_ls-1 >= lgT+lk)
+                    lgK = lk;
+            }
+#endif
+            size_t part_off = temp_sz + digits_sz + d_point_sz;
+            part_off = (part_off + 255) & ~(size_t)255;
+            size_t part_sz = lgK ? ((size_t)nwins << (lgT+lgK)) * 2 * sizeof(bucket_h) : 0;
+
+            dev_ptr_t<uint8_t> d_temp{part_off + part_sz, gpu[2]};
+            bucket_h* d_part = lgK ? (bucket_h*)&d_temp[part_off] : nullptr;
 
             vec2d_t<uint2> d_temps{&d_temp[0], stride};
             vec2d_t<uint32_t> d_digits{&d_temp[temp_sz], stride};
@@ -523,12 +712,29 @@ public:
                 );
                 gpu[i&1].record(ev);
 
+#ifndef __HIPCC__
+                if (lgK) {
+                    integrate_split<bucket_t><<<nwins << lgK, MSM_NTHREADS,
+                                      sizeof(bucket_t)*MSM_NTHREADS/bucket_t::degree,
+                                      gpu[i&1]>>>(
+                        d_part, d_buckets, wbits, scalar_t::bit_length(), lgK
+                    );
+                    CUDA_OK(cudaGetLastError());
+                    uint32_t nthr = (nwins << lgT) * bucket_t::degree;
+                    integrate_combine<bucket_t><<<(nthr + 127) / 128, 128, 0, gpu[i&1]>>>(
+                        d_buckets, d_part, nwins, wbits, scalar_t::bit_length(), lgT, lgK
+                    );
+                    CUDA_OK(cudaGetLastError());
+                } else
+#endif
+                {
                 integrate<bucket_t><<<nwins, MSM_NTHREADS,
                                       sizeof(bucket_t)*MSM_NTHREADS/bucket_t::degree,
                                       gpu[i&1]>>>(
                     d_buckets, nwins, wbits, scalar_t::bit_length()
                 );
                 CUDA_OK(cudaGetLastError());
+                }
 
                 if (i < batch-1) {
                     h_off += stride;
@@ -569,10 +775,35 @@ public:
 #endif
         }
 
+        if (defer) {
+            defer->res = std::move(res);
+            defer->ones = std::move(ones);
+            defer->partial = out;
+            return RustError{cudaSuccess};
+        }
         collect(p, res, ones);
         out.add(p);
 
         return RustError{cudaSuccess};
+    }
+
+    template<typename affine_ptr_t = const affine_h*,
+             typename scalar_ptr_t = const scalar_t*>
+    RustError invoke_defer(pending_t& pend, affine_ptr_t points, size_t npoints,
+                           scalar_ptr_t scalars, bool mont = true)
+    {
+        const auto* p_ptr = &points[0];
+        if (is_device_ptr<affine_ptr_t>::value) {
+            d_points = (decltype(d_points))p_ptr;
+            p_ptr = nullptr;
+        }
+        const auto* s_ptr = &scalars[0];
+        if (is_device_ptr<scalar_ptr_t>::value) {
+            d_scalars = const_cast<decltype(d_scalars)>(s_ptr);
+            s_ptr = nullptr;
+        }
+        point_t dummy;
+        return invoke(dummy, p_ptr, npoints, s_ptr, mont, sizeof(affine_t), &pend);
     }
 
 #if 0

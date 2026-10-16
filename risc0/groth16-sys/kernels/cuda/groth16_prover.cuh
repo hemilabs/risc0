@@ -45,6 +45,21 @@ static bool g16_tune() {
   return g16_cold_enabled();
 #endif
 }
+// C2-R3 Groth16 tail (msm_c2 only): each MSM's host collect overlaps the next MSM's GPU work
+// (deferred collect), 4 windows per sort launch, split integrate (K = 8). Group-element identical
+// results. Also gates PIN_EARLY, DRAIN_OVERLAP and PARVERIFY on the Rust side:
+// RISC0_CUDA_G16_TAIL=0 disables all of them.
+static bool g16_tail_enabled() {
+#ifdef __HIPCC__
+  return false;
+#else
+  static const bool on = [] {
+    const char* e = getenv("RISC0_CUDA_G16_TAIL");
+    return !(e && e[0] == '0');
+  }();
+  return on;
+#endif
+}
 // The bit set S of the split MSMs (risc0_groth16_cuda_set_bit_signals, derived from the witness
 // graph by the Rust side).
 static std::mutex g16_bits_mu;
@@ -427,10 +442,35 @@ public:
       fprintf(stderr, "groth16: %d bit-split scalars are not 0/1; using the full MSMs\n", bad);
       return false;
     }
-    msm_ok(msm_g1.invoke(results.a, dev_ptr_t<affine_t>{sp_a.pn}, c2_nn, c2_sn, false), "a");
-    msm_ok(msm_g1.invoke(results.b_g1, dev_ptr_t<affine_t>{sp_b1.pn}, c2_nn, c2_sn, false), "b_g1");
-    msm_ok(msm_g2.invoke(results.b_g2, dev_ptr_t<affine_fp2_t>{sp_b2.pn}, c2_nn, c2_sn, false), "b_g2");
-    msm_ok(msm_g1.invoke(results.c, dev_ptr_t<affine_t>{sp_c.pn}, c2_nn_c, c2_sn_c, false), "c");
+    if (g16_tail_enabled()) {
+      // GPU: a, b_g1, b_g2, c back to back; host: each collect on its own thread meanwhile.
+      typename decltype(msm_g1)::pending_t pa, pb1, pc;
+      typename decltype(msm_g2)::pending_t pb2;
+      std::vector<std::thread> th;
+      auto join_all = [&] {
+        for (auto& t : th)
+          if (t.joinable()) t.join();
+      };
+      try {
+        msm_ok(msm_g1.invoke_defer(pa, dev_ptr_t<affine_t>{sp_a.pn}, c2_nn, c2_sn, false), "a");
+        th.emplace_back([&] { msm_g1.finish(results.a, pa); });
+        msm_ok(msm_g1.invoke_defer(pb1, dev_ptr_t<affine_t>{sp_b1.pn}, c2_nn, c2_sn, false), "b_g1");
+        th.emplace_back([&] { msm_g1.finish(results.b_g1, pb1); });
+        msm_ok(msm_g2.invoke_defer(pb2, dev_ptr_t<affine_fp2_t>{sp_b2.pn}, c2_nn, c2_sn, false), "b_g2");
+        th.emplace_back([&] { msm_g2.finish(results.b_g2, pb2); });
+        msm_ok(msm_g1.invoke_defer(pc, dev_ptr_t<affine_t>{sp_c.pn}, c2_nn_c, c2_sn_c, false), "c");
+        th.emplace_back([&] { msm_g1.finish(results.c, pc); });
+      } catch (...) {
+        join_all();
+        throw;
+      }
+      join_all();
+    } else {
+      msm_ok(msm_g1.invoke(results.a, dev_ptr_t<affine_t>{sp_a.pn}, c2_nn, c2_sn, false), "a");
+      msm_ok(msm_g1.invoke(results.b_g1, dev_ptr_t<affine_t>{sp_b1.pn}, c2_nn, c2_sn, false), "b_g1");
+      msm_ok(msm_g2.invoke(results.b_g2, dev_ptr_t<affine_fp2_t>{sp_b2.pn}, c2_nn, c2_sn, false), "b_g2");
+      msm_ok(msm_g1.invoke(results.c, dev_ptr_t<affine_t>{sp_c.pn}, c2_nn_c, c2_sn_c, false), "c");
+    }
     point_t p;
     p = ba; results.a.add(p); results.a.add(sp_a.corr);
     p = bb1; results.b_g1.add(p); results.b_g1.add(sp_b1.corr);
@@ -552,6 +592,12 @@ public:
       msm_g1.set_batch(1);
       msm_g2.set_batch(1);
     }
+#ifndef __HIPCC__
+    if (g16_tail_enabled()) {
+      msm_g1.set_tail(4, 8);
+      msm_g2.set_tail(4, 8);
+    }
+#endif
 
     fuzzed_results = read_fuzzed_results_from_file(fuzzed_results_file);
 #ifndef __HIPCC__
@@ -617,15 +663,23 @@ public:
         h2d_done.wait(gpu[0]);
       }
 
+      // witness_into_poly: one row per thread in a grid-stride loop, so the launch shape does not
+      // change the result; 12 x 256-thread blocks per SM beat 1 x 512 (C2-R2 kernel sweep: A+B
+      // 4.03 -> 3.63 ms with the compact coefficients).
+#ifndef __HIPCC__
+      const unsigned wip_grid = 12 * gpu.sm_count(), wip_block = 256;
+#else
+      const unsigned wip_grid = gpu.sm_count(), wip_block = 512;
+#endif
       gpu[0].bzero(&d_a[0], domain_size);
 #ifndef __HIPCC__
       if (coeffs.compact)
-        witness_into_poly_compact<<<gpu.sm_count(), 512, 0, gpu[0]>>>(
+        witness_into_poly_compact<<<wip_grid, wip_block, 0, gpu[0]>>>(
             &d_a[0], coeffs.get_cs_a(), &coeffs.d_table[0], coeffs.get_indices_a(),
             coeffs.get_rowc_a(), &d_witness[0]);
       else
 #endif
-      witness_into_poly<<<gpu.sm_count(), 512, 0, gpu[0]>>>(
+      witness_into_poly<<<wip_grid, wip_block, 0, gpu[0]>>>(
           &d_a[0], coeffs.get_coeffs_a().data(), coeffs.get_indices_a(), &d_witness[0]);
       CUDA_OK(cudaGetLastError());
       sync_event.record(gpu[0]);
@@ -633,12 +687,12 @@ public:
       gpu.bzero(&d_b[0], domain_size);
 #ifndef __HIPCC__
       if (coeffs.compact)
-        witness_into_poly_compact<<<gpu.sm_count(), 512, 0, gpu>>>(
+        witness_into_poly_compact<<<wip_grid, wip_block, 0, gpu>>>(
             &d_b[0], coeffs.get_cs_b(), &coeffs.d_table[0], coeffs.get_indices_b(),
             coeffs.get_rowc_b(), &d_witness[0]);
       else
 #endif
-      witness_into_poly<<<gpu.sm_count(), 512, 0, gpu>>>(
+      witness_into_poly<<<wip_grid, wip_block, 0, gpu>>>(
           &d_b[0], coeffs.get_coeffs_b().data(), coeffs.get_indices_b(), &d_witness[0]);
       CUDA_OK(cudaGetLastError());
 
@@ -654,12 +708,31 @@ public:
           &d_a[0], &d_b[0], &d_c[0], lg_domain_size);
       CUDA_OK(cudaGetLastError());
       gpu.sync();
+      // With the MSM tail, h's host collect runs on a thread while the next MSMs use the GPU;
+      // joined before anything reads results.h (also on unwind).
+      std::thread th_h;
+      struct join_on_exit {
+        std::thread& t;
+        ~join_on_exit() {
+          if (t.joinable()) t.join();
+        }
+      } th_h_guard{th_h};
+#ifndef __HIPCC__
+      typename decltype(msm_g1)::pending_t pend_h;
+      if (g16_tail_enabled()) {
+        msm_ok(msm_g1.invoke_defer(pend_h, srs.get_h(), domain_size, d_poly_a_b_c), "h");
+        th_h = std::thread([&] { msm_g1.finish(results.h, pend_h); });
+      } else
+#endif
       msm_ok(msm_g1.invoke(results.h, srs.get_h(), domain_size, d_poly_a_b_c), "h");
 
       bool split_done = false;
 #ifndef __HIPCC__
       if (c2_on)
         split_done = c2_msms(results);
+#endif
+      if (th_h.joinable()) th_h.join();
+#ifndef __HIPCC__
       if (c2_on && !split_done) {
         c2_full_msms(results);
       } else
