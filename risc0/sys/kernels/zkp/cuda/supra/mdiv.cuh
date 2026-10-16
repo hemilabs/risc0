@@ -266,6 +266,12 @@ static void mdiv_run(md4_t* base, size_t n, const uint32_t combo_indices[], cons
   }
   md4_t* scratch = nullptr;
   CUDA_OK(cudaMallocAsync((void**)&scratch, (2 * (size_t)num_combos * ntiles + tot) * sizeof(md4_t), st));
+  // Freed (stream-ordered) on every path out, also when a launch check below throws.
+  struct scratch_guard {
+    md4_t* p;
+    cudaStream_t st;
+    ~scratch_guard() { (void)cudaFreeAsync(p, st); }
+  } guard{scratch, st};
   md4_t* rems_d = scratch + 2 * (size_t)num_combos * ntiles;
   auto job = [&](uint32_t c, uint32_t r) {
     MdJob j;
@@ -307,6 +313,5 @@ static void mdiv_run(md4_t* base, size_t n, const uint32_t combo_indices[], cons
   mdiv_final<<<1, 32, 0, st>>>(J, nj);
   CUDA_OK(cudaGetLastError());
   CUDA_OK(cudaMemcpyAsync(rems_h, rems_d, tot * sizeof(md4_t), cudaMemcpyDeviceToHost, st));
-  CUDA_OK(cudaFreeAsync(scratch, st));
   CUDA_OK(cudaStreamSynchronize(st));
 }

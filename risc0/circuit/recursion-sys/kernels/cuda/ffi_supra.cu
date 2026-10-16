@@ -91,6 +91,12 @@ extern "C" const char* risc0_circuit_recursion_cuda_eval_check(Fp* check,
       hipMemcpyAsync(dev_ptr, poly_mix_pows, sizeof(poly_mix), hipMemcpyHostToDevice, stream);
     }
 #else
+    if (risc0::circuit::recursion::cuda::use_split()) {
+      // Uploads poly_mix to its own module's symbol (this one's is not read).
+      risc0::circuit::recursion::cuda::eval_check_split(stream, check, ctrl, data, accum, mix, out, rou,
+                                                        po2, domain, poly_mix_pows);
+      return nullptr;
+    }
     // Async memcpy on the same stream avoids a host-blocking sync that
     // serializes the persistent stream against the host. Stage into a
     // persistent host buffer so the source remains valid across the async
@@ -101,12 +107,6 @@ extern "C" const char* risc0_circuit_recursion_cuda_eval_check(Fp* check,
       cudaMemcpyToSymbolAsync(poly_mix, poly_mix_staging, sizeof(poly_mix),
                               0, cudaMemcpyHostToDevice, stream);
     }
-#endif
-#ifndef __HIPCC__
-    if (risc0::circuit::recursion::cuda::use_split()) {
-      risc0::circuit::recursion::cuda::eval_check_split(stream, check, ctrl, data, accum, mix, out, rou,
-                                                        po2, domain, poly_mix_pows);
-    } else
 #endif
     risc0::circuit::recursion::cuda::eval_check<<<cfg.grid, cfg.block, 0, stream>>>(
         check, ctrl, data, accum, mix, out, rou, po2, domain);
