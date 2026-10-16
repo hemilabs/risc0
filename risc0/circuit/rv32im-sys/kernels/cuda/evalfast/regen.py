@@ -26,6 +26,24 @@ to_cuda.py. The chain, the same one build.rs runs for the Intel mono kernel
   3. kernels/intel/evalfast/pipeline.py
   4. kernels/cuda/evalfast/to_cuda.py
 
+followed by the CUDA post-passes in this directory (PASSES below):
+
+  5. remat.py: slab values that are small Fp trees over input loads are
+     recomputed at their reads; the slab is re-coloured
+  6. lazyfp.py: lazy [0, 2P) Fp add/sub/mul where every consumer allows it
+  7. close.py: closures B + u * PM_k accumulated lazily in 64 bits with an
+     NBETA-folded constant table (+ inline PTX mad.wide, CUDA only)
+  8. linkext.py: rk_link with an FpExt term accumulated the same way
+  9. accfirst_cuda.py: the LogUp/accum block sliced out of the main chain
+ 10. mksplit2.py: main / LogUp block-type phase split (ef_eval_split, even
+     blocks main and odd blocks LogUp, plus ef_combine)
+ 11. remat_lu.py: LogUp slab FpExt values recomputed at their reads
+ 12. mksm2.py: per-phase 64 hottest slab words in shared memory
+
+Each pass prints what it did; EXPECT pins those lines, so a change in the
+circuit or a pass that changes the shape of the kernel fails here first: re-run
+the bit-exactness battery on the new kernel before updating the pins.
+
 The result is committed, so the CUDA build needs no Python. Re-run this after
 changing the generated circuit (kernels/cxx/rust_poly_fp_*.cpp) or any of the
 passes; --check (run in CI) fails if the committed file is out of date.
@@ -42,12 +60,40 @@ SYS = os.path.normpath(os.path.join(HERE, '..', '..', '..'))  # rv32im-sys
 OUT = os.path.join(SYS, 'kernels', 'cuda', 'eval_check_ef.cu')
 NS = 'namespace risc0::circuit::rv32im_v2 {'
 
+# (pass, extra arguments, lines its output must contain)
+PASSES = [
+    ('remat.py', ['--maxops', '4', '--maxloads', '4'],
+     ['remat: 675 values, 1421 loads rematerialized, 675 stores dropped, slab words 324']),
+    ('lazyfp.py', [], ["lazyfp: {'cand': 6032, 'add': 94, 'sub': 503, 'mul': 265}"]),
+    ('close.py', ['--chain'], ['close: 231 closures, 157 chained']),
+    ('linkext.py', [], ['linkext: 5118 call sites']),
+    ('accfirst_cuda.py', [], ['accfirst_cuda: 209 tail lines, 41 pulled-in defs']),
+    ('mksplit2.py', [], []),
+    ('remat_lu.py', ['--maxg', '4', '--maxops', '8'],
+     ["loads 135 {'keep': 41, 'remat': 94} stores 115 dropped 89"]),
+    ('mksm2.py', ['64', '64'], ['main words 85 acc 751 hot 683 | lu words 104 acc 268 hot 188']),
+]
+
+POST_HEADER = '''//
+// CUDA post-passes (kernels/cuda/evalfast, chained by regen.py): slab values
+// rematerialised from the inputs (remat.py), lazy [0, 2P) Fp results
+// (lazyfp.py), lazy 64-bit closure and FpExt link accumulation with inline PTX
+// mad.wide (close.py, linkext.py), the LogUp block sliced out of the main chain
+// (accfirst_cuda.py), a main / LogUp block-type phase split (ef_eval_split +
+// ef_combine, mksplit2.py), LogUp slab values rematerialised at their reads
+// (remat_lu.py) and the per-phase 64 hottest slab words in shared memory
+// (mksm2.py). The rematerialisation relies on data, accum and mix being
+// read-only for the whole kernel.
+'''
+HEADER_END = '// kernel happens to tolerate them.\n'
+
 
 def run(env, *args):
     r = subprocess.run([sys.executable, *args], env=env, cwd=SYS, capture_output=True, text=True)
     if r.returncode != 0:
         sys.exit('regen: %s failed (%d):\n%s%s' % (os.path.basename(args[0]), r.returncode,
                                                    r.stdout[-2000:], r.stderr[-2000:]))
+    return r.stdout + r.stderr
 
 
 def rust_lines(s):
@@ -93,10 +139,23 @@ def main():
             f.write(amalgamate(cse))
         fast = os.path.join(tmp, 'fast.cpp')
         run(env, 'kernels/intel/evalfast/pipeline.py', amalg, fast, os.path.join(tmp, 'work'))
-        gen = os.path.join(tmp, 'eval_check_ef.cu')
+        gen = os.path.join(tmp, 'base.cu')
         run(env, os.path.join(HERE, 'to_cuda.py'), fast, gen)
+        for n, (tool, extra, expect) in enumerate(PASSES):
+            nxt = os.path.join(tmp, 'p%d.cu' % n)
+            log = run(env, os.path.join(HERE, tool), gen, nxt, *extra)
+            for line in expect:
+                if line not in log:
+                    sys.exit('regen: EXPECT failed: %s did not print\n  %s\nit printed:\n%s'
+                             % (tool, line, log))
+            gen = nxt
         with open(gen, newline='') as f:
             new = f.read()
+    assert new.count(HEADER_END) == 1
+    new = new.replace(HEADER_END, HEADER_END + POST_HEADER)
+    bad = [i + 1 for i, l in enumerate(new.split('\n')) if l != l.rstrip()]
+    if bad:
+        sys.exit('regen: trailing whitespace on %d generated lines (first: %d)' % (len(bad), bad[0]))
     try:
         with open(OUT, newline='') as f:
             old = f.read()

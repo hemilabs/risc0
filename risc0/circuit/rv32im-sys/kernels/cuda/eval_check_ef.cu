@@ -9,12 +9,15 @@
 // non-canonical inputs give different (wrong) results, where the original
 // kernel happens to tolerate them.
 //
-// C2-R2 ec-logup (g4sm): main / LogUp block-type phase split (ef_eval_split +
-// ef_combine), LogUp slab values rematerialised at their reads (<=4 loads,
-// <=8 ops) and per-phase 64 hottest slab words in shared memory. Produced from
-// the R1 ec-algebra output by c2/r2/ec-logup/regen.sh (mksplit2.py, remat_lu.py,
-// mksm2.py). Remat relies on data, accum and mix being read-only for the whole
-// kernel.
+// CUDA post-passes (kernels/cuda/evalfast, chained by regen.py): slab values
+// rematerialised from the inputs (remat.py), lazy [0, 2P) Fp results
+// (lazyfp.py), lazy 64-bit closure and FpExt link accumulation with inline PTX
+// mad.wide (close.py, linkext.py), the LogUp block sliced out of the main chain
+// (accfirst_cuda.py), a main / LogUp block-type phase split (ef_eval_split +
+// ef_combine, mksplit2.py), LogUp slab values rematerialised at their reads
+// (remat_lu.py) and the per-phase 64 hottest slab words in shared memory
+// (mksm2.py). The rematerialisation relies on data, accum and mix being
+// read-only for the whole kernel.
 #define EF_EXT_LAZY 1
 #define RISC0_INTEL_EVAL_LOHI 1
 #define EF_SLAB_ASM 1
@@ -217,7 +220,7 @@ __device__ __forceinline__ static FpExt rk_fin(const RkAcc& s) {
 }
 
 
-// ---- lazyfp.py: lazy [0, 2P) Fp results (see tools/lazyfp.py for the bounds) ----
+// ---- lazyfp.py: lazy [0, 2P) Fp results (see evalfast/lazyfp.py for the bounds) ----
 __device__ __forceinline__ static ::risc0::Fp ef_ladd(::risc0::Fp a, ::risc0::Fp b) { return ::risc0::Fp::fromRaw(a.asRaw() + b.asRaw()); }
 __device__ __forceinline__ static ::risc0::Fp ef_lsub(::risc0::Fp a, ::risc0::Fp b) { return ::risc0::Fp::fromRaw(a.asRaw() + (::risc0::Fp::P - b.asRaw())); }
 __device__ __forceinline__ static ::risc0::Fp ef_lmul(::risc0::Fp a, ::risc0::Fp b) {
@@ -500,20 +503,17 @@ __device__ EF_NOINLINE FpExt rv32im_v2_19(size_t cycle, size_t steps, FpExt* pol
   RkAcc x298 = rk_link_k(x296, x297, 2u);
   constexpr Fp x27(1);
   auto x299 = x31 - x27;
-  
   RkAcc x300 = rk_link_nf_k(x298, x299, 3u);
   auto x301 = (EF_LD(arg8, (uint32_t)(132u * rk_s + ((rk_c - 0u) & rk_m))) * (Fp(1u) - EF_LD(arg8, (uint32_t)(132u * rk_s + ((rk_c - 0u) & rk_m)))));
   RkAcc x302 = rk_link_k(x300, x301, 4u);
   auto x41 = EF_LD(arg8, (uint32_t)(132u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x303 = x41 * x29;
-  
   auto x42 = EF_LD(arg8, (uint32_t)(30u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x304 = x303 + x42;
   auto x305 = x293 - x304;
   RkAcc x306 = rk_link_nf_k(x302, x305, 5u);
   auto x307 = x295 + x41;
   auto x308 = x32 - x27;
-  
   RkAcc x309 = rk_link_k(x306, x308, 6u);
   auto x310 = (EF_LD(arg8, (uint32_t)(133u * rk_s + ((rk_c - 0u) & rk_m))) * (Fp(1u) - EF_LD(arg8, (uint32_t)(133u * rk_s + ((rk_c - 0u) & rk_m)))));
   RkAcc x311 = rk_link_nf_k(x309, x310, 7u);
@@ -526,43 +526,34 @@ __device__ EF_NOINLINE FpExt rv32im_v2_19(size_t cycle, size_t steps, FpExt* pol
   auto x316 = (EF_LD(arg8, (uint32_t)(134u * rk_s + ((rk_c - 0u) & rk_m))) * (Fp(1u) - EF_LD(arg8, (uint32_t)(134u * rk_s + ((rk_c - 0u) & rk_m)))));
   RkAcc x317 = rk_link_nf_k(x315, x316, 9u);
   auto x318 = x33 - x27;
-  
   RkAcc x319 = rk_link_k(x317, x318, 10u);
   constexpr Fp x26(32768);
   auto x45 = EF_LD(arg8, (uint32_t)(134u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x320 = x45 * x26;
-  
   constexpr Fp x25(1006632961);
   auto x46 = EF_LD(arg8, (uint32_t)(34u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x321 = x46 * x25;
-  
   auto x322 = x320 + x321;
   auto x323 = x39 - x322;
   RkAcc x324 = rk_link_nf_k(x319, x323, 11u);
   auto x325 = (EF_LD(arg8, (uint32_t)(135u * rk_s + ((rk_c - 0u) & rk_m))) * (Fp(1u) - EF_LD(arg8, (uint32_t)(135u * rk_s + ((rk_c - 0u) & rk_m)))));
   RkAcc x326 = rk_link_k(x324, x325, 12u);
   auto x327 = x34 - x27;
-  
   RkAcc x328 = rk_link_nf_k(x326, x327, 13u);
   auto x47 = EF_LD(arg8, (uint32_t)(135u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x329 = x47 * x26;
-  
   auto x48 = EF_LD(arg8, (uint32_t)(36u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x330 = x48 * x25;
-  
   auto x331 = x329 + x330;
   auto x332 = x40 - x331;
   RkAcc x333 = rk_link_k(x328, x332, 14u);
   RkAcc x334 = rk_link_nf_k(x333, x156, 15u);
   auto x335 = x35 - x27;
-  
   RkAcc x336 = rk_link_k(x334, x335, 16u);
   auto x49 = EF_LD(arg8, (uint32_t)(136u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x337 = x49 * x26;
-  
   auto x50 = EF_LD(arg8, (uint32_t)(38u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x338 = x50 * x25;
-  
   auto x339 = x337 + x338;
   auto x340 = x44 - x339;
   RkAcc x341 = rk_link_nf_k(x336, x340, 17u);
@@ -719,7 +710,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_19(size_t cycle, size_t steps, FpExt* pol
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   auto x437 = ef_lsub(x27, x61);
-  
   // lincombF: fused into a lazy Fp linear combination
   auto x439 = RK_LD1M(arg0, 16u);
   auto x440 = x37 + x439;
@@ -830,48 +820,39 @@ __device__ EF_NOINLINE FpExt rv32im_v2_19(size_t cycle, size_t steps, FpExt* pol
   // lincombF: fused into a lazy Fp linear combination
   auto x125 = EF_LD(arg8, (uint32_t)(39u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x512 = x125 - x27;
-  
   RkAcc x513 = rk_link_nf_k(x380, x512, 288u);
   auto x126 = EF_LD(arg8, (uint32_t)(41u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x514 = ef_lsub(x27, x126);
   auto x515 = x126 * x514;
-  
   RkAcc x516 = rk_link_k(x513, x515, 289u);
   auto x517 = x126 * x29;
   auto x127 = EF_LD(arg8, (uint32_t)(40u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x518 = x517 + x127;
-  
   RkW1 _wx519 = rkw1_ff0(x381, x57, false); rkw1_ff(_wx519, x293, x58, false); rkw1_ff(_wx519, x431, x91, false); rkw1_ff(_wx519, x433, x92, false); rkw1_ff(_wx519, x429, x36, false); rkw1_ff(_wx519, x71, x53, false); rkw1_ff(_wx519, x437, x54, false); rkw1_ff(_wx519, x440, x56, false); rkw1_v(_wx519, x518, true); auto x519 = rkw1_fin(_wx519);
   RkAcc x520 = rk_link_nf_k(x516, x519, 290u);
   // lincombF: fused into a lazy Fp linear combination
   auto x128 = EF_LD(arg8, (uint32_t)(42u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x522 = x128 - x27;
-  
   RkAcc x523 = rk_link_k(x520, x522, 291u);
   auto x129 = EF_LD(arg8, (uint32_t)(44u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x524 = ef_lsub(x27, x129);
   auto x525 = x129 * x524;
-  
   RkAcc x526 = rk_link_nf_k(x523, x525, 292u);
   auto x527 = x129 * x29;
   auto x130 = EF_LD(arg8, (uint32_t)(43u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x528 = x527 + x130;
-  
   RkW1 _wx529 = rkw1_ff0(x449, x57, false); rkw1_ff(_wx529, x295, x58, false); rkw1_ff(_wx529, x499, x91, false); rkw1_ff(_wx529, x501, x92, false); rkw1_ff(_wx529, x497, x36, false); rkw1_ff(_wx529, x505, x56, false); rkw1_v(_wx529, x126, false); rkw1_v(_wx529, x528, true); auto x529 = rkw1_fin(_wx529);
   RkAcc x530 = rk_link_k(x526, x529, 293u);
   auto x131 = EF_LD(arg8, (uint32_t)(45u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x531 = x131 - x27;
-  
   RkAcc x532 = rk_link_nf_k(x530, x531, 294u);
   auto x132 = EF_LD(arg8, (uint32_t)(47u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x533 = ef_lsub(x27, x132);
   auto x534 = x132 * x533;
-  
   RkAcc x535 = rk_link_k(x532, x534, 295u);
   auto x536 = x132 * x29;
   auto x133 = EF_LD(arg8, (uint32_t)(46u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x537 = x536 + x133;
-  
   auto x538 = RK_LD1M(arg0, 6u);
   auto x539 = x538 - x537;
   RkAcc x540 = rk_link_nf_k(x535, x539, 296u);
@@ -879,24 +860,19 @@ __device__ EF_NOINLINE FpExt rv32im_v2_19(size_t cycle, size_t steps, FpExt* pol
   auto x542 = x541 + x132;
   auto x134 = EF_LD(arg8, (uint32_t)(48u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x543 = x134 - x27;
-  
   RkAcc x544 = rk_link_k(x540, x543, 297u);
   auto x135 = EF_LD(arg8, (uint32_t)(50u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x545 = ef_lsub(x27, x135);
   auto x546 = x135 * x545;
-  
   RkAcc x547 = rk_link_nf_k(x544, x546, 298u);
   auto x548 = x135 * x29;
   auto x136 = EF_LD(arg8, (uint32_t)(49u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x549 = x548 + x136;
-  
   auto x550 = x542 - x549;
   RkAcc x551 = rk_link_k(x547, x550, 299u);
   auto x137 = EF_LD(arg8, (uint32_t)(51u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x552 = x27 - x137;
-  
   auto x553 = x137 * x552;
-  
   RkAcc x554 = rk_link_nf_k(x551, x553, 300u);
   auto x555 = (((EF_LD(arg8, (uint32_t)(81u * rk_s + ((rk_c - 0u) & rk_m))) * Fp(8u)) + (EF_LD(arg8, (uint32_t)(82u * rk_s + ((rk_c - 0u) & rk_m))) * Fp(2u))) + EF_LD(arg8, (uint32_t)(83u * rk_s + ((rk_c - 0u) & rk_m))));
   auto x138 = EF_LD(arg8, (uint32_t)(52u * rk_s + ((rk_c - 0u) & rk_m)));
@@ -908,7 +884,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_19(size_t cycle, size_t steps, FpExt* pol
   RK_ST1M(arg0, 8u, x559);
   RkAcc x560 = rk_link_nf_k(x558, x559, 302u);
   auto x561 = x137 * x138;
-  
   RkAcc x562 = rk_link_k(x560, x561, 303u);
   auto x563 = RK_LD1M(arg0, 1u);
   auto x564 = x552 * x563;
@@ -924,11 +899,9 @@ __device__ EF_NOINLINE FpExt rv32im_v2_19(size_t cycle, size_t steps, FpExt* pol
   constexpr Fp x9(2013265920);
   auto x140 = EF_LD(arg8, (uint32_t)(55u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x573 = x140 - x9;
-  
   RkAcc x574 = rk_link_k(x572, x573, 305u);
   auto x141 = EF_LD(arg8, (uint32_t)(59u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x575 = x141 - x27;
-  
   RkAcc x576 = rk_link_nf_k(x574, x575, 306u);
   auto x577 = ((EF_LD(arg8, (uint32_t)(0u * rk_s + ((rk_c - 0u) & rk_m))) * Fp(2u)) + Fp(1u));
   auto x142 = EF_LD(arg8, (uint32_t)(60u * rk_s + ((rk_c - 0u) & rk_m)));
@@ -937,26 +910,21 @@ __device__ EF_NOINLINE FpExt rv32im_v2_19(size_t cycle, size_t steps, FpExt* pol
   RkAcc x579 = rk_link_k(x576, x578, 307u);
   auto x143 = EF_LD(arg8, (uint32_t)(54u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x581 = x143 - x139;
-  
   RkAcc x582 = rk_link_nf_k(x579, x581, 309u);
   auto x583 = x142 - x27;
   auto x144 = EF_LD(arg8, (uint32_t)(56u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x584 = x583 - x144;
   auto x145 = EF_LD(arg8, (uint32_t)(63u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x585 = x145 - x27;
-  
   RkAcc x586 = rk_link_k(x582, x585, 310u);
   auto x146 = EF_LD(arg8, (uint32_t)(64u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x587 = x146 - x584;
-  
   RkAcc x588 = rk_link_nf_k(x586, x587, 311u);
   auto x147 = EF_LD(arg8, (uint32_t)(61u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x589 = x147 - x127;
-  
   RkAcc x590 = rk_link_k(x588, x589, 312u);
   auto x148 = EF_LD(arg8, (uint32_t)(62u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x591 = ef_lsub(x148, x130);
-  
   FpExt x592 = rk_fin(rk_link_k(x590, x591, 313u));
   auto x149 = EF_LD(arg8, (uint32_t)(1u * rk_s + ((rk_c - 0u) & rk_m)));
   RkW _cx593 = rk_cl0(arg5, x149 * x592, 29u); FpExt x593 = rkw_fin(_cx593);
@@ -1176,7 +1144,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_19(size_t cycle, size_t steps, FpExt* pol
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   auto x971 = x27 - x71;
-  
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx973 = rkw1_ff0(x71, x958, false); rkw1_ff(_wx973, x971, x961, false); auto x973 = rkw1_fin(_wx973);
   // lincombF: fused into a lazy Fp linear combination
@@ -1247,7 +1214,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_19(size_t cycle, size_t steps, FpExt* pol
   auto x1038 = x92 + x36;
   auto x1039 = x1038 + x53;
   auto x1040 = x1039 + x54;
-  
   auto x1041 = ((((Fp(1u) - EF_LD(arg8, (uint32_t)(18u * rk_s + ((rk_c - 0u) & rk_m)))) * EF_LD(arg8, (uint32_t)(14u * rk_s + ((rk_c - 4u) & rk_m)))) + Fp(4u)) * EF_LD(arg8, (uint32_t)(24u * rk_s + ((rk_c - 0u) & rk_m))));
   auto x1042 = ((((Fp(1u) - EF_LD(arg8, (uint32_t)(18u * rk_s + ((rk_c - 0u) & rk_m)))) * EF_LD(arg8, (uint32_t)(14u * rk_s + ((rk_c - 4u) & rk_m)))) + Fp(4u)) * EF_LD(arg8, (uint32_t)(25u * rk_s + ((rk_c - 0u) & rk_m))));
   // lincombF: fused into a lazy Fp linear combination
@@ -1458,7 +1424,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(size_t cycle, size_t steps, FpExt* pol
   constexpr Fp x33(1);
   auto x38 = EF_LD(arg9, (uint32_t)(107u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x243 = x38 - x33;
-  
   auto x39 = EF_LD(arg9, (uint32_t)(103u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x244 = x243 - x39;
   auto x245 = (EF_LD(arg9, (uint32_t)(110u * rk_s + ((rk_c - 0u) & rk_m))) - Fp(1u));
@@ -1496,7 +1461,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(size_t cycle, size_t steps, FpExt* pol
   auto x46 = EF_LD(arg9, (uint32_t)(112u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x269 = ef_lsub(x33, x46);
   auto x270 = x46 * x269;
-  
   RkAcc x271 = rk_link_nf_k(x264, x270, 5u);
   auto x272 = (EF_LD(arg9, (uint32_t)(33u * rk_s + ((rk_c - 0u) & rk_m))) - Fp(1u));
   RkAcc x273 = rk_link_k(x271, x272, 6u);
@@ -1580,9 +1544,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(size_t cycle, size_t steps, FpExt* pol
   auto x338 = x61 * x24;
   auto x62 = EF_LD(arg9, (uint32_t)(113u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x344 = x33 - x62;
-  
   auto x345 = x62 * x344;
-  
   RkAcc x346 = rk_link_nf_k(x323, x345, 131u);
   auto x347 = RK_LD1M(arg0, 6u);
   auto x63 = EF_LD(arg9, (uint32_t)(114u * rk_s + ((rk_c - 0u) & rk_m)));
@@ -1592,7 +1554,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(size_t cycle, size_t steps, FpExt* pol
   auto x351 = x62 * x347;
   RkAcc x352 = rk_link_nf_k(x350, x351, 133u);
   auto x353 = x62 * x63;
-  
   RkAcc x354 = rk_link_k(x352, x353, 134u);
   // lincombF: fused into a lazy Fp linear combination
   auto x356 = ef_lsub(x33, x344);
@@ -1645,13 +1606,10 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(size_t cycle, size_t steps, FpExt* pol
   RkAcc x382 = rk_link_nf_k(x380, x2001761, 144u);
   auto x72 = EF_LD(arg9, (uint32_t)(127u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x383 = x72 - x33;
-  
   RkAcc x384 = rk_link_k(x382, x383, 145u);
   auto x73 = EF_LD(arg9, (uint32_t)(129u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x385 = ef_lsub(x33, x73);
-  
   auto x386 = x73 * x385;
-  
   RkAcc x387 = rk_link_nf_k(x384, x386, 146u);
   constexpr Fp x20(65536);
   auto x388 = x73 * x20;
@@ -1692,7 +1650,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(size_t cycle, size_t steps, FpExt* pol
   auto x424 = (EF_LD(arg9, (uint32_t)(78u * rk_s + ((rk_c - 0u) & rk_m))) - EF_LD(arg9, (uint32_t)(82u * rk_s + ((rk_c - 0u) & rk_m))));
   auto x426 = (EF_LD(arg9, (uint32_t)(79u * rk_s + ((rk_c - 0u) & rk_m))) - EF_LD(arg9, (uint32_t)(83u * rk_s + ((rk_c - 0u) & rk_m))));
   auto x428 = x45 - x33;
-  
   auto x430 = RK_LD1M(arg0, 10u);
   auto x431 = x42 - x430;
   auto x83 = EF_LD(arg9, (uint32_t)(97u * rk_s + ((rk_c - 0u) & rk_m)));
@@ -1739,7 +1696,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(size_t cycle, size_t steps, FpExt* pol
   auto x87 = EF_LD(arg9, (uint32_t)(87u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x88 = EF_LD(arg9, (uint32_t)(91u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x460 = x87 - x88;
-  
   auto x89 = EF_LD(arg9, (uint32_t)(88u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x90 = EF_LD(arg9, (uint32_t)(92u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x462 = x89 - x90;
@@ -1822,7 +1778,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(size_t cycle, size_t steps, FpExt* pol
   auto x100 = EF_LD(arg9, (uint32_t)(106u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x495 = ef_lsub(x33, x100);
   auto x496 = x100 * x495;
-  
   RkAcc x497 = rk_link_k(x494, x496, 80u);
   auto x498 = x100 * x20;
   auto x499 = x498 + x36;
@@ -1831,9 +1786,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(size_t cycle, size_t steps, FpExt* pol
   auto x502 = x492 + x100;
   RkAcc x503 = rk_link_k(x501, x243, 82u);
   auto x504 = ef_lsub(x33, x37);
-  
   auto x505 = x37 * x504;
-  
   RkAcc x506 = rk_link_nf_k(x503, x505, 83u);
   auto x507 = x37 * x20;
   auto x508 = x507 + x35;
@@ -1843,7 +1796,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(size_t cycle, size_t steps, FpExt* pol
   RkAcc x512 = rk_link_nf_k(x510, x511, 85u);
   auto x513 = ef_lsub(x33, x40);
   auto x514 = x40 * x513;
-  
   RkAcc x515 = rk_link_k(x512, x514, 86u);
   // lincombF: fused into a lazy Fp linear combination
   auto x101 = EF_LD(arg9, (uint32_t)(110u * rk_s + ((rk_c - 0u) & rk_m)));
@@ -1856,7 +1808,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(size_t cycle, size_t steps, FpExt* pol
   RkAcc x523 = rk_link_k(x521, x522, 88u);
   auto x524 = x33 - x63;
   auto x525 = x63 * x524;
-  
   RkAcc x526 = rk_link_nf_k(x523, x525, 89u);
   auto x527 = x35 * x64;
   auto x528 = x527 - x524;
@@ -1978,11 +1929,9 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(size_t cycle, size_t steps, FpExt* pol
   auto x634 = x73 - x542;
   RkAcc x635 = rk_link_k(x632, x634, 157u);
   auto x636 = x111 - x33;
-  
   auto x637 = x636 - x75;
   auto x112 = EF_LD(arg9, (uint32_t)(138u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x638 = x112 - x33;
-  
   RkAcc x639 = rk_link_nf_k(x635, x638, 158u);
   auto x113 = EF_LD(arg9, (uint32_t)(139u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x640 = x113 - x637;
@@ -2001,7 +1950,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(size_t cycle, size_t steps, FpExt* pol
   auto x650 = x116 * x20;
   auto x117 = EF_LD(arg9, (uint32_t)(141u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x651 = x650 + x117;
-  
   auto x652 = x390 - x651;
   RkAcc x653 = rk_link_nf_k(x649, x652, 164u);
   auto x654 = x393 + x116;
@@ -2060,10 +2008,8 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(size_t cycle, size_t steps, FpExt* pol
   RkAcc x691 = rk_link_nf_k(arg2, x664, 0u);
   RkAcc x692 = rk_link_k(x691, x679, 1u);
   auto x693 = x49 - x22;
-  
   RkAcc x694 = rk_link_nf_k(x692, x693, 2u);
   auto x695 = x107 - x33;
-  
   RkAcc x696 = rk_link_k(x694, x695, 3u);
   auto x697 = x47 - x454;
   RK_ST1M(arg0, 8u, x697);
@@ -2071,15 +2017,12 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(size_t cycle, size_t steps, FpExt* pol
   auto x700 = x44 - x682;
   RkAcc x701 = rk_link_k(x698, x700, 6u);
   auto x702 = x43 - x106;
-  
   RkAcc x703 = rk_link_nf_k(x701, x702, 7u);
   auto x124 = EF_LD(arg9, (uint32_t)(37u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x704 = x51 - x124;
-  
   RkAcc x705 = rk_link_k(x703, x704, 8u);
   auto x125 = EF_LD(arg9, (uint32_t)(38u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x706 = x125 - x22;
-  
   RkAcc x707 = rk_link_nf_k(x705, x706, 9u);
   auto x708 = (EF_LD(arg9, (uint32_t)(43u * rk_s + ((rk_c - 0u) & rk_m))) - Fp(1u));
   RkAcc x709 = rk_link_k(x707, x708, 10u);
@@ -2093,20 +2036,16 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(size_t cycle, size_t steps, FpExt* pol
   auto x128 = EF_LD(arg9, (uint32_t)(41u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x129 = EF_LD(arg9, (uint32_t)(45u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x715 = x128 - x129;
-  
   RkAcc x716 = rk_link_nf_k(x714, x715, 14u);
   auto x130 = EF_LD(arg9, (uint32_t)(42u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x131 = EF_LD(arg9, (uint32_t)(46u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x717 = x130 - x131;
-  
   RkAcc x718 = rk_link_k(x716, x717, 15u);
   auto x132 = EF_LD(arg9, (uint32_t)(47u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x719 = x132 - x22;
-  
   RkAcc x720 = rk_link_nf_k(x718, x719, 16u);
   auto x133 = EF_LD(arg9, (uint32_t)(52u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x721 = x133 - x33;
-  
   RkAcc x722 = rk_link_k(x720, x721, 17u);
   auto x134 = EF_LD(arg9, (uint32_t)(53u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x723 = x134 - x454;
@@ -2118,15 +2057,12 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(size_t cycle, size_t steps, FpExt* pol
   auto x136 = EF_LD(arg9, (uint32_t)(50u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x137 = EF_LD(arg9, (uint32_t)(54u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x728 = x136 - x137;
-  
   RkAcc x729 = rk_link_nf_k(x727, x728, 21u);
   auto x138 = EF_LD(arg9, (uint32_t)(51u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x139 = EF_LD(arg9, (uint32_t)(55u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x730 = x138 - x139;
-  
   RkAcc x731 = rk_link_k(x729, x730, 22u);
   auto x732 = x41 - x22;
-  
   RkAcc x733 = rk_link_nf_k(x731, x732, 23u);
   auto x734 = (EF_LD(arg9, (uint32_t)(61u * rk_s + ((rk_c - 0u) & rk_m))) - Fp(1u));
   RkAcc x735 = rk_link_k(x733, x734, 24u);
@@ -2140,12 +2076,10 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(size_t cycle, size_t steps, FpExt* pol
   auto x142 = EF_LD(arg9, (uint32_t)(59u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x143 = EF_LD(arg9, (uint32_t)(63u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x741 = x142 - x143;
-  
   RkAcc x742 = rk_link_nf_k(x740, x741, 28u);
   auto x144 = EF_LD(arg9, (uint32_t)(60u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x145 = EF_LD(arg9, (uint32_t)(64u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x743 = x144 - x145;
-  
   RkAcc x744 = rk_link_k(x742, x743, 29u);
   auto x745 = (EF_LD(arg9, (uint32_t)(65u * rk_s + ((rk_c - 0u) & rk_m))) - Fp(2013265920u));
   RkAcc x746 = rk_link_nf_k(x744, x745, 30u);
@@ -2163,11 +2097,9 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(size_t cycle, size_t steps, FpExt* pol
   auto x148 = EF_LD(arg9, (uint32_t)(69u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x149 = EF_LD(arg9, (uint32_t)(73u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x756 = x148 - x149;
-  
   RkAcc x757 = rk_link_k(x755, x756, 36u);
   auto x150 = EF_LD(arg9, (uint32_t)(74u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x758 = x150 - x22;
-  
   RkAcc x759 = rk_link_nf_k(x757, x758, 37u);
   auto x760 = (EF_LD(arg9, (uint32_t)(79u * rk_s + ((rk_c - 0u) & rk_m))) - Fp(1u));
   RkAcc x761 = rk_link_k(x759, x760, 38u);
@@ -2180,12 +2112,10 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(size_t cycle, size_t steps, FpExt* pol
   auto x152 = EF_LD(arg9, (uint32_t)(77u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x153 = EF_LD(arg9, (uint32_t)(81u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x767 = x152 - x153;
-  
   RkAcc x768 = rk_link_nf_k(x766, x767, 42u);
   RkAcc x769 = rk_link_k(x768, x424, 43u);
   auto x154 = EF_LD(arg9, (uint32_t)(83u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x770 = x154 - x22;
-  
   RkAcc x771 = rk_link_nf_k(x769, x770, 44u);
   auto x772 = (EF_LD(arg9, (uint32_t)(88u * rk_s + ((rk_c - 0u) & rk_m))) - Fp(1u));
   RkAcc x773 = rk_link_k(x771, x772, 45u);
@@ -2195,11 +2125,9 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(size_t cycle, size_t steps, FpExt* pol
   auto x777 = x80 - x688;
   RkAcc x778 = rk_link_k(x775, x777, 48u);
   auto x779 = x91 - x85;
-  
   RkAcc x780 = rk_link_nf_k(x778, x779, 49u);
   RkAcc x781 = rk_link_k(x780, x460, 50u);
   auto x782 = x90 - x22;
-  
   RkAcc x783 = rk_link_nf_k(x781, x782, 51u);
   auto x784 = (EF_LD(arg9, (uint32_t)(97u * rk_s + ((rk_c - 0u) & rk_m))) - Fp(1u));
   RkAcc x785 = rk_link_k(x783, x784, 52u);
@@ -2382,14 +2310,12 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(size_t cycle, size_t steps, FpExt* pol
   auto x909 = x209 * x667;
   RkAcc x910 = rk_link_k(x908, x909, 3u);
   auto x911 = ef_lmul(x209, x208);
-  
   FpExt x912 = rk_fin(rk_link_k(x910, x911, 4u));
   RkAcc x913 = rk_link_nf_k(arg2, x693, 0u);
   FpExt x914 = rk_fin(rk_link_k(x913, x695, 1u));
   FpExt x915 = rk_fin(rk_link_k(x914, x697, 2u));
   constexpr Fp x13(1073725572);
   auto x917 = x44 - x13;
-  
   RkAcc x918 = rk_link_nf_k(x915, x917, 4u);
   RkAcc x919 = rk_link_k(x918, x702, 5u);
   RkAcc x920 = rk_link_nf_k(x919, x704, 6u);
@@ -2405,18 +2331,15 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(size_t cycle, size_t steps, FpExt* pol
   RkAcc x928 = rk_link_k(x927, x710, 11u);
   constexpr Fp x12(1073725573);
   auto x930 = x127 - x12;
-  
   RkAcc x931 = rk_link_nf_k(x928, x930, 13u);
   RkAcc x932 = rk_link_k(x931, x715, 14u);
   RkAcc x933 = rk_link_nf_k(x932, x717, 15u);
   auto x934 = x126 - x33;
   auto x210 = EF_LD(arg9, (uint32_t)(40u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x935 = x934 - x210;
-  
   auto x936 = (EF_LD(arg9, (uint32_t)(103u * rk_s + ((rk_c - 0u) & rk_m))) - Fp(1u));
   RkAcc x937 = rk_link_k(x933, x936, 16u);
   auto x938 = x34 - x935;
-  
   RkAcc x939 = rk_link_nf_k(x937, x938, 17u);
   RkAcc x940 = rk_link_k(x939, x132, 18u);
   RkAcc x941 = rk_link_nf_k(x940, x133, 19u);
@@ -2480,7 +2403,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(size_t cycle, size_t steps, FpExt* pol
   auto x991 = x990 - x219;
   RK_ST1M(arg0, 21u, x991);
   auto x992 = x36 - x33;
-  
   RkAcc x993 = rk_link_nf_k(x989, x992, 23u);
   auto x994 = x100 - x991;
   RK_ST1M(arg0, 22u, x994);
@@ -2555,10 +2477,8 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(size_t cycle, size_t steps, FpExt* pol
   RkAcc x1055 = rk_link_k(x1052, x1054, 58u);
   auto x1056 = x452 - x86;
   auto x1057 = x62 - x33;
-  
   RkAcc x1058 = rk_link_nf_k(x1055, x1057, 59u);
   auto x1059 = x63 - x1056;
-  
   RkAcc x1060 = rk_link_k(x1058, x1059, 60u);
   auto x1061 = x85 - x230;
   RkAcc x1062 = rk_link_nf_k(x1060, x1061, 61u);
@@ -2572,7 +2492,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(size_t cycle, size_t steps, FpExt* pol
   auto x1070 = x45 - x4;
   RkAcc x1071 = rk_link_k(x1068, x1070, 67u);
   auto x1072 = x64 - x33;
-  
   RkAcc x1073 = rk_link_nf_k(x1071, x1072, 68u);
   auto x1074 = ((EF_LD(arg9, (uint32_t)(98u * rk_s + ((rk_c - 0u) & rk_m))) - Fp(1u)) - EF_LD(arg9, (uint32_t)(94u * rk_s + ((rk_c - 0u) & rk_m))));
   auto x1075 = x67 - x1074;
@@ -2645,7 +2564,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(size_t cycle, size_t steps, FpExt* pol
   auto x1137 = x236 * x393;
   RkAcc x1138 = rk_link_k(x1136, x1137, 7u);
   auto x1139 = x236 * x235;
-  
   RkAcc x1140 = rk_link_nf_k(x1138, x1139, 8u);
   RkAcc x1141 = rk_link_k(x1140, x236, 9u);
   auto x1142 = (EF_LD(arg9, (uint32_t)(119u * rk_s + ((rk_c - 0u) & rk_m))) - Fp(1u));
@@ -2669,7 +2587,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_15(size_t cycle, size_t steps, FpExt* pol
   RkAcc x1161 = rk_link_nf_k(x1160, x124, 22u);
   constexpr Fp x2(115);
   auto x1162 = x106 - x2;
-  
   RkAcc x1163 = rk_link_k(x1161, x1162, 23u);
   auto x1164 = (((Fp(1u) - EF_LD(arg9, (uint32_t)(18u * rk_s + ((rk_c - 0u) & rk_m)))) * EF_LD(arg9, (uint32_t)(16u * rk_s + ((rk_c - 4u) & rk_m)))) - Fp(48u));
   RkAcc x1165 = rk_link_nf_k(x1163, x1164, 24u);
@@ -2818,21 +2735,17 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(size_t cycle, size_t steps, FpExt* pol
   constexpr Fp x20(0);
   auto x55 = EF_LD(arg10, (uint32_t)(31u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x213 = x20 - x55;
-  
   RkAcc x214 = rk_link_nf_k(x212, x213, 3u);
   auto x56 = EF_LD(arg10, (uint32_t)(32u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x215 = x20 - x56;
-  
   RkAcc x216 = rk_link_k(x214, x215, 4u);
   auto x57 = EF_LD(arg10, (uint32_t)(33u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x217 = x20 - x57;
-  
   RkAcc x218 = rk_link_nf_k(x216, x217, 5u);
   auto x219 = (Fp(0u) - EF_LD(arg10, (uint32_t)(34u * rk_s + ((rk_c - 0u) & rk_m))));
   FpExt x220 = rk_fin(rk_link_k(x218, x219, 6u));
   auto x58 = EF_LD(arg10, (uint32_t)(35u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x221 = x20 - x58;
-  
   RkAcc x222 = rk_link_nf_k(x220, x221, 7u);
   auto x223 = (Fp(0u) - EF_LD(arg10, (uint32_t)(36u * rk_s + ((rk_c - 0u) & rk_m))));
   RkAcc x224 = rk_link_k(x222, x223, 8u);
@@ -2842,7 +2755,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(size_t cycle, size_t steps, FpExt* pol
   RkAcc x228 = rk_link_k(x226, x227, 10u);
   auto x59 = EF_LD(arg10, (uint32_t)(39u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x229 = x20 - x59;
-  
   RkAcc x230 = rk_link_nf_k(x228, x229, 11u);
   auto x231 = (Fp(0u) - EF_LD(arg10, (uint32_t)(40u * rk_s + ((rk_c - 0u) & rk_m))));
   RkAcc x232 = rk_link_k(x230, x231, 12u);
@@ -2977,7 +2889,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(size_t cycle, size_t steps, FpExt* pol
   auto x333 = ef_lsub(x19, x86);
   auto x87 = EF_LD(arg10, (uint32_t)(31u * rk_s + ((rk_c - 4u) & rk_m)));
   auto x334 = x87 + x19;
-  
   constexpr Fp x18(2);
   auto x335 = x87 + x18;
   constexpr Fp x17(3);
@@ -2994,7 +2905,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(size_t cycle, size_t steps, FpExt* pol
   auto x88 = EF_LD(arg10, (uint32_t)(29u * rk_s + ((rk_c - 4u) & rk_m)));
   auto x341 = x88 * x12;
   auto x342 = ef_lsub(x19, x88);
-  
   auto x89 = EF_LD(arg10, (uint32_t)(69u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x343 = x89 - x87;
   RkAcc x344 = rk_link_nf_k(arg6, x343, 4u);
@@ -3198,35 +3108,27 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(size_t cycle, size_t steps, FpExt* pol
   RkAcc x529 = rk_link_k(x527, x528, 94u);
   auto x108 = EF_LD(arg10, (uint32_t)(40u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x530 = x90 - x108;
-  
   RkAcc x531 = rk_link_nf_k(x529, x530, 95u);
   auto x109 = EF_LD(arg10, (uint32_t)(41u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x532 = x92 - x109;
-  
   RkAcc x533 = rk_link_k(x531, x532, 96u);
   auto x110 = EF_LD(arg10, (uint32_t)(42u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x534 = x94 - x110;
-  
   RkAcc x535 = rk_link_nf_k(x533, x534, 97u);
   auto x111 = EF_LD(arg10, (uint32_t)(43u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x536 = x96 - x111;
-  
   RkAcc x537 = rk_link_k(x535, x536, 98u);
   auto x112 = EF_LD(arg10, (uint32_t)(44u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x538 = x98 - x112;
-  
   RkAcc x539 = rk_link_nf_k(x537, x538, 99u);
   auto x113 = EF_LD(arg10, (uint32_t)(45u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x540 = x100 - x113;
-  
   RkAcc x541 = rk_link_k(x539, x540, 100u);
   auto x114 = EF_LD(arg10, (uint32_t)(46u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x542 = x102 - x114;
-  
   RkAcc x543 = rk_link_nf_k(x541, x542, 101u);
   auto x115 = EF_LD(arg10, (uint32_t)(47u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x544 = x104 - x115;
-  
   RkAcc x545 = rk_link_k(x543, x544, 102u);
   auto x546 = (EF_LD(arg10, (uint32_t)(48u * rk_s + ((rk_c - 4u) & rk_m))) - EF_LD(arg10, (uint32_t)(48u * rk_s + ((rk_c - 0u) & rk_m))));
   RkAcc x547 = rk_link_nf_k(x545, x546, 103u);
@@ -3287,14 +3189,12 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(size_t cycle, size_t steps, FpExt* pol
   FpExt x602 = rk_fin(rk_link_k(x601, x51, 143u));
   RkW _cx603 = rk_cl0(arg7, x86 * x602, 0u); FpExt x603 = rkw_fin(_cx603);
   auto x604 = x28 - x19;
-  
   RkAcc x605 = rk_link_nf_k(arg7, x604, 0u);
   auto x116 = EF_LD(arg10, (uint32_t)(75u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x606 = ef_lsub(x90, x116);
   constexpr Fp x9(2013235201);
   auto x607 = x606 * x9;
   auto x608 = x29 - x19;
-  
   FpExt x609 = rk_fin(rk_link_k(x605, x608, 1u));
   auto x117 = EF_LD(arg10, (uint32_t)(76u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x610 = x117 - x607;
@@ -3328,7 +3228,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(size_t cycle, size_t steps, FpExt* pol
   RkAcc x634 = rk_link_nf_k(x633, x349, 14u);
   RkAcc x635 = rk_link_k(x634, x351, 15u);
   auto x638 = x31 - x19;
-  
   RkAcc x639 = rk_link_nf_k(x635, x638, 18u);
   auto x120 = EF_LD(arg10, (uint32_t)(84u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x640 = ef_lsub(x92, x120);
@@ -3364,7 +3263,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(size_t cycle, size_t steps, FpExt* pol
   RkAcc x667 = rk_link_nf_k(x666, x369, 32u);
   RkAcc x668 = rk_link_k(x667, x371, 33u);
   auto x671 = x34 - x19;
-  
   RkAcc x672 = rk_link_nf_k(x668, x671, 36u);
   auto x124 = EF_LD(arg10, (uint32_t)(93u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x673 = ef_lsub(x94, x124);
@@ -3401,13 +3299,11 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(size_t cycle, size_t steps, FpExt* pol
   RkAcc x700 = rk_link_nf_k(x699, x389, 50u);
   RkAcc x701 = rk_link_k(x700, x391, 51u);
   auto x704 = x37 - x19;
-  
   RkAcc x705 = rk_link_nf_k(x701, x704, 54u);
   auto x129 = EF_LD(arg10, (uint32_t)(102u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x706 = ef_lsub(x96, x129);
   auto x707 = x706 * x9;
   auto x708 = x38 - x19;
-  
   RkAcc x709 = rk_link_k(x705, x708, 55u);
   auto x130 = EF_LD(arg10, (uint32_t)(103u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x710 = x130 - x707;
@@ -3439,13 +3335,11 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(size_t cycle, size_t steps, FpExt* pol
   RkAcc x733 = rk_link_nf_k(x732, x409, 68u);
   RkAcc x734 = rk_link_k(x733, x411, 69u);
   auto x737 = x40 - x19;
-  
   RkAcc x738 = rk_link_nf_k(x734, x737, 72u);
   auto x134 = EF_LD(arg10, (uint32_t)(111u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x739 = ef_lsub(x98, x134);
   auto x740 = x739 * x9;
   auto x741 = x41 - x19;
-  
   RkAcc x742 = rk_link_k(x738, x741, 73u);
   auto x135 = EF_LD(arg10, (uint32_t)(112u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x743 = x135 - x740;
@@ -3455,7 +3349,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(size_t cycle, size_t steps, FpExt* pol
   auto x747 = x8 - x135;
   RkAcc x748 = rk_link_nf_k(arg7, x134, 0u);
   auto x749 = x42 - x19;
-  
   RkAcc x750 = rk_link_k(x748, x749, 1u);
   auto x136 = EF_LD(arg10, (uint32_t)(175u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x751 = ef_lsub(x136, x747);
@@ -3478,13 +3371,11 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(size_t cycle, size_t steps, FpExt* pol
   RkAcc x766 = rk_link_nf_k(x765, x429, 86u);
   RkAcc x767 = rk_link_k(x766, x431, 87u);
   auto x770 = x43 - x19;
-  
   RkAcc x771 = rk_link_nf_k(x767, x770, 90u);
   auto x139 = EF_LD(arg10, (uint32_t)(120u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x772 = ef_lsub(x100, x139);
   auto x773 = x772 * x9;
   auto x774 = x44 - x19;
-  
   RkAcc x775 = rk_link_k(x771, x774, 91u);
   auto x140 = EF_LD(arg10, (uint32_t)(121u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x776 = x140 - x773;
@@ -3515,13 +3406,11 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(size_t cycle, size_t steps, FpExt* pol
   RkAcc x799 = rk_link_nf_k(x798, x449, 104u);
   RkAcc x800 = rk_link_k(x799, x451, 105u);
   auto x803 = x46 - x19;
-  
   RkAcc x804 = rk_link_nf_k(x800, x803, 108u);
   auto x143 = EF_LD(arg10, (uint32_t)(129u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x805 = ef_lsub(x102, x143);
   auto x806 = x805 * x9;
   auto x807 = x47 - x19;
-  
   RkAcc x808 = rk_link_k(x804, x807, 109u);
   auto x144 = EF_LD(arg10, (uint32_t)(130u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x809 = x144 - x806;
@@ -3553,22 +3442,18 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(size_t cycle, size_t steps, FpExt* pol
   RkAcc x832 = rk_link_nf_k(x831, x469, 122u);
   RkAcc x833 = rk_link_k(x832, x471, 123u);
   auto x836 = x49 - x19;
-  
   RkAcc x837 = rk_link_nf_k(x833, x836, 126u);
   auto x148 = EF_LD(arg10, (uint32_t)(138u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x838 = ef_lsub(x104, x148);
   auto x839 = x838 * x9;
   auto x840 = x50 - x19;
-  
   RkAcc x841 = rk_link_k(x837, x840, 127u);
   auto x149 = EF_LD(arg10, (uint32_t)(139u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x842 = x149 - x839;
   RkAcc x843 = rk_link_nf_k(x841, x842, 128u);
   auto x150 = EF_LD(arg10, (uint32_t)(203u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x844 = ef_lsub(x19, x150);
-  
   auto x845 = x150 * x844;
-  
   FpExt x846 = rk_fin(rk_link_k(x843, x845, 129u));
   auto x847 = x8 - x149;
   RkAcc x848 = rk_link_nf_k(arg7, x148, 0u);
@@ -3595,7 +3480,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(size_t cycle, size_t steps, FpExt* pol
   auto x153 = EF_LD(arg10, (uint32_t)(204u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x869 = x19 - x153;
   auto x870 = x153 * x869;
-  
   RkAcc x871 = rk_link_nf_k(x866, x870, 144u);
   auto x154 = EF_LD(arg10, (uint32_t)(205u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x872 = x105 * x154;
@@ -3670,7 +3554,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(size_t cycle, size_t steps, FpExt* pol
   auto x938 = x937 - x19;
   RkAcc x939 = rk_link_nf_k(x932, x938, 6u);
   auto x940 = x137 * x18;
-  
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
@@ -3716,7 +3599,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(size_t cycle, size_t steps, FpExt* pol
   auto x980 = x107 * x4;
   auto x981 = x6 - x980;
   auto x982 = x107 * x18;
-  
   auto x983 = ef_ladd(x982, x19);
   auto x984 = x983 * x4;
   auto x985 = x6 - x984;
@@ -3736,7 +3618,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(size_t cycle, size_t steps, FpExt* pol
   RkAcc x998 = rk_link_nf_k(x996, x997, 8u);
   auto x159 = EF_LD(arg10, (uint32_t)(38u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x999 = x19 - x159;
-  
   RkAcc x1000 = rk_link_k(x998, x999, 9u);
   RkAcc x1001 = rk_link_nf_k(x1000, x229, 10u);
   RkAcc x1002 = rk_link_k(x1001, x231, 11u);
@@ -3773,7 +3654,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_11(size_t cycle, size_t steps, FpExt* pol
   constexpr Fp x1(32);
   auto x1037 = x1 - x159;
   auto x1039 = x19 - x59;
-  
   auto x2000400 = x215 - x988;
   RkAcc x2000399 = rk_link_nf_k(x1026, x2000400, 3u);
   auto x2000402 = x1035 - x997;
@@ -4088,7 +3968,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(size_t cycle, size_t steps, FpExt* poly
   constexpr Fp x21(2013265920);
   auto x85 = EF_LD(arg9, (uint32_t)(132u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x414 = x85 - x21;
-  
   RkAcc x415 = rk_link_nf_k(arg6, x414, 0u);
   auto x416 = (EF_LD(arg9, (uint32_t)(137u * rk_s + ((rk_c - 0u) & rk_m))) - Fp(1u));
   RkAcc x417 = rk_link_k(x415, x416, 1u);
@@ -4105,7 +3984,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(size_t cycle, size_t steps, FpExt* poly
   auto x88 = EF_LD(arg9, (uint32_t)(136u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x89 = EF_LD(arg9, (uint32_t)(140u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x425 = x88 - x89;
-  
   RkAcc x426 = rk_link_k(x424, x425, 6u);
   auto x427 = (EF_LD(arg9, (uint32_t)(138u * rk_s + ((rk_c - 0u) & rk_m))) - Fp(1u));
   auto x90 = EF_LD(arg9, (uint32_t)(134u * rk_s + ((rk_c - 0u) & rk_m)));
@@ -4124,7 +4002,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(size_t cycle, size_t steps, FpExt* poly
   // lincombF: fused into a lazy Fp linear combination
   auto x93 = EF_LD(arg9, (uint32_t)(141u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x436 = x93 - x21;
-  
   RkAcc x437 = rk_link_nf_k(x432, x436, 9u);
   auto x438 = (EF_LD(arg9, (uint32_t)(146u * rk_s + ((rk_c - 0u) & rk_m))) - Fp(1u));
   RkAcc x439 = rk_link_k(x437, x438, 10u);
@@ -4145,16 +4022,13 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(size_t cycle, size_t steps, FpExt* poly
   RkAcc x448 = rk_link_k(x446, x447, 15u);
   constexpr Fp x15(1);
   auto x449 = x94 - x15;
-  
   auto x100 = EF_LD(arg9, (uint32_t)(143u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x450 = x449 - x100;
   auto x101 = EF_LD(arg9, (uint32_t)(179u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x451 = x101 - x15;
-  
   RkAcc x452 = rk_link_nf_k(x448, x451, 16u);
   auto x102 = EF_LD(arg9, (uint32_t)(180u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x453 = x102 - x450;
-  
   RkAcc x454 = rk_link_k(x452, x453, 17u);
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
@@ -4164,7 +4038,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(size_t cycle, size_t steps, FpExt* poly
   RkAcc x459 = rk_link_nf_k(x454, x458, 18u);
   auto x104 = EF_LD(arg9, (uint32_t)(155u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x460 = x104 - x15;
-  
   RkAcc x461 = rk_link_k(x459, x460, 19u);
   auto x105 = EF_LD(arg9, (uint32_t)(156u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x462 = x105 - x407;
@@ -4289,7 +4162,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(size_t cycle, size_t steps, FpExt* poly
   auto x543 = x141 * x536;
   RkAcc x544 = rk_link_k(x542, x543, 2u);
   auto x545 = x141 * x140;
-  
   RkAcc x546 = rk_link_nf_k(x544, x545, 3u);
   auto x547 = (EF_LD(arg9, (uint32_t)(193u * rk_s + ((rk_c - 0u) & rk_m))) * (Fp(1u) - EF_LD(arg9, (uint32_t)(193u * rk_s + ((rk_c - 0u) & rk_m)))));
   FpExt x548 = rk_fin(rk_link_k(x546, x547, 4u));
@@ -4303,11 +4175,9 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(size_t cycle, size_t steps, FpExt* poly
   auto x553 = x144 * x142;
   RkAcc x554 = rk_link_k(x552, x553, 6u);
   auto x555 = x144 * x143;
-  
   RkAcc x556 = rk_link_nf_k(x554, x555, 7u);
   constexpr Fp x9(48);
   auto x557 = x144 * x9;
-  
   constexpr Fp x8(34);
   auto x558 = x550 * x8;
   auto x559 = x557 + x558;
@@ -4457,7 +4327,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(size_t cycle, size_t steps, FpExt* poly
   RkAcc x686 = rk_link_nf_k(x627, x685, 51u);
   auto x687 = ef_lsub(x15, x147);
   auto x688 = x147 * x687;
-  
   RkAcc x689 = rk_link_k(x686, x688, 52u);
   auto x690 = (Fp(1u) - EF_LD(arg9, (uint32_t)(38u * rk_s + ((rk_c - 0u) & rk_m))));
   auto x691 = x148 * x690;
@@ -4469,7 +4338,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(size_t cycle, size_t steps, FpExt* poly
   RkAcc x695 = rk_link_k(x692, x694, 54u);
   auto x696 = ef_lsub(x15, x50);
   auto x697 = x50 * x696;
-  
   RkAcc x698 = rk_link_nf_k(x695, x697, 55u);
   auto x699 = (EF_LD(arg9, (uint32_t)(41u * rk_s + ((rk_c - 0u) & rk_m))) * (Fp(1u) - EF_LD(arg9, (uint32_t)(41u * rk_s + ((rk_c - 0u) & rk_m)))));
   RkAcc x700 = rk_link_k(x698, x699, 56u);
@@ -4503,47 +4371,37 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(size_t cycle, size_t steps, FpExt* poly
   RkAcc x728 = rk_link_k(x726, x727, 70u);
   auto x729 = ef_lsub(x15, x66);
   auto x730 = x66 * x729;
-  
   RkAcc x731 = rk_link_nf_k(x728, x730, 71u);
   auto x732 = (EF_LD(arg9, (uint32_t)(57u * rk_s + ((rk_c - 0u) & rk_m))) * (Fp(1u) - EF_LD(arg9, (uint32_t)(57u * rk_s + ((rk_c - 0u) & rk_m)))));
   RkAcc x733 = rk_link_k(x731, x732, 72u);
   auto x734 = ef_lsub(x15, x68);
   auto x735 = x68 * x734;
-  
   RkAcc x736 = rk_link_nf_k(x733, x735, 73u);
   auto x737 = ef_lsub(x15, x69);
   auto x738 = x69 * x737;
-  
   RkAcc x739 = rk_link_k(x736, x738, 74u);
   auto x740 = (EF_LD(arg9, (uint32_t)(60u * rk_s + ((rk_c - 0u) & rk_m))) * (Fp(1u) - EF_LD(arg9, (uint32_t)(60u * rk_s + ((rk_c - 0u) & rk_m)))));
   RkAcc x741 = rk_link_nf_k(x739, x740, 75u);
   auto x742 = ef_lsub(x15, x71);
   auto x743 = x71 * x742;
-  
   RkAcc x744 = rk_link_k(x741, x743, 76u);
   auto x745 = ef_lsub(x15, x72);
   auto x746 = x72 * x745;
-  
   RkAcc x747 = rk_link_nf_k(x744, x746, 77u);
   auto x748 = ef_lsub(x15, x73);
   auto x749 = x73 * x748;
-  
   RkAcc x750 = rk_link_k(x747, x749, 78u);
   auto x751 = ef_lsub(x15, x150);
   auto x752 = x150 * x751;
-  
   RkAcc x753 = rk_link_nf_k(x750, x752, 79u);
   auto x754 = ef_lsub(x15, x151);
   auto x755 = x151 * x754;
-  
   RkAcc x756 = rk_link_k(x753, x755, 80u);
   auto x757 = ef_lsub(x15, x152);
   auto x758 = x152 * x757;
-  
   RkAcc x759 = rk_link_nf_k(x756, x758, 81u);
   auto x760 = ef_lsub(x15, x153);
   auto x761 = x153 * x760;
-  
   RkAcc x762 = rk_link_k(x759, x761, 82u);
   constexpr Fp x1(256);
   // lincombF: fused into a lazy Fp linear combination
@@ -4642,7 +4500,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(size_t cycle, size_t steps, FpExt* poly
   // lincombF: fused into a lazy Fp linear combination
   auto x827 = ef_lsub(x15, x159);
   auto x828 = x159 * x827;
-  
   RkAcc x829 = rk_link_nf_k(x770, x828, 85u);
   auto x830 = (EF_LD(arg9, (uint32_t)(69u * rk_s + ((rk_c - 0u) & rk_m))) * (Fp(1u) - EF_LD(arg9, (uint32_t)(69u * rk_s + ((rk_c - 0u) & rk_m)))));
   RkAcc x831 = rk_link_k(x829, x830, 86u);
@@ -4680,7 +4537,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(size_t cycle, size_t steps, FpExt* poly
   RkAcc x863 = rk_link_k(x861, x862, 102u);
   auto x864 = ef_lsub(x15, x166);
   auto x865 = x166 * x864;
-  
   RkAcc x866 = rk_link_nf_k(x863, x865, 103u);
   auto x867 = (EF_LD(arg9, (uint32_t)(87u * rk_s + ((rk_c - 0u) & rk_m))) * (Fp(1u) - EF_LD(arg9, (uint32_t)(87u * rk_s + ((rk_c - 0u) & rk_m)))));
   RkAcc x868 = rk_link_k(x866, x867, 104u);
@@ -4916,19 +4772,15 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(size_t cycle, size_t steps, FpExt* poly
   RkAcc x1060 = rk_link_nf_k(x1058, x1059, 41u);
   auto x1061 = ef_lsub(x15, x199);
   auto x1062 = x199 * x1061;
-  
   RkAcc x1063 = rk_link_k(x1060, x1062, 42u);
   auto x1064 = ef_lsub(x15, x200);
   auto x1065 = x200 * x1064;
-  
   RkAcc x1066 = rk_link_nf_k(x1063, x1065, 43u);
   auto x1067 = ef_lsub(x15, x201);
   auto x1068 = x201 * x1067;
-  
   RkAcc x1069 = rk_link_k(x1066, x1068, 44u);
   auto x1070 = ef_lsub(x15, x202);
   auto x1071 = x202 * x1070;
-  
   RkAcc x1072 = rk_link_nf_k(x1069, x1071, 45u);
   auto x1073 = (EF_LD(arg9, (uint32_t)(124u * rk_s + ((rk_c - 0u) & rk_m))) * (Fp(1u) - EF_LD(arg9, (uint32_t)(124u * rk_s + ((rk_c - 0u) & rk_m)))));
   RkAcc x1074 = rk_link_k(x1072, x1073, 46u);
@@ -5021,7 +4873,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(size_t cycle, size_t steps, FpExt* poly
   auto x235 = EF_LD(arg9, (uint32_t)(37u * rk_s + ((rk_c - 4u) & rk_m)));
   auto x1141 = x220 + x235;
   auto x1142 = ef_lmul(x220, x6);
-  
   auto x1143 = x1142 * x235;
   auto x1144 = x1141 - x1143;
   auto x236 = EF_LD(arg9, (uint32_t)(38u * rk_s + ((rk_c - 4u) & rk_m)));
@@ -5032,7 +4883,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(size_t cycle, size_t steps, FpExt* poly
   auto x237 = EF_LD(arg9, (uint32_t)(39u * rk_s + ((rk_c - 4u) & rk_m)));
   auto x1149 = x224 + x237;
   auto x1150 = ef_lmul(x224, x6);
-  
   auto x1151 = x1150 * x237;
   auto x1152 = x1149 - x1151;
   auto x238 = EF_LD(arg9, (uint32_t)(40u * rk_s + ((rk_c - 4u) & rk_m)));
@@ -5043,37 +4893,31 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(size_t cycle, size_t steps, FpExt* poly
   auto x239 = EF_LD(arg9, (uint32_t)(41u * rk_s + ((rk_c - 4u) & rk_m)));
   auto x1157 = x228 + x239;
   auto x1158 = ef_lmul(x228, x6);
-  
   auto x1159 = x1158 * x239;
   auto x1160 = x1157 - x1159;
   auto x240 = EF_LD(arg9, (uint32_t)(42u * rk_s + ((rk_c - 4u) & rk_m)));
   auto x1161 = x230 + x240;
   auto x1162 = ef_lmul(x230, x6);
-  
   auto x1163 = x1162 * x240;
   auto x1164 = x1161 - x1163;
   auto x241 = EF_LD(arg9, (uint32_t)(43u * rk_s + ((rk_c - 4u) & rk_m)));
   auto x1165 = x232 + x241;
   auto x1166 = ef_lmul(x232, x6);
-  
   auto x1167 = x1166 * x241;
   auto x1168 = x1165 - x1167;
   auto x242 = EF_LD(arg9, (uint32_t)(44u * rk_s + ((rk_c - 4u) & rk_m)));
   auto x1169 = x233 + x242;
   auto x1170 = ef_lmul(x233, x6);
-  
   auto x1171 = x1170 * x242;
   auto x1172 = x1169 - x1171;
   auto x243 = EF_LD(arg9, (uint32_t)(45u * rk_s + ((rk_c - 4u) & rk_m)));
   auto x1173 = x234 + x243;
   auto x1174 = ef_lmul(x234, x6);
-  
   auto x1175 = x1174 * x243;
   auto x1176 = x1173 - x1175;
   auto x244 = EF_LD(arg9, (uint32_t)(46u * rk_s + ((rk_c - 4u) & rk_m)));
   auto x1177 = x235 + x244;
   auto x1178 = ef_lmul(x235, x6);
-  
   auto x1179 = x1178 * x244;
   auto x1180 = x1177 - x1179;
   auto x245 = EF_LD(arg9, (uint32_t)(47u * rk_s + ((rk_c - 4u) & rk_m)));
@@ -5086,12 +4930,10 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(size_t cycle, size_t steps, FpExt* poly
   auto x1186 = ef_lmul(x237, x6);
   auto x1187 = x1186 * x246;
   auto x1188 = x1185 - x1187;
-  
   auto x1189 = x238 + x215;
   auto x1190 = ef_lmul(x238, x6);
   auto x1191 = x1190 * x215;
   auto x1192 = x1189 - x1191;
-  
   auto x1193 = x239 + x217;
   auto x1194 = (EF_LD(arg9, (uint32_t)(41u * rk_s + ((rk_c - 4u) & rk_m))) * Fp(2u));
   auto x1195 = x1194 * x217;
@@ -5101,7 +4943,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(size_t cycle, size_t steps, FpExt* poly
   auto x1198 = ef_lmul(x240, x6);
   auto x1199 = x1198 * x219;
   auto x1200 = x1197 - x1199;
-  
   auto x1201 = x241 + x221;
   auto x1202 = (EF_LD(arg9, (uint32_t)(43u * rk_s + ((rk_c - 4u) & rk_m))) * Fp(2u));
   auto x1203 = x1202 * x221;
@@ -5111,7 +4952,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(size_t cycle, size_t steps, FpExt* poly
   auto x1206 = ef_lmul(x242, x6);
   auto x1207 = x1206 * x223;
   auto x1208 = x1205 - x1207;
-  
   auto x1209 = x243 + x225;
   auto x1210 = (EF_LD(arg9, (uint32_t)(45u * rk_s + ((rk_c - 4u) & rk_m))) * Fp(2u));
   auto x1211 = x1210 * x225;
@@ -5121,7 +4961,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(size_t cycle, size_t steps, FpExt* poly
   auto x1214 = x244 * x6;
   auto x1215 = x1214 * x227;
   auto x1216 = x1213 - x1215;
-  
   auto x1217 = x245 + x229;
   auto x1218 = (EF_LD(arg9, (uint32_t)(47u * rk_s + ((rk_c - 4u) & rk_m))) * Fp(2u));
   auto x1219 = x1218 * x229;
@@ -5131,7 +4970,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_7(size_t cycle, size_t steps, FpExt* poly
   auto x1222 = x246 * x6;
   auto x1223 = x1222 * x231;
   auto x1224 = x1221 - x1223;
-  
   auto x1225 = x236 + x1100;
   auto x1226 = x1182 * x1100;
   auto x1227 = x1225 - x1226;
@@ -6489,16 +6327,12 @@ __device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args)
   RkAcc x215 = rk_link_k(x211, x2000188, 556u);
   auto x39 = EF_LD(args[1], (uint32_t)(14u * rk_s + ((rk_c - 4u) & rk_m)));
   auto x216 = x204 * x39;
-  
   auto x40 = EF_LD(args[1], (uint32_t)(15u * rk_s + ((rk_c - 4u) & rk_m)));
   auto x217 = x204 * x40;
-  
   auto x218 = x204 * x36;
-  
   auto x41 = EF_LD(args[1], (uint32_t)(17u * rk_s + ((rk_c - 4u) & rk_m)));
   auto x219 = x204 * x41;
   auto x220 = x219 + x35;
-  
   auto x44 = EF_LD(args[1], (uint32_t)(21u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x221 = ef_lsub(x31, x44);
   auto x222 = x44 * x221;
@@ -6553,7 +6387,6 @@ __device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args)
   constexpr Fp x29(6);
   auto x258 = x50 * x29;
   auto x259 = x51 * x30;
-  
   auto x260 = x45 + x254;
   auto x261 = x260 + x255;
   auto x262 = x261 + x256;
@@ -6661,11 +6494,9 @@ __device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args)
   FpExt x344 = rk_fin(rk_link_k(x320, x343, 28u));
   constexpr Fp x19(48);
   auto x345 = x218 - x19;
-  
   constexpr Fp x16(65535);
   auto x346 = x220 * x16;
   auto x347 = ef_lsub(x31, x220);
-  
   constexpr Fp x17(49151);
   auto x348 = x347 * x17;
   auto x349 = x346 + x348;
@@ -6674,7 +6505,6 @@ __device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args)
   RK_ST1M(x33, 3u, x350);
   constexpr Fp x18(16384);
   auto x351 = x217 * x18;
-  
   constexpr Fp x2(1073725440);
   auto x352 = x220 * x2;
   constexpr Fp x1(1073725472);
@@ -6682,15 +6512,10 @@ __device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args)
   auto x354 = x352 + x353;
   RK_ST1M(x33, 4u, x354);
   auto x355 = ef_ladd(x216, x27);
-  
   auto x359 = x355 * x47;
-  
   auto x360 = x355 * x48;
-  
   auto x361 = x355 * x49;
-  
   auto x362 = x355 * x50;
-  
   auto x2001912 = x44 + x45;
   auto x2001913 = x2001912 + x46;
   auto x2001914 = x2001913 + x47;
@@ -6703,15 +6528,10 @@ __device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args)
   auto x2001920 = x2001919 + x2001916;
   RK_ST1M(x33, 6u, x2001920);
   auto x374 = x217 * x47;
-  
   auto x375 = x217 * x48;
-  
   auto x376 = x217 * x49;
-  
   auto x377 = x217 * x50;
-  
   auto x378 = x217 * x51;
-  
   auto x2001921 = x44 + x45;
   auto x2001922 = x2001921 + x46;
   auto x2001923 = x2001922 + x47;
@@ -6724,13 +6544,10 @@ __device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args)
   auto x2001929 = x2001928 + x2001925;
   RK_ST1M(x33, 8u, x2001929);
   auto x386 = x37 * x25;
-  
   auto x65 = EF_LD(args[1], (uint32_t)(66u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x387 = x65 - x386;
-  
   RkAcc x388 = rk_link_nf_k(x203, x387, 0u);
   auto x389 = x386 + x31;
-  
   auto x66 = EF_LD(args[1], (uint32_t)(68u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x390 = x66 - x389;
   RkAcc x391 = rk_link_k(x388, x390, 1u);
@@ -6738,7 +6555,6 @@ __device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args)
   auto x67 = EF_LD(args[1], (uint32_t)(85u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x393 = ef_lsub(x31, x67);
   auto x394 = ef_lmul(x67, x393);
-  
   auto x395 = x25 - x67;
   auto x396 = ef_lmul(x394, x395);
   auto x397 = x26 - x67;
@@ -6753,7 +6569,6 @@ __device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args)
   auto x70 = EF_LD(args[1], (uint32_t)(88u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x404 = x31 - x70;
   auto x405 = x70 * x404;
-  
   RkAcc x406 = rk_link_nf_k(x403, x405, 6u);
   auto x71 = EF_LD(args[1], (uint32_t)(89u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x407 = x217 * x71;
@@ -6766,7 +6581,6 @@ __device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args)
   RkAcc x414 = rk_link_nf_k(x413, x70, 10u);
   auto x72 = EF_LD(args[1], (uint32_t)(90u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x415 = x72 - x31;
-  
   RkAcc x416 = rk_link_k(x414, x415, 11u);
   auto x73 = EF_LD(args[1], (uint32_t)(91u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x417 = x73 * x27;
@@ -6781,11 +6595,9 @@ __device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args)
   RkAcc x424 = rk_link_nf_k(x422, x423, 14u);
   auto x79 = EF_LD(args[1], (uint32_t)(97u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x425 = x79 - x31;
-  
   RkAcc x426 = rk_link_k(x424, x425, 15u);
   auto x80 = EF_LD(args[1], (uint32_t)(98u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x427 = x80 - x386;
-  
   RkAcc x428 = rk_link_nf_k(x426, x427, 16u);
   auto x75 = EF_LD(args[1], (uint32_t)(92u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x430 = x75 - x421;
@@ -6793,21 +6605,16 @@ __device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args)
   auto x77 = EF_LD(args[1], (uint32_t)(95u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x81 = EF_LD(args[1], (uint32_t)(99u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x432 = x77 - x81;
-  
   RkAcc x433 = rk_link_nf_k(x431, x432, 19u);
   auto x78 = EF_LD(args[1], (uint32_t)(96u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x82 = EF_LD(args[1], (uint32_t)(100u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x434 = x78 - x82;
-  
   RkAcc x435 = rk_link_k(x433, x434, 20u);
   auto x436 = x80 - x31;
-  
   auto x76 = EF_LD(args[1], (uint32_t)(94u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x437 = x436 - x76;
-  
   auto x83 = EF_LD(args[1], (uint32_t)(101u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x438 = x83 - x31;
-  
   RkAcc x439 = rk_link_nf_k(x435, x438, 21u);
   auto x84 = EF_LD(args[1], (uint32_t)(102u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x440 = x84 - x437;
@@ -6815,12 +6622,10 @@ __device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args)
   auto x85 = EF_LD(args[1], (uint32_t)(69u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x442 = ef_lsub(x31, x85);
   auto x443 = x85 * x442;
-  
   RkAcc x444 = rk_link_nf_k(x441, x443, 23u);
   auto x86 = EF_LD(args[1], (uint32_t)(70u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x445 = ef_lsub(x31, x86);
   auto x446 = ef_lmul(x86, x445);
-  
   auto x447 = x25 - x86;
   auto x448 = ef_lmul(x446, x447);
   auto x449 = x26 - x86;
@@ -6829,7 +6634,6 @@ __device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args)
   auto x87 = EF_LD(args[1], (uint32_t)(71u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x452 = ef_lsub(x31, x87);
   auto x453 = ef_lmul(x87, x452);
-  
   auto x454 = x25 - x87;
   auto x455 = ef_lmul(x453, x454);
   auto x456 = x26 - x87;
@@ -6837,9 +6641,7 @@ __device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args)
   RkAcc x458 = rk_link_nf_k(x451, x457, 25u);
   auto x88 = EF_LD(args[1], (uint32_t)(72u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x459 = ef_lsub(x31, x88);
-  
   auto x460 = ef_lmul(x88, x459);
-  
   auto x461 = x25 - x88;
   auto x462 = ef_lmul(x460, x461);
   auto x463 = x26 - x88;
@@ -6849,7 +6651,6 @@ __device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args)
   auto x89 = EF_LD(args[1], (uint32_t)(73u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x466 = ef_lsub(x31, x89);
   auto x467 = ef_lmul(x89, x466);
-  
   auto x468 = x25 - x89;
   auto x469 = ef_lmul(x467, x468);
   auto x470 = x26 - x89;
@@ -6858,9 +6659,7 @@ __device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args)
   RkAcc x472 = rk_link_nf_k(x465, x471, 27u);
   auto x90 = EF_LD(args[1], (uint32_t)(74u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x473 = ef_lsub(x31, x90);
-  
   auto x474 = ef_lmul(x90, x473);
-  
   auto x475 = x25 - x90;
   auto x476 = ef_lmul(x474, x475);
   auto x477 = x26 - x90;
@@ -6870,13 +6669,10 @@ __device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args)
   auto x91 = EF_LD(args[1], (uint32_t)(75u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x480 = ef_lsub(x31, x91);
   auto x481 = x91 * x480;
-  
   RkAcc x482 = rk_link_nf_k(x479, x481, 29u);
   auto x92 = EF_LD(args[1], (uint32_t)(76u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x483 = ef_lsub(x31, x92);
-  
   auto x484 = ef_lmul(x92, x483);
-  
   auto x485 = x25 - x92;
   auto x486 = ef_lmul(x484, x485);
   auto x487 = x26 - x92;
@@ -6886,7 +6682,6 @@ __device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args)
   auto x93 = EF_LD(args[1], (uint32_t)(77u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x490 = ef_lsub(x31, x93);
   auto x491 = ef_lmul(x93, x490);
-  
   auto x492 = x25 - x93;
   auto x493 = ef_lmul(x491, x492);
   auto x494 = x26 - x93;
@@ -6895,17 +6690,14 @@ __device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args)
   auto x94 = EF_LD(args[1], (uint32_t)(78u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x497 = ef_lsub(x31, x94);
   auto x498 = x94 * x497;
-  
   RkAcc x499 = rk_link_k(x496, x498, 32u);
   auto x95 = EF_LD(args[1], (uint32_t)(79u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x500 = ef_lsub(x31, x95);
   auto x501 = x95 * x500;
-  
   RkAcc x502 = rk_link_nf_k(x499, x501, 33u);
   auto x96 = EF_LD(args[1], (uint32_t)(80u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x503 = ef_lsub(x31, x96);
   auto x504 = ef_lmul(x96, x503);
-  
   auto x505 = x25 - x96;
   auto x506 = ef_lmul(x504, x505);
   auto x507 = x26 - x96;
@@ -6914,7 +6706,6 @@ __device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args)
   auto x97 = EF_LD(args[1], (uint32_t)(81u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x510 = ef_lsub(x31, x97);
   auto x511 = ef_lmul(x97, x510);
-  
   auto x512 = x25 - x97;
   auto x513 = ef_lmul(x511, x512);
   auto x514 = x26 - x97;
@@ -6923,7 +6714,6 @@ __device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args)
   auto x98 = EF_LD(args[1], (uint32_t)(82u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x517 = ef_lsub(x31, x98);
   auto x518 = ef_lmul(x98, x517);
-  
   auto x519 = x25 - x98;
   auto x520 = ef_lmul(x518, x519);
   auto x521 = x26 - x98;
@@ -6933,7 +6723,6 @@ __device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args)
   auto x99 = EF_LD(args[1], (uint32_t)(83u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x524 = ef_lsub(x31, x99);
   auto x525 = x99 * x524;
-  
   RkAcc x526 = rk_link_nf_k(x523, x525, 37u);
   constexpr Fp x3(32768);
   auto x527 = x85 * x3;
@@ -6956,18 +6745,15 @@ __device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args)
   auto x538 = x91 * x9;
   auto x539 = x537 + x538;
   auto x540 = x92 * x27;
-  
   auto x541 = x539 + x540;
   auto x542 = x541 + x93;
   auto x543 = x82 - x542;
   RkAcc x544 = rk_link_k(x526, x543, 38u);
   auto x545 = x94 * x3;
-  
   auto x546 = x95 * x18;
   auto x547 = x545 + x546;
   constexpr Fp x10(4096);
   auto x548 = x96 * x10;
-  
   auto x549 = x547 + x548;
   RK_ST1M(x33, 14u, x549);
   constexpr Fp x11(1024);
@@ -6977,7 +6763,6 @@ __device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args)
   auto x552 = x98 * x12;
   auto x553 = x551 + x552;
   auto x554 = x99 * x7;
-  
   auto x555 = x553 + x554;
   auto x100 = EF_LD(args[1], (uint32_t)(84u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x556 = x555 + x100;
@@ -6985,47 +6770,36 @@ __device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args)
   RkAcc x558 = rk_link_nf_k(x544, x557, 39u);
   auto x559 = x92 * x20;
   auto x560 = x93 * x25;
-  
   auto x561 = x559 + x560;
   auto x562 = x561 + x94;
   auto x563 = x89 * x20;
-  
   auto x564 = x90 * x25;
-  
   auto x565 = x563 + x564;
   auto x566 = x565 + x91;
   auto x567 = x97 * x20;
-  
   auto x568 = x98 * x25;
-  
   auto x569 = x567 + x568;
   auto x570 = x569 + x99;
-  
   auto x571 = x86 * x9;
   auto x572 = x87 * x27;
   auto x573 = x571 + x572;
   auto x574 = x573 + x88;
-  
   constexpr Fp x13(64);
   auto x575 = x85 * x13;
   auto x576 = x575 + x574;
   RK_ST1M(x33, 15u, x576);
   auto x577 = x95 * x27;
   auto x578 = x577 + x96;
-  
   constexpr Fp x14(61440);
   auto x579 = x85 * x14;
-  
   auto x580 = x576 * x8;
   auto x581 = x579 + x580;
   auto x582 = x581 + x566;
   RK_ST1M(x33, 16u, x582);
   auto x583 = x85 * x16;
-  
   auto x101 = EF_LD(args[1], (uint32_t)(125u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x584 = x31 - x101;
   auto x585 = x101 * x584;
-  
   RkAcc x586 = rk_link_k(x558, x585, 40u);
   auto x587 = ef_lsub(x562, x566);
   auto x588 = x354 + x562;
@@ -7035,7 +6809,6 @@ __device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args)
   auto x592 = ef_lsub(x103, x15);
   auto x108 = EF_LD(args[1], (uint32_t)(108u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x594 = ef_lsub(x108, x31);
-  
   auto x109 = EF_LD(args[1], (uint32_t)(109u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x596 = ef_lsub(x109, x386);
   auto x104 = EF_LD(args[1], (uint32_t)(104u * rk_s + ((rk_c - 0u) & rk_m)));
@@ -7046,14 +6819,11 @@ __device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args)
   auto x107 = EF_LD(args[1], (uint32_t)(107u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x111 = EF_LD(args[1], (uint32_t)(111u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x603 = ef_lsub(x107, x111);
-  
   auto x605 = x109 - x31;
-  
   auto x105 = EF_LD(args[1], (uint32_t)(105u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x606 = x605 - x105;
   auto x112 = EF_LD(args[1], (uint32_t)(121u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x607 = ef_lsub(x112, x31);
-  
   auto x113 = EF_LD(args[1], (uint32_t)(122u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x609 = ef_lsub(x113, x606);
   auto x2000189 = x101 * x587;
@@ -7090,7 +6860,6 @@ __device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args)
   auto x626 = ef_lsub(x615, x117);
   auto x628 = ef_lsub(x114, x15);
   auto x630 = ef_lsub(x115, x31);
-  
   auto x122 = EF_LD(args[1], (uint32_t)(118u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x632 = ef_lsub(x122, x386);
   auto x118 = EF_LD(args[1], (uint32_t)(113u * rk_s + ((rk_c - 0u) & rk_m)));
@@ -7101,13 +6870,10 @@ __device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args)
   auto x121 = EF_LD(args[1], (uint32_t)(116u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x124 = EF_LD(args[1], (uint32_t)(120u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x639 = ef_lsub(x121, x124);
-  
   auto x641 = x122 - x31;
-  
   auto x119 = EF_LD(args[1], (uint32_t)(114u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x642 = x641 - x119;
   auto x643 = ef_lsub(x116, x31);
-  
   auto x125 = EF_LD(args[1], (uint32_t)(124u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x645 = ef_lsub(x125, x642);
   auto x2000214 = x584 * x590;
@@ -7197,96 +6963,71 @@ __device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args)
   FpExt x682 = rk_fin(rk_link_k(x681, x138, 7u));
   RkW _cx683 = _cx675; rk_cl_acc(_cx683, x45 * x682, 87u); FpExt x683 = rkw_fin(_cx683);
   auto x684 = x578 - x27;
-  
   RkAcc x685 = rk_link_nf_k(x667, x684, 1u);
   RkAcc x686 = rk_link_k(x685, x576, 2u);
   auto x139 = EF_LD(args[1], (uint32_t)(132u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x687 = ef_lsub(x31, x139);
-  
   auto x688 = x139 * x687;
-  
   RkAcc x689 = rk_link_nf_k(x686, x688, 3u);
   auto x140 = EF_LD(args[1], (uint32_t)(133u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x690 = ef_lsub(x31, x140);
-  
   auto x691 = x140 * x690;
-  
   RkAcc x692 = rk_link_k(x689, x691, 4u);
   auto x141 = EF_LD(args[1], (uint32_t)(134u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x693 = ef_lsub(x31, x141);
-  
   auto x694 = x141 * x693;
-  
   RkAcc x695 = rk_link_nf_k(x692, x694, 5u);
   auto x142 = EF_LD(args[1], (uint32_t)(135u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x696 = ef_lsub(x31, x142);
-  
   auto x697 = x142 * x696;
-  
   RkAcc x698 = rk_link_k(x695, x697, 6u);
   auto x143 = EF_LD(args[1], (uint32_t)(136u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x699 = ef_lsub(x31, x143);
-  
   auto x700 = x143 * x699;
-  
   RkAcc x701 = rk_link_nf_k(x698, x700, 7u);
   auto x144 = EF_LD(args[1], (uint32_t)(137u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x702 = ef_lsub(x31, x144);
-  
   auto x703 = x144 * x702;
-  
   RkAcc x704 = rk_link_k(x701, x703, 8u);
   auto x145 = EF_LD(args[1], (uint32_t)(138u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x705 = ef_lsub(x31, x145);
-  
   auto x706 = x145 * x705;
-  
   RkAcc x707 = rk_link_nf_k(x704, x706, 9u);
   auto x146 = EF_LD(args[1], (uint32_t)(139u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x708 = ef_lsub(x31, x146);
   auto x709 = x146 * x708;
-  
   RkAcc x710 = rk_link_k(x707, x709, 10u);
   auto x147 = EF_LD(args[1], (uint32_t)(140u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x711 = ef_lsub(x31, x147);
   auto x712 = x147 * x711;
-  
   RkAcc x713 = rk_link_nf_k(x710, x712, 11u);
   auto x148 = EF_LD(args[1], (uint32_t)(141u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x714 = ef_lsub(x31, x148);
   auto x715 = x148 * x714;
-  
   RkAcc x716 = rk_link_k(x713, x715, 12u);
   auto x149 = EF_LD(args[1], (uint32_t)(142u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x717 = ef_lsub(x31, x149);
   auto x718 = x149 * x717;
-  
   RkAcc x719 = rk_link_nf_k(x716, x718, 13u);
   auto x150 = EF_LD(args[1], (uint32_t)(143u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x720 = ef_lsub(x31, x150);
   auto x721 = x150 * x720;
-  
   RkAcc x722 = rk_link_k(x719, x721, 14u);
   auto x151 = EF_LD(args[1], (uint32_t)(144u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x723 = ef_lsub(x31, x151);
   auto x724 = x151 * x723;
-  
   RkAcc x725 = rk_link_nf_k(x722, x724, 15u);
   auto x152 = EF_LD(args[1], (uint32_t)(145u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x726 = ef_lsub(x31, x152);
   auto x727 = x152 * x726;
-  
   RkAcc x728 = rk_link_k(x725, x727, 16u);
   auto x153 = EF_LD(args[1], (uint32_t)(146u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x729 = ef_lsub(x31, x153);
   auto x730 = x153 * x729;
-  
   RkAcc x731 = rk_link_nf_k(x728, x730, 17u);
   auto x154 = EF_LD(args[1], (uint32_t)(147u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x732 = ef_lsub(x31, x154);
-  
   auto x733 = x154 * x732;
-  
   RkAcc x734 = rk_link_k(x731, x733, 18u);
   auto x735 = x140 * x25;
   auto x736 = x141 * x27;
@@ -7296,7 +7037,6 @@ __device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args)
   auto x740 = x145 * x13;
   auto x741 = x146 * x7;
   auto x742 = x147 * x12;
-  
   auto x743 = x148 * x6;
   auto x744 = x149 * x11;
   auto x745 = x150 * x5;
@@ -7325,89 +7065,66 @@ __device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args)
   auto x155 = EF_LD(args[1], (uint32_t)(148u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x767 = ef_lsub(x31, x155);
   auto x768 = x155 * x767;
-  
   RkAcc x769 = rk_link_k(x766, x768, 20u);
   auto x156 = EF_LD(args[1], (uint32_t)(149u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x770 = ef_lsub(x31, x156);
   auto x771 = x156 * x770;
-  
   RkAcc x772 = rk_link_nf_k(x769, x771, 21u);
   auto x157 = EF_LD(args[1], (uint32_t)(150u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x773 = ef_lsub(x31, x157);
   auto x774 = x157 * x773;
-  
   RkAcc x775 = rk_link_k(x772, x774, 22u);
   auto x158 = EF_LD(args[1], (uint32_t)(151u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x776 = ef_lsub(x31, x158);
   auto x777 = x158 * x776;
-  
   RkAcc x778 = rk_link_nf_k(x775, x777, 23u);
   auto x159 = EF_LD(args[1], (uint32_t)(152u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x779 = ef_lsub(x31, x159);
   auto x780 = x159 * x779;
-  
   RkAcc x781 = rk_link_k(x778, x780, 24u);
   auto x160 = EF_LD(args[1], (uint32_t)(153u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x782 = ef_lsub(x31, x160);
-  
   auto x783 = x160 * x782;
-  
   RkAcc x784 = rk_link_nf_k(x781, x783, 25u);
   auto x161 = EF_LD(args[1], (uint32_t)(154u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x785 = ef_lsub(x31, x161);
-  
   auto x786 = x161 * x785;
-  
   RkAcc x787 = rk_link_k(x784, x786, 26u);
   auto x162 = EF_LD(args[1], (uint32_t)(155u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x788 = ef_lsub(x31, x162);
-  
   auto x789 = x162 * x788;
-  
   RkAcc x790 = rk_link_nf_k(x787, x789, 27u);
   auto x163 = EF_LD(args[1], (uint32_t)(156u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x791 = ef_lsub(x31, x163);
-  
   auto x792 = x163 * x791;
-  
   RkAcc x793 = rk_link_k(x790, x792, 28u);
   auto x164 = EF_LD(args[1], (uint32_t)(157u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x794 = ef_lsub(x31, x164);
-  
   auto x795 = x164 * x794;
-  
   RkAcc x796 = rk_link_nf_k(x793, x795, 29u);
   auto x165 = EF_LD(args[1], (uint32_t)(158u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x797 = ef_lsub(x31, x165);
-  
   auto x798 = x165 * x797;
-  
   RkAcc x799 = rk_link_k(x796, x798, 30u);
   auto x166 = EF_LD(args[1], (uint32_t)(159u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x800 = ef_lsub(x31, x166);
   auto x801 = x166 * x800;
-  
   RkAcc x802 = rk_link_nf_k(x799, x801, 31u);
   auto x167 = EF_LD(args[1], (uint32_t)(160u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x803 = ef_lsub(x31, x167);
   auto x804 = x167 * x803;
-  
   RkAcc x805 = rk_link_k(x802, x804, 32u);
   auto x168 = EF_LD(args[1], (uint32_t)(161u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x806 = ef_lsub(x31, x168);
   auto x807 = x168 * x806;
-  
   RkAcc x808 = rk_link_nf_k(x805, x807, 33u);
   auto x169 = EF_LD(args[1], (uint32_t)(162u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x809 = ef_lsub(x31, x169);
-  
   auto x810 = x169 * x809;
-  
   RkAcc x811 = rk_link_k(x808, x810, 34u);
   auto x170 = EF_LD(args[1], (uint32_t)(163u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x812 = ef_lsub(x31, x170);
   auto x813 = x170 * x812;
-  
   RkAcc x814 = rk_link_nf_k(x811, x813, 35u);
   auto x815 = x156 * x25;
   auto x816 = x157 * x27;
@@ -7446,85 +7163,66 @@ __device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args)
   auto x171 = EF_LD(args[1], (uint32_t)(164u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x847 = ef_lsub(x31, x171);
   auto x848 = x171 * x847;
-  
   RkAcc x849 = rk_link_nf_k(x846, x848, 37u);
   auto x172 = EF_LD(args[1], (uint32_t)(165u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x850 = ef_lsub(x31, x172);
   auto x851 = x172 * x850;
-  
   RkAcc x852 = rk_link_k(x849, x851, 38u);
   auto x173 = EF_LD(args[1], (uint32_t)(166u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x853 = ef_lsub(x31, x173);
   auto x854 = x173 * x853;
-  
   RkAcc x855 = rk_link_nf_k(x852, x854, 39u);
   auto x174 = EF_LD(args[1], (uint32_t)(167u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x856 = ef_lsub(x31, x174);
   auto x857 = x174 * x856;
-  
   RkAcc x858 = rk_link_k(x855, x857, 40u);
   auto x175 = EF_LD(args[1], (uint32_t)(168u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x859 = ef_lsub(x31, x175);
-  
   auto x860 = x175 * x859;
-  
   RkAcc x861 = rk_link_nf_k(x858, x860, 41u);
   auto x176 = EF_LD(args[1], (uint32_t)(169u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x862 = ef_lsub(x31, x176);
   auto x863 = x176 * x862;
-  
   RkAcc x864 = rk_link_k(x861, x863, 42u);
   auto x177 = EF_LD(args[1], (uint32_t)(170u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x865 = ef_lsub(x31, x177);
   auto x866 = x177 * x865;
-  
   RkAcc x867 = rk_link_nf_k(x864, x866, 43u);
   auto x178 = EF_LD(args[1], (uint32_t)(171u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x868 = ef_lsub(x31, x178);
   auto x869 = x178 * x868;
-  
   RkAcc x870 = rk_link_k(x867, x869, 44u);
   auto x179 = EF_LD(args[1], (uint32_t)(172u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x871 = ef_lsub(x31, x179);
   auto x872 = x179 * x871;
-  
   RkAcc x873 = rk_link_nf_k(x870, x872, 45u);
   auto x180 = EF_LD(args[1], (uint32_t)(173u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x874 = ef_lsub(x31, x180);
-  
   auto x875 = x180 * x874;
-  
   RkAcc x876 = rk_link_k(x873, x875, 46u);
   auto x181 = EF_LD(args[1], (uint32_t)(174u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x877 = ef_lsub(x31, x181);
   auto x878 = x181 * x877;
-  
   RkAcc x879 = rk_link_nf_k(x876, x878, 47u);
   auto x182 = EF_LD(args[1], (uint32_t)(175u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x880 = ef_lsub(x31, x182);
   auto x881 = x182 * x880;
-  
   RkAcc x882 = rk_link_k(x879, x881, 48u);
   auto x183 = EF_LD(args[1], (uint32_t)(176u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x883 = ef_lsub(x31, x183);
-  
   auto x884 = x183 * x883;
-  
   RkAcc x885 = rk_link_nf_k(x882, x884, 49u);
   auto x184 = EF_LD(args[1], (uint32_t)(177u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x886 = ef_lsub(x31, x184);
   auto x887 = x184 * x886;
-  
   RkAcc x888 = rk_link_k(x885, x887, 50u);
   auto x185 = EF_LD(args[1], (uint32_t)(178u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x889 = ef_lsub(x31, x185);
   auto x890 = x185 * x889;
-  
   RkAcc x891 = rk_link_nf_k(x888, x890, 51u);
   auto x186 = EF_LD(args[1], (uint32_t)(179u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x892 = ef_lsub(x31, x186);
   auto x893 = x186 * x892;
-  
   RkAcc x894 = rk_link_k(x891, x893, 52u);
   auto x895 = x172 * x25;
   auto x896 = x173 * x27;
@@ -7562,89 +7260,66 @@ __device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args)
   auto x187 = EF_LD(args[1], (uint32_t)(180u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x927 = ef_lsub(x31, x187);
   auto x928 = x187 * x927;
-  
   RkAcc x929 = rk_link_k(x926, x928, 54u);
   auto x188 = EF_LD(args[1], (uint32_t)(181u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x930 = ef_lsub(x31, x188);
-  
   auto x931 = x188 * x930;
-  
   RkAcc x932 = rk_link_nf_k(x929, x931, 55u);
   auto x189 = EF_LD(args[1], (uint32_t)(182u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x933 = ef_lsub(x31, x189);
-  
   auto x934 = x189 * x933;
-  
   RkAcc x935 = rk_link_k(x932, x934, 56u);
   auto x190 = EF_LD(args[1], (uint32_t)(183u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x936 = ef_lsub(x31, x190);
   auto x937 = x190 * x936;
-  
   RkAcc x938 = rk_link_nf_k(x935, x937, 57u);
   auto x191 = EF_LD(args[1], (uint32_t)(184u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x939 = ef_lsub(x31, x191);
-  
   auto x940 = x191 * x939;
-  
   RkAcc x941 = rk_link_k(x938, x940, 58u);
   auto x192 = EF_LD(args[1], (uint32_t)(185u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x942 = ef_lsub(x31, x192);
-  
   auto x943 = x192 * x942;
-  
   RkAcc x944 = rk_link_nf_k(x941, x943, 59u);
   auto x193 = EF_LD(args[1], (uint32_t)(186u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x945 = ef_lsub(x31, x193);
-  
   auto x946 = x193 * x945;
-  
   RkAcc x947 = rk_link_k(x944, x946, 60u);
   auto x194 = EF_LD(args[1], (uint32_t)(187u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x948 = ef_lsub(x31, x194);
   auto x949 = x194 * x948;
-  
   RkAcc x950 = rk_link_nf_k(x947, x949, 61u);
   auto x195 = EF_LD(args[1], (uint32_t)(188u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x951 = ef_lsub(x31, x195);
   auto x952 = x195 * x951;
-  
   RkAcc x953 = rk_link_k(x950, x952, 62u);
   auto x196 = EF_LD(args[1], (uint32_t)(189u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x954 = ef_lsub(x31, x196);
   auto x955 = x196 * x954;
-  
   RkAcc x956 = rk_link_nf_k(x953, x955, 63u);
   auto x197 = EF_LD(args[1], (uint32_t)(190u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x957 = ef_lsub(x31, x197);
   auto x958 = x197 * x957;
-  
   RkAcc x959 = rk_link_k(x956, x958, 64u);
   auto x198 = EF_LD(args[1], (uint32_t)(191u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x960 = ef_lsub(x31, x198);
-  
   auto x961 = x198 * x960;
-  
   RkAcc x962 = rk_link_nf_k(x959, x961, 65u);
   auto x199 = EF_LD(args[1], (uint32_t)(192u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x963 = ef_lsub(x31, x199);
   auto x964 = x199 * x963;
-  
   RkAcc x965 = rk_link_k(x962, x964, 66u);
   auto x200 = EF_LD(args[1], (uint32_t)(193u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x966 = ef_lsub(x31, x200);
-  
   auto x967 = x200 * x966;
-  
   RkAcc x968 = rk_link_nf_k(x965, x967, 67u);
   auto x201 = EF_LD(args[1], (uint32_t)(194u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x969 = ef_lsub(x31, x201);
   auto x970 = x201 * x969;
-  
   RkAcc x971 = rk_link_k(x968, x970, 68u);
   auto x202 = EF_LD(args[1], (uint32_t)(195u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x972 = ef_lsub(x31, x202);
   auto x973 = x202 * x972;
-  
   RkAcc x974 = rk_link_nf_k(x971, x973, 69u);
   auto x975 = x188 * x25;
   auto x976 = x189 * x27;
@@ -7662,7 +7337,6 @@ __device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args)
   auto x988 = x201 * x18;
   auto x989 = x202 * x3;
   auto x990 = x187 + x975;
-  
   auto x991 = x990 + x976;
   auto x992 = x991 + x977;
   auto x993 = x992 + x978;
@@ -7688,12 +7362,10 @@ __device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args)
   FpExt x1011 = rk_fin(rk_link_k(x1010, x138, 75u));
   RkW _cx1012 = _cx683; rk_cl_acc(_cx1012, x46 * x1011, 95u); FpExt x1012 = rkw_fin(_cx1012);
   auto x1013 = x578 - x29;
-  
   auto x2000448 = ef_lsub(x1013, x684);
   FpExt x1088 = rk_fin(rk_link_k(x1011, x2000448, 1u));
   RkW _cx1089 = _cx1012; rk_cl_acc(_cx1089, x47 * x1088, 171u); FpExt x1089 = rkw_fin(_cx1089);
   auto x1090 = x578 - x30;
-  
   RkAcc x1091 = rk_link_nf_k(x667, x1090, 1u);
   RkAcc x1092 = rk_link_k(x1091, x576, 2u);
   RkAcc x1093 = rk_link_nf_k(x1092, x688, 3u);
@@ -7908,7 +7580,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(size_t cycle, size_t steps, FpExt* pol
   auto x38 = EF_LD(arg5, (uint32_t)(87u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x318 = ef_lsub(x26, x38);
   auto x319 = ef_lmul(x38, x318);
-  
   constexpr Fp x23(2);
   auto x320 = x23 - x38;
   auto x321 = ef_lmul(x319, x320);
@@ -7918,7 +7589,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(size_t cycle, size_t steps, FpExt* pol
   RkAcc x324 = rk_link_k(x317, x323, 3u);
   auto x39 = EF_LD(arg5, (uint32_t)(88u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x325 = x39 - x26;
-  
   RkAcc x326 = rk_link_nf_k(x324, x325, 4u);
   auto x327 = RK_LD1M(arg0, 3u);
   auto x40 = EF_LD(arg5, (uint32_t)(89u * rk_s + ((rk_c - 0u) & rk_m)));
@@ -7927,7 +7597,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(size_t cycle, size_t steps, FpExt* pol
   auto x41 = EF_LD(arg5, (uint32_t)(90u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x330 = x26 - x41;
   auto x331 = x41 * x330;
-  
   RkAcc x332 = rk_link_nf_k(x329, x331, 6u);
   auto x42 = EF_LD(arg5, (uint32_t)(91u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x333 = x214 * x42;
@@ -7940,12 +7609,10 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(size_t cycle, size_t steps, FpExt* pol
   RkAcc x340 = rk_link_nf_k(x339, x41, 10u);
   auto x43 = EF_LD(arg5, (uint32_t)(92u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x341 = x43 - x26;
-  
   RkAcc x342 = rk_link_k(x340, x341, 11u);
   constexpr Fp x21(4);
   auto x44 = EF_LD(arg5, (uint32_t)(93u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x343 = x44 * x21;
-  
   auto x344 = x343 + x38;
   auto x345 = x344 - x196;
   RkAcc x346 = rk_link_nf_k(x342, x345, 12u);
@@ -7955,11 +7622,9 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(size_t cycle, size_t steps, FpExt* pol
   constexpr Fp x20(2013265920);
   auto x45 = EF_LD(arg5, (uint32_t)(95u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x350 = x45 - x20;
-  
   RkAcc x351 = rk_link_nf_k(x349, x350, 14u);
   auto x46 = EF_LD(arg5, (uint32_t)(99u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x352 = x46 - x26;
-  
   RkAcc x353 = rk_link_k(x351, x352, 15u);
   auto x47 = EF_LD(arg5, (uint32_t)(100u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x354 = x47 - x310;
@@ -7974,15 +7639,12 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(size_t cycle, size_t steps, FpExt* pol
   auto x51 = EF_LD(arg5, (uint32_t)(98u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x52 = EF_LD(arg5, (uint32_t)(102u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x361 = x51 - x52;
-  
   RkAcc x362 = rk_link_k(x360, x361, 20u);
   auto x363 = x47 - x26;
-  
   auto x53 = EF_LD(arg5, (uint32_t)(96u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x364 = x363 - x53;
   auto x54 = EF_LD(arg5, (uint32_t)(103u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x365 = x54 - x26;
-  
   RkAcc x366 = rk_link_nf_k(x362, x365, 21u);
   auto x55 = EF_LD(arg5, (uint32_t)(104u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x367 = x55 - x364;
@@ -8036,7 +7698,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(size_t cycle, size_t steps, FpExt* pol
   auto x60 = EF_LD(arg5, (uint32_t)(84u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x411 = ef_lsub(x26, x60);
   auto x412 = ef_lmul(x60, x411);
-  
   auto x413 = x23 - x60;
   auto x414 = ef_lmul(x412, x413);
   auto x415 = x22 - x60;
@@ -8061,7 +7722,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(size_t cycle, size_t steps, FpExt* pol
   // lincombF: fused into a lazy Fp linear combination
   constexpr Fp x15(128);
   auto x427 = x56 * x15;
-  
   // lincombF: fused into a lazy Fp linear combination
   constexpr Fp x14(32);
   auto x65 = EF_LD(arg5, (uint32_t)(76u * rk_s + ((rk_c - 0u) & rk_m)));
@@ -8072,7 +7732,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(size_t cycle, size_t steps, FpExt* pol
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   auto x433 = x57 * x21;
-  
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx436 = rkw1_ff0(x61, x19, true); rkw1_v(_wx436, x52, false); rkw1_ff(_wx436, x62, x18, true); rkw1_ff(_wx436, x63, x17, true); rkw1_ff(_wx436, x64, x16, true); rkw1_v(_wx436, x427, true); rkw1_ff(_wx436, x65, x14, true); rkw1_ff(_wx436, x66, x13, true); rkw1_v(_wx436, x433, true); rkw1_v(_wx436, x58, true); auto x436 = rkw1_fin(_wx436);
@@ -8092,7 +7751,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(size_t cycle, size_t steps, FpExt* pol
   // lincombF: fused into a lazy Fp linear combination
   constexpr Fp x9(256);
   auto x445 = x60 * x9;
-  
   // lincombF: fused into a lazy Fp linear combination
   auto x70 = EF_LD(arg5, (uint32_t)(85u * rk_s + ((rk_c - 0u) & rk_m)));
   // lincombF: fused into a lazy Fp linear combination
@@ -8112,11 +7770,9 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(size_t cycle, size_t steps, FpExt* pol
   RkW1 _wx459 = rkw1_ff0(x56, x8, false); rkw1_ff(_wx459, x65, x23, false); rkw1_v(_wx459, x66, false); auto x459 = rkw1_fin(_wx459);
   auto x460 = x59 * x8;
   auto x461 = x60 * x23;
-  
   auto x462 = x460 + x461;
   auto x463 = x462 + x70;
   auto x464 = x62 * x13;
-  
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
@@ -8126,9 +7782,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(size_t cycle, size_t steps, FpExt* pol
   auto x471 = x470 + x69;
   auto x72 = EF_LD(arg5, (uint32_t)(127u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x472 = x26 - x72;
-  
   auto x473 = x72 * x472;
-  
   RkAcc x474 = rk_link_k(x451, x473, 40u);
   auto x475 = ef_lsub(x455, x459);
   auto x476 = x287 + x455;
@@ -8138,7 +7792,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(size_t cycle, size_t steps, FpExt* pol
   auto x480 = ef_lsub(x74, x20);
   auto x75 = EF_LD(arg5, (uint32_t)(110u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x482 = ef_lsub(x75, x26);
-  
   auto x76 = EF_LD(arg5, (uint32_t)(111u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x484 = x76 - x310;
   auto x77 = EF_LD(arg5, (uint32_t)(106u * rk_s + ((rk_c - 0u) & rk_m)));
@@ -8146,12 +7799,10 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(size_t cycle, size_t steps, FpExt* pol
   auto x78 = EF_LD(arg5, (uint32_t)(108u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x79 = EF_LD(arg5, (uint32_t)(112u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x489 = ef_lsub(x78, x79);
-  
   auto x80 = EF_LD(arg5, (uint32_t)(109u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x81 = EF_LD(arg5, (uint32_t)(113u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x491 = ef_lsub(x80, x81);
   auto x493 = x76 - x26;
-  
   auto x82 = EF_LD(arg5, (uint32_t)(107u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x494 = x493 - x82;
   auto x495 = (EF_LD(arg5, (uint32_t)(123u * rk_s + ((rk_c - 0u) & rk_m))) - Fp(1u));
@@ -8191,7 +7842,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(size_t cycle, size_t steps, FpExt* pol
   auto x514 = ef_lsub(x503, x87);
   auto x516 = ef_lsub(x84, x20);
   auto x518 = ef_lsub(x85, x26);
-  
   auto x88 = EF_LD(arg5, (uint32_t)(120u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x520 = x88 - x310;
   RK_ST1M(arg0, 0u, x520);
@@ -8200,17 +7850,13 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(size_t cycle, size_t steps, FpExt* pol
   auto x90 = EF_LD(arg5, (uint32_t)(117u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x91 = EF_LD(arg5, (uint32_t)(121u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x525 = ef_lsub(x90, x91);
-  
   auto x92 = EF_LD(arg5, (uint32_t)(118u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x93 = EF_LD(arg5, (uint32_t)(122u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x527 = ef_lsub(x92, x93);
-  
   auto x529 = x88 - x26;
   auto x94 = EF_LD(arg5, (uint32_t)(116u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x530 = x529 - x94;
-  
   auto x531 = ef_lsub(x86, x26);
-  
   auto x95 = EF_LD(arg5, (uint32_t)(126u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x533 = ef_lsub(x95, x530);
   auto x2000274 = x472 * x478;
@@ -8308,7 +7954,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(size_t cycle, size_t steps, FpExt* pol
   RkAcc x578 = rk_link_k(x568, x577, 8u);
   auto x109 = EF_LD(arg5, (uint32_t)(30u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x579 = x109 * x14;
-  
   RkW1 _wx580 = rkw1_ff0(x104, x23, false); rkw1_v(_wx580, x579, false); rkw1_v(_wx580, x108, false); rkw1_ff(_wx580, x105, x21, false); rkw1_ff(_wx580, x106, x8, false); rkw1_ff(_wx580, x107, x13, false); auto x580 = rkw1_fin(_wx580);
   auto x581 = x580 - x102;
   RkAcc x582 = rk_link_nf_k(x578, x581, 9u);
@@ -8340,25 +7985,20 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(size_t cycle, size_t steps, FpExt* pol
   auto x608 = x607 - x112;
   RkAcc x609 = rk_link_k(x606, x608, 12u);
   auto x610 = x32 - x26;
-  
   RkAcc x611 = rk_link_nf_k(x609, x610, 13u);
   auto x113 = EF_LD(arg5, (uint32_t)(43u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x612 = x113 - x26;
-  
   RkAcc x613 = rk_link_k(x611, x612, 14u);
   RkAcc x614 = rk_link_nf_k(x613, x257, 15u);
   auto x615 = x33 - x26;
-  
   RkAcc x616 = rk_link_k(x614, x615, 16u);
   auto x114 = EF_LD(arg5, (uint32_t)(49u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x617 = x114 - x26;
-  
   RkAcc x618 = rk_link_nf_k(x616, x617, 17u);
   auto x619 = (EF_LD(arg5, (uint32_t)(142u * rk_s + ((rk_c - 0u) & rk_m))) * (Fp(1u) - EF_LD(arg5, (uint32_t)(142u * rk_s + ((rk_c - 0u) & rk_m)))));
   RkAcc x620 = rk_link_k(x618, x619, 18u);
   auto x115 = EF_LD(arg5, (uint32_t)(44u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x621 = x115 * x9;
-  
   auto x116 = EF_LD(arg5, (uint32_t)(42u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x622 = x116 + x621;
   auto x623 = x100 - x622;
@@ -8381,25 +8021,20 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(size_t cycle, size_t steps, FpExt* pol
   RkAcc x635 = rk_link_nf_k(x630, x634, 21u);
   auto x121 = EF_LD(arg5, (uint32_t)(51u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x636 = x121 - x26;
-  
   RkAcc x637 = rk_link_k(x635, x636, 22u);
   auto x638 = x34 - x26;
-  
   RkAcc x639 = rk_link_nf_k(x637, x638, 23u);
   auto x122 = EF_LD(arg5, (uint32_t)(55u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x640 = x122 - x26;
-  
   RkAcc x641 = rk_link_k(x639, x640, 24u);
   auto x123 = EF_LD(arg5, (uint32_t)(57u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x642 = x123 - x26;
-  
   RkAcc x643 = rk_link_nf_k(x641, x642, 25u);
   RkAcc x644 = rk_link_k(x643, x294, 26u);
   auto x645 = (EF_LD(arg5, (uint32_t)(143u * rk_s + ((rk_c - 0u) & rk_m))) * (Fp(1u) - EF_LD(arg5, (uint32_t)(143u * rk_s + ((rk_c - 0u) & rk_m)))));
   RkAcc x646 = rk_link_nf_k(x644, x645, 27u);
   auto x124 = EF_LD(arg5, (uint32_t)(54u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x647 = x124 * x9;
-  
   auto x125 = EF_LD(arg5, (uint32_t)(52u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x648 = x125 + x647;
   auto x649 = x111 - x648;
@@ -8427,7 +8062,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(size_t cycle, size_t steps, FpExt* pol
   auto x666 = x130 * x19;
   auto x131 = EF_LD(arg5, (uint32_t)(32u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x667 = x131 * x6;
-  
   auto x668 = x666 + x667;
   constexpr Fp x24(0);
   auto x669 = x24 - x668;
@@ -8442,7 +8076,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(size_t cycle, size_t steps, FpExt* pol
   RkAcc x678 = rk_link_k(x670, x677, 34u);
   auto x132 = EF_LD(arg5, (uint32_t)(61u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x679 = x132 - x26;
-  
   RkAcc x680 = rk_link_nf_k(x678, x679, 35u);
   auto x681 = (EF_LD(arg5, (uint32_t)(145u * rk_s + ((rk_c - 0u) & rk_m))) * (Fp(1u) - EF_LD(arg5, (uint32_t)(145u * rk_s + ((rk_c - 0u) & rk_m)))));
   RkAcc x682 = rk_link_k(x680, x681, 36u);
@@ -8508,7 +8141,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(size_t cycle, size_t steps, FpExt* pol
   RkAcc x740 = rk_link_k(x724, x739, 44u);
   auto x141 = EF_LD(arg5, (uint32_t)(65u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x741 = x141 - x26;
-  
   RkAcc x742 = rk_link_nf_k(x740, x741, 45u);
   auto x743 = (EF_LD(arg5, (uint32_t)(149u * rk_s + ((rk_c - 0u) & rk_m))) * (Fp(1u) - EF_LD(arg5, (uint32_t)(149u * rk_s + ((rk_c - 0u) & rk_m)))));
   RkAcc x744 = rk_link_k(x742, x743, 46u);
@@ -8809,7 +8441,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(size_t cycle, size_t steps, FpExt* pol
   RkAcc x1160 = rk_link_k(x1158, x1159, 332u);
   auto x169 = EF_LD(arg5, (uint32_t)(161u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1161 = x169 - x26;
-  
   RkAcc x1162 = rk_link_nf_k(x1160, x1161, 333u);
   auto x170 = EF_LD(arg5, (uint32_t)(162u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1163 = x170 - x313;
@@ -8818,13 +8449,10 @@ __device__ EF_NOINLINE FpExt rv32im_v2_18(size_t cycle, size_t steps, FpExt* pol
   auto x1166 = ef_lsub(x171, x167);
   FpExt x1167 = rk_fin(rk_link_k(x1164, x1166, 336u));
   auto x1168 = x170 - x26;
-  
   auto x172 = EF_LD(arg5, (uint32_t)(158u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1169 = x1168 - x172;
-  
   auto x173 = EF_LD(arg5, (uint32_t)(165u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1170 = x173 - x26;
-  
   auto x1171 = rv32im_v2_17(cycle, steps, poly_mix, arg0, x1167.elems[0], x1167.elems[1], x1167.elems[2], x1167.elems[3], x309.elems[0], x309.elems[1], x309.elems[2], x309.elems[3], arg3.elems[0], arg3.elems[1], arg3.elems[2], arg3.elems[3], x1098.elems[0], x1098.elems[1], x1098.elems[2], x1098.elems[3], x1102.elems[0], x1102.elems[1], x1102.elems[2], x1102.elems[3], x1099.elems[0], x1099.elems[1], x1099.elems[2], x1099.elems[3], arg4, arg5, arg6, arg7, arg8);
   return x1171;
 }
@@ -9063,7 +8691,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(size_t cycle, size_t steps, FpExt* pol
   RkAcc x357 = rk_link_nf_k(x355, x356, 2u);
   auto x100 = EF_LD(arg10, (uint32_t)(182u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x358 = x100 * x99;
-  
   FpExt x359 = rk_fin(rk_link_k(x357, x358, 3u));
   auto x360 = RK_LD1M(arg3, 4u);
   RkAcc x361 = rk_link_nf_k(arg4, x360, 0u);
@@ -9806,9 +9433,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(size_t cycle, size_t steps, FpExt* pol
   RK_ST1M(arg3, 5u, x993);
   auto x224 = EF_LD(arg10, (uint32_t)(22u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x994 = x224 * x39;
-  
   auto x995 = x98 * x28;
-  
   auto x996 = (EF_LD(arg10, (uint32_t)(0u * rk_s + ((rk_c - 0u) & rk_m))) * Fp(2u));
   auto x997 = x107 - x996;
   RK_ST1M(arg3, 6u, x997);
@@ -9839,7 +9464,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(size_t cycle, size_t steps, FpExt* pol
   RkAcc x1022 = rk_link_k(x1020, x1021, 9u);
   RkAcc x1023 = rk_link_nf_k(x1022, x135, 10u);
   auto x1024 = x221 - x29;
-  
   RkAcc x1025 = rk_link_k(x1023, x1024, 11u);
   auto x1026 = x217 * x39;
   auto x1027 = x1026 + x1007;
@@ -9888,7 +9512,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(size_t cycle, size_t steps, FpExt* pol
   auto x225 = EF_LD(arg10, (uint32_t)(108u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1068 = ef_lsub(x29, x225);
   auto x1069 = x225 * x1068;
-  
   RkAcc x1070 = rk_link_nf_k(x1067, x1069, 27u);
   auto x1071 = (EF_LD(arg10, (uint32_t)(109u * rk_s + ((rk_c - 0u) & rk_m))) * (Fp(1u) - EF_LD(arg10, (uint32_t)(109u * rk_s + ((rk_c - 0u) & rk_m)))));
   RkAcc x1072 = rk_link_k(x1070, x1071, 28u);
@@ -9935,7 +9558,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(size_t cycle, size_t steps, FpExt* pol
   RkAcc x1108 = rk_link_k(x1107, x366, 3u);
   constexpr Fp x2(1073725450);
   auto x1110 = x101 - x2;
-  
   RkAcc x1111 = rk_link_nf_k(x1108, x1110, 5u);
   RkAcc x1112 = rk_link_k(x1111, x371, 6u);
   RkAcc x1113 = rk_link_nf_k(x1112, x373, 7u);
@@ -9946,7 +9568,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(size_t cycle, size_t steps, FpExt* pol
   RkAcc x1118 = rk_link_k(x1117, x271, 12u);
   constexpr Fp x1(1073725451);
   auto x1120 = x70 - x1;
-  
   RkAcc x1121 = rk_link_nf_k(x1118, x1120, 14u);
   RkAcc x1122 = rk_link_k(x1121, x276, 15u);
   RkAcc x1123 = rk_link_nf_k(x1122, x278, 16u);
@@ -9977,7 +9598,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(size_t cycle, size_t steps, FpExt* pol
   RkW _cx1148 = _cx1104; rk_cl_acc(_cx1148, x224 * x1147, 59u); FpExt x1148 = rkw_fin(_cx1148);
   constexpr Fp x0(1073725452);
   auto x1172 = x102 - x0;
-  
   auto x1176 = (EF_LD(arg10, (uint32_t)(69u * rk_s + ((rk_c - 0u) & rk_m))) - Fp(1u));
   auto x1178 = RK_LD1M(arg3, 21u);
   auto x1179 = x82 - x1178;
@@ -9987,16 +9607,13 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(size_t cycle, size_t steps, FpExt* pol
   auto x1185 = (EF_LD(arg10, (uint32_t)(75u * rk_s + ((rk_c - 0u) & rk_m))) - Fp(1u));
   auto x231 = EF_LD(arg10, (uint32_t)(76u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1187 = x231 - x1184;
-  
   auto x1191 = RK_LD1M(arg3, 23u);
   auto x1194 = x103 - x2;
-  
   auto x1196 = (EF_LD(arg10, (uint32_t)(71u * rk_s + ((rk_c - 0u) & rk_m))) - Fp(1u));
   auto x1198 = RK_LD1M(arg3, 24u);
   auto x1199 = x121 - x1198;
   RK_ST1M(arg3, 12u, x1199);
   auto x1201 = x117 - x83;
-  
   auto x1204 = (EF_LD(arg10, (uint32_t)(77u * rk_s + ((rk_c - 0u) & rk_m))) - Fp(1u));
   auto x1206 = (EF_LD(arg10, (uint32_t)(78u * rk_s + ((rk_c - 0u) & rk_m))) * Fp(4u));
   auto x1207 = x1206 + x226;
@@ -10005,7 +9622,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(size_t cycle, size_t steps, FpExt* pol
   auto x1215 = x1214 + x90;
   auto x1216 = x1215 + x225;
   auto x1217 = x1216 - x29;
-  
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
@@ -10018,10 +9634,8 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(size_t cycle, size_t steps, FpExt* pol
   auto x1228 = x1226 - x1227;
   auto x1230 = x91 * x170;
   auto x1232 = x91 * x232;
-  
   auto x1234 = x91 * x89;
   auto x1235 = x1234 - x92;
-  
   auto x2000464 = x990 - x989;
   RkAcc x2000463 = rk_link_nf_k(x1147, x2000464, 0u);
   auto x2000466 = x389 - x1126;
@@ -10081,7 +9695,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_14(size_t cycle, size_t steps, FpExt* pol
   FpExt x1236 = rk_fin(rk_link_k(x2000516, x1235, 53u));
   auto x1237 = x227 + x90;
   auto x1238 = x1237 + x225;
-  
   auto x1239 = rv32im_v2_13(cycle, steps, poly_mix, arg3, x1236.elems[0], x1236.elems[1], x1236.elems[2], x1236.elems[3], x1148.elems[0], x1148.elems[1], x1148.elems[2], x1148.elems[3], arg4.elems[0], arg4.elems[1], arg4.elems[2], arg4.elems[3], arg7.elems[0], arg7.elems[1], arg7.elems[2], arg7.elems[3], x988.elems[0], x988.elems[1], x988.elems[2], x988.elems[3], arg8, arg9.elems[0], arg9.elems[1], arg9.elems[2], arg9.elems[3], arg10, arg11, arg12, arg13);
   return x1239;
 }
@@ -10465,7 +10078,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(size_t cycle, size_t steps, FpExt* pol
   constexpr Fp x203(48);
   auto x285 = EF_LD(arg27, (uint32_t)(35u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x637 = x203 - x285;
-  
   RkAcc x638 = rk_link_nf_k(x636, x637, 150u);
   auto x639 = (Fp(0u) - EF_LD(arg27, (uint32_t)(36u * rk_s + ((rk_c - 0u) & rk_m))));
   RkAcc x640 = rk_link_k(x638, x639, 151u);
@@ -10585,7 +10197,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(size_t cycle, size_t steps, FpExt* pol
   auto x740 = x256 * x209;
   RkAcc x741 = rk_link_k(x739, x740, 11u);
   auto x742 = x295 - x294;
-  
   auto x744 = x713 - x294;
   constexpr Fp x197(18);
   // lincombF: fused into a lazy Fp linear combination
@@ -10607,20 +10218,17 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(size_t cycle, size_t steps, FpExt* pol
   auto x296 = EF_LD(arg27, (uint32_t)(126u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x755 = ef_lsub(x199, x296);
   auto x756 = x296 * x755;
-  
   RkAcc x757 = rk_link_nf_k(x741, x756, 12u);
   auto x758 = (EF_LD(arg27, (uint32_t)(127u * rk_s + ((rk_c - 0u) & rk_m))) * (Fp(1u) - EF_LD(arg27, (uint32_t)(127u * rk_s + ((rk_c - 0u) & rk_m)))));
   RkAcc x759 = rk_link_k(x757, x758, 13u);
   auto x297 = EF_LD(arg27, (uint32_t)(128u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x760 = ef_lsub(x199, x297);
   auto x761 = x297 * x760;
-  
   RkAcc x762 = rk_link_nf_k(x759, x761, 14u);
   auto x763 = (EF_LD(arg27, (uint32_t)(129u * rk_s + ((rk_c - 0u) & rk_m))) * (Fp(1u) - EF_LD(arg27, (uint32_t)(129u * rk_s + ((rk_c - 0u) & rk_m)))));
   RkAcc x764 = rk_link_k(x762, x763, 15u);
   auto x765 = ef_lsub(x199, x280);
   auto x766 = x280 * x765;
-  
   RkAcc x767 = rk_link_nf_k(x764, x766, 16u);
   auto x768 = (EF_LD(arg27, (uint32_t)(131u * rk_s + ((rk_c - 0u) & rk_m))) * (Fp(1u) - EF_LD(arg27, (uint32_t)(131u * rk_s + ((rk_c - 0u) & rk_m)))));
   RkAcc x769 = rk_link_k(x767, x768, 17u);
@@ -11217,7 +10825,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(size_t cycle, size_t steps, FpExt* pol
   auto x1160 = x1159 - x301;
   RkAcc x1161 = rk_link_nf_k(x796, x1160, 22u);
   auto x1162 = ef_lmul(x301, x301);
-  
   auto x1163 = x1162 * x1157;
   auto x302 = EF_LD(arg27, (uint32_t)(78u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1164 = x1163 - x302;
@@ -11230,7 +10837,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(size_t cycle, size_t steps, FpExt* pol
   auto x1169 = x1168 - x304;
   RkAcc x1170 = rk_link_nf_k(x1165, x1169, 24u);
   auto x1171 = ef_lmul(x304, x304);
-  
   auto x1172 = x1171 * x1166;
   auto x305 = EF_LD(arg27, (uint32_t)(80u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1173 = x1172 - x305;
@@ -11243,7 +10849,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(size_t cycle, size_t steps, FpExt* pol
   auto x1178 = x1177 - x307;
   RkAcc x1179 = rk_link_nf_k(x1174, x1178, 26u);
   auto x1180 = ef_lmul(x307, x307);
-  
   auto x1181 = x1180 * x1175;
   auto x1182 = x1181 - x210;
   RkAcc x1183 = rk_link_k(x1179, x1182, 27u);
@@ -11254,7 +10859,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(size_t cycle, size_t steps, FpExt* pol
   auto x1187 = x1186 - x260;
   RkAcc x1188 = rk_link_nf_k(x1183, x1187, 28u);
   auto x1189 = ef_lmul(x260, x260);
-  
   auto x1190 = x1189 * x1184;
   auto x1191 = x1190 - x259;
   RkAcc x1192 = rk_link_k(x1188, x1191, 29u);
@@ -11266,7 +10870,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(size_t cycle, size_t steps, FpExt* pol
   auto x1196 = x1195 - x310;
   RkAcc x1197 = rk_link_nf_k(x1192, x1196, 30u);
   auto x1198 = ef_lmul(x310, x310);
-  
   auto x1199 = x1198 * x1193;
   auto x1200 = x1199 - x211;
   RkAcc x1201 = rk_link_k(x1197, x1200, 31u);
@@ -11278,7 +10881,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(size_t cycle, size_t steps, FpExt* pol
   auto x1205 = x1204 - x312;
   RkAcc x1206 = rk_link_nf_k(x1201, x1205, 32u);
   auto x1207 = ef_lmul(x312, x312);
-  
   auto x1208 = x1207 * x1202;
   auto x313 = EF_LD(arg27, (uint32_t)(88u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1209 = x1208 - x313;
@@ -11290,7 +10892,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(size_t cycle, size_t steps, FpExt* pol
   auto x1214 = x1213 - x212;
   RkAcc x1215 = rk_link_nf_k(x1210, x1214, 34u);
   auto x1216 = ef_lmul(x212, x212);
-  
   auto x1217 = x1216 * x1211;
   auto x315 = EF_LD(arg27, (uint32_t)(90u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1218 = x1217 - x315;
@@ -11302,7 +10903,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(size_t cycle, size_t steps, FpExt* pol
   auto x1223 = x1222 - x263;
   RkAcc x1224 = rk_link_nf_k(x1219, x1223, 36u);
   auto x1225 = ef_lmul(x263, x263);
-  
   auto x1226 = x1225 * x1220;
   auto x317 = EF_LD(arg27, (uint32_t)(92u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1227 = x1226 - x317;
@@ -11314,7 +10914,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(size_t cycle, size_t steps, FpExt* pol
   auto x1232 = x1231 - x213;
   RkAcc x1233 = rk_link_nf_k(x1228, x1232, 38u);
   auto x1234 = ef_lmul(x213, x213);
-  
   auto x1235 = x1234 * x1229;
   auto x1236 = x1235 - x264;
   RkAcc x1237 = rk_link_k(x1233, x1236, 39u);
@@ -11326,7 +10925,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(size_t cycle, size_t steps, FpExt* pol
   auto x1241 = x1240 - x320;
   RkAcc x1242 = rk_link_nf_k(x1237, x1241, 40u);
   auto x1243 = ef_lmul(x320, x320);
-  
   auto x1244 = x1243 * x1238;
   auto x321 = EF_LD(arg27, (uint32_t)(96u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1245 = x1244 - x321;
@@ -11339,7 +10937,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(size_t cycle, size_t steps, FpExt* pol
   auto x1250 = x1249 - x323;
   RkAcc x1251 = rk_link_nf_k(x1246, x1250, 42u);
   auto x1252 = ef_lmul(x323, x323);
-  
   auto x1253 = x1252 * x1247;
   auto x324 = EF_LD(arg27, (uint32_t)(98u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1254 = x1253 - x324;
@@ -11352,7 +10949,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(size_t cycle, size_t steps, FpExt* pol
   auto x1259 = x1258 - x326;
   RkAcc x1260 = rk_link_nf_k(x1255, x1259, 44u);
   auto x1261 = ef_lmul(x326, x326);
-  
   auto x1262 = x1261 * x1256;
   auto x1263 = x1262 - x214;
   RkAcc x1264 = rk_link_k(x1260, x1263, 45u);
@@ -11363,7 +10959,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(size_t cycle, size_t steps, FpExt* pol
   auto x1268 = x1267 - x268;
   RkAcc x1269 = rk_link_nf_k(x1264, x1268, 46u);
   auto x1270 = ef_lmul(x268, x268);
-  
   auto x1271 = x1270 * x1265;
   auto x1272 = x1271 - x267;
   RkAcc x1273 = rk_link_k(x1269, x1272, 47u);
@@ -11375,7 +10970,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(size_t cycle, size_t steps, FpExt* pol
   auto x1277 = x1276 - x329;
   RkAcc x1278 = rk_link_nf_k(x1273, x1277, 48u);
   auto x1279 = ef_lmul(x329, x329);
-  
   auto x1280 = x1279 * x1274;
   auto x1281 = x1280 - x215;
   RkAcc x1282 = rk_link_k(x1278, x1281, 49u);
@@ -11387,7 +10981,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(size_t cycle, size_t steps, FpExt* pol
   auto x1286 = x1285 - x331;
   RkAcc x1287 = rk_link_nf_k(x1282, x1286, 50u);
   auto x1288 = ef_lmul(x331, x331);
-  
   auto x1289 = x1288 * x1283;
   auto x332 = EF_LD(arg27, (uint32_t)(106u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1290 = x1289 - x332;
@@ -11399,7 +10992,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(size_t cycle, size_t steps, FpExt* pol
   auto x1295 = x1294 - x216;
   RkAcc x1296 = rk_link_nf_k(x1291, x1295, 52u);
   auto x1297 = ef_lmul(x216, x216);
-  
   auto x1298 = x1297 * x1292;
   auto x334 = EF_LD(arg27, (uint32_t)(108u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1299 = x1298 - x334;
@@ -11410,7 +11002,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(size_t cycle, size_t steps, FpExt* pol
   auto x1304 = x1303 - x271;
   RkAcc x1305 = rk_link_nf_k(x1300, x1304, 54u);
   auto x1306 = ef_lmul(x271, x271);
-  
   auto x1307 = x1306 * x1301;
   auto x335 = EF_LD(arg27, (uint32_t)(110u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1308 = x1307 - x335;
@@ -11421,7 +11012,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_10(size_t cycle, size_t steps, FpExt* pol
   auto x1313 = x1312 - x217;
   RkAcc x1314 = rk_link_nf_k(x1309, x1313, 56u);
   auto x1315 = ef_lmul(x217, x217);
-  
   auto x1316 = x1315 * x1310;
   auto x1317 = x1316 - x272;
   RkAcc x1318 = rk_link_k(x1314, x1317, 57u);
@@ -11854,7 +11444,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(size_t cycle, size_t steps, FpExt* poly
   RK_ST1M(arg0, 18u, x528);
   auto x65 = EF_LD(arg10, (uint32_t)(124u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x529 = x65 * x14;
-  
   auto x66 = EF_LD(arg10, (uint32_t)(125u * rk_s + ((rk_c - 0u) & rk_m)));
   // lincombF: fused into a lazy Fp linear combination
   auto x67 = EF_LD(arg10, (uint32_t)(126u * rk_s + ((rk_c - 0u) & rk_m)));
@@ -12611,7 +12200,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(size_t cycle, size_t steps, FpExt* poly
   auto x235 = EF_LD(arg10, (uint32_t)(58u * rk_s + ((rk_c - 4u) & rk_m)));
   auto x236 = EF_LD(arg10, (uint32_t)(58u * rk_s + ((rk_c - 8u) & rk_m)));
   auto x1148 = ef_lmul(x235, x236);
-  
   auto x237 = EF_LD(arg10, (uint32_t)(58u * rk_s + ((rk_c - 12u) & rk_m)));
   auto x1149 = x0 - x237;
   // lincombF: fused into a lazy Fp linear combination
@@ -12621,7 +12209,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_6(size_t cycle, size_t steps, FpExt* poly
   RkW1 _wx1154 = rkw1_ff0(x1148, x1149, false); rkw1_ff(_wx1154, x1152, x237, false); auto x1154 = rkw1_fin(_wx1154);
   RK_ST1M(arg0, 78u, x1154);
   auto x1155 = x0 - x235;
-  
   auto x1156 = rv32im_v2_5(cycle, steps, poly_mix, arg0, arg1.elems[0], arg1.elems[1], arg1.elems[2], arg1.elems[3], arg2.elems[0], arg2.elems[1], arg2.elems[2], arg2.elems[3], arg3.elems[0], arg3.elems[1], arg3.elems[2], arg3.elems[3], arg4.elems[0], arg4.elems[1], arg4.elems[2], arg4.elems[3], arg5.elems[0], arg5.elems[1], arg5.elems[2], arg5.elems[3], arg6.elems[0], arg6.elems[1], arg6.elems[2], arg6.elems[3], arg7.elems[0], arg7.elems[1], arg7.elems[2], arg7.elems[3], arg8.elems[0], arg8.elems[1], arg8.elems[2], arg8.elems[3], arg9, arg10, arg11, arg12);
   return x1156;
 }
@@ -13814,7 +13401,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   constexpr Fp x27(65536);
   auto x33 = EF_LD(arg8, (uint32_t)(169u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x181 = x33 * x27;
-  
   auto x34 = EF_LD(arg8, (uint32_t)(168u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x182 = x181 + x34;
   auto x183 = (((Fp(1u) - EF_LD(arg8, (uint32_t)(18u * rk_s + ((rk_c - 0u) & rk_m)))) * EF_LD(arg8, (uint32_t)(14u * rk_s + ((rk_c - 4u) & rk_m)))) + Fp(4u));
@@ -13824,13 +13410,11 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   auto x187 = x186 + x33;
   auto x35 = EF_LD(arg8, (uint32_t)(170u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x188 = x35 - x28;
-  
   RkAcc x189 = rk_link_k(x185, x188, 344u);
   auto x190 = (EF_LD(arg8, (uint32_t)(172u * rk_s + ((rk_c - 0u) & rk_m))) * (Fp(1u) - EF_LD(arg8, (uint32_t)(172u * rk_s + ((rk_c - 0u) & rk_m)))));
   RkAcc x191 = rk_link_nf_k(x189, x190, 345u);
   auto x36 = EF_LD(arg8, (uint32_t)(172u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x192 = x36 * x27;
-  
   auto x37 = EF_LD(arg8, (uint32_t)(171u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x193 = x192 + x37;
   auto x194 = x187 - x193;
@@ -13850,7 +13434,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   auto x41 = EF_LD(arg8, (uint32_t)(107u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x205 = ef_lsub(x28, x41);
   auto x206 = ef_lmul(x41, x205);
-  
   constexpr Fp x26(2);
   auto x207 = x26 - x41;
   auto x208 = ef_lmul(x206, x207);
@@ -13866,9 +13449,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   RkAcc x216 = rk_link_k(x213, x215, 5u);
   auto x43 = EF_LD(arg8, (uint32_t)(110u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x217 = x28 - x43;
-  
   auto x218 = x43 * x217;
-  
   RkAcc x219 = rk_link_nf_k(x216, x218, 6u);
   auto x44 = EF_LD(arg8, (uint32_t)(111u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x220 = x186 * x44;
@@ -13881,7 +13462,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   RkAcc x227 = rk_link_nf_k(x226, x43, 10u);
   auto x45 = EF_LD(arg8, (uint32_t)(112u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x228 = x45 - x28;
-  
   RkAcc x229 = rk_link_k(x227, x228, 11u);
   constexpr Fp x24(4);
   auto x46 = EF_LD(arg8, (uint32_t)(113u * rk_s + ((rk_c - 0u) & rk_m)));
@@ -13917,12 +13497,10 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   auto x50 = EF_LD(arg8, (uint32_t)(91u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x256 = ef_lsub(x28, x50);
   auto x257 = x50 * x256;
-  
   RkAcc x258 = rk_link_nf_k(x255, x257, 23u);
   auto x51 = EF_LD(arg8, (uint32_t)(92u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x259 = ef_lsub(x28, x51);
   auto x260 = ef_lmul(x51, x259);
-  
   auto x261 = x26 - x51;
   auto x262 = ef_lmul(x260, x261);
   auto x263 = x25 - x51;
@@ -13930,9 +13508,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   RkAcc x265 = rk_link_k(x258, x264, 24u);
   auto x52 = EF_LD(arg8, (uint32_t)(93u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x266 = ef_lsub(x28, x52);
-  
   auto x267 = ef_lmul(x52, x266);
-  
   auto x268 = x26 - x52;
   auto x269 = ef_lmul(x267, x268);
   auto x270 = x25 - x52;
@@ -13940,9 +13516,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   RkAcc x272 = rk_link_nf_k(x265, x271, 25u);
   auto x53 = EF_LD(arg8, (uint32_t)(94u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x273 = ef_lsub(x28, x53);
-  
   auto x274 = ef_lmul(x53, x273);
-  
   auto x275 = x26 - x53;
   auto x276 = ef_lmul(x274, x275);
   auto x277 = x25 - x53;
@@ -13951,7 +13525,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   auto x54 = EF_LD(arg8, (uint32_t)(95u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x280 = ef_lsub(x28, x54);
   auto x281 = ef_lmul(x54, x280);
-  
   auto x282 = x26 - x54;
   auto x283 = ef_lmul(x281, x282);
   auto x284 = x25 - x54;
@@ -13960,7 +13533,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   auto x55 = EF_LD(arg8, (uint32_t)(96u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x287 = ef_lsub(x28, x55);
   auto x288 = ef_lmul(x55, x287);
-  
   auto x289 = x26 - x55;
   auto x290 = ef_lmul(x288, x289);
   auto x291 = x25 - x55;
@@ -13968,14 +13540,11 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   RkAcc x293 = rk_link_k(x286, x292, 28u);
   auto x56 = EF_LD(arg8, (uint32_t)(97u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x294 = ef_lsub(x28, x56);
-  
   auto x295 = x56 * x294;
-  
   RkAcc x296 = rk_link_nf_k(x293, x295, 29u);
   auto x57 = EF_LD(arg8, (uint32_t)(98u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x297 = ef_lsub(x28, x57);
   auto x298 = ef_lmul(x57, x297);
-  
   auto x299 = x26 - x57;
   auto x300 = ef_lmul(x298, x299);
   auto x301 = x25 - x57;
@@ -13984,7 +13553,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   auto x58 = EF_LD(arg8, (uint32_t)(99u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x304 = ef_lsub(x28, x58);
   auto x305 = ef_lmul(x58, x304);
-  
   auto x306 = x26 - x58;
   auto x307 = ef_lmul(x305, x306);
   auto x308 = x25 - x58;
@@ -13992,19 +13560,15 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   RkAcc x310 = rk_link_nf_k(x303, x309, 31u);
   auto x59 = EF_LD(arg8, (uint32_t)(100u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x311 = ef_lsub(x28, x59);
-  
   auto x312 = x59 * x311;
-  
   RkAcc x313 = rk_link_k(x310, x312, 32u);
   auto x60 = EF_LD(arg8, (uint32_t)(101u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x314 = ef_lsub(x28, x60);
   auto x315 = x60 * x314;
-  
   RkAcc x316 = rk_link_nf_k(x313, x315, 33u);
   auto x61 = EF_LD(arg8, (uint32_t)(102u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x317 = ef_lsub(x28, x61);
   auto x318 = ef_lmul(x61, x317);
-  
   auto x319 = x26 - x61;
   auto x320 = ef_lmul(x318, x319);
   auto x321 = x25 - x61;
@@ -14013,7 +13577,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   auto x62 = EF_LD(arg8, (uint32_t)(103u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x324 = ef_lsub(x28, x62);
   auto x325 = ef_lmul(x62, x324);
-  
   auto x326 = x26 - x62;
   auto x327 = ef_lmul(x325, x326);
   auto x328 = x25 - x62;
@@ -14022,7 +13585,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   auto x63 = EF_LD(arg8, (uint32_t)(104u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x331 = ef_lsub(x28, x63);
   auto x332 = ef_lmul(x63, x331);
-  
   auto x333 = x26 - x63;
   auto x334 = ef_lmul(x332, x333);
   auto x335 = x25 - x63;
@@ -14031,7 +13593,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   auto x64 = EF_LD(arg8, (uint32_t)(105u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x338 = ef_lsub(x28, x64);
   auto x339 = x64 * x338;
-  
   RkAcc x340 = rk_link_nf_k(x337, x339, 37u);
   constexpr Fp x21(32768);
   // lincombF: fused into a lazy Fp linear combination
@@ -14085,18 +13646,13 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx376 = rkw1_ff0(x57, x10, false); rkw1_ff(_wx376, x58, x26, false); rkw1_v(_wx376, x59, false); auto x376 = rkw1_fin(_wx376);
   auto x377 = x54 * x10;
-  
   auto x378 = x55 * x26;
-  
   auto x379 = x377 + x378;
   auto x380 = x379 + x56;
   auto x381 = x62 * x10;
-  
   auto x382 = x63 * x26;
-  
   auto x383 = x381 + x382;
   auto x384 = x383 + x64;
-  
   // lincombF: fused into a lazy Fp linear combination
   auto x386 = (EF_LD(arg8, (uint32_t)(93u * rk_s + ((rk_c - 0u) & rk_m))) * Fp(4u));
   // lincombF: fused into a lazy Fp linear combination
@@ -14107,7 +13663,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   RK_ST1M(arg0, 0u, x390);
   auto x391 = x60 * x24;
   auto x392 = x391 + x61;
-  
   auto x393 = (EF_LD(arg8, (uint32_t)(147u * rk_s + ((rk_c - 0u) & rk_m))) * (Fp(1u) - EF_LD(arg8, (uint32_t)(147u * rk_s + ((rk_c - 0u) & rk_m)))));
   RkAcc x394 = rk_link_k(x372, x393, 40u);
   auto x395 = ef_lsub(x376, x380);
@@ -14119,7 +13674,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   auto x401 = x69 - x23;
   auto x70 = EF_LD(arg8, (uint32_t)(130u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x403 = x70 - x28;
-  
   auto x71 = EF_LD(arg8, (uint32_t)(131u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x405 = x71 - x197;
   auto x72 = EF_LD(arg8, (uint32_t)(126u * rk_s + ((rk_c - 0u) & rk_m)));
@@ -14131,12 +13685,10 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   auto x76 = EF_LD(arg8, (uint32_t)(133u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x412 = x75 - x76;
   auto x414 = x71 - x28;
-  
   auto x77 = EF_LD(arg8, (uint32_t)(127u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x415 = x414 - x77;
   auto x78 = EF_LD(arg8, (uint32_t)(143u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x416 = x78 - x28;
-  
   auto x79 = EF_LD(arg8, (uint32_t)(144u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x418 = x79 - x415;
   auto x83 = EF_LD(arg8, (uint32_t)(147u * rk_s + ((rk_c - 0u) & rk_m)));
@@ -14174,7 +13726,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   auto x435 = x424 - x84;
   auto x437 = x80 - x23;
   auto x439 = x81 - x28;
-  
   auto x85 = EF_LD(arg8, (uint32_t)(140u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x441 = x85 - x197;
   auto x86 = EF_LD(arg8, (uint32_t)(135u * rk_s + ((rk_c - 0u) & rk_m)));
@@ -14186,11 +13737,9 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   auto x90 = EF_LD(arg8, (uint32_t)(142u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x448 = x89 - x90;
   auto x450 = x85 - x28;
-  
   auto x91 = EF_LD(arg8, (uint32_t)(136u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x451 = x450 - x91;
   auto x452 = x82 - x28;
-  
   auto x92 = EF_LD(arg8, (uint32_t)(146u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x454 = x92 - x451;
   auto x456 = (Fp(1u) - EF_LD(arg8, (uint32_t)(147u * rk_s + ((rk_c - 0u) & rk_m))));
@@ -14261,7 +13810,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   constexpr Fp x7(5);
   auto x477 = x392 - x7;
   auto x478 = x98 - x21;
-  
   FpExt x479 = rk_fin(rk_link_k(arg3, x476, 0u));
   FpExt x480 = rk_fin(rk_link_k(x479, x477, 1u));
   RkAcc x481 = rk_link_nf_k(x480, x390, 2u);
@@ -14333,11 +13881,9 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   RkAcc x542 = rk_link_k(x540, x541, 17u);
   auto x109 = EF_LD(arg8, (uint32_t)(67u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x543 = x109 - x28;
-  
   RkAcc x544 = rk_link_nf_k(x542, x543, 18u);
   auto x110 = EF_LD(arg8, (uint32_t)(69u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x545 = x110 - x28;
-  
   RkAcc x546 = rk_link_k(x544, x545, 19u);
   auto x547 = (EF_LD(arg8, (uint32_t)(164u * rk_s + ((rk_c - 0u) & rk_m))) * (Fp(1u) - EF_LD(arg8, (uint32_t)(164u * rk_s + ((rk_c - 0u) & rk_m)))));
   RkAcc x548 = rk_link_nf_k(x546, x547, 20u);
@@ -14345,7 +13891,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   auto x549 = x111 * x11;
   auto x112 = EF_LD(arg8, (uint32_t)(62u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x550 = x112 + x549;
-  
   auto x113 = EF_LD(arg8, (uint32_t)(162u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x551 = x113 - x550;
   RkAcc x552 = rk_link_k(x548, x551, 21u);
@@ -14353,14 +13898,12 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   auto x553 = x114 * x17;
   auto x115 = EF_LD(arg8, (uint32_t)(66u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x554 = x115 + x553;
-  
   auto x555 = x31 * x21;
   auto x556 = x554 + x555;
   auto x557 = x30 - x556;
   RkAcc x558 = rk_link_nf_k(x552, x557, 22u);
   constexpr Fp x6(1006632961);
   auto x559 = x114 * x6;
-  
   auto x560 = x31 * x17;
   auto x561 = x559 + x560;
   auto x116 = EF_LD(arg8, (uint32_t)(68u * rk_s + ((rk_c - 0u) & rk_m)));
@@ -14368,23 +13911,18 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   RkAcc x563 = rk_link_k(x558, x562, 23u);
   auto x117 = EF_LD(arg8, (uint32_t)(71u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x564 = x117 - x28;
-  
   RkAcc x565 = rk_link_nf_k(x563, x564, 24u);
   auto x118 = EF_LD(arg8, (uint32_t)(73u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x566 = x118 - x28;
-  
   RkAcc x567 = rk_link_k(x565, x566, 25u);
   auto x119 = EF_LD(arg8, (uint32_t)(75u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x568 = x119 - x28;
-  
   RkAcc x569 = rk_link_nf_k(x567, x568, 26u);
   auto x120 = EF_LD(arg8, (uint32_t)(77u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x570 = x120 - x28;
-  
   RkAcc x571 = rk_link_k(x569, x570, 27u);
   auto x121 = EF_LD(arg8, (uint32_t)(79u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x572 = x121 - x28;
-  
   RkAcc x573 = rk_link_nf_k(x571, x572, 28u);
   auto x574 = (EF_LD(arg8, (uint32_t)(165u * rk_s + ((rk_c - 0u) & rk_m))) * (Fp(1u) - EF_LD(arg8, (uint32_t)(165u * rk_s + ((rk_c - 0u) & rk_m)))));
   RkAcc x575 = rk_link_k(x573, x574, 29u);
@@ -14392,22 +13930,18 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   auto x576 = x122 * x11;
   auto x123 = EF_LD(arg8, (uint32_t)(72u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x577 = x123 + x576;
-  
   auto x578 = x107 - x577;
-  
   RkAcc x579 = rk_link_nf_k(x575, x578, 30u);
   auto x124 = EF_LD(arg8, (uint32_t)(80u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x580 = x124 * x17;
   auto x125 = EF_LD(arg8, (uint32_t)(76u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x581 = x125 + x580;
-  
   auto x126 = EF_LD(arg8, (uint32_t)(165u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x582 = x126 * x21;
   auto x583 = x581 + x582;
   auto x584 = x108 - x583;
   RkAcc x585 = rk_link_k(x579, x584, 31u);
   auto x586 = x124 * x6;
-  
   auto x587 = x126 * x17;
   auto x588 = x586 + x587;
   auto x127 = EF_LD(arg8, (uint32_t)(78u * rk_s + ((rk_c - 0u) & rk_m)));
@@ -14424,7 +13958,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   auto x598 = x128 - x597;
   RkAcc x599 = rk_link_k(x594, x598, 35u);
   auto x600 = x112 * x123;
-  
   auto x129 = EF_LD(arg8, (uint32_t)(32u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x601 = x129 + x600;
   // lincombF: fused into a lazy Fp linear combination
@@ -14437,7 +13970,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   RkAcc x608 = rk_link_nf_k(x599, x607, 36u);
   auto x130 = EF_LD(arg8, (uint32_t)(81u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x609 = x130 - x28;
-  
   RkAcc x610 = rk_link_k(x608, x609, 37u);
   auto x611 = (EF_LD(arg8, (uint32_t)(167u * rk_s + ((rk_c - 0u) & rk_m))) * (Fp(1u) - EF_LD(arg8, (uint32_t)(167u * rk_s + ((rk_c - 0u) & rk_m)))));
   RkAcc x612 = rk_link_nf_k(x610, x611, 38u);
@@ -14445,23 +13977,18 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   RkAcc x614 = rk_link_k(x612, x613, 39u);
   auto x615 = x34 * x26;
   auto x616 = x615 + x32;
-  
   constexpr Fp x5(16777216);
   auto x617 = x616 * x5;
   auto x131 = EF_LD(arg8, (uint32_t)(82u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x618 = x131 * x27;
-  
   auto x619 = x617 + x618;
   auto x132 = EF_LD(arg8, (uint32_t)(38u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x620 = x619 + x132;
   auto x621 = x606 - x620;
   RkAcc x622 = rk_link_nf_k(x614, x621, 40u);
   auto x626 = x112 * x125;
-  
   auto x628 = x111 * x122;
-  
   auto x630 = x115 * x123;
-  
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
@@ -14475,7 +14002,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   RkAcc x642 = rk_link_k(x622, x641, 41u);
   auto x133 = EF_LD(arg8, (uint32_t)(83u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x643 = x133 - x28;
-  
   RkAcc x644 = rk_link_nf_k(x642, x643, 42u);
   RkAcc x645 = rk_link_k(x644, x179, 43u);
   auto x646 = (EF_LD(arg8, (uint32_t)(170u * rk_s + ((rk_c - 0u) & rk_m))) * (Fp(1u) - EF_LD(arg8, (uint32_t)(170u * rk_s + ((rk_c - 0u) & rk_m)))));
@@ -14484,7 +14010,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   auto x649 = x648 + x33;
   auto x134 = EF_LD(arg8, (uint32_t)(84u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x651 = x134 * x27;
-  
   auto x2002299 = ef_ladd(x616, x638);
   // lincombF: fused into a lazy Fp linear combination
   auto x3000017 = EF_LD(arg8, (uint32_t)(76u * rk_s + ((rk_c - 0u) & rk_m)));
@@ -14506,11 +14031,8 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   RkW1 _wx2002313 = rkw1_ff0(x2002299, x11, false); rkw1_v(_wx2002313, x128, false); rkw1_v(_wx2002313, x131, false); rkw1_ff(_wx2002313, x112, x3000017, false); rkw1_ff(_wx2002313, x111, x3000018, false); rkw1_ff(_wx2002313, x115, x123, false); rkw1_ff(_wx2002313, x649, x5, true); rkw1_ff(_wx2002313, x3000019, x27, true); rkw1_v(_wx2002313, x135, true); auto x2002313 = rkw1_fin(_wx2002313);
   RkAcc x655 = rk_link_k(x647, x2002313, 45u);
   auto x659 = x111 * x127;
-  
   auto x661 = x115 * x125;
-  
   auto x663 = x116 * x122;
-  
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx667 = rkw1_ff0(x115, x127, false); rkw1_ff(_wx667, x116, x125, false); auto x667 = rkw1_fin(_wx667);
@@ -14520,7 +14042,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   RkAcc x671 = rk_link_nf_k(x655, x670, 46u);
   auto x136 = EF_LD(arg8, (uint32_t)(85u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x672 = x136 - x28;
-  
   RkAcc x673 = rk_link_k(x671, x672, 47u);
   auto x674 = (EF_LD(arg8, (uint32_t)(171u * rk_s + ((rk_c - 0u) & rk_m))) * (Fp(1u) - EF_LD(arg8, (uint32_t)(171u * rk_s + ((rk_c - 0u) & rk_m)))));
   RkAcc x675 = rk_link_nf_k(x673, x674, 48u);
@@ -14529,7 +14050,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   auto x678 = x677 + x37;
   auto x137 = EF_LD(arg8, (uint32_t)(86u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x680 = x137 * x27;
-  
   auto x2002314 = ef_ladd(x649, x667);
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
@@ -14556,7 +14076,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   constexpr Fp x3(131070);
   auto x687 = x686 + x3;
   auto x688 = x116 * x127;
-  
   auto x689 = x687 + x688;
   auto x690 = (EF_LD(arg8, (uint32_t)(43u * rk_s + ((rk_c - 0u) & rk_m))) - Fp(1u));
   RkAcc x691 = rk_link_k(x684, x690, 51u);
@@ -14731,7 +14250,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   auto x868 = x29 * x17;
   auto x869 = x586 + x868;
   auto x870 = x127 - x869;
-  
   auto x874 = x32 * x21;
   auto x875 = (EF_LD(arg8, (uint32_t)(38u * rk_s + ((rk_c - 0u) & rk_m))) * Fp(1006632961u));
   auto x876 = x874 + x875;
@@ -14770,7 +14288,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   RK_ST1M(arg0, 10u, x2002343);
   auto x921 = x141 * x26;
   auto x922 = x921 + x36;
-  
   auto x2002344 = ef_ladd(x904, x667);
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
@@ -14806,26 +14323,20 @@ __device__ EF_NOINLINE FpExt rv32im_v2_17(size_t cycle, size_t steps, FpExt* pol
   RK_ST1M(arg0, 14u, x943);
   auto x946 = x143 * x1;
   auto x947 = x139 - x946;
-  
   auto x949 = x144 - x946;
-  
   auto x952 = x145 * x21;
   auto x953 = ef_lsub(x841, x952);
   auto x954 = x953 * x26;
   auto x956 = x146 - x954;
   RK_ST1M(arg0, 15u, x956);
   auto x960 = x107 - x736;
-  
   auto x962 = x108 + x147;
   auto x965 = x962 - x744;
-  
   auto x969 = x128 - x753;
-  
   auto x971 = x161 + x151;
   auto x974 = x158 * x27;
   auto x975 = x974 + x154;
   auto x976 = x971 - x975;
-  
   auto x980 = x152 + x27;
   auto x981 = x980 - x148;
   auto x982 = x154 + x1;
@@ -15073,12 +14584,10 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(size_t cycle, size_t steps, FpExt* pol
   auto x41 = EF_LD(arg8, (uint32_t)(115u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x238 = ef_lsub(x36, x41);
   auto x239 = x41 * x238;
-  
   RkAcc x240 = rk_link_nf_k(x237, x239, 58u);
   auto x42 = EF_LD(arg8, (uint32_t)(116u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x241 = x36 - x42;
   auto x242 = x42 * x241;
-  
   RkAcc x243 = rk_link_k(x240, x242, 59u);
   auto x43 = EF_LD(arg8, (uint32_t)(113u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x44 = EF_LD(arg8, (uint32_t)(114u * rk_s + ((rk_c - 0u) & rk_m)));
@@ -15098,7 +14607,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(size_t cycle, size_t steps, FpExt* pol
   auto x45 = EF_LD(arg8, (uint32_t)(117u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x255 = x36 - x45;
   auto x256 = x45 * x255;
-  
   RkAcc x257 = rk_link_nf_k(x254, x256, 62u);
   auto x46 = EF_LD(arg8, (uint32_t)(118u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x258 = x38 * x46;
@@ -15286,14 +14794,12 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(size_t cycle, size_t steps, FpExt* pol
   RkAcc x425 = rk_link_k(x423, x424, 23u);
   auto x426 = ef_lsub(x36, x46);
   auto x427 = x46 * x426;
-  
   RkAcc x428 = rk_link_nf_k(x425, x427, 24u);
   auto x429 = ef_lsub(x65, x46);
   constexpr Fp x32(1006632961);
   auto x430 = x429 * x32;
   auto x431 = ef_lsub(x36, x47);
   auto x432 = x47 * x431;
-  
   RkAcc x433 = rk_link_k(x428, x432, 25u);
   auto x434 = x430 - x47;
   RkAcc x435 = rk_link_nf_k(x433, x434, 26u);
@@ -15353,7 +14859,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(size_t cycle, size_t steps, FpExt* pol
   RkW1 _wx481 = rkw1_ff0(x47, x71, false); rkw1_ff(_wx481, x431, x70, false); rkw1_ff(_wx481, x73, x31, true); rkw1_v(_wx481, x74, true); auto x481 = rkw1_fin(_wx481);
   RkAcc x482 = rk_link_nf_k(x478, x481, 50u);
   auto x483 = ef_lsub(x72, x74);
-  
   auto x2000382 = x46 * x483;
   RkAcc x485 = rk_link_k(x482, x2000382, 563u);
   auto x75 = EF_LD(arg8, (uint32_t)(84u * rk_s + ((rk_c - 0u) & rk_m)));
@@ -15436,7 +14941,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(size_t cycle, size_t steps, FpExt* pol
   auto x89 = EF_LD(arg8, (uint32_t)(124u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x604 = x36 - x89;
   auto x605 = x89 * x604;
-  
   auto x90 = EF_LD(arg8, (uint32_t)(125u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x607 = x603 * x90;
   auto x608 = x607 - x604;
@@ -15733,7 +15237,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(size_t cycle, size_t steps, FpExt* pol
   auto x130 = EF_LD(arg8, (uint32_t)(131u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x763 = x36 - x130;
   auto x764 = x130 * x763;
-  
   RkAcc x765 = rk_link_k(x761, x764, 328u);
   auto x131 = EF_LD(arg8, (uint32_t)(132u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x766 = x762 * x131;
@@ -15778,7 +15281,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(size_t cycle, size_t steps, FpExt* pol
   auto x801 = x800 + x799;
   auto x136 = EF_LD(arg8, (uint32_t)(137u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x802 = x136 - x36;
-  
   RkAcc x803 = rk_link_k(x794, x802, 340u);
   auto x804 = (EF_LD(arg8, (uint32_t)(139u * rk_s + ((rk_c - 0u) & rk_m))) * (Fp(1u) - EF_LD(arg8, (uint32_t)(139u * rk_s + ((rk_c - 0u) & rk_m)))));
   RkAcc x805 = rk_link_nf_k(x803, x804, 341u);
@@ -15787,7 +15289,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(size_t cycle, size_t steps, FpExt* pol
   auto x806 = x137 * x16;
   auto x138 = EF_LD(arg8, (uint32_t)(138u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x807 = x806 + x138;
-  
   auto x808 = x801 - x807;
   RkAcc x809 = rk_link_k(x805, x808, 342u);
   auto x810 = ((Fp(1u) - EF_LD(arg8, (uint32_t)(18u * rk_s + ((rk_c - 0u) & rk_m)))) * EF_LD(arg8, (uint32_t)(15u * rk_s + ((rk_c - 4u) & rk_m))));
@@ -15837,125 +15338,93 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(size_t cycle, size_t steps, FpExt* pol
   constexpr Fp x33(0);
   auto x144 = EF_LD(arg8, (uint32_t)(29u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x846 = x33 - x144;
-  
   RkAcc x847 = rk_link_nf_k(arg3, x846, 0u);
   auto x848 = x33 - x66;
-  
   FpExt x849 = rk_fin(rk_link_k(x847, x848, 1u));
   auto x145 = EF_LD(arg8, (uint32_t)(31u * rk_s + ((rk_c - 0u) & rk_m)));
   RkW1 _wx850 = rkw1_ff0(x824, x14, false); rkw1_ff(_wx850, x826, x13, false); rkw1_v(_wx850, x145, true); auto x850 = rkw1_fin(_wx850);
   RkAcc x851 = rk_link_nf_k(x849, x850, 2u);
   auto x146 = EF_LD(arg8, (uint32_t)(32u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x852 = x36 - x146;
-  
   RkAcc x853 = rk_link_k(x851, x852, 3u);
   auto x147 = EF_LD(arg8, (uint32_t)(33u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x854 = x36 - x147;
-  
   RkAcc x855 = rk_link_nf_k(x853, x854, 4u);
   auto x856 = x36 - x93;
-  
   RkAcc x857 = rk_link_k(x855, x856, 5u);
   constexpr Fp x12(22);
   auto x148 = EF_LD(arg8, (uint32_t)(35u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x858 = x12 - x148;
   RkAcc x859 = rk_link_nf_k(x857, x858, 6u);
   auto x860 = x33 - x69;
-  
   RkAcc x861 = rk_link_k(x859, x860, 7u);
   auto x862 = x33 - x55;
-  
   RkAcc x863 = rk_link_nf_k(x861, x862, 8u);
   auto x864 = x33 - x94;
-  
   RkAcc x865 = rk_link_k(x863, x864, 9u);
   auto x866 = x823 - x68;
   RkAcc x867 = rk_link_nf_k(x865, x866, 10u);
   auto x149 = EF_LD(arg8, (uint32_t)(40u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x868 = x33 - x149;
-  
   RkAcc x869 = rk_link_k(x867, x868, 11u);
   auto x150 = EF_LD(arg8, (uint32_t)(41u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x870 = x33 - x150;
-  
   RkAcc x871 = rk_link_nf_k(x869, x870, 12u);
   auto x151 = EF_LD(arg8, (uint32_t)(42u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x872 = x33 - x151;
-  
   RkAcc x873 = rk_link_k(x871, x872, 13u);
   auto x874 = x33 - x95;
-  
   RkAcc x875 = rk_link_nf_k(x873, x874, 14u);
   auto x152 = EF_LD(arg8, (uint32_t)(44u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x876 = x33 - x152;
-  
   RkAcc x877 = rk_link_k(x875, x876, 15u);
   auto x878 = x33 - x70;
-  
   RkAcc x879 = rk_link_nf_k(x877, x878, 16u);
   auto x880 = x33 - x71;
-  
   RkAcc x881 = rk_link_k(x879, x880, 17u);
   auto x882 = x33 - x76;
-  
   RkAcc x883 = rk_link_nf_k(x881, x882, 18u);
   auto x884 = x33 - x86;
-  
   RkAcc x885 = rk_link_k(x883, x884, 19u);
   auto x153 = EF_LD(arg8, (uint32_t)(49u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x886 = x33 - x153;
-  
   RkAcc x887 = rk_link_nf_k(x885, x886, 20u);
   auto x154 = EF_LD(arg8, (uint32_t)(50u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x888 = x33 - x154;
-  
   RkAcc x889 = rk_link_k(x887, x888, 21u);
   auto x155 = EF_LD(arg8, (uint32_t)(51u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x890 = x33 - x155;
-  
   RkAcc x891 = rk_link_nf_k(x889, x890, 22u);
   auto x892 = x33 - x77;
-  
   RkAcc x893 = rk_link_k(x891, x892, 23u);
   auto x156 = EF_LD(arg8, (uint32_t)(53u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x894 = x33 - x156;
-  
   RkAcc x895 = rk_link_nf_k(x893, x894, 24u);
   auto x157 = EF_LD(arg8, (uint32_t)(54u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x896 = x33 - x157;
-  
   RkAcc x897 = rk_link_k(x895, x896, 25u);
   auto x898 = x33 - x56;
-  
   RkAcc x899 = rk_link_nf_k(x897, x898, 26u);
   auto x900 = x33 - x78;
-  
   RkAcc x901 = rk_link_k(x899, x900, 27u);
   auto x902 = x33 - x88;
-  
   RkAcc x903 = rk_link_nf_k(x901, x902, 28u);
   auto x158 = EF_LD(arg8, (uint32_t)(58u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x904 = x33 - x158;
-  
   RkAcc x905 = rk_link_k(x903, x904, 29u);
   auto x159 = EF_LD(arg8, (uint32_t)(59u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x906 = x33 - x159;
-  
   RkAcc x907 = rk_link_nf_k(x905, x906, 30u);
   auto x160 = EF_LD(arg8, (uint32_t)(60u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x908 = x33 - x160;
-  
   RkAcc x909 = rk_link_k(x907, x908, 31u);
   auto x910 = x33 - x79;
-  
   RkAcc x911 = rk_link_nf_k(x909, x910, 32u);
   auto x161 = EF_LD(arg8, (uint32_t)(62u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x912 = x33 - x161;
-  
   RkAcc x913 = rk_link_k(x911, x912, 33u);
   auto x162 = EF_LD(arg8, (uint32_t)(63u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x914 = x33 - x162;
-  
   RkAcc x915 = rk_link_nf_k(x913, x914, 34u);
   constexpr FpExt x11(0,1,0,0);
   auto x916 = x97 * x11;
@@ -15992,7 +15461,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(size_t cycle, size_t steps, FpExt* pol
   RkW _cx936 = rk_cl0(x845, x143 * x935, 4u); FpExt x936 = rkw_fin(_cx936);
   constexpr Fp x9(2013265920);
   auto x937 = x164 - x9;
-  
   RkAcc x938 = rk_link_nf_k(arg3, x937, 0u);
   RkAcc x939 = rk_link_k(x938, x339, 1u);
   auto x940 = x40 - x829;
@@ -16001,30 +15469,24 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(size_t cycle, size_t steps, FpExt* pol
   auto x943 = x80 - x8;
   RkAcc x944 = rk_link_nf_k(x941, x943, 4u);
   auto x945 = x81 - x82;
-  
   RkAcc x946 = rk_link_k(x944, x945, 5u);
   auto x171 = EF_LD(arg8, (uint32_t)(72u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x947 = x171 - x84;
-  
   RkAcc x948 = rk_link_nf_k(x946, x947, 6u);
   auto x949 = x40 - x36;
-  
   auto x172 = EF_LD(arg8, (uint32_t)(70u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x950 = x949 - x172;
   RkAcc x951 = rk_link_k(x948, x812, 7u);
   auto x173 = EF_LD(arg8, (uint32_t)(141u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x952 = x173 - x950;
-  
   RkAcc x953 = rk_link_nf_k(x951, x952, 8u);
   // lincombF: fused into a lazy Fp linear combination
   constexpr Fp x7(1509949441);
   // lincombF: fused into a lazy Fp linear combination
   RkW1 _wx956 = rkw1_ff0(x84, x17, false); rkw1_ff(_wx956, x82, x7, false); auto x956 = rkw1_fin(_wx956);
   auto x957 = x58 - x9;
-  
   RkAcc x958 = rk_link_k(x953, x957, 9u);
   auto x959 = x72 - x36;
-  
   RkAcc x960 = rk_link_nf_k(x958, x959, 10u);
   auto x961 = x51 - x829;
   RK_ST1M(arg0, 10u, x961);
@@ -16034,14 +15496,11 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(size_t cycle, size_t steps, FpExt* pol
   auto x964 = x174 - x6;
   RkAcc x965 = rk_link_nf_k(x962, x964, 13u);
   auto x966 = x38 - x75;
-  
   RkAcc x967 = rk_link_k(x965, x966, 14u);
   auto x968 = x50 - x52;
-  
   RkAcc x969 = rk_link_nf_k(x967, x968, 15u);
   auto x970 = x469 - x59;
   auto x971 = x168 - x36;
-  
   RkAcc x972 = rk_link_k(x969, x971, 16u);
   auto x175 = EF_LD(arg8, (uint32_t)(143u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x973 = x175 - x970;
@@ -16051,10 +15510,8 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(size_t cycle, size_t steps, FpExt* pol
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
   auto x978 = x74 - x9;
-  
   RkAcc x979 = rk_link_k(x974, x978, 18u);
   auto x980 = x125 - x36;
-  
   RkAcc x981 = rk_link_nf_k(x979, x980, 19u);
   auto x176 = EF_LD(arg8, (uint32_t)(92u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x982 = x176 - x829;
@@ -16065,16 +15522,13 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(size_t cycle, size_t steps, FpExt* pol
   RkAcc x986 = rk_link_nf_k(x983, x985, 22u);
   auto x177 = EF_LD(arg8, (uint32_t)(93u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x987 = x123 - x177;
-  
   RkAcc x988 = rk_link_k(x986, x987, 23u);
   auto x178 = EF_LD(arg8, (uint32_t)(94u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x989 = x124 - x178;
-  
   RkAcc x990 = rk_link_nf_k(x988, x989, 24u);
   auto x991 = (EF_LD(arg8, (uint32_t)(92u * rk_s + ((rk_c - 0u) & rk_m))) - Fp(1u));
   auto x992 = x991 - x73;
   auto x993 = x169 - x36;
-  
   RkAcc x994 = rk_link_k(x990, x993, 25u);
   auto x179 = EF_LD(arg8, (uint32_t)(145u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x995 = x179 - x992;
@@ -16100,13 +15554,11 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(size_t cycle, size_t steps, FpExt* pol
   auto x182 = EF_LD(arg8, (uint32_t)(99u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x183 = EF_LD(arg8, (uint32_t)(103u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1011 = x182 - x183;
-  
   RkAcc x1012 = rk_link_nf_k(x1010, x1011, 33u);
   auto x1013 = (EF_LD(arg8, (uint32_t)(101u * rk_s + ((rk_c - 0u) & rk_m))) - Fp(1u));
   auto x184 = EF_LD(arg8, (uint32_t)(97u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1014 = x1013 - x184;
   auto x1015 = x170 - x36;
-  
   RkAcc x1016 = rk_link_k(x1012, x1015, 34u);
   auto x185 = EF_LD(arg8, (uint32_t)(147u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1017 = x185 - x1014;
@@ -16114,9 +15566,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(size_t cycle, size_t steps, FpExt* pol
   RkAcc x1018 = rk_link_nf_k(x1016, x1017, 35u);
   auto x186 = EF_LD(arg8, (uint32_t)(196u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1019 = x36 - x186;
-  
   auto x1020 = x186 * x1019;
-  
   RkAcc x1021 = rk_link_k(x1018, x1020, 36u);
   auto x187 = EF_LD(arg8, (uint32_t)(197u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1022 = x956 * x187;
@@ -16125,19 +15575,14 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(size_t cycle, size_t steps, FpExt* pol
   auto x1025 = x186 * x956;
   RkAcc x1026 = rk_link_k(x1024, x1025, 38u);
   auto x1027 = x186 * x187;
-  
   RkAcc x1028 = rk_link_nf_k(x1026, x1027, 39u);
   auto x188 = EF_LD(arg8, (uint32_t)(198u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1029 = ef_lsub(x36, x188);
-  
   auto x1030 = x188 * x1029;
-  
   RkAcc x1031 = rk_link_k(x1028, x1030, 40u);
   auto x189 = EF_LD(arg8, (uint32_t)(199u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1032 = ef_lsub(x36, x189);
-  
   auto x1033 = x189 * x1032;
-  
   RkAcc x1034 = rk_link_nf_k(x1031, x1033, 41u);
   constexpr Fp x3(32768);
   // lincombF: fused into a lazy Fp linear combination
@@ -16147,9 +15592,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(size_t cycle, size_t steps, FpExt* pol
   RkAcc x1039 = rk_link_k(x1034, x1038, 42u);
   auto x190 = EF_LD(arg8, (uint32_t)(200u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1040 = x36 - x190;
-  
   auto x1041 = x190 * x1040;
-  
   RkAcc x1042 = rk_link_nf_k(x1039, x1041, 43u);
   auto x191 = EF_LD(arg8, (uint32_t)(102u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x192 = EF_LD(arg8, (uint32_t)(201u * rk_s + ((rk_c - 0u) & rk_m)));
@@ -16172,7 +15615,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(size_t cycle, size_t steps, FpExt* pol
   auto x1066 = x189 - x147;
   RkAcc x1067 = rk_link_nf_k(x1065, x1066, 51u);
   auto x1068 = x33 - x93;
-  
   RkAcc x1069 = rk_link_k(x1067, x1068, 52u);
   constexpr Fp x2(17);
   // lincombF: fused into a lazy Fp linear combination
@@ -16287,7 +15729,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(size_t cycle, size_t steps, FpExt* pol
   RkW _cx1142 = rk_cl0(x834, x107 * x1141, 3u); FpExt x1142 = rkw_fin(_cx1142);
   auto x223 = EF_LD(arg8, (uint32_t)(30u * rk_s + ((rk_c - 4u) & rk_m)));
   auto x1143 = x80 - x223;
-  
   RkAcc x1144 = rk_link_nf_k(x941, x1143, 4u);
   RkAcc x1145 = rk_link_k(x1144, x945, 5u);
   RkAcc x1146 = rk_link_nf_k(x1145, x947, 6u);
@@ -16295,13 +15736,11 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(size_t cycle, size_t steps, FpExt* pol
   RkAcc x1148 = rk_link_nf_k(x1147, x952, 8u);
   auto x1149 = x84 * x16;
   auto x1150 = x1149 + x82;
-  
   auto x1151 = x223 + x36;
   RkAcc x1152 = rk_link_k(x1148, x957, 9u);
   RkAcc x1153 = rk_link_nf_k(x1152, x959, 10u);
   RkAcc x1154 = rk_link_k(x1153, x961, 11u);
   auto x1156 = x174 - x1151;
-  
   RkAcc x1157 = rk_link_nf_k(x1154, x1156, 13u);
   RkAcc x1158 = rk_link_k(x1157, x966, 14u);
   RkAcc x1159 = rk_link_nf_k(x1158, x968, 15u);
@@ -16309,13 +15748,11 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(size_t cycle, size_t steps, FpExt* pol
   RkAcc x1161 = rk_link_nf_k(x1160, x973, 17u);
   auto x1162 = x52 * x16;
   auto x1163 = x1162 + x75;
-  
   auto x1164 = x223 + x35;
   RkAcc x1165 = rk_link_k(x1161, x978, 18u);
   RkAcc x1166 = rk_link_nf_k(x1165, x980, 19u);
   RkAcc x1167 = rk_link_k(x1166, x982, 20u);
   auto x1169 = x53 - x1164;
-  
   RkAcc x1170 = rk_link_nf_k(x1167, x1169, 22u);
   RkAcc x1171 = rk_link_k(x1170, x987, 23u);
   RkAcc x1172 = rk_link_nf_k(x1171, x989, 24u);
@@ -16323,14 +15760,11 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(size_t cycle, size_t steps, FpExt* pol
   RkAcc x1174 = rk_link_nf_k(x1173, x995, 26u);
   auto x1175 = x178 * x16;
   auto x1176 = x1175 + x177;
-  
   auto x1177 = x223 + x34;
-  
   RkAcc x1178 = rk_link_k(x1174, x1000, 27u);
   RkAcc x1179 = rk_link_nf_k(x1178, x1002, 28u);
   RkAcc x1180 = rk_link_k(x1179, x1004, 29u);
   auto x1182 = x181 - x1177;
-  
   RkAcc x1183 = rk_link_nf_k(x1180, x1182, 31u);
   RkAcc x1184 = rk_link_k(x1183, x1009, 32u);
   RkAcc x1185 = rk_link_nf_k(x1184, x1011, 33u);
@@ -16338,10 +15772,8 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(size_t cycle, size_t steps, FpExt* pol
   RkAcc x1187 = rk_link_nf_k(x1186, x1017, 35u);
   auto x1188 = x183 * x16;
   auto x1189 = x1188 + x191;
-  
   auto x1190 = x223 + x37;
   auto x1191 = x62 - x9;
-  
   RkAcc x1192 = rk_link_k(x1187, x1191, 36u);
   auto x1193 = (EF_LD(arg8, (uint32_t)(109u * rk_s + ((rk_c - 0u) & rk_m))) - Fp(1u));
   RkAcc x1194 = rk_link_nf_k(x1192, x1193, 37u);
@@ -16350,7 +15782,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(size_t cycle, size_t steps, FpExt* pol
   RkAcc x1196 = rk_link_k(x1194, x1195, 38u);
   auto x224 = EF_LD(arg8, (uint32_t)(105u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1198 = x224 - x1190;
-  
   RkAcc x1199 = rk_link_nf_k(x1196, x1198, 40u);
   auto x1200 = (EF_LD(arg8, (uint32_t)(107u * rk_s + ((rk_c - 0u) & rk_m))) - EF_LD(arg8, (uint32_t)(111u * rk_s + ((rk_c - 0u) & rk_m))));
   RkAcc x1201 = rk_link_k(x1199, x1200, 41u);
@@ -16360,7 +15791,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(size_t cycle, size_t steps, FpExt* pol
   auto x225 = EF_LD(arg8, (uint32_t)(106u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1205 = x1204 - x225;
   auto x1206 = x193 - x36;
-  
   RkAcc x1207 = rk_link_k(x1203, x1206, 43u);
   auto x226 = EF_LD(arg8, (uint32_t)(149u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1208 = x226 - x1205;
@@ -16369,12 +15799,9 @@ __device__ EF_NOINLINE FpExt rv32im_v2_13(size_t cycle, size_t steps, FpExt* pol
   auto x1210 = x39 * x16;
   auto x227 = EF_LD(arg8, (uint32_t)(111u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1211 = x1210 + x227;
-  
   constexpr Fp x0(5);
   auto x1212 = x223 + x0;
-  
   auto x1213 = x43 - x9;
-  
   RkAcc x1214 = rk_link_k(x1209, x1213, 45u);
   auto x1215 = (EF_LD(arg8, (uint32_t)(118u * rk_s + ((rk_c - 0u) & rk_m))) - Fp(1u));
   FpExt x1216 = rk_fin(rk_link_k(x1214, x1215, 46u));
@@ -18525,15 +17952,12 @@ __device__ EF_NOINLINE FpExt rv32im_v2_5(size_t cycle, size_t steps, FpExt* poly
   auto x1087 = x143 + x165;
   auto x1088 = x954 * x165;
   auto x1089 = x1087 - x1088;
-  
   auto x1090 = x145 + x167;
   auto x1091 = x958 * x167;
   auto x1092 = x1090 - x1091;
-  
   auto x1093 = x147 + x169;
   auto x1094 = x962 * x169;
   auto x1095 = x1093 - x1094;
-  
   auto x172 = EF_LD(arg10, (uint32_t)(119u * rk_s + ((rk_c - 8u) & rk_m)));
   auto x173 = EF_LD(arg10, (uint32_t)(110u * rk_s + ((rk_c - 8u) & rk_m)));
   auto x1096 = x172 + x173;
@@ -18651,7 +18075,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_5(size_t cycle, size_t steps, FpExt* poly
   auto x202 = EF_LD(arg10, (uint32_t)(108u * rk_s + ((rk_c - 8u) & rk_m)));
   auto x1180 = x202 + x193;
   auto x1181 = ef_lmul(x202, x19);
-  
   auto x1182 = x1181 * x193;
   auto x1183 = x1180 - x1182;
   auto x1184 = x187 + x1099;
@@ -18748,7 +18171,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_5(size_t cycle, size_t steps, FpExt* poly
   auto x1252 = x201 + x203;
   auto x1253 = x1177 * x203;
   auto x1254 = x1252 - x1253;
-  
   auto x1255 = rv32im_v2_4(cycle, steps, poly_mix, arg0, x880.elems[0], x880.elems[1], x880.elems[2], x880.elems[3], x853.elems[0], x853.elems[1], x853.elems[2], x853.elems[3], arg4.elems[0], arg4.elems[1], arg4.elems[2], arg4.elems[3], arg5.elems[0], arg5.elems[1], arg5.elems[2], arg5.elems[3], arg6.elems[0], arg6.elems[1], arg6.elems[2], arg6.elems[3], arg7.elems[0], arg7.elems[1], arg7.elems[2], arg7.elems[3], arg8.elems[0], arg8.elems[1], arg8.elems[2], arg8.elems[3], arg9, arg10, arg11, arg12);
   return x1255;
 }
@@ -20441,7 +19863,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(size_t cycle, size_t steps, FpExt* pol
   RkAcc x506 = rk_link_k(x505, x203, 68u);
   auto x71 = EF_LD(arg15, (uint32_t)(175u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x507 = x71 * x25;
-  
   auto x72 = EF_LD(arg15, (uint32_t)(54u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x508 = x507 + x72;
   auto x509 = x502 - x508;
@@ -20451,7 +19872,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(size_t cycle, size_t steps, FpExt* pol
   RkAcc x513 = rk_link_nf_k(x512, x211, 71u);
   auto x73 = EF_LD(arg15, (uint32_t)(176u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x514 = x73 * x25;
-  
   auto x74 = EF_LD(arg15, (uint32_t)(56u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x515 = x514 + x74;
   auto x516 = x511 - x515;
@@ -20585,7 +20005,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(size_t cycle, size_t steps, FpExt* pol
   auto x857 = x94 * x852;
   RkAcc x858 = rk_link_nf_k(x856, x857, 392u);
   auto x859 = x94 * x93;
-  
   RkAcc x860 = rk_link_k(x858, x859, 393u);
   // lincombF: fused into a lazy Fp linear combination
   auto x862 = x26 - x854;
@@ -20661,9 +20080,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(size_t cycle, size_t steps, FpExt* pol
   RkAcc x890 = rk_link_k(x888, x889, 404u);
   auto x106 = EF_LD(arg15, (uint32_t)(202u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x891 = ef_lsub(x26, x106);
-  
   auto x892 = x106 * x891;
-  
   RkAcc x893 = rk_link_nf_k(x890, x892, 405u);
   auto x894 = x106 * x25;
   auto x107 = EF_LD(arg15, (uint32_t)(201u * rk_s + ((rk_c - 0u) & rk_m)));
@@ -20679,7 +20096,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(size_t cycle, size_t steps, FpExt* pol
   auto x109 = EF_LD(arg15, (uint32_t)(205u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x903 = ef_lsub(x26, x109);
   auto x904 = x109 * x903;
-  
   RkAcc x905 = rk_link_k(x902, x904, 408u);
   auto x906 = x109 * x25;
   auto x110 = EF_LD(arg15, (uint32_t)(204u * rk_s + ((rk_c - 0u) & rk_m)));
@@ -20697,7 +20113,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(size_t cycle, size_t steps, FpExt* pol
   RkAcc x917 = rk_link_nf_k(x915, x916, 2u);
   auto x918 = ef_lsub(x26, x77);
   auto x919 = ef_lmul(x77, x918);
-  
   auto x920 = x21 - x77;
   auto x921 = ef_lmul(x919, x920);
   constexpr Fp x10(3);
@@ -20713,7 +20128,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(size_t cycle, size_t steps, FpExt* pol
   auto x113 = EF_LD(arg15, (uint32_t)(60u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x930 = x26 - x113;
   auto x931 = x113 * x930;
-  
   RkAcc x932 = rk_link_nf_k(x929, x931, 6u);
   auto x114 = EF_LD(arg15, (uint32_t)(61u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x933 = x899 * x114;
@@ -20726,7 +20140,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(size_t cycle, size_t steps, FpExt* pol
   RkAcc x940 = rk_link_nf_k(x939, x113, 10u);
   auto x115 = EF_LD(arg15, (uint32_t)(62u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x941 = x115 - x26;
-  
   RkAcc x942 = rk_link_k(x940, x941, 11u);
   auto x116 = EF_LD(arg15, (uint32_t)(63u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x943 = x116 * x27;
@@ -20739,7 +20152,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(size_t cycle, size_t steps, FpExt* pol
   RkAcc x950 = rk_link_k(x947, x77, 13u);
   auto x117 = EF_LD(arg15, (uint32_t)(65u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x951 = x117 - x12;
-  
   RkAcc x952 = rk_link_nf_k(x950, x951, 14u);
   RkAcc x953 = rk_link_k(x952, x290, 15u);
   auto x118 = EF_LD(arg15, (uint32_t)(70u * rk_s + ((rk_c - 0u) & rk_m)));
@@ -20754,10 +20166,8 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(size_t cycle, size_t steps, FpExt* pol
   RkAcc x960 = rk_link_nf_k(x958, x959, 19u);
   auto x122 = EF_LD(arg15, (uint32_t)(72u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x961 = x36 - x122;
-  
   RkAcc x962 = rk_link_k(x960, x961, 20u);
   auto x963 = x118 - x26;
-  
   auto x964 = x963 - x54;
   RkAcc x965 = rk_link_nf_k(x962, x309, 21u);
   auto x123 = EF_LD(arg15, (uint32_t)(74u * rk_s + ((rk_c - 0u) & rk_m)));
@@ -20767,7 +20177,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(size_t cycle, size_t steps, FpExt* pol
   RkAcc x969 = rk_link_nf_k(x967, x968, 23u);
   auto x970 = ef_lsub(x26, x56);
   auto x971 = ef_lmul(x56, x970);
-  
   auto x972 = x21 - x56;
   auto x973 = ef_lmul(x971, x972);
   auto x974 = x10 - x56;
@@ -20776,7 +20185,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(size_t cycle, size_t steps, FpExt* pol
   auto x124 = EF_LD(arg15, (uint32_t)(43u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x977 = ef_lsub(x26, x124);
   auto x978 = ef_lmul(x124, x977);
-  
   auto x979 = x21 - x124;
   auto x980 = ef_lmul(x978, x979);
   auto x981 = x10 - x124;
@@ -20791,7 +20199,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(size_t cycle, size_t steps, FpExt* pol
   auto x125 = EF_LD(arg15, (uint32_t)(45u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x990 = ef_lsub(x26, x125);
   auto x991 = ef_lmul(x125, x990);
-  
   auto x992 = x21 - x125;
   auto x993 = ef_lmul(x991, x992);
   auto x994 = x10 - x125;
@@ -20799,7 +20206,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(size_t cycle, size_t steps, FpExt* pol
   RkAcc x996 = rk_link_nf_k(x989, x995, 27u);
   auto x997 = ef_lsub(x26, x64);
   auto x998 = ef_lmul(x64, x997);
-  
   auto x999 = x21 - x64;
   auto x1000 = ef_lmul(x998, x999);
   auto x1001 = x10 - x64;
@@ -20809,7 +20215,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(size_t cycle, size_t steps, FpExt* pol
   RkAcc x1005 = rk_link_nf_k(x1003, x1004, 29u);
   auto x1006 = ef_lsub(x26, x67);
   auto x1007 = ef_lmul(x67, x1006);
-  
   auto x1008 = x21 - x67;
   auto x1009 = ef_lmul(x1007, x1008);
   auto x1010 = x10 - x67;
@@ -20818,7 +20223,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(size_t cycle, size_t steps, FpExt* pol
   auto x126 = EF_LD(arg15, (uint32_t)(49u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1013 = ef_lsub(x26, x126);
   auto x1014 = ef_lmul(x126, x1013);
-  
   auto x1015 = x21 - x126;
   auto x1016 = ef_lmul(x1014, x1015);
   auto x1017 = x10 - x126;
@@ -20830,7 +20234,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(size_t cycle, size_t steps, FpExt* pol
   RkAcc x1023 = rk_link_nf_k(x1021, x1022, 33u);
   auto x1024 = ef_lsub(x26, x70);
   auto x1025 = ef_lmul(x70, x1024);
-  
   auto x1026 = x21 - x70;
   auto x1027 = ef_lmul(x1025, x1026);
   auto x1028 = x10 - x70;
@@ -20839,7 +20242,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(size_t cycle, size_t steps, FpExt* pol
   auto x127 = EF_LD(arg15, (uint32_t)(53u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1031 = ef_lsub(x26, x127);
   auto x1032 = ef_lmul(x127, x1031);
-  
   auto x1033 = x21 - x127;
   auto x1034 = ef_lmul(x1032, x1033);
   auto x1035 = x10 - x127;
@@ -20847,7 +20249,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(size_t cycle, size_t steps, FpExt* pol
   RkAcc x1037 = rk_link_nf_k(x1030, x1036, 35u);
   auto x1038 = ef_lsub(x26, x72);
   auto x1039 = ef_lmul(x72, x1038);
-  
   auto x1040 = x21 - x72;
   auto x1041 = ef_lmul(x1039, x1040);
   auto x1042 = x10 - x72;
@@ -20856,7 +20257,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(size_t cycle, size_t steps, FpExt* pol
   auto x128 = EF_LD(arg15, (uint32_t)(55u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1045 = ef_lsub(x26, x128);
   auto x1046 = x128 * x1045;
-  
   RkAcc x1047 = rk_link_nf_k(x1044, x1046, 37u);
   auto x129 = EF_LD(arg15, (uint32_t)(41u * rk_s + ((rk_c - 0u) & rk_m)));
   // lincombF: fused into a lazy Fp linear combination
@@ -20925,7 +20325,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(size_t cycle, size_t steps, FpExt* pol
   RkW1 _wx1097 = rkw1_ff0(x129, x13, false); rkw1_ff(_wx1097, x56, x5, false); rkw1_ff(_wx1097, x124, x27, false); rkw1_v(_wx1097, x63, false); auto x1097 = rkw1_fin(_wx1097);
   auto x1098 = x131 * x27;
   auto x1099 = x1098 + x70;
-  
   constexpr Fp x0(61440);
   // lincombF: fused into a lazy Fp linear combination
   // lincombF: fused into a lazy Fp linear combination
@@ -20933,7 +20332,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(size_t cycle, size_t steps, FpExt* pol
   RK_ST1M(arg0, 7u, x1102);
   auto x1103 = x1102 + x1087;
   auto x1104 = x129 * x24;
-  
   auto x1105 = x864 + x1083;
   RK_ST1M(arg0, 8u, x1105);
   auto x1106 = x1105 - x53;
@@ -20942,7 +20340,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(size_t cycle, size_t steps, FpExt* pol
   RkAcc x1109 = rk_link_k(x1107, x1108, 41u);
   auto x132 = EF_LD(arg15, (uint32_t)(80u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1110 = x132 - x26;
-  
   RkAcc x1111 = rk_link_nf_k(x1109, x1110, 42u);
   auto x133 = EF_LD(arg15, (uint32_t)(81u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1112 = x133 - x911;
@@ -20952,18 +20349,15 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(size_t cycle, size_t steps, FpExt* pol
   auto x1115 = x134 - x53;
   RkAcc x1116 = rk_link_nf_k(x1113, x1115, 45u);
   auto x1117 = x38 - x45;
-  
   RkAcc x1118 = rk_link_k(x1116, x1117, 46u);
   auto x135 = EF_LD(arg15, (uint32_t)(79u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x136 = EF_LD(arg15, (uint32_t)(83u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1119 = x135 - x136;
-  
   RkAcc x1120 = rk_link_nf_k(x1118, x1119, 47u);
   auto x137 = EF_LD(arg15, (uint32_t)(77u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1121 = x171 - x137;
   RK_ST1M(arg0, 10u, x1121);
   auto x1122 = x49 - x26;
-  
   RkAcc x1123 = rk_link_k(x1120, x1122, 48u);
   auto x138 = EF_LD(arg15, (uint32_t)(85u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1124 = x138 - x1121;
@@ -20972,12 +20366,10 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(size_t cycle, size_t steps, FpExt* pol
   auto x1127 = x136 + x1104;
   auto x139 = EF_LD(arg15, (uint32_t)(87u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1128 = x139 - x26;
-  
   RkAcc x1129 = rk_link_k(x1125, x1128, 50u);
   auto x140 = EF_LD(arg15, (uint32_t)(89u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1130 = ef_lsub(x26, x140);
   auto x1131 = x140 * x1130;
-  
   RkAcc x1132 = rk_link_nf_k(x1129, x1131, 51u);
   auto x1133 = x140 * x25;
   auto x141 = EF_LD(arg15, (uint32_t)(88u * rk_s + ((rk_c - 0u) & rk_m)));
@@ -21007,7 +20399,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(size_t cycle, size_t steps, FpExt* pol
   auto x1153 = x1152 - x143;
   auto x146 = EF_LD(arg15, (uint32_t)(95u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1154 = x146 - x26;
-  
   RkAcc x1155 = rk_link_k(x1149, x1154, 58u);
   auto x147 = EF_LD(arg15, (uint32_t)(96u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1156 = x147 - x1153;
@@ -21045,7 +20436,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_16(size_t cycle, size_t steps, FpExt* pol
   FpExt x1182 = rk_fin(rk_link_k(x1180, x1181, 69u));
   auto x154 = EF_LD(arg15, (uint32_t)(101u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1184 = x154 - x1176;
-  
   auto x1185 = rv32im_v2_15(cycle, steps, poly_mix, arg0, x1182.elems[0], x1182.elems[1], x1182.elems[2], x1182.elems[3], arg7.elems[0], arg7.elems[1], arg7.elems[2], arg7.elems[3], arg11.elems[0], arg11.elems[1], arg11.elems[2], arg11.elems[3], x910.elems[0], x910.elems[1], x910.elems[2], x910.elems[3], x1079.elems[0], x1079.elems[1], x1079.elems[2], x1079.elems[3], arg12.elems[0], arg12.elems[1], arg12.elems[2], arg12.elems[3], arg13, arg14.elems[0], arg14.elems[1], arg14.elems[2], arg14.elems[3], arg15, arg16, arg17, arg18);
   return x1185;
 }
@@ -21075,7 +20465,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_12(size_t cycle, size_t steps, FpExt* pol
   constexpr Fp x14(1);
   auto x18 = EF_LD(arg9, (uint32_t)(150u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x223 = x18 - x14;
-  
   RkAcc x224 = rk_link_nf_k(x220, x223, 52u);
   auto x19 = EF_LD(arg9, (uint32_t)(151u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x225 = x19 - x222;
@@ -21086,14 +20475,12 @@ __device__ EF_NOINLINE FpExt rv32im_v2_12(size_t cycle, size_t steps, FpExt* pol
   auto x227 = x20 * x13;
   auto x21 = EF_LD(arg9, (uint32_t)(120u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x228 = x227 + x21;
-  
   constexpr Fp x12(6);
   auto x22 = EF_LD(arg9, (uint32_t)(30u * rk_s + ((rk_c - 4u) & rk_m)));
   auto x229 = x22 + x12;
   constexpr Fp x11(2013265920);
   auto x23 = EF_LD(arg9, (uint32_t)(122u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x230 = x23 - x11;
-  
   RkAcc x231 = rk_link_nf_k(x226, x230, 54u);
   auto x232 = (EF_LD(arg9, (uint32_t)(127u * rk_s + ((rk_c - 0u) & rk_m))) - Fp(1u));
   RkAcc x233 = rk_link_k(x231, x232, 55u);
@@ -21104,42 +20491,33 @@ __device__ EF_NOINLINE FpExt rv32im_v2_12(size_t cycle, size_t steps, FpExt* pol
   RkAcc x236 = rk_link_nf_k(x233, x235, 56u);
   auto x25 = EF_LD(arg9, (uint32_t)(123u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x238 = x25 - x229;
-  
   RkAcc x239 = rk_link_k(x236, x238, 58u);
   auto x26 = EF_LD(arg9, (uint32_t)(125u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x27 = EF_LD(arg9, (uint32_t)(129u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x240 = x26 - x27;
-  
   RkAcc x241 = rk_link_nf_k(x239, x240, 59u);
   auto x28 = EF_LD(arg9, (uint32_t)(126u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x29 = EF_LD(arg9, (uint32_t)(130u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x242 = x28 - x29;
-  
   RkAcc x243 = rk_link_k(x241, x242, 60u);
   auto x244 = x24 - x14;
   auto x30 = EF_LD(arg9, (uint32_t)(124u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x245 = x244 - x30;
   auto x31 = EF_LD(arg9, (uint32_t)(152u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x246 = x31 - x14;
-  
   RkAcc x247 = rk_link_nf_k(x243, x246, 61u);
   auto x32 = EF_LD(arg9, (uint32_t)(153u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x248 = x32 - x245;
-  
   RkAcc x249 = rk_link_k(x247, x248, 62u);
   auto x250 = x29 * x13;
   auto x251 = x250 + x27;
-  
   constexpr Fp x10(7);
   auto x252 = x22 + x10;
-  
   auto x33 = EF_LD(arg9, (uint32_t)(131u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x253 = x33 - x11;
-  
   RkAcc x254 = rk_link_nf_k(x249, x253, 63u);
   auto x34 = EF_LD(arg9, (uint32_t)(136u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x255 = x34 - x14;
-  
   RkAcc x256 = rk_link_k(x254, x255, 64u);
   auto x35 = EF_LD(arg9, (uint32_t)(137u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x257 = x35 - x234;
@@ -21147,24 +20525,20 @@ __device__ EF_NOINLINE FpExt rv32im_v2_12(size_t cycle, size_t steps, FpExt* pol
   RkAcc x258 = rk_link_nf_k(x256, x257, 65u);
   auto x36 = EF_LD(arg9, (uint32_t)(132u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x260 = x36 - x252;
-  
   RkAcc x261 = rk_link_k(x258, x260, 67u);
   auto x37 = EF_LD(arg9, (uint32_t)(134u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x38 = EF_LD(arg9, (uint32_t)(138u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x262 = x37 - x38;
-  
   RkAcc x263 = rk_link_nf_k(x261, x262, 68u);
   auto x39 = EF_LD(arg9, (uint32_t)(135u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x40 = EF_LD(arg9, (uint32_t)(139u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x264 = x39 - x40;
-  
   RkAcc x265 = rk_link_k(x263, x264, 69u);
   auto x266 = (EF_LD(arg9, (uint32_t)(137u * rk_s + ((rk_c - 0u) & rk_m))) - Fp(1u));
   auto x41 = EF_LD(arg9, (uint32_t)(133u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x267 = x266 - x41;
   auto x42 = EF_LD(arg9, (uint32_t)(154u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x268 = x42 - x14;
-  
   RkAcc x269 = rk_link_nf_k(x265, x268, 70u);
   auto x43 = EF_LD(arg9, (uint32_t)(155u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x270 = x43 - x267;
@@ -21173,53 +20547,43 @@ __device__ EF_NOINLINE FpExt rv32im_v2_12(size_t cycle, size_t steps, FpExt* pol
   auto x44 = EF_LD(arg9, (uint32_t)(29u * rk_s + ((rk_c - 4u) & rk_m)));
   auto x45 = EF_LD(arg9, (uint32_t)(29u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x272 = x44 - x45;
-  
   RkAcc x273 = rk_link_nf_k(x271, x272, 72u);
   auto x46 = EF_LD(arg9, (uint32_t)(30u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x274 = x22 - x46;
-  
   RkAcc x275 = rk_link_k(x273, x274, 73u);
   auto x47 = EF_LD(arg9, (uint32_t)(31u * rk_s + ((rk_c - 4u) & rk_m)));
   auto x48 = EF_LD(arg9, (uint32_t)(31u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x276 = x47 - x48;
-  
   RkAcc x277 = rk_link_nf_k(x275, x276, 74u);
   auto x49 = EF_LD(arg9, (uint32_t)(32u * rk_s + ((rk_c - 4u) & rk_m)));
   auto x50 = EF_LD(arg9, (uint32_t)(32u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x278 = x49 - x50;
-  
   RkAcc x279 = rk_link_k(x277, x278, 75u);
   auto x51 = EF_LD(arg9, (uint32_t)(33u * rk_s + ((rk_c - 4u) & rk_m)));
   auto x52 = EF_LD(arg9, (uint32_t)(33u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x280 = x51 - x52;
-  
   RkAcc x281 = rk_link_nf_k(x279, x280, 76u);
   auto x53 = EF_LD(arg9, (uint32_t)(34u * rk_s + ((rk_c - 4u) & rk_m)));
   auto x54 = EF_LD(arg9, (uint32_t)(34u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x282 = x53 - x54;
-  
   RkAcc x283 = rk_link_k(x281, x282, 77u);
   constexpr Fp x9(18);
   auto x55 = EF_LD(arg9, (uint32_t)(35u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x284 = x9 - x55;
-  
   RkAcc x285 = rk_link_nf_k(x283, x284, 78u);
   auto x286 = (Fp(0u) - EF_LD(arg9, (uint32_t)(36u * rk_s + ((rk_c - 0u) & rk_m))));
   RkAcc x287 = rk_link_k(x285, x286, 79u);
   auto x56 = EF_LD(arg9, (uint32_t)(37u * rk_s + ((rk_c - 4u) & rk_m)));
   auto x57 = EF_LD(arg9, (uint32_t)(37u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x288 = x56 - x57;
-  
   RkAcc x289 = rk_link_nf_k(x287, x288, 80u);
   auto x58 = EF_LD(arg9, (uint32_t)(38u * rk_s + ((rk_c - 4u) & rk_m)));
   auto x59 = EF_LD(arg9, (uint32_t)(38u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x290 = x58 - x59;
-  
   RkAcc x291 = rk_link_k(x289, x290, 81u);
   auto x60 = EF_LD(arg9, (uint32_t)(39u * rk_s + ((rk_c - 4u) & rk_m)));
   auto x61 = EF_LD(arg9, (uint32_t)(39u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x292 = x60 - x61;
-  
   RkAcc x293 = rk_link_nf_k(x291, x292, 82u);
   auto x294 = (Fp(0u) - EF_LD(arg9, (uint32_t)(40u * rk_s + ((rk_c - 0u) & rk_m))));
   RkAcc x295 = rk_link_k(x293, x294, 83u);
@@ -21359,9 +20723,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_12(size_t cycle, size_t steps, FpExt* pol
   RkAcc x387 = rk_link_k(x385, x386, 1u);
   auto x102 = EF_LD(arg9, (uint32_t)(201u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x388 = ef_lsub(x14, x102);
-  
   auto x389 = x102 * x388;
-  
   RkAcc x390 = rk_link_nf_k(x387, x389, 2u);
   auto x103 = EF_LD(arg9, (uint32_t)(199u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x104 = EF_LD(arg9, (uint32_t)(200u * rk_s + ((rk_c - 0u) & rk_m)));
@@ -21393,10 +20755,8 @@ __device__ EF_NOINLINE FpExt rv32im_v2_12(size_t cycle, size_t steps, FpExt* pol
   auto x108 = EF_LD(arg9, (uint32_t)(59u * rk_s + ((rk_c - 4u) & rk_m)));
   auto x408 = x107 + x108;
   auto x409 = x106 * x7;
-  
   auto x410 = x409 + x408;
   auto x411 = x108 * x7;
-  
   auto x412 = x411 + x407;
   auto x413 = x408 * x5;
   auto x414 = x413 + x412;
@@ -21411,10 +20771,8 @@ __device__ EF_NOINLINE FpExt rv32im_v2_12(size_t cycle, size_t steps, FpExt* pol
   auto x112 = EF_LD(arg9, (uint32_t)(63u * rk_s + ((rk_c - 4u) & rk_m)));
   auto x420 = x111 + x112;
   auto x421 = x110 * x7;
-  
   auto x422 = x421 + x420;
   auto x423 = x112 * x7;
-  
   auto x424 = x423 + x419;
   auto x425 = x420 * x5;
   auto x426 = x425 + x424;
@@ -21426,9 +20784,7 @@ __device__ EF_NOINLINE FpExt rv32im_v2_12(size_t cycle, size_t steps, FpExt* pol
   RkAcc x432 = rk_link_nf_k(arg4, x431, 0u);
   auto x113 = EF_LD(arg9, (uint32_t)(197u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x433 = ef_lsub(x14, x113);
-  
   auto x434 = x113 * x433;
-  
   RkAcc x435 = rk_link_k(x432, x434, 1u);
   auto x436 = (EF_LD(arg9, (uint32_t)(198u * rk_s + ((rk_c - 0u) & rk_m))) * (Fp(1u) - EF_LD(arg9, (uint32_t)(198u * rk_s + ((rk_c - 0u) & rk_m)))));
   RkAcc x437 = rk_link_nf_k(x435, x436, 2u);
@@ -21952,7 +21308,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_12(size_t cycle, size_t steps, FpExt* pol
   RkAcc x917 = rk_link_k(x916, x282, 193u);
   constexpr Fp x0(24);
   auto x918 = x0 - x55;
-  
   RkAcc x919 = rk_link_nf_k(x917, x918, 194u);
   RkAcc x920 = rk_link_k(x919, x286, 195u);
   auto x921 = x406 - x57;
@@ -22046,7 +21401,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_12(size_t cycle, size_t steps, FpExt* pol
   auto x992 = x991 + x2002635;
   auto x194 = EF_LD(arg9, (uint32_t)(36u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x994 = x14 - x194;
-  
   auto x999 = x978 - x178;
   auto x1001 = x980 - x179;
   auto x1003 = x982 - x180;
@@ -22057,44 +21411,28 @@ __device__ EF_NOINLINE FpExt rv32im_v2_12(size_t cycle, size_t steps, FpExt* pol
   auto x1013 = x992 - x185;
   auto x195 = EF_LD(arg9, (uint32_t)(48u * rk_s + ((rk_c - 4u) & rk_m)));
   auto x1015 = x195 - x186;
-  
   auto x196 = EF_LD(arg9, (uint32_t)(49u * rk_s + ((rk_c - 4u) & rk_m)));
   auto x1017 = x196 - x187;
-  
   auto x197 = EF_LD(arg9, (uint32_t)(50u * rk_s + ((rk_c - 4u) & rk_m)));
   auto x1019 = x197 - x188;
-  
   auto x198 = EF_LD(arg9, (uint32_t)(51u * rk_s + ((rk_c - 4u) & rk_m)));
   auto x1021 = x198 - x189;
-  
   auto x199 = EF_LD(arg9, (uint32_t)(52u * rk_s + ((rk_c - 4u) & rk_m)));
   auto x1023 = x199 - x190;
-  
   auto x200 = EF_LD(arg9, (uint32_t)(53u * rk_s + ((rk_c - 4u) & rk_m)));
   auto x1025 = x200 - x191;
-  
   auto x201 = EF_LD(arg9, (uint32_t)(54u * rk_s + ((rk_c - 4u) & rk_m)));
   auto x1027 = x201 - x192;
-  
   auto x202 = EF_LD(arg9, (uint32_t)(55u * rk_s + ((rk_c - 4u) & rk_m)));
   auto x1029 = x202 - x193;
-  
   auto x1031 = x105 - x62;
-  
   auto x1033 = x106 - x63;
-  
   auto x1035 = x107 - x64;
-  
   auto x1037 = x108 - x65;
-  
   auto x1039 = x109 - x66;
-  
   auto x1041 = x110 - x67;
-  
   auto x1043 = x111 - x68;
-  
   auto x1045 = x112 - x69;
-  
   auto x2000783 = x284 - x918;
   RkAcc x2000782 = rk_link_nf_k(x975, x2000783, 194u);
   auto x2000785 = x994 - x286;
@@ -22155,10 +21493,8 @@ __device__ EF_NOINLINE FpExt rv32im_v2_12(size_t cycle, size_t steps, FpExt* pol
   auto x206 = EF_LD(arg9, (uint32_t)(43u * rk_s + ((rk_c - 4u) & rk_m)));
   auto x1050 = x205 + x206;
   auto x1051 = x204 * x7;
-  
   auto x1052 = x1051 + x1050;
   auto x1053 = x206 * x7;
-  
   auto x1054 = x1053 + x1049;
   auto x1055 = x1050 * x5;
   auto x1056 = x1055 + x1054;
@@ -22173,10 +21509,8 @@ __device__ EF_NOINLINE FpExt rv32im_v2_12(size_t cycle, size_t steps, FpExt* pol
   auto x210 = EF_LD(arg9, (uint32_t)(47u * rk_s + ((rk_c - 4u) & rk_m)));
   auto x1062 = x209 + x210;
   auto x1063 = x208 * x7;
-  
   auto x1064 = x1063 + x1062;
   auto x1065 = x210 * x7;
-  
   auto x1066 = x1065 + x1061;
   auto x1067 = x1062 * x5;
   auto x1068 = x1067 + x1066;
@@ -24499,7 +23833,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_4(size_t cycle, size_t steps, FpExt* poly
   RkAcc x1276 = rk_link_k(x1275, x221, 9u);
   auto x224 = EF_LD(arg9, (uint32_t)(60u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1277 = x224 - x4;
-  
   RkAcc x1278 = rk_link_nf_k(x1276, x1277, 10u);
   auto x1279 = (EF_LD(arg9, (uint32_t)(65u * rk_s + ((rk_c - 0u) & rk_m))) - Fp(1u));
   RkAcc x1280 = rk_link_k(x1278, x1279, 11u);
@@ -24512,12 +23845,10 @@ __device__ EF_NOINLINE FpExt rv32im_v2_4(size_t cycle, size_t steps, FpExt* poly
   auto x226 = EF_LD(arg9, (uint32_t)(63u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x227 = EF_LD(arg9, (uint32_t)(67u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1286 = x226 - x227;
-  
   RkAcc x1287 = rk_link_nf_k(x1285, x1286, 15u);
   auto x228 = EF_LD(arg9, (uint32_t)(64u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x229 = EF_LD(arg9, (uint32_t)(68u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1288 = x228 - x229;
-  
   RkAcc x1289 = rk_link_k(x1287, x1288, 16u);
   auto x230 = EF_LD(arg9, (uint32_t)(66u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1290 = x230 - x11;
@@ -24527,7 +23858,6 @@ __device__ EF_NOINLINE FpExt rv32im_v2_4(size_t cycle, size_t steps, FpExt* poly
   RkAcc x1293 = rk_link_nf_k(x1289, x1292, 17u);
   auto x232 = EF_LD(arg9, (uint32_t)(108u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1294 = x232 - x1291;
-  
   RkAcc x1295 = rk_link_k(x1293, x1294, 18u);
   // lincombF: fused into a lazy Fp linear combination
   constexpr Fp x1(1509949441);
@@ -24537,13 +23867,11 @@ __device__ EF_NOINLINE FpExt rv32im_v2_4(size_t cycle, size_t steps, FpExt* poly
   auto x233 = EF_LD(arg9, (uint32_t)(29u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1300 = x11 - x233;
   auto x1301 = x233 * x1300;
-  
   RkAcc x1302 = rk_link_nf_k(x1295, x1301, 19u);
   RkAcc x1303 = rk_link_k(x1302, x1300, 20u);
   auto x234 = EF_LD(arg9, (uint32_t)(30u * rk_s + ((rk_c - 0u) & rk_m)));
   auto x1304 = ef_lsub(x11, x234);
   auto x1305 = x234 * x1304;
-  
   RkAcc x1306 = rk_link_nf_k(x1303, x1305, 21u);
   auto x1307 = x219 - x234;
   RkAcc x1308 = rk_link_k(x1306, x1307, 22u);
@@ -26373,6 +25701,7 @@ __global__ void ef_prep_n(const FpExt* tab, FpExt* tabn) {
 
 // Phase-split variant: even blocks evaluate the main chain (poly_fp), odd blocks the LogUp chain
 // (rk_accblk) of the same 128 rows; ef_combine adds the two partials and scales by the quotient.
+static_assert(EF_SPLIT_SHIFT == 1, "ef_eval_split has two phases: main (even blocks) and LogUp (odd)");
 __launch_bounds__(EF_THREADS, EF_MINB)
 __global__ void ef_eval_split(Fp* check, Fp* data, Fp* accum, Fp* mix, Fp* out, uint32_t domain, Fp* scratch) {
   FpExt* pm = nullptr;
@@ -26422,7 +25751,7 @@ static EfBufs& efBufs() {
     CUDA_OK(cudaMalloc(&bufs[dev].tab, EF_NPM * sizeof(FpExt)));
     CUDA_OK(cudaMalloc(&bufs[dev].q, 4 * sizeof(uint32_t)));
     CUDA_OK(cudaMalloc(&bufs[dev].tabn, EF_NPM * sizeof(FpExt)));
-    CUDA_OK(cudaFuncSetCacheConfig((const void*)ef_eval_split, cudaFuncCachePreferL1));
+    CUDA_OK(cudaFuncSetAttribute((const void*)ef_eval_split, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
   }
   return bufs[dev];
 }
