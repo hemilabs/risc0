@@ -735,7 +735,8 @@ mod testutil {
     pub(crate) fn hash_fold_tree<H: Hal>(hal_gpu: H) {
         let mut rng = rand::rng();
         let hal_cpu = CpuHal::new(hal_gpu.get_hash_suite().clone());
-        for layers in [1, 2, 7, 12] {
+        // 13 and 14 reach the quad-per-permutation small-level kernels (pv_small.cuh, 2048 < n <= 8192).
+        for layers in [1, 2, 7, 12, 13, 14] {
             let leaves = 1 << layers;
             let digests: Vec<Digest> = (0..leaves * 2)
                 .map(|_| Digest::from(std::array::from_fn(|_| rng.next_u32() / 3)))
@@ -757,7 +758,8 @@ mod testutil {
         let hal = DualHal::new(Rc::new(hal_cpu), Rc::new(hal_gpu));
         // Includes every column count the provers hash (1, 12, 16, 23, 64, 103, 128, 211) and
         // rows past one CUDA block.
-        let rows = [1, 2, 3, 4, 10, 129, 1000];
+        // 2049..8193 cover the warp / quad / thread-per-hash boundaries of pv_small.cuh.
+        let rows = [1, 2, 3, 4, 10, 129, 1000, 2048, 2049, 8192, 8193];
         let cols = [1, 12, 16, 23, 32, 64, 103, 128, 211];
         for row_count in rows {
             for col_count in cols {
