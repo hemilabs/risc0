@@ -391,8 +391,13 @@ supra_poly_divide_multi(fr4_t* combos_base, size_t stride,
 
   try {
 #ifndef __HIPCC__
-    // Fused multi-root division (bit-identical to the loop below; one sync).
-    if (mdiv_supported(stride, num_combos, pows_per_combo) && !std::getenv("RISC0_MDIV_OFF")) {
+    // Fused multi-root division (bit-identical to the loop below; one sync). On unless
+    // RISC0_CUDA_MDIV=0.
+    static const bool s_mdiv = [] {
+      const char* e = std::getenv("RISC0_CUDA_MDIV");
+      return !(e && e[0] == '0');
+    }();
+    if (s_mdiv && mdiv_supported(stride, num_combos, pows_per_combo)) {
       mdiv_run(combos_base, stride, combo_indices, pows_per_combo, all_pows, num_combos, remainders, gpu);
       return RustError{cudaSuccess};
     }

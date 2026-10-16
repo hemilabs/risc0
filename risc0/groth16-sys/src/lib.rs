@@ -76,12 +76,15 @@ pub fn preload(setup_params: &SetupParams) -> anyhow::Result<()> {
     ffi_wrap(|| unsafe { risc0_groth16_cuda_preload(&setup_params) })
 }
 
-/// C2-R2: load the proving key and build the prover on the current device without taking any
+/// Load the proving key and build the prover on the current device without taking any
 /// lock other than the cache's, through pinned staging (safe to run beside a STARK proof).
 /// Returns the witness length when it loaded (or found) the key, `None` when skipped because the
 /// card has less than `min_total_vram` bytes.
 #[cfg(feature = "cuda")]
-pub fn prestart(setup_params: &SetupParams, min_total_vram: usize) -> anyhow::Result<Option<usize>> {
+pub fn prestart(
+    setup_params: &SetupParams,
+    min_total_vram: usize,
+) -> anyhow::Result<Option<usize>> {
     let raw = RawSetupParams {
         pcoeffs_path: setup_params.pcoeffs_path.c_str.as_ptr(),
         fres_path: setup_params.fres_path.c_str.as_ptr(),
@@ -89,11 +92,13 @@ pub fn prestart(setup_params: &SetupParams, min_total_vram: usize) -> anyhow::Re
     };
     let mut len: usize = 0;
     let mut loaded: i32 = 0;
-    ffi_wrap(|| unsafe { risc0_groth16_cuda_prestart(&raw, min_total_vram, &mut len, &mut loaded) })?;
+    ffi_wrap(|| unsafe {
+        risc0_groth16_cuda_prestart(&raw, min_total_vram, &mut len, &mut loaded)
+    })?;
     Ok((loaded != 0).then_some(len))
 }
 
-/// C2-R2: the witness indices that are always 0/1 (the bit set of the split MSMs), used by the
+/// The witness indices that are always 0/1 (the bit set of the split MSMs), used by the
 /// next prover construction. Takes effect only if set before the prover is built.
 #[cfg(feature = "cuda")]
 pub fn set_bit_signals(bits: &[u32]) {

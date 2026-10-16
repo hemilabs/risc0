@@ -1,12 +1,13 @@
-// C2 prototype: band-parallel evaluation of the shrink_wrap witness graph.
+// Parallel evaluation of the shrink_wrap witness graph.
 //
 // The graph (18.1M nodes, depth 87,607) is cut into bands of BAND consecutive ASAP levels.
 // Inside a band, nodes are grouped into connected components, ignoring operands from earlier
 // bands and leaves (inputs/constants), whose values are final before the band starts. Every
-// component is evaluated by one thread in node (topological) order; bands are separated by a
-// barrier. Each node is written exactly once, by the task that owns its component, and only
-// reads operands that are (a) leaves, (b) in an earlier band, or (c) earlier in its own
-// component: no data races, and the values are the same as the serial evaluator's.
+// component is evaluated by one thread in node (topological) order, once every component it
+// reads from is done (dataflow over the component DAG). Each node is written exactly once, by
+// the task that owns its component, and only reads operands that are (a) leaves, (b) in an
+// earlier band, or (c) earlier in its own component: no data races, and the values are the same
+// as the serial evaluator's.
 //
 // Values live in a node-indexed array (18.1M x 32 B = 580 MB), allocated and pre-faulted once
 // at compile time (on the graph preload thread) and reused by every proof.
@@ -20,7 +21,6 @@ use circom_witnesscalc::{
     field::{FieldOperations, U254},
     graph::{Node, Nodes, NodesStorage, VecNodes},
 };
-use rayon::prelude::*;
 
 use super::witness_fast::{
     add_mod, compile_node_ins, from_l, mont_mul, operands, sub_mod, to_l, Ins, NodeIns, L,
@@ -32,17 +32,14 @@ pub(crate) struct ParProgram {
     /// Component node lists, flattened; comp_off[c]..comp_off[c+1].
     comp_nodes: Vec<u32>,
     comp_off: Vec<u32>,
-    /// Per band: component ids (largest first).
-    bands: Vec<Vec<u32>>,
     out_idx: Vec<u32>,
     out_dups: Vec<(u32, u32)>,
-    /// C2-R2 dataflow schedule: component DAG (edges from operand components to users).
+    /// Dataflow schedule: component DAG (edges from operand components to users).
     succ: Vec<u32>,
     succ_off: Vec<u32>,
     indeg: Vec<u32>,
     roots: Vec<u32>,
     cnt: Vec<AtomicU32>,
-    barrier: bool,
     values: Mutex<Vec<L>>,
     pool: rayon::ThreadPool,
 }
@@ -56,15 +53,14 @@ fn find(p: &mut [u32], mut x: u32) -> u32 {
     x
 }
 
+/// ASAP levels per band.
+const BAND: u32 = 32;
+/// Evaluation threads (measured best on a 16-core host; more threads contend for memory).
+const THREADS: usize = 12;
+
 pub(crate) fn compile(nodes: &Nodes<U254, VecNodes>, signals: &[usize]) -> Option<ParProgram> {
-    let band: u32 = std::env::var("RISC0_G16_PAR_BAND")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(32);
-    let nthr: usize = std::env::var("RISC0_G16_PAR_THREADS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(12);
+    let band = BAND;
+    let nthr = THREADS;
     let ni = compile_node_ins(nodes, signals)?;
     let n = nodes.nodes.len();
     let mut level = vec![0u32; n];
@@ -130,14 +126,6 @@ pub(crate) fn compile(nodes: &Nodes<U254, VecNodes>, signals: &[usize]) -> Optio
             fill[c as usize] += 1;
         }
     }
-    let nb = comp_band.iter().max().map(|&b| b as usize + 1).unwrap_or(0);
-    let mut bands: Vec<Vec<u32>> = vec![Vec::new(); nb];
-    for c in 0..nc {
-        bands[comp_band[c] as usize].push(c as u32);
-    }
-    for b in bands.iter_mut() {
-        b.sort_by(|&x, &y| comp_size[y as usize].cmp(&comp_size[x as usize]));
-    }
     // Component DAG: an edge for every operand in another (earlier-band) component.
     let mut edges: Vec<(u32, u32)> = Vec::new();
     for i in 0..n {
@@ -174,7 +162,6 @@ pub(crate) fn compile(nodes: &Nodes<U254, VecNodes>, signals: &[usize]) -> Optio
     let mut roots: Vec<u32> = (0..nc as u32).filter(|&c| indeg[c as usize] == 0).collect();
     roots.sort_by(|&x, &y| comp_size[y as usize].cmp(&comp_size[x as usize]));
     let cnt: Vec<AtomicU32> = indeg.iter().map(|&d| AtomicU32::new(d)).collect();
-    let barrier = std::env::var_os("RISC0_G16_PAR_BARRIER").is_some();
     let mut out_idx = vec![u32::MAX; n];
     let mut out_dups = Vec::new();
     for (w, &s) in signals.iter().enumerate() {
@@ -200,7 +187,6 @@ pub(crate) fn compile(nodes: &Nodes<U254, VecNodes>, signals: &[usize]) -> Optio
         leaves,
         comp_nodes,
         comp_off,
-        bands,
         out_idx,
         out_dups,
         succ,
@@ -208,7 +194,6 @@ pub(crate) fn compile(nodes: &Nodes<U254, VecNodes>, signals: &[usize]) -> Optio
         indeg,
         roots,
         cnt,
-        barrier,
         values: Mutex::new(values),
         pool,
     })
@@ -262,8 +247,14 @@ unsafe fn eval_node(
 /// Evaluate the witness into `out` (one canonical little-endian value per signal).
 pub(crate) fn eval(p: &ParProgram, nodes: &Nodes<U254, VecNodes>, inputs: &[U254], out: &mut [L]) {
     assert_eq!(p.ni.ins.len(), nodes.nodes.len());
-    assert!(p.out_idx.iter().all(|&w| w == u32::MAX || (w as usize) < out.len()));
-    assert!(p.out_dups.iter().all(|&(w, s)| (w as usize) < out.len() && (s as usize) < out.len()));
+    assert!(p
+        .out_idx
+        .iter()
+        .all(|&w| w == u32::MAX || (w as usize) < out.len()));
+    assert!(p
+        .out_dups
+        .iter()
+        .all(|&(w, s)| (w as usize) < out.len() && (s as usize) < out.len()));
     let mut guard = p.values.lock().unwrap();
     let v = SyncPtr(guard.as_mut_ptr());
     let o = SyncPtr(out.as_mut_ptr());
@@ -284,20 +275,19 @@ pub(crate) fn eval(p: &ParProgram, nodes: &Nodes<U254, VecNodes>, inputs: &[U254
             run(i, &v, &o);
         }
     };
-    if p.barrier {
-        p.pool.install(|| {
-            for b in &p.bands {
-                b.par_iter().with_max_len(1).for_each(|&c| run_comp(c));
-            }
-        });
-    } else {
+    {
         // Dataflow: a component runs once all components it reads from are done (the AcqRel
         // decrement that releases it orders their writes before its reads). No barriers, so
         // one descheduled thread delays only its own successors instead of every band.
         for (c, &d) in p.cnt.iter().zip(p.indeg.iter()) {
             c.store(d, Ordering::Relaxed);
         }
-        fn go<'a, F: Fn(u32) + Sync>(mut c: u32, sc: &rayon::Scope<'a>, p: &'a ParProgram, f: &'a F) {
+        fn go<'a, F: Fn(u32) + Sync>(
+            mut c: u32,
+            sc: &rayon::Scope<'a>,
+            p: &'a ParProgram,
+            f: &'a F,
+        ) {
             loop {
                 f(c);
                 let mut next = u32::MAX;

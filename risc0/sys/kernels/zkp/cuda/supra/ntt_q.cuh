@@ -1,4 +1,4 @@
-// Four-step fused commit NTT ("nttq", C2-R2 tuning) for lg_domain_size 16..21, lg_blowup 2 (CUDA only).
+// Four-step fused commit NTT ("nttq") for lg_domain_size 16..21, lg_blowup 2 (CUDA only).
 //   per column: W (evaluations) --colpass--> T1 --rowpass (* n^-1 * g^k)--> C (natural coefficients)
 //               C (rows < Lc/4 of the [Lc][Lr] LDE matrix) --coset colpass--> T2 --rowpass--> E
 // Each pass computes batched line DFTs of length L = 2^LOGL (256..2048) as 16 x 16 x P3 stages in
@@ -343,7 +343,7 @@ static const Tables& tables(const gpu_t& gpu, unsigned lgN, unsigned lgLr, unsig
     return T;
 }
 
-// Per-size schedule (measured on RTX 5090, C2-R2): inverse row line 2^IR (column 2^(lg-IR)),
+// Per-size schedule (measured on RTX 5090): inverse row line 2^IR (column 2^(lg-IR)),
 // forward row line 2^FR (coset column 2^(lg-FR)), TB per pass, side streams, columns per forward
 // launch, columns per inverse chunk.
 struct Cfg { unsigned IR, FR, ITC, ITR, FTC, FTR, NS, CHF, CHI; };
@@ -360,15 +360,10 @@ static Cfg cfg(unsigned lg) {
 
 static bool supported(unsigned lg, unsigned lgB) { return lgB == 2 && lg >= 16 && lg <= 21; }
 
+// The four-step commit NTT and LDE (this file): on unless RISC0_CUDA_NTTQ=0.
 static bool enabled() {
-    static int on = -1;
-    if (on < 0) { const char* e = getenv("RISC0_CUDA_NTTQ"); on = (e && e[0] == '0') ? 0 : 1; }
-    return on == 1;
-}
-static bool enabled_lde() {
-    static int on = -1;
-    if (on < 0) { const char* e = getenv("RISC0_CUDA_NTTQ_LDE"); on = (e && e[0] == '0') ? 0 : 1; }
-    return on == 1 && enabled();
+    static const bool on = [] { const char* e = getenv("RISC0_CUDA_NTTQ"); return !(e && e[0] == '0'); }();
+    return on;
 }
 
 // Scratch T2 of the forward passes: one allocation sized for the largest schedule below, made on

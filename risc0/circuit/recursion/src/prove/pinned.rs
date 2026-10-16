@@ -1,4 +1,4 @@
-// C2-R2: page-locked staging of the recursion witgen inputs, filled on the prepare thread.
+// Page-locked staging of the recursion witgen inputs, filled on the prepare thread.
 //
 // The GPU-thread uploads of the preflight trace (wom, cycles, iops) and the host-chain rows are
 // pageable cudaMemcpys: ~3.5 ms per join after the last segment and ~13 ms per join between
@@ -40,8 +40,12 @@ impl Pinned {
         // Headroom so the next job of a similar size reuses it.
         let cap = (bytes + bytes / 4 + (1 << 20)) & !((1 << 20) - 1);
         let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
-        risc0_sys::ffi_wrap(|| unsafe { risc0_circuit_recursion_cuda_host_alloc(cap, &mut p) }).ok()?;
-        Some(Pinned { ptr: p as usize, cap })
+        risc0_sys::ffi_wrap(|| unsafe { risc0_circuit_recursion_cuda_host_alloc(cap, &mut p) })
+            .ok()?;
+        Some(Pinned {
+            ptr: p as usize,
+            cap,
+        })
     }
 
     fn base(&self) -> *mut u8 {
@@ -56,7 +60,10 @@ impl Drop for Pinned {
         }
         let mut pool = POOL.lock().unwrap();
         if pool.len() < POOL_CAP {
-            pool.push(Pinned { ptr: self.ptr, cap: self.cap });
+            pool.push(Pinned {
+                ptr: self.ptr,
+                cap: self.cap,
+            });
         } else {
             let p = self.ptr as *mut std::ffi::c_void;
             let _ = risc0_sys::ffi_wrap(|| unsafe { risc0_circuit_recursion_cuda_host_free(p) });
@@ -91,14 +98,29 @@ impl PinnedTrace {
         let parts: [&[u8]; 8] = {
             let e: &[u32] = &[];
             let (h, c, r, wi, wr) = match chains {
-                Some(hc) => (&hc.heads[..], &hc.cycles[..], &hc.rows[..], &hc.wom_idx[..], &hc.wom_rows[..]),
+                Some(hc) => (
+                    &hc.heads[..],
+                    &hc.cycles[..],
+                    &hc.rows[..],
+                    &hc.wom_idx[..],
+                    &hc.wom_rows[..],
+                ),
                 None => (e, e, e, e, e),
             };
             unsafe {
                 [
-                    std::slice::from_raw_parts(wom.as_ptr() as *const u8, std::mem::size_of_val(wom)),
-                    std::slice::from_raw_parts(cycles.as_ptr() as *const u8, std::mem::size_of_val(cycles)),
-                    std::slice::from_raw_parts(iops.as_ptr() as *const u8, std::mem::size_of_val(iops)),
+                    std::slice::from_raw_parts(
+                        wom.as_ptr() as *const u8,
+                        std::mem::size_of_val(wom),
+                    ),
+                    std::slice::from_raw_parts(
+                        cycles.as_ptr() as *const u8,
+                        std::mem::size_of_val(cycles),
+                    ),
+                    std::slice::from_raw_parts(
+                        iops.as_ptr() as *const u8,
+                        std::mem::size_of_val(iops),
+                    ),
                     bytemuck::cast_slice(h),
                     bytemuck::cast_slice(c),
                     bytemuck::cast_slice(r),

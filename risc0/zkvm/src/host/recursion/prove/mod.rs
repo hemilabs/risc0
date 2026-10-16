@@ -1048,12 +1048,15 @@ impl Prover {
         Ok(())
     }
 
-    /// C2: start a join whose `b` receipt is not known yet: `prepare()` may run now and blocks
+    /// Start a join whose `b` receipt is not known yet: `prepare()` may run now and blocks
     /// when the program first reads `b`'s words; feed them with [Self::feed_join_b].
     pub fn new_join_streaming(
         a: &SuccinctReceipt<ReceiptClaim>,
         opts: ProverOpts,
-    ) -> Result<(Self, std::sync::Arc<risc0_circuit_recursion::prove::InputStream>)> {
+    ) -> Result<(
+        Self,
+        std::sync::Arc<risc0_circuit_recursion::prove::InputStream>,
+    )> {
         ensure_poseidon2!(a);
         let (program, control_id) = zkr::join(&opts.hashfn)?;
         let mut prover = Prover::new(program, control_id, opts);
@@ -1064,7 +1067,7 @@ impl Prover {
         Ok((prover, stream))
     }
 
-    /// C2: complete the input of [Self::new_join_streaming] with the `b` receipt (the same
+    /// Complete the input of [Self::new_join_streaming] with the `b` receipt (the same
     /// words `new_join` adds). Always closes the stream, also on error.
     pub fn feed_join_b(
         stream: &risc0_circuit_recursion::prove::InputStream,
@@ -1102,7 +1105,7 @@ impl Prover {
         res.map(|_| ())
     }
 
-    /// C2: upload and commit the ctrl of the lift programs for `po2s`, the join program and
+    /// Upload and commit the ctrl of the lift programs for `po2s`, the join program and
     /// (with `p254`) the identity_p254 program on this thread's cached recursion provers.
     pub fn prewarm(po2s: &[usize], opts: &ProverOpts, p254: bool) -> Result<()> {
         for &po2 in po2s {

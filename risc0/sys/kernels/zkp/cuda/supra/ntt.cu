@@ -334,7 +334,7 @@ sppark_batch_bit_reverse(fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly_c
 // Two-pass LDE of bit-reversed coefficients (d_in is restored to bit-reversed order).
 static bool nttq_expand_ntt(const gpu_t& gpu, fr_t* d_out, fr_t* d_in, uint32_t lg,
                             uint32_t lg_blowup, uint32_t poly_count) {
-  if (!nttq::supported(lg, lg_blowup) || !nttq::enabled_lde())
+  if (!nttq::supported(lg, lg_blowup) || !nttq::enabled())
     return false;
   bitrev_batched(gpu, d_in, lg, poly_count);
   nttq::forward(gpu, d_out, d_in, lg, lg_blowup, poly_count);

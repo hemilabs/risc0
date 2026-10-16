@@ -17,7 +17,9 @@ use std::{collections::HashMap, path::Path, sync::OnceLock};
 use anyhow::{Context as _, Result};
 use circom_witnesscalc::deserialize_inputs2;
 use circom_witnesscalc::field::U254;
-use circom_witnesscalc::graph::{evaluate, Node, Nodes, NodesInterface, NodesStorage, Operation, VecNodes};
+use circom_witnesscalc::graph::{
+    evaluate, Node, Nodes, NodesInterface, NodesStorage, Operation, VecNodes,
+};
 use circom_witnesscalc::storage::proto_deserializer::deserialize_witnesscalc_graph_from_bytes;
 use circom_witnesscalc::InputSignalsInfo;
 use risc0_groth16_sys::{ProverParams, SetupParams, WitnessParams};
@@ -81,7 +83,7 @@ struct CachedGraph {
     input_mapping: InputSignalsInfo,
     /// The graph compiled for `witness_fast` (None if it doesn't qualify).
     fast: Option<super::witness_fast::Program>,
-    /// C2: band-parallel evaluator (default; RISC0_G16_PAR_WITNESS=0 disables).
+    /// The parallel evaluator (None if the cold-path switch is off or it doesn't qualify).
     par: Option<super::witness_par::ParProgram>,
 }
 
@@ -92,7 +94,7 @@ unsafe impl Sync for CachedGraph {}
 
 static CACHED_GRAPH: OnceLock<CachedGraph> = OnceLock::new();
 
-/// C2-R2: witness indices whose signal is `x & 1` (a Band node with the constant 1), i.e.
+/// Witness indices whose signal is `x & 1` (a Band node with the constant 1), i.e.
 /// always 0 or 1: the bit set S of the split MSMs. Derived from the graph itself (no index
 /// file); the prover still checks every S scalar at prove time and falls back to the full MSMs
 /// if one is not 0/1, so S only affects speed, never the proof.
@@ -131,19 +133,17 @@ fn get_cached_graph(graph_path: &Path) -> &'static CachedGraph {
         if fast.is_none() {
             tracing::warn!("groth16: the fast witness evaluator does not support this graph");
         }
-        let par = if std::env::var("RISC0_G16_PAR_WITNESS").as_deref() != Ok("0") {
+        let par = if cold_path_enabled() {
             let t = std::time::Instant::now();
             let par = nodes
                 .as_any()
                 .downcast_ref::<Nodes<U254, VecNodes>>()
                 .and_then(|nodes| super::witness_par::compile(nodes, &signals));
-            if std::env::var_os("RISC0_G16_TIMING").is_some() {
-                eprintln!(
-                    "[g16_timing] witness_par compile {:.1}ms ok={}",
-                    t.elapsed().as_secs_f64() * 1e3,
-                    par.is_some()
-                );
-            }
+            tracing::debug!(
+                "groth16: witness_par compile {:.1}ms ok={}",
+                t.elapsed().as_secs_f64() * 1e3,
+                par.is_some()
+            );
             par
         } else {
             None
@@ -178,13 +178,28 @@ pub(crate) fn preload_srs() -> Result<()> {
     Ok(())
 }
 
-/// C2-R2: start loading the proving key on a background thread (pinned staging, own streams),
-/// then pre-allocate the pinned witness buffer, so that neither is on the shrink_wrap path.
-/// Meant to be called when a Groth16 proof is about to be produced (e.g. at prover construction
-/// or at the start of the STARK). Skipped on cards with < RISC0_G16_PRESTART_MIN_GB (28) GB.
+/// The Groth16 cold-path optimizations: background proving-key load during the STARK
+/// (`prestart_key`), early witness-graph parse, compact coefficients, bit-split MSMs, tuned MSM
+/// batching and the parallel witness evaluator. On by default; `RISC0_CUDA_G16_COLD=0` disables
+/// all of them (the same switch is read by the CUDA library).
+pub(crate) fn cold_path_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("RISC0_CUDA_G16_COLD").as_deref() != Ok("0"));
+    *ON
+}
+
+/// Minimum device memory for `prestart_key`: the key sits beside a STARK proof (peak
+/// 27.0-27.5 GB at po2=21 with the key loaded).
+const PRESTART_MIN_VRAM: usize = 30 << 30;
+
+/// Start loading the proving key on a background thread (pinned staging, own streams), then
+/// pre-allocate the pinned witness buffer, so that neither is on the shrink_wrap path. Meant to
+/// be called when a Groth16 proof is about to be produced. The loader waits for
+/// `prestart_key_go` (segment 0's GPU work queued), at most 2 s. Skipped on cards with less than
+/// `PRESTART_MIN_VRAM` or with the cold-path switch off.
 pub(crate) fn prestart_key() {
     static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+    if !cold_path_enabled() || STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return;
     }
     // The bit set S (split MSMs) comes from the parsed graph: make sure a parse is running.
@@ -192,15 +207,8 @@ pub(crate) fn prestart_key() {
         let _ = preload_graph();
     });
     std::thread::spawn(|| {
-        // Let the first STARK segment's cold allocations and uploads go first: wait for
-        // `prestart_key_go` (segment 0 queued), at most 2 s; RISC0_G16_PRESTART_DELAY_MS=N
-        // waits a fixed N ms instead.
-        if let Some(ms) = std::env::var("RISC0_G16_PRESTART_DELAY_MS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
+        // Let the first STARK segment's cold allocations and uploads go first.
         {
-            std::thread::sleep(std::time::Duration::from_millis(ms));
-        } else {
             let (m, cv) = &PRESTART_GO;
             let g = m.lock().unwrap();
             let _ = cv
@@ -216,30 +224,21 @@ pub(crate) fn prestart_key() {
             risc0_groth16_sys::set_bit_signals(bits);
         }
         let t_bits = t.elapsed();
-        let timing = std::env::var_os("RISC0_G16_TIMING").is_some();
-        let min_gb: usize = std::env::var("RISC0_G16_PRESTART_MIN_GB")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(28);
         let r = (|| -> Result<Option<usize>> {
             let root_dir = get_root_dir()?;
             let setup = SetupParams::new(root_dir)?;
-            let len = risc0_groth16_sys::prestart(&setup, min_gb << 30)?;
+            let len = risc0_groth16_sys::prestart(&setup, PRESTART_MIN_VRAM)?;
             if let Some(len) = len {
-                if std::env::var_os("RISC0_G16_NO_PINPRE").is_none() {
-                    drop(risc0_groth16_sys::host_buffer(len * 32)?);
-                }
+                drop(risc0_groth16_sys::host_buffer(len * 32)?);
             }
             Ok(len)
         })();
-        if timing {
-            eprintln!(
-                "[g16_timing] prestart_key done in {:.1}ms (bit set wait {:.1}ms): {:?}",
-                t.elapsed().as_secs_f64() * 1e3,
-                t_bits.as_secs_f64() * 1e3,
-                r.as_ref().map_err(|e| format!("{e:#}"))
-            );
-        }
+        tracing::debug!(
+            "groth16: prestart_key done in {:.1}ms (bit set wait {:.1}ms): {:?}",
+            t.elapsed().as_secs_f64() * 1e3,
+            t_bits.as_secs_f64() * 1e3,
+            r.as_ref().map_err(|e| format!("{e:#}"))
+        );
         if let Err(e) = r {
             tracing::warn!("groth16 key prestart failed (non-fatal): {e:#}");
         }
@@ -259,22 +258,6 @@ pub(crate) fn prestart_key_go() {
     }
 }
 
-/// Start `preload_srs` on its own thread (C2 prototype; `shrink_wrap`'s own preload then
-/// waits for it on the C++ cache mutex).
-pub(crate) fn prestart() {
-    std::thread::spawn(|| {
-        let t = std::time::Instant::now();
-        let r = preload_srs();
-        if std::env::var_os("RISC0_G16_TIMING").is_some() {
-            eprintln!(
-                "[g16_timing] prestart preload done in {:.1}ms ok={}",
-                t.elapsed().as_secs_f64() * 1e3,
-                r.is_ok()
-            );
-        }
-    });
-}
-
 /// Drop the prover and SRS that `preload_srs` and `shrink_wrap` cached on the GPU. See
 /// `prove::release_srs`.
 pub(crate) fn release_srs() -> Result<()> {
@@ -291,10 +274,7 @@ pub(crate) fn shrink_wrap(seal_bytes: &[u8]) -> Result<Seal> {
     let setup_params =
         SetupParams::new(root_dir).context("failed to create groth16 work directories")?;
 
-    let t_all = std::time::Instant::now();
-    let timing = std::env::var_os("RISC0_G16_TIMING").is_some();
     let inputs = to_json(seal_bytes)?;
-    let t_json = t_all.elapsed();
 
     // Start SRS preload on background thread while witness calc runs on CPU.
     // SRS loading (disk I/O + GPU upload) overlaps with witness computation.
@@ -308,16 +288,10 @@ pub(crate) fn shrink_wrap(seal_bytes: &[u8]) -> Result<Seal> {
 
     let witness_params = WitnessParams::new(root_dir);
     let graph = get_cached_graph(&witness_params.graph_path);
-    let t_w0 = std::time::Instant::now();
     let witness = calc_witness(graph, &inputs).context("failed to calculate groth16 witness")?;
-    let t_wit = t_w0.elapsed();
 
     // Wait for SRS preload to complete before taking the GPU lock.
-    let t_j0 = std::time::Instant::now();
     let _ = srs_preload.join();
-    let t_join = t_j0.elapsed();
-    let t_p0 = std::time::Instant::now();
-    let _timing_guard = TimingPrint(timing, t_all, t_json, t_wit, t_join, t_p0);
 
     {
         let _lock = risc0_zkp::hal::cuda::singleton().lock();
@@ -329,35 +303,9 @@ pub(crate) fn shrink_wrap(seal_bytes: &[u8]) -> Result<Seal> {
 
         let contents = std::fs::read_to_string(prover_params.proof_path.as_path())
             .context("failed to read groth16 prove output file")?;
-        if std::env::var_os("RISC0_G16_DUMP").is_some() {
-            eprintln!("[g16_proof] {}", contents.replace('\n', " "));
-        }
         let proof_json: ProofJson = serde_json::from_str(&contents)
             .context("failed to decode groth16 prove output file JSON")?;
         proof_json.try_into()
-    }
-}
-
-struct TimingPrint(
-    bool,
-    std::time::Instant,
-    std::time::Duration,
-    std::time::Duration,
-    std::time::Duration,
-    std::time::Instant,
-);
-impl Drop for TimingPrint {
-    fn drop(&mut self) {
-        if self.0 {
-            eprintln!(
-                "[g16_timing] to_json={:.1}ms witness={:.1}ms srs_join_wait={:.1}ms prove+io={:.1}ms total={:.1}ms",
-                self.2.as_secs_f64() * 1e3,
-                self.3.as_secs_f64() * 1e3,
-                self.4.as_secs_f64() * 1e3,
-                self.5.elapsed().as_secs_f64() * 1e3,
-                self.1.elapsed().as_secs_f64() * 1e3
-            );
-        }
     }
 }
 
@@ -411,14 +359,6 @@ fn calc_witness(graph: &CachedGraph, inputs: &str) -> Result<CalcWitness> {
         let mut buf = risc0_groth16_sys::host_buffer(graph.signals.len() * 32)
             .context("failed to allocate the pinned witness buffer")?;
         super::witness_par::eval(program, nodes, &input_vec, buf.as_limbs_mut());
-        if std::env::var_os("RISC0_G16_PAR_CHECK").is_some() {
-            if let Some(fast) = graph.fast.as_ref() {
-                let mut chk = vec![[0u64; 4]; graph.signals.len()];
-                super::witness_fast::eval(fast, nodes, &input_vec, &mut chk);
-                let bad = chk.iter().zip(buf.as_limbs_mut().iter()).filter(|(a, b)| a != b).count();
-                eprintln!("[g16_par_check] witness_par vs witness_fast mismatches={bad}/{}", chk.len());
-            }
-        }
         return Ok(CalcWitness::Pinned(buf));
     }
     if let Some(program) = graph.fast.as_ref() {

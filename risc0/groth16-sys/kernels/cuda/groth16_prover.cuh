@@ -37,10 +37,16 @@ __global__ __launch_bounds__(512) void witness_into_poly(fr_t* out,
 #ifndef __HIPCC__
 #include "c2_split.cuh"
 #endif
-// C2-R2 defaults on; "0" disables.
-static bool g16_tune() { static bool v = g16_env_on("RISC0_G16_MSM_TUNE"); return v; }
+// Tuned MSM batching (cold path, see g16_cold_enabled; msm_c2 only).
+static bool g16_tune() {
+#ifdef __HIPCC__
+  return false;
+#else
+  return g16_cold_enabled();
+#endif
+}
 // The bit set S of the split MSMs (risc0_groth16_cuda_set_bit_signals, derived from the witness
-// graph by the Rust side); RISC0_G16_BITIDX=<u32 file> overrides it.
+// graph by the Rust side).
 static std::mutex g16_bits_mu;
 static std::vector<uint32_t>& g16_bits() { static std::vector<uint32_t> v; return v; }
 
@@ -141,7 +147,7 @@ __global__ __launch_bounds__(512) void witness_into_poly(fr_t* out,
 #endif
 
 #ifndef __HIPCC__
-// C2-R2: witness_into_poly over the compact coefficients; same summation order, bit-exact.
+// witness_into_poly over the compact coefficients; same summation order, bit-exact.
 __global__ __launch_bounds__(512) void witness_into_poly_compact(fr_t* out, const uint2* cs,
     const fr_t* table, slice_t<uint32_t> indices, const uint32_t* rowc, const fr_t* witness) {
   size_t tid = threadIdx.x + (size_t)blockIdx.x * blockDim.x;
@@ -246,11 +252,12 @@ public:
   gpu_ptr_t<fr_t> d_witness;
 
 #ifndef __HIPCC__
-  // C2 prototype: bit-split MSMs (RISC0_G16_SPLIT=1 + RISC0_G16_BITIDX=<u32 index file>).
-  // C2-R2: the SRS points of a, b_g1, b_g2 (over [0,n)) and c (over [0,c_size)) are permuted
-  // IN PLACE to [non-bit | bit] order (no extra 1.8 GB copies); the corrections -MSM(P_nb, f_nb)
-  // are cached in a small file (RISC0_G16_CORR_CACHE=0 disables), so a cold init costs no MSMs.
-  // The full (fallback / SPLIT_CHECK) path runs on the permuted points with permuted scalars.
+  // Bit-split MSMs (c2_split.cuh), with the bit set from risc0_groth16_cuda_set_bit_signals.
+  // The SRS points of a, b_g1, b_g2 (over [0,n)) and c (over [0,c_size)) are permuted IN PLACE
+  // to [non-bit | bit] order (no extra 1.8 GB copies); the corrections -MSM(P_nb, f_nb) are
+  // cached in a small file (keyed by the permutation, the sizes, sampled SRS bytes and the fuzz),
+  // so a cold init costs no MSMs. The fallback path runs on the permuted points with permuted
+  // scalars.
   bool c2_on = false;
   size_t c2_nb = 0, c2_nn = 0, c2_nb_c = 0, c2_nn_c = 0, c2_off_c = 0;
   gpu_ptr_t<uint32_t> c2_perm, c2_perm_c;   // [nbidx | bidx]
@@ -265,8 +272,6 @@ public:
     return h;
   }
   static std::string c2_cache_path(uint64_t key) {
-    if (const char* e = getenv("RISC0_G16_CORR_CACHE"))
-      if (!strcmp(e, "0")) return "";
     std::string dir;
     if (const char* d = getenv("RISC0_G16_CACHE_DIR")) dir = d;
     else if (const char* x = getenv("XDG_CACHE_HOME")) dir = std::string(x) + "/risc0-groth16";
@@ -311,21 +316,14 @@ public:
   }
 
   void c2_init() {
-    // Default on for cards with >= 28 GB (the split raises the peak from 19.9 to 24.4 GB);
-    // RISC0_G16_SPLIT=0 disables it, =1 forces it.
+    // Cards with >= 28 GB only (the split raises the peak from 19.9 to 24.4 GB).
+    if (!g16_cold_enabled()) return;
     {
-      const char* e = getenv("RISC0_G16_SPLIT");
-      if (e && e[0] == '0') return;
-      if (!(e && e[0] == '1')) {
-        size_t free_b = 0, total_b = 0;
-        if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess || total_b < (size_t(28) << 30)) return;
-      }
+      size_t free_b = 0, total_b = 0;
+      if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess || total_b < (size_t(28) << 30)) return;
     }
-    auto t0 = std::chrono::steady_clock::now();
     std::vector<uint32_t> bidx;
-    if (const char* path = getenv("RISC0_G16_BITIDX")) {
-      bidx = c2_read_u32_file(path);
-    } else {
+    {
       std::lock_guard<std::mutex> lk(g16_bits_mu);
       bidx = g16_bits();
     }
@@ -340,7 +338,7 @@ public:
     std::vector<uint8_t> isb(n, 0);
     for (uint32_t i : bidx) {
       if (i >= n || isb[i] || i <= srs.get_num_public())
-        throw sppark_error{EINVAL, "bad bit index file: "};
+        throw sppark_error{EINVAL, "groth16: bad bit signal index: "};
       isb[i] = 1;
     }
     c2_off_c = n - srs.get_c_size();
@@ -402,14 +400,10 @@ public:
       c2_store_corr(cpath, key);
     }
     c2_on = true;
-    if (g16_timing())
-      fprintf(stderr, "[g16_timing] c2 split init: bits=%zu nonbits=%zu (c: %zu/%zu) corr=%s %.1fms\n",
-              c2_nb, c2_nn, c2_nb_c, c2_nn_c, cached ? "cached" : "computed",
-              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
   }
 
   // true if the split MSMs ran (all S scalars were 0/1); false: the caller runs c2_full_msms
-  bool c2_msms(msm_results& results, std::function<void(const char*)> tick) {
+  bool c2_msms(msm_results& results) {
     const uint32_t* bidx = &c2_perm[c2_nn];
     const uint32_t* bidx_c = &c2_perm_c[c2_nn_c];
     cudaMemsetAsync(&c2_bad[0], 0, sizeof(int), gpu);
@@ -429,19 +423,14 @@ public:
     gpu.DtoH(&bb2, &sp_b2.acc[0], 1);
     gpu.DtoH(&bc, &sp_c.acc[0], 1);
     gpu.sync();
-    tick("c2_bits+gather");
     if (bad != 0) {
       fprintf(stderr, "groth16: %d bit-split scalars are not 0/1; using the full MSMs\n", bad);
       return false;
     }
     msm_ok(msm_g1.invoke(results.a, dev_ptr_t<affine_t>{sp_a.pn}, c2_nn, c2_sn, false), "a");
-    tick("msm_a");
     msm_ok(msm_g1.invoke(results.b_g1, dev_ptr_t<affine_t>{sp_b1.pn}, c2_nn, c2_sn, false), "b_g1");
-    tick("msm_b1");
     msm_ok(msm_g2.invoke(results.b_g2, dev_ptr_t<affine_fp2_t>{sp_b2.pn}, c2_nn, c2_sn, false), "b_g2");
-    tick("msm_b2");
     msm_ok(msm_g1.invoke(results.c, dev_ptr_t<affine_t>{sp_c.pn}, c2_nn_c, c2_sn_c, false), "c");
-    tick("msm_c");
     point_t p;
     p = ba; results.a.add(p); results.a.add(sp_a.corr);
     p = bb1; results.b_g1.add(p); results.b_g1.add(sp_b1.corr);
@@ -452,18 +441,16 @@ public:
   }
 
   // The unsplit MSMs over the permuted points: scalars (w + f) permuted the same way.
-  void c2_full_msms(msm_results& results, std::function<void(const char*)> tick) {
+  void c2_full_msms(msm_results& results) {
     size_t n = witness_size, nc = srs.get_c_size();
     c2_gather_add<<<gpu.sm_count() * 4, 256, 0, gpu>>>(&c2_sn[0], &d_witness[0], &d_fuzz[0], &c2_perm[0], n);
     c2_gather_add<<<gpu.sm_count() * 4, 256, 0, gpu>>>(&c2_sn_c[0], &d_witness[c2_off_c], &d_fuzz[c2_off_c], &c2_perm_c[0], nc);
     CUDA_OK(cudaGetLastError());
     gpu.sync();
-    tick("c2_full_gather");
     msm_ok(msm_g1.invoke(results.a, dev_ptr_t<affine_t>{sp_a.pn}, n, c2_sn, false), "a");
     msm_ok(msm_g1.invoke(results.b_g1, dev_ptr_t<affine_t>{sp_b1.pn}, n, c2_sn, false), "b_g1");
     msm_ok(msm_g2.invoke(results.b_g2, dev_ptr_t<affine_fp2_t>{sp_b2.pn}, n, c2_sn, false), "b_g2");
     msm_ok(msm_g1.invoke(results.c, dev_ptr_t<affine_t>{sp_c.pn}, nc, c2_sn_c, false), "c");
-    tick("c2_full_msms");
     results.a.add(fuzzed_results.a);
     results.b_g1.add(fuzzed_results.b_g1);
     results.b_g2.add(fuzzed_results.b_g2);
@@ -606,19 +593,7 @@ public:
     size_t domain_size = (size_t)1 << lg_domain_size;
 
     msm_results results;
-    auto T0 = std::chrono::steady_clock::now();
-    auto TL = T0;
-    std::function<void(const char*)> tick = [&](const char* what) {
-      if (!g16_timing()) return;
-      gpu.sync(); gpu[0].sync();
-      auto t = std::chrono::steady_clock::now();
-      fprintf(stderr, "[g16_timing]   %s=%.2fms\n", what,
-              std::chrono::duration<double, std::milli>(t - TL).count());
-      TL = t;
-    };
-
     gpu.HtoD(&d_witness[0], &witness[0], witness_size);
-    tick("htod_witness");
 
     std::exception_ptr eptr = nullptr;
     std::thread write_public_file_thread = std::thread([&] {
@@ -679,60 +654,37 @@ public:
           &d_a[0], &d_b[0], &d_c[0], lg_domain_size);
       CUDA_OK(cudaGetLastError());
       gpu.sync();
-      tick("poly+ntt");
       msm_ok(msm_g1.invoke(results.h, srs.get_h(), domain_size, d_poly_a_b_c), "h");
-      tick("msm_h");
 
       bool split_done = false;
 #ifndef __HIPCC__
       if (c2_on)
-        split_done = c2_msms(results, tick);
-#endif
-      msm_results split_results = results;
-      bool split_check = split_done && getenv("RISC0_G16_SPLIT_CHECK") != nullptr;
-#ifndef __HIPCC__
-      if (c2_on && (!split_done || split_check)) {
-        c2_full_msms(results, tick);
+        split_done = c2_msms(results);
+      if (c2_on && !split_done) {
+        c2_full_msms(results);
       } else
 #endif
-      if (!split_done || split_check) {
+      if (!split_done) {
       coeff_wise_add<<<gpu.sm_count(), 1024, 0, gpu>>>(&d_witness[0], &d_fuzz[0], witness_size);
       CUDA_OK(cudaGetLastError());
       gpu.sync();
 
-      tick("fuzz_add");
       msm_ok(msm_g1.invoke(results.a, srs.get_a(), srs.get_a_size(), d_witness, false), "a");
-      tick("msm_a");
       msm_ok(msm_g1.invoke(results.b_g1, srs.get_b_g1(), srs.get_b_g1_size(), d_witness, false),
              "b_g1");
-      tick("msm_b1");
       msm_ok(msm_g2.invoke(results.b_g2, srs.get_b_g2(), srs.get_b_g2_size(), d_witness, false),
              "b_g2");
-      tick("msm_b2");
       msm_ok(msm_g1.invoke(results.c,
                            srs.get_c(),
                            srs.get_c_size(),
                            dev_ptr_t<fr_t>{&d_witness[witness_size - srs.get_c_size()]},
                            false),
              "c");
-      tick("msm_c");
       results.a.add(fuzzed_results.a);
       results.b_g1.add(fuzzed_results.b_g1);
       results.b_g2.add(fuzzed_results.b_g2);
       results.c.add(fuzzed_results.c);
       }
-#ifndef __CUDA_ARCH__
-      if (split_check) {
-        bool ok = (split_results.a == results.a) && (split_results.b_g1 == results.b_g1) &&
-                  (split_results.b_g2 == results.b_g2) && (split_results.c == results.c);
-        fprintf(stderr, "[g16_split_check] split == full: a=%d b_g1=%d b_g2=%d c=%d => %s\n",
-                (int)(split_results.a == results.a), (int)(split_results.b_g1 == results.b_g1),
-                (int)(split_results.b_g2 == results.b_g2), (int)(split_results.c == results.c),
-                ok ? "MATCH" : "MISMATCH");
-      }
-      if (split_done)
-        results = split_results;
-#endif
 
       write_public_file_thread.join();
       if (eptr != nullptr) {
@@ -749,10 +701,6 @@ public:
     s.zero();
     randombytes_buf((void*)&r, sizeof(fr_t) - 1);
     randombytes_buf((void*)&s, sizeof(fr_t) - 1);
-    if (g16_fixed_rs()) {  // test hook: deterministic proof for A/B comparison
-      uint8_t* rb = (uint8_t*)&r; uint8_t* sb = (uint8_t*)&s;
-      for (size_t i = 0; i < sizeof(fr_t) - 1; i++) { rb[i] = (uint8_t)(i * 7 + 1); sb[i] = (uint8_t)(i * 13 + 5); }
-    }
 
     point_t p1;
     point_fp2_t p2;
@@ -785,9 +733,6 @@ public:
     p1.cneg(true);
     results.c.add(p1);
 
-    if (g16_timing())
-      fprintf(stderr, "[g16_timing]   prove_total=%.2fms\n",
-              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - T0).count());
     return groth16_proof{results.a, results.c, results.b_g2};
   }
 

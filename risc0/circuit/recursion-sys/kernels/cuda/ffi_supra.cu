@@ -21,12 +21,13 @@ extern __constant__ FpExt poly_mix[158];
 namespace risc0::circuit::recursion::cuda {
 
 #ifndef __HIPCC__
-// eval_check_split.cu (C2 prototype): the same polynomial in several smaller kernels.
+// eval_check_split.cu: the same polynomial in several smaller kernels (RISC0_CUDA_REC_KERNELS=0
+// restores the single kernel; the same switch controls the inlined accum kernels in ffi.cu).
 void eval_check_split(cudaStream_t stream, Fp* check, const Fp* ctrl, const Fp* data, const Fp* accum,
                       const Fp* mix, const Fp* out, Fp rou, uint32_t po2, uint32_t domain,
                       const void* poly_mix_host);
 static bool use_split() {
-  static const bool on = [] { const char* e = getenv("RISC0_C2_REC_EC_SPLIT"); return !(e && e[0] == '0'); }();
+  static const bool on = [] { const char* e = getenv("RISC0_CUDA_REC_KERNELS"); return !(e && e[0] == '0'); }();
   return on;
 }
 #endif

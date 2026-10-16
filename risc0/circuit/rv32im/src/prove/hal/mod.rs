@@ -462,10 +462,7 @@ where
         let t_accum = ta.elapsed();
 
         let tac = std::time::Instant::now();
-        prover.commit_group(
-            REGISTER_GROUP_ACCUM,
-            &witgen.accum.as_ref().unwrap().buf,
-        );
+        prover.commit_group(REGISTER_GROUP_ACCUM, &witgen.accum.as_ref().unwrap().buf);
         let t_accum_commit = tac.elapsed();
 
         let global_clone = hal.alloc_elem("global_clone", witgen.global.buf.size());

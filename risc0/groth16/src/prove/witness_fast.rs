@@ -157,7 +157,10 @@ pub(crate) struct NodeIns {
     pub(crate) r2: L,
 }
 
-pub(crate) fn compile_node_ins(nodes: &Nodes<U254, VecNodes>, signals: &[usize]) -> Option<NodeIns> {
+pub(crate) fn compile_node_ins(
+    nodes: &Nodes<U254, VecNodes>,
+    signals: &[usize],
+) -> Option<NodeIns> {
     let p = from_l(&P);
     let n = nodes.nodes.len();
     if n >= u32::MAX as usize || signals.len() >= u32::MAX as usize {
@@ -231,7 +234,12 @@ pub(crate) fn compile_node_ins(nodes: &Nodes<U254, VecNodes>, signals: &[usize])
         ins.push(x);
     }
 
-    Some(NodeIns { ins, kmul, kraw, r2: to_l(&r2) })
+    Some(NodeIns {
+        ins,
+        kmul,
+        kraw,
+        r2: to_l(&r2),
+    })
 }
 
 pub(crate) struct Program {

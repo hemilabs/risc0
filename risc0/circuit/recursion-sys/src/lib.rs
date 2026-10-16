@@ -185,5 +185,7 @@ extern "C" {
         out: *mut *mut std::ffi::c_void,
     ) -> *const std::os::raw::c_char;
 
-    pub fn risc0_circuit_recursion_cuda_host_free(p: *mut std::ffi::c_void) -> *const std::os::raw::c_char;
+    pub fn risc0_circuit_recursion_cuda_host_free(
+        p: *mut std::ffi::c_void,
+    ) -> *const std::os::raw::c_char;
 }

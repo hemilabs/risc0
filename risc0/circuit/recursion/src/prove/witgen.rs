@@ -147,7 +147,7 @@ pub(crate) struct HostChains {
     pub rows: Vec<u32>,
     pub wom_idx: Vec<u32>,
     pub wom_rows: Vec<u32>,
-    /// C2-R2: addresses of page-locked copies of the five arrays above (same contents).
+    /// Addresses of page-locked copies of the five arrays above (same contents).
     pub pinned: Option<[usize; 5]>,
 }
 
@@ -188,7 +188,7 @@ fn try_host_chains(zkr: &Program, preflight: &Preflight) -> Result<Option<HostCh
     Ok(try_host_chains_range(zkr, &t.wom, &t.cycles, &t.iops, 0, true)?.0)
 }
 
-/// C2-R2: the chains of `cycles[lo..]` (`lo` a chain start). With `complete == false` the trace
+/// The chains of `cycles[lo..]` (`lo` a chain start). With `complete == false` the trace
 /// is a prefix of a running preflight: the last, possibly unfinished, chain is left out, and the
 /// returned boundary is where a later pass over the full trace must start.
 pub(crate) fn try_host_chains_range(
@@ -207,7 +207,11 @@ pub(crate) fn try_host_chains_range(
     let mut start = lo;
     let mut num_rows = 0usize;
     for c in lo + 1..=n {
-        let closed = if c == n { complete } else { cycles[c].is_par_safe != 0 };
+        let closed = if c == n {
+            complete
+        } else {
+            cycles[c].is_par_safe != 0
+        };
         if closed {
             let len = c - start;
             if len >= min_len {
@@ -260,8 +264,11 @@ pub(crate) fn try_host_chains_range(
     Ok((Some(out), boundary))
 }
 
-/// C2-R2: concatenate the chains of two disjoint passes.
-pub(crate) fn merge_host_chains(a: Option<HostChains>, b: Option<HostChains>) -> Option<HostChains> {
+/// Concatenate the chains of two disjoint passes.
+pub(crate) fn merge_host_chains(
+    a: Option<HostChains>,
+    b: Option<HostChains>,
+) -> Option<HostChains> {
     match (a, b) {
         (None, x) | (x, None) => x,
         (Some(mut a), Some(b)) => {

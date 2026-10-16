@@ -20,10 +20,7 @@ use risc0_core::field::baby_bear::{BabyBearElem as Fp, BabyBearExtElem as FpExt}
 use risc0_zkp::{
     core::{
         digest::{DIGEST_SHORTS, DIGEST_WORDS, WORD_SIZE},
-        hash::{
-            poseidon2::CELLS,
-            sha::SHA256_INIT,
-        },
+        hash::{poseidon2::CELLS, sha::SHA256_INIT},
     },
     field::{Elem as _, ExtElem},
     layout,
@@ -61,10 +58,7 @@ pub(crate) struct PreflightTrace {
     pub iops: Vec<FpExt>,
 }
 
-static PF_PROF: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| std::env::var_os("RISC0_C2_PF_PROF").is_some());
-
-/// C2: input words that arrive while the preflight runs (streaming join preflight). The
+/// Input words that arrive while the preflight runs (streaming join preflight). The
 /// preflight blocks when it needs more words than it holds until `push` or `close`.
 #[derive(Default)]
 pub struct InputStream {
@@ -103,7 +97,6 @@ pub struct Preflight {
     pub stream_wait_ns: u64,
     /// Words consumed from the input so far.
     pub consumed: usize,
-    prof: [(u64, u64); 7],
 
     poseidon2_state: [Fp; CELLS],
     sha_state: [u32; DIGEST_WORDS],
@@ -134,7 +127,7 @@ pub struct Preflight {
     /// `witgen::host_chains`), so the GPU witgen does not run them one thread at a time.
     pub(crate) host_chains: std::sync::Mutex<Option<super::witgen::HostChains>>,
 
-    /// C2-R2: page-locked copy of the trace and host chains (RISC0_C2_REC_PIN).
+    /// Page-locked copy of the trace and host chains (see `host_prep_enabled`).
     #[cfg(feature = "cuda")]
     pub(crate) pinned: std::sync::Mutex<Option<super::pinned::PinnedTrace>>,
 }
@@ -147,7 +140,6 @@ impl Preflight {
             stream: None,
             stream_wait_ns: 0,
             consumed: 0,
-            prof: [(0, 0); 7],
 
             poseidon2_state: [Fp::ZERO; CELLS],
             sha_state: [0; 8],
@@ -262,51 +254,6 @@ impl Preflight {
     }
 
     pub fn step(&mut self, cycle: usize, code: &[Fp]) -> Result<()> {
-        if *PF_PROF {
-            #[cfg(target_arch = "x86_64")]
-            {
-                let t = unsafe { core::arch::x86_64::_rdtsc() };
-                let cat = self.category(code);
-                let r = self.step_inner(cycle, code);
-                let d = unsafe { core::arch::x86_64::_rdtsc() } - t;
-                self.prof[cat].0 += 1;
-                self.prof[cat].1 += d;
-                return r;
-            }
-        }
-        self.step_inner(cycle, code)
-    }
-
-    fn category(&self, code: &[Fp]) -> usize {
-        let sel = &CODE_LAYOUT.code.select;
-        if self.get(code, sel.macro_ops) == Fp::ONE {
-            0
-        } else if self.get(code, sel.micro_ops) == Fp::ONE {
-            1
-        } else if self.get(code, sel.checked_bytes) == Fp::ONE {
-            2
-        } else if self.get(code, sel.poseidon2_load) == Fp::ONE {
-            3
-        } else if self.get(code, sel.poseidon2_full) == Fp::ONE {
-            4
-        } else if self.get(code, sel.poseidon2_partial) == Fp::ONE {
-            5
-        } else {
-            6
-        }
-    }
-
-    pub fn prof_report(&self) -> String {
-        const N: [&str; 7] = ["macro", "micro", "checked_bytes", "p2_load", "p2_full", "p2_partial", "p2_store"];
-        let mut out = String::new();
-        for (i, (n, c)) in self.prof.iter().enumerate() {
-            // rdtsc ticks at ~ the base clock; report raw Mticks and ns/row at 4.3 GHz
-            out += &format!(" {}={}r/{:.2}Mt", N[i], n, *c as f64 / 1e6);
-        }
-        out
-    }
-
-    fn step_inner(&mut self, cycle: usize, code: &[Fp]) -> Result<()> {
         tracing::trace!("top[{cycle}]: {code:?}");
         let is_par_safe = if self.get(code, CODE_LAYOUT.code.select.macro_ops) == Fp::ONE {
             self.macro_op(cycle, code)?

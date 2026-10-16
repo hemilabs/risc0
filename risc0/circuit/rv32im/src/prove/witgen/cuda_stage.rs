@@ -29,17 +29,23 @@ use std::sync::{
 use rayon::prelude::*;
 use risc0_circuit_rv32im_sys::{
     risc0_circuit_rv32im_cuda_event_wait, risc0_circuit_rv32im_cuda_host_alloc,
-    risc0_circuit_rv32im_cuda_host_free, risc0_circuit_rv32im_cuda_prefetch,
-    RawMemoryTransaction, RawPreflightCycle,
+    risc0_circuit_rv32im_cuda_host_free, risc0_circuit_rv32im_cuda_prefetch, RawMemoryTransaction,
+    RawPreflightCycle,
 };
 use risc0_sys::ffi_wrap;
 
 use super::preflight::{Back, PreflightTrace};
 use crate::zirgen::circuit::ExtVal;
 
-/// Staging on unless RISC0_C2_NOSTAGE is set (A/B switch).
-pub(crate) static STAGE: LazyLock<bool> =
-    LazyLock::new(|| std::env::var_os("RISC0_C2_NOSTAGE").is_none());
+/// The rv32im witgen staging feature: pinned staging of the preflight trace on the preflight
+/// thread, its prefetch to the device during the previous segment's finalize, the per-cycle
+/// columns written on the device, and the recycling of trace vectors. On unless
+/// `RISC0_CUDA_WITGEN_STAGE=0`.
+pub(crate) fn enabled() -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var("RISC0_CUDA_WITGEN_STAGE").as_deref() != Ok("0"));
+    *ON
+}
 
 /// Free pinned slots: (address, capacity).
 static POOL: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
@@ -56,10 +62,6 @@ pub(crate) struct StagedTrace {
     copy_ev: Mutex<usize>,
 }
 
-/// Prefetch on unless RISC0_C2_NOPREFETCH is set (A/B switch).
-static PREFETCH: LazyLock<bool> =
-    LazyLock::new(|| std::env::var_os("RISC0_C2_NOPREFETCH").is_none());
-
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Staged traces not yet prefetched (pushed by the preflight thread).
@@ -69,7 +71,7 @@ static READY: Mutex<Vec<Weak<StagedTrace>>> = Mutex::new(Vec::new());
 /// GPU work in flight. Call on the proving thread (GPU lock held), between segments' GPU work:
 /// the CUDA HAL calls it once eval_check is done, while the finalize kernels run.
 pub(crate) fn prefetch_ready() {
-    if !*PREFETCH {
+    if !enabled() {
         return;
     }
     let ready: Vec<Weak<StagedTrace>> = std::mem::take(&mut *READY.lock().unwrap());
@@ -86,7 +88,8 @@ pub(crate) fn prefetch_ready() {
             if !ev.is_null() {
                 let old = std::mem::replace(&mut *staged.copy_ev.lock().unwrap(), ev as usize);
                 if old != 0 {
-                    let _ = ffi_wrap(|| unsafe { risc0_circuit_rv32im_cuda_event_wait(old as *mut _) });
+                    let _ =
+                        ffi_wrap(|| unsafe { risc0_circuit_rv32im_cuda_event_wait(old as *mut _) });
                 }
             }
             // `staged` (the Arc) may be the last reference: its Drop waits for the copy.
@@ -111,7 +114,9 @@ impl Drop for StagedTrace {
         // error path): wait for it before another trace can be staged into the slot.
         let ev = *self.copy_ev.get_mut().unwrap_or_else(|e| e.into_inner());
         if ev != 0 {
-            if let Err(err) = ffi_wrap(|| unsafe { risc0_circuit_rv32im_cuda_event_wait(ev as *mut _) }) {
+            if let Err(err) =
+                ffi_wrap(|| unsafe { risc0_circuit_rv32im_cuda_event_wait(ev as *mut _) })
+            {
                 // Don't recycle a slot that may still be read by the device.
                 tracing::warn!("cuda_stage: prefetch event wait failed: {err}; leaking slot");
                 return;
@@ -166,13 +171,15 @@ fn take_slot(len: usize) -> Option<(*mut u8, usize)> {
 fn par_copy(dst: *mut u8, src: &[u8]) {
     const CHUNK: usize = 4 << 20;
     let dst = dst as usize;
-    src.par_chunks(CHUNK).enumerate().for_each(|(i, chunk)| unsafe {
-        std::ptr::copy_nonoverlapping(
-            chunk.as_ptr(),
-            (dst as *mut u8).add(i * CHUNK),
-            chunk.len(),
-        );
-    });
+    src.par_chunks(CHUNK)
+        .enumerate()
+        .for_each(|(i, chunk)| unsafe {
+            std::ptr::copy_nonoverlapping(
+                chunk.as_ptr(),
+                (dst as *mut u8).add(i * CHUNK),
+                chunk.len(),
+            );
+        });
 }
 
 fn as_bytes<T>(v: &[T]) -> &[u8] {
@@ -183,7 +190,7 @@ fn as_bytes<T>(v: &[T]) -> &[u8] {
 /// Copy `trace`'s device inputs into a pinned slot (None: staging off or no pinned memory, the
 /// witgen FFI then stages on the proving thread as before).
 pub(crate) fn stage(trace: &PreflightTrace) -> Option<Arc<StagedTrace>> {
-    if !*STAGE {
+    if !enabled() {
         return None;
     }
     let lens = byte_lens(trace);
@@ -201,24 +208,24 @@ pub(crate) fn stage(trace: &PreflightTrace) -> Option<Arc<StagedTrace>> {
         id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
         copy_ev: Mutex::new(0),
     });
-    if *PREFETCH {
-        READY.lock().unwrap().push(Arc::downgrade(&staged));
-    }
+    READY.lock().unwrap().push(Arc::downgrade(&staged));
     Some(staged)
 }
 
-/// Reuse the trace vectors of finished segments (RISC0_C2_RECYCLE=0 disables): a fresh ~300 MB
-/// of vectors per po2=20 segment costs the preflight thread page faults and zeroing, and the
-/// txns vector its doubling reallocations.
-static RECYCLE: LazyLock<bool> = LazyLock::new(|| {
-    std::env::var("RISC0_C2_RECYCLE").map_or(true, |v| v != "0")
-});
+// Reuse the trace vectors of finished segments: a fresh ~300 MB of vectors per po2=20 segment
+// costs the preflight thread page faults and zeroing, and the txns vector its doubling
+// reallocations.
 
-type TraceVecs = (Vec<RawPreflightCycle>, Vec<RawMemoryTransaction>, Vec<u8>, Vec<Back>);
+type TraceVecs = (
+    Vec<RawPreflightCycle>,
+    Vec<RawMemoryTransaction>,
+    Vec<u8>,
+    Vec<Back>,
+);
 static TRACE_POOL: Mutex<Vec<TraceVecs>> = Mutex::new(Vec::new());
 
 pub(crate) fn recycled_trace(total_cycles: usize, rand_z: ExtVal) -> PreflightTrace {
-    let vecs = if *RECYCLE {
+    let vecs = if enabled() {
         TRACE_POOL.lock().unwrap().pop()
     } else {
         None
@@ -246,7 +253,7 @@ pub(crate) fn recycled_trace(total_cycles: usize, rand_z: ExtVal) -> PreflightTr
 }
 
 pub(crate) fn recycle_trace(trace: &mut PreflightTrace) {
-    if !*RECYCLE || trace.cycles.capacity() == 0 {
+    if !enabled() || trace.cycles.capacity() == 0 {
         return;
     }
     let mut vecs = (

@@ -18,7 +18,8 @@ fn main() {
     // RISC0_EARLY_PROVER=1: construct the prover (which starts the CUDA warmup) before executing
     // the guest, the order LocalProver::prove and prove_e2e use, so CUDA init overlaps execution.
     let opts = ProverOpts::composite().with_hashfn("poseidon2".to_string());
-    let early_prover = std::env::var_os("RISC0_EARLY_PROVER").map(|_| get_prover_server(&opts).unwrap());
+    let early_prover =
+        std::env::var_os("RISC0_EARLY_PROVER").map(|_| get_prover_server(&opts).unwrap());
 
     eprintln!("Executing guest (SimpleLoop {iters} iters, segment_limit_po2={po2})...");
     let env = ExecutorEnv::builder()

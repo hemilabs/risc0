@@ -36,7 +36,7 @@ private:
   slice_t<uint32_t> d_ind_idx_a, d_ind_idx_b;
 
 public:
-  // C2-R2 compact form (RISC0_G16_COMPACT=1): per coefficient (s, value index) into a table of
+  // Compact form (cold path, see g16_cold_enabled): per coefficient (s, value index) into a table of
   // the 16,413 distinct values, plus each row's output index c. 278 MB instead of 1.44 GB;
   // derived once from the preprocessed file and cached (keyed by sampled file bytes).
   bool compact = false;
@@ -267,7 +267,7 @@ public:
     stream_t ld{gpu.id()};
     try {
 #ifndef __HIPCC__
-      if (g16_env_on("RISC0_G16_COMPACT") && c2_compact_load(ld, _ptr, file_size)) {
+      if (g16_cold_enabled() && c2_compact_load(ld, _ptr, file_size)) {
         munmap(const_cast<byte*>(_ptr), file_size);
         return;
       }
@@ -388,11 +388,10 @@ public:
     snprintf(name, sizeof name, "/coeffs_compact_%016llx.bin", (unsigned long long)key);
     return dir + name;
   }
-  void c2_up(stream_t& ld, void* dst, const void* src, size_t bytes,
-             const char* path = nullptr, size_t off = 0) {
+  void c2_up(stream_t& ld, void* dst, const void* src, size_t bytes) {
     if (g16_staged()) {
       ld.sync();
-      c2_stager::get().upload(dst, src, bytes, path, off);
+      c2_stager::get().upload(dst, src, bytes);
     } else {
       CUDA_OK(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, ld));
       ld.sync();
@@ -477,12 +476,10 @@ public:
     d_table = gpu_ptr_t<fr_t>((fr_t*)ld.Dmalloc(ch->ntab * sizeof(fr_t)));
     d_rowc = gpu_ptr_t<uint32_t>((uint32_t*)ld.Dmalloc((ua + ub) * 4));
     d_independent_indices = gpu_ptr_t<uint32_t>((uint32_t*)ld.Dmalloc((ua + ub) * 4));
-    const char* fpath = cp ? path.c_str() : nullptr;  // O_DIRECT source when loaded from the cache
-    auto off = [&]() { return (size_t)(p - base); };
-    c2_up(ld, &d_cs[0], p, n * 8, fpath, off()); p += n * 8;
-    c2_up(ld, &d_table[0], p, ch->ntab * sizeof(fr_t), fpath, off()); p += ch->ntab * sizeof(fr_t);
-    c2_up(ld, &d_rowc[0], p, (ua + ub) * 4, fpath, off()); p += (ua + ub) * 4;
-    c2_up(ld, &d_independent_indices[0], p, (ua + ub) * 4, fpath, off());
+    c2_up(ld, &d_cs[0], p, n * 8); p += n * 8;
+    c2_up(ld, &d_table[0], p, ch->ntab * sizeof(fr_t)); p += ch->ntab * sizeof(fr_t);
+    c2_up(ld, &d_rowc[0], p, (ua + ub) * 4); p += (ua + ub) * 4;
+    c2_up(ld, &d_independent_indices[0], p, (ua + ub) * 4);
     ld.sync();
     if (cp) munmap(const_cast<byte*>(cp), csz);
     d_ind_idx_a = slice_t<uint32_t>(&d_independent_indices[0], ua);

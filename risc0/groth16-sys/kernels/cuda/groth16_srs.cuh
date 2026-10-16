@@ -196,9 +196,9 @@ private:
   void operator=(SRS const&) = delete;
 
 public:
-  // C2: set once a prover has permuted a/b_g1/b_g2/c in place for the bit-split MSMs.
+  // Set once a prover has permuted a/b_g1/b_g2/c in place for the bit-split MSMs.
   mutable bool c2_permuted = false;
-  // C2: FNV-1a of sampled bytes of the point sections (keys the split-correction cache).
+  // FNV-1a of sampled bytes of the point sections (keys the split-correction cache).
   uint64_t c2_salt = 0;
 
   SRS(size_t gpu_id, const char* srs_path) : gpu(select_gpu(gpu_id)), srs_path(srs_path) {
@@ -367,11 +367,11 @@ public:
       if (g16_staged()) {
         ld.sync();  // the allocations
         c2_stager& sg = c2_stager::get();
-        sg.upload(&h[0], srs_ptr + data.h.off, h_size * sizeof(affine_t), this->srs_path.c_str(), data.h.off);
-        sg.upload(&a[0], srs_ptr + data.a.off, a_size * sizeof(affine_t), this->srs_path.c_str(), data.a.off);
-        sg.upload(&b_g1[0], srs_ptr + data.b_g1.off, b_g1_size * sizeof(affine_t), this->srs_path.c_str(), data.b_g1.off);
-        sg.upload(&b_g2[0], srs_ptr + data.b_g2.off, b_g2_size * sizeof(affine_fp2_t), this->srs_path.c_str(), data.b_g2.off);
-        sg.upload(&c[0], srs_ptr + data.c.off, c_size * sizeof(affine_t), this->srs_path.c_str(), data.c.off);
+        sg.upload(&h[0], srs_ptr + data.h.off, h_size * sizeof(affine_t));
+        sg.upload(&a[0], srs_ptr + data.a.off, a_size * sizeof(affine_t));
+        sg.upload(&b_g1[0], srs_ptr + data.b_g1.off, b_g1_size * sizeof(affine_t));
+        sg.upload(&b_g2[0], srs_ptr + data.b_g2.off, b_g2_size * sizeof(affine_fp2_t));
+        sg.upload(&c[0], srs_ptr + data.c.off, c_size * sizeof(affine_t));
       } else {
       ld.HtoD(&a[0], srs_ptr + data.a.off, a_size);
       ld.HtoD(&b_g1[0], srs_ptr + data.b_g1.off, b_g1_size);

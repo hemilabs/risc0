@@ -1,5 +1,5 @@
 #pragma once
-// C2 prototype (CUDA only): Groth16 bit-split MSMs.
+// Groth16 bit-split MSMs (CUDA only).
 // MSM(P, w) = MSM(P_nb, w_nb + f_nb) - MSM(P_nb, f_nb) + sum_{i in S, w_i = 1} P_i
 // S: witness indices that are 0/1 by construction (circom Band(x, 1) outputs). The first term
 // keeps the fuzz (random scalars avoid bucket pile-ups in sppark's accumulate: the unfuzzed
@@ -120,15 +120,4 @@ struct c2_split_t {
     CUDA_OK(cudaGetLastError());
   }
 };
-
-static std::vector<uint32_t> c2_read_u32_file(const char* path) {
-  std::ifstream f(path, std::ios::binary | std::ios::ate);
-  if (!f.is_open())
-    throw sppark_error{errno, "open(\"%s\") failed: ", path};
-  size_t sz = f.tellg();
-  std::vector<uint32_t> v(sz / 4);
-  f.seekg(0);
-  f.read((char*)v.data(), v.size() * 4);
-  return v;
-}
 #endif

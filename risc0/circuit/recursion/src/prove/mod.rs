@@ -95,7 +95,7 @@ pub trait RecursionProver {
         preflight: Option<Preflight>,
     ) -> Result<RecursionReceipt>;
 
-    /// C2: build and cache this program's ctrl buffer and committed ctrl group (no proof).
+    /// Build and cache this program's ctrl buffer and committed ctrl group (no proof).
     fn prewarm(&self, _program: &Arc<Program>) -> Result<()> {
         Ok(())
     }
@@ -132,6 +132,15 @@ pub fn set_host_chains_check(on: bool) -> usize {
     witgen::HOST_CHAINS_CHECKED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The recursion host-side preparation optimizations: host chains split across the preflight,
+/// page-locked staging of the witgen inputs (CUDA) and the fast host Poseidon2 permutation of the
+/// preflight. On unless `RISC0_CUDA_REC_PREP=0`.
+pub(crate) fn host_prep_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("RISC0_CUDA_REC_PREP").as_deref() != Ok("0"));
+    *ON
+}
+
 fn preflight_is_streaming(p: &Preflight) -> bool {
     p.is_streaming()
 }
@@ -159,7 +168,7 @@ pub struct Prover {
     input: VecDeque<u32>,
     /// Pre-computed preflight result (set by `prepare()`).
     prepared_preflight: Option<Preflight>,
-    /// C2: the rest of the input arrives here while `prepare()` runs.
+    /// Streaming: the rest of the input arrives here while `prepare()` runs.
     stream: Option<Arc<InputStream>>,
 }
 
@@ -190,7 +199,7 @@ impl Prover {
         }
     }
 
-    /// C2: words added from now on via the returned stream (not `add_input`) reach a running
+    /// Words added from now on via the returned stream (not `add_input`) reach a running
     /// `prepare()`, which blocks when it needs them. Close the stream when done.
     pub fn streaming(&mut self) -> Arc<InputStream> {
         let s = Arc::new(InputStream::default());
@@ -198,7 +207,7 @@ impl Prover {
         s
     }
 
-    /// C2: on this thread's cached prover, upload and commit this program's ctrl (the first
+    /// On this thread's cached prover, upload and commit this program's ctrl (the first
     /// proof of each program otherwise pays it on the GPU thread).
     pub fn prewarm(&self) -> Result<()> {
         #[cfg(feature = "cuda")]
@@ -226,16 +235,18 @@ impl Prover {
             None => Preflight::new(input),
         };
         let mut cross_ms = -1.0f64;
-        // C2-R2 (RISC0_C2_CHAIN_SPLIT=1): execute the host chains of the trace prefix on a
-        // background thread while the preflight continues (from the point where a streaming
-        // preflight has consumed its whole prefix, else at 3/5 of the rows); the rest after.
+        // Execute the host chains of the trace prefix on a background thread while the
+        // preflight continues (from the point where a streaming preflight has consumed its whole
+        // prefix, else at 3/5 of the rows); the rest after.
         #[cfg(feature = "cuda")]
-        let split = std::env::var("RISC0_C2_CHAIN_SPLIT").as_deref() != Ok("0");
+        let split = host_prep_enabled();
         #[cfg(not(feature = "cuda"))]
         let split = false;
         let streaming = preflight_is_streaming(&preflight);
         let split_row = self.program.code_rows() * 3 / 5;
-        let mut early: Option<std::thread::JoinHandle<Result<(Option<witgen::HostChains>, usize)>>> = None;
+        let mut early: Option<
+            std::thread::JoinHandle<Result<(Option<witgen::HostChains>, usize)>>,
+        > = None;
         let mut early_at = 0.0f64;
         for (cycle, row) in self.program.code_by_row().enumerate() {
             preflight.step(cycle, row)?;
@@ -243,7 +254,11 @@ impl Prover {
                 cross_ms = t_pf.elapsed().as_secs_f64() * 1e3;
             }
             if split && early.is_none() {
-                let go = if streaming { preflight.consumed >= prefix } else { cycle + 1 == split_row };
+                let go = if streaming {
+                    preflight.consumed >= prefix
+                } else {
+                    cycle + 1 == split_row
+                };
                 if go {
                     let wom = preflight.trace.wom.clone();
                     let cycles = preflight.trace.cycles.clone();
@@ -256,20 +271,16 @@ impl Prover {
                 }
             }
         }
-        if *VERBOSE {
-            eprintln!(
-                "[c2_pf] rows={} preflight={:.1}ms prefix_words={} consumed={} past_prefix_at={:.1}ms stream_wait={:.1}ms",
-                self.program.code_rows(),
-                t_pf.elapsed().as_secs_f64() * 1e3,
-                prefix,
-                preflight.consumed,
-                cross_ms,
-                preflight.stream_wait_ns as f64 / 1e6
-            );
-            if std::env::var_os("RISC0_C2_PF_PROF").is_some() {
-                eprintln!("[c2_pf_prof]{}", preflight.prof_report());
-            }
-        }
+        tracing::debug!(
+            "recursion preflight: rows={} {:.1}ms prefix_words={} consumed={} past_prefix_at={:.1}ms \
+             stream_wait={:.1}ms",
+            self.program.code_rows(),
+            t_pf.elapsed().as_secs_f64() * 1e3,
+            prefix,
+            preflight.consumed,
+            cross_ms,
+            preflight.stream_wait_ns as f64 / 1e6
+        );
         #[cfg(feature = "intel")]
         // Default on; RISC0_RECURSION_PREWITGEN=0 keeps witgen on the GPU thread.
         if !matches!(
@@ -289,42 +300,34 @@ impl Prover {
         #[cfg(feature = "cuda")]
         if let Some(h) = early.take() {
             let t0 = std::time::Instant::now();
-            let first = h.join().map_err(|_| anyhow::anyhow!("host chains thread panicked"))?;
+            let first = h
+                .join()
+                .map_err(|_| anyhow::anyhow!("host chains thread panicked"))?;
             let tw = t0.elapsed().as_secs_f64() * 1e3;
             let t = &preflight.trace;
             let chains = match first {
                 Ok((a, boundary)) => {
-                    match witgen::try_host_chains_range(&self.program, &t.wom, &t.cycles, &t.iops, boundary, true) {
+                    match witgen::try_host_chains_range(
+                        &self.program,
+                        &t.wom,
+                        &t.cycles,
+                        &t.iops,
+                        boundary,
+                        true,
+                    ) {
                         Ok((b, _)) => witgen::merge_host_chains(a, b),
                         Err(_) => witgen::host_chains(&self.program, &preflight),
                     }
                 }
                 Err(_) => witgen::host_chains(&self.program, &preflight),
             };
-            if std::env::var_os("RISC0_C2_CHAIN_SPLIT_CHECK").is_some() {
-                let full = witgen::host_chains(&self.program, &preflight);
-                let same = match (&full, &chains) {
-                    (None, None) => true,
-                    (Some(a), Some(b)) => {
-                        a.heads == b.heads
-                            && a.cycles == b.cycles
-                            && a.rows == b.rows
-                            && a.wom_idx == b.wom_idx
-                            && a.wom_rows == b.wom_rows
-                    }
-                    _ => false,
-                };
-                eprintln!("[c2_chain_split_check] identical={same}");
-                anyhow::ensure!(same, "split host chains differ from the full pass");
-            }
-            if *VERBOSE {
-                eprintln!(
-                    "[recursion_host_chains] split at {early_at:.1}ms: {} chains, {} rows; wait {tw:.1}ms, after preflight {:.1}ms",
-                    chains.as_ref().map_or(0, |c| c.heads.len()),
-                    chains.as_ref().map_or(0, |c| c.cycles.len()),
-                    t0.elapsed().as_secs_f64() * 1e3
-                );
-            }
+            tracing::debug!(
+                "recursion host chains: split at {early_at:.1}ms: {} chains, {} rows; wait {tw:.1}ms, \
+                 after preflight {:.1}ms",
+                chains.as_ref().map_or(0, |c| c.heads.len()),
+                chains.as_ref().map_or(0, |c| c.cycles.len()),
+                t0.elapsed().as_secs_f64() * 1e3
+            );
             *preflight.host_chains.lock().unwrap() = chains;
         } else {
             let t0 = std::time::Instant::now();
@@ -339,21 +342,21 @@ impl Prover {
             }
             *preflight.host_chains.lock().unwrap() = chains;
         }
+        // Stage the trace and host chains in page-locked memory here, off the GPU thread, so
+        // their H2D copies are truly asynchronous.
         #[cfg(feature = "cuda")]
-        if std::env::var("RISC0_C2_REC_PIN").as_deref() != Ok("0") {
+        if host_prep_enabled() {
             let t0 = std::time::Instant::now();
             let staged = {
                 let chains = preflight.host_chains.lock().unwrap();
                 let t = &preflight.trace;
                 pinned::PinnedTrace::new(&t.wom, &t.cycles, &t.iops, chains.as_ref())
             };
-            if *VERBOSE {
-                eprintln!(
-                    "[c2_pin] staged={} {:.1}ms",
-                    staged.is_some(),
-                    t0.elapsed().as_secs_f64() * 1e3
-                );
-            }
+            tracing::debug!(
+                "recursion pinned staging: staged={} {:.1}ms",
+                staged.is_some(),
+                t0.elapsed().as_secs_f64() * 1e3
+            );
             *preflight.pinned.lock().unwrap() = staged;
         }
         self.prepared_preflight = Some(preflight);
@@ -516,14 +519,12 @@ where
                 cache.insert(ctrl_key, group);
             }
         }
-        if *VERBOSE {
-            eprintln!(
-                "[c2_prewarm] po2={} rows={} {:.1}ms",
-                program.po2,
-                program.code_rows(),
-                t0.elapsed().as_secs_f64() * 1e3
-            );
-        }
+        tracing::debug!(
+            "recursion prewarm: po2={} rows={} {:.1}ms",
+            program.po2,
+            program.code_rows(),
+            t0.elapsed().as_secs_f64() * 1e3
+        );
         Ok(())
     }
 }

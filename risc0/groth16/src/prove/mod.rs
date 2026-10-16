@@ -52,6 +52,17 @@ pub fn preload_graph() -> Result<()> {
     }
 }
 
+/// Start [preload_graph] on a background thread (CUDA with the cold-path optimizations on, see
+/// `RISC0_CUDA_G16_COLD`; no-op otherwise), e.g. while the guest executes.
+pub fn preload_graph_background() {
+    #[cfg(feature = "cuda")]
+    if self::cuda::cold_path_enabled() {
+        std::thread::spawn(|| {
+            let _ = self::cuda::preload_graph();
+        });
+    }
+}
+
 /// Start the Groth16 prover ahead of [shrink_wrap] so that it loads its
 /// proving key while the caller finishes `identity_p254` (intel builds with
 /// the rzup `risc0-groth16` component installed; otherwise a no-op).
@@ -66,26 +77,21 @@ pub fn prestart_prover() -> Result<()> {
                 self::fast::prestart()?;
             }
             Ok(())
-        } else if #[cfg(feature = "cuda")] {
-            // C2 prototype: load the proving key while identity_p254 runs.
-            if std::env::var_os("RISC0_G16_PRESTART").is_some() {
-                self::cuda::prestart();
-            }
-            Ok(())
         } else {
             Ok(())
         }
     }
 }
 
-/// C2-R2: start loading the Groth16 proving key in the background (CUDA; no-op elsewhere).
-/// The loader waits for [prestart_key_go] (or 2 s), unless RISC0_G16_PRESTART_DELAY_MS is set.
+/// Start loading the Groth16 proving key in the background (CUDA; no-op elsewhere, on cards
+/// with less than 30 GB, or with `RISC0_CUDA_G16_COLD=0`). The loader waits for
+/// [prestart_key_go] (or 2 s).
 pub fn prestart_key() {
     #[cfg(feature = "cuda")]
     self::cuda::prestart_key();
 }
 
-/// C2-R2: release a pending [prestart_key] loader (no-op if none is waiting).
+/// Release a pending [prestart_key] loader (no-op if none is waiting).
 pub fn prestart_key_go() {
     #[cfg(feature = "cuda")]
     self::cuda::prestart_key_go();

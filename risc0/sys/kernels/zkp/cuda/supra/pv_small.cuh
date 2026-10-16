@@ -303,13 +303,13 @@ __global__ __launch_bounds__(128) void rows_k(uint32_t* out,
 
 } // namespace q
 
-// Measured crossovers (RTX 5090, C2-R2 merkle-small bench_lvl / bench_rows): warp kernels for
+// Measured crossovers (RTX 5090, merkle-small bench_lvl / bench_rows): warp kernels for
 // n <= 2048, quad kernels for n <= 8192, pv.cuh's thread kernels above.
 constexpr uint32_t W_MAX = 2048, Q_MAX = 8192;
 
-// RISC0_PV_SMALL=0 keeps pv.cuh's thread kernels for every size.
+// RISC0_CUDA_PV_SMALL=0 keeps pv.cuh's thread kernels for every size.
 inline bool enabled() {
-  static const bool on = [] { const char* e = std::getenv("RISC0_PV_SMALL"); return !(e && e[0] == '0'); }();
+  static const bool on = [] { const char* e = std::getenv("RISC0_CUDA_PV_SMALL"); return !(e && e[0] == '0'); }();
   return on;
 }
 

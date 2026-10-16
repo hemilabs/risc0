@@ -1,4 +1,4 @@
-// C2-R2: faster Poseidon2 permutation for the recursion preflight (bit-identical to
+// Faster Poseidon2 permutation for the recursion preflight (bit-identical to
 // `risc0_zkp::core::hash::poseidon2::poseidon2_mix`).
 //
 // The linear layers (M_EXT, the M_INT row sum) are done in u64 integer arithmetic with one
@@ -10,7 +10,9 @@
 // lets the compiler vectorize the 24-wide S-box and M_INT loops.
 
 use risc0_zkp::{
-    core::hash::poseidon2::{poseidon2_mix, CELLS, M_INT_DIAG_HZN, ROUNDS_HALF_FULL, ROUNDS_PARTIAL, ROUND_CONSTANTS},
+    core::hash::poseidon2::{
+        poseidon2_mix, CELLS, M_INT_DIAG_HZN, ROUNDS_HALF_FULL, ROUNDS_PARTIAL, ROUND_CONSTANTS,
+    },
     field::baby_bear::BabyBearElem as Fp,
 };
 use std::sync::LazyLock;
@@ -24,7 +26,10 @@ struct Consts {
 }
 
 static CONSTS: LazyLock<Consts> = LazyLock::new(|| {
-    let rc = ROUND_CONSTANTS.iter().map(|e| e.as_u32_montgomery()).collect();
+    let rc = ROUND_CONSTANTS
+        .iter()
+        .map(|e| e.as_u32_montgomery())
+        .collect();
     let mut diag = [0u32; CELLS];
     for i in 0..CELLS {
         diag[i] = M_INT_DIAG_HZN[i].as_u32_montgomery();
@@ -136,8 +141,8 @@ unsafe fn mix_canonical_avx2(c: &mut [u32; CELLS], k: &Consts) {
 }
 
 static MODE: LazyLock<u8> = LazyLock::new(|| {
-    // 0: reference, 1: scalar fast, 2: AVX2 fast. RISC0_C2_P2FAST=0 forces the reference.
-    if matches!(std::env::var("RISC0_C2_P2FAST").as_deref(), Ok("0")) {
+    // 0: reference, 1: scalar fast, 2: AVX2 fast. RISC0_CUDA_REC_PREP=0 forces the reference.
+    if !super::host_prep_enabled() {
         return 0;
     }
     #[cfg(target_arch = "x86_64")]

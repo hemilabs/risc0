@@ -180,8 +180,13 @@ __global__ void fwdStepVerifyWom(ExecContext* ctx) {
 #ifndef __HIPCC__
 void risc0_recursion_launch_accum_inl(int verify, unsigned grid, unsigned block, cudaStream_t stream,
                                       AccumContext* ctx);
+// accum_inl.cu: the accum steps force-inlined into the kernels, and eval_check split into
+// standalone kernels (ffi_supra.cu): on unless RISC0_CUDA_REC_KERNELS=0.
 static bool accumInl() {
-  static const bool on = !getenv("RISC0_REC_ACCUM_INL") || atoi(getenv("RISC0_REC_ACCUM_INL")) != 0;
+  static const bool on = [] {
+    const char* e = getenv("RISC0_CUDA_REC_KERNELS");
+    return !(e && e[0] == '0');
+  }();
   return on;
 }
 #endif
@@ -511,7 +516,7 @@ struct HostAccumContext {
     ctx->workCycles = workCycles;
 
     ctx->accum = g_accumCache.accum;
-    // C2-R2: fill with FpExt(1) on the device instead of uploading a host vector of ones.
+    // Fill with FpExt(1) on the device instead of uploading a host vector of ones.
     fillOneExt<<<(workCycles + 255) / 256, 256, 0, stream>>>(ctx->accum, workCycles);
     CUDA_OK(cudaGetLastError());
   }

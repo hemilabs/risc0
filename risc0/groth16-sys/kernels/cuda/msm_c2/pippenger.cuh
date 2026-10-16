@@ -349,7 +349,7 @@ class msm_t {
     {   int ret=0; while (n>>=1) ret++; return ret;   }
 
 public:
-    // C2 prototype: 0 = sppark's heuristic (4 batches for ~2^23 points); 1 = one pass when
+    // 0 = sppark's heuristic (4 batches for ~2^23 points); 1 = one pass when
     // points and scalars are already on the device (no upload to pipeline).
     void set_batch(size_t b) { batch_override = b; }
     msm_t(const affine_t points[], size_t np,

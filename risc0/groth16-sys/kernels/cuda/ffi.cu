@@ -1,10 +1,6 @@
 #include <cstring>
-#include <chrono>
-#include <functional>
 #include <cstdio>
 #include <cstdlib>
-static bool g16_timing() { static bool v = getenv("RISC0_G16_TIMING") != nullptr; return v; }
-static bool g16_fixed_rs() { static bool v = getenv("RISC0_G16_FIXED_RS") != nullptr; return v; }
 #include <iostream>
 #include <mutex>
 #include <stdexcept>
@@ -222,37 +218,31 @@ extern "C" const char* risc0_groth16_cuda_preload(SetupParams* setup_params) {
   try {
     int dev = current_device();
     std::lock_guard<std::mutex> lock(cached_mutex);
-    auto t0 = std::chrono::steady_clock::now();
-    bool did = false;
     if (!cached_srs[dev]) {
       cached_srs[dev] = new SRS(dev, setup_params->srs_path);
-      did = true;
     }
-    auto t1 = std::chrono::steady_clock::now();
     if (!cached_prover[dev]) {
       cached_prover[dev] = new groth16_prover(
           *cached_srs[dev], setup_params->pcoeffs_path, setup_params->fres_path);
     }
-    auto t2 = std::chrono::steady_clock::now();
-    if (did && g16_timing())
-      fprintf(stderr, "[g16_timing] preload srs=%.1fms prover(coeffs)=%.1fms\n",
-              std::chrono::duration<double, std::milli>(t1 - t0).count(),
-              std::chrono::duration<double, std::milli>(t2 - t1).count());
   } catch (const std::exception& err) {
     return strdup(err.what());
   }
   return nullptr;
 }
 
-// C2-R2: load the proving key (SRS points + preprocessed coeffs) and build the prover in the
-// background, e.g. while the STARK proves. Uploads go through the pinned stager on its own
-// non-blocking streams (never pageable copies: those take the driver lock for their whole
-// duration and stall every other thread's CUDA calls). Skipped (loaded = 0) on a card with less
-// than `min_total_vram` bytes, where the key cannot sit beside a STARK proof.
+// The witness indices that are always 0/1 (the bit set of the split MSMs), used by the next
+// prover construction.
 extern "C" void risc0_groth16_cuda_set_bit_signals(const uint32_t* bits, size_t len) {
   std::lock_guard<std::mutex> lk(g16_bits_mu);
   g16_bits().assign(bits, bits + len);
 }
+
+// Load the proving key (SRS points + preprocessed coeffs) and build the prover in the
+// background, e.g. while the STARK proves. Uploads go through the pinned stager on its own
+// non-blocking streams (never pageable copies: those take the driver lock for their whole
+// duration and stall every other thread's CUDA calls). Skipped (loaded = 0) on a card with less
+// than `min_total_vram` bytes, where the key cannot sit beside a STARK proof.
 
 extern "C" const char* risc0_groth16_cuda_prestart(SetupParams* setup_params,
                                                    size_t min_total_vram,
@@ -265,24 +255,17 @@ extern "C" const char* risc0_groth16_cuda_prestart(SetupParams* setup_params,
     size_t free_b = 0, total_b = 0;
     if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess || total_b < min_total_vram)
       return nullptr;
-    g16_force_staged = true;
-    auto t0 = std::chrono::steady_clock::now();
+    g16_staged_upload = true;
     std::lock_guard<std::mutex> lock(cached_mutex);
     if (!cached_srs[dev]) {
       cached_srs[dev] = new SRS(dev, setup_params->srs_path);
     }
-    auto t1 = std::chrono::steady_clock::now();
     if (!cached_prover[dev]) {
       cached_prover[dev] = new groth16_prover(
           *cached_srs[dev], setup_params->pcoeffs_path, setup_params->fres_path);
     }
-    auto t2 = std::chrono::steady_clock::now();
     *witness_len = cached_srs[dev]->get_a_size();
     *loaded = 1;
-    if (g16_timing())
-      fprintf(stderr, "[g16_timing] prestart srs=%.1fms prover=%.1fms (vram total %.1f GB)\n",
-              std::chrono::duration<double, std::milli>(t1 - t0).count(),
-              std::chrono::duration<double, std::milli>(t2 - t1).count(), total_b / 1e9);
   } catch (const std::exception& err) {
     return strdup(err.what());
   }

@@ -718,11 +718,35 @@ __global__ void finalizeZeroizeAccum(DeviceAccumContext* ctx, uint32_t lastCycle
     for (size_t c = 0; c < cols; c++) z(c * rows + cycle);
   }
 }
-static bool accumFz() {
-  static const bool on = !getenv("RISC0_ACCUM_FZ") || atoi(getenv("RISC0_ACCUM_FZ")) != 0;
-  return on;
-}
 #endif
+
+static bool envOn(const char* name) {
+  const char* e = getenv(name);
+  return !(e && e[0] == '0');
+}
+
+// The accum kernel feature: stepAccum force-inlined in a whole-program TU (accum_tu.cu), its
+// cycles sorted by major within 2^14-row windows, and finalizeAccum fused with the zeroize. On
+// unless RISC0_CUDA_ACCUM_TU=0 (then: stepAccum, a global sort by major, separate zeroize).
+static bool accumTu() {
+#ifdef __HIPCC__
+  return false;
+#else
+  static const bool on = envOn("RISC0_CUDA_ACCUM_TU");
+  return on;
+#endif
+}
+
+// witgen_tu.cu (par_stepExec's call graph in a standalone noinline TU): on unless
+// RISC0_CUDA_WITGEN_TU=0.
+static bool witgenTu() {
+#ifdef __HIPCC__
+  return false;
+#else
+  static const bool on = envOn("RISC0_CUDA_WITGEN_TU");
+  return on;
+#endif
+}
 
 __global__ void finalizeAccum(DeviceAccumContext* ctx, uint32_t lastCycle) {
   uint32_t cycle = blockDim.x * blockIdx.x + threadIdx.x;
@@ -913,9 +937,8 @@ const char* risc0_circuit_rv32im_cuda_witgen_v2(uint32_t mode,
         // witgen_tu.cu: step_Top's call graph as static (noinline) functions in a standalone TU,
         // power-of-two rows only. Kept noinline on purpose: the fully inlined build reorders the
         // back-row loads of rows written by neighbouring threads (latent race) and is not bit-exact.
-        static const bool s_witgen_tu = !getenv("RISC0_WITGEN_TU") || atoi(getenv("RISC0_WITGEN_TU")) != 0;
         auto pow2 = [](size_t r) { return r && (r & (r - 1)) == 0; };
-        if (s_witgen_tu && pow2(buffers->data.rows) &&
+        if (witgenTu() && pow2(buffers->data.rows) &&
             pow2(buffers->pre_data.rows ? buffers->pre_data.rows : buffers->data.rows)) {
           risc0_rv32im_launch_par_stepExecTU(cfg1.grid.x, cfg1.block.x, stream, d_ctx, 0, split);
           risc0_rv32im_launch_par_stepExecTU(cfg2.grid.x, cfg2.block.x, stream, d_ctx, split, phase2Count);
@@ -978,9 +1001,8 @@ const char* risc0_circuit_rv32im_cuda_accum(AccumBuffers* buffers,
       static uint32_t* s_keys[16] = {};
       static uint32_t* s_perm[16] = {};
       static uint32_t* s_keys2[16] = {};
-      // RISC0_ACCUM_SORT_WIN=0 restores the global (8-bit) sort by major.
-      static const uint32_t s_win =
-          getenv("RISC0_ACCUM_SORT_WIN") ? atoi(getenv("RISC0_ACCUM_SORT_WIN")) : 14;
+      // Sort window (rows, log2); without the accum TU feature: one global sort by major.
+      const uint32_t s_win = accumTu() ? 14 : 0;
       static uint32_t* s_perm2[16] = {};
       static size_t s_cap[16] = {};
       {
@@ -1016,9 +1038,8 @@ const char* risc0_circuit_rv32im_cuda_accum(AccumBuffers* buffers,
 #ifndef __HIPCC__
       // accum_tu.cu: the stepAccum call graph force-inlined in a whole-program TU (no ABI
       // calls or stack-resident buffer objects); needs power-of-two rows (RISC0_ROWS_POW2).
-      static const bool s_accum_tu = !getenv("RISC0_ACCUM_TU") || atoi(getenv("RISC0_ACCUM_TU")) != 0;
       auto pow2 = [](size_t r) { return r && (r & (r - 1)) == 0; };
-      if (s_accum_tu && pow2(buffers->data.rows) && pow2(buffers->accum.rows)) {
+      if (accumTu() && pow2(buffers->data.rows) && pow2(buffers->accum.rows)) {
         risc0_rv32im_launch_stepAccumTU(cfg.grid.x, cfg.block.x, stream, d_ctx, lastCycle, perm);
       } else
 #endif
@@ -1063,7 +1084,7 @@ const char* risc0_circuit_rv32im_cuda_accum(AccumBuffers* buffers,
 #endif
 
 #ifndef __HIPCC__
-      if (accumFz()) {
+      if (accumTu()) {
         auto cfgz = getSimpleConfig(rows);
         finalizeZeroizeAccum<<<cfgz.grid, cfgz.block, 0, stream>>>(d_ctx, lastCycle);
       } else
@@ -1091,11 +1112,7 @@ const char* risc0_circuit_rv32im_cuda_accum(AccumBuffers* buffers,
 // 1 when risc0_circuit_rv32im_cuda_accum also zeroizes accum (finalizeZeroizeAccum), so the
 // caller skips its separate eltwise_zeroize of the accum buffer.
 int risc0_circuit_rv32im_cuda_accum_zeroizes() {
-#ifndef __HIPCC__
-  return accumFz() ? 1 : 0;
-#else
-  return 0;
-#endif
+  return accumTu() ? 1 : 0;
 }
 
 const char* risc0_circuit_rv32im_cuda_warmup() {

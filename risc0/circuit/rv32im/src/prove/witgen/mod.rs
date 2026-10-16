@@ -31,9 +31,12 @@ static VERBOSE: LazyLock<bool> = LazyLock::new(|| std::env::var("RISC0_VERBOSE")
 
 /// On CUDA the witgen kernel writes the five per-cycle columns (CYCLE_COLS) from the uploaded
 /// cycles, so the host injector leaves them out (5 of its ~5.1 entries per row at po2=20).
-/// RISC0_C2_HOSTCOLS=1 keeps them in the injector (A/B switch).
+/// Part of the witgen staging feature (`RISC0_CUDA_WITGEN_STAGE=0` keeps them in the injector).
 static DEFER_CYCLE_COLS: LazyLock<bool> = LazyLock::new(|| {
-    cfg!(feature = "cuda") && std::env::var_os("RISC0_C2_HOSTCOLS").is_none()
+    #[cfg(feature = "cuda")]
+    return cuda_stage::enabled();
+    #[cfg(not(feature = "cuda"))]
+    false
 });
 
 /// Data columns set for every row from its preflight cycle: cycle, next_pc_low, next_pc_high,
@@ -108,16 +111,14 @@ impl PreflightResults {
         {
             trace.staged = cuda_stage::stage(&trace);
         }
-        if *VERBOSE {
-            eprintln!(
-                "    [preflight_new] preflight={:.1}ms global+injector={:.1}ms stage={:.1}ms (cycles={} txns={})",
-                (tp1 - tp0).as_secs_f64() * 1000.0,
-                (tp2 - tp1).as_secs_f64() * 1000.0,
-                tp2.elapsed().as_secs_f64() * 1000.0,
-                trace.cycles.len(),
-                trace.txns.len(),
-            );
-        }
+        tracing::debug!(
+            "preflight: trace={:.1}ms global+injector={:.1}ms stage={:.1}ms (cycles={} txns={})",
+            (tp1 - tp0).as_secs_f64() * 1000.0,
+            (tp2 - tp1).as_secs_f64() * 1000.0,
+            tp2.elapsed().as_secs_f64() * 1000.0,
+            trace.cycles.len(),
+            trace.txns.len(),
+        );
 
         Ok(Self {
             global,
