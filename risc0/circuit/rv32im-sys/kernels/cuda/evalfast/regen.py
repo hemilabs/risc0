@@ -39,6 +39,8 @@ followed by the CUDA post-passes in this directory (PASSES below):
      blocks main and odd blocks LogUp, plus ef_combine)
  11. remat_lu.py: LogUp slab FpExt values recomputed at their reads
  12. mksm2.py: per-phase 64 hottest slab words in shared memory
+ 13. mksub.py: every chain function split in two at its narrowest point
+     between 45% and 55% of its body (the tail is a __noinline__ template)
 
 Each pass prints what it did; EXPECT pins those lines, so a change in the
 circuit or a pass that changes the shape of the kernel fails here first: re-run
@@ -60,6 +62,31 @@ SYS = os.path.normpath(os.path.join(HERE, '..', '..', '..'))  # rv32im-sys
 OUT = os.path.join(SYS, 'kernels', 'cuda', 'eval_check_ef.cu')
 NS = 'namespace risc0::circuit::rv32im_v2 {'
 
+# mksub.py cut points: function, body lines, cut line, live values passed to the tail (+ input
+# loads re-issued there instead).
+MKSUB = [
+    'rv32im_v2_0: 1329 lines, cut at 640 (0.48), live 28 (+90 reloaded)',
+    'rv32im_v2_1: 1238 lines, cut at 592 (0.48), live 32 (+69 reloaded)',
+    'rv32im_v2_2: 1131 lines, cut at 528 (0.47), live 35 (+57 reloaded)',
+    'rv32im_v2_3: 999 lines, cut at 452 (0.45), live 8 (+23 reloaded)',
+    'rv32im_v2_4: 1322 lines, cut at 594 (0.45), live 76 (+2 reloaded)',
+    'rv32im_v2_5: 1283 lines, cut at 581 (0.45), live 15 (+0 reloaded)',
+    'rv32im_v2_6: 1132 lines, cut at 509 (0.45), live 85 (+40 reloaded)',
+    'rv32im_v2_7: 1335 lines, cut at 687 (0.51), live 29 (+10 reloaded)',
+    'rv32im_v2_8: 1023 lines, cut at 481 (0.47), live 35 (+1 reloaded)',
+    'rv32im_v2_9: 1077 lines, cut at 486 (0.45), live 35 (+7 reloaded)',
+    'rv32im_v2_10: 1378 lines, cut at 620 (0.45), live 12 (+36 reloaded)',
+    'rv32im_v2_11: 1088 lines, cut at 489 (0.45), live 102 (+43 reloaded)',
+    'rv32im_v2_12: 1222 lines, cut at 642 (0.53), live 65 (+25 reloaded)',
+    'rv32im_v2_13: 1250 lines, cut at 591 (0.47), live 13 (+51 reloaded)',
+    'rv32im_v2_14: 1240 lines, cut at 672 (0.54), live 43 (+83 reloaded)',
+    'rv32im_v2_15: 1280 lines, cut at 610 (0.48), live 67 (+57 reloaded)',
+    'rv32im_v2_16: 998 lines, cut at 541 (0.54), live 15 (+24 reloaded)',
+    'rv32im_v2_17: 1186 lines, cut at 533 (0.45), live 46 (+18 reloaded)',
+    'rv32im_v2_18: 1038 lines, cut at 504 (0.49), live 19 (+13 reloaded)',
+    'rv32im_v2_19: 1015 lines, cut at 465 (0.46), live 112 (+25 reloaded)',
+]
+
 # (pass, extra arguments, lines its output must contain)
 PASSES = [
     ('remat.py', ['--maxops', '4', '--maxloads', '4'],
@@ -72,6 +99,8 @@ PASSES = [
     ('remat_lu.py', ['--maxg', '4', '--maxops', '8'],
      ["loads 135 {'keep': 41, 'remat': 94} stores 115 dropped 89"]),
     ('mksm2.py', ['64', '64'], ['main words 85 acc 751 hot 683 | lu words 104 acc 268 hot 188']),
+    ('mksub.py', ['--fns', ','.join('rv32im_v2_%d' % i for i in range(20)), '--lo', '0.45', '--hi', '0.55'],
+     MKSUB),
 ]
 
 POST_HEADER = '''//
@@ -81,8 +110,9 @@ POST_HEADER = '''//
 // mad.wide (close.py, linkext.py), the LogUp block sliced out of the main chain
 // (accfirst_cuda.py), a main / LogUp block-type phase split (ef_eval_split +
 // ef_combine, mksplit2.py), LogUp slab values rematerialised at their reads
-// (remat_lu.py) and the per-phase 64 hottest slab words in shared memory
-// (mksm2.py). The rematerialisation relies on data, accum and mix being
+// (remat_lu.py), the per-phase 64 hottest slab words in shared memory
+// (mksm2.py) and every chain function split in two at its narrowest point
+// (mksub.py). The rematerialisation relies on data, accum and mix being
 // read-only for the whole kernel.
 '''
 HEADER_END = '// kernel happens to tolerate them.\n'
