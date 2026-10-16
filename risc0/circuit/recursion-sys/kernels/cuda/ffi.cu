@@ -564,6 +564,68 @@ struct AccumBuffersState {
   int device = -1;
 };
 
+#ifdef SPPARK_NO_COOPERATIVE_LAUNCH
+// In-place inclusive prefix products of an FpExt array without a grid-wide sync (no cooperative
+// launch on this platform): each block scans a chunk and writes its total, one thread scans the
+// totals, then each chunk past the first is multiplied by the product of the chunks before it.
+// FpExt multiplication is associative, so the products are those of the sequential scan.
+constexpr uint32_t kScanThreads = 256;
+constexpr uint32_t kScanPerThread = 8;
+constexpr uint32_t kScanChunk = kScanThreads * kScanPerThread;
+
+__global__ void __launch_bounds__(kScanThreads)
+    prefixProductsChunks(FpExt* io, uint32_t n, FpExt* totals) {
+  // Raw storage: HIP has no __shared__ objects with constructors.
+  __shared__ uint32_t raw[kScanThreads * 4] __attribute__((aligned(16)));
+  FpExt* part = reinterpret_cast<FpExt*>(raw);
+  uint32_t t = threadIdx.x;
+  size_t base = (size_t)blockIdx.x * kScanChunk + (size_t)t * kScanPerThread;
+  FpExt run(1);
+  for (uint32_t k = 0; k < kScanPerThread; k++) {
+    size_t i = base + k;
+    if (i < n) {
+      run = run * io[i];
+      io[i] = run;
+    }
+  }
+  part[t] = run;
+  __syncthreads();
+  // Inclusive scan of the threads' products (Hillis-Steele).
+  for (uint32_t d = 1; d < kScanThreads; d <<= 1) {
+    FpExt v = part[t];
+    if (t >= d)
+      v = part[t - d] * v;
+    __syncthreads();
+    part[t] = v;
+    __syncthreads();
+  }
+  if (t > 0) {
+    FpExt before = part[t - 1];
+    for (uint32_t k = 0; k < kScanPerThread; k++) {
+      size_t i = base + k;
+      if (i < n)
+        io[i] = before * io[i];
+    }
+  }
+  if (t == kScanThreads - 1)
+    totals[blockIdx.x] = part[t];
+}
+
+// One thread: totals[b] becomes the product of chunks 0..b (inclusive).
+__global__ void prefixProductsTotals(FpExt* totals, uint32_t nblocks) {
+  if (threadIdx.x != 0 || blockIdx.x != 0)
+    return;
+  for (uint32_t b = 1; b < nblocks; b++)
+    totals[b] = totals[b - 1] * totals[b];
+}
+
+__global__ void prefixProductsFixup(FpExt* io, uint32_t n, const FpExt* totals) {
+  size_t i = (size_t)blockDim.x * blockIdx.x + threadIdx.x + kScanChunk;
+  if (i < n)
+    io[i] = totals[i / kScanChunk - 1] * io[i];
+}
+#endif
+
 // Cached GPU buffers for HostAccumContext
 struct CachedAccumBuffers : AccumBuffersState {
   void ensure(uint32_t workCycles) {
@@ -624,7 +686,13 @@ struct HostAccumContext {
     ctx->workCycles = workCycles;
 
     ctx->accum = g_accumCache.accum;
-    if (recAsync()) {
+#ifdef SPPARK_NO_COOPERATIVE_LAUNCH
+    // Its prefix products run on the device too (see calcPrefixProducts).
+    const bool device_fill = true;
+#else
+    const bool device_fill = recAsync();
+#endif
+    if (device_fill) {
       // Fill with FpExt(1) on the device instead of uploading a host vector of ones.
       fillOneExt<<<(workCycles + 255) / 256, 256, 0, stream>>>(g_accumCache.accum, workCycles);
       CUDA_OK(cudaGetLastError());
@@ -654,16 +722,25 @@ struct HostAccumContext {
     nvtx3::scoped_range range("calcPrefixProducts");
 #ifdef SPPARK_NO_COOPERATIVE_LAUNCH
     // sppark's prefix_op needs a cooperative launch, which this platform has not (see sppark's
-    // util/cuda2hip.hpp): scan on the host, as the HIP HAL's prefix_products does.
-    CUDA_OK(cudaStreamSynchronize(stream));
-    std::vector<FpExt> accum(ctx->workCycles);
-    CUDA_OK(cudaMemcpy(
-        accum.data(), ctx->accum, accum.size() * sizeof(FpExt), cudaMemcpyDeviceToHost));
-    for (size_t i = 1; i < accum.size(); i++) {
-      accum[i] = accum[i - 1] * accum[i];
+    // util/cuda2hip.hpp): a three-kernel scan instead (see prefixProductsChunks).
+    uint32_t n = (uint32_t)ctx->workCycles;
+    uint32_t nblocks = (n + kScanChunk - 1) / kScanChunk;
+    static thread_local FpExt* totals = nullptr;
+    static thread_local uint32_t totalsCap = 0;
+    if (nblocks > totalsCap) {
+      if (totals)
+        CUDA_OK(cudaFree(totals));
+      CUDA_OK(cudaMalloc(&totals, nblocks * sizeof(FpExt)));
+      totalsCap = nblocks;
     }
-    CUDA_OK(cudaMemcpy(
-        ctx->accum, accum.data(), accum.size() * sizeof(FpExt), cudaMemcpyHostToDevice));
+    prefixProductsChunks<<<nblocks, kScanThreads, 0, stream>>>(ctx->accum, n, totals);
+    if (nblocks > 1) {
+      prefixProductsTotals<<<1, 1, 0, stream>>>(totals, nblocks);
+      uint32_t rest = n - kScanChunk;
+      prefixProductsFixup<<<(rest + 255) / 256, 256, 0, stream>>>(ctx->accum, n, totals);
+    }
+    CUDA_OK(cudaGetLastError());
+    CUDA_OK(cudaStreamSynchronize(stream));
 #else
     sppark::calcPrefixProducts(ctx->accum, ctx->workCycles);
     CUDA_OK(cudaStreamSynchronize(stream));
