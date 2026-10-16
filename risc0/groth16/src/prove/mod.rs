@@ -28,7 +28,7 @@ mod hip;
 mod intel;
 mod seal_format;
 mod seal_to_json;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 mod witness_fast;
 #[cfg(feature = "cuda")]
 mod witness_par;

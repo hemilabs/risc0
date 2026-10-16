@@ -116,7 +116,7 @@ pub fn release() -> anyhow::Result<()> {
 /// held exclusively: other callers wait until this is dropped, so keep it until the `prove`
 /// that reads it has returned. Unlike a `MutexGuard` it may be dropped on another thread than
 /// the one that took it (the witness is computed on a helper thread, see `shrink_wrap_with`).
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 pub struct HostBuffer {
     ptr: *mut u8,
     len: usize,
@@ -124,15 +124,15 @@ pub struct HostBuffer {
 
 // Safety: the buffer is a process-lifetime pinned allocation (it is only freed or regrown by a
 // holder of the HOST_BUFFER_BUSY flag), and only the HostBuffer holding the flag touches it.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 unsafe impl Send for HostBuffer {}
 
 /// Whether a [HostBuffer] is live; the condvar wakes waiters when it is dropped.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 static HOST_BUFFER_BUSY: (std::sync::Mutex<bool>, std::sync::Condvar) =
     (std::sync::Mutex::new(false), std::sync::Condvar::new());
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 fn host_buffer_acquire() {
     let (m, cv) = &HOST_BUFFER_BUSY;
     let mut busy = m.lock().unwrap_or_else(|e| e.into_inner());
@@ -142,21 +142,21 @@ fn host_buffer_acquire() {
     *busy = true;
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 fn host_buffer_release() {
     let (m, cv) = &HOST_BUFFER_BUSY;
     *m.lock().unwrap_or_else(|e| e.into_inner()) = false;
     cv.notify_one();
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 impl Drop for HostBuffer {
     fn drop(&mut self) {
         host_buffer_release();
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 impl HostBuffer {
     pub fn as_ptr(&self) -> *const u8 {
         self.ptr
@@ -171,7 +171,7 @@ impl HostBuffer {
 }
 
 /// Lock the pinned witness buffer, growing it to at least `bytes`.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 pub fn host_buffer(bytes: usize) -> anyhow::Result<HostBuffer> {
     host_buffer_acquire();
     let ptr = unsafe { risc0_groth16_cuda_host_buffer(bytes) };
@@ -310,7 +310,7 @@ extern "C" {
         loaded: *mut i32,
     ) -> *const c_char;
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     fn risc0_groth16_cuda_host_buffer(bytes: usize) -> *mut u8;
 
     #[cfg(feature = "cuda")]

@@ -44,15 +44,18 @@ pub(crate) fn preload_graph() -> Result<()> {
     let witness_params = WitnessParams::new(&root_dir);
     let pg = PARSED_GRAPH.get_or_init(|| load_graph(&witness_params.graph_path));
 
-    // Also precompute BFS level data for parallel evaluation (~570ms).
-    // This runs on the background thread during segment proving.
+    // Also compile the graph for the fast evaluator, or failing that precompute BFS level data
+    // for parallel evaluation (~570ms). This runs on the background thread during segment
+    // proving.
     let nodes = pg
         .nodes
         .as_any()
         .downcast_ref::<Nodes<U254, VecNodes>>()
         .expect("expected U254 nodes in circom graph");
-    pg.level_data
-        .get_or_init(|| compute_level_data(&nodes.nodes));
+    if fast_program(pg, nodes).is_none() {
+        pg.level_data
+            .get_or_init(|| compute_level_data(&nodes.nodes));
+    }
 
     Ok(())
 }
@@ -74,7 +77,24 @@ fn load_graph(graph_path: &Path) -> ParsedGraph {
         signals,
         input_mapping,
         level_data: OnceLock::new(),
+        fast: OnceLock::new(),
     }
+}
+
+/// The graph compiled for `witness_fast` (as on CUDA), or None if it doesn't qualify.
+fn fast_program<'a>(
+    pg: &'a ParsedGraph,
+    nodes: &Nodes<U254, VecNodes>,
+) -> Option<&'a super::witness_fast::Program> {
+    pg.fast
+        .get_or_init(|| {
+            let fast = super::witness_fast::compile(nodes, &pg.signals);
+            if fast.is_none() {
+                tracing::warn!("groth16: the fast witness evaluator does not support this graph");
+            }
+            fast
+        })
+        .as_ref()
 }
 
 /// Convert seal bytes directly to a Vec of U254 values, bypassing JSON serialization.
@@ -198,13 +218,18 @@ pub(crate) fn shrink_wrap(seal_bytes: &[u8]) -> Result<Seal> {
     }
 }
 
-struct CalcWitness {
-    witness: Vec<wtns_file::FieldElement<32>>,
+enum CalcWitness {
+    Vec(Vec<wtns_file::FieldElement<32>>),
+    /// Canonical little-endian values in the pinned buffer, held until the prove has read it.
+    Pinned(risc0_groth16_sys::HostBuffer),
 }
 
 impl CalcWitness {
     fn as_ptr(&self) -> *const u8 {
-        self.witness.as_ptr() as *const u8
+        match self {
+            CalcWitness::Vec(w) => w.as_ptr() as *const u8,
+            CalcWitness::Pinned(buf) => buf.as_ptr(),
+        }
     }
 }
 
@@ -229,6 +254,7 @@ struct ParsedGraph {
     signals: Vec<usize>,
     input_mapping: InputSignalsInfo,
     level_data: OnceLock<LevelData>,
+    fast: OnceLock<Option<super::witness_fast::Program>>,
 }
 
 // SAFETY: The concrete type behind `dyn NodesInterface` is `Nodes<U254, VecNodes>`,
@@ -495,7 +521,7 @@ fn calc_witness(graph_path: &Path, inputs: &str) -> Result<CalcWitness> {
         (t3 - t0).as_secs_f64() * 1000.0,
     );
 
-    Ok(CalcWitness { witness })
+    Ok(CalcWitness::Vec(witness))
 }
 
 /// Binary-input variant of calc_witness that accepts pre-computed U254 values
@@ -537,6 +563,20 @@ fn calc_witness_binary(graph_path: &Path, iop_values: Vec<U254>) -> Result<CalcW
 
     let t1 = std::time::Instant::now();
 
+    // The fast evaluator (as on CUDA), straight into the pinned buffer the prover uploads from.
+    if let Some(program) = fast_program(pg, nodes) {
+        let mut buf = risc0_groth16_sys::host_buffer(pg.signals.len() * 32)
+            .context("failed to allocate the pinned witness buffer")?;
+        super::witness_fast::eval(program, nodes, &flat_inputs, buf.as_limbs_mut());
+        eprintln!(
+            "[groth16_witness] inputs={:.1}ms evaluate(fast)={:.1}ms total={:.1}ms",
+            (t1 - t0).as_secs_f64() * 1000.0,
+            t1.elapsed().as_secs_f64() * 1000.0,
+            t0.elapsed().as_secs_f64() * 1000.0,
+        );
+        return Ok(CalcWitness::Pinned(buf));
+    }
+
     // Evaluate the circuit graph using parallel BFS-level evaluation
     let result = evaluate_parallel(
         pg,
@@ -570,5 +610,5 @@ fn calc_witness_binary(graph_path: &Path, iop_values: Vec<U254>) -> Result<CalcW
         (t3 - t0).as_secs_f64() * 1000.0,
     );
 
-    Ok(CalcWitness { witness })
+    Ok(CalcWitness::Vec(witness))
 }
