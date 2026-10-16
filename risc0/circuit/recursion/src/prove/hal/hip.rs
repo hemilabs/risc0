@@ -17,8 +17,8 @@ use std::sync::Arc;
 use anyhow::{bail, Result};
 use risc0_circuit_recursion_sys::{
     risc0_circuit_recursion_cuda_accum, risc0_circuit_recursion_cuda_eval_check,
-    risc0_circuit_recursion_cuda_witgen, RawAccumBuffers, RawExecBuffers, RawPreflightTrace,
-    StepMode,
+    risc0_circuit_recursion_cuda_witgen, risc0_circuit_recursion_cuda_witgen_chains,
+    RawAccumBuffers, RawExecBuffers, RawHostChains, RawPreflightTrace, StepMode,
 };
 use risc0_sys::ffi_wrap;
 use risc0_zkp::{
@@ -78,6 +78,49 @@ impl<CH: HipHash> CircuitWitnessGenerator<HipHal<CH>> for HipCircuitHal<CH> {
         };
         ffi_wrap(|| unsafe {
             risc0_circuit_recursion_cuda_witgen(mode, &buffers, preflight, total_cycles)
+        })
+    }
+
+    fn generate_witness_with_chains(
+        &self,
+        mode: StepMode,
+        total_cycles: u32,
+        preflight: &RawPreflightTrace,
+        host_chains: Option<&crate::prove::witgen::HostChains>,
+        ctrl: &HipBuffer<BabyBearElem>,
+        data: &HipBuffer<BabyBearElem>,
+        global: &HipBuffer<BabyBearElem>,
+    ) -> Result<()> {
+        let Some(hc) = host_chains else {
+            return self.generate_witness(mode, total_cycles, preflight, ctrl, data, global);
+        };
+        let ctrl = ctrl.as_device_ptr();
+        let data = data.as_device_ptr();
+        let global = global.as_device_ptr();
+        let buffers = RawExecBuffers {
+            ctrl: ctrl.as_ptr() as *const BabyBearElem,
+            data: data.as_ptr() as *const BabyBearElem,
+            global: global.as_ptr() as *const BabyBearElem,
+        };
+        let raw = RawHostChains {
+            heads: hc.heads.as_ptr(),
+            num_heads: hc.heads.len() as u32,
+            cycles: hc.cycles.as_ptr(),
+            rows: hc.rows.as_ptr(),
+            wom_idx: hc.wom_idx.as_ptr(),
+            wom_rows: hc.wom_rows.as_ptr(),
+            num_rows: hc.cycles.len() as u32,
+            data_cols: (hc.rows.len() / hc.cycles.len().max(1)) as u32,
+        };
+        // `hc` outlives the call, which synchronizes before returning.
+        ffi_wrap(|| unsafe {
+            risc0_circuit_recursion_cuda_witgen_chains(
+                mode,
+                &buffers,
+                preflight,
+                total_cycles,
+                &raw,
+            )
         })
     }
 }

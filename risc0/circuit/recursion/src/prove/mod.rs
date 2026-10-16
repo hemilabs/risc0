@@ -298,7 +298,8 @@ impl Prover {
                 );
             }
         }
-        #[cfg(feature = "cuda")]
+        // ROCm never splits (`split` is false there), so it takes the else branch.
+        #[cfg(any(feature = "cuda", feature = "rocm"))]
         if let Some(h) = early.take() {
             let t0 = std::time::Instant::now();
             // A panic on the early thread falls back like its error does.

@@ -385,7 +385,7 @@ where
             // Long chains from `prepare`, or computed here (a few ms of host time that saves
             // ~20 ms of single-thread GPU time).
             let mut chains = preflight.host_chains.lock().unwrap().take();
-            if chains.is_none() && cfg!(feature = "cuda") {
+            if chains.is_none() && cfg!(any(feature = "cuda", feature = "rocm")) {
                 chains = host_chains(zkr, preflight);
             } else if let Some(hc) = chains.as_mut() {
                 // Upload the chain rows from the page-locked copy, if there is one.
