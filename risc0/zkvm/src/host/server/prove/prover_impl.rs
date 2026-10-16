@@ -1215,7 +1215,7 @@ impl ProverImpl {
         // inputs in-circuit, so verifying the final receipt covers them. Above the
         // default po2 the recursion allows the wider set of control IDs, and so
         // must the verifier.
-        if !skip_verify {
+        let verify_succinct = |succinct_receipt: &SuccinctReceipt<ReceiptClaim>| -> Result<()> {
             let max_po2 = self.opts.max_segment_po2;
             let wide_ctx;
             let succinct_ctx = if max_po2 > crate::receipt::DEFAULT_MAX_PO2 {
@@ -1231,7 +1231,18 @@ impl ProverImpl {
             };
             succinct_receipt
                 .verify_integrity_with_context(succinct_ctx)
-                .context("verify succinct")?;
+                .context("verify succinct")
+        };
+        // C2-R3 PARVERIFY: for Groth16, verify the succinct receipt on a scoped thread alongside
+        // succinct_to_groth16 (CPU work beside identity_p254 and the wrap); joined, and its error
+        // returned, before the Groth16 receipt is. RISC0_CUDA_G16_TAIL=0 (the Groth16 tail
+        // switch, see risc0-groth16) verifies first.
+        let par_verify = !skip_verify
+            && self.opts.receipt_kind == ReceiptKind::Groth16
+            && pre_ident.is_none()
+            && std::env::var("RISC0_CUDA_G16_TAIL").as_deref() != Ok("0");
+        if !skip_verify && !par_verify {
+            verify_succinct(&succinct_receipt)?;
         }
 
         if self.opts.receipt_kind == ReceiptKind::Succinct {
@@ -1248,15 +1259,15 @@ impl ProverImpl {
 
         let groth16_receipt = if let Some(ident_receipt) = pre_ident {
             // identity_p254 already computed by recursion worker (overlapped with STARK).
-            use risc0_groth16::prove::shrink_wrap;
+            use risc0_groth16::prove::shrink_wrap_with;
             if let Err(e) = risc0_groth16::prove::prestart_prover() {
                 eprintln!("[groth16] prover prestart failed (non-fatal): {e}");
             }
             let t0 = std::time::Instant::now();
             let seal_bytes = ident_receipt.get_seal_bytes();
             // See `release_hal_buffers`: the wrap cannot reclaim what the STARK HAL is caching.
-            super::release_hal_buffers();
-            let seal = shrink_wrap(&seal_bytes)?.to_vec();
+            // Released while the wrap computes its witness on another thread.
+            let seal = shrink_wrap_with(&seal_bytes, super::release_hal_buffers)?.to_vec();
             super::release_hal_buffers();
             let wrap_ms = t0.elapsed().as_secs_f64() * 1000.0;
             eprintln!(
@@ -1270,6 +1281,17 @@ impl ProverImpl {
             };
             super::check_groth16_receipt(&groth16_receipt)?;
             groth16_receipt
+        } else if par_verify {
+            let succinct_receipt = &succinct_receipt;
+            let verify_succinct = &verify_succinct;
+            std::thread::scope(|sc| -> Result<_> {
+                let verify = sc.spawn(move || verify_succinct(succinct_receipt));
+                let groth16 = self.succinct_to_groth16(succinct_receipt);
+                verify
+                    .join()
+                    .map_err(|_| anyhow!("succinct verify thread panicked"))??;
+                groth16
+            })?
         } else {
             // succinct_to_groth16 verifies the receipt before returning it.
             self.succinct_to_groth16(&succinct_receipt)?

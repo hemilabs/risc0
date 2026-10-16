@@ -25,7 +25,7 @@ use std::rc::Rc;
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use risc0_core::field::baby_bear::{BabyBear, Elem, ExtElem};
-use risc0_groth16::prove::shrink_wrap;
+use risc0_groth16::prove::shrink_wrap_with;
 use risc0_zkp::hal::{CircuitHal, Hal};
 
 use self::{dev_mode::DevModeProver, prover_impl::ProverImpl};
@@ -221,10 +221,10 @@ pub trait ProverServer: private::Sealed {
         let seal_bytes = ident_receipt.get_seal_bytes();
         let seal_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
-        // Hand the GPU to the Groth16 prover, then take it back. See `release_hal_buffers`.
-        release_hal_buffers();
+        // Hand the GPU to the Groth16 prover, then take it back. See `release_hal_buffers`. The
+        // first release runs while the wrap computes its witness on another thread.
         let t2 = std::time::Instant::now();
-        let seal = shrink_wrap(&seal_bytes)?.to_vec();
+        let seal = shrink_wrap_with(&seal_bytes, release_hal_buffers)?.to_vec();
         release_hal_buffers();
         let wrap_ms = t2.elapsed().as_secs_f64() * 1000.0;
 
