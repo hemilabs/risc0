@@ -14,12 +14,12 @@
 
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fmt::Debug,
     marker::PhantomData,
     mem::ManuallyDrop,
     rc::Rc,
-    sync::{Once, OnceLock},
+    sync::{Mutex, MutexGuard, Once, OnceLock},
 };
 
 use anyhow::{bail, Context as _, Result};
@@ -53,8 +53,9 @@ use crate::{
     FRI_FOLD,
 };
 
-/// Thread-local pool of HIP device buffers, keyed by byte size.
+/// A device's pool of freed HIP buffers, keyed by byte size.
 /// Reuses freed buffers to avoid hipMalloc/hipFree overhead.
+#[derive(Default)]
 struct BufferPool {
     cache: HashMap<usize, Vec<HipDeviceBuffer>>,
     total_cached: usize,
@@ -64,13 +65,6 @@ const BUFFER_POOL_MAX_BYTES: usize = 16 << 30; // 16 GB
 const BUFFER_POOL_SMALL_THRESHOLD: usize = 64 << 10; // 64 KB - always pool small buffers
 
 impl BufferPool {
-    fn new() -> Self {
-        Self {
-            cache: HashMap::new(),
-            total_cached: 0,
-        }
-    }
-
     fn pop(&mut self, size: usize) -> Option<HipDeviceBuffer> {
         if let Some(bufs) = self.cache.get_mut(&size) {
             if let Some(buf) = bufs.pop() {
@@ -93,8 +87,24 @@ impl BufferPool {
     }
 }
 
+/// The buffer pools, one per device, shared by every thread: the prover proves segments, keccak
+/// and recursion on different threads, and with a pool per thread, the buffers one thread's
+/// segments left idle could not be released for another's proofs (`clear_buffer_pool`), nor
+/// counted when deciding to (`release_pool_unless_fits`).
+static BUFFER_POOLS: Mutex<BTreeMap<i32, BufferPool>> = Mutex::new(BTreeMap::new());
+
+fn buffer_pools() -> MutexGuard<'static, BTreeMap<i32, BufferPool>> {
+    BUFFER_POOLS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Bytes pooled for this thread's device.
+fn pooled_bytes() -> usize {
+    buffer_pools()
+        .get(&get_device_for_thread())
+        .map_or(0, |pool| pool.total_cached)
+}
+
 thread_local! {
-    static BUFFER_POOL: RefCell<BufferPool> = RefCell::new(BufferPool::new());
     /// Which HIP device this thread should use (default 0).
     static THREAD_DEVICE: Cell<i32> = Cell::new(0);
 }
@@ -225,15 +235,39 @@ pub fn recursion_device() -> Option<i32> {
 
 /// Release all cached GPU buffers back to the HIP runtime.
 ///
-/// The HAL keeps a thread-local pool of freed GPU buffers for reuse.
-/// Call this before operations that need the maximum available VRAM
-/// (e.g. Groth16 BN254 proving via sppark which uses its own allocator).
+/// The HAL keeps a pool of freed GPU buffers per device for reuse. Call this before operations
+/// that need the maximum available VRAM (e.g. Groth16 BN254 proving via sppark which uses its own
+/// allocator). Releases every device's pool.
 pub fn clear_buffer_pool() {
-    BUFFER_POOL.with(|pool| {
-        let mut pool = pool.borrow_mut();
-        pool.cache.clear();
-        pool.total_cached = 0;
-    });
+    // Take the pools out first, so the hipFrees run without the lock held.
+    let pools = std::mem::take(&mut *buffer_pools());
+    drop(pools);
+}
+
+/// Room to leave on the device beyond a new allocation before the pool is kept.
+const POOL_RELEASE_HEADROOM: usize = 256 << 20;
+
+/// Release the buffer pool if a new `size`-byte allocation would not fit in free device memory.
+///
+/// Waiting for hipMalloc to fail is not enough on Windows: there the driver backs an allocation
+/// beyond the card's memory with shared system memory instead of failing, so a pool of buffers
+/// kept from a large segment pushes every later allocation of another size off the card, and the
+/// kernels using it then run several times slower.
+fn release_pool_unless_fits(size: usize) {
+    if size < BUFFER_POOL_SMALL_THRESHOLD {
+        return;
+    }
+    let pooled = pooled_bytes();
+    if pooled == 0 {
+        return;
+    }
+    let mut free: usize = 0;
+    let mut total: usize = 0;
+    let err = unsafe { risc0_sys::hip::hipMemGetInfo(&mut free, &mut total) };
+    if err == risc0_sys::hip::HIP_SUCCESS && free < size.saturating_add(POOL_RELEASE_HEADROOM) {
+        tracing::debug!("releasing {pooled} pooled bytes: {size} requested, {free} free");
+        clear_buffer_pool();
+    }
 }
 
 // Per-device locks: prevents concurrent provers on the SAME device.
@@ -463,6 +497,8 @@ pub type HipHalPoseidon254 = HipHal<HipHashPoseidon254>;
 
 struct RawBuffer {
     name: &'static str,
+    /// The device it was allocated on, whose pool it returns to.
+    device: i32,
     buf: ManuallyDrop<HipDeviceBuffer>,
 }
 
@@ -470,25 +506,29 @@ impl RawBuffer {
     pub fn new(name: &'static str, size: usize) -> Self {
         tracing::trace!("alloc: {size} bytes, {name}");
         tracker().lock().unwrap().alloc(size);
-        let buf = BUFFER_POOL
-            .with(|pool| pool.borrow_mut().pop(size))
-            .unwrap_or_else(|| {
-                HipDeviceBuffer::uninitialized(size).unwrap_or_else(|_| {
-                    // OOM: clear the buffer pool to free cached GPU memory and retry.
-                    clear_buffer_pool();
-                    // Clear the stale HIP error from the failed hipMalloc above.
-                    // Without this, sppark's cudaGetLastError() picks up the old
-                    // "out of memory" error and panics even though the retry succeeds.
-                    unsafe {
-                        risc0_sys::hip::hipGetLastError();
-                    }
-                    HipDeviceBuffer::uninitialized(size)
-                        .context(format!("allocation failed on {name}: {size} bytes"))
-                        .unwrap()
-                })
-            });
+        let device = get_device_for_thread();
+        let pooled = buffer_pools()
+            .get_mut(&device)
+            .and_then(|pool| pool.pop(size));
+        let buf = pooled.unwrap_or_else(|| {
+            release_pool_unless_fits(size);
+            HipDeviceBuffer::uninitialized(size).unwrap_or_else(|_| {
+                // OOM: clear the buffer pool to free cached GPU memory and retry.
+                clear_buffer_pool();
+                // Clear the stale HIP error from the failed hipMalloc above.
+                // Without this, sppark's cudaGetLastError() picks up the old
+                // "out of memory" error and panics even though the retry succeeds.
+                unsafe {
+                    risc0_sys::hip::hipGetLastError();
+                }
+                HipDeviceBuffer::uninitialized(size)
+                    .context(format!("allocation failed on {name}: {size} bytes"))
+                    .unwrap()
+            })
+        });
         Self {
             name,
+            device,
             buf: ManuallyDrop::new(buf),
         }
     }
@@ -508,16 +548,10 @@ impl Drop for RawBuffer {
         // Safety: self.buf is not accessed after take() since we're in Drop,
         // and ManuallyDrop's own drop is a no-op.
         let buf = unsafe { ManuallyDrop::take(&mut self.buf) };
-        // During thread shutdown, TLS may already be destroyed. Use try_with
-        // to gracefully handle this — if the pool is gone, just drop the buffer
-        // directly (hipFree via HipDeviceBuffer's own Drop).
-        match BUFFER_POOL.try_with(|pool| pool.borrow_mut().push(size, buf)) {
-            Ok(()) => {}
-            Err(_) => {
-                // TLS destroyed; closure was never called, so `buf` (captured
-                // by the closure) drops here via HipDeviceBuffer::drop (hipFree).
-            }
-        }
+        buffer_pools()
+            .entry(self.device)
+            .or_default()
+            .push(size, buf);
     }
 }
 
@@ -1054,7 +1088,7 @@ impl<HH: HipHash + ?Sized> Hal for HipHal<HH> {
         let err = unsafe { risc0_sys::hip::hipMemGetInfo(&mut free, &mut total) };
         if err == risc0_sys::hip::HIP_SUCCESS {
             // Add pool contents to free count, since those are reclaimable.
-            let pool_bytes = BUFFER_POOL.with(|pool| pool.borrow().total_cached);
+            let pool_bytes = pooled_bytes();
             free + pool_bytes
         } else {
             usize::MAX
