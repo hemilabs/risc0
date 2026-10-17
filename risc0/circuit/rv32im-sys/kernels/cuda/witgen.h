@@ -72,8 +72,14 @@ struct MutableBufObj : public BufferObj {
       return 0;
     }
     size_t rows = buf.rows;
+#ifdef RISC0_ROWS_POW2
+    // rows is a power of two (the launcher checks), so there is no 64-bit modulo fallback
+    // in the code: its ~6400 inlined call sites bloated stepAccum's instruction footprint.
+    size_t backRow = (ctx.cycle - back) & (rows - 1);
+#else
     size_t backRow = ((rows & (rows - 1)) == 0) ? ((ctx.cycle - back) & (rows - 1))
                                                  : ((rows + ctx.cycle - back) % rows);
+#endif
     if (back > 0 && preDataBuf.buf) {
       return preDataBuf.get(backRow, col);
     }

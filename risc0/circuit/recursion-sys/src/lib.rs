@@ -177,3 +177,15 @@ extern "C" {
         total: u32,
     ) -> *const std::os::raw::c_char;
 }
+
+#[cfg(feature = "cuda")]
+extern "C" {
+    pub fn risc0_circuit_recursion_cuda_host_alloc(
+        bytes: usize,
+        out: *mut *mut std::ffi::c_void,
+    ) -> *const std::os::raw::c_char;
+
+    pub fn risc0_circuit_recursion_cuda_host_free(
+        p: *mut std::ffi::c_void,
+    ) -> *const std::os::raw::c_char;
+}

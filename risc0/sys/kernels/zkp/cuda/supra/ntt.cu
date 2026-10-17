@@ -252,6 +252,11 @@ sppark_batch_iNTT_zk_shift(fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly
   return RustError{cudaSuccess};
 }
 
+#ifndef __HIPCC__
+static bool nttq_expand_ntt(const gpu_t& gpu, fr_t* d_out, fr_t* d_in, uint32_t lg,
+                            uint32_t lg_blowup, uint32_t poly_count);
+#endif
+
 extern "C" RustError::by_value
 sppark_batch_expand_NTT(fr_t* d_out, fr_t* d_in,
                         uint32_t lg_domain_size, uint32_t lg_blowup, uint32_t poly_count) {
@@ -265,6 +270,12 @@ sppark_batch_expand_NTT(fr_t* d_out, fr_t* d_in,
   const gpu_t& gpu = select_gpu(-1);
 
   try {
+#ifndef __HIPCC__
+    if (nttq_expand_ntt(gpu, d_out, d_in, lg_domain_size, lg_blowup, poly_count)) {
+      gpu.sync();
+      return RustError{cudaSuccess};
+    }
+#endif
     // Batched expand: single kernel for all columns
     launch_batch_expand(gpu, d_out, d_in, domain_size, lg_domain_size, lg_blowup, poly_count);
 
@@ -319,6 +330,17 @@ sppark_batch_bit_reverse(fr_t* d_inout, uint32_t lg_domain_size, uint32_t poly_c
 #ifndef __HIPCC__
 // Fused commit NTT and its batched helpers (ntt_x.cuh; CUDA only, untested on ROCm).
 #include "ntt_x.cuh"
+
+// Two-pass LDE of bit-reversed coefficients (d_in is restored to bit-reversed order).
+static bool nttq_expand_ntt(const gpu_t& gpu, fr_t* d_out, fr_t* d_in, uint32_t lg,
+                            uint32_t lg_blowup, uint32_t poly_count) {
+  if (!nttq::supported(lg, lg_blowup) || !nttq::enabled())
+    return false;
+  bitrev_batched(gpu, d_in, lg, poly_count);
+  nttq::forward(gpu, d_out, d_in, lg, lg_blowup, poly_count);
+  bitrev_batched(gpu, d_in, lg, poly_count);
+  return true;
+}
 
 // Batched iNTT + zk-shift: the per-column iNTTs, then one zk-shift kernel over all columns.
 extern "C" RustError::by_value

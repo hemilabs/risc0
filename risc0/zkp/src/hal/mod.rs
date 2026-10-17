@@ -548,6 +548,20 @@ mod testutil {
         hal.batch_expand_into_evaluate_ntt(&output, &input, count, expand_bits);
     }
 
+    pub(crate) fn batch_expand_into_evaluate_ntt_large<H: Hal>(hal_gpu: H) {
+        let mut rng = rand::rng();
+        let hal_cpu = CpuHal::new(hal_gpu.get_hash_suite().clone());
+        let hal = DualHal::new(Rc::new(hal_cpu), Rc::new(hal_gpu));
+        for (po2, count) in [(16, 5), (17, 3), (18, 3), (19, 2), (20, 3), (21, 2)] {
+            let steps = 1 << po2;
+            let input = generate_elem(&hal, &mut rng, count * steps);
+            let output = hal.alloc_elem("output", count * steps * INV_RATE);
+            hal.batch_expand_into_evaluate_ntt(&output, &input, count, 2);
+            // a second call checks that the input was left unchanged
+            hal.batch_expand_into_evaluate_ntt(&output, &input, count, 2);
+        }
+    }
+
     pub(crate) fn batch_interpolate_ntt<H: Hal>(hal_gpu: H) {
         let mut rng = rand::rng();
         let hal_cpu = CpuHal::new(hal_gpu.get_hash_suite().clone());
@@ -721,7 +735,8 @@ mod testutil {
     pub(crate) fn hash_fold_tree<H: Hal>(hal_gpu: H) {
         let mut rng = rand::rng();
         let hal_cpu = CpuHal::new(hal_gpu.get_hash_suite().clone());
-        for layers in [1, 2, 7, 12] {
+        // 13 and 14 reach the quad-per-permutation small-level kernels (pv_small.cuh, 2048 < n <= 8192).
+        for layers in [1, 2, 7, 12, 13, 14] {
             let leaves = 1 << layers;
             let digests: Vec<Digest> = (0..leaves * 2)
                 .map(|_| Digest::from(std::array::from_fn(|_| rng.next_u32() / 3)))
@@ -743,7 +758,8 @@ mod testutil {
         let hal = DualHal::new(Rc::new(hal_cpu), Rc::new(hal_gpu));
         // Includes every column count the provers hash (1, 12, 16, 23, 64, 103, 128, 211) and
         // rows past one CUDA block.
-        let rows = [1, 2, 3, 4, 10, 129, 1000];
+        // 2049..8193 cover the warp / quad / thread-per-hash boundaries of pv_small.cuh.
+        let rows = [1, 2, 3, 4, 10, 129, 1000, 2048, 2049, 8192, 8193];
         let cols = [1, 12, 16, 23, 32, 64, 103, 128, 211];
         for row_count in rows {
             for col_count in cols {
@@ -783,6 +799,12 @@ mod testutil {
             (16, 211),
             (18, 5),
             (21, 2),
+            (20, 9),
+            (21, 3),
+            (22, 1),
+            (17, 7),
+            (19, 3),
+            (18, 33),
         ] {
             assert!(hal_gpu.has_commit_coeffs_lde(po2));
             let size = (1 << po2) * count;

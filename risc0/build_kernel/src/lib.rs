@@ -39,6 +39,7 @@ pub struct KernelBuild {
     kernel_type: KernelType,
     flags: Vec<String>,
     files: Vec<PathBuf>,
+    own_thread_files: Vec<PathBuf>,
     inc_dirs: Vec<PathBuf>,
     deps: Vec<PathBuf>,
 }
@@ -49,6 +50,7 @@ impl KernelBuild {
             kernel_type,
             flags: Vec::new(),
             files: Vec::new(),
+            own_thread_files: Vec::new(),
             inc_dirs: Vec::new(),
             deps: Vec::new(),
         }
@@ -81,6 +83,27 @@ impl KernelBuild {
         for file in p.into_iter() {
             self.file(file);
         }
+        self
+    }
+
+    /// Add files which will be compiled (C++ only) each on a thread of its own, started before
+    /// the other files, with the same command `cc` would run.
+    ///
+    /// For a few huge generated files on the critical path of the build: through `cc`'s queue
+    /// they could start long after the rest of the build script's work. The first of them runs
+    /// on the build script's own jobserver token, each other one acquires a token of cargo's
+    /// jobserver first, so the build stays within its job limit.
+    pub fn files_on_own_threads<P>(&mut self, p: P) -> &mut KernelBuild
+    where
+        P: IntoIterator,
+        P::Item: AsRef<Path>,
+    {
+        assert!(
+            self.kernel_type == KernelType::Cpp,
+            "files_on_own_threads is only supported for C++ kernels"
+        );
+        self.own_thread_files
+            .extend(p.into_iter().map(|f| f.as_ref().to_path_buf()));
         self
     }
 
@@ -118,7 +141,7 @@ impl KernelBuild {
 
     pub fn compile(&mut self, output: &str) {
         println!("cargo:rerun-if-env-changed=RISC0_SKIP_BUILD_KERNELS");
-        for src in self.files.iter() {
+        for src in self.files.iter().chain(&self.own_thread_files) {
             rerun_if_changed(src);
         }
         for dep in self.deps.iter() {
@@ -152,12 +175,65 @@ impl KernelBuild {
         build
             .cpp(true)
             .debug(false)
-            .files(&self.files)
             .includes(&self.inc_dirs)
             .flag_if_supported("-fno-var-tracking")
             .flag_if_supported("-fno-var-tracking-assignments")
-            .flag_if_supported("-g0")
-            .compile(output);
+            .flag_if_supported("-g0");
+        if self.own_thread_files.is_empty() {
+            build.files(&self.files).compile(output);
+            return;
+        }
+        assert!(
+            !self.files.is_empty(),
+            "files_on_own_threads needs at least one other file for cc to archive"
+        );
+
+        let out_dir = env::var("OUT_DIR").map(PathBuf::from).unwrap();
+        let obj_dir = out_dir.join("own_thread");
+        fs::create_dir_all(&obj_dir).unwrap();
+        let msvc = is_msvc_target();
+        // SAFETY: the descriptors named in the environment are the jobserver cargo hands every
+        // build script, open for its whole run (`cc` connects the same way; any number of calls
+        // is allowed). None outside cargo: the threads then run unbounded.
+        let jobserver = unsafe { jobserver::Client::from_env() };
+        let objs = std::thread::scope(|scope| {
+            let threads: Vec<_> = self
+                .own_thread_files
+                .iter()
+                .enumerate()
+                .map(|(i, src)| {
+                    let jobserver = jobserver.as_ref();
+                    let obj = obj_dir
+                        .join(src.file_stem().unwrap())
+                        .with_extension(object_extension());
+                    // The arguments `cc` passes for each of its files, after the flags.
+                    let mut cmd = build.get_compiler().to_command();
+                    if msvc {
+                        cmd.arg(format!("-Fo{}", obj.display()));
+                    } else {
+                        cmd.arg("-o").arg(&obj);
+                    }
+                    cmd.arg("-c").arg(src);
+                    scope.spawn(move || {
+                        // The first file uses the token this build script runs on.
+                        let _token = (i > 0)
+                            .then(|| jobserver.and_then(|js| js.acquire().ok()))
+                            .flatten();
+                        let status = cmd.status().unwrap_or_else(|e| {
+                            panic!("failed to run the C++ compiler for {}: {e}", src.display())
+                        });
+                        assert!(status.success(), "failed to compile {}", src.display());
+                        obj
+                    })
+                })
+                .collect();
+            build.files(&self.files).compile(output);
+            threads
+                .into_iter()
+                .map(|t| t.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        add_to_static_lib(&out_dir, output, &objs);
     }
 
     fn compile_cuda(&mut self, output: &str) {
@@ -435,6 +511,17 @@ pub fn nvcc_command() -> Command {
     cmd
 }
 
+/// The `-ccbin` argument for a direct nvcc invocation with a GCC/Clang host compiler: the
+/// compiler named by `NVCC_CCBIN` when set (as for the `cc` builds, where nvcc reads it), else
+/// `c++`. Part of the command, so a cache keyed by [`command_key`] follows it.
+pub fn nvcc_ccbin_arg() -> String {
+    println!("cargo:rerun-if-env-changed=NVCC_CCBIN");
+    match env::var("NVCC_CCBIN") {
+        Ok(ccbin) if !ccbin.is_empty() => format!("-ccbin={ccbin}"),
+        _ => "-ccbin=c++".to_string(),
+    }
+}
+
 /// The C++ standard flag for nvcc. The generated circuit layouts (e.g.
 /// keccak-sys's `layout.cu.inc`) use designated initializers, a C++20 feature
 /// that GCC/Clang also accept in C++17 mode; MSVC, and nvcc's front end in MSVC
@@ -474,13 +561,19 @@ pub fn msvc_toolkit_include_dir() -> PathBuf {
     let include = cuda_toolkit_dir().join("include");
     let cuda_h = include.join("cuda.h");
     // CUDA 13 moved the CCCL headers (libcudacxx among them) under include/cccl.
-    let cuda_std_array = [include.join("cuda/std/array"), include.join("cccl/cuda/std/array")]
-        .into_iter()
-        .find(|p| p.is_file());
-    assert!(cuda_h.is_file(), "CUDA toolkit header not found at {}", cuda_h.display());
-    let cuda_std_array = cuda_std_array.unwrap_or_else(|| {
-        panic!("<cuda/std/array> not found under {}", include.display())
-    });
+    let cuda_std_array = [
+        include.join("cuda/std/array"),
+        include.join("cccl/cuda/std/array"),
+    ]
+    .into_iter()
+    .find(|p| p.is_file());
+    assert!(
+        cuda_h.is_file(),
+        "CUDA toolkit header not found at {}",
+        cuda_h.display()
+    );
+    let cuda_std_array = cuda_std_array
+        .unwrap_or_else(|| panic!("<cuda/std/array> not found under {}", include.display()));
 
     let dir = PathBuf::from(env::var("OUT_DIR").unwrap()).join("risc0_msvc_include");
     fs::create_dir_all(&dir).unwrap();
@@ -489,7 +582,11 @@ pub fn msvc_toolkit_include_dir() -> PathBuf {
         ("risc0_toolkit_cuda_std_array.h", &cuda_std_array),
     ] {
         let path = target.to_string_lossy().replace('\\', "/");
-        fs::write(dir.join(name), format!("#pragma once\n#include \"{path}\"\n")).unwrap();
+        fs::write(
+            dir.join(name),
+            format!("#pragma once\n#include \"{path}\"\n"),
+        )
+        .unwrap();
     }
     dir
 }
@@ -505,9 +602,9 @@ fn cuda_toolkit_dir() -> PathBuf {
             }
         }
     }
-    env::var("CUDA_PATH").map(PathBuf::from).expect(
-        "cannot locate the CUDA toolkit: set CUDA_PATH, or NVCC to the full path of nvcc",
-    )
+    env::var("CUDA_PATH")
+        .map(PathBuf::from)
+        .expect("cannot locate the CUDA toolkit: set CUDA_PATH, or NVCC to the full path of nvcc")
 }
 
 /// File extension for an object file on the target toolchain.
@@ -534,7 +631,11 @@ pub fn add_to_static_lib(out_dir: &Path, name: &str, objs: &[PathBuf]) {
         }
         cmd.args(objs);
         let status = cmd.status().expect("failed to run lib.exe");
-        assert!(status.success(), "lib.exe failed to build {}", lib.display());
+        assert!(
+            status.success(),
+            "lib.exe failed to build {}",
+            lib.display()
+        );
     } else {
         let lib = out_dir.join(format!("lib{name}.a"));
         let status = Command::new(find_ar_tool())

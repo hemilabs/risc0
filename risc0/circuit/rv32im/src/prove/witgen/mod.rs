@@ -14,6 +14,8 @@
 
 pub(crate) mod bigint;
 pub(crate) mod byte_poly;
+#[cfg(feature = "cuda")]
+pub(crate) mod cuda_stage;
 pub(crate) mod paged_map;
 pub(crate) mod poseidon2;
 pub(crate) mod preflight;
@@ -26,6 +28,26 @@ use std::{iter::zip, sync::LazyLock};
 use anyhow::{Context, Result};
 
 static VERBOSE: LazyLock<bool> = LazyLock::new(|| std::env::var("RISC0_VERBOSE").is_ok());
+
+/// On CUDA the witgen kernel writes the five per-cycle columns (CYCLE_COLS) from the uploaded
+/// cycles, so the host injector leaves them out (5 of its ~5.1 entries per row at po2=20).
+/// Part of the witgen staging feature (`RISC0_CUDA_WITGEN_STAGE=0` keeps them in the injector).
+static DEFER_CYCLE_COLS: LazyLock<bool> = LazyLock::new(|| {
+    #[cfg(feature = "cuda")]
+    return cuda_stage::enabled();
+    #[cfg(not(feature = "cuda"))]
+    false
+});
+
+/// Data columns set for every row from its preflight cycle: cycle, next_pc_low, next_pc_high,
+/// next_state, next_machine_mode (in this order; the CUDA kernel takes them as such).
+pub(crate) const CYCLE_COLS: [u32; 5] = [
+    LAYOUT_TOP.cycle._super.offset as u32,
+    LAYOUT_TOP.next_pc_low._super.offset as u32,
+    LAYOUT_TOP.next_pc_high._super.offset as u32,
+    LAYOUT_TOP.next_state_0._super.offset as u32,
+    LAYOUT_TOP.next_machine_mode._super.offset as u32,
+];
 use preflight::PreflightTrace;
 use rayon::prelude::*;
 use risc0_binfmt::{PovwNonce, WordAddr};
@@ -68,7 +90,9 @@ impl PreflightResults {
     pub fn new(segment: &Segment, rand_z: ExtVal) -> Result<Self> {
         scope!("preflight_result_new");
 
+        let tp0 = std::time::Instant::now();
         let trace = segment.preflight(rand_z)?;
+        let tp1 = std::time::Instant::now();
 
         tracing::trace!("{segment:#?}");
         tracing::trace!("{trace:#?}");
@@ -78,7 +102,23 @@ impl PreflightResults {
         let cycles = 1 << segment.po2;
 
         let global = build_global_vec(segment, &trace);
+        let mut trace = trace;
+        trace.cycle_cols_deferred = *DEFER_CYCLE_COLS;
         let (injector, bigint_rows) = build_injector(&trace, cycles);
+        // Stage the trace for the GPU upload here, on the preflight thread, off the critical path.
+        let tp2 = std::time::Instant::now();
+        #[cfg(feature = "cuda")]
+        {
+            trace.staged = cuda_stage::stage(&trace);
+        }
+        tracing::debug!(
+            "preflight: trace={:.1}ms global+injector={:.1}ms stage={:.1}ms (cycles={} txns={})",
+            (tp1 - tp0).as_secs_f64() * 1000.0,
+            (tp2 - tp1).as_secs_f64() * 1000.0,
+            tp2.elapsed().as_secs_f64() * 1000.0,
+            trace.cycles.len(),
+            trace.txns.len(),
+        );
 
         Ok(Self {
             global,
@@ -291,6 +331,20 @@ where
         if let Some(ref pd) = pre_data_buf {
             hal.scatter_bits(&pd.buf, &injector.bit_data, cycles as u32);
         }
+        // The injector left out the per-cycle columns: write them from the host where the
+        // circuit HAL doesn't (and always into pre_data), after the back entries as before.
+        if trace.cycle_cols_deferred {
+            let host_data = !circuit_hal.writes_cycle_cols();
+            if host_data || pre_data_buf.is_some() {
+                let cols = build_cycle_col_injector(trace, cycles);
+                if host_data {
+                    hal.scatter(&data.buf, &cols.index, &cols.offsets, &cols.values);
+                }
+                if let Some(ref pd) = pre_data_buf {
+                    hal.scatter(&pd.buf, &cols.index, &cols.offsets, &cols.values);
+                }
+            }
+        }
         let tw4 = std::time::Instant::now();
         if *VERBOSE {
             eprintln!("      [scatter_detail] s1={:.1}ms s2={:.1}ms sb1={:.1}ms sb2={:.1}ms total={:.1}ms",
@@ -360,7 +414,8 @@ where
         let mut bigint_accum = BigIntAccum::new(last_mix);
 
         for &row in &self.bigint_rows {
-            if let Back::BigInt(state) = &self.trace.backs[row] {
+            if let Back::BigInt(idx) = self.trace.backs[row] {
+                let state = &self.trace.bigint_states[idx as usize];
                 bigint_accum.step(state)?;
                 for (col, value) in zip(BigIntAccumState::offsets(), bigint_accum.state.as_array())
                 {
@@ -411,9 +466,11 @@ where
             );
         }
 
-        scope!("zeroize(accum)", {
-            hal.eltwise_zeroize_elem(&accum_buf.buf);
-        });
+        if !circuit_hal.step_accum_zeroizes() {
+            scope!("zeroize(accum)", {
+                hal.eltwise_zeroize_elem(&accum_buf.buf);
+            });
+        }
         if *VERBOSE {
             eprintln!(
                 "    [accum] zeroize: {:.1}ms",
@@ -432,9 +489,25 @@ where
     }
 }
 
+/// Serial preflight post-processing on the preflight thread (RISC0_CUDA_SERIAL_PREFLIGHT=0
+/// restores the rayon versions): the injector build when the cycle columns are deferred, and the pinned
+/// staging copy (`cuda_stage`). The preflight thread runs beside the proving thread's own rayon
+/// work, and on a loaded host the rayon versions waited for busy workers: at +32 runnable threads
+/// the parallel injector took 54-106 ms vs 2.6 ms serial (only ~0.1 entries per row remain once
+/// the cycle columns are deferred), and the parallel stage copy 29.6 vs 15.5 ms. On a quiet host
+/// the parallel versions win by under 2 ms, off the critical path.
+pub(crate) static SERIAL_PREFLIGHT: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("RISC0_CUDA_SERIAL_PREFLIGHT").as_deref() != Ok("0"));
+
 fn build_injector(trace: &PreflightTrace, cycles: usize) -> (Injector, Vec<usize>) {
     scope!("build_injector");
+    if trace.cycle_cols_deferred && *SERIAL_PREFLIGHT {
+        return build_injector_serial(trace, cycles);
+    }
+    build_injector_parallel(trace, cycles)
+}
 
+fn build_injector_parallel(trace: &PreflightTrace, cycles: usize) -> (Injector, Vec<usize>) {
     const CYCLE_COL: usize = LAYOUT_TOP.cycle._super.offset;
     const NEXT_PC_LOW: usize = LAYOUT_TOP.next_pc_low._super.offset;
     const NEXT_PC_HIGH: usize = LAYOUT_TOP.next_pc_high._super.offset;
@@ -446,20 +519,24 @@ fn build_injector(trace: &PreflightTrace, cycles: usize) -> (Injector, Vec<usize
     const SET_CYCLE_COUNT: u32 = 5;
 
     let n = trace.backs.len();
+    let cycle_cols = !trace.cycle_cols_deferred;
+    let set_cycle_count = if cycle_cols { SET_CYCLE_COUNT } else { 0 };
 
     // Steps 1+2: Compute exclusive prefix sums in a single pass.
     // scatter entries (without SHA2 u32 bit decomposition — those go to bit_data)
     let mut index = Vec::with_capacity(n + 1);
+    advise_huge(&index);
     index.push(0u32);
     let mut total = 0u32;
     // bit entries: each SHA2 u32 becomes one packed (row, base_col, value) triple
     let mut bit_index = Vec::with_capacity(n + 1);
+    advise_huge(&bit_index);
     bit_index.push(0u32);
     let mut bit_total = 0u32;
     // Pre-extract BigInt row indices for accum phase (avoids 1M-entry scan later)
     let mut bigint_rows = Vec::new();
     for (row, back) in trace.backs.iter().enumerate() {
-        total += SET_CYCLE_COUNT
+        total += set_cycle_count
             + match back {
                 Back::None => 0,
                 Back::Ecall(..) => 3,
@@ -483,6 +560,8 @@ fn build_injector(trace: &PreflightTrace, cycles: usize) -> (Injector, Vec<usize
     // Step 3: Pre-allocate output arrays (skip zero-fill since every element is overwritten)
     let mut offsets = Vec::<u32>::with_capacity(total);
     let mut values = Vec::<Val>::with_capacity(total);
+    advise_huge(&offsets);
+    advise_huge(&values);
     // SAFETY: All elements [0..total) will be written by the parallel fill below.
     unsafe {
         offsets.set_len(total);
@@ -490,6 +569,7 @@ fn build_injector(trace: &PreflightTrace, cycles: usize) -> (Injector, Vec<usize
     }
     // Packed (row, base_col, value) triples for GPU-side bit decomposition
     let mut bit_data = Vec::<u32>::with_capacity(bit_total * 3);
+    advise_huge(&bit_data);
     unsafe {
         bit_data.set_len(bit_total * 3);
     }
@@ -539,12 +619,14 @@ fn build_injector(trace: &PreflightTrace, cycles: usize) -> (Injector, Vec<usize
                 set(ECALL_S1, *s1);
                 set(ECALL_S2, *s2);
             }
-            Back::Poseidon2(p2_state) => {
+            Back::Poseidon2(idx) => {
+                let p2_state = &trace.p2_states[*idx as usize];
                 for (col, value) in zip(Poseidon2State::offsets(), p2_state.as_array()) {
                     set(col, value);
                 }
             }
-            Back::Sha2(sha2_state) => {
+            Back::Sha2(idx) => {
+                let sha2_state = &trace.sha2_states[*idx as usize];
                 for (col, value) in zip(Sha2State::fp_offsets(), sha2_state.fp_array()) {
                     set(col, value);
                 }
@@ -552,19 +634,29 @@ fn build_injector(trace: &PreflightTrace, cycles: usize) -> (Injector, Vec<usize
                     set_bits(col, value);
                 }
             }
-            Back::BigInt(state) => {
+            Back::BigInt(idx) => {
+                let state = &trace.bigint_states[*idx as usize];
                 for (col, value) in zip(BigIntState::offsets(), state.as_array()) {
                     set(col, value);
                 }
             }
         }
 
-        set(CYCLE_COL, row as u32);
-        set(NEXT_PC_LOW, cycle.pc & 0xffff);
-        set(NEXT_PC_HIGH, cycle.pc >> 16);
-        set(NEXT_STATE, cycle.state);
-        set(NEXT_MACHINE_MODE, cycle.machine_mode as u32);
+        if cycle_cols {
+            set(CYCLE_COL, row as u32);
+            set(NEXT_PC_LOW, cycle.pc & 0xffff);
+            set(NEXT_PC_HIGH, cycle.pc >> 16);
+            set(NEXT_STATE, cycle.state);
+            set(NEXT_MACHINE_MODE, cycle.machine_mode as u32);
+        }
     });
+
+    // Rows without entries (most of them once the cycle columns are left out) add nothing to
+    // the scatter but one thread each: drop their (repeated) bounds. Same writes in the same
+    // per-row order; the scatter kernel never needs the row number.
+    if !cycle_cols {
+        index.dedup();
+    }
 
     (
         Injector {
@@ -576,6 +668,107 @@ fn build_injector(trace: &PreflightTrace, cycles: usize) -> (Injector, Vec<usize
         },
         bigint_rows,
     )
+}
+
+/// [`build_injector`] without the cycle columns, in one serial pass: the same entries in the same
+/// (row) order, and the same deduplicated row bounds.
+fn build_injector_serial(trace: &PreflightTrace, cycles: usize) -> (Injector, Vec<usize>) {
+    const ECALL_S0: usize = LAYOUT_TOP.inst_result.arm8.s0._super.offset;
+    const ECALL_S1: usize = LAYOUT_TOP.inst_result.arm8.s1._super.offset;
+    const ECALL_S2: usize = LAYOUT_TOP.inst_result.arm8.s2._super.offset;
+    debug_assert!(trace.cycle_cols_deferred);
+
+    let mut offsets = Vec::<u32>::new();
+    let mut values = Vec::<Val>::new();
+    let mut bit_data = Vec::<u32>::new();
+    let mut bigint_rows = Vec::new();
+    // Row bounds, deduplicated as `index.dedup()` does in the parallel version: a bound is
+    // pushed only when it differs from the previous one (rows with entries end a run).
+    let mut index = vec![0u32];
+    for (row, back) in trace.backs.iter().enumerate() {
+        let mut set = |col: usize, value: u32| {
+            offsets.push((col * cycles + row) as u32);
+            values.push(Val::new(value));
+        };
+        match back {
+            Back::None => continue,
+            Back::Ecall(s0, s1, s2) => {
+                set(ECALL_S0, *s0);
+                set(ECALL_S1, *s1);
+                set(ECALL_S2, *s2);
+            }
+            Back::Poseidon2(idx) => {
+                let p2_state = &trace.p2_states[*idx as usize];
+                for (col, value) in zip(Poseidon2State::offsets(), p2_state.as_array()) {
+                    set(col, value);
+                }
+            }
+            Back::Sha2(idx) => {
+                let sha2_state = &trace.sha2_states[*idx as usize];
+                for (col, value) in zip(Sha2State::fp_offsets(), sha2_state.fp_array()) {
+                    set(col, value);
+                }
+                for (col, value) in zip(Sha2State::u32_offsets(), sha2_state.u32_array()) {
+                    bit_data.extend_from_slice(&[row as u32, col as u32, value]);
+                }
+            }
+            Back::BigInt(idx) => {
+                bigint_rows.push(row);
+                let state = &trace.bigint_states[*idx as usize];
+                for (col, value) in zip(BigIntState::offsets(), state.as_array()) {
+                    set(col, value);
+                }
+            }
+        }
+        let end = offsets.len() as u32;
+        if *index.last().unwrap() != end {
+            index.push(end);
+        }
+    }
+
+    (
+        Injector {
+            rows: cycles,
+            offsets,
+            values,
+            index,
+            bit_data,
+        },
+        bigint_rows,
+    )
+}
+
+/// The per-cycle columns (CYCLE_COLS) as an injector, for HALs that don't write them.
+fn build_cycle_col_injector(trace: &PreflightTrace, cycles: usize) -> Injector {
+    let n = trace.cycles.len();
+    let index: Vec<u32> = (0..=n).map(|row| (row * CYCLE_COLS.len()) as u32).collect();
+    let mut offsets = vec![0u32; n * CYCLE_COLS.len()];
+    let mut values = vec![Val::ZERO; n * CYCLE_COLS.len()];
+    offsets
+        .par_chunks_mut(CYCLE_COLS.len())
+        .zip(values.par_chunks_mut(CYCLE_COLS.len()))
+        .enumerate()
+        .for_each(|(row, (offs, vals))| {
+            let cycle = &trace.cycles[row];
+            let v = [
+                row as u32,
+                cycle.pc & 0xffff,
+                cycle.pc >> 16,
+                cycle.state,
+                cycle.machine_mode as u32,
+            ];
+            for i in 0..CYCLE_COLS.len() {
+                offs[i] = (CYCLE_COLS[i] as usize * cycles + row) as u32;
+                vals[i] = Val::new(v[i]);
+            }
+        });
+    Injector {
+        rows: cycles,
+        offsets,
+        values,
+        index,
+        bit_data: vec![],
+    }
 }
 
 fn build_global_vec(segment: &Segment, trace: &PreflightTrace) -> Vec<Val> {
@@ -703,4 +896,44 @@ fn node_addr_to_idx(addr: WordAddr) -> u32 {
 
 fn node_idx_to_addr(idx: u32) -> WordAddr {
     MERKLE_TREE_END_ADDR - idx * DIGEST_WORDS as u32
+}
+
+/// Advise the kernel to back a freshly allocated (not yet touched) vector with transparent huge
+/// pages. The preflight trace and injector vectors are ~250 MB at po2=20, written once per segment;
+/// with 4 KB pages their page faults were ~half of preflight time (preflight body 80 -> 42 ms at
+/// po2=20), and the first segment's preflight is on the critical path. Huge pages also make the
+/// background munmap of the trace short, which otherwise holds the process mmap lock for 10-30 ms
+/// and stalls concurrent driver calls that map memory. Only whole 2 MB pages inside the
+/// allocation are advised; contents are unaffected. RISC0_CUDA_THP=0 disables it. Linux only.
+pub(crate) fn advise_huge<T>(v: &Vec<T>) {
+    #[cfg(target_os = "linux")]
+    {
+        static ON: LazyLock<bool> =
+            LazyLock::new(|| std::env::var("RISC0_CUDA_THP").as_deref() != Ok("0"));
+        const HUGE: usize = 2 << 20;
+        const MADV_HUGEPAGE: std::os::raw::c_int = 14;
+        extern "C" {
+            fn madvise(
+                addr: *mut std::os::raw::c_void,
+                len: usize,
+                advice: std::os::raw::c_int,
+            ) -> std::os::raw::c_int;
+        }
+        let bytes = v.capacity() * std::mem::size_of::<T>();
+        if !*ON || bytes < 2 * HUGE {
+            return;
+        }
+        let start = v.as_ptr() as usize;
+        let lo = (start + HUGE - 1) & !(HUGE - 1);
+        let hi = (start + bytes) & !(HUGE - 1);
+        if hi > lo {
+            // SAFETY: [lo, hi) lies inside the vector's allocation; MADV_HUGEPAGE only changes
+            // how the kernel backs the pages, never their contents.
+            unsafe {
+                madvise(lo as *mut std::os::raw::c_void, hi - lo, MADV_HUGEPAGE);
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = v;
 }

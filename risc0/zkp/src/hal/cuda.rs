@@ -53,7 +53,29 @@ struct BufferPool {
     total_cached: usize,
 }
 
-const BUFFER_POOL_MAX_BYTES: usize = 16 << 30; // 16 GB
+const BUFFER_POOL_MAX_BYTES: usize = 16 << 30; // 16 GB (floor of the cap)
+/// Headroom the pool cap leaves below the device's total memory.
+const BUFFER_POOL_HEADROOM: usize = 8 << 30; // 8 GB
+
+/// Cap on the bytes of large buffers the pool caches: max(16 GB, device total - 8 GB), i.e.
+/// (of device 0, the HAL's only device: see `CudaHal::new_from_hash`; hosts with several GPUs run a
+/// process per GPU with `CUDA_VISIBLE_DEVICES`, as r0vm does),
+/// 24 GB on a 32 GB card, where the fixed 16 GB cap freed (and later re-allocated with a cold
+/// cuMemAlloc) part of a po2=21 segment's working set every segment. RISC0_CUDA_POOL_MAX_GB
+/// overrides it (16 = the previous behavior). Evaluated on the first push, when a context is
+/// current.
+static POOL_MAX: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    if let Some(g) = std::env::var("RISC0_CUDA_POOL_MAX_GB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        return g << 30;
+    }
+    match cust::memory::mem_get_info() {
+        Ok((_free, total)) => BUFFER_POOL_MAX_BYTES.max(total.saturating_sub(BUFFER_POOL_HEADROOM)),
+        Err(_) => BUFFER_POOL_MAX_BYTES,
+    }
+});
 const BUFFER_POOL_SMALL_THRESHOLD: usize = 64 << 10; // 64 KB - always pool small buffers
 
 impl BufferPool {
@@ -77,7 +99,7 @@ impl BufferPool {
     fn push(&mut self, size: usize, buf: DeviceBuffer<u8>) {
         // Always pool small buffers (cuMemFree overhead > storage cost).
         // Only enforce cap for large buffers.
-        if size >= BUFFER_POOL_SMALL_THRESHOLD && self.total_cached + size > BUFFER_POOL_MAX_BYTES {
+        if size >= BUFFER_POOL_SMALL_THRESHOLD && self.total_cached + size > *POOL_MAX {
             drop(buf);
             return;
         }
@@ -123,6 +145,65 @@ fn trim_cuda_mempool() {
     }
 }
 
+/// Called by raw device allocations in the kernel libraries (`risc0_cuda_malloc` in
+/// `device_alloc.h`: nttq scratch, the rv32im preflight slots, sort keys) when cudaMalloc fails:
+/// releases this thread's cached buffers and trims the mempool, so the allocation can be retried,
+/// as `RawBuffer::new` does for the HAL's own allocations. Those callers run on the proving
+/// thread, which owns the pool that holds the memory.
+extern "C" fn drain_pool_on_oom() {
+    let _ = std::panic::catch_unwind(|| {
+        run_release_hooks(true);
+        let released = BUFFER_POOL
+            .try_with(|pool| {
+                pool.try_borrow_mut()
+                    .map(|mut pool| {
+                        let cached = pool.total_cached;
+                        pool.drain();
+                        cached
+                    })
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        trim_cuda_mempool();
+        tracing::debug!(
+            "raw device allocation failed: released {:.2} GiB of cached buffers, retrying",
+            released as f64 / (1u64 << 30) as f64
+        );
+    });
+}
+
+/// Caches kept outside this HAL's pool by the circuit crates: device scratch of their kernel
+/// libraries, and host staging pools (pinned buffers, recycled trace vectors).
+static RELEASE_HOOKS: std::sync::Mutex<Vec<fn(bool)>> = std::sync::Mutex::new(Vec::new());
+
+/// Register `hook` (once; repeated registrations of the same function are ignored) to release a
+/// cache that `clear_buffer_pool` cannot see. It is called with `device_only = false` by
+/// [clear_buffer_pool] (free everything that can be rebuilt: device scratch not in use, host
+/// pools), and with `device_only = true` when a raw device allocation fails on the proving thread
+/// (free device memory not in use right now). It must not block on locks its own code may hold
+/// around a device allocation (use `try_lock`).
+pub fn register_release_hook(hook: fn(bool)) {
+    let mut hooks = RELEASE_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
+    if !hooks.iter().any(|h| std::ptr::fn_addr_eq(*h, hook)) {
+        hooks.push(hook);
+    }
+}
+
+fn run_release_hooks(device_only: bool) {
+    let hooks = RELEASE_HOOKS
+        .try_lock()
+        .map(|h| h.clone())
+        .unwrap_or_default();
+    for hook in hooks {
+        hook(device_only);
+    }
+}
+
+fn register_oom_hook() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe { risc0_sys::cuda::risc0_zkp_cuda_set_oom_hook(drain_pool_on_oom) });
+}
+
 /// Release every device buffer this thread's `BUFFER_POOL` is caching, and trim the CUDA
 /// stream-ordered mempool back to the driver. The CUDA counterpart of `hal::hip::clear_buffer_pool`.
 ///
@@ -136,6 +217,7 @@ fn trim_cuda_mempool() {
 ///
 /// Thread-local, like the pool: it releases only what the CALLING thread cached.
 pub fn clear_buffer_pool() {
+    run_release_hooks(false);
     let released = BUFFER_POOL.with(|pool| {
         let mut pool = pool.borrow_mut();
         let cached = pool.total_cached;
@@ -263,6 +345,22 @@ impl CudaHash for CudaHashSha256 {
     fn get_hash_suite(&self) -> &HashSuite<BabyBear> {
         &self.suite
     }
+}
+
+/// `DeviceBuffer::copy_from` from pageable memory (cuMemcpyHtoD) returns once the data is in the
+/// driver's staging buffer; the DMA to the device may still be in flight on the legacy stream.
+/// Kernels on the persistent stream (a blocking stream) are ordered after it, but sppark's
+/// kernels run on non-blocking streams and could read the buffer before the copy lands
+/// (hash_fold_tree read stale leaves about 1 run in 10 at 2^14 leaves). Wait for the legacy
+/// stream, which holds only that copy. `set_32` (cuMemsetD32) is asynchronous on the legacy
+/// stream as well and gets the same wait.
+fn wait_pageable_upload() {
+    let res = unsafe { cust::sys::cuStreamSynchronize(std::ptr::null_mut()) };
+    assert_eq!(
+        res,
+        cust::sys::cudaError_enum::CUDA_SUCCESS,
+        "cuStreamSynchronize failed"
+    );
 }
 
 /// Wait, on the host, for everything queued on the risc0 persistent stream.
@@ -744,6 +842,7 @@ impl RawBuffer {
 
     pub fn set_u32(&mut self, value: u32) {
         self.buf.set_32(value).unwrap();
+        wait_pageable_upload();
     }
 }
 
@@ -820,6 +919,7 @@ impl<T> BufferImpl<T> {
         let mut buffer = RawBuffer::new(name, bytes_len);
         let bytes = unchecked_cast(slice);
         buffer.buf.copy_from(bytes).unwrap();
+        wait_pageable_upload();
 
         BufferImpl {
             buffer: Rc::new(RefCell::new(buffer)),
@@ -900,6 +1000,7 @@ impl<T: Clone> Buffer<T> for BufferImpl<T> {
         let slice = unchecked_cast_mut(&mut host_buf);
         f(&mut slice[self.offset..]);
         buf.buf.copy_from(&host_buf).unwrap();
+        wait_pageable_upload();
     }
 
     fn to_vec(&self) -> Vec<T> {
@@ -952,6 +1053,7 @@ impl<CH: CudaHash + ?Sized> CudaHal<CH> {
             fn risc0_zkp_cuda_warmup() -> *const std::os::raw::c_char;
         }
         let _ = ffi_wrap(|| unsafe { risc0_zkp_cuda_warmup() });
+        register_oom_hook();
 
         let mut hal = Self {
             max_threads: max_threads as u32,
@@ -1870,6 +1972,11 @@ mod tests {
     #[test]
     fn batch_expand_into_evaluate_ntt() {
         testutil::batch_expand_into_evaluate_ntt(CudaHalSha256::new());
+    }
+
+    #[test]
+    fn batch_expand_into_evaluate_ntt_large() {
+        testutil::batch_expand_into_evaluate_ntt_large(CudaHalSha256::new());
     }
 
     #[test]

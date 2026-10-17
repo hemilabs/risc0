@@ -32,7 +32,7 @@ use circom_witnesscalc::{
     graph::{Node, Nodes, NodesStorage, Operation, VecNodes},
 };
 
-type L = [u64; 4];
+pub(crate) type L = [u64; 4];
 const P: L = [
     0x43e1f593f0000001,
     0x2833e84879b97091,
@@ -76,7 +76,7 @@ fn sub_p(r: &mut L) {
 
 /// CIOS Montgomery multiplication, no-carry variant (P < 2^254). Inputs and output < P.
 #[inline(always)]
-fn mont_mul(a: &L, b: &L) -> L {
+pub(crate) fn mont_mul(a: &L, b: &L) -> L {
     let mut t = [0u64; 4];
     for i in 0..4 {
         let (t0, mut c) = mac(t[0], a[0], b[i], 0);
@@ -98,7 +98,7 @@ fn mont_mul(a: &L, b: &L) -> L {
 }
 
 #[inline(always)]
-fn add_mod(a: &L, b: &L) -> L {
+pub(crate) fn add_mod(a: &L, b: &L) -> L {
     let mut r = [0u64; 4];
     let mut c = 0;
     for i in 0..4 {
@@ -113,7 +113,7 @@ fn add_mod(a: &L, b: &L) -> L {
 }
 
 #[inline(always)]
-fn sub_mod(a: &L, b: &L) -> L {
+pub(crate) fn sub_mod(a: &L, b: &L) -> L {
     let mut r = [0u64; 4];
     let mut borrow = 0u64;
     for i in 0..4 {
@@ -135,7 +135,7 @@ fn sub_mod(a: &L, b: &L) -> L {
 
 /// One node of the program. Operands are slot ids; `k` indexes `Program::kmul`/`kraw`.
 #[derive(Clone, Copy)]
-enum Ins {
+pub(crate) enum Ins {
     MulVV(u32, u32),
     /// `a * c` or `a / c` with a constant c: `mont(a, kmul[k])`.
     MulVK(u32, u32),
@@ -147,6 +147,99 @@ enum Ins {
     And(u32, u32),
     /// Any other node: the reference operation on the slots in `Program::slow_ops`.
     Slow,
+}
+
+/// Node-indexed instructions (operands are node ids), for `witness_par`.
+pub(crate) struct NodeIns {
+    pub(crate) ins: Vec<Ins>,
+    pub(crate) kmul: Vec<L>,
+    pub(crate) kraw: Vec<L>,
+    pub(crate) r2: L,
+}
+
+pub(crate) fn compile_node_ins(
+    nodes: &Nodes<U254, VecNodes>,
+    signals: &[usize],
+) -> Option<NodeIns> {
+    let p = from_l(&P);
+    let n = nodes.nodes.len();
+    if n >= u32::MAX as usize || signals.len() >= u32::MAX as usize {
+        return None;
+    }
+    // Operands precede their node (the evaluation reads slots without checks), and constants
+    // are canonical (add_mod/sub_mod assume operands < P).
+    for i in 0..n {
+        if operands(&nodes.nodes.get(i).unwrap())
+            .iter()
+            .any(|&d| d != usize::MAX && d >= i)
+        {
+            return None;
+        }
+    }
+    if nodes.constants.iter().any(|c| *c >= p) || signals.iter().any(|&s| s >= n) {
+        return None;
+    }
+
+    // R = 2^256 mod p
+    let r_mod = {
+        let two128: U254 = U254::from(1u64) << 128usize;
+        let r128: U254 = two128 % p;
+        r128.mul_mod(r128, p)
+    };
+    let r2 = r_mod.mul_mod(r_mod, p);
+    let cval = |i: usize| -> Option<U254> {
+        match nodes.nodes.get(i).unwrap() {
+            Node::Constant(c) => Some(nodes.constants[c]),
+            _ => None,
+        }
+    };
+
+    // Instructions with node-id operands.
+    let mut kmul: Vec<L> = Vec::new();
+    let mut kraw: Vec<L> = Vec::new();
+    let mut kmul_idx = std::collections::HashMap::<(L, bool), u32>::new();
+    let mut kraw_idx = std::collections::HashMap::<L, u32>::new();
+    let mut mul_k = |c: U254, inverse: bool| -> u32 {
+        *kmul_idx.entry((to_l(&c), inverse)).or_insert_with(|| {
+            let m = if inverse { c.inv_mod(p).unwrap() } else { c };
+            kmul.push(to_l(&m.mul_mod(r_mod, p)));
+            (kmul.len() - 1) as u32
+        })
+    };
+    let mut raw_k = |c: U254| -> u32 {
+        *kraw_idx.entry(to_l(&c)).or_insert_with(|| {
+            kraw.push(to_l(&c));
+            (kraw.len() - 1) as u32
+        })
+    };
+    let mut ins = Vec::with_capacity(n);
+    for i in 0..n {
+        let x = match nodes.nodes.get(i).unwrap() {
+            Node::Op(op, a, b) => match (op, cval(a), cval(b)) {
+                (Operation::Mul, None, None) => Ins::MulVV(a as u32, b as u32),
+                (Operation::Mul, Some(c), None) => Ins::MulVK(b as u32, mul_k(c, false)),
+                (Operation::Mul, None, Some(c)) => Ins::MulVK(a as u32, mul_k(c, false)),
+                (Operation::Div, None, Some(c)) if c != U254::ZERO => {
+                    Ins::MulVK(a as u32, mul_k(c, true))
+                }
+                (Operation::Add, None, None) => Ins::Add(a as u32, b as u32),
+                (Operation::Add, Some(c), None) => Ins::AddVK(b as u32, raw_k(c)),
+                (Operation::Add, None, Some(c)) => Ins::AddVK(a as u32, raw_k(c)),
+                (Operation::Sub, None, None) => Ins::Sub(a as u32, b as u32),
+                (Operation::Band, None, Some(c)) => Ins::And(a as u32, raw_k(c)),
+                _ => Ins::Slow,
+            },
+            _ => Ins::Slow,
+        };
+        ins.push(x);
+    }
+
+    Some(NodeIns {
+        ins,
+        kmul,
+        kraw,
+        r2: to_l(&r2),
+    })
 }
 
 pub(crate) struct Program {
@@ -167,15 +260,15 @@ pub(crate) struct Program {
     nslots: usize,
 }
 
-fn to_l(x: &U254) -> L {
+pub(crate) fn to_l(x: &U254) -> L {
     *x.as_limbs()
 }
 
-fn from_l(x: &L) -> U254 {
+pub(crate) fn from_l(x: &L) -> U254 {
     U254::from_limbs(*x)
 }
 
-fn operands(node: &Node) -> [usize; 3] {
+pub(crate) fn operands(node: &Node) -> [usize; 3] {
     match *node {
         Node::Op(_, a, b) => [a, b, usize::MAX],
         Node::UnoOp(_, a) => [a, usize::MAX, usize::MAX],

@@ -17,6 +17,7 @@
 #include "fp.h"
 #include "fpext.h"
 #include "kernels.h"
+#include "thp_pinned.h"
 
 #ifndef __HIPCC__
 #include "vendor/nvtx3/nvtx3.hpp"
@@ -35,6 +36,9 @@ namespace cuda { namespace std { using ::std::array; } }
 #include <cuda_runtime.h>
 #endif
 #include <exception>
+#include <mutex>
+#include <stdexcept>
+#include <unordered_map>
 #ifdef _WIN32
 #include <mutex>
 #include <vector>
@@ -42,7 +46,76 @@ namespace cuda { namespace std { using ::std::array; } }
 #include <thrust/execution_policy.h>
 #include <thrust/host_vector.h>
 #include <thrust/sort.h>
+#include <thrust/scan.h>
 #include <vector>
+#include <cstdlib>
+#include <map>
+
+// Async recursion witgen (CUDA only; kill switch RISC0_CUDA_REC_WITGEN=0 restores the synchronous
+// path): the witgen uploads and the accum's initial ones go on the context's stream
+// (cudaMemcpyAsync/cudaMemsetAsync, a fill kernel) instead of the legacy stream, thrust's temporary storage comes from a per-thread cache and runs on that
+// stream (no cudaMalloc/cudaFree per proof: cudaFree synchronizes the device and both take a
+// driver ioctl that costs ~1 ms when the host is busy), the cached buffers grow with 25%
+// headroom, and the warmup pre-grows the stack reservation and loads the split eval_check module.
+#ifndef __HIPCC__
+#define REC_ASYNC_AVAILABLE 1
+#endif
+static bool recAsync() {
+#ifdef REC_ASYNC_AVAILABLE
+  static const bool on = [] {
+    const char* e = std::getenv("RISC0_CUDA_REC_WITGEN");
+    return !(e && e[0] == '0');
+  }();
+  return on;
+#else
+  return false;
+#endif
+}
+
+static uint32_t recGrow(uint32_t need) {
+  return recAsync() ? need + need / 4 : need;
+}
+
+#ifdef REC_ASYNC_AVAILABLE
+// thrust temporary allocations from a per-thread free list. Blocks are only reused by later
+// thrust calls on the same thread, which run on the same (or a synchronized) stream.
+struct RecThrustAlloc {
+  typedef char value_type;
+  std::multimap<std::ptrdiff_t, char*> freeBlocks;
+  std::map<char*, std::ptrdiff_t> used;
+
+  char* allocate(std::ptrdiff_t n) {
+    char* p = nullptr;
+    auto it = freeBlocks.lower_bound(n);
+    if (it != freeBlocks.end()) {
+      p = it->second;
+      n = it->first;
+      freeBlocks.erase(it);
+    } else {
+      n += n / 4;
+      CUDA_OK(cudaMalloc(&p, n));
+    }
+    used[p] = n;
+    return p;
+  }
+
+  void deallocate(char* p, size_t) {
+    auto it = used.find(p);
+    if (it == used.end()) return;
+    freeBlocks.insert({it->second, p});
+    used.erase(it);
+  }
+
+  ~RecThrustAlloc() {
+#ifndef _WIN32
+    for (auto& b : freeBlocks) cudaFree(b.second);
+#endif
+  }
+};
+static thread_local RecThrustAlloc g_recThrustAlloc;
+extern "C" const char* rec_eval_check_split_warmup(size_t* localBytes);  // eval_check_split.cu
+size_t risc0_recursion_accum_inl_warmup();                                  // accum_inl.cu
+#endif
 
 constexpr size_t kStepModeParallel = 0;
 constexpr size_t kStepModeSeqForward = 1;
@@ -173,6 +246,22 @@ __global__ void fwdStepVerifyWom(ExecContext* ctx) {
   }
 }
 
+#ifndef __HIPCC__
+void risc0_recursion_launch_accum_inl(int verify, unsigned grid, unsigned block, cudaStream_t stream,
+                                      AccumContext* ctx);
+// accum_inl.cu: the accum steps force-inlined into the kernels, and eval_check split into
+// standalone kernels (ffi_supra.cu): on unless RISC0_CUDA_REC_KERNELS=0. The switch selects
+// kernels, not sources: with it off, parStepComputeAccum / parStepVerifyAccum still run the
+// step_*_accum.cu sources with the branch-free asserts (bit-identical results either way).
+static bool accumInl() {
+  static const bool on = [] {
+    const char* e = getenv("RISC0_CUDA_REC_KERNELS");
+    return !(e && e[0] == '0');
+  }();
+  return on;
+}
+#endif
+
 __global__ void parStepComputeAccum(AccumContext* ctx) {
   uint32_t cycle = blockDim.x * blockIdx.x + threadIdx.x;
   if (cycle < ctx->workCycles) {
@@ -269,6 +358,7 @@ struct CachedExecBuffers : ExecBuffersState {
       CUDA_OK(cudaMallocManaged(&trace, sizeof(PreflightTrace)));
     }
     if (numCycles > maxCycles) {
+      numCycles = recGrow(numCycles);
       cudaFree(womRows);
       cudaFree(womIndex);
       cudaFree(cycles);
@@ -278,11 +368,13 @@ struct CachedExecBuffers : ExecBuffersState {
       maxCycles = numCycles;
     }
     if (numWoms > maxWoms) {
+      numWoms = recGrow(numWoms);
       cudaFree(wom);
       CUDA_OK(cudaMalloc(&wom, numWoms * sizeof(FpExt)));
       maxWoms = numWoms;
     }
     if (numIops > maxIops) {
+      numIops = recGrow(numIops);
       cudaFree(iops);
       CUDA_OK(cudaMalloc(&iops, numIops * sizeof(FpExt)));
       maxIops = numIops;
@@ -329,25 +421,41 @@ struct HostExecContext {
     ctx->trace->numIops = trace->numIops;
 
     ctx->trace->wom = g_execCache.wom;
+    ctx->trace->cycles = g_execCache.cycles;
+    ctx->trace->iops = g_execCache.iops;
+    ctx->womRows = g_execCache.womRows;
+    ctx->womIndex = g_execCache.womIndex;
+    if (recAsync()) {
+      // Stream-ordered before the witgen kernels. The host arrays (preflight's page-locked
+      // staging, or pageable when that is off, which the driver stages before returning) stay
+      // alive until this witgen call returns, after its final stream synchronize. The device
+      // pointers come from g_execCache, not from ctx / ctx->trace: those are managed memory,
+      // which the host must not touch while work is queued on a device without concurrent
+      // managed access.
+      CUDA_OK(cudaMemcpyAsync(g_execCache.wom, trace->wom, trace->numWoms * sizeof(FpExt),
+                              cudaMemcpyHostToDevice, stream));
+      CUDA_OK(cudaMemcpyAsync(g_execCache.cycles, trace->cycles,
+                              trace->numCycles * sizeof(PreflightCycle), cudaMemcpyHostToDevice,
+                              stream));
+      CUDA_OK(cudaMemcpyAsync(g_execCache.iops, trace->iops, trace->numIops * sizeof(FpExt),
+                              cudaMemcpyHostToDevice, stream));
+      CUDA_OK(cudaMemsetAsync(g_execCache.womRows, kInvalidPattern,
+                              trace->numCycles * kMaxWomRowsPerCycle * sizeof(WomArgumentRow),
+                              stream));
+      CUDA_OK(cudaMemsetAsync(g_execCache.womIndex, 0, trace->numCycles * sizeof(uint32_t), stream));
+      return;
+    }
     CUDA_OK(cudaMemcpy(
         ctx->trace->wom, trace->wom, trace->numWoms * sizeof(FpExt), cudaMemcpyHostToDevice));
-
-    ctx->trace->cycles = g_execCache.cycles;
     CUDA_OK(cudaMemcpy(ctx->trace->cycles,
                        trace->cycles,
                        trace->numCycles * sizeof(PreflightCycle),
                        cudaMemcpyHostToDevice));
-
-    ctx->trace->iops = g_execCache.iops;
     CUDA_OK(cudaMemcpy(
         ctx->trace->iops, trace->iops, trace->numIops * sizeof(FpExt), cudaMemcpyHostToDevice));
-
-    ctx->womRows = g_execCache.womRows;
     CUDA_OK(cudaMemset(ctx->womRows,
                        kInvalidPattern,
                        trace->numCycles * kMaxWomRowsPerCycle * sizeof(WomArgumentRow)));
-
-    ctx->womIndex = g_execCache.womIndex;
     CUDA_OK(cudaMemset(ctx->womIndex, 0, trace->numCycles * sizeof(uint32_t)));
   }
 
@@ -364,6 +472,7 @@ struct HostExecContext {
     static thread_local size_t dCap = 0;
     size_t nWords = hc->numHeads + (size_t)hc->numRows * (2 + hc->dataCols + kMaxWomRowsPerCycle * 5);
     if (nWords > dCap) {
+      if (recAsync()) nWords += nWords / 4;
       if (dBuf) cudaFree(dBuf);
       CUDA_OK(cudaMalloc(&dBuf, nWords * 4));
       dCap = nWords;
@@ -406,15 +515,31 @@ struct HostExecContext {
     nvtx3::scoped_range range("verifyWom");
     uint32_t numCycles = ctx->trace->numCycles;
 
+#ifdef REC_ASYNC_AVAILABLE
+    if (recAsync()) {
+      // Same thrust algorithms (the sort compares every field, so its output is unique), on the
+      // context stream with cached temporary storage; par_nosync: no host wait in between.
+      auto policy = thrust::cuda::par_nosync(g_recThrustAlloc).on(stream);
+      {
+        nvtx3::scoped_range range("sortWom");
+        thrust::sort(policy, ctx->womRows, ctx->womRows + numCycles * kMaxWomRowsPerCycle);
+      }
+      {
+        nvtx3::scoped_range range("scan");
+        thrust::exclusive_scan(policy, ctx->womIndex, ctx->womIndex + numCycles, ctx->womIndex);
+      }
+    } else
+#endif
     {
-      nvtx3::scoped_range range("sortWom");
-      thrust::sort(thrust::device, ctx->womRows, ctx->womRows + numCycles * kMaxWomRowsPerCycle);
-    }
-
-    {
-      nvtx3::scoped_range range("scan");
-      thrust::exclusive_scan(
-          thrust::device, ctx->womIndex, ctx->womIndex + numCycles, ctx->womIndex);
+      {
+        nvtx3::scoped_range range("sortWom");
+        thrust::sort(thrust::device, ctx->womRows, ctx->womRows + numCycles * kMaxWomRowsPerCycle);
+      }
+      {
+        nvtx3::scoped_range range("scan");
+        thrust::exclusive_scan(
+            thrust::device, ctx->womIndex, ctx->womIndex + numCycles, ctx->womIndex);
+      }
     }
 
     {
@@ -452,6 +577,7 @@ struct CachedAccumBuffers : AccumBuffersState {
       CUDA_OK(cudaMallocManaged(&ctx, sizeof(AccumContext)));
     }
     if (workCycles > maxWorkCycles) {
+      workCycles = recGrow(workCycles);
       cudaFree(accum);
       CUDA_OK(cudaMalloc(&accum, workCycles * sizeof(FpExt)));
       maxWorkCycles = workCycles;
@@ -472,6 +598,13 @@ struct CachedAccumBuffers : AccumBuffersState {
 
 static thread_local CachedAccumBuffers g_accumCache;
 
+__global__ void fillOneExt(FpExt* p, uint32_t n) {
+  uint32_t i = blockDim.x * blockIdx.x + threadIdx.x;
+  if (i < n) {
+    p[i] = FpExt(1);
+  }
+}
+
 struct HostAccumContext {
   AccumContext* ctx;
   CudaStream stream;
@@ -491,6 +624,12 @@ struct HostAccumContext {
     ctx->workCycles = workCycles;
 
     ctx->accum = g_accumCache.accum;
+    if (recAsync()) {
+      // Fill with FpExt(1) on the device instead of uploading a host vector of ones.
+      fillOneExt<<<(workCycles + 255) / 256, 256, 0, stream>>>(g_accumCache.accum, workCycles);
+      CUDA_OK(cudaGetLastError());
+      return;
+    }
     std::vector<FpExt> accumInit(workCycles, FpExt(1));
     CUDA_OK(cudaMemcpy(
         ctx->accum, accumInit.data(), workCycles * sizeof(FpExt), cudaMemcpyHostToDevice));
@@ -502,6 +641,11 @@ struct HostAccumContext {
 
   void computeAccum() {
     nvtx3::scoped_range range("computeAccum");
+#ifndef __HIPCC__
+    if (accumInl()) {
+      risc0_recursion_launch_accum_inl(0, cfg.grid.x, cfg.block.x, stream, ctx);
+    } else
+#endif
     parStepComputeAccum<<<cfg.grid, cfg.block, 0, stream>>>(ctx);
     CUDA_OK(cudaStreamSynchronize(stream));
   }
@@ -515,6 +659,11 @@ struct HostAccumContext {
   void verifyAccum() {
     nvtx3::scoped_range range("verifyAccum");
     CUDA_OK(cudaDeviceSynchronize());
+#ifndef __HIPCC__
+    if (accumInl()) {
+      risc0_recursion_launch_accum_inl(1, cfg.grid.x, cfg.block.x, stream, ctx);
+    } else
+#endif
     parStepVerifyAccum<<<cfg.grid, cfg.block, 0, stream>>>(ctx);
     CUDA_OK(cudaStreamSynchronize(stream));
   }
@@ -569,8 +718,74 @@ const char* risc0_circuit_recursion_cuda_warmup() {
     CUDA_OK(cudaFuncGetAttributes(&attr, scatterHostChains));
     CUDA_OK(cudaFuncGetAttributes(&attr, parStepComputeAccum));
     CUDA_OK(cudaFuncGetAttributes(&attr, parStepVerifyAccum));
+#ifdef REC_ASYNC_AVAILABLE
+    if (recAsync()) {
+      // The first parStepExec launch paid ~4 ms growing the context's local-memory
+      // reservation on the GPU thread (its stack frame exceeds every earlier kernel's); grow it
+      // here, at process start, instead. For the current device, the HAL's (device 0); on any
+      // other the driver still grows it at the first launch, as before.
+      size_t need = 0;
+      for (const void* f : {(const void*)parStepExec, (const void*)injectWomBacks,
+                            (const void*)parStepVerifyWom, (const void*)parStepComputeAccum,
+                            (const void*)parStepVerifyAccum}) {
+        CUDA_OK(cudaFuncGetAttributes(&attr, f));
+        need = attr.localSizeBytes > need ? attr.localSizeBytes : need;
+      }
+      size_t more = risc0_recursion_accum_inl_warmup();
+      need = more > need ? more : need;
+      if (const char* e = rec_eval_check_split_warmup(&more)) return e;
+      need = more > need ? more : need;
+      size_t cur = 0;
+      CUDA_OK(cudaDeviceGetLimit(&cur, cudaLimitStackSize));
+      if (need > cur) CUDA_OK(cudaDeviceSetLimit(cudaLimitStackSize, need));
+    }
+#endif
   } catch (const std::exception& err) {
     return strdup(err.what());
+  }
+  return nullptr;
+}
+
+// Page-locked host memory for the recursion witgen inputs (prepared off the GPU thread), backed
+// by huge pages (ThpPinned): cudaHostAlloc pins 4 KB pages while holding the driver lock, which
+// stalls the proving thread's CUDA calls.
+static std::mutex g_host_bufs_mu;
+static std::unordered_map<void*, ThpPinned>& hostBufs() {
+  static std::unordered_map<void*, ThpPinned> m;
+  return m;
+}
+
+const char* risc0_circuit_recursion_cuda_host_alloc(size_t bytes, void** out) {
+  *out = nullptr;
+  try {
+    ThpPinned p;
+    p.alloc(bytes);
+    std::lock_guard<std::mutex> lk(g_host_bufs_mu);
+    hostBufs()[p.ptr] = p;
+    *out = p.ptr;
+  } catch (const std::exception& err) {
+    return strdup(err.what());
+  } catch (...) {
+    return strdup("Generic exception");
+  }
+  return nullptr;
+}
+
+const char* risc0_circuit_recursion_cuda_host_free(void* ptr) {
+  try {
+    ThpPinned p;
+    {
+      std::lock_guard<std::mutex> lk(g_host_bufs_mu);
+      auto it = hostBufs().find(ptr);
+      if (it == hostBufs().end()) throw std::runtime_error("host_free: unknown pointer");
+      p = it->second;
+      hostBufs().erase(it);
+    }
+    p.free_pinned(); // synchronizes the device first, like cudaFreeHost
+  } catch (const std::exception& err) {
+    return strdup(err.what());
+  } catch (...) {
+    return strdup("Generic exception");
   }
   return nullptr;
 }

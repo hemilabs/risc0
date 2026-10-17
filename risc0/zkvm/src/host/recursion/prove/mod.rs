@@ -1048,6 +1048,79 @@ impl Prover {
         Ok(())
     }
 
+    /// Start a join whose `b` receipt is not known yet: `prepare()` may run now and blocks
+    /// when the program first reads `b`'s words; feed them with [Self::feed_join_b].
+    pub fn new_join_streaming(
+        a: &SuccinctReceipt<ReceiptClaim>,
+        opts: ProverOpts,
+    ) -> Result<(
+        Self,
+        std::sync::Arc<risc0_circuit_recursion::prove::InputStream>,
+    )> {
+        ensure_poseidon2!(a);
+        let (program, control_id) = zkr::join(&opts.hashfn)?;
+        let mut prover = Prover::new(program, control_id, opts);
+        let merkle_root = a.control_root()?;
+        prover.add_input_digest(&merkle_root, DigestKind::Poseidon2);
+        prover.add_succinct_rv32im_receipt(a)?;
+        let stream = prover.prover.streaming();
+        Ok((prover, stream))
+    }
+
+    /// Complete the input of [Self::new_join_streaming] with the `b` receipt (the same
+    /// words `new_join` adds). Always closes the stream, also on error.
+    pub fn feed_join_b(
+        stream: &risc0_circuit_recursion::prove::InputStream,
+        a: &SuccinctReceipt<ReceiptClaim>,
+        b: &SuccinctReceipt<ReceiptClaim>,
+    ) -> Result<()> {
+        let res = (|| -> Result<Vec<u32>> {
+            ensure_poseidon2!(b);
+            let a_root = a.control_root()?;
+            let b_root = b.control_root()?;
+            ensure!(
+                a_root == b_root,
+                "merkle roots for a and b do not match: {} != {}",
+                a_root,
+                b_root
+            );
+            let mut w: Vec<u32> = Vec::new();
+            w.extend_from_slice(&b.seal);
+            w.extend_from_slice(bytemuck::cast_slice(&[BabyBearElem::new(
+                b.control_inclusion_proof.index,
+            )]));
+            for digest in &b.control_inclusion_proof.digests {
+                w.extend_from_slice(digest.as_words());
+            }
+            let mut data = Vec::<u32>::new();
+            b.claim.as_value()?.encode(&mut data)?;
+            let data_fp: Vec<BabyBearElem> = data.iter().map(|x| BabyBearElem::new(*x)).collect();
+            w.extend_from_slice(bytemuck::cast_slice(&data_fp));
+            Ok(w)
+        })();
+        if let Ok(w) = &res {
+            stream.push(w);
+        }
+        stream.close();
+        res.map(|_| ())
+    }
+
+    /// Upload and commit the ctrl of the lift programs for `po2s`, the join program and
+    /// (with `p254`) the identity_p254 program on this thread's cached recursion provers.
+    pub fn prewarm(po2s: &[usize], opts: &ProverOpts, p254: bool) -> Result<()> {
+        for &po2 in po2s {
+            let (program, _) = zkr::lift(po2, &opts.hashfn)?;
+            risc0_circuit_recursion::prove::Prover::new(program, &opts.hashfn).prewarm()?;
+        }
+        let (program, _) = zkr::join(&opts.hashfn)?;
+        risc0_circuit_recursion::prove::Prover::new(program, &opts.hashfn).prewarm()?;
+        if p254 {
+            let (program, _) = zkr::identity("poseidon_254")?;
+            risc0_circuit_recursion::prove::Prover::new(program, "poseidon_254").prewarm()?;
+        }
+        Ok(())
+    }
+
     /// Pre-compute the CPU preflight for pipelining. Can be called from any thread.
     /// If called before `run()`, `run()` will skip the preflight step and use this result.
     pub fn prepare(&mut self) -> Result<()> {

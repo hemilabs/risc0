@@ -54,6 +54,7 @@ struct CudaCircuitHal<CH: CudaHash> {
 
 impl<CH: CudaHash> CudaCircuitHal<CH> {
     pub fn new(_hal: Arc<CudaHal<CH>>) -> Self {
+        risc0_zkp::hal::cuda::register_release_hook(super::super::pinned::release);
         Self { _hal }
     }
 }
@@ -102,13 +103,20 @@ impl<CH: CudaHash> CircuitWitnessGenerator<CudaHal<CH>> for CudaCircuitHal<CH> {
             data: data.as_ptr() as *const BabyBearElem,
             global: global.as_ptr() as *const BabyBearElem,
         };
+        let p = hc.pinned.unwrap_or([
+            hc.heads.as_ptr() as usize,
+            hc.cycles.as_ptr() as usize,
+            hc.rows.as_ptr() as usize,
+            hc.wom_idx.as_ptr() as usize,
+            hc.wom_rows.as_ptr() as usize,
+        ]);
         let raw = RawHostChains {
-            heads: hc.heads.as_ptr(),
+            heads: p[0] as *const u32,
             num_heads: hc.heads.len() as u32,
-            cycles: hc.cycles.as_ptr(),
-            rows: hc.rows.as_ptr(),
-            wom_idx: hc.wom_idx.as_ptr(),
-            wom_rows: hc.wom_rows.as_ptr(),
+            cycles: p[1] as *const u32,
+            rows: p[2] as *const u32,
+            wom_idx: p[3] as *const u32,
+            wom_rows: p[4] as *const u32,
             num_rows: hc.cycles.len() as u32,
             data_cols: (hc.rows.len() / hc.cycles.len().max(1)) as u32,
         };

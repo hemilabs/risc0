@@ -622,9 +622,15 @@ static unsigned nttx_auto_chunk(unsigned lg, unsigned lgB) {
 
 // Fused commit: C = bitrev(zk_shift(iNTT(W))) (natural-order shifted coeffs, == today's
 // coeffs after PolyGroup::new), E = NTT_RN(expand(zk_shift(iNTT(W)))). W is not modified.
+#include "ntt_q.cuh"
+
 static void nttx_commit(const gpu_t& gpu, fr_t* C, fr_t* E, const fr_t* W, unsigned lg, unsigned lgB,
                         unsigned cols, unsigned chunk) {
     const NttxTables& T = nttx_tables(gpu, lg);
+    if (chunk == 0 && nttq::supported(lg, lgB) && nttq::enabled()) {
+        nttq::commit(gpu, C, E, W, lg, lgB, cols, T.lo, T.hi);
+        return;
+    }
     if (chunk == 0) chunk = nttx_auto_chunk(lg, lgB);
     size_t n = (size_t)1 << lg, N = n << lgB;
     for (unsigned c0 = 0; c0 < cols; c0 += chunk) {

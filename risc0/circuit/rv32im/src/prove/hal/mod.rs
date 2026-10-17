@@ -105,6 +105,12 @@ pub(crate) enum StepMode {
 }
 
 pub(crate) trait CircuitWitnessGenerator<H: Hal> {
+    /// Whether `generate_witness` writes the per-cycle columns (witgen::CYCLE_COLS) itself
+    /// when the trace defers them (`PreflightTrace::cycle_cols_deferred`).
+    fn writes_cycle_cols(&self) -> bool {
+        false
+    }
+
     fn generate_witness(
         &self,
         mode: StepMode,
@@ -124,6 +130,11 @@ pub(crate) trait CircuitAccumulator<H: Hal> {
         global: &MetaBuffer<H>,
         mix: &MetaBuffer<H>,
     ) -> Result<()>;
+
+    /// Whether `step_accum` already leaves the accum buffer zeroized (INVALID -> 0).
+    fn step_accum_zeroizes(&self) -> bool {
+        false
+    }
 }
 
 pub(crate) struct SegmentProverImpl<H, C, F>
@@ -182,15 +193,7 @@ where
     fn preflight(&self, segment: &Segment) -> Result<PreflightResults> {
         scope!("preflight");
 
-        cfg_if::cfg_if! {
-            if #[cfg(feature = "witgen_debug")] {
-                let rand_z = ExtVal::ONE;
-            } else {
-                let mut rng = rand::rng();
-                let rand_z = ExtVal::random(&mut rng);
-            }
-        }
-        PreflightResults::new(segment, rand_z)
+        PreflightResults::new(segment, super::preflight_rand_z())
     }
 
     fn prove_core(&self, preflight_results: PreflightResults) -> Result<Seal> {
@@ -451,10 +454,7 @@ where
         let t_accum = ta.elapsed();
 
         let tac = std::time::Instant::now();
-        prover.commit_group(
-            REGISTER_GROUP_ACCUM,
-            &witgen.accum.as_ref().unwrap().buf,
-        );
+        prover.commit_group(REGISTER_GROUP_ACCUM, &witgen.accum.as_ref().unwrap().buf);
         let t_accum_commit = tac.elapsed();
 
         let global_clone = hal.alloc_elem("global_clone", witgen.global.buf.size());
