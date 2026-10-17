@@ -116,7 +116,7 @@ pub fn release() -> anyhow::Result<()> {
 /// held exclusively: other callers wait until this is dropped, so keep it until the `prove`
 /// that reads it has returned. Unlike a `MutexGuard` it may be dropped on another thread than
 /// the one that took it (the witness is computed on a helper thread, see `shrink_wrap_with`).
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 pub struct HostBuffer {
     ptr: *mut u8,
     len: usize,
@@ -124,15 +124,15 @@ pub struct HostBuffer {
 
 // Safety: the buffer is a process-lifetime pinned allocation (it is only freed or regrown by a
 // holder of the HOST_BUFFER_BUSY flag), and only the HostBuffer holding the flag touches it.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 unsafe impl Send for HostBuffer {}
 
 /// Whether a [HostBuffer] is live; the condvar wakes waiters when it is dropped.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 static HOST_BUFFER_BUSY: (std::sync::Mutex<bool>, std::sync::Condvar) =
     (std::sync::Mutex::new(false), std::sync::Condvar::new());
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 fn host_buffer_acquire() {
     let (m, cv) = &HOST_BUFFER_BUSY;
     let mut busy = m.lock().unwrap_or_else(|e| e.into_inner());
@@ -142,21 +142,21 @@ fn host_buffer_acquire() {
     *busy = true;
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 fn host_buffer_release() {
     let (m, cv) = &HOST_BUFFER_BUSY;
     *m.lock().unwrap_or_else(|e| e.into_inner()) = false;
     cv.notify_one();
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 impl Drop for HostBuffer {
     fn drop(&mut self) {
         host_buffer_release();
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 impl HostBuffer {
     pub fn as_ptr(&self) -> *const u8 {
         self.ptr
@@ -171,7 +171,7 @@ impl HostBuffer {
 }
 
 /// Lock the pinned witness buffer, growing it to at least `bytes`.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 pub fn host_buffer(bytes: usize) -> anyhow::Result<HostBuffer> {
     host_buffer_acquire();
     let ptr = unsafe { risc0_groth16_cuda_host_buffer(bytes) };
@@ -217,6 +217,43 @@ pub fn prove(prover_params: &ProverParams, setup_params: &SetupParams) -> anyhow
     ffi_wrap(|| unsafe { risc0_groth16_cuda_prove(&setup_params, &prover_params) })
 }
 
+/// Load the proving key and coefficients onto the Intel GPU, where they stay cached until
+/// [intel_release]. [intel_prove] does this itself if needed.
+#[cfg(feature = "intel")]
+pub fn intel_preload(setup_params: &SetupParams) -> anyhow::Result<()> {
+    let setup_params = setup_params.raw();
+    ffi_wrap(|| unsafe { risc0_groth16_intel_preload(&setup_params) })
+}
+
+/// Prove with the Intel GPU prover; writes the proof to `prover_params.proof_path`.
+#[cfg(feature = "intel")]
+pub fn intel_prove(prover_params: &ProverParams, setup_params: &SetupParams) -> anyhow::Result<()> {
+    let setup_params = setup_params.raw();
+    let prover_params = RawProverParams {
+        public_path: prover_params.public_path.c_str.as_ptr(),
+        proof_path: prover_params.proof_path.c_str.as_ptr(),
+        witness: prover_params.witness,
+    };
+    ffi_wrap(|| unsafe { risc0_groth16_intel_prove(&setup_params, &prover_params) })
+}
+
+/// Free the Intel GPU prover's cached proving key, coefficients and scratch (several GB).
+#[cfg(feature = "intel")]
+pub fn intel_release() -> anyhow::Result<()> {
+    ffi_wrap(|| unsafe { risc0_groth16_intel_release() })
+}
+
+#[cfg(feature = "intel")]
+impl SetupParams {
+    fn raw(&self) -> RawSetupParams {
+        RawSetupParams {
+            pcoeffs_path: self.pcoeffs_path.c_str.as_ptr(),
+            fres_path: self.fres_path.c_str.as_ptr(),
+            srs_path: self.srs_path.c_str.as_ptr(),
+        }
+    }
+}
+
 #[cfg(all(any(feature = "cuda", feature = "rocm"), feature = "setup"))]
 pub fn setup(params: &SetupParams) -> anyhow::Result<()> {
     let raw_params = RawSetupParams {
@@ -227,7 +264,10 @@ pub fn setup(params: &SetupParams) -> anyhow::Result<()> {
     ffi_wrap(|| unsafe { risc0_groth16_cuda_setup(&raw_params) })
 }
 
-#[cfg_attr(not(any(feature = "cuda", feature = "rocm")), allow(dead_code))]
+#[cfg_attr(
+    not(any(feature = "cuda", feature = "rocm", feature = "intel")),
+    allow(dead_code)
+)]
 #[repr(C)]
 struct RawProverParams {
     pub public_path: *const c_char,
@@ -235,7 +275,10 @@ struct RawProverParams {
     pub witness: *const u8,
 }
 
-#[cfg_attr(not(any(feature = "cuda", feature = "rocm")), allow(dead_code))]
+#[cfg_attr(
+    not(any(feature = "cuda", feature = "rocm", feature = "intel")),
+    allow(dead_code)
+)]
 #[repr(C)]
 struct RawSetupParams {
     pub pcoeffs_path: *const c_char,
@@ -267,7 +310,7 @@ extern "C" {
         loaded: *mut i32,
     ) -> *const c_char;
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     fn risc0_groth16_cuda_host_buffer(bytes: usize) -> *mut u8;
 
     #[cfg(feature = "cuda")]
@@ -276,11 +319,26 @@ extern "C" {
     #[cfg(feature = "cuda")]
     fn risc0_groth16_cuda_pinned_release();
 
+    #[cfg(feature = "intel")]
+    fn risc0_groth16_intel_preload(setup: *const RawSetupParams) -> *const c_char;
+
+    #[cfg(feature = "intel")]
+    fn risc0_groth16_intel_prove(
+        setup: *const RawSetupParams,
+        params: *const RawProverParams,
+    ) -> *const c_char;
+
+    #[cfg(feature = "intel")]
+    fn risc0_groth16_intel_release() -> *const c_char;
+
     #[cfg(all(any(feature = "cuda", feature = "rocm"), feature = "setup"))]
     fn risc0_groth16_cuda_setup(params: *const RawSetupParams) -> *const c_char;
 }
 
-#[cfg_attr(not(any(feature = "cuda", feature = "rocm")), allow(dead_code))]
+#[cfg_attr(
+    not(any(feature = "cuda", feature = "rocm", feature = "intel")),
+    allow(dead_code)
+)]
 fn ffi_wrap<F>(mut inner: F) -> Result<()>
 where
     F: FnMut() -> *const c_char,
@@ -305,7 +363,10 @@ where
     }
 }
 
-#[cfg_attr(not(any(feature = "cuda", feature = "rocm")), allow(dead_code))]
+#[cfg_attr(
+    not(any(feature = "cuda", feature = "rocm", feature = "intel")),
+    allow(dead_code)
+)]
 pub struct RawPath {
     path: PathBuf,
     c_str: CString,

@@ -184,8 +184,7 @@ __global__ void mix_poly_coeffs(FpExt* out,
   }
 }
 
-#ifndef __HIPCC__
-// ---- eval_u v2 (CUDA only: the reductions assume 32-lane warps) ----
+// ---- eval_u v2 (its reductions work in 32-lane groups; on ROCm, width-32 shuffles) ----
 // Split-K over (chunk, eval point), per-point power tables, J coefficients per thread per
 // step, one REDC per pair of products. Exact field arithmetic (canonical Montgomery form),
 // so results are bit-identical to the Horner kernel batch_evaluate_any for any input.
@@ -222,7 +221,11 @@ __device__ __forceinline__ FpExt fpext_shfl_down(FpExt v, int d) {
   FpExt r;
 #pragma unroll
   for (int i = 0; i < 4; i++) {
+#ifdef __HIPCC__
+    r.elems[i] = Fp::fromRaw(__shfl_down(v.elems[i].asRaw(), d, 32));
+#else
     r.elems[i] = Fp::fromRaw(__shfl_down_sync(0xffffffff, v.elems[i].asRaw(), d));
+#endif
   }
   return r;
 }
@@ -281,7 +284,13 @@ __global__ void __launch_bounds__(EU_THREADS) eu2_main(FpExt* partial,
 #pragma unroll
   for (int d = 16; d > 0; d >>= 1)
     acc += fpext_shfl_down(acc, d);
+#ifdef __HIPCC__
+  // HIP doesn't allow __shared__ objects with constructors: raw storage, as FpExt.
+  __shared__ uint32_t red_raw[EU_THREADS / 32 * 4] __attribute__((aligned(16)));
+  FpExt* red = reinterpret_cast<FpExt*>(red_raw);
+#else
   __shared__ FpExt red[EU_THREADS / 32];
+#endif
   if ((t & 31) == 0)
     red[t >> 5] = acc;
   __syncthreads();
@@ -307,11 +316,9 @@ __global__ void eu2_reduce(FpExt* out, const FpExt* partial, uint32_t S) {
   if (threadIdx.x == 0)
     out[e] = v;
 }
-#endif // __HIPCC__
 
 
-#ifndef __HIPCC__
-// ---- mix_poly_coeffs v2 (CUDA only, like eval_u v2: untested on ROCm) ----
+// ---- mix_poly_coeffs v2 (CUDA and ROCm; no warp-size assumptions) ----
 // one RMW of `out` per run of equal combo ids (instead of one per input),
 // lazy pair REDC for the FpExt x Fp products, parallel mix-power table in shared memory.
 // Exact field arithmetic with canonical outputs => bit-identical to the original kernel.
@@ -377,9 +384,6 @@ __global__ void __launch_bounds__(256) mix_poly_coeffs_v2(FpExt* __restrict__ ou
     }
   }
 }
-
-
-#endif // __HIPCC__
 
 // ---- batched gather_sample (all FRI queries of one tree in one launch) ----
 __global__ void gather_samples(Fp* dst, const Fp* src, const uint32_t* idxs, const uint32_t n,

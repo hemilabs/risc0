@@ -14,7 +14,7 @@
 
 // Poseidon2 (BabyBear, width 24) row hashing and folding with lazy Montgomery reductions:
 // fewer instructions than poseidon2.cuh for the same results (same I/O: Montgomery-form u32).
-// CUDA only (PTX).
+// CUDA uses PTX carry chains; ROCm the same arithmetic in 64-bit C++, which wraps identically.
 //
 // Value bounds, checked exhaustively over all canonical inputs (p/2^32 = 0.46875):
 // - mred(t) = t * 2^-32 mod p, in [0, t/2^32 + p); exact (congruent) whenever the high word
@@ -44,12 +44,18 @@ __device__ __forceinline__ uint32_t addm(uint32_t a, uint32_t b) {
 
 // Montgomery reduction (see the bounds above).
 __device__ __forceinline__ uint32_t mred(uint64_t t) {
+#ifdef __HIPCC__
+  // The high word of t + m*p, modulo 2^64 like the PTX carry chain below.
+  uint32_t m = uint32_t(t) * M0;
+  return uint32_t((t + uint64_t(m) * P) >> 32);
+#else
   uint32_t r;
   asm("{\n\t.reg .u32 m, lo, hi, d;\n\tmov.b64 {lo,hi}, %1;\n\tmul.lo.u32 m, lo, %2;\n\t"
       "mad.lo.cc.u32 d, m, %3, lo;\n\tmadc.hi.u32 %0, m, %3, hi;\n\t}"
       : "=r"(r)
       : "l"(t), "n"(M0), "n"(P));
   return r;
+#endif
 }
 
 __device__ __forceinline__ uint32_t mmul_lazy(uint32_t a, uint32_t b) {
@@ -108,12 +114,20 @@ __device__ __forceinline__ void partial_rounds(uint32_t* x) {
 #pragma unroll 1
   for (int r = 0; r < 21; r++) {
     x[0] = sbox(addm(red1(x[0]), PV_RCP[r]));
+#ifdef __HIPCC__
+    uint64_t sum = x[0];
+#pragma unroll
+    for (int i = 1; i < 24; i++)
+      sum += x[i];
+    uint32_t st = mred(sum); // < p + 22
+#else
     uint32_t lo, hi;
     asm("add.cc.u32 %0, %2, %3; addc.u32 %1, 0, 0;" : "=r"(lo), "=r"(hi) : "r"(x[0]), "r"(x[1]));
 #pragma unroll
     for (int i = 2; i < 24; i++)
       asm("add.cc.u32 %0, %0, %2; addc.u32 %1, %1, 0;" : "+r"(lo), "+r"(hi) : "r"(x[i]));
     uint32_t st = mred(((uint64_t)hi << 32) | lo); // < p + 22
+#endif
     uint32_t w = mred((uint64_t)st * 0x12f37bfbu); // == S * 2^32 mod p, < 1.074p
 #pragma unroll
     for (int i = 0; i < 24; i++)

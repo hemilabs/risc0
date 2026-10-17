@@ -149,7 +149,8 @@ pub(crate) enum Ins {
     Slow,
 }
 
-/// Node-indexed instructions (operands are node ids), for `witness_par`.
+/// Node-indexed instructions (operands are node ids), for `witness_par` (CUDA only).
+#[cfg(feature = "cuda")]
 pub(crate) struct NodeIns {
     pub(crate) ins: Vec<Ins>,
     pub(crate) kmul: Vec<L>,
@@ -157,6 +158,7 @@ pub(crate) struct NodeIns {
     pub(crate) r2: L,
 }
 
+#[cfg(feature = "cuda")]
 pub(crate) fn compile_node_ins(
     nodes: &Nodes<U254, VecNodes>,
     signals: &[usize],

@@ -1021,30 +1021,63 @@ pub fn hash_key(parts: &[&str]) -> String {
 
 /// Find the hipcc compiler, handling Windows HIP SDK quirks.
 ///
-/// On Windows, the HIP SDK ships `hipcc` as a Perl wrapper script and
-/// `hipcc.bin.exe` as the actual compiler driver. This function checks
-/// `HIPCC` env var first, then tries `hipcc.bin.exe` on Windows (avoids
-/// Perl dependency), then falls back to `hipcc` on PATH.
+/// Checks the `HIPCC` env var first. On Windows, older HIP SDKs ship `hipcc` as a Perl wrapper
+/// script with `hipcc.bin.exe` as the actual compiler driver, and newer ones (7.x) `hipcc.exe`
+/// itself, neither on PATH by default: this looks for either under `HIP_PATH`, then under the
+/// standard install paths. Else `hipcc` on PATH.
 pub fn find_hipcc() -> String {
+    println!("cargo:rerun-if-env-changed=HIPCC");
+    println!("cargo:rerun-if-env-changed=HIP_PATH");
     if let Ok(hipcc) = env::var("HIPCC") {
         return hipcc;
     }
 
     if cfg!(target_os = "windows") {
-        // Try hipcc.bin.exe from HIP_PATH (avoids Perl dependency)
-        if let Ok(hip_path) = env::var("HIP_PATH") {
-            let candidate = PathBuf::from(&hip_path).join("bin").join("hipcc.bin.exe");
-            if candidate.exists() {
-                return candidate.to_string_lossy().into_owned();
+        for exe in ["hipcc.bin.exe", "hipcc.exe"] {
+            if let Ok(hip_path) = env::var("HIP_PATH") {
+                let candidate = PathBuf::from(&hip_path).join("bin").join(exe);
+                if candidate.exists() {
+                    return candidate.to_string_lossy().into_owned();
+                }
             }
-        }
-        // Try standard Windows ROCm install paths
-        if let Some(candidate) = find_in_windows_rocm("bin", "hipcc.bin.exe") {
-            return candidate;
+            if let Some(candidate) = find_in_windows_rocm("bin", exe) {
+                return candidate;
+            }
         }
     }
 
     "hipcc".to_string()
+}
+
+/// The flags every hipcc compile needs for its host code on the target toolchain.
+///
+/// `-fPIC` elsewhere. On MSVC, where clang rejects `-fPIC`, the C runtime the rest of the binary
+/// links: rustc links the DLL runtime (`/MD`; the static one, `/MT`, under `+crt-static`), and
+/// clang targeting MSVC defaults to neither, which leaves the STL's runtime check expecting the
+/// static one and the link failing on `cc`'s `/MD` objects (LNK2038).
+pub fn hip_host_flags() -> Vec<&'static str> {
+    if !is_msvc_target() {
+        vec!["-fPIC"]
+    } else if crt_static() {
+        vec!["-fms-runtime-lib=static", "-DNOMINMAX"]
+    } else {
+        vec!["-fms-runtime-lib=dll", "-DNOMINMAX"]
+    }
+}
+
+/// A `Command` for a direct hipcc invocation (one that bypasses `cc`): `hipcc`, with, on MSVC,
+/// the environment of the cl.exe `cc` finds (`INCLUDE`, `LIB`, `PATH`), so the MSVC headers and
+/// libraries are found outside a Visual Studio developer shell. The caller adds
+/// [`hip_host_flags`].
+pub fn hipcc_command(hipcc: &str) -> Command {
+    let mut cmd = Command::new(hipcc);
+    if is_msvc_target() {
+        let cl = cc::Build::new().cpp(true).get_compiler();
+        for (key, value) in cl.env() {
+            cmd.env(key, value);
+        }
+    }
+    cmd
 }
 
 /// Find a platform-appropriate static archive tool (`ar` / `llvm-ar`).
@@ -1167,7 +1200,7 @@ fn hip_compile_single(
     arches: &str,
     work_dir: Option<&Path>,
 ) {
-    let mut cmd = Command::new(hipcc);
+    let mut cmd = hipcc_command(hipcc);
     if let Some(dir) = work_dir {
         cmd.current_dir(dir);
     }
@@ -1367,4 +1400,252 @@ fn find_offload_bundler(hipcc: &str) -> String {
 
     // 4. PATH fallback.
     "clang-offload-bundler".to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Intel (oneAPI SYCL) build utilities (cross-platform: Linux + Windows)
+// ---------------------------------------------------------------------------
+
+/// A Python 3 interpreter for the Intel kernel-generation scripts.
+///
+/// `RISC0_PYTHON` if set; otherwise the first of `python3`, `python` and `py -3` that runs.
+/// Running each one matters on Windows, where `python3` and `python` on `PATH` are usually the
+/// Microsoft Store stubs, which exist but fail.
+pub fn python_command() -> Command {
+    println!("cargo:rerun-if-env-changed=RISC0_PYTHON");
+    if let Ok(python) = env::var("RISC0_PYTHON") {
+        return Command::new(python);
+    }
+    let candidates: &[(&str, &[&str])] = &[("python3", &[]), ("python", &[]), ("py", &["-3"])];
+    for (program, args) in candidates {
+        let works = Command::new(program)
+            .args(*args)
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if works {
+            let mut cmd = Command::new(program);
+            cmd.args(*args);
+            return cmd;
+        }
+    }
+    panic!("no Python 3 interpreter found (tried python3, python, py -3); set RISC0_PYTHON");
+}
+
+/// The oneAPI DPC++ compiler driver (`icpx`).
+///
+/// `RISC0_ICPX` if set; otherwise the oneAPI installation's (`ONEAPI_ROOT`, or the default
+/// install location: `/opt/intel/oneapi` on Linux, `Program Files (x86)\Intel\oneAPI` on
+/// Windows); otherwise `icpx` on `PATH`.
+pub fn find_icpx() -> PathBuf {
+    println!("cargo:rerun-if-env-changed=RISC0_ICPX");
+    println!("cargo:rerun-if-env-changed=ONEAPI_ROOT");
+    if let Ok(icpx) = env::var("RISC0_ICPX") {
+        return PathBuf::from(icpx);
+    }
+    let exe = if cfg!(windows) { "icpx.exe" } else { "icpx" };
+    let mut roots: Vec<PathBuf> = env::var_os("ONEAPI_ROOT")
+        .map(PathBuf::from)
+        .into_iter()
+        .collect();
+    if cfg!(windows) {
+        let pf86 =
+            env::var("ProgramFiles(x86)").unwrap_or_else(|_| r"C:\Program Files (x86)".into());
+        roots.push(PathBuf::from(pf86).join("Intel").join("oneAPI"));
+    } else {
+        roots.push(PathBuf::from("/opt/intel/oneapi"));
+    }
+    for root in roots {
+        let candidate = root.join("compiler").join("latest").join("bin").join(exe);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    PathBuf::from(exe)
+}
+
+/// The file `icpx` builds for the Intel shared library `name` in `dir`:
+/// `lib<name>.so` on Linux, `<name>.dll` (with its import library `<name>.lib`) on Windows.
+pub fn intel_library_path(dir: &Path, name: &str) -> PathBuf {
+    if cfg!(windows) {
+        dir.join(format!("{name}.dll"))
+    } else {
+        dir.join(format!("lib{name}.so"))
+    }
+}
+
+/// Build the Intel (SYCL) shared library `name` in `dir` from `sources` with `icpx`, passing
+/// `args` (compile and device-link options: `-fsycl`, `-O*`, `-I*`, `-fsycl-targets=...`,
+/// `-Xs ...`; not `-shared`, `-fPIC` or `-o`) to every step. Returns the last step's output.
+///
+/// On Linux this is one `icpx -shared -fPIC` command. On Windows a DLL exports only what it is
+/// told to, so each source is compiled to an object first, the C (unmangled) functions they
+/// define are listed with `llvm-nm` into a module-definition file, and the DLL is linked with
+/// it, which also writes the import library that Rust links against.
+pub fn intel_build_library(
+    icpx: &Path,
+    args: &[std::ffi::OsString],
+    sources: &[PathBuf],
+    dir: &Path,
+    name: &str,
+) -> std::process::Output {
+    let lib = intel_library_path(dir, name);
+    if !cfg!(windows) {
+        let mut cmd = Command::new(icpx);
+        cmd.arg("-shared")
+            .arg("-fPIC")
+            .args(args)
+            .args(sources)
+            .arg("-o")
+            .arg(&lib);
+        eprintln!("  Running: {cmd:?}");
+        return cmd
+            .output()
+            .unwrap_or_else(|e| panic!("failed to run {}: {e}", icpx.display()));
+    }
+
+    let obj_dir = dir.join(format!("{name}.objs"));
+    let _ = fs::remove_dir_all(&obj_dir);
+    fs::create_dir_all(&obj_dir).unwrap();
+    // Compile the sources in parallel: each is a separate icpx process.
+    let compiled: Vec<(PathBuf, std::process::Output)> = sources
+        .par_iter()
+        .enumerate()
+        .map(|(i, src)| {
+            let stem = src.file_stem().unwrap_or_default().to_string_lossy();
+            let obj = obj_dir.join(format!("{i}_{stem}.obj"));
+            let mut cmd = Command::new(icpx);
+            cmd.arg("-c").args(args).arg(src).arg("-o").arg(&obj);
+            eprintln!("  Running: {cmd:?}");
+            let out = cmd
+                .output()
+                .unwrap_or_else(|e| panic!("failed to run {}: {e}", icpx.display()));
+            (obj, out)
+        })
+        .collect();
+    if let Some((_, failed)) = compiled.iter().find(|(_, out)| !out.status.success()) {
+        return failed.clone();
+    }
+    let objs: Vec<PathBuf> = compiled.into_iter().map(|(obj, _)| obj).collect();
+
+    let nm = intel_tool(icpx, "llvm-nm.exe");
+    let mut exports = std::collections::BTreeSet::new();
+    for obj in &objs {
+        let out = Command::new(&nm)
+            .args(["--extern-only", "--defined-only"])
+            .arg(obj)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to run {}: {e}", nm.display()));
+        assert!(
+            out.status.success(),
+            "llvm-nm failed on {}: {}",
+            obj.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let mut fields = line.split_whitespace();
+            let (Some(_addr), Some(kind), Some(sym)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            if kind == "T" && is_exported_c_function(sym) {
+                exports.insert(sym.to_string());
+            }
+        }
+    }
+    assert!(
+        !exports.is_empty(),
+        "{name}: no C functions found to export"
+    );
+    let def = obj_dir.join(format!("{name}.def"));
+    let mut def_text = format!("LIBRARY {name}\nEXPORTS\n");
+    for sym in &exports {
+        def_text.push_str(&format!("    {sym}\n"));
+    }
+    fs::write(&def, def_text).unwrap();
+
+    // libmmd.lib and the SYCL runtime's import libraries, which oneAPI's `setvars` would
+    // otherwise have put on LIB.
+    let lib_dir = icpx.parent().and_then(Path::parent).map(|p| p.join("lib"));
+    let mut cmd = Command::new(icpx);
+    cmd.arg("-shared").args(args).args(&objs);
+    if let Some(lib_dir) = lib_dir.filter(|d| d.is_dir()) {
+        cmd.arg(format!("-L{}", lib_dir.display()));
+    }
+    cmd.arg(format!("-Wl,/DEF:{}", def.display()))
+        .arg("-o")
+        .arg(&lib);
+    eprintln!("  Running: {cmd:?}");
+    cmd.output()
+        .unwrap_or_else(|e| panic!("failed to run {}: {e}", icpx.display()))
+}
+
+/// Whether an object's defined function `sym` is one of the library's C entry points: not
+/// C++-mangled (`?...`), not a compiler or CRT internal (`_...`, `$...`), and not one of the C
+/// runtime's inline printf/scanf functions, which its headers define in every object using
+/// them.
+fn is_exported_c_function(sym: &str) -> bool {
+    !sym.starts_with('?')
+        && !sym.starts_with('_')
+        && !sym.starts_with('$')
+        && !["printf", "printf_s", "scanf", "scanf_s"]
+            .iter()
+            .any(|s| sym.ends_with(s))
+}
+
+/// A tool from oneAPI's bundled LLVM (`bin/compiler/<tool>` next to `icpx`), else from `PATH`.
+fn intel_tool(icpx: &Path, tool: &str) -> PathBuf {
+    icpx.parent()
+        .map(|bin| bin.join("compiler").join(tool))
+        .filter(|p| p.is_file())
+        .unwrap_or_else(|| PathBuf::from(tool))
+}
+
+/// Link the Intel shared library `name` built in `dir` (see [`intel_build_library`]).
+///
+/// On Windows the DLL is also copied next to the binaries being built (`<target>/<profile>`
+/// and its `deps`), which is where Windows looks for it when they run.
+pub fn intel_link_library(dir: &Path, name: &str) {
+    println!("cargo:rustc-link-search=native={}", dir.display());
+    println!("cargo:rustc-link-lib=dylib={name}");
+    if cfg!(windows) {
+        let dll = intel_library_path(dir, name);
+        let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+        // OUT_DIR is <target>/<profile>/build/<crate>-<hash>/out.
+        if let Some(profile_dir) = out_dir.ancestors().nth(3) {
+            for dest in [profile_dir.to_path_buf(), profile_dir.join("deps")] {
+                if dest.is_dir() {
+                    let target = dest.join(dll.file_name().unwrap());
+                    if let Err(e) = fs::copy(&dll, &target) {
+                        println!(
+                            "cargo:warning=could not copy {} to {}: {e}",
+                            dll.display(),
+                            target.display()
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Link the SYCL runtime for Rust code that calls it directly: `libsycl.so` on Linux. On
+/// Windows the runtime is versioned (`sycl8.dll`) and only the Intel DLLs call it, which
+/// `icpx` links against it itself, so there is nothing to add.
+pub fn intel_link_sycl_runtime() {
+    if cfg!(windows) {
+        return;
+    }
+    if let Ok(oneapi_root) = env::var("ONEAPI_ROOT") {
+        let lib_dir = PathBuf::from(&oneapi_root).join("lib");
+        if lib_dir.exists() {
+            println!("cargo:rustc-link-search=native={}", lib_dir.display());
+        }
+    }
+    let intel_lib = PathBuf::from("/opt/intel/oneapi/compiler/latest/lib");
+    if intel_lib.exists() {
+        println!("cargo:rustc-link-search=native={}", intel_lib.display());
+    }
+    println!("cargo:rustc-link-lib=dylib=sycl");
 }

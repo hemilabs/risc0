@@ -424,8 +424,18 @@ pub fn prove_zkr(
     allowed_control_ids: Vec<Digest>,
     input: &[u8],
 ) -> Result<SuccinctReceipt<Unknown>> {
+    prove_shared_zkr(Arc::new(program), control_id, allowed_control_ids, input)
+}
+
+/// [prove_zkr], with a program shared with other proofs (see `get_keccak_zkr_shared`).
+pub(crate) fn prove_shared_zkr(
+    program: Arc<Program>,
+    control_id: &Digest,
+    allowed_control_ids: Vec<Digest>,
+    input: &[u8],
+) -> Result<SuccinctReceipt<Unknown>> {
     let opts = ProverOpts::succinct().with_control_ids(allowed_control_ids);
-    let mut prover = Prover::new(Arc::new(program), *control_id, opts.clone());
+    let mut prover = Prover::new(program, *control_id, opts.clone());
     prover.add_input(bytemuck::cast_slice(input));
 
     tracing::debug!("Running prover");

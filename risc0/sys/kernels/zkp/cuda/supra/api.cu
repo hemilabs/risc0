@@ -8,14 +8,31 @@
 #include <polynomial/prefix_op.cuh>
 
 #include "poseidon2.cuh"
-#ifndef __HIPCC__
-// CUDA uses the lazy-reduction Poseidon2 kernels (pv.cuh); ROCm keeps poseidon2.cuh's.
+// The lazy-reduction Poseidon2 kernels (pv.cuh), for CUDA and ROCm.
 #include "pv.cuh"
-#include "mdiv.cuh"
 #define PV_BLOCK 128
+#ifndef __HIPCC__
+#include "mdiv.cuh"
 // Latency-bound small levels / row counts: warp- and quad-per-permutation kernels.
 #include "pv_small.cuh"
 #endif
+
+#include <cstdlib>
+#include <cstring>
+
+// Whether to hash with pv.cuh's kernels rather than poseidon2.cuh's: always on CUDA; on ROCm
+// unless RISC0_HIP_POSEIDON2=classic.
+static bool use_pv_kernels() {
+#ifdef __HIPCC__
+  static const bool pv = [] {
+    const char* v = std::getenv("RISC0_HIP_POSEIDON2");
+    return !(v && std::strcmp(v, "classic") == 0);
+  }();
+  return pv;
+#else
+  return true;
+#endif
+}
 #if defined(__HIPCC__) && !defined(__HIP_DEVICE_COMPILE__)
 // HIP host pass: blst_256_t::operator[] is private, causing errors in
 // poseidon254.cuh's __device__ helpers. Provide empty __global__ kernel
@@ -117,7 +134,13 @@ sppark_poseidon2_fold(poseidon_out_t* d_out, const poseidon_in_t* d_in, size_t n
           (uint4*)d_out, (const uint4*)d_in, (uint32_t)num_hashes);
     }
 #else
-    _poseidon2_fold<<<num_blocks, block_size, 0, gpu>>>(d_out, d_in, num_hashes);
+    if (use_pv_kernels()) {
+      size_t bs = num_hashes < PV_BLOCK ? num_hashes : PV_BLOCK;
+      pv::fold_k<<<(num_hashes + bs - 1) / bs, bs, 0, gpu>>>(
+          (uint4*)d_out, (const uint4*)d_in, (uint32_t)num_hashes);
+    } else {
+      _poseidon2_fold<<<num_blocks, block_size, 0, gpu>>>(d_out, d_in, num_hashes);
+    }
 #endif
 
     CUDA_OK(cudaGetLastError());
@@ -155,12 +178,18 @@ sppark_poseidon2_fold_tree(poseidon_out_t* nodes, uint32_t layers) {
             (uint4*)(nodes + layer_size), (const uint4*)(nodes + 2 * layer_size), layer_size);
       }
 #else
-      size_t block_size = layer_size < P2_BLOCK ? layer_size : P2_BLOCK;
-      size_t num_blocks = layer_size < P2_BLOCK ? 1 : layer_size / P2_BLOCK;
-      _poseidon2_fold<<<num_blocks, block_size, 0, gpu>>>(
-          nodes + layer_size,
-          (const poseidon_in_t*)(nodes + 2 * layer_size),
-          layer_size);
+      if (use_pv_kernels()) {
+        uint32_t bs = layer_size < PV_BLOCK ? layer_size : PV_BLOCK;
+        pv::fold_k<<<(layer_size + bs - 1) / bs, bs, 0, gpu>>>(
+            (uint4*)(nodes + layer_size), (const uint4*)(nodes + 2 * layer_size), layer_size);
+      } else {
+        size_t block_size = layer_size < P2_BLOCK ? layer_size : P2_BLOCK;
+        size_t num_blocks = layer_size < P2_BLOCK ? 1 : layer_size / P2_BLOCK;
+        _poseidon2_fold<<<num_blocks, block_size, 0, gpu>>>(
+            nodes + layer_size,
+            (const poseidon_in_t*)(nodes + 2 * layer_size),
+            layer_size);
+      }
 #endif
       CUDA_OK(cudaGetLastError());
     }
@@ -198,7 +227,13 @@ sppark_poseidon2_rows(poseidon_out_t* d_out, const fr_t* d_in, uint32_t count, u
           (uint4*)d_out, (const uint32_t*)d_in, count, col_size);
     }
 #else
-    _poseidon2_rows<<<num_blocks, block_size, 0, gpu>>>(d_out, d_in, count, col_size);
+    if (use_pv_kernels()) {
+      uint32_t bs = count < PV_BLOCK ? count : PV_BLOCK;
+      pv::rows_k<<<(count + bs - 1) / bs, bs, 0, gpu>>>(
+          (uint4*)d_out, (const uint32_t*)d_in, count, col_size);
+    } else {
+      _poseidon2_rows<<<num_blocks, block_size, 0, gpu>>>(d_out, d_in, count, col_size);
+    }
 #endif
 
     CUDA_OK(cudaGetLastError());
@@ -402,6 +437,64 @@ supra_poly_divide_multi(fr4_t* combos_base, size_t stride,
       return RustError{cudaSuccess};
     }
 #endif
+#ifdef SPPARK_NO_COOPERATIVE_LAUNCH
+    // Without cooperative launch each division runs as one block (see div_by_x_minus_z), so run
+    // the combos' independent chains concurrently, one stream each, after the work queued on
+    // gpu's stream. Each remainder is copied on the device as its division finishes, and all of
+    // them to the host once at the end: a pageable device-to-host copy per division would block
+    // the host between launches.
+    (void)sm_count;
+    constexpr uint32_t kStreams = 8;
+    int dev = 0;
+    CUDA_OK(cudaGetDevice(&dev));
+    static cudaStream_t side[16][kStreams] = {};
+    static cudaEvent_t done[16][kStreams] = {};
+    static cudaEvent_t ready[16] = {};
+    static fr4_t* d_rem[16] = {};
+    static size_t d_rem_cap[16] = {};
+    if (!ready[dev]) {
+      CUDA_OK(cudaEventCreateWithFlags(&ready[dev], cudaEventDisableTiming));
+      for (uint32_t k = 0; k < kStreams; k++) {
+        CUDA_OK(cudaStreamCreateWithFlags(&side[dev][k], cudaStreamNonBlocking));
+        CUDA_OK(cudaEventCreateWithFlags(&done[dev][k], cudaEventDisableTiming));
+      }
+    }
+    size_t total_pows = 0;
+    for (uint32_t c = 0; c < num_combos; c++)
+      total_pows += pows_per_combo[c];
+    if (total_pows > d_rem_cap[dev]) {
+      if (d_rem[dev])
+        CUDA_OK(cudaFree(d_rem[dev]));
+      CUDA_OK(cudaMalloc(&d_rem[dev], total_pows * sizeof(fr4_t)));
+      d_rem_cap[dev] = total_pows;
+    }
+    struct one_stream {
+      cudaStream_t s;
+      int sm_count() const { return 1; }
+      operator cudaStream_t() const { return s; }
+    };
+    CUDA_OK(cudaEventRecord(ready[dev], gpu));
+    uint32_t used = num_combos < kStreams ? num_combos : kStreams;
+    for (uint32_t k = 0; k < used; k++)
+      CUDA_OK(cudaStreamWaitEvent(side[dev][k], ready[dev], 0));
+    size_t pows_offset = 0;
+    for (uint32_t c = 0; c < num_combos; c++) {
+      one_stream s{side[dev][c % kStreams]};
+      fr4_t* slice = combos_base + combo_indices[c] * stride;
+      for (uint32_t d = 0; d < pows_per_combo[c]; d++) {
+        div_by_x_minus_z<true>(slice, stride, all_pows[pows_offset + d], s, 1);
+        CUDA_OK(cudaMemcpyAsync(&d_rem[dev][pows_offset + d], &slice[stride - 1], sizeof(fr4_t),
+                                cudaMemcpyDeviceToDevice, s.s));
+      }
+      pows_offset += pows_per_combo[c];
+    }
+    for (uint32_t k = 0; k < used; k++) {
+      CUDA_OK(cudaEventRecord(done[dev][k], side[dev][k]));
+      CUDA_OK(cudaStreamWaitEvent(gpu, done[dev][k], 0));
+    }
+    gpu.DtoH(remainders, d_rem[dev], total_pows);
+    gpu.sync();
+#else
     size_t pows_offset = 0;
     for (uint32_t c = 0; c < num_combos; c++) {
       fr4_t* slice = combos_base + combo_indices[c] * stride;
@@ -412,6 +505,7 @@ supra_poly_divide_multi(fr4_t* combos_base, size_t stride,
       pows_offset += pows_per_combo[c];
     }
     gpu.sync();
+#endif
   } catch (const cuda_error& e) {
     gpu.sync();
     return RustError{e.code(), e.what()};

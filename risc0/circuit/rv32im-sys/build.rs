@@ -314,9 +314,10 @@ fn build_cuda_kernels() {
         env::var_os("NVCC_PREPEND_FLAGS").is_none() && env::var_os("NVCC_APPEND_FLAGS").is_none();
 
     // Step 1: Compile eval_check_ef.cu WITHOUT -dc (standalone mode). It is the
-    // generated evalfast kernel (kernels/cuda/evalfast/regen.py); ROCm keeps
-    // eval_check_combined.cu. Standalone, NVCC sees the whole poly_fp call chain
-    // in one translation unit; with -dc it would compile relocatable code.
+    // generated evalfast kernel (kernels/cuda/evalfast/regen.py); ROCm builds
+    // eval_check_ef_hip.cu, an earlier output of it. Standalone,
+    // NVCC sees the whole poly_fp call chain in one translation unit; with -dc it would
+    // compile relocatable code.
     //
     // CACHING: eval_check compilation takes a few minutes. We cache it under a key over
     // everything it can read (see `eval_check_ef_sources_key`) and the compiler, and skip
@@ -493,6 +494,7 @@ fn build_cuda_kernels() {
                         | "eval_check_3.cu"
                         | "eval_check_combined.cu" // ROCm only
                         | "eval_check_ef.cu"
+                        | "eval_check_ef_hip.cu" // ROCm only
                         | "accum_tu.cu" // standalone (Step 1b)
                         | "witgen_tu.cu" // standalone (Step 1b)
                         | "eval_check_kernel.cu"  // RDC-only, not used by NVIDIA
@@ -547,8 +549,11 @@ fn build_rocm_kernels() {
     rerun_if_include_roots_changed(&[&cuda_root, &cxx_root, &sppark_root]);
     let hipcc = risc0_build_kernel::find_hipcc();
 
-    // Step 1: Compile eval_check_combined.cu standalone with hipcc.
-    // -mllvm -amdgpu-early-inline-all=false prevents OOM on this large kernel
+    // Step 1: Compile eval_check standalone with hipcc: the evalfast kernel
+    // (eval_check_ef_hip.cu, see its header) unless RISC0_HIP_EVAL_CHECK=combined selects the original
+    // eval_check_combined.cu. On an RX 9070 XT (gfx1201) evalfast needs 9.3 KB of scratch per
+    // lane against the original's 16.8 KB, and a po2 20 eval_check takes ~470 ms against 845 ms.
+    // For the original, -mllvm -amdgpu-early-inline-all=false prevents OOM on this large kernel
     // (21 functions, 2154 column reads).
     //
     // CACHING: eval_check compilation is very slow. We hash all eval_check
@@ -572,7 +577,8 @@ fn build_rocm_kernels() {
             "ffi_supra_hash_rocm.stamp",
         ],
     );
-    let eval_check_obj = out_dir.join("eval_check_combined_standalone.o");
+    let obj_ext = risc0_build_kernel::object_extension();
+    let eval_check_obj = out_dir.join(format!("eval_check_combined_standalone.{obj_ext}"));
     // Every cache below is keyed on its sources, the hipcc command and flags, what hipcc
     // reads from outside its arguments (its version and environment), and the architectures
     // -- for `native`, this machine's GPUs -- so none can reuse an object built without them.
@@ -587,24 +593,37 @@ fn build_rocm_kernels() {
         }
     );
     let include_cuda2hip = format!("{}/util/cuda2hip.hpp", &sppark_root);
-    let eval_check_flags: Vec<&str> = vec![
+    println!("cargo:rerun-if-env-changed=RISC0_HIP_EVAL_CHECK");
+    let evalfast = env::var("RISC0_HIP_EVAL_CHECK").as_deref() != Ok("combined");
+    let mut eval_check_flags: Vec<&str> = vec![
         "-x",
         "hip",
         "-std=c++17",
         "-O3",
-        "-fPIC",
         "-Wno-unused-function",
         "-Wno-unused-parameter",
-        "-mllvm",
-        "-amdgpu-early-inline-all=false",
-        "-mllvm",
-        "-amdgpu-use-aa-in-codegen",
-        "-mllvm",
-        "-amdgpu-schedule-metric-bias=0",
-        "-mllvm",
-        "-amdgpu-internalize-symbols",
-        "-mllvm",
-        "-amdgpu-schedule-relaxed-occupancy",
+    ];
+    if evalfast {
+        // Measured on an RX 9070 XT at po2 20: 64-wide waves and an occupancy target of 4 blocks
+        // (EF_MINB, the launch bounds' minimum) take eval_check from 603 to ~470 ms. Not 8, the
+        // fastest (392 ms): ROCm 7.2 miscompiles that combination, and nearly every call after
+        // the first few returns wrong values (5, 6 and 10 were correct in 300 calls each).
+        eval_check_flags.extend(["-mwavefrontsize64", "-DEF_MINB=4"]);
+    } else {
+        eval_check_flags.extend([
+            "-mllvm",
+            "-amdgpu-early-inline-all=false",
+            "-mllvm",
+            "-amdgpu-use-aa-in-codegen",
+            "-mllvm",
+            "-amdgpu-schedule-metric-bias=0",
+            "-mllvm",
+            "-amdgpu-internalize-symbols",
+            "-mllvm",
+            "-amdgpu-schedule-relaxed-occupancy",
+        ]);
+    }
+    eval_check_flags.extend([
         "-include",
         &include_cuda2hip,
         "-I",
@@ -613,24 +632,37 @@ fn build_rocm_kernels() {
         &cxx_root,
         "-I",
         &sppark_root,
-    ];
+    ]);
+    eval_check_flags.extend(risc0_build_kernel::hip_host_flags());
+    let (eval_check_src, eval_check_sources) = if evalfast {
+        (
+            "eval_check_ef_hip.cu",
+            eval_check_ef_hip_sources_key(&cuda_root, &cxx_root, &sppark_root),
+        )
+    } else {
+        (
+            "eval_check_combined.cu",
+            eval_check_sources_key(&cuda_root, &cxx_root, &sppark_root),
+        )
+    };
     let eval_check_key = risc0_build_kernel::hash_key(&[
         "rv32im-rocm-eval-check-v1",
-        &eval_check_sources_key(&cuda_root, &cxx_root, &sppark_root),
+        eval_check_src,
+        &eval_check_sources,
         &format!("{eval_check_flags:?}"),
         &hipcc_key,
     ]);
     risc0_build_kernel::cached_compile(
         &cache_dir,
         "eval_check_combined_standalone",
-        "o",
+        obj_ext,
         &eval_check_key,
         &eval_check_obj,
         |out| {
             risc0_build_kernel::hip_compile(
                 &hipcc,
                 &eval_check_flags,
-                Path::new("eval_check_combined.cu"),
+                Path::new(eval_check_src),
                 out,
                 &hip_arches,
                 Some(Path::new("kernels/cuda")),
@@ -654,6 +686,7 @@ fn build_rocm_kernels() {
                     | "eval_check_3.cu"
                     | "eval_check_combined.cu"
                     | "eval_check_ef.cu" // CUDA only
+                    | "eval_check_ef_hip.cu"
                     | "eval_check_kernel.cu"
                     | "witgen_combined.cu"
                     | "accum_tu.cu"
@@ -676,12 +709,11 @@ fn build_rocm_kernels() {
     // amalgamation by absolute path, and with `-I` to it), so their caches are keyed on all
     // of them.
     let kernel_dir_str = kernel_dir.to_str().unwrap();
-    let local_flags: Vec<&str> = vec![
+    let mut local_flags: Vec<&str> = vec![
         "-x",
         "hip",
         "-std=c++17",
         "-O3",
-        "-fPIC",
         "-Wno-unused-function",
         "-Wno-unused-parameter",
         "-mllvm",
@@ -697,6 +729,7 @@ fn build_rocm_kernels() {
         "-I",
         kernel_dir_str,
     ];
+    local_flags.extend(risc0_build_kernel::hip_host_flags());
     let local_sources_key = risc0_build_kernel::kernel_sources_key(
         &[
             Path::new(&cuda_root),
@@ -709,7 +742,7 @@ fn build_rocm_kernels() {
     );
 
     // Cache remaining_kernels.
-    let remaining_obj = out_dir.join("remaining_kernels_rocm.o");
+    let remaining_obj = out_dir.join(format!("remaining_kernels_rocm.{obj_ext}"));
     let remaining_key = risc0_build_kernel::hash_key(&[
         "rv32im-rocm-remaining-v1",
         &local_sources_key,
@@ -720,7 +753,7 @@ fn build_rocm_kernels() {
     risc0_build_kernel::cached_compile(
         &cache_dir,
         "remaining_kernels_rocm",
-        "o",
+        obj_ext,
         &remaining_key,
         &remaining_obj,
         |out| {
@@ -740,7 +773,7 @@ fn build_rocm_kernels() {
     let mut all_objs = vec![eval_check_obj.clone(), remaining_obj];
     for cu in &separate_files {
         let stem = cu.file_stem().unwrap().to_str().unwrap();
-        let obj = out_dir.join(format!("{stem}.o"));
+        let obj = out_dir.join(format!("{stem}.{obj_ext}"));
         let key = risc0_build_kernel::hash_key(&[
             "rv32im-rocm-separate-v1",
             &local_sources_key,
@@ -748,23 +781,16 @@ fn build_rocm_kernels() {
             &format!("{local_flags:?}"),
             &hipcc_key,
         ]);
-        risc0_build_kernel::cached_compile(&cache_dir, stem, "o", &key, &obj, |out| {
+        risc0_build_kernel::cached_compile(&cache_dir, stem, obj_ext, &key, &obj, |out| {
             risc0_build_kernel::hip_compile(&hipcc, &local_flags, cu, out, &hip_arches, None)
         });
         all_objs.push(obj);
     }
 
     // Step 3: Archive all objects
-    let archive = out_dir.join(format!("lib{output}.a"));
-    let _ = std::fs::remove_file(&archive);
-    let ar = risc0_build_kernel::find_ar_tool();
-    let mut ar_cmd = Command::new(&ar);
-    ar_cmd.arg("rcs").arg(&archive);
-    for obj in &all_objs {
-        ar_cmd.arg(obj);
-    }
-    let status = ar_cmd.status().expect("failed to run ar");
-    assert!(status.success(), "ar failed");
+    let _ = std::fs::remove_file(out_dir.join(format!("lib{output}.a")));
+    let _ = std::fs::remove_file(out_dir.join(format!("{output}.lib")));
+    risc0_build_kernel::add_to_static_lib(&out_dir, output, &all_objs);
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static={output}");
@@ -800,6 +826,23 @@ const EVAL_CHECK_EF_LOCAL_SOURCES: &[&str] = &[
     "kernels/cuda/ef_fp.h",
     "kernels/cuda/ef_fpext.h",
 ];
+
+/// The files in kernels/cuda that the ROCm eval_check_ef_hip.cu reads.
+const EVAL_CHECK_EF_HIP_LOCAL_SOURCES: &[&str] = &[
+    "kernels/cuda/eval_check_ef_hip.cu",
+    "kernels/cuda/ef_fp.h",
+    "kernels/cuda/ef_fpext.h",
+];
+
+/// [`eval_check_sources_key`] for the ROCm eval_check_ef_hip.cu.
+fn eval_check_ef_hip_sources_key(cuda_root: &str, cxx_root: &str, sppark_root: &str) -> String {
+    include_roots_sources_key(
+        EVAL_CHECK_EF_HIP_LOCAL_SOURCES,
+        cuda_root,
+        cxx_root,
+        sppark_root,
+    )
+}
 
 /// [`eval_check_sources_key`] for the CUDA eval_check_ef.cu.
 fn eval_check_ef_sources_key(cuda_root: &str, cxx_root: &str, sppark_root: &str) -> String {
@@ -1254,7 +1297,9 @@ fn try_recover_witgen_so(out_dir: &Path, dest_so: &Path) {
         }
     };
     let variant = intel_variant_tag();
-    let so_name = "librisc0_rv32im_intel_witgen.so";
+    let so_name_path =
+        risc0_build_kernel::intel_library_path(Path::new(""), "risc0_rv32im_intel_witgen");
+    let so_name = so_name_path.to_str().unwrap();
     // Same-variant only. We DO include both same-profile and release
     // candidates — a debug build's recovery can pull from release
     // (icpx flags are profile-invariant for the same variant), but we
@@ -1371,17 +1416,7 @@ fn build_intel_kernels() {
         println!("cargo:rerun-if-changed={cxx_root}/{header}");
     }
 
-    // Find icpx compiler
-    let icpx = env::var("RISC0_ICPX")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let oneapi = PathBuf::from("/opt/intel/oneapi/compiler/latest/bin/icpx");
-            if oneapi.exists() {
-                oneapi
-            } else {
-                PathBuf::from("icpx")
-            }
-        });
+    let icpx = risc0_build_kernel::find_icpx();
 
     // Cache directory for the expensive eval_check compilation. Anchor on the
     // <profile> directory under target/ regardless of profile name so custom
@@ -1425,7 +1460,7 @@ fn build_intel_kernels() {
     let multipass_hash = compute_multipass_hash(&cxx_root, &icpx_version);
     let witgen_hash = compute_witgen_hash(&cxx_root, &icpx_version);
 
-    let so_path = cache_dir.join("librisc0_rv32im_intel.so");
+    let so_path = risc0_build_kernel::intel_library_path(&cache_dir, "risc0_rv32im_intel");
 
     // Check if we can skip rebuild: artifact present, stamp parses, hash
     // matches the recomputed-from-source hash, status was "ok" last build.
@@ -1447,7 +1482,7 @@ fn build_intel_kernels() {
             let dst = out_dir.join("poly_fp_tree_reduced");
             std::fs::create_dir_all(&dst).unwrap();
             let script = std::path::PathBuf::from("kernels/intel/tree_reduce_fma.py");
-            let status = std::process::Command::new("python3")
+            let status = risc0_build_kernel::python_command()
                 .arg(&script)
                 .arg(&current_src_dir)
                 .arg(&dst)
@@ -1490,7 +1525,7 @@ fn build_intel_kernels() {
                 std::env::var("RISC0_POLY_FP_CSE_TOP").unwrap_or_else(|_| "16".to_string());
             let cse_min =
                 std::env::var("RISC0_POLY_FP_CSE_MIN_SHARE").unwrap_or_else(|_| "10".to_string());
-            let mut script_cmd = std::process::Command::new("python3");
+            let mut script_cmd = risc0_build_kernel::python_command();
             script_cmd
                 .arg(&script)
                 .arg(&current_src_dir)
@@ -1514,10 +1549,9 @@ fn build_intel_kernels() {
         }
         let poly_fp_dir = current_src_dir;
 
+        // Collects the arguments for intel_build_library (not run itself).
         let mut cmd = Command::new(&icpx);
-        cmd.arg("-shared")
-            .arg("-fPIC")
-            .arg("-fsycl")
+        cmd.arg("-fsycl")
             .arg("-std=c++17")
             .arg("-Os") // -Os + noinline + 256 GRF: best eval_check perf (18MB vs 30MB -O1, 2x fewer icache misses)
             // Tell ocloc to skip expensive optimization passes via -cl-opt-disable.
@@ -1595,7 +1629,7 @@ fn build_intel_kernels() {
         let compile_src = if eval_fast {
             let fast_path = out_dir.join("intel_eval_check_amalg_fast.cpp");
             let work_dir = out_dir.join("evalfast_work");
-            let status = Command::new("python3")
+            let status = risc0_build_kernel::python_command()
                 .arg("kernels/intel/evalfast/pipeline.py")
                 .arg(&amalg_path)
                 .arg(&fast_path)
@@ -1621,18 +1655,21 @@ fn build_intel_kernels() {
             amalg_path.clone()
         };
 
-        cmd.arg(&compile_src)
-            .arg("-o")
-            .arg(&so_path)
-            .arg("-fsycl-targets=intel_gpu_bmg_g31") // AOT with noinline sub-functions
+        cmd.arg("-fsycl-targets=intel_gpu_bmg_g31") // AOT with noinline sub-functions
             // Force 256 GRF mode: doubles register file from 8KB to 16KB per thread,
             // dramatically reducing the 42KB spill overhead. Trades occupancy (8→4 threads/EU)
             // for fewer spills — net win since kernel is spill-bound, not compute-bound.
             .arg("-Xs")
             .arg(format!("-options \"{xs_options}\""));
 
-        eprintln!("  Running: {:?}", cmd);
-        let output = cmd.output().expect("Failed to run icpx");
+        let args: Vec<std::ffi::OsString> = cmd.get_args().map(|a| a.to_owned()).collect();
+        let output = risc0_build_kernel::intel_build_library(
+            &icpx,
+            &args,
+            &[compile_src],
+            &cache_dir,
+            "risc0_rv32im_intel",
+        );
         // IGC/ocloc report warnings on stdout, the compiler driver on stderr.
         let log = format!(
             "{}{}",
@@ -1659,8 +1696,7 @@ fn build_intel_kernels() {
     }
 
     // Link eval_check
-    println!("cargo:rustc-link-search=native={}", cache_dir.display());
-    println!("cargo:rustc-link-lib=dylib=risc0_rv32im_intel");
+    risc0_build_kernel::intel_link_library(&cache_dir, "risc0_rv32im_intel");
 
     // mono_path is the monolithic amalgamation without kernel wrapper (for multipass gen)
     let mono_path = out_dir.join("intel_eval_check_mono.cpp");
@@ -1669,8 +1705,8 @@ fn build_intel_kernels() {
     // Build 2-way multi-pass eval_check (two separate .so files)
     // Each .so has ~27K lines (half monolithic) → ~9MB GPU binary, fits in L2.
     // ========================================================================
-    let pass1_so = cache_dir.join("librisc0_rv32im_intel_pass1.so");
-    let pass2_so = cache_dir.join("librisc0_rv32im_intel_pass2.so");
+    let pass1_so = risc0_build_kernel::intel_library_path(&cache_dir, "risc0_rv32im_intel_pass1");
+    let pass2_so = risc0_build_kernel::intel_library_path(&cache_dir, "risc0_rv32im_intel_pass2");
     let multipass_stamp = cache_dir.join("intel_multipass.stamp");
     // Multipass cache is hit only when both pass-side .so files exist and the
     // stamp hash matches mono+gen_multipass.py inputs. Either .so missing or
@@ -1685,7 +1721,7 @@ fn build_intel_kernels() {
             let pass1_amalg = out_dir.join("intel_eval_check_pass1.cpp");
             let pass2_amalg = out_dir.join("intel_eval_check_pass2.cpp");
 
-            let mp_output = Command::new("python3")
+            let mp_output = risc0_build_kernel::python_command()
                 .arg(&multipass_script)
                 .arg(&mono_path)
                 .arg(&pass1_amalg)
@@ -1699,27 +1735,31 @@ fn build_intel_kernels() {
 
                 // Compile pass1
                 eprintln!("  Compiling pass1...");
-                let p1_output = Command::new(&icpx)
-                    .arg("-shared")
-                    .arg("-fPIC")
-                    .arg("-fsycl")
-                    .arg("-std=c++17")
-                    .arg("-Os")
-                    .arg("-Wno-unused-parameter")
-                    .arg("-Wno-unused-function")
-                    .arg("-Wno-unused-variable")
-                    .arg("-Wno-sign-compare")
-                    .arg(format!("-I{cxx_root}"))
-                    .arg("-Ikernels/cxx")
-                    .arg("-Ikernels/intel")
-                    .arg(&pass1_amalg)
-                    .arg("-o")
-                    .arg(&pass1_so)
-                    .arg("-fsycl-targets=intel_gpu_bmg_g31")
-                    .arg("-Xs")
-                    .arg(format!("-options \"{}\"", intel_xs_options()))
-                    .output()
-                    .expect("Failed to run icpx for pass1");
+                let p1_args: Vec<std::ffi::OsString> = [
+                    "-fsycl".to_string(),
+                    "-std=c++17".into(),
+                    "-Os".into(),
+                    "-Wno-unused-parameter".into(),
+                    "-Wno-unused-function".into(),
+                    "-Wno-unused-variable".into(),
+                    "-Wno-sign-compare".into(),
+                    format!("-I{cxx_root}"),
+                    "-Ikernels/cxx".into(),
+                    "-Ikernels/intel".into(),
+                    "-fsycl-targets=intel_gpu_bmg_g31".into(),
+                    "-Xs".into(),
+                    format!("-options \"{}\"", intel_xs_options()),
+                ]
+                .into_iter()
+                .map(Into::into)
+                .collect();
+                let p1_output = risc0_build_kernel::intel_build_library(
+                    &icpx,
+                    &p1_args,
+                    std::slice::from_ref(&pass1_amalg),
+                    &cache_dir,
+                    "risc0_rv32im_intel_pass1",
+                );
 
                 if !p1_output.status.success() {
                     let stderr = String::from_utf8_lossy(&p1_output.stderr);
@@ -1730,27 +1770,31 @@ fn build_intel_kernels() {
 
                 // Compile pass2
                 eprintln!("  Compiling pass2...");
-                let p2_output = Command::new(&icpx)
-                    .arg("-shared")
-                    .arg("-fPIC")
-                    .arg("-fsycl")
-                    .arg("-std=c++17")
-                    .arg("-Os")
-                    .arg("-Wno-unused-parameter")
-                    .arg("-Wno-unused-function")
-                    .arg("-Wno-unused-variable")
-                    .arg("-Wno-sign-compare")
-                    .arg(format!("-I{cxx_root}"))
-                    .arg("-Ikernels/cxx")
-                    .arg("-Ikernels/intel")
-                    .arg(&pass2_amalg)
-                    .arg("-o")
-                    .arg(&pass2_so)
-                    .arg("-fsycl-targets=intel_gpu_bmg_g31")
-                    .arg("-Xs")
-                    .arg(format!("-options \"{}\"", intel_xs_options()))
-                    .output()
-                    .expect("Failed to run icpx for pass2");
+                let p2_args: Vec<std::ffi::OsString> = [
+                    "-fsycl".to_string(),
+                    "-std=c++17".into(),
+                    "-Os".into(),
+                    "-Wno-unused-parameter".into(),
+                    "-Wno-unused-function".into(),
+                    "-Wno-unused-variable".into(),
+                    "-Wno-sign-compare".into(),
+                    format!("-I{cxx_root}"),
+                    "-Ikernels/cxx".into(),
+                    "-Ikernels/intel".into(),
+                    "-fsycl-targets=intel_gpu_bmg_g31".into(),
+                    "-Xs".into(),
+                    format!("-options \"{}\"", intel_xs_options()),
+                ]
+                .into_iter()
+                .map(Into::into)
+                .collect();
+                let p2_output = risc0_build_kernel::intel_build_library(
+                    &icpx,
+                    &p2_args,
+                    std::slice::from_ref(&pass2_amalg),
+                    &cache_dir,
+                    "risc0_rv32im_intel_pass2",
+                );
 
                 if !p2_output.status.success() {
                     let stderr = String::from_utf8_lossy(&p2_output.stderr);
@@ -1776,16 +1820,16 @@ fn build_intel_kernels() {
 
     // Link multi-pass .so files if they exist
     if pass1_so.exists() {
-        println!("cargo:rustc-link-lib=dylib=risc0_rv32im_intel_pass1");
+        risc0_build_kernel::intel_link_library(&cache_dir, "risc0_rv32im_intel_pass1");
     }
     if pass2_so.exists() {
-        println!("cargo:rustc-link-lib=dylib=risc0_rv32im_intel_pass2");
+        risc0_build_kernel::intel_link_library(&cache_dir, "risc0_rv32im_intel_pass2");
     }
 
     // ========================================================================
     // Build Intel SYCL witgen kernel (separate .so, ~34s compile)
     // ========================================================================
-    let witgen_so = cache_dir.join("librisc0_rv32im_intel_witgen.so");
+    let witgen_so = risc0_build_kernel::intel_library_path(&cache_dir, "risc0_rv32im_intel_witgen");
     let witgen_stamp = cache_dir.join("intel_witgen.stamp");
     let witgen_rebuild = stamp::need_rebuild(&witgen_so, &witgen_stamp, &witgen_hash);
 
@@ -1852,7 +1896,7 @@ fn build_intel_kernels() {
         // Montgomery batch inversion of the FpExt inv_0 calls in each
         // exec_TopAccum mux arm (chunks of 8; 64 miscompiled under IGC spill
         // pressure, 8/16 verified bit-exact). Expect all but 4 of 411 batched.
-        let st = Command::new("python3")
+        let st = risc0_build_kernel::python_command()
             .arg("kernels/intel/accum_batchinv.py")
             .arg(&witgen_amalg_path)
             .arg(&witgen_amalg_path)
@@ -1866,10 +1910,9 @@ fn build_intel_kernels() {
             String::from_utf8_lossy(&st.stderr)
         );
 
+        // Collects the arguments for intel_build_library (not run itself).
         let mut cmd = Command::new(&icpx);
-        cmd.arg("-shared")
-            .arg("-fPIC")
-            .arg("-fsycl")
+        cmd.arg("-fsycl")
             .arg("-std=c++17")
             .arg("-Os") // -Os: different opt passes to avoid icpx -O1 accum miscompilation
             // 32-bit Montgomery + inlined lazy FpExt mul (fp.h/fpext.h): accum 2x.
@@ -1887,13 +1930,16 @@ fn build_intel_kernels() {
             .arg(format!("-Ikernels/intel"))
             .arg(format!("-I{cxx_root}"))
             .arg("-Ikernels/cxx")
-            .arg(&witgen_amalg_path)
-            .arg("-o")
-            .arg(&witgen_so)
             .arg("-fsycl-targets=intel_gpu_bmg_g31");
 
-        eprintln!("  Running: {:?}", cmd);
-        let output = cmd.output().expect("Failed to run icpx for witgen");
+        let args: Vec<std::ffi::OsString> = cmd.get_args().map(|a| a.to_owned()).collect();
+        let output = risc0_build_kernel::intel_build_library(
+            &icpx,
+            &args,
+            std::slice::from_ref(&witgen_amalg_path),
+            &cache_dir,
+            "risc0_rv32im_intel_witgen",
+        );
         if !output.status.success() {
             stamp::write(&witgen_stamp, &witgen_hash, &icpx_version, "failed");
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1927,7 +1973,7 @@ fn build_intel_kernels() {
 
     // Link witgen .so (if it exists)
     if witgen_so.exists() {
-        println!("cargo:rustc-link-lib=dylib=risc0_rv32im_intel_witgen");
+        risc0_build_kernel::intel_link_library(&cache_dir, "risc0_rv32im_intel_witgen");
     }
 
     // RPATH for runtime

@@ -30,18 +30,19 @@ use risc0_core::scope;
 
 static VERBOSE: LazyLock<bool> = LazyLock::new(|| std::env::var("RISC0_VERBOSE").is_ok());
 
-/// Free the host preflight trace (~124 MB at po2=20) after the eval_check launch. On CUDA, on a
-/// background thread: inline it holds up the next segment by 10-20 ms with the GPU idle. The
+/// Free the host preflight trace (~124 MB at po2=20) after the eval_check launch. On CUDA and
+/// ROCm, on a background thread: inline it holds up the next segment by 10-20 ms with the GPU
+/// idle (on ROCm eval_check has finished by then, so it is all on the critical path). The
 /// trace is plain host memory (nothing in it is registered with the device).
 fn drop_trace(trace: PreflightTrace) {
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     if let Err(err) = std::thread::Builder::new()
         .name("drop_trace".into())
         .spawn(move || drop(trace))
     {
         tracing::debug!("drop_trace: inline ({err})");
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(any(feature = "cuda", feature = "rocm")))]
     drop(trace);
 }
 use risc0_zkp::{
