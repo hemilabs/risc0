@@ -53,10 +53,12 @@ namespace nvtx3 { struct scoped_range { scoped_range(const char*) {} }; }
 namespace cuda { namespace std { using ::std::array; } }
 #include <hip/hip_runtime.h>
 #include <hipcub/hipcub.hpp>
-// Not aliased by sppark's cuda2hip.hpp.
-static const auto cudaEventSynchronize = hipEventSynchronize;
+// cudaEventSynchronize is aliased by some sppark versions' cuda2hip.hpp and not others: use a
+// name of this file's own.
+static const auto rv32imEventSynchronize = hipEventSynchronize;
 #else
 #include <cuda/std/array>
+static const auto rv32imEventSynchronize = cudaEventSynchronize;
 #include <thrust/execution_policy.h>
 #include <thrust/scan.h>
 #include <thrust/sort.h>
@@ -894,7 +896,7 @@ int risc0_circuit_rv32im_cuda_staging_disabled() {
 const char* risc0_circuit_rv32im_cuda_event_wait(void* ev) {
   try {
     if (ev) {
-      CUDA_OK(cudaEventSynchronize((cudaEvent_t)ev));
+      CUDA_OK(rv32imEventSynchronize((cudaEvent_t)ev));
       CUDA_OK(cudaEventDestroy((cudaEvent_t)ev));
     }
   } catch (const std::exception& err) {
