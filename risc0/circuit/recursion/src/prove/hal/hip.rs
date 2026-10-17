@@ -247,3 +247,27 @@ pub(crate) fn recursion_prover(hashfn: &str) -> Result<Box<dyn RecursionProver>>
         _ => bail!("Unsupported hashfn: {hashfn}"),
     }
 }
+
+#[cfg(all(test, feature = "test"))]
+mod tests {
+    use std::sync::Arc;
+
+    use risc0_core::field::baby_bear::BabyBear;
+    use risc0_zkp::{
+        core::hash::sha::Sha256HashSuite,
+        hal::{cpu::CpuHal, hip::HipHalSha256},
+    };
+    use test_log::test;
+
+    use super::HipCircuitHal;
+    use crate::prove::hal::cpu::CpuCircuitHal;
+
+    #[test]
+    fn eval_check() {
+        const PO2: usize = 4;
+        let cpu_hal: CpuHal<BabyBear> = CpuHal::new(Sha256HashSuite::new_suite());
+        let gpu_hal = Arc::new(HipHalSha256::new());
+        let gpu_eval = HipCircuitHal::new(gpu_hal.clone());
+        crate::testutil::eval_check(&cpu_hal, CpuCircuitHal, gpu_hal.as_ref(), gpu_eval, PO2);
+    }
+}

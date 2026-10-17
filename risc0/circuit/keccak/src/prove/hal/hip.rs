@@ -210,3 +210,33 @@ pub fn keccak_prover() -> Result<Box<dyn KeccakProver>> {
 fn hip_reset() {
     ffi_wrap(|| unsafe { risc0_circuit_keccak_cuda_reset() }).unwrap();
 }
+
+#[cfg(test)]
+mod tests {
+    use std::rc::Rc;
+
+    use risc0_core::field::baby_bear::BabyBear;
+    use risc0_zkp::{
+        core::hash::poseidon2::Poseidon2HashSuite,
+        hal::{cpu::CpuHal, hip::HipHalPoseidon2},
+    };
+    use test_log::test;
+
+    use super::HipCircuitHalPoseidon2;
+    use crate::prove::hal::cpu::CpuCircuitHal;
+
+    #[test]
+    fn eval_check() {
+        const PO2: usize = 4;
+        let cpu_hal: CpuHal<BabyBear> = CpuHal::new(Poseidon2HashSuite::new_suite());
+        let gpu_hal = Rc::new(HipHalPoseidon2::new());
+        let gpu_eval = HipCircuitHalPoseidon2::new(gpu_hal.clone());
+        crate::prove::testutil::eval_check(
+            &cpu_hal,
+            CpuCircuitHal,
+            gpu_hal.as_ref(),
+            gpu_eval,
+            PO2,
+        );
+    }
+}
