@@ -314,9 +314,10 @@ fn build_cuda_kernels() {
         env::var_os("NVCC_PREPEND_FLAGS").is_none() && env::var_os("NVCC_APPEND_FLAGS").is_none();
 
     // Step 1: Compile eval_check_ef.cu WITHOUT -dc (standalone mode). It is the
-    // generated evalfast kernel (kernels/cuda/evalfast/regen.py); ROCm keeps
-    // eval_check_combined.cu. Standalone, NVCC sees the whole poly_fp call chain
-    // in one translation unit; with -dc it would compile relocatable code.
+    // generated evalfast kernel (kernels/cuda/evalfast/regen.py); ROCm builds
+    // eval_check_ef_hip.cu, an earlier output of it. Standalone,
+    // NVCC sees the whole poly_fp call chain in one translation unit; with -dc it would
+    // compile relocatable code.
     //
     // CACHING: eval_check compilation takes a few minutes. We cache it under a key over
     // everything it can read (see `eval_check_ef_sources_key`) and the compiler, and skip
@@ -493,6 +494,7 @@ fn build_cuda_kernels() {
                         | "eval_check_3.cu"
                         | "eval_check_combined.cu" // ROCm only
                         | "eval_check_ef.cu"
+                        | "eval_check_ef_hip.cu" // ROCm only
                         | "accum_tu.cu" // standalone (Step 1b)
                         | "witgen_tu.cu" // standalone (Step 1b)
                         | "eval_check_kernel.cu"  // RDC-only, not used by NVIDIA
@@ -547,8 +549,11 @@ fn build_rocm_kernels() {
     rerun_if_include_roots_changed(&[&cuda_root, &cxx_root, &sppark_root]);
     let hipcc = risc0_build_kernel::find_hipcc();
 
-    // Step 1: Compile eval_check_combined.cu standalone with hipcc.
-    // -mllvm -amdgpu-early-inline-all=false prevents OOM on this large kernel
+    // Step 1: Compile eval_check standalone with hipcc: the evalfast kernel
+    // (eval_check_ef_hip.cu, see its header) unless RISC0_HIP_EVAL_CHECK=combined selects the original
+    // eval_check_combined.cu. On an RX 9070 XT (gfx1201) evalfast needs 9.3 KB of scratch per
+    // lane against the original's 16.8 KB, and a po2 20 eval_check takes 392 ms against 845 ms.
+    // For the original, -mllvm -amdgpu-early-inline-all=false prevents OOM on this large kernel
     // (21 functions, 2154 column reads).
     //
     // CACHING: eval_check compilation is very slow. We hash all eval_check
@@ -588,6 +593,8 @@ fn build_rocm_kernels() {
         }
     );
     let include_cuda2hip = format!("{}/util/cuda2hip.hpp", &sppark_root);
+    println!("cargo:rerun-if-env-changed=RISC0_HIP_EVAL_CHECK");
+    let evalfast = env::var("RISC0_HIP_EVAL_CHECK").as_deref() != Ok("combined");
     let mut eval_check_flags: Vec<&str> = vec![
         "-x",
         "hip",
@@ -595,16 +602,27 @@ fn build_rocm_kernels() {
         "-O3",
         "-Wno-unused-function",
         "-Wno-unused-parameter",
-        "-mllvm",
-        "-amdgpu-early-inline-all=false",
-        "-mllvm",
-        "-amdgpu-use-aa-in-codegen",
-        "-mllvm",
-        "-amdgpu-schedule-metric-bias=0",
-        "-mllvm",
-        "-amdgpu-internalize-symbols",
-        "-mllvm",
-        "-amdgpu-schedule-relaxed-occupancy",
+    ];
+    if evalfast {
+        // Measured on an RX 9070 XT at po2 20: 64-wide waves and an occupancy target of 8 blocks
+        // (EF_MINB, the launch bounds' minimum) take eval_check from 603 to 392 ms. Wave32 gains
+        // nothing from the higher target; 6 and 10 blocks are slower than 8.
+        eval_check_flags.extend(["-mwavefrontsize64", "-DEF_MINB=8"]);
+    } else {
+        eval_check_flags.extend([
+            "-mllvm",
+            "-amdgpu-early-inline-all=false",
+            "-mllvm",
+            "-amdgpu-use-aa-in-codegen",
+            "-mllvm",
+            "-amdgpu-schedule-metric-bias=0",
+            "-mllvm",
+            "-amdgpu-internalize-symbols",
+            "-mllvm",
+            "-amdgpu-schedule-relaxed-occupancy",
+        ]);
+    }
+    eval_check_flags.extend([
         "-include",
         &include_cuda2hip,
         "-I",
@@ -613,11 +631,23 @@ fn build_rocm_kernels() {
         &cxx_root,
         "-I",
         &sppark_root,
-    ];
+    ]);
     eval_check_flags.extend(risc0_build_kernel::hip_host_flags());
+    let (eval_check_src, eval_check_sources) = if evalfast {
+        (
+            "eval_check_ef_hip.cu",
+            eval_check_ef_hip_sources_key(&cuda_root, &cxx_root, &sppark_root),
+        )
+    } else {
+        (
+            "eval_check_combined.cu",
+            eval_check_sources_key(&cuda_root, &cxx_root, &sppark_root),
+        )
+    };
     let eval_check_key = risc0_build_kernel::hash_key(&[
         "rv32im-rocm-eval-check-v1",
-        &eval_check_sources_key(&cuda_root, &cxx_root, &sppark_root),
+        eval_check_src,
+        &eval_check_sources,
         &format!("{eval_check_flags:?}"),
         &hipcc_key,
     ]);
@@ -631,7 +661,7 @@ fn build_rocm_kernels() {
             risc0_build_kernel::hip_compile(
                 &hipcc,
                 &eval_check_flags,
-                Path::new("eval_check_combined.cu"),
+                Path::new(eval_check_src),
                 out,
                 &hip_arches,
                 Some(Path::new("kernels/cuda")),
@@ -655,6 +685,7 @@ fn build_rocm_kernels() {
                     | "eval_check_3.cu"
                     | "eval_check_combined.cu"
                     | "eval_check_ef.cu" // CUDA only
+                    | "eval_check_ef_hip.cu"
                     | "eval_check_kernel.cu"
                     | "witgen_combined.cu"
                     | "accum_tu.cu"
@@ -794,6 +825,23 @@ const EVAL_CHECK_EF_LOCAL_SOURCES: &[&str] = &[
     "kernels/cuda/ef_fp.h",
     "kernels/cuda/ef_fpext.h",
 ];
+
+/// The files in kernels/cuda that the ROCm eval_check_ef_hip.cu reads.
+const EVAL_CHECK_EF_HIP_LOCAL_SOURCES: &[&str] = &[
+    "kernels/cuda/eval_check_ef_hip.cu",
+    "kernels/cuda/ef_fp.h",
+    "kernels/cuda/ef_fpext.h",
+];
+
+/// [`eval_check_sources_key`] for the ROCm eval_check_ef_hip.cu.
+fn eval_check_ef_hip_sources_key(cuda_root: &str, cxx_root: &str, sppark_root: &str) -> String {
+    include_roots_sources_key(
+        EVAL_CHECK_EF_HIP_LOCAL_SOURCES,
+        cuda_root,
+        cxx_root,
+        sppark_root,
+    )
+}
 
 /// [`eval_check_sources_key`] for the CUDA eval_check_ef.cu.
 fn eval_check_ef_sources_key(cuda_root: &str, cxx_root: &str, sppark_root: &str) -> String {
