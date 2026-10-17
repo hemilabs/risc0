@@ -122,7 +122,13 @@ fn build_rocm_kernels() {
         &sppark_root,
         "-D__ADX__",
     ];
-    let thp_define = thp_pinned_define();
+    // Windows hipcc rebuilds the command line for clang and drops unescaped quotes, which would
+    // leave the header name bare; escaped, they reach clang as quotes.
+    let thp_define = if cfg!(windows) {
+        thp_pinned_define().replace('"', "\\\"")
+    } else {
+        thp_pinned_define()
+    };
     base_flags.push(&thp_define);
 
     if env::var("CARGO_FEATURE_SETUP").is_ok() {

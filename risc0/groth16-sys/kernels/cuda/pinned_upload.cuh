@@ -21,9 +21,12 @@
 // can't go on the include path, its cuda.h would shadow the toolkit's).
 #include RISC0_THP_PINNED_H
 
+// cudaEventSynchronize is aliased by some sppark versions' cuda2hip.hpp and not others: use a
+// name of this file's own.
 #ifdef __HIPCC__
-// Not aliased by sppark's cuda2hip.hpp.
-static const auto cudaEventSynchronize = hipEventSynchronize;
+static const auto g16EventSynchronize = hipEventSynchronize;
+#else
+static const auto g16EventSynchronize = cudaEventSynchronize;
 #endif
 
 // The Groth16 cold-path optimizations (background key load, compact coefficients, bit-split
@@ -115,7 +118,7 @@ public:
         for (size_t c; (c = next.fetch_add(1)) < nch; k++) {
           int b = t * NB + (k % NB);
           // The buffer's previous copy (if any) must be done before it is overwritten.
-          if (cudaEventSynchronize(ev[b]) != cudaSuccess) err = 1;
+          if (g16EventSynchronize(ev[b]) != cudaSuccess) err = 1;
           size_t o = c * CH, n = std::min(CH, bytes - o);
           memcpy(bufs[b], (const char*)src + o, n);
           if (cudaMemcpyAsync((char*)dst + o, bufs[b], n, cudaMemcpyHostToDevice, st[t]) != cudaSuccess)
