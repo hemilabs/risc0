@@ -278,6 +278,9 @@ impl Prover {
                 }
             }
         }
+        // Read only where host chains run (CUDA and ROCm); the repository builds with -Dwarnings.
+        #[cfg(not(any(feature = "cuda", feature = "rocm")))]
+        let _ = early_at;
         tracing::debug!(
             "recursion preflight: rows={} {:.1}ms prefix_words={} consumed={} past_prefix_at={:.1}ms \
              stream_wait={:.1}ms",

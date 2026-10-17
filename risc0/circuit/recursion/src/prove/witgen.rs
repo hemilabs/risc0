@@ -262,6 +262,7 @@ pub(crate) fn try_host_chains_range(
 }
 
 /// Concatenate the chains of two disjoint passes.
+#[cfg_attr(not(any(feature = "cuda", feature = "rocm")), allow(dead_code))]
 pub(crate) fn merge_host_chains(
     a: Option<HostChains>,
     b: Option<HostChains>,
