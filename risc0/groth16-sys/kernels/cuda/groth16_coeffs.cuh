@@ -1,5 +1,7 @@
 #pragma once
 
+#include "pinned_file.cuh"
+
 #ifdef _WIN32
 #include <cerrno>
 #include <cstdio>
@@ -167,14 +169,24 @@ public:
   }
 
   preprocessed_coeffs(const gpu_t& gpu, const char* file_path) : gpu(gpu) {
-    std::vector<byte> file = read_whole_file(file_path);
-    if (file.size() < 4 * sizeof(size_t)) {
+    std::vector<byte> owned;
+    const byte* file_data = nullptr;
+    size_t file_size = 0;
+#ifdef GROTH16_PINNED_FILES
+    file_data = (const byte*)groth16_pinned_file(file_path, &file_size);
+#endif
+    if (!file_data) {
+      owned = read_whole_file(file_path);
+      file_data = owned.data();
+      file_size = owned.size();
+    }
+    if (file_size < 4 * sizeof(size_t)) {
       throw sppark_error{EINVAL, "\"%s\" is truncated: ", file_path};
     }
 
     try {
       {
-        size_t* ptr = (size_t*)file.data();
+        const size_t* ptr = (const size_t*)file_data;
         size_t coeff_count_a = ptr[0];
         size_t coeff_count_b = ptr[1];
         size_t unique_count_a = ptr[2];
@@ -192,14 +204,14 @@ public:
         d_ind_idx_b = slice_t<uint32_t>(&d_independent_indices[unique_count_a], unique_count_b);
       }
 
-      const byte* ptr = file.data() + 4 * sizeof(size_t);
+      const byte* ptr = file_data + 4 * sizeof(size_t);
       gpu.HtoD(&d_coeffs[0], (coeff_t*)&ptr[0], d_coeffs_a.size() + d_coeffs_b.size());
 
       ptr += (d_coeffs_a.size() + d_coeffs_b.size()) * sizeof(coeff_t);
       gpu.HtoD(
           &d_independent_indices[0], (uint32_t*)&ptr[0], d_ind_idx_a.size() + d_ind_idx_b.size());
 
-      // The copies are asynchronous: `file` must outlive them.
+      // The copies are asynchronous: the file's bytes must outlive them.
       gpu.sync();
     } catch (const sppark_error& e) {
       gpu.sync();

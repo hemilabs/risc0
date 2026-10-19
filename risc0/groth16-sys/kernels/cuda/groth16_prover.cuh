@@ -614,11 +614,11 @@ public:
       , msm_g1(nullptr, g16_tune() ? 2 * srs.get_h_size() : srs.get_h_size())
       , msm_g2(nullptr, srs.get_b_g2_size()) {
     init_memory();
+#ifndef __HIPCC__  // msm_groth16 only (g16_tune() is false under HIP)
     if (g16_tune()) {
       msm_g1.set_batch(1);
       msm_g2.set_batch(1);
     }
-#ifndef __HIPCC__
     if (g16_tail_enabled()) {
       msm_g1.set_tail(4, 8);
       msm_g2.set_tail(4, 8);

@@ -123,6 +123,12 @@ pub fn cuda_warmup() {
     let _ = risc0_sys::ffi_wrap(|| unsafe { risc0_circuit_recursion_cuda_warmup_eval_check() });
 }
 
+/// Drop this thread's cached recursion provers, and with them the device buffers they keep
+/// between proofs (each program's committed ctrl group). The next proof rebuilds them.
+pub fn release_cached_provers() {
+    PROVER_CACHE.with(|cache| cache.borrow_mut().clear());
+}
+
 /// Test hook: while on, each recursion witness generated with host-executed chains is
 /// regenerated on the device without them and compared (an error if they differ). Returns how
 /// many witnesses were compared so far.
@@ -272,6 +278,9 @@ impl Prover {
                 }
             }
         }
+        // Read only where host chains run (CUDA and ROCm); the repository builds with -Dwarnings.
+        #[cfg(not(any(feature = "cuda", feature = "rocm")))]
+        let _ = early_at;
         tracing::debug!(
             "recursion preflight: rows={} {:.1}ms prefix_words={} consumed={} past_prefix_at={:.1}ms \
              stream_wait={:.1}ms",
@@ -298,7 +307,8 @@ impl Prover {
                 );
             }
         }
-        #[cfg(feature = "cuda")]
+        // ROCm never splits (`split` is false there), so it takes the else branch.
+        #[cfg(any(feature = "cuda", feature = "rocm"))]
         if let Some(h) = early.take() {
             let t0 = std::time::Instant::now();
             // A panic on the early thread falls back like its error does.

@@ -18,7 +18,10 @@ use anyhow::{anyhow, bail, ensure, Context, Result};
 
 static VERBOSE: LazyLock<bool> = LazyLock::new(|| std::env::var("RISC0_VERBOSE").is_ok());
 
-use super::{keccak::prove_keccak, ProverServer};
+use super::{
+    keccak::{prove_keccak, prove_keccak_with},
+    ProverServer,
+};
 use risc0_circuit_rv32im::prove::SegmentProver;
 
 thread_local! {
@@ -27,6 +30,41 @@ thread_local! {
     // GPU memory is reclaimed by CUDA context teardown regardless.
     static CACHED_SEGMENT_PROVER: std::mem::ManuallyDrop<RefCell<Option<Box<dyn SegmentProver>>>> =
         std::mem::ManuallyDrop::new(RefCell::new(None));
+}
+
+/// Completes, and discards, whatever segment the cached prover still has pending when dropped.
+struct DrainSegmentProverOnExit;
+
+impl Drop for DrainSegmentProverOnExit {
+    fn drop(&mut self) {
+        // An error here means nothing was pending, or the GPU work failed; the slot is idle either
+        // way. Not while panicking: the prover's RefCell may be the thing that is borrowed.
+        if !std::thread::panicking() {
+            let _ = with_segment_prover(|sp| sp.prove_end());
+        }
+    }
+}
+
+/// Drop this thread's cached segment prover and the device buffers it keeps between segments
+/// (see `release_cached_provers`). Only between sessions: the prover must be idle.
+#[cfg(feature = "rocm")]
+fn release_cached_segment_prover() {
+    CACHED_SEGMENT_PROVER.with(|cell| {
+        if let Ok(mut borrow) = cell.try_borrow_mut() {
+            *borrow = None;
+        }
+    });
+}
+
+/// Before the Groth16 wrap on ROCm, drop the provers cached between proofs (this thread's
+/// segment prover and recursion provers), then the HAL's pool. On an RX 9070 XT (16 GB,
+/// Windows) the wrap's ~7 GB proving key beside those long-lived buffers made the driver move
+/// ~2 GB of them into shared system memory, where they stayed: every later session ran ~2.5x
+/// slower. Rebuilt by the next session, in device memory.
+#[cfg(feature = "rocm")]
+pub(crate) fn release_cached_provers() {
+    release_cached_segment_prover();
+    risc0_circuit_recursion::prove::release_cached_provers();
 }
 
 fn with_segment_prover<R>(f: impl FnOnce(&dyn SegmentProver) -> Result<R>) -> Result<R> {
@@ -743,6 +781,12 @@ impl ProverImpl {
             );
         }
 
+        // A session that leaves the pipeline early (an invalid segment, an error) leaves its last
+        // segment's finalize pending in the CACHED prover, and the next session's first
+        // prove_begin would hand that stale seal back as its own previous segment's. Complete it
+        // on the way out, so the next session starts with the prover idle.
+        let pipeline_guard = DrainSegmentProverOnExit;
+
         for (seg_idx, segment_ref) in session.segments.iter().enumerate() {
             let t_seg = std::time::Instant::now();
 
@@ -975,6 +1019,11 @@ impl ProverImpl {
             }
         }
 
+        // The loop is done. The last segment's deferred finalize was completed by the early seals,
+        // or is completed just below, which empties the prover whether or not it succeeds: there is
+        // nothing left for the guard to drain.
+        std::mem::forget(pipeline_guard);
+
         if early_seal {
             // Every seal was taken in the loop: collect the last receipt (verified on its
             // thread); its lift's claim is the merged one, set when the pipe drains.
@@ -1114,15 +1163,82 @@ impl ProverImpl {
             super::release_hal_buffers();
         }
 
-        for proof_request in session.pending_keccaks.iter() {
-            let receipt = prove_keccak(proof_request).context("prove keccak")?;
-            receipt.verify_integrity_with_context(&keccak_ctx)?;
-            tracing::debug!("adding keccak assumption: {}", receipt.claim.digest());
-            keccak_receipts.insert(receipt)?;
-        }
+        let t_keccaks = std::time::Instant::now();
+        std::thread::scope(|scope| -> Result<()> {
+            // On Intel and AMD GPUs a keccak proof's witness is made on the CPU, about half of
+            // the proof's time: make each on a thread, a proof ahead of the GPU, so the two
+            // overlap. (On CUDA the GPU makes it.) Returning early drops `witnesses`, which ends
+            // the thread.
+            let witnesses = (cfg!(any(feature = "intel", feature = "rocm"))
+                && session.pending_keccaks.len() > 1)
+                .then(|| {
+                    let (tx, rx) = mpsc::sync_channel(1);
+                    let requests = &session.pending_keccaks;
+                    scope.spawn(move || {
+                        for request in requests {
+                            let witness = risc0_circuit_keccak::prove::host_witness(
+                                &request.input,
+                                request.po2,
+                            );
+                            if tx.send(witness).is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    rx
+                });
+            for (i, proof_request) in session.pending_keccaks.iter().enumerate() {
+                let t_keccak = std::time::Instant::now();
+                let witness = match &witnesses {
+                    Some(rx) => Some(
+                        rx.recv()
+                            .map_err(|_| anyhow!("the keccak witness thread ended early"))?
+                            .context("keccak witness")?,
+                    ),
+                    None => None,
+                };
+                let wait_ms = t_keccak.elapsed().as_secs_f64() * 1000.0;
+                let receipt = prove_keccak_with(proof_request, witness).context("prove keccak")?;
+                let prove_ms = t_keccak.elapsed().as_secs_f64() * 1000.0;
+                receipt.verify_integrity_with_context(&keccak_ctx)?;
+                tracing::debug!("adding keccak assumption: {}", receipt.claim.digest());
+                let t_insert = std::time::Instant::now();
+                keccak_receipts.insert(receipt)?;
+                if *VERBOSE {
+                    eprintln!(
+                        "[keccak] {i}: po2={} witness wait={wait_ms:.1}ms \
+                         prove+lift={prove_ms:.1}ms insert={:.1}ms total={:.1}ms",
+                        proof_request.po2,
+                        t_insert.elapsed().as_secs_f64() * 1000.0,
+                        t_keccak.elapsed().as_secs_f64() * 1000.0,
+                    );
+                }
+            }
+            Ok(())
+        })?;
 
         // NOTE: Calling keccak_receipts.root() proves the union tree.
-        if let Ok(root_receipt) = keccak_receipts.root() {
+        let t_root = std::time::Instant::now();
+        let keccak_root = keccak_receipts.root();
+        if *VERBOSE && !session.pending_keccaks.is_empty() {
+            eprintln!(
+                "[keccak] {} proofs: root={:.1}ms total={:.1}ms",
+                session.pending_keccaks.len(),
+                t_root.elapsed().as_secs_f64() * 1000.0,
+                t_keccaks.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
+        // On ROCm, start the segments' lifts and joins from fresh device memory: the keccak
+        // proofs peak near a 16 GB card's capacity, and on Windows buffers the HAL pooled
+        // through that peak could be in shared system memory. With keccak at po2 18 on an RX
+        // 9070 XT the lifts and joins after it ran ~1.6x slower (recursion data commits 28 ->
+        // 93 ms). The keccak lift programs' cached ctrl groups aren't needed after this either.
+        #[cfg(feature = "rocm")]
+        if !session.pending_keccaks.is_empty() {
+            release_cached_provers();
+            super::release_hal_buffers();
+        }
+        if let Ok(root_receipt) = keccak_root {
             let assumption = Assumption {
                 claim: root_receipt.claim.digest(),
                 control_root: root_receipt.control_root()?,
@@ -1271,6 +1387,8 @@ impl ProverImpl {
             let seal_bytes = ident_receipt.get_seal_bytes();
             // See `release_hal_buffers`: the wrap cannot reclaim what the STARK HAL is caching.
             // Released while the wrap computes its witness on another thread.
+            #[cfg(feature = "rocm")]
+            release_cached_provers();
             let seal = shrink_wrap_with(&seal_bytes, super::release_hal_buffers)?.to_vec();
             super::release_hal_buffers();
             let wrap_ms = t0.elapsed().as_secs_f64() * 1000.0;

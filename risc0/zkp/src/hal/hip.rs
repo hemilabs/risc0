@@ -14,12 +14,12 @@
 
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fmt::Debug,
     marker::PhantomData,
     mem::ManuallyDrop,
     rc::Rc,
-    sync::{Once, OnceLock},
+    sync::{Mutex, MutexGuard, Once, OnceLock},
 };
 
 use anyhow::{bail, Context as _, Result};
@@ -53,8 +53,9 @@ use crate::{
     FRI_FOLD,
 };
 
-/// Thread-local pool of HIP device buffers, keyed by byte size.
+/// A device's pool of freed HIP buffers, keyed by byte size.
 /// Reuses freed buffers to avoid hipMalloc/hipFree overhead.
+#[derive(Default)]
 struct BufferPool {
     cache: HashMap<usize, Vec<HipDeviceBuffer>>,
     total_cached: usize,
@@ -64,13 +65,6 @@ const BUFFER_POOL_MAX_BYTES: usize = 16 << 30; // 16 GB
 const BUFFER_POOL_SMALL_THRESHOLD: usize = 64 << 10; // 64 KB - always pool small buffers
 
 impl BufferPool {
-    fn new() -> Self {
-        Self {
-            cache: HashMap::new(),
-            total_cached: 0,
-        }
-    }
-
     fn pop(&mut self, size: usize) -> Option<HipDeviceBuffer> {
         if let Some(bufs) = self.cache.get_mut(&size) {
             if let Some(buf) = bufs.pop() {
@@ -93,8 +87,24 @@ impl BufferPool {
     }
 }
 
+/// The buffer pools, one per device, shared by every thread: the prover proves segments, keccak
+/// and recursion on different threads, and with a pool per thread, the buffers one thread's
+/// segments left idle could not be released for another's proofs (`clear_buffer_pool`), nor
+/// counted when deciding to (`release_pool_unless_fits`).
+static BUFFER_POOLS: Mutex<BTreeMap<i32, BufferPool>> = Mutex::new(BTreeMap::new());
+
+fn buffer_pools() -> MutexGuard<'static, BTreeMap<i32, BufferPool>> {
+    BUFFER_POOLS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Bytes pooled for this thread's device.
+fn pooled_bytes() -> usize {
+    buffer_pools()
+        .get(&get_device_for_thread())
+        .map_or(0, |pool| pool.total_cached)
+}
+
 thread_local! {
-    static BUFFER_POOL: RefCell<BufferPool> = RefCell::new(BufferPool::new());
     /// Which HIP device this thread should use (default 0).
     static THREAD_DEVICE: Cell<i32> = Cell::new(0);
 }
@@ -225,15 +235,39 @@ pub fn recursion_device() -> Option<i32> {
 
 /// Release all cached GPU buffers back to the HIP runtime.
 ///
-/// The HAL keeps a thread-local pool of freed GPU buffers for reuse.
-/// Call this before operations that need the maximum available VRAM
-/// (e.g. Groth16 BN254 proving via sppark which uses its own allocator).
+/// The HAL keeps a pool of freed GPU buffers per device for reuse. Call this before operations
+/// that need the maximum available VRAM (e.g. Groth16 BN254 proving via sppark which uses its own
+/// allocator). Releases every device's pool.
 pub fn clear_buffer_pool() {
-    BUFFER_POOL.with(|pool| {
-        let mut pool = pool.borrow_mut();
-        pool.cache.clear();
-        pool.total_cached = 0;
-    });
+    // Take the pools out first, so the hipFrees run without the lock held.
+    let pools = std::mem::take(&mut *buffer_pools());
+    drop(pools);
+}
+
+/// Room to leave on the device beyond a new allocation before the pool is kept.
+const POOL_RELEASE_HEADROOM: usize = 256 << 20;
+
+/// Release the buffer pool if a new `size`-byte allocation would not fit in free device memory.
+///
+/// Waiting for hipMalloc to fail is not enough on Windows: there the driver backs an allocation
+/// beyond the card's memory with shared system memory instead of failing, so a pool of buffers
+/// kept from a large segment pushes every later allocation of another size off the card, and the
+/// kernels using it then run several times slower.
+fn release_pool_unless_fits(size: usize) {
+    if size < BUFFER_POOL_SMALL_THRESHOLD {
+        return;
+    }
+    let pooled = pooled_bytes();
+    if pooled == 0 {
+        return;
+    }
+    let mut free: usize = 0;
+    let mut total: usize = 0;
+    let err = unsafe { risc0_sys::hip::hipMemGetInfo(&mut free, &mut total) };
+    if err == risc0_sys::hip::HIP_SUCCESS && free < size.saturating_add(POOL_RELEASE_HEADROOM) {
+        tracing::debug!("releasing {pooled} pooled bytes: {size} requested, {free} free");
+        clear_buffer_pool();
+    }
 }
 
 // Per-device locks: prevents concurrent provers on the SAME device.
@@ -463,6 +497,8 @@ pub type HipHalPoseidon254 = HipHal<HipHashPoseidon254>;
 
 struct RawBuffer {
     name: &'static str,
+    /// The device it was allocated on, whose pool it returns to.
+    device: i32,
     buf: ManuallyDrop<HipDeviceBuffer>,
 }
 
@@ -470,25 +506,29 @@ impl RawBuffer {
     pub fn new(name: &'static str, size: usize) -> Self {
         tracing::trace!("alloc: {size} bytes, {name}");
         tracker().lock().unwrap().alloc(size);
-        let buf = BUFFER_POOL
-            .with(|pool| pool.borrow_mut().pop(size))
-            .unwrap_or_else(|| {
-                HipDeviceBuffer::uninitialized(size).unwrap_or_else(|_| {
-                    // OOM: clear the buffer pool to free cached GPU memory and retry.
-                    clear_buffer_pool();
-                    // Clear the stale HIP error from the failed hipMalloc above.
-                    // Without this, sppark's cudaGetLastError() picks up the old
-                    // "out of memory" error and panics even though the retry succeeds.
-                    unsafe {
-                        risc0_sys::hip::hipGetLastError();
-                    }
-                    HipDeviceBuffer::uninitialized(size)
-                        .context(format!("allocation failed on {name}: {size} bytes"))
-                        .unwrap()
-                })
-            });
+        let device = get_device_for_thread();
+        let pooled = buffer_pools()
+            .get_mut(&device)
+            .and_then(|pool| pool.pop(size));
+        let buf = pooled.unwrap_or_else(|| {
+            release_pool_unless_fits(size);
+            HipDeviceBuffer::uninitialized(size).unwrap_or_else(|_| {
+                // OOM: clear the buffer pool to free cached GPU memory and retry.
+                clear_buffer_pool();
+                // Clear the stale HIP error from the failed hipMalloc above.
+                // Without this, sppark's cudaGetLastError() picks up the old
+                // "out of memory" error and panics even though the retry succeeds.
+                unsafe {
+                    risc0_sys::hip::hipGetLastError();
+                }
+                HipDeviceBuffer::uninitialized(size)
+                    .context(format!("allocation failed on {name}: {size} bytes"))
+                    .unwrap()
+            })
+        });
         Self {
             name,
+            device,
             buf: ManuallyDrop::new(buf),
         }
     }
@@ -508,16 +548,10 @@ impl Drop for RawBuffer {
         // Safety: self.buf is not accessed after take() since we're in Drop,
         // and ManuallyDrop's own drop is a no-op.
         let buf = unsafe { ManuallyDrop::take(&mut self.buf) };
-        // During thread shutdown, TLS may already be destroyed. Use try_with
-        // to gracefully handle this — if the pool is gone, just drop the buffer
-        // directly (hipFree via HipDeviceBuffer's own Drop).
-        match BUFFER_POOL.try_with(|pool| pool.borrow_mut().push(size, buf)) {
-            Ok(()) => {}
-            Err(_) => {
-                // TLS destroyed; closure was never called, so `buf` (captured
-                // by the closure) drops here via HipDeviceBuffer::drop (hipFree).
-            }
-        }
+        buffer_pools()
+            .entry(self.device)
+            .or_default()
+            .push(size, buf);
     }
 }
 
@@ -582,6 +616,29 @@ impl<T> BufferImpl<T> {
             offset: 0,
             marker: PhantomData,
         }
+    }
+
+    /// Upload `data` over the whole buffer, without downloading it first as `view_mut` does.
+    /// Returns once the copy is done, so `data` may be freed.
+    pub fn copy_from_host(&self, data: &[T]) {
+        assert_eq!(data.len(), self.size, "copy_from_host: size mismatch");
+        extern "C" {
+            fn risc0_zkp_cuda_memcpy_h2d(
+                dst: *mut std::os::raw::c_void,
+                src: *const std::os::raw::c_void,
+                size: usize,
+            ) -> *const std::os::raw::c_char;
+        }
+        let bytes: &[u8] = unchecked_cast(data);
+        ffi_wrap(|| unsafe {
+            risc0_zkp_cuda_memcpy_h2d(
+                self.as_device_ptr().0 as *mut std::os::raw::c_void,
+                bytes.as_ptr() as *const std::os::raw::c_void,
+                bytes.len(),
+            )
+        })
+        .unwrap();
+        sync_persistent_stream();
     }
 
     pub fn as_device_ptr(&self) -> DevicePointer<u8> {
@@ -1021,6 +1078,46 @@ impl<HH: HipHash + ?Sized> Hal for HipHal<HH> {
         .unwrap();
     }
 
+    fn gather_samples(
+        &self,
+        dst: &Self::Buffer<Self::Elem>,
+        src: &Self::Buffer<Self::Elem>,
+        indices: &[usize],
+        size: usize,
+        stride: usize,
+    ) {
+        if indices.len() < 2 {
+            for (q, &idx) in indices.iter().enumerate() {
+                self.gather_sample(&dst.slice(q * size, size), src, idx, size, stride);
+            }
+            return;
+        }
+        let idxs: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
+        // As on CUDA: copy_from is a synchronous copy on the legacy stream, which waits for the
+        // (blocking) persistent stream, so idx_buf can go back to the pool after the launch.
+        let idx_buf = self.copy_from_u32("gather_idx", &idxs);
+        extern "C" {
+            fn risc0_zkp_cuda_gather_samples(
+                dst: DevicePointer<u8>,
+                src: DevicePointer<u8>,
+                idxs: DevicePointer<u8>,
+                n: u32,
+                size: u32,
+                stride: u32,
+            ) -> *const std::os::raw::c_char;
+        }
+        ffi_wrap(|| unsafe {
+            risc0_zkp_cuda_gather_samples(
+                dst.as_device_ptr(),
+                src.as_device_ptr(),
+                idx_buf.as_device_ptr(),
+                idxs.len() as u32,
+                size as u32,
+                stride as u32,
+            )
+        })
+        .unwrap();
+    }
     fn has_unified_memory(&self) -> bool {
         false
     }
@@ -1031,7 +1128,7 @@ impl<HH: HipHash + ?Sized> Hal for HipHal<HH> {
         let err = unsafe { risc0_sys::hip::hipMemGetInfo(&mut free, &mut total) };
         if err == risc0_sys::hip::HIP_SUCCESS {
             // Add pool contents to free count, since those are reclaimable.
-            let pool_bytes = BUFFER_POOL.with(|pool| pool.borrow().total_cached);
+            let pool_bytes = pooled_bytes();
             free + pool_bytes
         } else {
             usize::MAX
@@ -1437,39 +1534,47 @@ impl<HH: HipHash + ?Sized> Hal for HipHal<HH> {
         reg_combo_ids: &[u32],
         mix: &Self::ExtElem,
     ) {
-        let coeff_u = self.copy_from_extelem("coeff_u", coeff_u);
-        let combo_count = combo_count as u32;
-        let cycles = cycles as u32;
-        let regs_count = reg_sizes.len() as u32;
-        let reg_sizes = self.copy_from_u32("reg_sizes", reg_sizes);
-        let reg_combo_ids = self.copy_from_u32("reg_combo_ids", reg_combo_ids);
-        let mix = self.copy_from_extelem("mix", &[*mix]);
-
+        // As on CUDA: compute the per-element deltas on the host (coeff_u is host data) and
+        // apply them with one small parallel kernel, instead of a single-thread device loop. The
+        // temporaries are freed after the async launch; see gather_samples.
+        let mut deltas: std::collections::BTreeMap<u32, Self::ExtElem> =
+            std::collections::BTreeMap::new();
+        let mut cur = Self::ExtElem::ONE;
+        let mut pos = 0usize;
+        for (size, combo_id) in reg_sizes.iter().zip(reg_combo_ids.iter()) {
+            for j in 0..*size as usize {
+                let off = (cycles * *combo_id as usize + j) as u32;
+                let e = deltas.entry(off).or_insert(Self::ExtElem::ZERO);
+                *e += cur * coeff_u[pos + j];
+            }
+            cur *= *mix;
+            pos += *size as usize;
+        }
+        for _ in 0..Self::CHECK_SIZE {
+            let off = (cycles * combo_count) as u32;
+            let e = deltas.entry(off).or_insert(Self::ExtElem::ZERO);
+            *e += cur * coeff_u[pos];
+            pos += 1;
+            cur *= *mix;
+        }
+        let offs: Vec<u32> = deltas.keys().copied().collect();
+        let vals: Vec<Self::ExtElem> = deltas.values().copied().collect();
+        let offs_buf = self.copy_from_u32("combos_offs", &offs);
+        let vals_buf = self.copy_from_extelem("combos_deltas", &vals);
         extern "C" {
-            fn risc0_zkp_cuda_combos_prepare(
+            fn risc0_zkp_cuda_combos_sub(
                 combos: DevicePointer<u8>,
-                coeff_u: DevicePointer<u8>,
-                combo_count: u32,
-                cycles: u32,
-                regs_count: u32,
-                reg_sizes: DevicePointer<u8>,
-                reg_combo_ids: DevicePointer<u8>,
-                checkSize: u32,
-                mix: DevicePointer<u8>,
+                deltas: DevicePointer<u8>,
+                offsets: DevicePointer<u8>,
+                count: u32,
             ) -> *const std::os::raw::c_char;
         }
-
         ffi_wrap(|| unsafe {
-            risc0_zkp_cuda_combos_prepare(
+            risc0_zkp_cuda_combos_sub(
                 combos.as_device_ptr(),
-                coeff_u.as_device_ptr(),
-                combo_count,
-                cycles,
-                regs_count,
-                reg_sizes.as_device_ptr(),
-                reg_combo_ids.as_device_ptr(),
-                Self::CHECK_SIZE as u32,
-                mix.as_device_ptr(),
+                vals_buf.as_device_ptr(),
+                offs_buf.as_device_ptr(),
+                offs.len() as u32,
             )
         })
         .unwrap();

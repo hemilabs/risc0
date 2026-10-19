@@ -27,5 +27,7 @@ tracing = "0.1.41"
 default = []
 cuda = ["dep:blst", "dep:sppark", "dep:risc0-sys", "risc0-sys/cuda"]
 rocm = ["dep:blst", "dep:sppark", "dep:risc0-sys", "risc0-sys/rocm"]
+# The SYCL prover for Intel GPUs (kernels/intel); needs oneAPI (icpx).
+intel = []
 metal = []
 setup = []
