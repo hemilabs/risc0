@@ -33,7 +33,7 @@ members = [
   "website/doc-test/main",
   "xtask",
 ]
-exclude = ["tools/crates-validator", "vendor/sppark"]
+exclude = ["tools/crates-validator"]
 
 [workspace.package]
 version = "3.0.0"
@@ -79,10 +79,12 @@ opt-level = 3
 [profile.release]
 lto = true
 
-# sppark 0.1.14 with four missing __syncthreads() (shared-memory races in the GS NTT and in
-# polynomial division that corrupt proofs; still in the 0.1.15 release): see vendor/sppark/README.risc0.md.
-# Only CUDA/ROCm builds use sppark. A [patch] applies to this workspace's builds only: a crate
-# depending on this repository resolves sppark through its own (zk-miner patches in the hemilabs
-# fork, which needs the same barriers).
+# sppark from the hemilabs fork, as zk-miner builds it. Released sppark (through 0.1.15) lacks
+# four __syncthreads() in the GS NTT and in polynomial division (shared-memory races that corrupt
+# proofs; upstream fixed them on master in 9e5c795 and 6b931f3), and its HIP shim defines a
+# __syncwarp() that ROCm 7's headers also declare, so ROCm builds stop there. The fork has both
+# fixes and a __syncwarp() that also orders LDS accesses on RDNA. Only CUDA/ROCm builds use sppark.
+# A [patch] applies to this workspace's builds only: a crate depending on this repository resolves
+# sppark through its own lockfile and patches.
 [patch.crates-io]
-sppark = { path = "vendor/sppark" }
+sppark = { git = "https://github.com/hemilabs/risc0-sppark", rev = "725d3af6db6548bac1ecd6cb0f863578e2bb03c7" }

@@ -238,6 +238,8 @@ public:
     }
     size_t srs_file_size = st.st_size;
 
+    // Pinned key files are Windows-only (above): here the key is always mapped.
+    const bool srs_pinned = false;
     const byte* srs_ptr =
         (const byte*)mmap(NULL, srs_file_size, PROT_READ, MAP_PRIVATE, srs_file, 0);
 
