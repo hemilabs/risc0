@@ -716,10 +716,10 @@ __global__ void majorKeys(const PreflightCycle* cycles, uint32_t* keys, uint32_t
 
 #ifndef __HIPCC__
 // finalizeAccum fused with eltwise_zeroize_fp(accum) (INVALID -> 0), one pass over all rows.
-// Same result as finalizeAccum followed by the zeroize: machine cells are finalized then
-// zeroized, every other cell is only zeroized. prev[] (last 4 columns, row back1) is read raw
-// while row back1's thread may zeroize it concurrently; those cells are inclusive-scan outputs
-// and never INVALID, so the zeroize cannot change them.
+// Same result as finalizeAccum followed by the zeroize: machine cells are finalized (an unset
+// one counting as 0), every other cell is only zeroized. prev[] (last 4 columns, row back1) is
+// read raw while row back1's thread may zeroize it concurrently; those cells are inclusive-scan
+// outputs and never INVALID, so the zeroize cannot change them.
 __global__ void finalizeZeroizeAccum(DeviceAccumContext* ctx, uint32_t lastCycle) {
   uint32_t cycle = blockDim.x * blockIdx.x + threadIdx.x;
   if (!ctx) return;
@@ -737,8 +737,10 @@ __global__ void finalizeZeroizeAccum(DeviceAccumContext* ctx, uint32_t lastCycle
 #pragma unroll
       for (int k = 0; k < 4; k++) {
         size_t i = (kUserAccumSplit + j * 4 + k) * rows + cycle;
-        Fp v = buf[i] + prev[k];
-        buf[i] = v.asRaw() == Fp::INVALID ? Fp() : v;
+        // An unset (INVALID) cell counts as 0: INVALID + prev[k] is unreduced when prev[k] is
+        // 0, and the NTT mishandles it (see phase 3 of risc0_circuit_rv32im_cpu_accum).
+        Fp cur = buf[i].asRaw() == Fp::INVALID ? Fp() : buf[i];
+        buf[i] = cur + prev[k];
       }
     }
     for (size_t c = 0; c < kUserAccumSplit; c++) z(c * rows + cycle);
@@ -782,7 +784,13 @@ __global__ void finalizeAccum(DeviceAccumContext* ctx, uint32_t lastCycle) {
   for (size_t j = 0; j < machineColumns - 1; j++) {
     for (size_t k = 0; k < 4; k++) {
       size_t col = kUserAccumSplit + j * 4 + k;
-      accum.set(cycle, col, accum.get(cycle, col) + prev[k]);
+      // An unset (INVALID) cell counts as 0: INVALID + prev[k] is unreduced when prev[k] is 0,
+      // and the NTT mishandles it (see phase 3 of risc0_circuit_rv32im_cpu_accum).
+      Fp cur = accum.get(cycle, col);
+      if (cur.asRaw() == Fp::INVALID) {
+        cur = Fp();
+      }
+      accum.set(cycle, col, cur + prev[k]);
     }
   }
 }
