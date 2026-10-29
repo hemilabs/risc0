@@ -192,6 +192,11 @@ void* esimd_create_queue() {
     }
 }
 
+// Total memory of the GPU the queues run on, in bytes; 0 before the first queue exists.
+size_t esimd_device_total_memory() {
+    return g_shared_device ? g_shared_device->get_info<sycl::info::device::global_mem_size>() : 0;
+}
+
 void esimd_destroy_queue(void* queue) {
     if (queue) {
         auto* q = static_cast<sycl::queue*>(queue);

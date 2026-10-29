@@ -18,7 +18,10 @@ use std::{
     fmt::Debug,
     marker::PhantomData,
     mem::ManuallyDrop,
-    sync::{Arc, OnceLock},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, OnceLock,
+    },
 };
 
 use parking_lot::{Mutex, ReentrantMutex};
@@ -270,7 +273,10 @@ struct IntelBufferPool {
     total_cached: usize,
 }
 
-const POOL_MAX_BYTES: usize = 16 << 30; // 16 GiB cap
+/// The most the pool keeps in idle buffers: a quarter of the GPU's memory, at most 16 GiB. A
+/// fixed 16 GiB is more than an Arc B580's whole memory (12 GB), and allocations made inside the
+/// C++ kernels can't take it back from the pool the way [RawBuffer::new] can.
+const POOL_MAX_BYTES: usize = 16 << 30;
 const POOL_SMALL_THRESHOLD: usize = 64 << 10; // Always pool buffers under 64 KiB
 
 impl IntelBufferPool {
@@ -293,8 +299,13 @@ impl IntelBufferPool {
 
     /// Returns the buffer back if the pool is full, so the caller frees it
     /// outside the pool lock.
-    fn push(&mut self, size: usize, buf: IntelDeviceBuffer) -> Option<IntelDeviceBuffer> {
-        if size < POOL_SMALL_THRESHOLD || self.total_cached + size <= POOL_MAX_BYTES {
+    fn push(
+        &mut self,
+        size: usize,
+        buf: IntelDeviceBuffer,
+        max_bytes: usize,
+    ) -> Option<IntelDeviceBuffer> {
+        if size < POOL_SMALL_THRESHOLD || self.total_cached + size <= max_bytes {
             self.total_cached += size;
             self.cache.entry(size).or_default().push(buf);
             None
@@ -322,6 +333,23 @@ pub fn release_idle_buffers() {
 
 static BUFFER_POOL: LazyLock<Mutex<IntelBufferPool>> =
     LazyLock::new(|| Mutex::new(IntelBufferPool::new()));
+
+/// The pool's cap for this GPU (see [POOL_MAX_BYTES]). The device's memory is known once the
+/// queue exists, which every buffer's allocation has ensured.
+fn pool_max_bytes() -> usize {
+    static MAX: AtomicUsize = AtomicUsize::new(0);
+    let max = MAX.load(Ordering::Relaxed);
+    if max != 0 {
+        return max;
+    }
+    let total = intel::device_total_memory();
+    if total == 0 {
+        return POOL_MAX_BYTES;
+    }
+    let max = (total / 4).min(POOL_MAX_BYTES);
+    MAX.store(max, Ordering::Relaxed);
+    max
+}
 
 // ============================================================================
 // RawBuffer - RAII device allocation with tracking + pool
@@ -365,9 +393,10 @@ impl Drop for RawBuffer {
         tracing::trace!("free: {size} bytes, {}", self.name);
         tracker().lock().unwrap().free(size);
         let buf = unsafe { ManuallyDrop::take(&mut self.buf) };
-        let overflow = BUFFER_POOL.lock().push(size, buf);
+        let max_bytes = pool_max_bytes();
+        let overflow = BUFFER_POOL.lock().push(size, buf, max_bytes);
         if overflow.is_some() {
-            // Over the pool cap (reachable at po2=21): the buffer is freed, and
+            // Over the pool cap (reachable in long sessions): the buffer is freed, and
             // esimd_free_device does not wait for queued kernels still using it.
             unsafe { intel::esimd_sync(get_queue()) };
         }
