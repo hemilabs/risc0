@@ -401,7 +401,7 @@ fn build_intel_kernels() {
         include(&intel_dir).into(),
         include(&cuda_dir).into(),
         include(Path::new(&cxx_root)).into(),
-        "-fsycl-targets=intel_gpu_bmg_g31".into(),
+        risc0_build_kernel::intel_sycl_targets_arg().into(),
         "-Xs".into(),
         "-options \"-cl-intel-256-GRF-per-thread -igc_opts 'DisableRecompilation=1'\"".into(),
     ];

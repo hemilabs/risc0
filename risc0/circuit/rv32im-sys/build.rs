@@ -1195,6 +1195,7 @@ fn compute_mono_hash(cxx_root: &str, icpx_version: &str) -> String {
             &iex_tag,
             &cse_tag,
             fast_tag,
+            &risc0_build_kernel::intel_sycl_targets_arg(),
         ],
     )
 }
@@ -1216,7 +1217,13 @@ fn compute_multipass_hash(cxx_root: &str, icpx_version: &str) -> String {
     let variant = intel_variant_tag();
     stamp::hash_labeled(
         &pairs,
-        &[icpx_version, INTEL_STAMP_VERSION, "multipass", &variant],
+        &[
+            icpx_version,
+            INTEL_STAMP_VERSION,
+            "multipass",
+            &variant,
+            &risc0_build_kernel::intel_sycl_targets_arg(),
+        ],
     )
 }
 
@@ -1238,7 +1245,13 @@ fn compute_witgen_hash(cxx_root: &str, icpx_version: &str) -> String {
     let variant = intel_variant_tag();
     stamp::hash_labeled(
         &pairs,
-        &[icpx_version, INTEL_STAMP_VERSION, "witgen", &variant],
+        &[
+            icpx_version,
+            INTEL_STAMP_VERSION,
+            "witgen",
+            &variant,
+            &risc0_build_kernel::intel_sycl_targets_arg(),
+        ],
     )
 }
 
@@ -1655,7 +1668,7 @@ fn build_intel_kernels() {
             amalg_path.clone()
         };
 
-        cmd.arg("-fsycl-targets=intel_gpu_bmg_g31") // AOT with noinline sub-functions
+        cmd.arg(risc0_build_kernel::intel_sycl_targets_arg()) // AOT with noinline sub-functions
             // Force 256 GRF mode: doubles register file from 8KB to 16KB per thread,
             // dramatically reducing the 42KB spill overhead. Trades occupancy (8→4 threads/EU)
             // for fewer spills — net win since kernel is spill-bound, not compute-bound.
@@ -1746,7 +1759,7 @@ fn build_intel_kernels() {
                     format!("-I{cxx_root}"),
                     "-Ikernels/cxx".into(),
                     "-Ikernels/intel".into(),
-                    "-fsycl-targets=intel_gpu_bmg_g31".into(),
+                    risc0_build_kernel::intel_sycl_targets_arg(),
                     "-Xs".into(),
                     format!("-options \"{}\"", intel_xs_options()),
                 ]
@@ -1781,7 +1794,7 @@ fn build_intel_kernels() {
                     format!("-I{cxx_root}"),
                     "-Ikernels/cxx".into(),
                     "-Ikernels/intel".into(),
-                    "-fsycl-targets=intel_gpu_bmg_g31".into(),
+                    risc0_build_kernel::intel_sycl_targets_arg(),
                     "-Xs".into(),
                     format!("-options \"{}\"", intel_xs_options()),
                 ]
@@ -1930,7 +1943,7 @@ fn build_intel_kernels() {
             .arg(format!("-Ikernels/intel"))
             .arg(format!("-I{cxx_root}"))
             .arg("-Ikernels/cxx")
-            .arg("-fsycl-targets=intel_gpu_bmg_g31");
+            .arg(risc0_build_kernel::intel_sycl_targets_arg());
 
         let args: Vec<std::ffi::OsString> = cmd.get_args().map(|a| a.to_owned()).collect();
         let output = risc0_build_kernel::intel_build_library(

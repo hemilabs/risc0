@@ -252,6 +252,7 @@ fn compute_recursion_intel_hash(cxx_root: &str, icpx_version: &str) -> String {
             "recursion",
             opt_tag,
             &split_tag,
+            &risc0_build_kernel::intel_sycl_targets_arg(),
         ],
     )
 }
@@ -771,7 +772,7 @@ fn build_intel_kernels() {
             }
         }
 
-        cmd.arg("-fsycl-targets=intel_gpu_bmg_g31"); // AOT for BMG
+        cmd.arg(risc0_build_kernel::intel_sycl_targets_arg()); // AOT for Battlemage
 
         let args: Vec<std::ffi::OsString> = cmd.get_args().map(|a| a.to_owned()).collect();
         let output = risc0_build_kernel::intel_build_library(
@@ -832,7 +833,11 @@ fn build_intel_accum(
     .map(|p| (PathBuf::from(p), PathBuf::from(p)))
     .collect();
     pairs.extend(cxx_root_headers(cxx_root));
-    let hash = stamp::hash_labeled(&pairs, &[icpx_version, RECURSION_ACCUM_STAMP_VERSION]);
+    let targets = risc0_build_kernel::intel_sycl_targets_arg();
+    let hash = stamp::hash_labeled(
+        &pairs,
+        &[icpx_version, RECURSION_ACCUM_STAMP_VERSION, &targets],
+    );
     if !stamp::need_rebuild(&so_path, &stamp_path, &hash) {
         eprintln!("Using cached Intel recursion accum kernel");
         return;
@@ -873,7 +878,7 @@ fn build_intel_accum(
         .arg("-Wno-sign-compare")
         .arg(format!("-I{cxx_root}"))
         .arg("-Ikernels/cxx")
-        .arg("-fsycl-targets=intel_gpu_bmg_g31");
+        .arg(risc0_build_kernel::intel_sycl_targets_arg());
     let args: Vec<std::ffi::OsString> = cmd.get_args().map(|a| a.to_owned()).collect();
     let output = risc0_build_kernel::intel_build_library(
         icpx,
