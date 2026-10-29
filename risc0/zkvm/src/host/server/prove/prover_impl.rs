@@ -1458,7 +1458,10 @@ impl ProverServer for ProverImpl {
         // lifts and joins; composite proving costs more per cycle at po2=21, but less than the
         // recursion it saves). Only when the caller did not choose a segment size;
         // RISC0_SUCCINCT_SEGMENT_PO2 (or RISC0_INTEL_SUCCINCT_SEGMENT_PO2) overrides, e.g. 20
-        // keeps the executor default. CUDA needs ~28 GB of device memory for po2=21.
+        // keeps the executor default. CUDA needs ~28 GB of device memory for po2=21. Intel keeps
+        // the executor default: on the 32 GB Arc Pro B70, po2=21 ran out of device memory in long
+        // sessions and after a Groth16 wrap in the same process (an Ethereum block, a STARK
+        // proof after the Groth16 prover cached its key), where po2=20 did not.
         #[cfg(any(feature = "intel", feature = "cuda"))]
         if self.opts.receipt_kind != ReceiptKind::Composite && env.segment_limit_po2.is_none() {
             let po2 = std::env::var("RISC0_SUCCINCT_SEGMENT_PO2")
@@ -1470,8 +1473,6 @@ impl ProverServer for ProverImpl {
                 let total = risc0_zkp::hal::cuda::device_total_memory().unwrap_or(0);
                 (total >= 30 << 30).then_some(21)
             });
-            #[cfg(feature = "intel")]
-            let po2 = po2.or(Some(21));
             if let Some(po2) = po2 {
                 env.segment_limit_po2 = Some(po2.min(self.opts.max_segment_po2 as u32));
             }
