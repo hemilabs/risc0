@@ -689,7 +689,14 @@ const char* risc0_circuit_rv32im_intel_accum(
             for (size_t j = 0; j < machineColumns - 1; j++) {
               for (size_t k = 0; k < 4; k++) {
                 size_t col = kUserAccumSplit + j * 4 + k;
-                ab.set(cycle, col, ab.get(cycle, col) + prev[k]);
+                // An unset (INVALID) cell counts as 0: INVALID + prev[k] is unreduced when
+                // prev[k] is 0, and the NTT mishandles it (see phase 3 of
+                // risc0_circuit_rv32im_cpu_accum).
+                risc0::Fp cur = ab.get(cycle, col);
+                if (cur == risc0::Fp::invalid()) {
+                  cur = risc0::Fp(0);
+                }
+                ab.set(cycle, col, cur + prev[k]);
               }
             }
           });
