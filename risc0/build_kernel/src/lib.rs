@@ -1464,6 +1464,20 @@ pub fn find_icpx() -> PathBuf {
     PathBuf::from(exe)
 }
 
+/// The `-fsycl-targets=` argument for the kernels compiled ahead of time: Intel's Battlemage GPUs
+/// (BMG-G31: Arc Pro B70 and B60; BMG-G21: Arc B580 and B570). A GPU missing from the list has
+/// no device code for these kernels. `RISC0_INTEL_SYCL_TARGETS` overrides the list, e.g.
+/// `intel_gpu_bmg_g31` alone builds faster for a B70. Kernel caches must include the value in
+/// their keys, so that a build for other targets doesn't reuse them.
+pub fn intel_sycl_targets_arg() -> String {
+    println!("cargo:rerun-if-env-changed=RISC0_INTEL_SYCL_TARGETS");
+    let targets = env::var("RISC0_INTEL_SYCL_TARGETS")
+        .ok()
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or_else(|| "intel_gpu_bmg_g31,intel_gpu_bmg_g21".into());
+    format!("-fsycl-targets={targets}")
+}
+
 /// The file `icpx` builds for the Intel shared library `name` in `dir`:
 /// `lib<name>.so` on Linux, `<name>.dll` (with its import library `<name>.lib`) on Windows.
 pub fn intel_library_path(dir: &Path, name: &str) -> PathBuf {
