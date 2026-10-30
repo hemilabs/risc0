@@ -1258,6 +1258,55 @@ fn post_state_digest_randomization() {
     assert_eq!(post_state_digests.len(), 1);
 }
 
+/// With a random seed, the guest's randomness (`getrandom`, and the memory-image entropy every
+/// guest draws at start) repeats from run to run: so do the journal and the post-state digest. A
+/// different seed changes both, and without a seed each run draws fresh entropy.
+#[test_log::test]
+fn random_seed_repeats_the_guest_randomness() {
+    let run = |seed: Option<[u8; 32]>| {
+        let mut builder = ExecutorEnv::builder();
+        builder.write(&MultiTestSpec::DoRandom).unwrap();
+        if let Some(seed) = seed {
+            builder.random_seed(seed);
+        }
+        let session = execute_elf(builder.build().unwrap(), MULTI_TEST_ELF).unwrap();
+        assert_eq!(session.exit_code, ExitCode::Halted(0));
+        let journal = session.journal.as_ref().unwrap().bytes.clone();
+        let segment = session.segments.last().unwrap().resolve().unwrap();
+        (journal, segment.inner.claim.post_state)
+    };
+
+    let seeded = run(Some([7u8; 32]));
+    assert_eq!(run(Some([7u8; 32])), seeded);
+
+    let other = run(Some([8u8; 32]));
+    assert_ne!(other.0, seeded.0);
+    assert_ne!(other.1, seeded.1);
+
+    let (a, b) = (run(None), run(None));
+    assert_ne!(a.0, b.0);
+    assert_ne!(a.1, b.1);
+}
+
+/// A prover that runs the guest in another process can't honor a random seed: it refuses the
+/// environment before launching anything, rather than silently answering with fresh entropy.
+#[test_log::test]
+fn out_of_process_provers_refuse_a_random_seed() {
+    use crate::{Executor as _, ExternalProver, Prover as _};
+
+    let seeded = || {
+        ExecutorEnv::builder()
+            .random_seed([7u8; 32])
+            .build()
+            .unwrap()
+    };
+    let r0vm = ExternalProver::new("ipc", "/nonexistent/r0vm");
+    let err = r0vm.execute(seeded(), MULTI_TEST_ELF).unwrap_err();
+    assert!(format!("{err:#}").contains("random_seed"), "{err:#}");
+    let err = r0vm.prove(seeded(), MULTI_TEST_ELF).unwrap_err();
+    assert!(format!("{err:#}").contains("random_seed"), "{err:#}");
+}
+
 #[test_log::test]
 fn aligned_alloc() {
     multi_test(MultiTestSpec::AlignedAlloc);
