@@ -252,9 +252,51 @@ fn compute_recursion_intel_hash(cxx_root: &str, icpx_version: &str) -> String {
             "recursion",
             opt_tag,
             &split_tag,
+            &remat_distance(),
             &risc0_build_kernel::intel_sycl_targets_arg(),
         ],
     )
+}
+
+/// The statement distance past which eval_remat_loads.py reloads a buffer value instead of
+/// keeping it live (`RISC0_RECURSION_REMAT_G` overrides).
+///
+/// With icpx/ocloc 2026.0 and eval_check.cpp's loop over rows, 200 or less keeps poly_fp's
+/// values out of private memory: the kernel's private size is 896 B per work item, against
+/// 527,232 B at 300 and above (the B70-era 400) or without the loop. On an Arc B580 that took
+/// eval_check from 172 to 68 ms per recursion proof (lift/join of 32 po2 20 segments 17.1 ->
+/// 10.4 s); 100 was 72 ms, 200 69 ms, 300 and 800 172 ms. `warn_private_size` checks the result.
+/// Warns if a kernel in the built library `lib` uses more than 64 KiB of private memory per work
+/// item, as its embedded zeInfo reports (`private_size: N`): eval_check then runs ~2.5x slower
+/// (see `remat_distance`), which a compiler or generated-code change can bring about silently.
+fn warn_private_size(lib: &Path) {
+    let Ok(bytes) = std::fs::read(lib) else {
+        return;
+    };
+    let key = b"private_size:";
+    let mut largest = 0u64;
+    for i in 0..bytes.len().saturating_sub(key.len()) {
+        if &bytes[i..i + key.len()] == key {
+            let digits: String = bytes[i + key.len()..]
+                .iter()
+                .map(|&b| b as char)
+                .skip_while(|c| *c == ' ')
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            largest = largest.max(digits.parse().unwrap_or(0));
+        }
+    }
+    if largest > 64 << 10 {
+        println!(
+            "cargo:warning=recursion eval_check: a kernel uses {largest} B of private memory per \
+             work item (expected under 64 KiB); it will run ~2.5x slower. See remat_distance in \
+             risc0/circuit/recursion-sys/build.rs."
+        );
+    }
+}
+
+fn remat_distance() -> String {
+    std::env::var("RISC0_RECURSION_REMAT_G").unwrap_or_else(|_| "150".into())
 }
 
 #[cfg(all(feature = "cuda", feature = "rocm"))]
@@ -584,6 +626,7 @@ fn build_intel_kernels() {
     rerun_if_changed("kernels/intel");
     rerun_if_changed("kernels/cxx");
     println!("cargo:rerun-if-env-changed=RISC0_RECURSION_OPTIMIZE");
+    println!("cargo:rerun-if-env-changed=RISC0_RECURSION_REMAT_G");
     println!("cargo:rerun-if-env-changed=RISC0_RECURSION_SPLIT_POLY_FP");
     println!("cargo:rerun-if-env-changed=RISC0_RECURSION_SPLIT_N");
 
@@ -641,7 +684,7 @@ fn build_intel_kernels() {
             // RISC0_INTEL_EVAL_FAST device helpers (mandatory: without them the
             // monolith never finishes compiling), DisableRecompilation=1, and the
             // 4-entry vanishing-quotient table. Post-passes below: lazy poly_mix
-            // chains + volatile load rematerialisation (G=400). 730 -> ~42 ms.
+            // chains + volatile load rematerialisation (see `remat_distance`).
             cmd.arg("-Os")
                 .arg("-DRISC0_INTEL_EVAL_FAST")
                 .arg("-DRECURSION_QTABLE")
@@ -760,7 +803,11 @@ fn build_intel_kernels() {
                 ),
                 (
                     "kernels/intel/eval_remat_loads.py",
-                    vec![lazy_path.clone(), amalg_path.clone(), PathBuf::from("400")],
+                    vec![
+                        lazy_path.clone(),
+                        amalg_path.clone(),
+                        PathBuf::from(remat_distance()),
+                    ],
                 ),
             ] {
                 let status = risc0_build_kernel::python_command()
@@ -789,6 +836,7 @@ fn build_intel_kernels() {
         }
         stamp::write(&stamp_path, &recursion_hash, &icpx_version, "ok");
         eprintln!("  Built {}", so_path.display());
+        warn_private_size(&so_path);
     } else {
         eprintln!("Using cached Intel recursion eval_check kernel");
     }
