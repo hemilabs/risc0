@@ -84,7 +84,9 @@ lto = true
 # proofs; upstream fixed them on master in 9e5c795 and 6b931f3), and its HIP shim defines a
 # __syncwarp() that ROCm 7's headers also declare, so ROCm builds stop there. The fork has both
 # fixes and a __syncwarp() that also orders LDS accesses on RDNA. Only CUDA/ROCm builds use sppark.
+# This revision (the fork's zkminer/windows-amd) also builds on Windows: with MSVC as nvcc's host
+# compiler, and with its `sppark` -> `..` symlink checked out as a plain file, as cargo does there.
 # A [patch] applies to this workspace's builds only: a crate depending on this repository resolves
 # sppark through its own lockfile and patches.
 [patch.crates-io]
-sppark = { git = "https://github.com/hemilabs/risc0-sppark", rev = "725d3af6db6548bac1ecd6cb0f863578e2bb03c7" }
+sppark = { git = "https://github.com/hemilabs/risc0-sppark", rev = "5f68eb3eb9e4e06c9837d22aade07ed40432889f" }
