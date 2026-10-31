@@ -44,12 +44,24 @@ static size_t slab_words_for(uint32_t rows) {
 }
 
 // Rows per launch: min(tile, domain). The slab is always sized for a full
-// tile (2^20 rows = 1.4 GB by default, RISC0_EVAL_SLAB_TILE_LOG2 overrides),
-// independent of the domain, so segments of different po2 never regrow it
-// (a regrow drains the queue). If that allocation fails the tile halves, down
-// to 2^14 rows, and g_tile_cap keeps the smaller size until release.
+// tile (2^20 rows = 1.4 GB by default, 2^18 rows = 350 MB on cards under
+// 20 GiB; RISC0_EVAL_SLAB_TILE_LOG2 overrides), independent of the domain, so
+// segments of different po2 never regrow it (a regrow drains the queue). If
+// that allocation fails the tile halves, down to 2^14 rows, and g_tile_cap
+// keeps the smaller size until release.
+//
+// On a 12 GB Arc B580 under Windows, where over-budget allocations spill into
+// shared system memory instead of failing, the 1.4 GB slab (held from the first
+// segment to the end of the session) pushed the next session's segments into
+// shared memory: po2 20 segments 27.5 s -> 39.3 s per 32M cycles, or 30.1 s with
+// a Groth16 wrap between sessions. With 2^18 rows: 27.3-27.6 s either way, and
+// the kernel itself is no slower (403 vs 406 ms per po2 20 segment).
 static uint32_t slab_tile(sycl::queue* q, uint32_t domain) {
-    uint32_t tile = 1u << 20;
+    constexpr uint64_t kSmallCard = uint64_t(20) << 30;
+    uint32_t tile =
+        q->get_device().get_info<sycl::info::device::global_mem_size>() < kSmallCard
+            ? 1u << 18
+            : 1u << 20;
     if (const char* s = std::getenv("RISC0_EVAL_SLAB_TILE_LOG2")) {
         int v = std::atoi(s);
         if (v >= 9 && v <= 26) tile = 1u << v;
