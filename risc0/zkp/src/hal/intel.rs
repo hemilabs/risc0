@@ -334,8 +334,20 @@ pub fn release_idle_buffers() {
 static BUFFER_POOL: LazyLock<Mutex<IntelBufferPool>> =
     LazyLock::new(|| Mutex::new(IntelBufferPool::new()));
 
+/// Cards with less memory than this keep only small buffers in the pool on Windows (see
+/// [pool_max_bytes]).
+const POOL_SMALL_CARD_BYTES: usize = 20 << 30;
+
 /// The pool's cap for this GPU (see [POOL_MAX_BYTES]). The device's memory is known once the
 /// queue exists, which every buffer's allocation has ensured.
+///
+/// On Windows a card with less than [POOL_SMALL_CARD_BYTES] pools only small buffers. There an
+/// allocation beyond the card's memory does not fail but spills into shared system memory, so
+/// [RawBuffer::new]'s release of the pool on a failed allocation never happens, and idle buffers
+/// kept from earlier proofs pushed later ones off the card. On a 12 GB Arc B580 at po2=20, 3 GiB
+/// of pooled buffers left the next sessions' segments at 42-46 s after the first's 28 s (with up
+/// to 1.2 GB in shared memory); pooling only small buffers kept them at 28-30 s, with the first
+/// session no slower. Sessions at po2=19 took ~3% longer without the pool (64.4 s, from 62.1).
 fn pool_max_bytes() -> usize {
     static MAX: AtomicUsize = AtomicUsize::new(0);
     let max = MAX.load(Ordering::Relaxed);
@@ -346,7 +358,12 @@ fn pool_max_bytes() -> usize {
     if total == 0 {
         return POOL_MAX_BYTES;
     }
-    let max = (total / 4).min(POOL_MAX_BYTES);
+    let max = if cfg!(windows) && total < POOL_SMALL_CARD_BYTES {
+        // Nonzero, as 0 means not yet known; [IntelBufferPool::push] keeps small buffers anyway.
+        1
+    } else {
+        (total / 4).min(POOL_MAX_BYTES)
+    };
     MAX.store(max, Ordering::Relaxed);
     max
 }

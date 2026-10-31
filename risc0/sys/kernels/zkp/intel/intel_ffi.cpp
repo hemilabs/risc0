@@ -12,6 +12,23 @@
 #include <algorithm>
 #include <deque>
 
+// On Windows, Level Zero's USM pool off, set while this library loads (before any thread runs,
+// and before SYCL initializes Level Zero, which reads it then). The HAL pools device buffers
+// itself (risc0-zkp's Intel HAL), and the Groth16 prover allocates in a context of its own.
+// Buffers they freed stayed in the adapter's pool, still counted in this process's video memory
+// usage, where neither could reuse them, so later allocations spilled into shared system memory:
+// on a 12 GB Arc B580 at po2=20, with the pool, the third session's segments took 35.6 s instead
+// of 28-30 s. UR_L0_DISABLE_USM_ALLOCATOR=0 (or its older name,
+// SYCL_PI_LEVEL_ZERO_DISABLE_USM_ALLOCATOR) keeps it.
+#ifdef _WIN32
+static const bool kLevelZeroUsmPoolOff = [] {
+    if (!std::getenv("UR_L0_DISABLE_USM_ALLOCATOR") &&
+        !std::getenv("SYCL_PI_LEVEL_ZERO_DISABLE_USM_ALLOCATOR"))
+        _putenv_s("UR_L0_DISABLE_USM_ALLOCATOR", "1");
+    return true;
+}();
+#endif
+
 // Host-to-device staging. A pageable q.memcpy is NOT reliably captured at
 // enqueue: NEO stages only the first copy from a given host address, and a
 // later copy from the same address that is enqueued before the host has seen

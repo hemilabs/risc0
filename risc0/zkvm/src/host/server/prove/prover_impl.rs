@@ -47,7 +47,7 @@ impl Drop for DrainSegmentProverOnExit {
 
 /// Drop this thread's cached segment prover and the device buffers it keeps between segments
 /// (see `release_cached_provers`). Only between sessions: the prover must be idle.
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "intel"))]
 fn release_cached_segment_prover() {
     CACHED_SEGMENT_PROVER.with(|cell| {
         if let Ok(mut borrow) = cell.try_borrow_mut() {
@@ -56,12 +56,14 @@ fn release_cached_segment_prover() {
     });
 }
 
-/// Before the Groth16 wrap on ROCm, drop the provers cached between proofs (this thread's
-/// segment prover and recursion provers), then the HAL's pool. On an RX 9070 XT (16 GB,
+/// Before the Groth16 wrap on ROCm and Intel, drop the provers cached between proofs (this
+/// thread's segment prover and recursion provers), then the HAL's pool. On an RX 9070 XT (16 GB,
 /// Windows) the wrap's ~7 GB proving key beside those long-lived buffers made the driver move
 /// ~2 GB of them into shared system memory, where they stayed: every later session ran ~2.5x
-/// slower. Rebuilt by the next session, in device memory.
-#[cfg(feature = "rocm")]
+/// slower. On an Arc B580 (12 GB, Windows) at po2=20 the next session's segments took 106 s
+/// instead of 28 (54-65 s with this alone; the rest was the HAL's pool, see `pool_max_bytes` in
+/// risc0-zkp's Intel HAL). Rebuilt by the next session, in device memory.
+#[cfg(any(feature = "rocm", feature = "intel"))]
 pub(crate) fn release_cached_provers() {
     release_cached_segment_prover();
     risc0_circuit_recursion::prove::release_cached_provers();
@@ -1387,7 +1389,7 @@ impl ProverImpl {
             let seal_bytes = ident_receipt.get_seal_bytes();
             // See `release_hal_buffers`: the wrap cannot reclaim what the STARK HAL is caching.
             // Released while the wrap computes its witness on another thread.
-            #[cfg(feature = "rocm")]
+            #[cfg(any(feature = "rocm", feature = "intel"))]
             release_cached_provers();
             let seal = shrink_wrap_with(&seal_bytes, super::release_hal_buffers)?.to_vec();
             super::release_hal_buffers();
