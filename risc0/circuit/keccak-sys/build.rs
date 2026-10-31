@@ -98,7 +98,9 @@ fn build_cuda_kernels() {
     let sppark_root = env::var("DEP_SPPARK_ROOT").unwrap();
     rerun_if_include_roots_changed(&[&cuda_root, &sppark_root]);
     let out_dir = env::var("OUT_DIR").map(PathBuf::from).unwrap();
-    let kernel_dir = std::fs::canonicalize("kernels/cuda").unwrap();
+    // `absolute`, not `canonicalize`: on Windows the latter gives a `\\?\` path, which cl.exe
+    // (nvcc's host compiler there) can't search for the scratch TU's includes.
+    let kernel_dir = std::path::absolute("kernels/cuda").unwrap();
     let msvc = risc0_build_kernel::is_msvc_target();
     let use_native_arch =
         env::var_os("NVCC_PREPEND_FLAGS").is_none() && env::var_os("NVCC_APPEND_FLAGS").is_none();

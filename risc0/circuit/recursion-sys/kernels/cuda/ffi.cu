@@ -51,8 +51,8 @@ namespace cuda { namespace std { using ::std::array; } }
 #include <cstdlib>
 #include <map>
 
-// Async recursion witgen (CUDA only; kill switch RISC0_CUDA_REC_WITGEN=0 restores the synchronous
-// path): the witgen uploads and the accum's initial ones go on the context's stream
+// Async recursion witgen (CUDA only, and off by default on Windows: see recAsync; kill switch
+// RISC0_CUDA_REC_WITGEN=0 restores the synchronous path):the witgen uploads and the accum's initial ones go on the context's stream
 // (cudaMemcpyAsync/cudaMemsetAsync, a fill kernel) instead of the legacy stream, thrust's temporary storage comes from a per-thread cache and runs on that
 // stream (no cudaMalloc/cudaFree per proof: cudaFree synchronizes the device and both take a
 // driver ioctl that costs ~1 ms when the host is busy), the cached buffers grow with 25%
@@ -64,7 +64,15 @@ static bool recAsync() {
 #ifdef REC_ASYNC_AVAILABLE
   static const bool on = [] {
     const char* e = std::getenv("RISC0_CUDA_REC_WITGEN");
+#ifdef _WIN32
+    // Off by default on Windows: the contexts are managed memory, which the host reads between
+    // kernels (e.g. verifyWom's numCycles), and under WDDM (no concurrentManagedAccess) a host
+    // access while a kernel is in flight faults (STATUS_IN_PAGE_ERROR). RISC0_CUDA_REC_WITGEN=1
+    // turns it on.
+    return e && e[0] == '1';
+#else
     return !(e && e[0] == '0');
+#endif
   }();
   return on;
 #else

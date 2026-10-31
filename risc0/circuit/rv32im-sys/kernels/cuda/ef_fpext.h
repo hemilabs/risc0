@@ -142,7 +142,13 @@ struct FpExt {
   // Inlined: as an out-of-line call (IGC's default for this size) every call
   // passed operands through private memory and drained the pipeline; that
   // calling convention, not the arithmetic, dominated the Intel eval_check.
+  // nvcc spells it __forceinline__: with cl.exe as its host compiler it has no
+  // __attribute__ (and it inlines this anyway).
+#ifdef __NVCC__
+  __forceinline__
+#else
   __attribute__((always_inline))
+#endif
 #endif
   constexpr FpExt operator*(FpExt rhs) const {
 #if defined(__CUDA_ARCH__) && defined(EF_EXT_LAZY)
