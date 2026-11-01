@@ -655,6 +655,40 @@ mod sys_verify {
         session
     }
 
+    #[test_log::test]
+    fn a_halt_digest_other_than_its_output_is_refused() {
+        // The guest commits to a journal, then halts with a digest that isn't its Output's: it
+        // executes, but the prover proves the Output built from the journal, so no proof of it can
+        // verify. Execution refuses it instead.
+        let env = ExecutorEnv::builder()
+            .write(&MultiTestSpec::HaltWithOutputDigest(Digest::from(
+                [1u32; 8],
+            )))
+            .unwrap()
+            .build()
+            .unwrap();
+        let Err(err) = execute_elf(env, MULTI_TEST_ELF) else {
+            panic!("a halt digest that isn't its output executed");
+        };
+        assert!(
+            format!("{err:#}").contains("no proof of this execution can verify"),
+            "{err:#}"
+        );
+    }
+
+    #[test_log::test]
+    fn a_halt_with_no_output_executes() {
+        // A zero digest means no output (whatever went to the journal): still a valid execution.
+        let env = ExecutorEnv::builder()
+            .write(&MultiTestSpec::HaltWithOutputDigest(Digest::ZERO))
+            .unwrap()
+            .build()
+            .unwrap();
+        let session = execute_elf(env, MULTI_TEST_ELF).unwrap();
+        assert_eq!(session.exit_code, ExitCode::Halted(0));
+        assert!(session.journal.is_none());
+    }
+
     fn exec_pause(exit_code: u8) -> Session {
         let env = ExecutorEnv::builder()
             .write(&MultiTestSpec::PauseResume(exit_code))
