@@ -167,19 +167,80 @@ fn only_the_circuits_encodings_execute() {
     assert_refused(run_kernel(jalr(1)), "IllegalInstruction");
 }
 
-/// The circuit has no trap step: a trap is an error, a trap table or not.
+const KERNEL_CODE: u32 = KERNEL_START_ADDR.0;
+const USER_CODE: u32 = ZERO_PAGE_END_ADDR.0 + 0x1_0000;
+
+/// `addi rd, x0, imm`, `lw rd, 0(rs1)` and `sw rs2, 0(rs1)`.
+fn addi(rd: usize, imm: u32) -> u32 {
+    (imm << 20) | ((rd as u32) << 7) | 0x13
+}
+fn lw(rd: usize, rs1: usize) -> u32 {
+    ((rs1 as u32) << 15) | (0b010 << 12) | ((rd as u32) << 7) | 0x03
+}
+fn sw(rs2: usize, rs1: usize) -> u32 {
+    ((rs2 as u32) << 20) | ((rs1 as u32) << 15) | (0b010 << 12) | 0x23
+}
+
+/// Drops to user mode at `target` (mret resumes at MEPC + 4).
+fn mret_to(asm: &mut Assembler, target: u32) {
+    asm.li(REG_T0, MEPC_ADDR.0);
+    asm.li(REG_T1, target.wrapping_sub(WORD_SIZE as u32));
+    asm.raw(sw(REG_T1, REG_T0));
+    asm.raw(MRET);
+}
+
+/// The circuit has no trap step. A user-mode trap with a trap table pointing at a kernel handler
+/// that halts cleanly used to execute; no proof of it could verify.
 #[test]
 fn a_trap_is_refused() {
-    let entry = USER_START_ADDR.0 + WORD_SIZE as u32;
     assert_refused(
         run_kernel(|asm| {
-            for cause in 0..16 {
-                asm.word(TRAP_DISPATCH_ADDR.0 + cause * WORD_SIZE as u32, entry);
+            // The handler: halt, exit code 0.
+            for (i, word) in [
+                addi(REG_A7, HOST_ECALL_TERMINATE),
+                addi(REG_A0, 0),
+                addi(REG_A1, 0),
+            ]
+            .into_iter()
+            .chain([ECALL])
+            .enumerate()
+            {
+                asm.word(KERNEL_CODE + (i * WORD_SIZE) as u32, word);
             }
-            asm.li(REG_T0, ZERO_PAGE_END_ADDR.0 + 1);
-            asm.lw(REG_T1, REG_T0, 0);
+            for cause in 0..16 {
+                asm.word(TRAP_DISPATCH_ADDR.0 + cause * WORD_SIZE as u32, KERNEL_CODE);
+            }
+            // The user code: a load from the zero page.
+            asm.word(USER_CODE, addi(REG_T0, 4));
+            asm.word(USER_CODE + WORD_SIZE as u32, lw(REG_T1, REG_T0));
+            mret_to(asm, USER_CODE);
         }),
         "Trap cannot be proven",
+    );
+}
+
+/// The circuit decodes an instruction only at an aligned pc: an mret to a misaligned one is refused
+/// (fetching rounded it down).
+#[test]
+fn a_misaligned_pc_is_refused() {
+    assert_refused(
+        run_kernel(|asm| {
+            asm.word(USER_CODE, addi(REG_T0, 4));
+            mret_to(asm, USER_CODE + 1);
+        }),
+        "Misaligned pc",
+    );
+}
+
+/// An unknown machine ecall is an error, not a panic.
+#[test]
+fn an_unknown_machine_ecall_is_refused() {
+    assert_refused(
+        run_kernel(|asm| {
+            asm.li(REG_A7, 6);
+            asm.ecall();
+        }),
+        "Unknown machine ecall: 6",
     );
 }
 

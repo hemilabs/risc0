@@ -147,6 +147,13 @@ impl BigInt {
 
         let base =
             ctx.load_aligned_addr_from_machine_register(LoadOp::Record, insn.reg as usize)?;
+        // The circuit adds the offset to the base's low half allowing one carry out of it, on every
+        // instruction (a Check's address too, used or not).
+        ensure!(
+            (base.baddr().0 & 0xffff) + insn.offset * (BIGINT_WIDTH_BYTES as u32) < 0x2_0000,
+            "bigint offset {} out of reach of its base {base:?}",
+            insn.offset
+        );
         let addr = base + insn.offset * BIGINT_WIDTH_WORDS as u32;
 
         tracing::trace!("step({:?}, {insn:?}, {addr:?})", self.state.pc);
@@ -722,6 +729,26 @@ mod tests {
         );
         ctx.store_register(MACHINE_REGS_ADDR.waddr(), 0, 0).unwrap();
         run(&mut ctx, &exec, |_, _, _| {}).unwrap();
+    }
+
+    #[test]
+    fn an_offset_past_one_carry_from_its_base_is_refused() {
+        // BASE's low half is 0x1000: offsets up to 0x1EFF keep the sum under 0x20000.
+        let at = |offset: u32| {
+            let (mut ctx, exec) = setup(
+                &[insn(MemoryOp::Read, PolyOp::Reset, offset)],
+                BigIntWitness::new(),
+            );
+            let addr = BASE + offset as usize * BIGINT_WIDTH_BYTES;
+            ctx.store_region(addr, &[0; BIGINT_WIDTH_BYTES]).unwrap();
+            run(&mut ctx, &exec, |_, _, _| {}).map(|_| ())
+        };
+        at(0x1eff).unwrap();
+        let err = at(0x1f00).unwrap_err();
+        assert!(
+            err.to_string().contains("out of reach of its base"),
+            "{err}"
+        );
     }
 
     #[test]

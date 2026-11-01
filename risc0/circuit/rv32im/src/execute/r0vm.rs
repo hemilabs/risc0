@@ -406,7 +406,7 @@ impl<'a, C: Risc0Context> Risc0Machine<'a, C> {
             HOST_ECALL_POSEIDON2 => self.ecall_poseidon2(),
             HOST_ECALL_SHA2 => self.ecall_sha2(),
             HOST_ECALL_BIGINT => self.ecall_bigint(),
-            _ => unimplemented!(),
+            a7 => bail!("Unknown machine ecall: {a7}"),
         }
     }
 

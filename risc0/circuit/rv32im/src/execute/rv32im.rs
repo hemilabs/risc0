@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use derive_more::Debug;
 use risc0_binfmt::{ByteAddr, WordAddr};
 
@@ -293,6 +293,12 @@ impl Emulator {
     pub fn step<C: EmuContext>(&mut self, ctx: &mut C) -> Result<()> {
         let pc = ctx.get_pc();
 
+        // The circuit decodes an instruction only at an aligned pc. Fetching rounds down, so one
+        // reached otherwise (an mret to a MEPC the guest wrote, a resume) ran here and no proof of it
+        // could.
+        if !pc.is_aligned() {
+            bail!("Misaligned pc: {pc:?}");
+        }
         if !ctx.check_insn_load(pc) {
             ctx.trap(Exception::InstructionFault)?;
             return Ok(());
