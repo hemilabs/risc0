@@ -12,13 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use anyhow::Result;
 use risc0_binfmt::MemoryImage;
 use risc0_zkp::core::digest::Digest;
 use test_log::test;
 
 use crate::{TerminateState, MAX_INSN_CYCLES};
 
-use super::{testutil, DEFAULT_SEGMENT_LIMIT_PO2};
+use super::{
+    platform::*,
+    syscall::{Syscall, SyscallContext},
+    testutil::{self, Assembler},
+    DEFAULT_SEGMENT_LIMIT_PO2,
+};
 
 #[test]
 fn basic() {
@@ -90,4 +96,126 @@ fn system_split() {
 
     assert!(segments[0].read_record.is_empty());
     assert!(segments[0].write_record.is_empty());
+}
+
+/// Executes `body` in machine mode, then halts: the error, if execution refuses it.
+fn run_kernel(body: impl FnOnce(&mut Assembler)) -> Result<()> {
+    struct Sink;
+    impl Syscall for Sink {
+        fn host_read(&self, _: &mut impl SyscallContext, _: u32, _: &mut [u8]) -> Result<u32> {
+            Ok(0)
+        }
+        fn host_write(&self, _: &mut impl SyscallContext, _: u32, buf: &[u8]) -> Result<u32> {
+            Ok(buf.len() as u32)
+        }
+    }
+    let mut asm = Assembler::new();
+    body(&mut asm);
+    asm.host_terminate(0, 0);
+    let image = MemoryImage::new_kernel(asm.program());
+    testutil::execute(
+        image,
+        DEFAULT_SEGMENT_LIMIT_PO2,
+        MAX_INSN_CYCLES,
+        testutil::DEFAULT_SESSION_LIMIT,
+        &Sink,
+        None,
+    )
+    .map(|_| ())
+}
+
+fn assert_refused(r: Result<()>, needle: &str) {
+    let err = r.expect_err("executed");
+    assert!(format!("{err:#}").contains(needle), "{err:#}");
+}
+
+const ECALL: u32 = 0x0000_0073;
+const MRET: u32 = 0x3020_0073;
+
+/// The circuit decodes jalr only with func3 0, and mret and ecall only as their exact words: any
+/// other encoding of them is an illegal instruction here too (where it ran, no proof of it could).
+#[test]
+fn only_the_circuits_encodings_execute() {
+    run_kernel(|_| {}).unwrap();
+
+    // A halt through `ecall` with rd (or rs1) set.
+    for word in [ECALL | (1 << 7), ECALL | (1 << 15)] {
+        assert_refused(
+            run_kernel(|asm| {
+                asm.li(REG_A7, HOST_ECALL_TERMINATE);
+                asm.li(REG_A0, 0);
+                asm.li(REG_A1, 0);
+                asm.raw(word);
+            }),
+            "IllegalInstruction",
+        );
+    }
+    // mret with rd set.
+    assert_refused(
+        run_kernel(|asm| asm.raw(MRET | (1 << 7))),
+        "IllegalInstruction",
+    );
+    // A jalr to the next instruction (after li's two and its own), with func3 1; with 0, it runs.
+    let jalr = |func3: u32| {
+        let next = USER_START_ADDR.0 + WORD_SIZE as u32 + 3 * WORD_SIZE as u32;
+        move |asm: &mut Assembler| {
+            asm.li(REG_T0, next);
+            asm.raw((REG_T0 as u32) << 15 | func3 << 12 | 0b1100111);
+        }
+    };
+    run_kernel(jalr(0)).unwrap();
+    assert_refused(run_kernel(jalr(1)), "IllegalInstruction");
+}
+
+/// The circuit has no trap step: a trap is an error, a trap table or not.
+#[test]
+fn a_trap_is_refused() {
+    let entry = USER_START_ADDR.0 + WORD_SIZE as u32;
+    assert_refused(
+        run_kernel(|asm| {
+            for cause in 0..16 {
+                asm.word(TRAP_DISPATCH_ADDR.0 + cause * WORD_SIZE as u32, entry);
+            }
+            asm.li(REG_T0, ZERO_PAGE_END_ADDR.0 + 1);
+            asm.lw(REG_T1, REG_T0, 0);
+        }),
+        "Trap cannot be proven",
+    );
+}
+
+fn sha2_ecall(asm: &mut Assembler, state_in: u32) {
+    let base = ZERO_PAGE_END_ADDR.0 + 0x1000;
+    asm.li(REG_A7, HOST_ECALL_SHA2);
+    asm.li(REG_A0, state_in);
+    asm.li(REG_A1, base + 0x100);
+    asm.li(REG_A2, base + 0x200);
+    asm.li(REG_A3, 0);
+    asm.li(REG_A4, base + 0x300);
+    asm.ecall();
+}
+
+/// The circuit divides a sha2 pointer by four as a field element: a misaligned one is refused.
+#[test]
+fn a_misaligned_sha2_pointer_is_refused() {
+    let base = ZERO_PAGE_END_ADDR.0 + 0x1000;
+    run_kernel(|asm| sha2_ecall(asm, base)).unwrap();
+    assert_refused(
+        run_kernel(|asm| sha2_ecall(asm, base + 1)),
+        "Misaligned pointer in sha2 ecall",
+    );
+}
+
+/// The prover's preflight replays no host write correctly: refused, after the host has it.
+#[test]
+fn a_host_write_is_refused() {
+    assert_refused(
+        run_kernel(|asm| {
+            asm.li(REG_A7, HOST_ECALL_WRITE);
+            asm.li(REG_A0, 2);
+            asm.li(REG_A1, ZERO_PAGE_END_ADDR.0 + 0x1000);
+            asm.li(REG_A2, 4);
+            asm.ecall();
+        }),
+        "Host write (fd 2, 4 bytes) cannot be proven",
+    );
 }

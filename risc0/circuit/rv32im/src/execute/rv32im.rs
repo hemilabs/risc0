@@ -86,12 +86,6 @@ pub enum Exception {
     UserEnvCall(ByteAddr),
 }
 
-impl Exception {
-    pub fn as_u32(&self) -> u32 {
-        unsafe { *(self as *const Self as *const u32) }
-    }
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct DecodedInstruction {
     pub insn: u32,
@@ -279,10 +273,16 @@ impl Emulator {
             // J-format jal
             (0b1101111, _, _) => self.step_compute(ctx, InsnKind::Jal, decoded),
             // I-format jalr
-            (0b1100111, _, _) => self.step_compute(ctx, InsnKind::JalR, decoded),
+            // (The circuit decodes jalr with func3 0, mret and ecall/ebreak only as their exact
+            // words: any other encoding the guest could run and no proof of it could verify.)
+            (0b1100111, 0b000, _) => self.step_compute(ctx, InsnKind::JalR, decoded),
             // System instruction
-            (0b1110011, 0b000, 0b0011000) => self.step_system(ctx, InsnKind::Mret, decoded),
-            (0b1110011, 0b000, 0b0000000) => self.step_system(ctx, InsnKind::Eany, decoded),
+            (0b1110011, 0b000, 0b0011000) if decoded.insn == 0x3020_0073 => {
+                self.step_system(ctx, InsnKind::Mret, decoded)
+            }
+            (0b1110011, 0b000, 0b0000000) if decoded.rs1 == 0 && decoded.rd == 0 => {
+                self.step_system(ctx, InsnKind::Eany, decoded)
+            }
             _ => Ok(ctx
                 .trap(Exception::IllegalInstruction(decoded.insn, line!()))?
                 .then_some(InsnKind::Invalid)),

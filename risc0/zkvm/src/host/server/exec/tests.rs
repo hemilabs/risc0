@@ -170,24 +170,36 @@ fn libm_build() {
     multi_test(MultiTestSpec::LibM);
 }
 
+/// A guest's `sys_poseidon2` with pointers is refused at execution: the 3.0 circuit reads them as byte
+/// addresses where the guest ABI passes word addresses, and the prover's preflight refuses the call.
+fn poseidon2_refused(spec: MultiTestSpec) {
+    let Err(err) = multi_test_raw(spec) else {
+        panic!("a sys_poseidon2 with pointers executed");
+    };
+    assert!(
+        format!("{err:#}").contains("sys_poseidon2 cannot be proven"),
+        "{err:#}"
+    );
+}
+
 #[test_log::test]
 fn poseidon2_basic() {
-    multi_test(MultiTestSpec::Poseidon2Basic);
+    poseidon2_refused(MultiTestSpec::Poseidon2Basic);
 }
 
 #[test_log::test]
 fn poseidon2_continue() {
-    multi_test(MultiTestSpec::Poseidon2Continue);
+    poseidon2_refused(MultiTestSpec::Poseidon2Continue);
 }
 
 #[test_log::test]
 fn poseidon2_short() {
-    multi_test(MultiTestSpec::Poseidon2Short);
+    poseidon2_refused(MultiTestSpec::Poseidon2Short);
 }
 
 #[test_log::test]
 fn poseidon2_long() {
-    multi_test(MultiTestSpec::Poseidon2Long);
+    poseidon2_refused(MultiTestSpec::Poseidon2Long);
 }
 
 #[test_log::test]
