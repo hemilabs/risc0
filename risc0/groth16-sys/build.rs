@@ -42,11 +42,20 @@ fn build_intel_kernels() {
     // and keccak are), with SPIR-V for any other GPU. Built as SPIR-V alone, the driver compiled the
     // prover on the card at its first Groth16 proof (about 2 minutes on an Arc B580). The options are
     // those that compile used, so the code is the same, only built earlier.
-    let args: Vec<std::ffi::OsString> = ["-fsycl", "-std=c++17", "-O3", "-Ikernels/intel"]
+    let targets = risc0_build_kernel::intel_sycl_targets_arg();
+    let mut args: Vec<std::ffi::OsString> = ["-fsycl", "-std=c++17", "-O3", "-Ikernels/intel"]
         .iter()
         .map(Into::into)
-        .chain([risc0_build_kernel::intel_sycl_targets_arg().into()])
+        .chain([targets.clone().into()])
         .collect();
+    // The Arc A770 (acm_g10) image needs 256 GRF asked for at the module level: without it, ocloc
+    // compiles the G2 bucket sums (msm_sorted<Fp2>) SIMD16 with 30 KB of private memory per work
+    // item and they take 19 s per proof instead of 1 s (the driver's own compile of the SPIR-V,
+    // and this option, give SIMD8 with 11 KB). Other targets are left as they were.
+    if targets.contains("intel_gpu_acm_g10") {
+        args.push("-Xsycl-target-backend=intel_gpu_acm_g10".into());
+        args.push("-options -cl-intel-256-GRF-per-thread".into());
+    }
     let output = risc0_build_kernel::intel_build_library(
         &icpx,
         &args,

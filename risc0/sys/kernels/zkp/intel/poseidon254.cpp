@@ -51,15 +51,50 @@ static void ensure_poseidon254_device_constants(sycl::queue& q) {
 // Kernel launchers
 // ============================================================================
 
-static void poseidon254_fold_impl(sycl::queue& q, uint32_t* d_out,
-                                   const uint32_t* d_in, uint32_t count) {
-    if (count == 0) return;
-    ensure_poseidon254_device_constants(q);
-    uint32_t num_threads = (count + 15) / 16;
+// GRF per thread for the kernels below. On Alchemist (Arc A-series, Xe-HPG) they get 256: with 128
+// the driver's compile spills (3 KB per thread for the rows kernel), and spills go to the scratch
+// space the driver shares between all of the context's kernels and sizes for the largest. After
+// a kernel with a 32 KB spill (the recursion eval_check from IGC 2.28) has run, the rows kernel's
+// spill lands at a 32 KB per-thread stride and identity_p254 took 17 s instead of 2.5 on an A770;
+// with 256 GRF there is no spill, and the kernel is also 2.5x faster on its own there. Battlemage
+// keeps 128 (not measured there with 256).
+static bool p254_large_grf(sycl::queue& q) {
+    namespace syclex = sycl::ext::oneapi::experimental;
+    static const bool large = [&] {
+        try {
+            auto arch = q.get_device().get_info<syclex::info::device::architecture>();
+            return arch == syclex::architecture::intel_gpu_acm_g10 ||
+                   arch == syclex::architecture::intel_gpu_acm_g11 ||
+                   arch == syclex::architecture::intel_gpu_acm_g12;
+        } catch (...) {
+            return false;
+        }
+    }();
+    return large;
+}
+
+// Threads for n outputs, 16 per thread, in a multiple of 16 threads: from 1024 threads on, SYCL
+// otherwise launches the range-rounding wrapper kernel, which the driver fails to build for these
+// kernels (UR_RESULT_ERROR_PROGRAM_LINK_FAILURE, "Internal linker error", after 105 s on an Arc
+// B580). The extra threads return at the kernels' bounds checks. Power-of-two sizes from 256 up
+// are already a multiple.
+static uint32_t p254_threads(uint32_t n) {
+    return ((n + 15) / 16 + 15) / 16 * 16;
+}
+
+// Each kernel is an unnamed lambda in a launcher templated on the GRF size, which gives each size a
+// kernel of its own. Named kernels would cost a card's first proof: the compiler puts a named
+// kernel and SYCL's range-rounding wrapper of it into one device image, and the driver compiles
+// the whole image on the card, so an Arc B580 took 179 s for it instead of 67. An unnamed kernel's
+// wrapper gets an image of its own, which the driver compiles only if the wrapper is launched.
+template <int GRF>
+static void poseidon254_fold_launch(sycl::queue& q, uint32_t* d_out,
+                                    const uint32_t* d_in, uint32_t count) {
+    uint32_t num_threads = p254_threads(count);
     const uint32_t* pc = g_d_p254_sparse;
 
     q.parallel_for(sycl::range<1>(num_threads),
-        syclex_oneapi_p254::properties{syclex_p254::grf_size<128>},
+        syclex_oneapi_p254::properties{syclex_p254::grf_size<GRF>},
         [=](sycl::id<1> idx) [[intel::sycl_explicit_simd]] {
             using namespace p254o;
             uint32_t base = idx[0] * 16;
@@ -97,16 +132,25 @@ static void poseidon254_fold_impl(sycl::queue& q, uint32_t* d_out,
         }).wait();
 }
 
-static void poseidon254_rows_impl(sycl::queue& q, uint32_t* d_out,
-                                   const uint32_t* d_matrix,
-                                   uint32_t row_size, uint32_t col_size) {
-    if (row_size == 0) return;
+static void poseidon254_fold_impl(sycl::queue& q, uint32_t* d_out,
+                                   const uint32_t* d_in, uint32_t count) {
+    if (count == 0) return;
     ensure_poseidon254_device_constants(q);
-    uint32_t num_threads = (row_size + 15) / 16;
+    if (p254_large_grf(q))
+        poseidon254_fold_launch<256>(q, d_out, d_in, count);
+    else
+        poseidon254_fold_launch<128>(q, d_out, d_in, count);
+}
+
+template <int GRF>
+static void poseidon254_rows_launch(sycl::queue& q, uint32_t* d_out,
+                                    const uint32_t* d_matrix,
+                                    uint32_t row_size, uint32_t col_size) {
+    uint32_t num_threads = p254_threads(row_size);
     const uint32_t* pc = g_d_p254_sparse;
 
     q.parallel_for(sycl::range<1>(num_threads),
-        syclex_oneapi_p254::properties{syclex_p254::grf_size<128>},
+        syclex_oneapi_p254::properties{syclex_p254::grf_size<GRF>},
         [=](sycl::id<1> idx) [[intel::sycl_explicit_simd]] {
             uint32_t base = idx[0] * 16;
             if (base >= row_size) return;
@@ -162,6 +206,17 @@ static void poseidon254_rows_impl(sycl::queue& q, uint32_t* d_out,
                 esimd::scatter<uint32_t, 16>(d_out, (out_base + j) * 4u, r.v[j], live);
             }
         }).wait();
+}
+
+static void poseidon254_rows_impl(sycl::queue& q, uint32_t* d_out,
+                                   const uint32_t* d_matrix,
+                                   uint32_t row_size, uint32_t col_size) {
+    if (row_size == 0) return;
+    ensure_poseidon254_device_constants(q);
+    if (p254_large_grf(q))
+        poseidon254_rows_launch<256>(q, d_out, d_matrix, row_size, col_size);
+    else
+        poseidon254_rows_launch<128>(q, d_out, d_matrix, row_size, col_size);
 }
 
 // ============================================================================
