@@ -22,7 +22,10 @@ pub mod dual;
 pub mod hip;
 #[cfg(feature = "intel")]
 pub mod intel;
-#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), target_os = "ios"))]
+#[cfg(all(
+    feature = "metal",
+    any(all(target_os = "macos", target_arch = "aarch64"), target_os = "ios")
+))]
 pub mod metal;
 
 use std::{
@@ -73,6 +76,14 @@ pub struct GatherJob<'a, H: Hal> {
 }
 
 pub trait Hal {
+    /// Delimit dispatches that do not require an intervening CPU read.
+    /// Backends without command batching execute the closure directly.
+    fn with_gpu_stage<R>(&self, _label: &'static str, f: impl FnOnce() -> R) -> R
+    where
+        Self: Sized,
+    {
+        f()
+    }
     type Field: Field<Elem = Self::Elem, ExtElem = Self::ExtElem>;
     type Elem: Elem + RootsOfUnity;
     type ExtElem: ExtElem<SubElem = Self::Elem>;
@@ -263,6 +274,18 @@ pub trait Hal {
         }
     }
 
+    /// Hash rows and all Merkle levels before the caller reads the root.
+    fn hash_tree(
+        &self,
+        nodes: &Self::Buffer<Digest>,
+        matrix: &Self::Buffer<Self::Elem>,
+        rows: usize,
+        layers: usize,
+    ) {
+        self.hash_rows(&nodes.slice(rows, rows), matrix);
+        self.hash_fold_tree(nodes, layers);
+    }
+
     fn gather_sample(
         &self,
         dst: &Self::Buffer<Self::Elem>,
@@ -299,7 +322,10 @@ pub trait Hal {
     /// `matrix[row + i * row_size]` (query-major, as `gather_samples`) and the digests at
     /// `node_indices` (as `batch_get_digest_at`).
     #[allow(clippy::type_complexity)]
-    fn gather_multi(&self, _jobs: &[GatherJob<'_, Self>]) -> Option<Vec<(Vec<Self::Elem>, Vec<Digest>)>>
+    fn gather_multi(
+        &self,
+        _jobs: &[GatherJob<'_, Self>],
+    ) -> Option<Vec<(Vec<Self::Elem>, Vec<Digest>)>>
     where
         Self: Sized,
     {

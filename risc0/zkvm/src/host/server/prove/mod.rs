@@ -16,7 +16,7 @@
 
 pub(crate) mod dev_mode;
 pub(crate) mod keccak;
-mod prover_impl;
+pub(crate) mod prover_impl;
 #[cfg(test)]
 mod tests;
 pub(crate) mod union_peak;
@@ -25,7 +25,7 @@ use std::rc::Rc;
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use risc0_core::field::baby_bear::{BabyBear, Elem, ExtElem};
-use risc0_groth16::prove::shrink_wrap_with;
+use risc0_groth16::prove::{shrink_wrap_with_startup, PrestartedProver};
 use risc0_zkp::hal::{CircuitHal, Hal};
 
 use self::{dev_mode::DevModeProver, prover_impl::ProverImpl};
@@ -216,10 +216,25 @@ pub trait ProverServer: private::Sealed {
     ) -> Result<Groth16Receipt<ReceiptClaim>> {
         let t0 = std::time::Instant::now();
         // Let the Groth16 prover load its proving key while identity_p254 runs.
-        if let Err(e) = risc0_groth16::prove::prestart_prover() {
+        let startup = risc0_groth16::prove::prestart_prover().unwrap_or_else(|e| {
             tracing::warn!("groth16 prover prestart failed (non-fatal): {e}");
+            PrestartedProver::default()
+        });
+        let verbose = std::env::var_os("RISC0_VERBOSE").is_some();
+        let identity_started = verbose.then(std::time::Instant::now);
+        if verbose {
+            eprintln!(
+                "[identity_profile] begin prestart_ms={:.3}",
+                t0.elapsed().as_secs_f64() * 1000.0
+            );
         }
         let ident_receipt = self.identity_p254(receipt).unwrap();
+        if let Some(identity_started) = identity_started {
+            eprintln!(
+                "[identity_profile] end identity_prove_ms={:.3}",
+                identity_started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         let ident_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         let t1 = std::time::Instant::now();
@@ -231,7 +246,7 @@ pub trait ProverServer: private::Sealed {
         #[cfg(any(feature = "rocm", feature = "intel"))]
         prover_impl::release_cached_provers();
         let t2 = std::time::Instant::now();
-        let seal = shrink_wrap_with(&seal_bytes, release_hal_buffers)?.to_vec();
+        let seal = shrink_wrap_with_startup(&seal_bytes, startup, release_hal_buffers)?.to_vec();
         release_hal_buffers();
         let wrap_ms = t2.elapsed().as_secs_f64() * 1000.0;
 

@@ -33,14 +33,14 @@ thread_local! {
 }
 
 /// Completes, and discards, whatever segment the cached prover still has pending when dropped.
-struct DrainSegmentProverOnExit;
+struct DrainSegmentProverOnExit<'a>(&'a ProverImpl);
 
-impl Drop for DrainSegmentProverOnExit {
+impl Drop for DrainSegmentProverOnExit<'_> {
     fn drop(&mut self) {
         // An error here means nothing was pending, or the GPU work failed; the slot is idle either
         // way. Not while panicking: the prover's RefCell may be the thing that is borrowed.
         if !std::thread::panicking() {
-            let _ = with_segment_prover(|sp| sp.prove_end());
+            let _ = self.0.with_segment_prover(|sp| sp.prove_end());
         }
     }
 }
@@ -170,6 +170,10 @@ impl ProverImpl {
             risc0_groth16::prove::preload_graph_background();
         }
         Self { opts }
+    }
+
+    fn with_segment_prover<R>(&self, f: impl FnOnce(&dyn SegmentProver) -> Result<R>) -> Result<R> {
+        with_segment_prover(f)
     }
 
     /// Parallel STARK proving: both GPUs prove segments simultaneously, then recursion runs
@@ -551,7 +555,7 @@ impl ProverImpl {
 
         // The segment prover is cached per thread; drop any seal a failed
         // earlier session left in its pipeline.
-        with_segment_prover(|sp| {
+        self.with_segment_prover(|sp| {
             sp.reset_pipeline();
             Ok(())
         })?;
@@ -810,7 +814,7 @@ impl ProverImpl {
         // segment's finalize pending in the CACHED prover, and the next session's first
         // prove_begin would hand that stale seal back as its own previous segment's. Complete it
         // on the way out, so the next session starts with the prover idle.
-        let pipeline_guard = DrainSegmentProverOnExit;
+        let pipeline_guard = DrainSegmentProverOnExit(self);
 
         for (seg_idx, segment_ref) in session.segments.iter().enumerate() {
             let t_seg = std::time::Instant::now();
@@ -937,7 +941,12 @@ impl ProverImpl {
             // complete prev deferred finalize + launch eval_check for this segment.
             // Returns the PREVIOUS segment's seal (None on first call).
             let t_psc = std::time::Instant::now();
-            let prev_seal = with_segment_prover(|sp| sp.prove_begin(results.inner))?;
+            #[cfg(feature = "metal-rv32im")]
+            let prev_seal = risc0_zkp::hal::metal::with_profile_segment(segment_index, || {
+                self.with_segment_prover(|sp| sp.prove_begin(results.inner))
+            })?;
+            #[cfg(not(feature = "metal-rv32im"))]
+            let prev_seal = self.with_segment_prover(|sp| sp.prove_begin(results.inner))?;
             let prove_begin_ms = t_psc.elapsed().as_secs_f64() * 1000.0;
             // Segment 0's GPU work (incl. its eval_check) is queued: release the Groth16 key
             // loader, so its pinned uploads and cold allocations do not compete with
@@ -958,7 +967,7 @@ impl ProverImpl {
                     "segment pipeline: unexpected seal from prove_begin with the early seal"
                 );
                 prev_seal_meta = cur_meta.take();
-                Some(with_segment_prover(|sp| sp.prove_end())?)
+                Some(self.with_segment_prover(|sp| sp.prove_end())?)
             } else {
                 prev_seal
             };
@@ -1066,7 +1075,7 @@ impl ProverImpl {
             }
         } else {
             // Complete the last segment's deferred finalize.
-            let last_seal = with_segment_prover(|sp| sp.prove_end())?;
+            let last_seal = self.with_segment_prover(|sp| sp.prove_end())?;
             let mut last_seal = Some(last_seal);
 
             // Parallel tail verify (without the recursion pipe, whose early seal verifies every
@@ -1405,17 +1414,19 @@ impl ProverImpl {
 
         let groth16_receipt = if let Some(ident_receipt) = pre_ident {
             // identity_p254 already computed by recursion worker (overlapped with STARK).
-            use risc0_groth16::prove::shrink_wrap_with;
-            if let Err(e) = risc0_groth16::prove::prestart_prover() {
+            use risc0_groth16::prove::{shrink_wrap_with_startup, PrestartedProver};
+            let startup = risc0_groth16::prove::prestart_prover().unwrap_or_else(|e| {
                 eprintln!("[groth16] prover prestart failed (non-fatal): {e}");
-            }
+                PrestartedProver::default()
+            });
             let t0 = std::time::Instant::now();
             let seal_bytes = ident_receipt.get_seal_bytes();
             // See `release_hal_buffers`: the wrap cannot reclaim what the STARK HAL is caching.
             // Released while the wrap computes its witness on another thread.
             #[cfg(any(feature = "rocm", feature = "intel"))]
             release_cached_provers();
-            let seal = shrink_wrap_with(&seal_bytes, super::release_hal_buffers)?.to_vec();
+            let seal = shrink_wrap_with_startup(&seal_bytes, startup, super::release_hal_buffers)?
+                .to_vec();
             super::release_hal_buffers();
             let wrap_ms = t0.elapsed().as_secs_f64() * 1000.0;
             eprintln!(
@@ -1530,7 +1541,7 @@ impl ProverServer for ProverImpl {
             segment.po2(),
             self.opts.max_segment_po2
         );
-        let inner = with_segment_prover(|sp| sp.preflight(&segment.inner))?;
+        let inner = self.with_segment_prover(|sp| sp.preflight(&segment.inner))?;
 
         Ok(PreflightResults {
             inner,
@@ -1557,7 +1568,13 @@ impl ProverServer for ProverImpl {
         let po2 = preflight_results.inner.po2();
         release_pool_on_po2_growth(po2);
         let t_psc = std::time::Instant::now();
-        let seal = with_segment_prover(|sp| sp.prove_core(preflight_results.inner))?;
+        #[cfg(feature = "metal-rv32im")]
+        let seal =
+            risc0_zkp::hal::metal::with_profile_segment(preflight_results.segment_index, || {
+                self.with_segment_prover(|sp| sp.prove_core(preflight_results.inner))
+            })?;
+        #[cfg(not(feature = "metal-rv32im"))]
+        let seal = self.with_segment_prover(|sp| sp.prove_core(preflight_results.inner))?;
         if *VERBOSE {
             eprintln!(
                 "[prove_segment_core] prove_core: {:.1}ms",

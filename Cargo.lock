@@ -7024,6 +7024,7 @@ dependencies = [
  "metal",
  "rand 0.9.2",
  "rayon",
+ "risc0-build-kernel",
  "risc0-circuit-recursion-sys",
  "risc0-core",
  "risc0-sys",
@@ -7066,6 +7067,7 @@ dependencies = [
  "gdbstub",
  "gdbstub_arch",
  "malachite",
+ "metal",
  "num-derive",
  "num-traits",
  "parking_lot",
@@ -8138,6 +8140,16 @@ dependencies = [
  "cfg-if",
  "cpufeatures",
  "digest 0.10.7",
+ "sha2-asm",
+]
+
+[[package]]
+name = "sha2-asm"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b845214d6175804686b2bd482bcffe96651bb2d1200742b712003504a2dac1ab"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

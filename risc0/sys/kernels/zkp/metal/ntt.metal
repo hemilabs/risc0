@@ -17,9 +17,6 @@
 
 using namespace metal;
 
-// Find the first bit that is set.
-inline uint32_t accel_ffs(uint32_t x) { return 32 - clz(x & -x); }
-
 kernel void multi_bit_reverse(device Fp* io,
                               const device uint32_t& nBits,
                               uint gid [[thread_position_in_grid]]) {
@@ -90,7 +87,7 @@ kernel void gather_sample(device Fp* dst,
 }
 
 kernel void multi_ntt_fwd_step(device Fp* io,
-                               const device Fp* rou,
+                               const device Fp* twiddles,
                                const device uint32_t& nBits,
                                const device uint32_t& sBits,
                                const device uint32_t& cSize,
@@ -108,21 +105,9 @@ kernel void multi_ntt_fwd_step(device Fp* io,
   uint32_t cOff = threadIdx.z + blockIdx.z * blockDim.z;
   uint32_t cStep = blockDim.z * gridDim.z;
 
-  // Compute the initial multiplier for the sOff: pow(rou[s], sOff)
-  Fp curMul(1);
-  uint32_t curRou = sBits;
-  uint32_t powX = sOff;
-  while (curRou > 0) {
-    if (powX & 1) {
-      curMul = curMul * rou[curRou];
-    }
-    powX >>= 1;
-    curRou--;
-  }
-  // Compute the multiplier for each loop around s
-  int rouStep = accel_ffs(sSize / sStep);
-  Fp stepMul = rou[rouStep];
+  const device Fp* stage = twiddles + sSize - 1;
   for (uint32_t s = sOff; s < sSize; s += sStep) {
+    Fp curMul = stage[s];
     for (uint32_t g = gOff; g < gSize; g += gStep) {
       for (uint32_t c = cOff; c < cSize; c += cStep) {
         Fp a = io[c * nSize + g * 2 * sSize + s];
@@ -132,12 +117,11 @@ kernel void multi_ntt_fwd_step(device Fp* io,
         io[c * nSize + g * 2 * sSize + s + sSize] = a - b;
       }
     }
-    curMul *= stepMul;
   }
 }
 
 kernel void multi_ntt_rev_step(device Fp* io,
-                               const device Fp* rou,
+                               const device Fp* twiddles,
                                const device uint32_t& nBits,
                                const device uint32_t& sBits,
                                const device uint32_t& cSize,
@@ -155,21 +139,9 @@ kernel void multi_ntt_rev_step(device Fp* io,
   uint32_t cOff = threadIdx.z + blockIdx.z * blockDim.z;
   uint32_t cStep = blockDim.z * gridDim.z;
 
-  // Compute the initial multiplier for the sOff: pow(rou[s], sOff)
-  Fp curMul(1);
-  uint32_t curRou = sBits;
-  uint32_t powX = sOff;
-  while (curRou > 0) {
-    if (powX & 1) {
-      curMul = curMul * rou[curRou];
-    }
-    powX >>= 1;
-    curRou--;
-  }
-  // Compute the multiplier for each loop around s
-  int rouStep = accel_ffs(sSize / sStep);
-  Fp stepMul = rou[rouStep];
+  const device Fp* stage = twiddles + sSize - 1;
   for (uint32_t s = sOff; s < sSize; s += sStep) {
+    Fp curMul = stage[s];
     for (uint32_t g = gOff; g < gSize; g += gStep) {
       for (uint32_t c = cOff; c < cSize; c += cStep) {
         Fp a = io[c * nSize + g * 2 * sSize + s];
@@ -178,6 +150,155 @@ kernel void multi_ntt_rev_step(device Fp* io,
         io[c * nSize + g * 2 * sSize + s + sSize] = (a - b) * curMul;
       }
     }
-    curMul *= stepMul;
   }
+}
+
+// Two adjacent DIT stages form a radix-4 butterfly in registers. One thread
+// owns each quadruple, so only one threadgroup barrier is needed per pair.
+inline void ntt_fwd_radix4(threadgroup Fp* tile,
+                           const device Fp* twiddles,
+                           uint32_t bits,
+                           uint32_t lane) {
+  uint32_t quarter = 1u << (bits - 1);
+  const device Fp* first = twiddles + quarter - 1;
+  const device Fp* second = twiddles + 2 * quarter - 1;
+  for (uint32_t j = lane; j < 1024; j += 256) {
+    uint32_t s = j & (quarter - 1);
+    uint32_t idx = (j / quarter) * 4 * quarter + s;
+    Fp a0 = tile[idx], a1 = tile[idx + quarter];
+    Fp a2 = tile[idx + 2 * quarter], a3 = tile[idx + 3 * quarter];
+    Fp w0 = first[s], w1 = second[s], w2 = second[s + quarter];
+    Fp t0 = a1 * w0, t1 = a3 * w0;
+    Fp u0 = a0 + t0, v0 = a0 - t0;
+    Fp u1 = a2 + t1, v1 = a2 - t1;
+    Fp p0 = u1 * w1, p1 = v1 * w2;
+    tile[idx] = u0 + p0;
+    tile[idx + quarter] = v0 + p1;
+    tile[idx + 2 * quarter] = u0 - p0;
+    tile[idx + 3 * quarter] = v0 - p1;
+  }
+}
+
+inline void ntt_rev_radix4(threadgroup Fp* tile,
+                           const device Fp* twiddles,
+                           uint32_t bits,
+                           uint32_t lane) {
+  uint32_t quarter = 1u << (bits - 2);
+  const device Fp* first = twiddles + 2 * quarter - 1;
+  const device Fp* second = twiddles + quarter - 1;
+  for (uint32_t j = lane; j < 1024; j += 256) {
+    uint32_t s = j & (quarter - 1);
+    uint32_t idx = (j / quarter) * 4 * quarter + s;
+    Fp a0 = tile[idx], a1 = tile[idx + quarter];
+    Fp a2 = tile[idx + 2 * quarter], a3 = tile[idx + 3 * quarter];
+    Fp w0 = first[s], w1 = first[s + quarter], w2 = second[s];
+    Fp u0 = a0 + a2, u1 = a1 + a3;
+    Fp v0 = (a0 - a2) * w0, v1 = (a1 - a3) * w1;
+    tile[idx] = u0 + u1;
+    tile[idx + quarter] = (u0 - u1) * w2;
+    tile[idx + 2 * quarter] = v0 + v1;
+    tile[idx + 3 * quarter] = (v0 - v1) * w2;
+  }
+}
+
+// Keep the low twelve stages in a 16 KiB threadgroup tile. Only the first
+// load and final store touch device memory.
+kernel void multi_ntt_fwd_tile(device Fp* io,
+                               const device Fp* twiddles,
+                               const device uint32_t& nBits,
+                               const device uint32_t& firstBits,
+                               uint2 group [[threadgroup_position_in_grid]],
+                               uint lane [[thread_index_in_threadgroup]]) {
+  threadgroup uint32_t words[4096];
+  threadgroup Fp* tile = reinterpret_cast<threadgroup Fp*>(words);
+  uint32_t base = group.y * (1u << nBits) + group.x * 4096;
+  for (uint32_t i = lane; i < 4096; i += 256) tile[i] = io[base + i];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  uint32_t bits = firstBits;
+  for (; bits + 1 <= 12; bits += 2) {
+    ntt_fwd_radix4(tile, twiddles, bits, lane);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  if (bits == 12) {
+    uint32_t span = 1u << (bits - 1);
+    const device Fp* stage = twiddles + span - 1;
+    for (uint32_t i = lane; i < 4096; i += 256) {
+      if ((i & span) == 0) {
+        Fp a = tile[i];
+        Fp b = tile[i + span];
+        Fp twiddle = stage[i & (span - 1)];
+        b *= twiddle;
+        tile[i] = a + b;
+        tile[i + span] = a - b;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  for (uint32_t i = lane; i < 4096; i += 256) io[base + i] = tile[i];
+}
+
+kernel void multi_ntt_rev_tile(device Fp* io,
+                               const device Fp* twiddles,
+                               const device uint32_t& nBits,
+                               uint2 group [[threadgroup_position_in_grid]],
+                               uint lane [[thread_index_in_threadgroup]]) {
+  threadgroup uint32_t words[4096];
+  threadgroup Fp* tile = reinterpret_cast<threadgroup Fp*>(words);
+  uint32_t base = group.y * (1u << nBits) + group.x * 4096;
+  for (uint32_t i = lane; i < 4096; i += 256) tile[i] = io[base + i];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint32_t bits = 12; bits >= 2; bits -= 2) {
+    ntt_rev_radix4(tile, twiddles, bits, lane);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  for (uint32_t i = lane; i < 4096; i += 256) io[base + i] = tile[i];
+}
+
+// Final inverse pass for a commit. Read the scratch evaluations, finish the
+// low stages in threadgroup memory, then normalize, zk-shift and write the
+// coefficients in natural order. The bit reversal is in this final store.
+kernel void multi_ntt_rev_tile_commit(device Fp* coeffs,
+                                      const device Fp* scratch,
+                                      const device Fp* twiddles,
+                                      const device Fp* scales,
+                                      const device uint32_t& nBits,
+                                      uint2 group [[threadgroup_position_in_grid]],
+                                      uint lane [[thread_index_in_threadgroup]]) {
+  threadgroup uint32_t words[4096];
+  threadgroup Fp* tile = reinterpret_cast<threadgroup Fp*>(words);
+  uint32_t row_base = group.x * 4096;
+  uint32_t column_base = group.y * (1u << nBits);
+  for (uint32_t i = lane; i < 4096; i += 256) {
+    tile[i] = scratch[column_base + row_base + i];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint32_t bits = 12; bits >= 2; bits -= 2) {
+    ntt_rev_radix4(tile, twiddles, bits, lane);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  for (uint32_t i = lane; i < 4096; i += 256) {
+    uint32_t natural = reverse_bits(row_base + i) >> (32 - nBits);
+    Fp value = tile[i];
+    Fp scale = scales[natural];
+    coeffs[column_base + natural] = value * scale;
+  }
+}
+
+// The fused inverse writes natural coefficients; the LDE DIT needs their
+// bit-reversed order, expanded by the blowup factor. Each thread reads one
+// coefficient and writes its adjacent copies, across all columns in one grid.
+kernel void batch_expand_bitrev(device Fp* out,
+                                const device Fp* coeffs,
+                                const device uint32_t& inBits,
+                                const device uint32_t& expandBits,
+                                uint2 group [[threadgroup_position_in_grid]],
+                                uint lane [[thread_index_in_threadgroup]]) {
+  uint32_t row = group.x * 256 + lane;
+  uint32_t inSize = 1u << inBits;
+  if (row >= inSize) return;
+  uint32_t outSize = inSize << expandBits;
+  uint32_t natural = reverse_bits(row) >> (32 - inBits);
+  Fp value = coeffs[group.y * inSize + natural];
+  uint32_t base = group.y * outSize + (row << expandBits);
+  for (uint32_t j = 0; j < (1u << expandBits); j++) out[base + j] = value;
 }

@@ -18,7 +18,7 @@
 mod component;
 #[cfg(feature = "cuda")]
 mod cuda;
-#[cfg(not(any(feature = "cuda", feature = "rocm")))]
+#[cfg(not(any(feature = "cuda", feature = "rocm", feature = "native-groth16")))]
 mod docker;
 #[cfg(all(feature = "intel", not(any(feature = "cuda", feature = "rocm"))))]
 mod fast;
@@ -26,8 +26,12 @@ mod fast;
 mod hip;
 #[cfg(all(feature = "intel", not(any(feature = "cuda", feature = "rocm"))))]
 mod intel;
+#[cfg(feature = "native-groth16")]
+pub mod native;
 mod seal_format;
 mod seal_to_json;
+#[cfg(feature = "native-groth16")]
+mod witness;
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 mod witness_fast;
 #[cfg(feature = "cuda")]
@@ -48,6 +52,8 @@ pub fn preload_graph() -> Result<()> {
             self::cuda::preload_graph()
         } else if #[cfg(feature = "rocm")] {
             self::hip::preload_graph()
+        } else if #[cfg(feature = "native-groth16")] {
+            self::native::preload()
         } else if #[cfg(feature = "intel")] {
             self::fast::preload()
         } else {
@@ -67,15 +73,24 @@ pub fn preload_graph_background() {
     }
 }
 
+/// Keeps a native helper owned across identity_p254 and reaps it on early exit.
+#[derive(Default)]
+pub struct PrestartedProver {
+    #[cfg(feature = "native-groth16")]
+    native: Option<native::Prestarted>,
+}
+
 /// Start the Groth16 prover ahead of [shrink_wrap] so that it loads its
-/// proving key while the caller finishes `identity_p254` (intel builds with
-/// the rzup `risc0-groth16` component installed; otherwise a no-op).
-pub fn prestart_prover() -> Result<()> {
+/// proving key while the caller finishes `identity_p254`.
+pub fn prestart_prover() -> Result<PrestartedProver> {
     cfg_if::cfg_if! {
-        if #[cfg(all(feature = "intel", not(any(feature = "cuda", feature = "rocm"))))] {
+        if #[cfg(feature = "native-groth16")] {
+            Ok(PrestartedProver { native: Some(self::native::prestart()?) })
+        } else if #[cfg(all(feature = "intel", not(any(feature = "cuda", feature = "rocm"))))] {
             if self::intel::enabled() {
                 // Uploads the proving key to the GPU in the background.
-                return self::intel::prestart();
+                self::intel::prestart()?;
+                return Ok(PrestartedProver::default());
             }
             // Only check that the graph exists here: building the witness
             // program (~1 s) stays on the preload thread, off this path.
@@ -84,9 +99,9 @@ pub fn prestart_prover() -> Result<()> {
             {
                 self::fast::prestart()?;
             }
-            Ok(())
+            Ok(PrestartedProver::default())
         } else {
-            Ok(())
+            Ok(PrestartedProver::default())
         }
     }
 }
@@ -178,6 +193,24 @@ pub fn shrink_wrap_with(identity_p254_seal_bytes: &[u8], pre_gpu: impl FnOnce())
     }
 }
 
+/// Consume a prestarted prover after identity_p254. Dropping the handle on an
+/// error or cancellation kills the native helper before the temporary work is removed.
+pub fn shrink_wrap_with_startup(
+    identity_p254_seal_bytes: &[u8],
+    startup: PrestartedProver,
+    pre_gpu: impl FnOnce(),
+) -> Result<Seal> {
+    cfg_if::cfg_if! {
+        if #[cfg(feature = "native-groth16")] {
+            pre_gpu();
+            self::native::shrink_wrap_started(identity_p254_seal_bytes, startup.native)
+        } else {
+            drop(startup);
+            shrink_wrap_with(identity_p254_seal_bytes, pre_gpu)
+        }
+    }
+}
+
 /// Produce a Groth16 proof from an `identity_p254` seal.
 pub fn shrink_wrap(identity_p254_seal_bytes: &[u8]) -> Result<Seal> {
     cfg_if::cfg_if! {
@@ -185,6 +218,8 @@ pub fn shrink_wrap(identity_p254_seal_bytes: &[u8]) -> Result<Seal> {
             self::cuda::shrink_wrap(identity_p254_seal_bytes)
         } else if #[cfg(feature = "rocm")] {
             self::hip::shrink_wrap(identity_p254_seal_bytes)
+        } else if #[cfg(feature = "native-groth16")] {
+            self::native::shrink_wrap(identity_p254_seal_bytes)
         } else if #[cfg(feature = "intel")] {
             if self::intel::enabled() {
                 self::intel::shrink_wrap(identity_p254_seal_bytes)

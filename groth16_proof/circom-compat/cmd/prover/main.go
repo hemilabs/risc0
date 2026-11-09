@@ -15,13 +15,37 @@ import (
 	"github.com/consensys/gnark/constraint"
 	bn254r1cs "github.com/consensys/gnark/constraint/bn254"
 	"github.com/consensys/gnark/logger"
+	"io"
 	"os"
 	"path"
+	"runtime/debug"
 	"time"
 )
 
+// Native callers opt in; existing container invocations retain their behavior.
+var nativeParent = flag.Int("native-parent", 0, "exit if this parent PID disappears")
+var nativeTimeout = flag.Duration("native-timeout", 0, "maximum native helper lifetime")
+var nativeNoGCSetup = flag.Bool("native-no-gc-setup", false, "defer Go GC until the witness is loaded")
+
 func main() {
 	flag.Parse()
+	if *nativeTimeout > 0 {
+		time.AfterFunc(*nativeTimeout, func() { os.Exit(124) })
+	}
+	if *nativeParent > 0 {
+		if os.Getppid() != *nativeParent {
+			os.Exit(125)
+		}
+		go func() {
+			ticker := time.NewTicker(100 * time.Millisecond)
+			defer ticker.Stop()
+			for range ticker.C {
+				if os.Getppid() != *nativeParent {
+					os.Exit(125)
+				}
+			}
+		}()
+	}
 	if flag.NArg() < 4 {
 		help()
 	}
@@ -41,6 +65,10 @@ func help() {
 }
 
 func run() error {
+	var oldGCPercent int
+	if *nativeNoGCSetup {
+		oldGCPercent = debug.SetGCPercent(-1)
+	}
 	r1cs, err := loadCS(flag.Arg(0))
 	if err != nil {
 		return fmt.Errorf("failed to load constraint system: %w", err)
@@ -50,10 +78,12 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("failed to load proving key: %w", err)
 	}
-
 	fullWitness, err := loadWitness(flag.Arg(2), r1cs)
 	if err != nil {
 		return fmt.Errorf("failed to load witness: %w", err)
+	}
+	if *nativeNoGCSetup {
+		debug.SetGCPercent(oldGCPercent)
 	}
 
 	proof, err := groth16.Prove(r1cs, pk, fullWitness)
@@ -162,9 +192,15 @@ func loadWitness(name string, cs constraint.ConstraintSystem) (witness.Witness, 
 	log := logger.Logger()
 	start := time.Now()
 
-	file, err := utils.OpenBufferedFile(name)
-	if err != nil {
-		return nil, err
+	var file io.ReadCloser
+	var err error
+	if name == "-" {
+		file = io.NopCloser(os.Stdin)
+	} else {
+		file, err = utils.OpenBufferedFile(name)
+		if err != nil {
+			return nil, err
+		}
 	}
 	defer func() {
 		if err := file.Close(); err != nil {
@@ -173,7 +209,11 @@ func loadWitness(name string, cs constraint.ConstraintSystem) (witness.Witness, 
 	}()
 
 	var w witness.Witness
-	switch path.Ext(name) {
+	ext := path.Ext(name)
+	if name == "-" {
+		ext = ".wtns"
+	}
+	switch ext {
 	case ".wtns":
 		w, err = circom.ReadWTNS(file, cs)
 		if err != nil {
