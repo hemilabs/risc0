@@ -77,6 +77,10 @@ pub fn metal_release() -> Result<()> {
 }
 
 #[cfg(test)]
+#[path = "tests.rs"]
+mod bn254_tests;
+
+#[cfg(test)]
 mod tests {
     use std::path::Path;
 
