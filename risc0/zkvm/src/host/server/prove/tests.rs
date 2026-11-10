@@ -565,7 +565,12 @@ fn sys_input() {
 #[case(ReceiptKind::Groth16, ReceiptKind::Succinct)]
 #[case(ReceiptKind::Groth16, ReceiptKind::Groth16)]
 #[test_log::test]
-#[cfg(any(feature = "cuda", feature = "rocm", feature = "docker"))]
+#[cfg(any(
+    feature = "cuda",
+    feature = "rocm",
+    feature = "metal",
+    feature = "docker"
+))]
 fn compress(#[case] from: ReceiptKind, #[case] into: ReceiptKind) {
     let from_receipt = prove_nothing(from).receipt;
     let opts = ProverOpts::default().with_receipt_kind(into);
@@ -597,7 +602,12 @@ fn compress(#[case] from: ReceiptKind, #[case] into: ReceiptKind) {
 #[case(ReceiptKind::Groth16, ReceiptKind::Succinct)]
 #[case(ReceiptKind::Groth16, ReceiptKind::Groth16)]
 #[test_log::test]
-#[cfg(any(feature = "cuda", feature = "rocm", feature = "docker"))]
+#[cfg(any(
+    feature = "cuda",
+    feature = "rocm",
+    feature = "metal",
+    feature = "docker"
+))]
 fn fake_compress(#[case] from: ReceiptKind, #[case] into: ReceiptKind) {
     use crate::{DevModeProver, FakeReceipt, ProverServer as _};
 
@@ -618,7 +628,7 @@ fn fake_compress(#[case] from: ReceiptKind, #[case] into: ReceiptKind) {
 }
 
 #[test_log::test]
-#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "metal"))]
 fn shrink_wrap() {
     // Perform many proofs in parallel. The initial implementation of the
     // groth16 prover on CUDA had issues with this. Ensure that we got a groth16
@@ -639,7 +649,12 @@ fn shrink_wrap() {
 #[case(ReceiptKind::Succinct)]
 #[case(ReceiptKind::Groth16)]
 #[test_log::test]
-#[cfg(any(feature = "cuda", feature = "rocm", feature = "docker"))]
+#[cfg(any(
+    feature = "cuda",
+    feature = "rocm",
+    feature = "metal",
+    feature = "docker"
+))]
 fn verify_in_guest(#[case] kind: ReceiptKind) {
     use risc0_zkvm_methods::VERIFY_ELF;
 
@@ -1131,5 +1146,176 @@ mod soundness {
 
         let security = soundness::toy_model_security::<CpuHal<BabyBear>>(taps, coeffs_size);
         assert_eq!(security, 97.14198);
+    }
+}
+
+/// Metal orchestration (docs/metal-port/notes/M3.md): a composite proof, the pooled memory
+/// `release_hal_buffers` returns, and the composite -> succinct round trip, with the wall time and
+/// the peak of the device's `currentAllocatedSize` (sampled every 2 ms) of each phase.
+/// `RISC0_M3_PO2` (default 18) and `RISC0_M3_CYCLES` (default 2^19) size the guest.
+#[cfg(feature = "metal")]
+mod metal {
+    use std::{
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            mpsc, Arc,
+        },
+        thread::JoinHandle,
+        time::{Duration, Instant},
+    };
+
+    use risc0_zkp::hal::{metal::MetalHalPoseidon2, Hal as _};
+    use risc0_zkvm_methods::{multi_test::MultiTestSpec, MULTI_TEST_ELF, MULTI_TEST_ID};
+
+    use super::super::{get_prover_server, release_hal_buffers};
+    use crate::{ExecutorEnv, InnerReceipt, ProverOpts};
+
+    /// The device's currentAllocatedSize, from a HAL made on the sampler thread (not under any
+    /// session's GPU lock: `MetalHal::new` takes it). Reading it takes no lock.
+    fn allocated(hal: &MetalHalPoseidon2) -> usize {
+        hal.gpu_total_memory() - hal.gpu_free_memory()
+    }
+
+    struct Sampler {
+        stop: Arc<AtomicBool>,
+        peak: Arc<AtomicUsize>,
+        now: Arc<AtomicUsize>,
+        handle: Option<JoinHandle<()>>,
+    }
+
+    impl Sampler {
+        fn start() -> Self {
+            let stop = Arc::new(AtomicBool::new(false));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let now = Arc::new(AtomicUsize::new(0));
+            let (tx, rx) = mpsc::channel();
+            let handle = {
+                let (stop, peak, now) = (stop.clone(), peak.clone(), now.clone());
+                std::thread::spawn(move || {
+                    let hal = MetalHalPoseidon2::new();
+                    tx.send(()).unwrap();
+                    loop {
+                        let a = allocated(&hal);
+                        now.store(a, Ordering::Relaxed);
+                        peak.fetch_max(a, Ordering::Relaxed);
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                })
+            };
+            rx.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+            Self {
+                stop,
+                peak,
+                now,
+                handle: Some(handle),
+            }
+        }
+
+        /// Restart the peak at the current value (a new phase).
+        fn phase(&self) {
+            std::thread::sleep(Duration::from_millis(10));
+            self.peak
+                .store(self.now.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+
+        fn current(&self) -> usize {
+            std::thread::sleep(Duration::from_millis(10));
+            self.now.load(Ordering::Relaxed)
+        }
+
+        fn peak(&self) -> usize {
+            std::thread::sleep(Duration::from_millis(10));
+            self.peak.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Drop for Sampler {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    fn mib(bytes: usize) -> f64 {
+        bytes as f64 / (1u64 << 20) as f64
+    }
+
+    fn env_or(name: &str, default: u64) -> u64 {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    }
+
+    #[test_log::test]
+    fn metal_composite_succinct_round_trip() {
+        let po2 = env_or("RISC0_M3_PO2", 18) as u32;
+        let cycles = env_or("RISC0_M3_CYCLES", 1 << 19);
+        let sampler = Sampler::start();
+        let base = sampler.current();
+
+        // Composite.
+        sampler.phase();
+        let opts = ProverOpts::composite();
+        let env = ExecutorEnv::builder()
+            .write(&MultiTestSpec::BusyLoop { cycles })
+            .unwrap()
+            .segment_limit_po2(po2)
+            .build()
+            .unwrap();
+        let t0 = Instant::now();
+        let info = get_prover_server(&opts)
+            .unwrap()
+            .prove(env, MULTI_TEST_ELF)
+            .unwrap();
+        let composite_s = t0.elapsed().as_secs_f64();
+        let composite_peak = sampler.peak();
+        let composite = info.receipt;
+        let segments = composite.inner.composite().unwrap().segments.len();
+        composite.verify(MULTI_TEST_ID).unwrap();
+
+        // What the cached segment prover's HAL holds between sessions, and what releasing it
+        // returns (this thread proved, so its cache is the one released).
+        let held = sampler.current();
+        release_hal_buffers();
+        let released = sampler.current();
+        assert!(
+            released <= held,
+            "release_hal_buffers grew the allocation: {held} -> {released}"
+        );
+
+        // Composite -> succinct, verified.
+        sampler.phase();
+        let sopts = ProverOpts::succinct();
+        let t1 = Instant::now();
+        let succinct = get_prover_server(&sopts)
+            .unwrap()
+            .compress(&sopts, &composite)
+            .unwrap();
+        let succinct_s = t1.elapsed().as_secs_f64();
+        let succinct_peak = sampler.peak();
+        assert!(matches!(succinct.inner, InnerReceipt::Succinct(_)));
+        succinct.verify(MULTI_TEST_ID).unwrap();
+        assert_eq!(succinct.journal.bytes, composite.journal.bytes);
+
+        eprintln!(
+            "[M3] po2={po2} cycles={cycles} segments={segments} \
+             baseline={:.1} MiB | composite: wall={composite_s:.2}s peak={:.1} MiB \
+             (+{:.1} over baseline) | held after session={:.1} MiB, after \
+             release_hal_buffers={:.1} MiB | succinct (compress): wall={succinct_s:.2}s \
+             peak={:.1} MiB",
+            mib(base),
+            mib(composite_peak),
+            mib(composite_peak.saturating_sub(base)),
+            mib(held),
+            mib(released),
+            mib(succinct_peak),
+        );
     }
 }
