@@ -14,7 +14,6 @@
 
 #include "fp.h"
 #include "fpext.h"
-#include "sha256.h"
 
 using namespace metal;
 
@@ -24,11 +23,11 @@ using namespace metal;
 //
 // Buffer indices:
 //   eltwise_add_fp        0 out, 1 in1, 2 in2
-//   eltwise_mul_factor_fp 0 io, 1 factor (set_bytes Fp)
+//   eltwise_mul_factor_fp 0 io, 1 factor (set_bytes Fp; no Hal caller since Z7, kept as the
+//                         KernelArg::Bytes plumbing kernel of hal::metal::tests)
 //   eltwise_copy_fp       0 out, 1 in
 //   eltwise_sum_fpext     0 out, 1 in, 2 to_add, 3 count          (CUDA argument order)
 //   eltwise_zeroize_fp    0 elems, 1 count
-//   eltwise_zeroize_fpext 0 elems, 1 count
 
 kernel void eltwise_add_fp(device Fp* out,
                            const device Fp* in1,
@@ -80,14 +79,4 @@ kernel void eltwise_zeroize_fp(device Fp* elems,
   if (val.asRaw() == Fp::INVALID) {
     elems[gid] = Fp(0);
   }
-}
-
-kernel void eltwise_zeroize_fpext(device FpExt* elems,
-                                  constant uint32_t& count,
-                                  uint gid [[thread_position_in_grid]]) {
-  if (gid >= count) {
-    return;
-  }
-  FpExt val = elems[gid];
-  elems[gid] = val.zeroize();
 }

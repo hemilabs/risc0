@@ -34,9 +34,7 @@ mod eval;
 mod kernels;
 mod mdiv;
 mod ntt;
-// `poseidon2` is taken by the `core::hash::poseidon2` import below.
-#[path = "metal/poseidon2.rs"]
-mod pv_poseidon2;
+mod poseidon2;
 mod runtime;
 mod small;
 #[cfg(test)]
@@ -51,6 +49,8 @@ mod tests_z3;
 mod tests_z4;
 #[cfg(test)]
 mod tests_z5;
+#[cfg(test)]
+mod tests_z7;
 
 use std::{
     fmt::Debug,
@@ -76,7 +76,7 @@ use self::runtime::Runtime;
 pub use self::{
     buffer::BufferImpl,
     kernels::MetalKernels,
-    pv_poseidon2::{MetalHashPoseidon2, Poseidon2Config, Poseidon2Kernels},
+    poseidon2::{MetalHashPoseidon2, Poseidon2Config, Poseidon2Kernels},
     runtime::{
         as_bytes, Grid, KernelArg, DEFAULT_BATCH_DISPATCHES, MAX_SET_BYTES, MAX_WORKING_SET_ENV,
     },
@@ -85,42 +85,39 @@ use super::{Buffer as _, Hal};
 use crate::{
     core::{
         digest::Digest,
-        hash::{
-            poseidon2::{self, Poseidon2HashSuite},
-            sha::Sha256HashSuite,
-            HashSuite,
-        },
+        hash::{sha::Sha256HashSuite, HashSuite},
     },
     FRI_FOLD,
 };
 
 const METAL_LIB: &[u8] = include_bytes!(env!("ZKP_METAL_PATH"));
 
-/// Every kernel of the zkp metallib; a PSO is built for each when the first HAL is created.
+/// Every kernel of the zkp metallib (one group per `sys/kernels/zkp/metal/*.metal` file, in the
+/// order of `sys/build.rs`); a PSO is built for each when the first HAL is created. The legacy
+/// kernels (`multi_ntt_*`, `multi_poly_eval`, `batch_expand`, `zk_shift`, `multi_bit_reverse`,
+/// `poseidon2_*`) and `eltwise_zeroize_fpext` were retired in Z7.
 pub const KERNEL_NAMES: &[&str] = &[
-    "batch_expand",
+    // eltwise.metal
     "eltwise_add_fp",
     "eltwise_copy_fp",
     "eltwise_mul_factor_fp",
     "eltwise_sum_fpext",
     "eltwise_zeroize_fp",
-    "eltwise_zeroize_fpext",
+    // fri.metal
     "fri_fold",
-    "gather_sample",
+    // mix.metal (Z4)
     "mix_poly_coeffs",
-    "multi_bit_reverse",
-    "multi_ntt_fwd_step",
-    "multi_ntt_rev_step",
-    "multi_poly_eval",
-    "poseidon2_fold",
-    "poseidon2_rows",
+    "mix_poly_coeffs_v1",
+    "mix_poly_coeffs_v2",
+    "mix_poly_coeffs_v2_dcids",
+    // sha.metal
     "sha_fold",
     "sha_rows",
-    "zk_shift",
-    // Z1 (misc.metal)
+    // misc.metal (Z1)
     "combos_sub",
     "eltwise_copy_fp_region",
     "fill_u32",
+    "gather_sample",
     "scatter",
     "scatter_bits",
     // ntt_x.metal (Z2; also `ntt::NTT_X_KERNELS`)
@@ -148,15 +145,12 @@ pub const KERNEL_NAMES: &[&str] = &[
     "pvs_w_fold_k_m32",
     "pvs_w_rows_k",
     "pvs_w_rows_k_m32",
-    // Z4: eval_u (eval.metal) and mix (mix.metal)
+    // eval.metal (Z4)
     "batch_evaluate_any",
     "eu2_pows",
     "eu2_main",
     "eu2_reduce",
-    "mix_poly_coeffs_v1",
-    "mix_poly_coeffs_v2",
-    "mix_poly_coeffs_v2_dcids",
-    // Z5: combos_divide (mdiv.metal)
+    // mdiv.metal (Z5)
     "mdiv_agg0_e8",
     "mdiv_agg0_e16",
     "mdiv_apply_e8",
@@ -323,62 +317,6 @@ impl MetalHash for MetalHashSha256 {
     }
 }
 
-/// The original `poseidon2.metal` kernels (oracle until Z7); [MetalHashPoseidon2] (pv.metal)
-/// can also select them at run time.
-pub struct MetalHashPoseidon2Legacy {
-    suite: HashSuite<BabyBear>,
-    round_constants: BufferImpl<BabyBearElem>,
-    m_int_diag: BufferImpl<BabyBearElem>,
-}
-
-impl MetalHash for MetalHashPoseidon2Legacy {
-    fn new(hal: &MetalHal<Self>) -> Self {
-        let round_constants =
-            hal.copy_from_elem("round_constants", poseidon2::consts::ROUND_CONSTANTS);
-        let m_int_diag = hal.copy_from_elem("m_int_diag", poseidon2::consts::M_INT_DIAG_HZN);
-        MetalHashPoseidon2Legacy {
-            suite: Poseidon2HashSuite::new_suite(),
-            round_constants,
-            m_int_diag,
-        }
-    }
-
-    fn hash_fold(&self, hal: &MetalHal<Self>, io: &BufferImpl<Digest>, output_size: usize) {
-        let args = &[
-            self.round_constants.as_arg(),
-            self.m_int_diag.as_arg(),
-            io.as_arg_with_offset(output_size),
-            io.as_arg_with_offset(output_size * 2),
-            KernelArg::Integer(output_size as u32),
-        ];
-        hal.launch("poseidon2_fold", output_size as u64, args);
-    }
-
-    fn hash_rows(
-        &self,
-        hal: &MetalHal<Self>,
-        output: &BufferImpl<Digest>,
-        matrix: &BufferImpl<BabyBearElem>,
-    ) {
-        let row_size = output.size();
-        let col_size = matrix.size() / output.size();
-        assert_eq!(matrix.size(), col_size * row_size);
-        let args = &[
-            self.round_constants.as_arg(),
-            self.m_int_diag.as_arg(),
-            output.as_arg(),
-            matrix.as_arg(),
-            KernelArg::Integer(row_size as u32),
-            KernelArg::Integer(col_size as u32),
-        ];
-        hal.launch("poseidon2_rows", row_size as u64, args);
-    }
-
-    fn get_hash_suite(&self) -> &HashSuite<BabyBear> {
-        &self.suite
-    }
-}
-
 pub struct MetalHal<MH: MetalHash> {
     pub device: Device,
     pub cmd_queue: CommandQueue,
@@ -398,7 +336,6 @@ impl<MH: MetalHash> Debug for MetalHal<MH> {
 
 pub type MetalHalSha256 = MetalHal<MetalHashSha256>;
 pub type MetalHalPoseidon2 = MetalHal<MetalHashPoseidon2>;
-pub type MetalHalPoseidon2Legacy = MetalHal<MetalHashPoseidon2Legacy>;
 
 impl<MH: MetalHash> Default for MetalHal<MH> {
     fn default() -> Self {

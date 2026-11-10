@@ -14,7 +14,8 @@
 
 //! Z3: the `pv.metal` Poseidon2 kernels against the CPU HAL, bit for bit. Every kernel is checked
 //! on its own (forced through `encode_rows`/`encode_fold`/`encode_fold_tail`), and through the
-//! `Hal` entry points with the default crossovers, the classic oracle, and the `m32` variants.
+//! `Hal` entry points with the default crossovers and the `m32` variants. (The classic
+//! `poseidon2.metal` oracle and its `legacy_oracle_matches_pv` test were retired in Z7.)
 //! `bench_*` (ignored) are the crossover measurements recorded in docs/metal-port/notes/Z3.md.
 
 use std::time::Instant;
@@ -24,8 +25,8 @@ use risc0_core::field::baby_bear::BabyBearElem;
 use test_log::test;
 
 use super::{
-    pv_poseidon2::PvKernel, BufferImpl, MetalHalPoseidon2, MetalHalPoseidon2Legacy, MetalHash,
-    MetalHashPoseidon2, Poseidon2Config, Poseidon2Kernels,
+    poseidon2::PvKernel, BufferImpl, MetalHalPoseidon2, MetalHash, MetalHashPoseidon2,
+    Poseidon2Config, Poseidon2Kernels,
 };
 use crate::{
     core::{digest::Digest, hash::poseidon2::Poseidon2HashSuite},
@@ -262,54 +263,9 @@ fn fold_tree_configs() {
                 ..d
             },
         ),
-        (
-            "classic",
-            Poseidon2Config {
-                kernels: Poseidon2Kernels::Classic,
-                ..d
-            },
-        ),
     ];
     for (i, (name, cfg)) in configs.into_iter().enumerate() {
         check_tree(&with_config(cfg), name, 100 + i as u64);
-    }
-}
-
-/// The classic kernels (`MetalHalPoseidon2Legacy`, F0's code path) and pv agree.
-#[test]
-fn legacy_oracle_matches_pv() {
-    let pv = MetalHalPoseidon2::new();
-    let legacy = MetalHalPoseidon2Legacy::new();
-    let mut rng = rng(5);
-    for (r, c) in [
-        (1usize, 1usize),
-        (33, 17),
-        (1000, 211),
-        (5000, 24),
-        (20000, 16),
-    ] {
-        let m = elems(&mut rng, r * c);
-        let a = {
-            let mb = pv.copy_from_elem("m", &m);
-            let out = pv.alloc_digest("out", r);
-            pv.hash_rows(&out, &mb);
-            out.to_vec()
-        };
-        let b = {
-            let mb = legacy.copy_from_elem("m", &m);
-            let out = legacy.alloc_digest("out", r);
-            legacy.hash_rows(&out, &mb);
-            out.to_vec()
-        };
-        assert!(a == b, "rows={r} cols={c}");
-    }
-    for layers in [1usize, 9, 14] {
-        let io = digests(&mut rng, 2 << layers);
-        let a = pv.copy_from_digest("io", &io);
-        let b = legacy.copy_from_digest("io", &io);
-        pv.hash_fold_tree(&a, layers);
-        legacy.hash_fold_tree(&b, layers);
-        assert!(a.to_vec()[1..] == b.to_vec()[1..], "layers={layers}");
     }
 }
 
@@ -417,7 +373,7 @@ fn bench_rows_kernels() {
     }
 }
 
-/// Fold trees: per-layer dispatches with the default crossovers vs the tail kernel, and classic.
+/// Fold trees: per-layer dispatches with the default crossovers vs the tail kernel.
 #[test]
 #[ignore]
 fn bench_fold_tree() {
@@ -428,13 +384,6 @@ fn bench_fold_tree() {
         ("tail128", Poseidon2Config { tail_max: 128, ..d }),
         ("tail16", Poseidon2Config { tail_max: 16, ..d }),
         ("no-small", Poseidon2Config { small: false, ..d }),
-        (
-            "classic",
-            Poseidon2Config {
-                kernels: Poseidon2Kernels::Classic,
-                ..d
-            },
-        ),
     ];
     const LAYERS: [usize; 5] = [7, 10, 14, 18, 21];
     let hals: Vec<_> = cfgs.iter().map(|(_, cfg)| with_config(*cfg)).collect();
@@ -474,7 +423,6 @@ fn bench_fold_tree() {
 #[ignore]
 fn bench_hal_entry_points() {
     let hal = MetalHalPoseidon2::new();
-    let legacy = MetalHalPoseidon2Legacy::new();
     let mut rng = rng(10);
     for (rows, cols) in [
         (1usize << 20, 24usize),
@@ -486,17 +434,6 @@ fn bench_hal_entry_points() {
         let a = hal.copy_from_elem("m", &m);
         let ao = hal.alloc_digest("out", rows);
         let pv_us = time_per(&hal, 3, || hal.hash().hash_rows(&hal, &ao, &a));
-        drop(a);
-        let b = legacy.copy_from_elem("m", &m);
-        let bo = legacy.alloc_digest("out", rows);
-        let t = Instant::now();
-        legacy.hash_rows(&bo, &b);
-        legacy.sync();
-        let classic_us = t.elapsed().as_secs_f64() * 1e6;
-        println!(
-            "hash_rows {rows}x{cols}: pv {:.2} ms, classic {:.2} ms",
-            pv_us / 1e3,
-            classic_us / 1e3
-        );
+        println!("hash_rows {rows}x{cols}: pv {:.2} ms", pv_us / 1e3);
     }
 }

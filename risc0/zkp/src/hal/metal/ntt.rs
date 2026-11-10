@@ -25,10 +25,8 @@
 //!   `nttx_batch_zk_shift`/`nttx_auto_chunk`/`nttx_commit` mirror the CUDA functions of the same
 //!   names, including launch shapes (block `2^(radix-1)`, grid `(nblocks[/8], cols)`, threadgroup
 //!   memory `[8 *] 4 << (radix-1)` bytes, at most 16 KB).
-//! * `RISC0_METAL_LEGACY=1` (read when the HAL is created; [MetalHal::set_ntt_legacy] for tests)
-//!   selects the pre-port `multi_ntt_*`/`batch_expand`/`multi_bit_reverse`/`zk_shift` kernels as
-//!   an A/B oracle; the fused entry points then fall back to the trait's unfused compositions and
-//!   `has_commit_coeffs_lde` is false.
+//! * The pre-port `multi_ntt_*`/`batch_expand`/`multi_bit_reverse`/`zk_shift` kernels and their
+//!   `RISC0_METAL_LEGACY=1` switch were retired in Z7.
 
 use std::{
     collections::HashMap,
@@ -278,9 +276,8 @@ fn zk_table(lg: usize) -> Vec<Fp> {
     out
 }
 
-/// Per-HAL NTT state: the A/B switch, the uploaded twiddle tables and zk tables per lg.
+/// Per-HAL NTT state: the uploaded twiddle tables and zk tables per lg.
 pub(crate) struct NttState {
-    legacy: AtomicBool,
     tables: OnceLock<[BufferImpl<Fp>; 2]>,
     zk: Mutex<HashMap<usize, BufferImpl<Fp>>>,
 }
@@ -288,7 +285,6 @@ pub(crate) struct NttState {
 impl NttState {
     pub(crate) fn new() -> Self {
         Self {
-            legacy: AtomicBool::new(std::env::var("RISC0_METAL_LEGACY").is_ok_and(|v| v == "1")),
             tables: OnceLock::new(),
             zk: Mutex::new(HashMap::new()),
         }
@@ -352,15 +348,6 @@ fn nttx_auto_chunk(lg: usize, lg_blowup: usize) -> usize {
 }
 
 impl<MH: MetalHash> MetalHal<MH> {
-    /// Select the legacy (`multi_ntt_*`) NTT kernels for this HAL (`RISC0_METAL_LEGACY=1`).
-    pub fn set_ntt_legacy(&self, on: bool) {
-        self.ntt.legacy.store(on, Ordering::Relaxed);
-    }
-
-    pub(crate) fn ntt_legacy(&self) -> bool {
-        self.ntt.legacy.load(Ordering::Relaxed)
-    }
-
     /// This HAL's copy of the twiddle tables (`[forward, inverse]`); the first call in the
     /// process also runs the GPU-vs-CPU self-check.
     fn ntt_tables(&self) -> &[BufferImpl<Fp>; 2] {
@@ -625,9 +612,6 @@ impl<MH: MetalHash> MetalHal<MH> {
         input: &BufferImpl<Fp>,
         count: usize,
     ) {
-        if self.ntt_legacy() {
-            return legacy::batch_expand_into_evaluate_ntt(self, output, input, count);
-        }
         scope!("batch_expand_into_evaluate_ntt");
         let out_size = output.size() / count;
         let in_size = input.size() / count;
@@ -662,9 +646,6 @@ impl<MH: MetalHash> MetalHal<MH> {
 
     /// `sppark_batch_iNTT`: in place, NR, scaled by `n^-1`.
     pub(crate) fn ntt_batch_interpolate(&self, io: &BufferImpl<Fp>, count: usize) {
-        if self.ntt_legacy() {
-            return legacy::batch_interpolate_ntt(self, io, count);
-        }
         scope!("batch_interpolate_ntt");
         let lg = self.ntt_row_bits(io, count);
         if lg > 0 {
@@ -675,10 +656,6 @@ impl<MH: MetalHash> MetalHal<MH> {
 
     /// `sppark_batch_iNTT_zk_shift_fused`, with the zk shift fused into the last GS pass.
     pub(crate) fn ntt_batch_interpolate_zk_shift(&self, io: &BufferImpl<Fp>, count: usize) {
-        if self.ntt_legacy() {
-            legacy::batch_interpolate_ntt(self, io, count);
-            return legacy::zk_shift(self, io, count);
-        }
         scope!("batch_interpolate_ntt_zk_shift");
         let lg = self.ntt_row_bits(io, count);
         if lg > 0 {
@@ -695,15 +672,6 @@ impl<MH: MetalHash> MetalHal<MH> {
         src: &BufferImpl<Fp>,
         count: usize,
     ) {
-        if self.ntt_legacy() {
-            self.launch(
-                "eltwise_copy_fp",
-                dst.size() as u64,
-                &[dst.as_arg(), src.as_arg()],
-            );
-            legacy::batch_interpolate_ntt(self, dst, count);
-            return legacy::zk_shift(self, dst, count);
-        }
         scope!("batch_interpolate_ntt_zk_shift_from");
         assert_eq!(dst.size(), src.size());
         let lg = self.ntt_row_bits(src, count);
@@ -722,9 +690,6 @@ impl<MH: MetalHash> MetalHal<MH> {
 
     /// `sppark_batch_zk_shift` (`nttx_batch_zk_shift`).
     pub(crate) fn ntt_zk_shift(&self, io: &BufferImpl<Fp>, count: usize) {
-        if self.ntt_legacy() {
-            return legacy::zk_shift(self, io, count);
-        }
         let lg = self.ntt_row_bits(io, count);
         if lg > 0 {
             self.nttx_batch_zk_shift(io, lg, count);
@@ -734,9 +699,6 @@ impl<MH: MetalHash> MetalHal<MH> {
 
     /// `sppark_batch_bit_reverse_tiled` (`bitrev_batched`).
     pub(crate) fn ntt_batch_bit_reverse(&self, io: &BufferImpl<Fp>, count: usize) {
-        if self.ntt_legacy() {
-            return legacy::batch_bit_reverse(self, io, count);
-        }
         let lg = self.ntt_row_bits(io, count);
         if lg > 0 && count > 0 {
             self.bitrev_batched((io, 0), lg, count);
@@ -746,7 +708,7 @@ impl<MH: MetalHash> MetalHal<MH> {
 
     /// `has_commit_coeffs_lde`: the range `sppark_commit_coeffs_lde` accepts (10..=23).
     pub(crate) fn ntt_has_commit_coeffs_lde(&self, po2: usize) -> bool {
-        !self.ntt_legacy() && (10..=23).contains(&po2)
+        (10..=23).contains(&po2)
     }
 
     /// `sppark_commit_coeffs_lde` (`nttx_commit`, chunk 0 = auto).
@@ -821,156 +783,6 @@ impl<MH: MetalHash> MetalHal<MH> {
             );
         }
         tracing::debug!("Metal NTT tables self-check passed");
-    }
-}
-
-/// The pre-port Metal NTT (A/B oracle behind `RISC0_METAL_LEGACY=1`; removed in Z7).
-pub(crate) mod legacy {
-    use metal::MTLSize;
-    use risc0_core::{
-        field::{baby_bear::BabyBearElem, Elem, RootsOfUnity},
-        scope,
-    };
-
-    use super::super::{as_bytes, BufferImpl, Grid, KernelArg, MetalHal, MetalHash};
-    use crate::{core::log2_ceil, hal::Buffer as _};
-
-    type Fp = BabyBearElem;
-
-    pub(crate) fn batch_bit_reverse<MH: MetalHash>(
-        hal: &MetalHal<MH>,
-        io: &BufferImpl<Fp>,
-        count: usize,
-    ) {
-        let row_size = io.size() / count;
-        assert_eq!(row_size * count, io.size());
-        let bits = log2_ceil(row_size);
-        assert_eq!(row_size, 1 << bits);
-        let args = &[io.as_arg(), KernelArg::Integer(bits as u32)];
-        hal.launch("multi_bit_reverse", row_size as u64 * count as u64, args);
-        hal.flush();
-    }
-
-    pub(crate) fn batch_expand_into_evaluate_ntt<MH: MetalHash>(
-        hal: &MetalHal<MH>,
-        output: &BufferImpl<Fp>,
-        input: &BufferImpl<Fp>,
-        count: usize,
-    ) {
-        let out_size = output.size() / count;
-        let in_size = input.size() / count;
-        let expand_bits = log2_ceil(out_size / in_size);
-        scope!("batch_expand", {
-            assert_eq!(output.size(), out_size * count);
-            assert_eq!(input.size(), in_size * count);
-            assert_eq!(out_size, in_size * (1 << expand_bits));
-            let args = &[
-                output.as_arg(),
-                input.as_arg(),
-                KernelArg::Integer(count as u32),
-                KernelArg::Integer(out_size as u32),
-                KernelArg::Integer(in_size as u32),
-                KernelArg::Integer(expand_bits as u32),
-            ];
-            hal.launch("batch_expand", out_size as u64, args);
-        });
-
-        scope!("batch_evaluate_ntt", {
-            let row_size = output.size() / count;
-            assert_eq!(row_size * count, output.size());
-            let n_bits = log2_ceil(row_size);
-            assert_eq!(row_size, 1 << n_bits);
-            assert!(n_bits >= expand_bits);
-            assert!(n_bits < Fp::MAX_ROU_PO2);
-            let rou = as_bytes(Fp::ROU_FWD);
-            let kernel = hal.pipeline("multi_ntt_fwd_step");
-            for s_bits in 1 + expand_bits..=n_bits {
-                let args = &[
-                    output.as_arg(),
-                    KernelArg::Bytes(rou),
-                    KernelArg::Integer(n_bits as u32),
-                    KernelArg::Integer(s_bits as u32),
-                    KernelArg::Integer(count as u32),
-                ];
-                let grid = compute_launch_params(n_bits as u32, s_bits as u32, count as u32);
-                hal.dispatch(kernel, args, grid, &[]);
-            }
-        });
-        hal.flush();
-    }
-
-    pub(crate) fn batch_interpolate_ntt<MH: MetalHash>(
-        hal: &MetalHal<MH>,
-        io: &BufferImpl<Fp>,
-        count: usize,
-    ) {
-        scope!("batch_interpolate_ntt");
-        let row_size = io.size() / count;
-        assert_eq!(row_size * count, io.size());
-        let n_bits = log2_ceil(row_size);
-        assert_eq!(row_size, 1 << n_bits);
-        assert!(n_bits < Fp::MAX_ROU_PO2);
-
-        let rou = as_bytes(Fp::ROU_REV);
-        let kernel = hal.pipeline("multi_ntt_rev_step");
-        for s_bits in (1..=n_bits).rev() {
-            let args = &[
-                io.as_arg(),
-                KernelArg::Bytes(rou),
-                KernelArg::Integer(n_bits as u32),
-                KernelArg::Integer(s_bits as u32),
-                KernelArg::Integer(count as u32),
-            ];
-            let grid = compute_launch_params(n_bits as u32, s_bits as u32, count as u32);
-            hal.dispatch(kernel, args, grid, &[]);
-        }
-
-        let norm = [Fp::new(row_size as u32).inv()];
-        let args = &[io.as_arg(), KernelArg::Bytes(as_bytes(&norm))];
-        hal.launch("eltwise_mul_factor_fp", io.size() as u64, args);
-        hal.flush();
-    }
-
-    pub(crate) fn zk_shift<MH: MetalHash>(
-        hal: &MetalHal<MH>,
-        io: &BufferImpl<Fp>,
-        poly_count: usize,
-    ) {
-        let bits = log2_ceil(io.size() / poly_count);
-        let count = io.size();
-        assert_eq!(io.size(), poly_count * (1 << bits));
-        let args = &[io.as_arg(), KernelArg::Integer(bits as u32)];
-        hal.launch("zk_shift", count as u64, args);
-        hal.flush();
-    }
-
-    fn compute_launch_params(n_bits: u32, s_bits: u32, c_size: u32) -> Grid {
-        let s_size = 1 << (s_bits - 1);
-        let g_size = 1 << (n_bits - s_bits);
-
-        let mut grid = MTLSize::new(1, 1, 1);
-        let mut block = MTLSize::new(1, 1, 1);
-
-        let mut threads = 128;
-        // First thread over S
-        block.width = threads.min(s_size);
-        threads /= block.width;
-        // Next thread over G
-        block.height = threads.min(g_size);
-        // Don't bother threading over C
-        let mut grids = 32;
-        // First grid over S
-        grid.width = grids.min(s_size / block.width);
-        grids /= grid.width;
-        // Next grid over G
-        grid.height = grids.min(g_size / block.height);
-        grids /= grid.height;
-        // Next grid over C
-        grid.depth = grids.min(c_size as u64);
-        Grid::Groups {
-            groups: grid,
-            threads: block,
-        }
     }
 }
 

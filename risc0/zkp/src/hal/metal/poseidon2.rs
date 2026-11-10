@@ -18,17 +18,16 @@
 //! `supra/api.cu` (`sppark_poseidon2_{rows,fold,fold_tree}`, `pvs::{rows,fold}`, HIP
 //! `hip_pv_fold_tail`) with crossovers measured on the M5 Max (see `docs/metal-port/notes/Z3.md`).
 //!
-//! The classic `poseidon2.metal` kernels stay selectable as an oracle until Z7:
-//! `RISC0_METAL_POSEIDON2=classic` (or `RISC0_METAL_LEGACY=1`), or [Poseidon2Config::kernels].
+//! The classic `poseidon2.metal` kernels (the pre-port oracle) were retired in Z7.
 //!
 //! Environment (read once per HAL):
 //! * `RISC0_METAL_POSEIDON2` = `pv` (default; pv.cuh's HIP int64 arithmetic) | `m32` (the same
-//!   kernels with the products split into 32-bit words; A/B only) | `classic`.
+//!   kernels with the products split into 32-bit words; A/B only).
 //! * `RISC0_METAL_PV_SMALL=0`: never use the `pvs` latency kernels.
 //! * `RISC0_METAL_PV_TAIL=0`: no single-dispatch fold-tree tail.
 //! * `RISC0_METAL_PVS_{W,Q}_MAX_{FOLD,ROWS}`: override a crossover (largest `n` for that kernel).
 
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use metal::MTLSize;
 use risc0_core::field::baby_bear::{BabyBear, BabyBearElem};
@@ -37,10 +36,7 @@ use super::{BufferImpl, Grid, KernelArg, MetalHal, MetalHash};
 use crate::{
     core::{
         digest::Digest,
-        hash::{
-            poseidon2::{self, Poseidon2HashSuite},
-            HashSuite,
-        },
+        hash::{poseidon2::Poseidon2HashSuite, HashSuite},
     },
     hal::Buffer as _,
 };
@@ -69,8 +65,6 @@ pub enum Poseidon2Kernels {
     /// `pv.metal` `_m32` instantiations: the same values from 32-bit mul/mulhi (A/B only;
     /// measured slower on the M5 Max).
     PvM32,
-    /// The original `poseidon2.metal` kernels (oracle until Z7).
-    Classic,
 }
 
 /// Kernel selection and crossovers. A size `n` (outputs of a fold, rows of `hash_rows`) uses
@@ -126,11 +120,7 @@ impl Poseidon2Config {
                 .ok()
                 .map(|v| v.trim().to_ascii_lowercase())
         };
-        if var("RISC0_METAL_LEGACY").as_deref() == Some("1") {
-            cfg.kernels = Poseidon2Kernels::Classic;
-        }
         match var("RISC0_METAL_POSEIDON2").as_deref() {
-            Some("classic") => cfg.kernels = Poseidon2Kernels::Classic,
             Some("m32") => cfg.kernels = Poseidon2Kernels::PvM32,
             Some("pv") => cfg.kernels = Poseidon2Kernels::Pv,
             Some(other) => tracing::warn!("RISC0_METAL_POSEIDON2={other}: unknown, using default"),
@@ -195,8 +185,6 @@ impl PvKernel {
 pub struct MetalHashPoseidon2 {
     suite: HashSuite<BabyBear>,
     cfg: Mutex<Poseidon2Config>,
-    /// `poseidon2.metal`'s round-constant and diagonal buffers, made on first classic use.
-    classic: OnceLock<(BufferImpl<BabyBearElem>, BufferImpl<BabyBearElem>)>,
 }
 
 impl MetalHashPoseidon2 {
@@ -213,18 +201,6 @@ impl MetalHashPoseidon2 {
             cfg.tail_max
         );
         *self.cfg.lock().unwrap() = cfg;
-    }
-
-    fn classic(
-        &self,
-        hal: &MetalHal<Self>,
-    ) -> &(BufferImpl<BabyBearElem>, BufferImpl<BabyBearElem>) {
-        self.classic.get_or_init(|| {
-            (
-                hal.copy_from_slice("round_constants", poseidon2::consts::ROUND_CONSTANTS),
-                hal.copy_from_slice("m_int_diag", poseidon2::consts::M_INT_DIAG_HZN),
-            )
-        })
     }
 
     fn fold_kernel(cfg: &Poseidon2Config, n: u32) -> PvKernel {
@@ -319,18 +295,6 @@ impl MetalHashPoseidon2 {
     fn fold(&self, hal: &MetalHal<Self>, io: &BufferImpl<Digest>, n: usize) {
         let cfg = self.config();
         let n32 = u32::try_from(n).expect("hash_fold: too many outputs");
-        if cfg.kernels == Poseidon2Kernels::Classic {
-            let (rc, diag) = self.classic(hal);
-            let args = &[
-                rc.as_arg(),
-                diag.as_arg(),
-                io.as_arg_with_offset(n),
-                io.as_arg_with_offset(n * 2),
-                KernelArg::Integer(n32),
-            ];
-            hal.launch("poseidon2_fold", n as u64, args);
-            return;
-        }
         let m32 = cfg.kernels == Poseidon2Kernels::PvM32;
         Self::encode_fold(hal, Self::fold_kernel(&cfg, n32), m32, io, n, 2 * n, n32);
     }
@@ -360,15 +324,10 @@ impl MetalHash for MetalHashPoseidon2 {
         {
             cfg.small = false;
         }
-        let this = MetalHashPoseidon2 {
+        MetalHashPoseidon2 {
             suite: Poseidon2HashSuite::new_suite(),
             cfg: Mutex::new(cfg),
-            classic: OnceLock::new(),
-        };
-        if cfg.kernels == Poseidon2Kernels::Classic {
-            this.classic(hal);
         }
-        this
     }
 
     fn hash_fold(&self, hal: &MetalHal<Self>, io: &BufferImpl<Digest>, output_size: usize) {
@@ -388,19 +347,6 @@ impl MetalHash for MetalHashPoseidon2 {
         let col_size = matrix.size() / row_size;
         assert_eq!(matrix.size(), col_size * row_size);
         let cfg = self.config();
-        if cfg.kernels == Poseidon2Kernels::Classic {
-            let (rc, diag) = self.classic(hal);
-            let args = &[
-                rc.as_arg(),
-                diag.as_arg(),
-                output.as_arg(),
-                matrix.as_arg(),
-                KernelArg::Integer(row_size as u32),
-                KernelArg::Integer(col_size as u32),
-            ];
-            hal.launch("poseidon2_rows", row_size as u64, args);
-            return;
-        }
         let rows = u32::try_from(row_size).expect("hash_rows: too many rows");
         let cols = u32::try_from(col_size).expect("hash_rows: too many columns");
         Self::encode_rows(
@@ -425,7 +371,7 @@ impl MetalHash for MetalHashPoseidon2 {
         );
         for i in (0..layers).rev() {
             let n = 1usize << i;
-            if cfg.kernels != Poseidon2Kernels::Classic && n as u32 <= cfg.tail_max {
+            if n as u32 <= cfg.tail_max {
                 Self::encode_fold_tail(hal, cfg.kernels == Poseidon2Kernels::PvM32, io, n as u32);
                 break;
             }

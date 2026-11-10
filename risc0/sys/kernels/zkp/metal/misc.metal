@@ -17,6 +17,7 @@
 //   scatter                 sys/kernels/zkp/cuda/kernels.cu:116
 //   scatter_bits            sys/kernels/zkp/cuda/kernels.cu:131
 //   combos_sub              sys/kernels/zkp/cuda/combos.cu:54
+//   gather_sample           sys/kernels/zkp/cuda/kernels.cu:108 (moved from the retired ntt.metal, Z7)
 // plus fill_u32 (plan 2.5: cudaMemsetAsync of a non byte-repeating word).
 // All are 1-D, launched over `count` threads like CUDA's launchKernel(count).
 // Untrusted indices (offsets, rows/cols) are validated on the host before the launch
@@ -29,6 +30,7 @@
 //   scatter_bits           0 into, 1 data, 2 cycles, 3 count
 //   combos_sub             0 combos, 1 deltas, 2 offsets, 3 count
 //   fill_u32               0 out, 1 value, 2 count
+//   gather_sample          0 dst, 1 src, 2 idx, 3 stride (grid = size)
 
 #include "fp.h"
 #include "fpext.h"
@@ -113,4 +115,14 @@ kernel void fill_u32(device uint32_t* out,
   if (gid < count) {
     out[gid] = value;
   }
+}
+
+// dst[gid] = src[gid * stride + idx], one thread per output (MetalHal::gather_sample launches
+// exactly `size` threads).
+kernel void gather_sample(device Fp* dst,
+                          const device Fp* src,
+                          constant uint32_t& idx,
+                          constant uint32_t& stride,
+                          uint gid [[thread_position_in_grid]]) {
+  dst[gid] = src[gid * stride + idx];
 }
