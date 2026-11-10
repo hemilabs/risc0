@@ -1000,10 +1000,13 @@ fn glob_paths(pattern: &str) -> Vec<PathBuf> {
 /// (`METAL_LIB`). Generated sources, when the unit adds them, go to `$OUT_DIR/metal`.
 fn build_metal_kernels() {
     const OUTPUT: &str = "metal_kernels_recursion";
-    const SOURCES: &[&str] = &["kernels/metal/noop.metal"];
+    // Hand-written kernels (C1). `kernels/metal` is the include dir for context.h/extern.h (it is
+    // also hashed into the metallib cache key, so editing a header rebuilds).
+    const SOURCES: &[&str] = &["kernels/metal/rec_kernels.metal"];
 
     KernelBuild::new(KernelType::Metal)
         .files(SOURCES)
+        .include("kernels/metal")
         .compile(OUTPUT);
 
     // KernelBuild writes `skip-<output>` (empty) under RISC0_SKIP_BUILD_KERNELS.

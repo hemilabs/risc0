@@ -29,7 +29,19 @@ pub const METAL_LIB: &[u8] = include_bytes!(env!("RECURSION_METAL_PATH"));
 
 /// Every kernel entry point in [METAL_LIB]; the HAL fails fast if one is missing.
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
-pub const METAL_KERNEL_NAMES: &[&str] = &["noop"];
+pub const METAL_KERNEL_NAMES: &[&str] = &[
+    // kernels/metal/rec_kernels.metal (C1)
+    "injectWomBacks",
+    "fillOneExt",
+    "prefixProductsChunks",
+    "prefixProductsTotals",
+    "prefixProductsFixup",
+    "recInitRows",
+    "recFillTail",
+    "recZeroizeRows",
+    "markHostChains",
+    "scatterHostChains",
+];
 
 use risc0_core::field::baby_bear::{BabyBearElem, BabyBearExtElem};
 
