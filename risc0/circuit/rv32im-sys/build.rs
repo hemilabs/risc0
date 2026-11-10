@@ -2215,7 +2215,44 @@ fn build_metal_kernels() {
     }
 
     // ---- BEGIN R4 accum_tu (metal) ----
-    // R4: `accum_tu_gen.py --metal` -> gen_dir/accum_tu.metal; push it onto `generated`.
+    // stepAccumA: `accum_tu_gen.py --metal` translates the step_TopAccum call graph of steps.cu
+    // (cuda2metal.py passes) into gen_dir/accum_tu.metal, rewritten only when it changed. Its
+    // rewrite counts are pinned in the script, so a reshaped steps.cu fails here. Inline
+    // strategy: RISC0_METAL_ACCUM_INLINE=always (default; [[clang::always_inline]], CUDA's
+    // __forceinline__ TU) or noinline (fallback). See docs/metal-port/notes/R4.md for the
+    // compile/PSO times of both.
+    if !skip {
+        const ACCUM_TU_GEN: &str = "kernels/cuda/accum_tu_gen.py";
+        for input in [
+            ACCUM_TU_GEN,
+            CUDA2METAL,
+            "kernels/cuda/steps.cu",
+            "kernels/cuda/types.cuh.inc",
+        ] {
+            rerun_if_changed(input);
+        }
+        println!("cargo:rerun-if-env-changed=RISC0_METAL_ACCUM_INLINE");
+        let inline = env::var("RISC0_METAL_ACCUM_INLINE").unwrap_or_else(|_| "always".into());
+        assert!(
+            inline == "always" || inline == "noinline",
+            "RISC0_METAL_ACCUM_INLINE must be `always` or `noinline`, not `{inline}`"
+        );
+        let gen_dir_arg = gen_dir.to_str().unwrap().to_string();
+        run_metal_generator(
+            ACCUM_TU_GEN,
+            &[
+                "--metal",
+                "-o",
+                gen_dir_arg.as_str(),
+                "--inline",
+                inline.as_str(),
+            ],
+            "accum_tu_gen.py --metal failed: if steps.cu was regenerated, re-run \
+             `python3 kernels/cuda/accum_tu_gen.py --metal -o <dir> --no-pin` in rv32im-sys, \
+             review the rewrite counts and update PINNED_METAL",
+        );
+        generated.push(gen_dir.join("accum_tu.metal"));
+    }
     // ---- END R4 accum_tu (metal) ----
 
     // ---- BEGIN R5 witgen_tu (metal) ----

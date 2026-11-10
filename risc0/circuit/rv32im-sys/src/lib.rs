@@ -35,6 +35,7 @@ pub const METAL_KERNEL_NAMES: &[&str] = &[
     "finalizeZeroizeAccum",
     "seq_fwd_probe",
     "seq_rev_probe",
+    "stepAccumA", // $OUT_DIR/metal/accum_tu.metal (kernels/cuda/accum_tu_gen.py --metal)
 ];
 
 #[cfg(feature = "cuda")]
