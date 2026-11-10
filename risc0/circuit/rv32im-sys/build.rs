@@ -233,6 +233,14 @@ mod stamp {
 #[cfg(all(feature = "cuda", feature = "rocm"))]
 compile_error!("Features 'cuda' and 'rocm' are mutually exclusive. Enable only one GPU backend.");
 
+#[cfg(all(
+    feature = "metal",
+    any(feature = "cuda", feature = "rocm", feature = "intel")
+))]
+compile_error!(
+    "Feature 'metal' is mutually exclusive with 'cuda', 'rocm' and 'intel'. Enable only one GPU backend."
+);
+
 fn main() {
     let cuda = env::var("CARGO_FEATURE_CUDA").is_ok();
     let rocm = env::var("CARGO_FEATURE_ROCM").is_ok();
@@ -261,6 +269,10 @@ fn main() {
 
         if env::var("CARGO_FEATURE_INTEL").is_ok() {
             build_intel_kernels();
+        }
+
+        if metal_enabled() {
+            build_metal_kernels();
         }
     });
 }
@@ -2148,4 +2160,33 @@ fn build_intel_kernels() {
     if intel_lib.exists() {
         println!("cargo:rustc-link-search=native={}", intel_lib.display());
     }
+}
+
+/// The `metal` feature on macOS/iOS: compile `kernels/metal/*.metal` into
+/// `metal_kernels_rv32im.metallib` and point `RV32IM_METAL_PATH` at it for `src/lib.rs`
+/// (`METAL_LIB`). Generated sources, when the unit adds them, go to `$OUT_DIR/metal`.
+fn build_metal_kernels() {
+    const OUTPUT: &str = "metal_kernels_rv32im";
+    const SOURCES: &[&str] = &["kernels/metal/noop.metal"];
+
+    KernelBuild::new(KernelType::Metal)
+        .files(SOURCES)
+        .compile(OUTPUT);
+
+    // KernelBuild writes `skip-<output>` (empty) under RISC0_SKIP_BUILD_KERNELS.
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let name = if env::var("RISC0_SKIP_BUILD_KERNELS").is_ok() {
+        format!("skip-{OUTPUT}")
+    } else {
+        OUTPUT.to_string()
+    };
+    let metallib = out_dir.join(name).with_extension("metallib");
+    println!("cargo:rustc-env=RV32IM_METAL_PATH={}", metallib.display());
+}
+
+/// Whether to build the Metal kernels: the `metal` feature on a macOS/iOS target (on any other
+/// target the guard in src/lib.rs rejects the feature).
+fn metal_enabled() -> bool {
+    env::var("CARGO_FEATURE_METAL").is_ok()
+        && env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "macos" || os == "ios")
 }

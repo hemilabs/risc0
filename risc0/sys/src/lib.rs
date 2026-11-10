@@ -12,6 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(all(
+    feature = "metal",
+    any(feature = "cuda", feature = "rocm", feature = "intel")
+))]
+compile_error!(
+    "Feature 'metal' is mutually exclusive with 'cuda', 'rocm' and 'intel'. Enable only one GPU backend."
+);
+
+#[cfg(all(feature = "metal", not(any(target_os = "macos", target_os = "ios"))))]
+compile_error!("Feature 'metal' is only supported on macOS and iOS targets.");
+
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 pub mod cuda;
 

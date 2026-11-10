@@ -22,8 +22,11 @@ pub mod dual;
 pub mod hip;
 #[cfg(feature = "intel")]
 pub mod intel;
-#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), target_os = "ios"))]
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub mod metal;
+
+#[cfg(all(feature = "metal", not(any(target_os = "macos", target_os = "ios"))))]
+compile_error!("Feature 'metal' is only supported on macOS and iOS targets.");
 
 use std::{
     fmt::Debug,

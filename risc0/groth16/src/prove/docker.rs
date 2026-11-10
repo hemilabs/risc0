@@ -37,8 +37,8 @@ pub(crate) fn shrink_wrap(identity_p254_seal_bytes: &[u8]) -> Result<Seal> {
         bail!("Please install docker first.")
     }
 
-    // Intel builds: in-process witness + pre-started prover (same image).
-    #[cfg(feature = "intel")]
+    // Intel and Metal builds: in-process witness + pre-started prover (same image).
+    #[cfg(any(feature = "intel", feature = "metal"))]
     if fast_enabled() {
         match super::fast::preload() {
             Ok(()) => return super::fast::shrink_wrap(identity_p254_seal_bytes),
@@ -88,6 +88,13 @@ pub(crate) const IMAGE: &str = "risczero/risc0-groth16-prover:v2025-04-03.1";
 #[cfg(feature = "intel")]
 pub(crate) fn fast_enabled() -> bool {
     std::env::var("RISC0_GROTH16_FAST").as_deref() != Ok("0")
+}
+
+/// Metal builds: the fast Docker path is opt-in (RISC0_GROTH16_FAST=1) until it has been run
+/// against Docker on macOS (its named pipe crosses the Docker VM's file sharing there).
+#[cfg(all(feature = "metal", not(feature = "intel")))]
+pub(crate) fn fast_enabled() -> bool {
+    std::env::var("RISC0_GROTH16_FAST").as_deref() == Ok("1")
 }
 
 fn is_docker_installed() -> bool {
