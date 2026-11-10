@@ -27,13 +27,12 @@
 //!   (`fwd_rev_ab` only) and with `RISC0_KECCAK_METAL_WITGEN=host`, the CPU witness generator
 //!   (kernels/cxx) writes the HAL's shared buffers instead, as K2 did for every mode.
 
-use std::{collections::BTreeMap, sync::OnceLock, time::Instant};
+use std::{collections::BTreeMap, time::Instant};
 
 use anyhow::{bail, ensure, Result};
-use metal::{ComputePipelineState, DeviceRef};
 use risc0_circuit_keccak_sys::{
     metal_witgen as wg, risc0_circuit_keccak_cpu_witgen, RawBuffer, RawExecBuffers,
-    RawPreflightTrace, ScatterInfo, METAL_LIB,
+    RawPreflightTrace, ScatterInfo,
 };
 use risc0_core::scope;
 use risc0_sys::ffi_wrap;
@@ -92,67 +91,9 @@ impl PreflightCycleOrder for MetalPreflightOrder {
     }
 }
 
-/// The arm kernels' PSOs, by cycle type, built once per process (cold creation takes tens of
-/// seconds, see docs/metal-port/notes/K6.md; the OS shader cache makes later processes instant).
-struct WitgenPipelines {
-    registry_id: u64,
-    arms: Vec<ComputePipelineState>,
-}
-
-fn witgen_pipelines(device: &DeviceRef) -> &'static WitgenPipelines {
-    static ONCE: OnceLock<WitgenPipelines> = OnceLock::new();
-    let p = ONCE.get_or_init(|| {
-        scope!("keccak_witgen_pso");
-        let t0 = Instant::now();
-        let library = device
-            .new_library_with_data(METAL_LIB)
-            .unwrap_or_else(|e| panic!("keccak metallib: {e}"));
-        // The PSOs compile independently: build them concurrently (the compiler service runs
-        // them in parallel; measured 30 s sequential vs 19 s concurrent, cold).
-        let arms = std::thread::scope(|s| {
-            let handles: Vec<_> = wg::WITGEN_ARM_KERNELS
-                .iter()
-                .map(|name| {
-                    let library = &library;
-                    s.spawn(move || {
-                        let f = library
-                            .get_function(name, None)
-                            .unwrap_or_else(|e| panic!("keccak metallib: {name}: {e}"));
-                        device
-                            .new_compute_pipeline_state_with_function(&f)
-                            .unwrap_or_else(|e| panic!("keccak witgen PSO {name}: {e}"))
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().unwrap())
-                .collect::<Vec<_>>()
-        });
-        tracing::debug!(
-            "keccak: {} witgen PSOs in {:.2} s",
-            arms.len(),
-            t0.elapsed().as_secs_f64()
-        );
-        WitgenPipelines {
-            registry_id: device.registry_id(),
-            arms,
-        }
-    });
-    assert_eq!(
-        p.registry_id,
-        device.registry_id(),
-        "keccak witgen PSOs were built for another Metal device"
-    );
-    p
-}
-
-/// Build the witgen PSOs now (e.g. on a background thread at startup) instead of on the first
-/// GPU witness.
-#[allow(dead_code)]
-pub(crate) fn warm_witgen_pipelines(device: &DeviceRef) {
-    witgen_pipelines(device);
-}
+// The arm kernels' PSOs are part of the circuit HAL's process-wide keccak PSOs (`keccak_kernels`
+// in mod.rs, K5): one load of the metallib, built concurrently through the binary archive, with
+// the eval_check stages. (K6 built them here, lazily, from a second load of the metallib.)
 
 /// Whether a parallel-mode witness of `cycles` cycles runs on the GPU ([WITGEN_ENV]).
 fn gpu_witgen(cycles: usize) -> bool {
@@ -361,7 +302,6 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
         let preimages_count = u32::try_from(preflight.preimages.len())?;
         #[cfg(test)]
         tests::GPU_WITGENS.with(|n| n.set(n.get() + 1));
-        let pipelines = witgen_pipelines(&self.hal.device);
 
         let (run_order, preimage_idx, buckets) = run_buckets(preflight)?;
         if run_order.is_empty() {
@@ -401,7 +341,7 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
             args[wg::WITGEN_BUF_FAULT] = fault.as_arg();
             args[wg::WITGEN_BUF_PARAMS] = KernelArg::Bytes(as_bytes(&params));
             self.hal.dispatch(
-                &pipelines.arms[b.cycle_type as usize],
+                self.pipeline(wg::WITGEN_ARM_KERNELS[b.cycle_type as usize]),
                 &args,
                 Grid::Threads(b.count as u64),
                 &[],

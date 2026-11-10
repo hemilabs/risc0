@@ -25,24 +25,29 @@
 //!
 //! K6 adds the GPU witness.
 //!
+//! All keccak PSOs (`scatter_preflight`, the eval_check stages and the witgen arms) are built once
+//! per process from one load of the metallib, through a binary archive on disk (K5, [archive]):
+//! cold creation costs minutes and the OS shader cache was seen to miss. [warmup] builds them
+//! without a HAL (and without the GPU lock), for a worker's startup.
+//!
 //! No `Drop` is needed: CUDA's (`cuda_reset`) resets a CUDA stack-size limit its witgen raised,
 //! and Metal has no such process state; the PSOs are process-wide ([keccak_kernels]) and stay,
 //! the HAL reference drops on its own, and buffers return to the HAL's pool after their last
 //! batch completes.
 
+pub(crate) mod archive;
 mod eval_check;
 mod witgen;
 
 use std::{rc::Rc, sync::OnceLock};
 
 use anyhow::Result;
-use metal::{ComputePipelineState, DeviceRef};
-use risc0_circuit_keccak_sys::{METAL_KERNEL_NAMES, METAL_LIB};
+use metal::{ComputePipelineState, Device, DeviceRef};
+use risc0_circuit_keccak_sys::{metal_witgen, METAL_KERNEL_NAMES, METAL_LIB};
 use risc0_core::scope;
 use risc0_zkp::hal::{
     metal::{
         BufferImpl as MetalBuffer, MetalHal, MetalHalPoseidon2, MetalHash, MetalHashPoseidon2,
-        MetalKernels,
     },
     AccumPreflight, CircuitHal,
 };
@@ -54,24 +59,80 @@ use crate::{
 
 pub struct MetalCircuitHal<MH: MetalHash> {
     hal: Rc<MetalHal<MH>>,
-    /// The keccak metallib, with a PSO for each of `METAL_KERNEL_NAMES`: built once per process
+    /// The keccak metallib, with a PSO for each of [kernel_names]: built once per process
     /// ([keccak_kernels]) and shared by every circuit HAL.
-    kernels: &'static MetalKernels,
+    kernels: &'static KeccakKernels,
     /// eval_check's chunk size and cached scratch/carry ([eval_check]).
     eval: eval_check::EvalCheckState,
 }
 
-/// The keccak PSOs (the hand-written kernels and the eval_check stages), built once per process,
-/// as the zkp crate's own (`zkp_kernels`): the zkvm makes a new keccak prover, so a new circuit
-/// HAL, for every proof, and building the stage PSOs takes 40-190 s whenever the OS shader cache
-/// misses. Panics if the metallib does not load or lacks a kernel. Every MetalHal uses the
-/// system default device, which these PSOs are built on.
-fn keccak_kernels(device: &DeviceRef) -> &'static MetalKernels {
-    static ONCE: OnceLock<MetalKernels> = OnceLock::new();
-    ONCE.get_or_init(|| {
+/// The keccak PSOs of one device.
+pub(crate) struct KeccakKernels {
+    registry_id: u64,
+    kernels: archive::ArchivedKernels,
+}
+
+impl KeccakKernels {
+    pub(crate) fn pipeline(&self, name: &str) -> &ComputePipelineState {
+        self.kernels.pipeline(name)
+    }
+
+    /// The binary archive's account of how the PSOs were built (K5).
+    pub(crate) fn archive_report(&self) -> &archive::ArchiveReport {
+        &self.kernels.report
+    }
+}
+
+/// Every keccak kernel: `METAL_KERNEL_NAMES` (scatter, eval_check stages) and the witgen arms.
+pub(crate) fn kernel_names() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = METAL_KERNEL_NAMES.to_vec();
+    for name in metal_witgen::WITGEN_KERNEL_NAMES {
+        if !names.contains(name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// The keccak PSOs (the hand-written kernels, the eval_check stages and the witgen arms), built
+/// once per process, as the zkp crate's own (`zkp_kernels`): the zkvm makes a new keccak prover,
+/// so a new circuit HAL, for every proof, and building the stage PSOs takes 40-190 s whenever
+/// neither the binary archive ([archive]) nor the OS shader cache has them. Panics if the
+/// metallib does not load or lacks a kernel. Every MetalHal uses the system default device,
+/// which these PSOs are built on (asserted).
+pub(crate) fn keccak_kernels(device: &DeviceRef) -> &'static KeccakKernels {
+    static ONCE: OnceLock<KeccakKernels> = OnceLock::new();
+    let k = ONCE.get_or_init(|| {
         scope!("load_keccak_metallib");
-        MetalKernels::new(device, METAL_LIB, METAL_KERNEL_NAMES)
-            .unwrap_or_else(|e| panic!("keccak metallib: {e:#}"))
+        let kernels = archive::ArchivedKernels::new(device, "keccak", METAL_LIB, &kernel_names())
+            .unwrap_or_else(|e| panic!("keccak metallib: {e:#}"));
+        KeccakKernels {
+            registry_id: device.registry_id(),
+            kernels,
+        }
+    });
+    assert_eq!(
+        k.registry_id,
+        device.registry_id(),
+        "keccak PSOs were built for another Metal device"
+    );
+    k
+}
+
+/// Build every keccak PSO now (through the binary archive), e.g. on a background thread at
+/// worker startup, so no proof pays for it. Uses the system default device directly: it creates
+/// no HAL and takes no GPU lock, so it can run beside a proof (which then waits for the same
+/// `OnceLock` instead of building twice). Returns the archive report.
+pub(crate) fn warmup() -> Result<archive::ArchiveReport> {
+    let device = Device::system_default().ok_or_else(|| anyhow::anyhow!("no Metal device"))?;
+    // keccak_kernels panics on a broken metallib (a build error); report it instead.
+    std::panic::catch_unwind(|| keccak_kernels(&device).archive_report().clone()).map_err(|e| {
+        let msg = e
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        anyhow::anyhow!("building the keccak PSOs: {msg}")
     })
 }
 
@@ -87,7 +148,7 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
         }
     }
 
-    /// The PSO of a keccak kernel (one of `METAL_KERNEL_NAMES`).
+    /// The PSO of a keccak kernel (one of [kernel_names]).
     pub(crate) fn pipeline(&self, name: &str) -> &ComputePipelineState {
         self.kernels.pipeline(name)
     }
@@ -359,7 +420,7 @@ mod tests {
         // Constructing the Poseidon2 circuit HAL directly also loads every PSO.
         let hal = Rc::new(MetalHalPoseidon2::new());
         let circuit_hal = MetalCircuitHalPoseidon2::new(hal);
-        for name in risc0_circuit_keccak_sys::METAL_KERNEL_NAMES {
+        for name in super::kernel_names() {
             let _ = circuit_hal.pipeline(name);
         }
     }
@@ -373,7 +434,7 @@ mod tests {
         let second = MetalCircuitHalPoseidon2::new(Rc::new(MetalHalPoseidon2::new()));
         let elapsed = t0.elapsed();
         assert!(std::ptr::eq(first.kernels, second.kernels));
-        for name in risc0_circuit_keccak_sys::METAL_KERNEL_NAMES {
+        for name in super::kernel_names() {
             assert!(
                 std::ptr::eq(first.pipeline(name), second.pipeline(name)),
                 "{name}"
@@ -383,6 +444,35 @@ mod tests {
             elapsed < Duration::from_millis(500),
             "second circuit HAL took {elapsed:?}"
         );
+    }
+
+    /// The process-wide keccak PSOs cover every kernel, including K6's witgen arms (one load of
+    /// the metallib, K5), and were built through the binary archive unless it is disabled.
+    #[test]
+    fn warmup_builds_every_pso() {
+        let names = super::kernel_names();
+        assert_eq!(
+            names.len(),
+            risc0_circuit_keccak_sys::METAL_KERNEL_NAMES.len()
+                + risc0_circuit_keccak_sys::metal_witgen::WITGEN_KERNEL_NAMES.len()
+        );
+        let report = super::warmup().unwrap();
+        assert_eq!(report.hits + report.misses, names.len(), "{report:?}");
+        if super::archive::archive_dir().is_some() {
+            assert!(report.path.is_some(), "{report:?}");
+            // No archive error on this machine (errors fall back silently in production).
+            assert!(report.errors.is_empty(), "{report:?}");
+        }
+        let kernels = super::keccak_kernels(&metal::Device::system_default().unwrap());
+        for name in &names {
+            let _ = kernels.pipeline(name);
+        }
+        // The witgen arms come from the same (process-wide) set.
+        let hal = MetalCircuitHalPoseidon2::new(Rc::new(MetalHalPoseidon2::new()));
+        for name in risc0_circuit_keccak_sys::metal_witgen::WITGEN_ARM_KERNELS {
+            assert!(std::ptr::eq(hal.pipeline(name), kernels.pipeline(name)));
+        }
+        println!("keccak PSO report: {report:?}");
     }
 
     /// One prover, proofs at the po2 values in `K4_SEQ_PO2S` (default 14,17) in turn, under the
