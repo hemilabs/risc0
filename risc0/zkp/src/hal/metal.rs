@@ -32,8 +32,11 @@
 mod buffer;
 mod kernels;
 mod runtime;
+mod small;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_z1;
 
 use std::{
     fmt::Debug,
@@ -47,7 +50,6 @@ use metal::{
     ComputePipelineStateRef, Device, MTLSize,
 };
 use parking_lot::{ReentrantMutex, ReentrantMutexGuard};
-use rayon::prelude::*;
 use risc0_core::{
     field::{
         baby_bear::{BabyBear, BabyBearElem, BabyBearExtElem},
@@ -99,6 +101,12 @@ pub const KERNEL_NAMES: &[&str] = &[
     "sha_fold",
     "sha_rows",
     "zk_shift",
+    // Z1 (misc.metal)
+    "combos_sub",
+    "eltwise_copy_fp_region",
+    "fill_u32",
+    "scatter",
+    "scatter_bits",
 ];
 
 /// Whether the Metal backend may be used for `unit` (one of `zkp`, `rv32im`, `recursion`,
@@ -226,6 +234,7 @@ impl MetalHash for MetalHashSha256 {
         let args = &[
             io.as_arg_with_offset(output_size),
             io.as_arg_with_offset(output_size * 2),
+            KernelArg::Integer(output_size as u32),
         ];
         hal.launch("sha_fold", output_size as u64, args);
     }
@@ -239,15 +248,11 @@ impl MetalHash for MetalHashSha256 {
         let row_size = output.size();
         let col_size = matrix.size() / output.size();
         assert_eq!(matrix.size(), col_size * row_size);
-        // sha.metal declares `count`/`col_size` as writable `device uint32_t&`, and the
-        // validation layer rejects `set_bytes` bound to a writable argument, so they go in a
-        // buffer until the kernel takes them as `constant`/`const device` (zkp-hal unit).
-        let params = hal.copy_from_u32("sha_rows_params", &[row_size as u32, col_size as u32]);
         let args = &[
             output.as_arg(),
             matrix.as_arg(),
-            params.as_arg_with_offset(0),
-            params.as_arg_with_offset(1),
+            KernelArg::Integer(row_size as u32),
+            KernelArg::Integer(col_size as u32),
         ];
         hal.launch("sha_rows", row_size as u64, args);
     }
@@ -281,6 +286,7 @@ impl MetalHash for MetalHashPoseidon2 {
             self.m_int_diag.as_arg(),
             io.as_arg_with_offset(output_size),
             io.as_arg_with_offset(output_size * 2),
+            KernelArg::Integer(output_size as u32),
         ];
         hal.launch("poseidon2_fold", output_size as u64, args);
     }
@@ -497,6 +503,19 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
         self.alloc_buffer(name, size)
     }
 
+    fn alloc_elem_init(
+        &self,
+        name: &'static str,
+        size: usize,
+        value: Self::Elem,
+    ) -> Self::Buffer<Self::Elem> {
+        self.small_alloc_elem_init(name, size, value)
+    }
+
+    fn alloc_extelem_zeroed(&self, name: &'static str, size: usize) -> Self::Buffer<Self::ExtElem> {
+        self.small_alloc_extelem_zeroed(name, size)
+    }
+
     fn copy_from_elem(&self, name: &'static str, slice: &[Self::Elem]) -> Self::Buffer<Self::Elem> {
         self.copy_from_slice(name, slice)
     }
@@ -679,17 +698,7 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
         output: &Self::Buffer<Self::Elem>,
         input: &Self::Buffer<Self::ExtElem>,
     ) {
-        let count = output.size() / Self::ExtElem::EXT_SIZE;
-        let to_add = input.size() / count;
-        assert_eq!(output.size(), count * Self::ExtElem::EXT_SIZE);
-        assert_eq!(input.size(), count * to_add);
-        let args = &[
-            output.as_arg(),
-            input.as_arg(),
-            KernelArg::Integer(count as u32),
-            KernelArg::Integer(to_add as u32),
-        ];
-        self.launch("eltwise_sum_fpext", count as u64, args);
+        self.small_eltwise_sum_extelem(output, input);
     }
 
     fn eltwise_copy_elem(
@@ -830,11 +839,7 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
     }
 
     fn eltwise_zeroize_elem(&self, elems: &Self::Buffer<Self::Elem>) {
-        elems.view_mut(|slice| {
-            slice.par_iter_mut().for_each(|elem| {
-                *elem = elem.valid_or_zero();
-            });
-        })
+        self.small_eltwise_zeroize_elem(elems);
     }
 
     fn scatter(
@@ -844,13 +849,32 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
         offsets: &[u32],
         values: &[Self::Elem],
     ) {
-        into.view_mut(|into| {
-            for cycle in 0..index.len() - 1 {
-                for idx in index[cycle]..index[cycle + 1] {
-                    into[offsets[idx as usize] as usize] = values[idx as usize];
-                }
-            }
-        });
+        self.small_scatter(into, index, offsets, values);
+    }
+
+    fn scatter_bits(&self, into: &Self::Buffer<Self::Elem>, bit_data: &[u32], cycles: u32) {
+        self.small_scatter_bits(into, bit_data, cycles);
+    }
+
+    fn combos_prepare(
+        &self,
+        combos: &Self::Buffer<Self::ExtElem>,
+        coeff_u: &[Self::ExtElem],
+        combo_count: usize,
+        cycles: usize,
+        reg_sizes: &[u32],
+        reg_combo_ids: &[u32],
+        mix: &Self::ExtElem,
+    ) {
+        self.small_combos_prepare(
+            combos,
+            coeff_u,
+            combo_count,
+            cycles,
+            reg_sizes,
+            reg_combo_ids,
+            mix,
+        );
     }
 
     fn eltwise_copy_elem_slice(
@@ -864,14 +888,16 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
         into_offset: usize,
         into_stride: usize,
     ) {
-        into.view_mut(|into| {
-            for row in 0..from_rows {
-                for col in 0..from_cols {
-                    into[into_offset + row * into_stride + col] =
-                        from[from_offset + row * from_stride + col];
-                }
-            }
-        });
+        self.small_eltwise_copy_elem_slice(
+            into,
+            from,
+            from_rows,
+            from_cols,
+            from_offset,
+            from_stride,
+            into_offset,
+            into_stride,
+        );
     }
 }
 

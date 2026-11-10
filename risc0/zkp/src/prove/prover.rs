@@ -54,6 +54,12 @@ pub struct DeferredFinalize<H: Hal> {
     keep_alive: Vec<H::Buffer<H::Elem>>,
 }
 
+/// A GPU HAL whose buffers live in host-shared memory (Apple Metal): host spills of device buffers
+/// save nothing there. The CPU HAL also reports unified memory but no GPU memory size.
+fn unified_memory_gpu<H: Hal>(hal: &H) -> bool {
+    hal.has_unified_memory() && hal.gpu_total_memory() != usize::MAX
+}
+
 fn make_coeffs<H: Hal>(hal: &H, witness: &H::Buffer<H::Elem>, count: usize) -> H::Buffer<H::Elem> {
     scope!("make_coeffs");
     let t0 = std::time::Instant::now();
@@ -148,7 +154,11 @@ impl<'a, H: Hal> Prover<'a, H> {
         // (3.4-13 GB depending on group) makes room for the next group's
         // allocations. `DeferredFinalize::complete` restores them before
         // circuit_hal.eval_check runs.
-        if self.po2 >= 22 {
+        // On a unified-memory GPU HAL (Metal) the "host" copy would live in the same physical
+        // memory as the device buffer, so the spill only costs a copy and transiently doubles the
+        // footprint: skip it there (plan 2.6, item Z1). CPU HALs (`gpu_total_memory() ==
+        // usize::MAX`) and discrete GPUs (`has_unified_memory() == false`) are unchanged.
+        if self.po2 >= 22 && !unified_memory_gpu(self.hal) {
             let evaluated_bytes = group_ref
                 .evaluated
                 .as_ref()

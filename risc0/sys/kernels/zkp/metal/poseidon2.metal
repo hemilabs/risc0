@@ -151,8 +151,11 @@ kernel void poseidon2_fold(const device Fp* ROUND_CONSTANTS,
                            const device Fp* M_INT_DIAG,
                            device Fp* output,
                            const device Fp* input,
-                           device uint32_t& output_size,
+                           constant uint32_t& output_size,
                            uint gid [[thread_position_in_grid]]) {
+  if (gid >= output_size) {
+    return;
+  }
   Fp cells[CELLS];
   for (size_t i = 0; i < CELLS_OUT; i++) {
     cells[i] = input[2 * gid * CELLS_OUT + i];
@@ -168,9 +171,12 @@ kernel void poseidon2_rows(const device Fp* ROUND_CONSTANTS,
                            const device Fp* M_INT_DIAG,
                            device Fp* out,
                            const device Fp* matrix,
-                           const device uint32_t& count,
-                           const device uint32_t& col_size,
+                           constant uint32_t& count,
+                           constant uint32_t& col_size,
                            uint gid [[thread_position_in_grid]]) {
+  if (gid >= count) {
+    return;
+  }
   Fp cells[CELLS];
   uint used = 0;
   for (uint i = 0; i < col_size; i++) {
