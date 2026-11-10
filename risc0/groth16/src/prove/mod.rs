@@ -93,8 +93,8 @@ pub fn preload_graph_background() {
 }
 
 /// Start the Groth16 prover ahead of [shrink_wrap] so that it loads its
-/// proving key while the caller finishes `identity_p254` (intel builds with
-/// the rzup `risc0-groth16` component installed; otherwise a no-op).
+/// proving key while the caller finishes `identity_p254` (intel and metal builds
+/// with the rzup `risc0-groth16` component installed; otherwise a no-op).
 pub fn prestart_prover() -> Result<()> {
     cfg_if::cfg_if! {
         if #[cfg(all(feature = "intel", not(any(feature = "cuda", feature = "rocm"))))] {
@@ -232,7 +232,7 @@ pub fn invalidate_caches() {
 }
 
 /// Like [shrink_wrap], but runs `pre_gpu` on the calling thread while the witness is computed on
-/// a helper thread (CUDA; elsewhere `pre_gpu` runs first). `pre_gpu` has returned before the GPU
+/// a helper thread (CUDA and the Metal GPU prover; elsewhere `pre_gpu` runs first). `pre_gpu` has returned before the GPU
 /// part of the wrap starts. Used to overlap releasing the STARK HAL's buffer pool (thread-local,
 /// ~35 ms of frees) with the CPU-only witness generation.
 pub fn shrink_wrap_with(identity_p254_seal_bytes: &[u8], pre_gpu: impl FnOnce()) -> Result<Seal> {
