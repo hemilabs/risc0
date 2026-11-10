@@ -25,6 +25,9 @@
 //!   may use it completed.
 //! * [exclusive] / [singleton] are taken per call (around every encode, commit and wait), never
 //!   stored in a HAL.
+//! * A [BufferImpl] may only be used (bound to a dispatch, read, dropped) through the HAL that
+//!   allocated it: host reads sync, and pool returns wait for, only that HAL's batches. Binding a
+//!   buffer of HAL A into a dispatch on HAL B can give stale reads and early pool reuse.
 
 mod buffer;
 mod kernels;
@@ -40,7 +43,8 @@ use std::{
 use anyhow::Result;
 use metal::{
     Buffer as MtlBuffer, BufferRef, CommandQueue, ComputeCommandEncoderRef,
-    ComputePipelineDescriptorRef, ComputePipelineState, ComputePipelineStateRef, Device, MTLSize,
+    ComputePipelineDescriptor, ComputePipelineDescriptorRef, ComputePipelineState,
+    ComputePipelineStateRef, Device, MTLSize,
 };
 use parking_lot::{ReentrantMutex, ReentrantMutexGuard};
 use rayon::prelude::*;
@@ -128,6 +132,11 @@ pub fn singleton() -> &'static ReentrantMutex<()> {
 }
 
 /// Exclusive use of the GPU against other threads for as long as the guard lives. Reentrant.
+///
+/// Reentrant only on the owning thread: while a thread holds this guard, a HAL call made from
+/// another thread (e.g. a rayon worker spawned by `rayon::join` / `par_iter` under the guard)
+/// blocks until the guard drops, which deadlocks if the holder waits for that worker. Do not
+/// call the HAL from rayon workers while holding `exclusive()`.
 pub fn exclusive() -> ReentrantMutexGuard<'static, ()> {
     singleton().lock()
 }
@@ -150,6 +159,18 @@ pub trait PipelineSource {
 impl PipelineSource for ComputePipelineStateRef {
     fn with_pso(&self, _device: &Device, f: &mut dyn FnMut(&ComputePipelineStateRef)) {
         f(self)
+    }
+}
+
+impl PipelineSource for ComputePipelineState {
+    fn with_pso(&self, device: &Device, f: &mut dyn FnMut(&ComputePipelineStateRef)) {
+        (**self).with_pso(device, f)
+    }
+}
+
+impl PipelineSource for ComputePipelineDescriptor {
+    fn with_pso(&self, device: &Device, f: &mut dyn FnMut(&ComputePipelineStateRef)) {
+        (**self).with_pso(device, f)
     }
 }
 
@@ -439,6 +460,10 @@ impl<MH: MetalHash> MetalHal<MH> {
     /// Source-compatible with the pre-batch HAL: encodes `callback` (e.g. `use_resource`) and the
     /// dispatch, then syncs before returning. `opts` = (threadgroups, threads per threadgroup);
     /// `None` dispatches `count` threads.
+    ///
+    /// `callback` runs while this HAL's internal state lock is held: it must only call methods
+    /// on the encoder (e.g. `use_resource`) and must not call back into this HAL (flush, sync,
+    /// dispatch, alloc, host reads), or it deadlocks.
     #[deprecated(note = "use dispatch(); this syncs on every call")]
     pub fn dispatch_with_resources<K, F>(
         &self,
@@ -515,6 +540,8 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
         );
         let args = &[io.as_arg(), KernelArg::Integer(bits as u32)];
         self.launch("multi_bit_reverse", row_size as u64 * count as u64, args);
+        // CUDA ends this method with sync_stream(): close the batch (plan 2.6).
+        self.flush();
     }
 
     fn batch_expand_into_evaluate_ntt(
@@ -748,6 +775,8 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
         assert_eq!(io.size(), poly_count * (1 << bits));
         let args = &[io.as_arg(), KernelArg::Integer(bits as u32)];
         self.launch("zk_shift", count as u64, args);
+        // CUDA ends this method with sync_stream(): close the batch (plan 2.6).
+        self.flush();
     }
 
     fn gather_sample(

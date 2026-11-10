@@ -350,6 +350,41 @@ fn memory_queries_and_compat_dispatch() {
     assert_eq!(out.to_vec(), elems((0..n as u32).map(|i| 2 * i)));
     hal.dispatch_by_name("eltwise_add_fp", &[out.as_arg(), a.as_arg(), a.as_arg()], 0);
     assert!(!hal.rt.unsynced(), "empty grids encode nothing");
+
+    // Old-style calls passing the owned metal-rs types (no `&*`) must still compile.
+    hal.dispatch_with_resources(
+        &pso,
+        &[out.as_arg(), out.as_arg(), a.as_arg()],
+        n as u64,
+        None,
+        |_| {},
+    );
+    assert_eq!(out.to_vec(), elems((0..n as u32).map(|i| 3 * i)));
+    let func = hal
+        .kernels
+        .library
+        .get_function("eltwise_add_fp", None)
+        .unwrap();
+    let desc = metal::ComputePipelineDescriptor::new();
+    desc.set_compute_function(Some(&func));
+    hal.dispatch_with_resources(
+        &desc,
+        &[out.as_arg(), out.as_arg(), a.as_arg()],
+        n as u64,
+        None,
+        |_| {},
+    );
+    assert_eq!(out.to_vec(), elems((0..n as u32).map(|i| 4 * i)));
+}
+
+/// `as_bytes` is a safe byte view for padding-free (`NoUninit`) types, including ExtElem.
+#[test]
+fn as_bytes_no_uninit() {
+    let e = [BabyBearElem::new(7), BabyBearElem::new(9)];
+    assert_eq!(super::as_bytes(&e).len(), 8);
+    let x = [BabyBearExtElem::from(BabyBearElem::new(5))];
+    assert_eq!(super::as_bytes(&x).len(), 16);
+    assert_eq!(super::as_bytes(&[1u32, 2]), &[1, 0, 0, 0, 2, 0, 0, 0]);
 }
 
 /// RISC0_METAL_DEBUG: a raw host pointer to a buffer an unsynced batch uses panics.

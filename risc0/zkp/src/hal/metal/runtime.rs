@@ -79,10 +79,13 @@ pub enum Grid {
     Groups { groups: MTLSize, threads: MTLSize },
 }
 
-/// The bytes of a slice of POD values, for [KernelArg::Bytes].
-pub fn as_bytes<T: Copy>(values: &[T]) -> &[u8] {
-    // SAFETY: any initialised `T: Copy` value may be viewed as bytes; the length is exact.
-    unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, mem::size_of_val(values)) }
+/// The bytes of a slice of padding-free values, for [KernelArg::Bytes].
+///
+/// `T: bytemuck::NoUninit` guarantees every byte of `T` is initialised (no padding), so this is
+/// sound for any caller. Kernel `Params` structs passed through `set_bytes` must therefore be
+/// `#[repr(C)]` with explicit padding fields and `#[derive(bytemuck::NoUninit)]`.
+pub fn as_bytes<T: bytemuck::NoUninit>(values: &[T]) -> &[u8] {
+    bytemuck::cast_slice(values)
 }
 
 enum Encoder {
