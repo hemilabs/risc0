@@ -33,6 +33,8 @@ use anyhow::Result;
 
 use crate::{ProverParams, SetupParams};
 
+pub mod small;
+
 /// The error every entry point returns until the Metal Groth16 prover exists. Callers fall back
 /// to another prover when they see it (`anyhow::Error::is::<MetalNotImplemented>()`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
