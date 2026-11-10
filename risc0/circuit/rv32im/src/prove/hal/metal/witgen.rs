@@ -38,8 +38,13 @@
 //! `pre_data == data`, saving `rows * 211 * 4` bytes). A separate `pre_data` from the prover
 //! (`RISC0_USE_PRE_DATA`) already holds the scattered rows and cycle columns and is bound as is.
 //!
-//! `RISC0_METAL_RV32IM_CPU_PHASES` containing `witgen` selects the CPU fallback: the CPU witgen
-//! kernel over host views of the shared buffers (R7's delegation), with the CPU HAL's flags.
+//! **The GPU path is opt-in** (`RISC0_METAL_RV32IM_GPU_PHASES` containing `witgen`). By default,
+//! and whenever `RISC0_METAL_RV32IM_CPU_PHASES` contains `witgen` (which wins), witgen runs the CPU
+//! kernel over host views of the shared buffers (R7's delegation), with the CPU HAL's flags. The
+//! generated witgen kernels give wrong results on identical inputs from time to time, even
+//! single-threaded (`fwd_stepExec`), so a proof made with them can fail verification
+//! (docs/metal-port/notes/R8.md, "Kernel nondeterminism"). Enable the GPU path only to work on
+//! that issue (`witgen_segment_file` reproduces it).
 
 use std::sync::LazyLock;
 
@@ -151,8 +156,18 @@ pub(crate) fn cpu_phase(phase: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Witgen runs the CPU kernel (debugging fallback), read once per process.
-static CPU_WITGEN: LazyLock<bool> = LazyLock::new(|| cpu_phase("witgen"));
+/// Whether `RISC0_METAL_RV32IM_GPU_PHASES` (comma list of `witgen,accum,eval`) names `phase`: an
+/// opt-in for a phase whose Metal kernels are not trusted yet.
+pub(crate) fn gpu_phase(phase: &str) -> bool {
+    std::env::var("RISC0_METAL_RV32IM_GPU_PHASES")
+        .map(|v| v.split(',').any(|p| p.trim() == phase))
+        .unwrap_or(false)
+}
+
+/// Witgen runs the CPU kernel: the default until the Metal witgen kernels are deterministic
+/// (module doc); `RISC0_METAL_RV32IM_GPU_PHASES=witgen` opts in to the GPU path,
+/// `RISC0_METAL_RV32IM_CPU_PHASES=witgen` forces the CPU. Read once per process.
+static CPU_WITGEN: LazyLock<bool> = LazyLock::new(|| cpu_phase("witgen") || !gpu_phase("witgen"));
 
 /// `RISC0_METAL_WITGEN_SINGLE_BUFFER=1`: bind `data` as `pre_data` (CUDA's default).
 fn single_buffer() -> bool {
@@ -167,6 +182,16 @@ fn single_buffer() -> bool {
 pub(crate) fn defers_cycle_cols() -> bool {
     risc0_zkp::hal::metal::enabled("rv32im") && !*CPU_WITGEN
 }
+
+/// Debug: `RISC0_METAL_WITGEN_SYNC_STEPS=1` waits for the GPU after every encoded step (each
+/// dispatch, and after `injectCycleCols` and the `pre_data` snapshot), to rule out ordering
+/// hazards inside the batch (it does not change the nondeterminism of notes/R8.md).
+static SYNC_STEPS: LazyLock<bool> = LazyLock::new(|| {
+    matches!(
+        std::env::var("RISC0_METAL_WITGEN_SYNC_STEPS").as_deref(),
+        Ok("1")
+    )
+});
 
 /// What parallel witgen binds as `pre_data` (tests force a choice per call).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -317,6 +342,9 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
                 &[],
             );
         }
+        if *SYNC_STEPS {
+            hal.try_sync()?;
+        }
 
         // 3. pre_data (parallel mode only; the sequential kernels ignore binding 1).
         let snapshot = if mode == StepMode::Parallel && aliased && pre == PreData::Auto {
@@ -328,6 +356,9 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
             })
             .map_err(|e| e.context("RISC0_METAL_WITGEN_SINGLE_BUFFER=1 runs without it"))?;
             hal.eltwise_copy_elem(&snap, &data.buf);
+            if *SYNC_STEPS {
+                hal.try_sync()?;
+            }
             Some(snap)
         } else {
             None
@@ -367,6 +398,11 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
             args.push(KernelArg::Bytes(as_bytes(std::slice::from_ref(params))));
             args.push(extra);
             hal.dispatch(pso, &args, grid, &[]);
+            if *SYNC_STEPS {
+                hal.try_sync()
+            } else {
+                Ok(())
+            }
         };
 
         let last_cycle = cycles as u32;
@@ -382,7 +418,7 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
                         ..base
                     };
                     // perm (binding 10) is not read with use_perm = 0: bind the fault word.
-                    encode(pso, &params, arg(bind(&fault)), Grid::Threads(count as u64));
+                    encode(pso, &params, arg(bind(&fault)), Grid::Threads(count as u64))?;
                 }
             }
             StepMode::SeqForward | StepMode::SeqReverse => {
@@ -405,7 +441,7 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
                         groups: one,
                         threads: one,
                     };
-                    encode(pso, &base, KernelArg::Bytes(as_bytes(&sp)), grid);
+                    encode(pso, &base, KernelArg::Bytes(as_bytes(&sp)), grid)?;
                     begin = end;
                 }
             }

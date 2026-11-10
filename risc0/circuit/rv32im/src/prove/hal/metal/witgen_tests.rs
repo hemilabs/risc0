@@ -16,6 +16,11 @@
 //! after `WitnessGenerator::new`, i.e. after witgen and zeroize), over several guests including
 //! the 46 riscv-tests cases, in the parallel and both sequential modes, repeated.
 //!
+//! The GPU path is opt-in in production (witgen.rs module doc); these tests force it through the
+//! [Gpu] wrapper. The bit-exactness tests are `#[ignore]`d while the witgen kernels are
+//! nondeterministic (notes/R8.md): run them with `--ignored`. [witgen_default_is_cpu] checks the
+//! default path, [witgen_segment_file] reproduces the nondeterminism on a dumped zkvm segment.
+//!
 //! Knobs: `RISC0_METAL_WITGEN_REPS` (parallel repetitions per segment, default 3),
 //! `RISC0_METAL_WITGEN_PO2S` (po2 list of `witgen_matches_cpu_large`, default `16,18`).
 
@@ -144,6 +149,30 @@ fn first_diff(label: &str, cpu: &[Val], gpu: &[Val], rows: usize) -> usize {
     bad
 }
 
+/// The Metal circuit HAL with its witgen forced onto the GPU path (opt-in in production, see the
+/// module doc of witgen.rs), binding `pre_data` as the [PreData] says.
+struct Gpu<'a>(&'a MetalCircuitHalPoseidon2, PreData);
+
+impl CircuitWitnessGenerator<MetalHalPoseidon2> for Gpu<'_> {
+    fn writes_cycle_cols(&self) -> bool {
+        true
+    }
+    fn takes_zeroed_data(&self) -> bool {
+        true
+    }
+    fn generate_witness(
+        &self,
+        mode: StepMode,
+        preflight: &PreflightTrace,
+        global: &MetaBuffer<MetalHalPoseidon2>,
+        data: &MetaBuffer<MetalHalPoseidon2>,
+        pre_data: &MetaBuffer<MetalHalPoseidon2>,
+    ) -> anyhow::Result<()> {
+        self.0
+            .metal_witgen(mode, preflight, global, data, pre_data, self.1)
+    }
+}
+
 struct Harness {
     cpu_hal: Rc<CpuHal<crate::zirgen::circuit::CircuitField>>,
     hal: Arc<MetalHalPoseidon2>,
@@ -175,6 +204,15 @@ impl Harness {
 
     /// Metal witgen in `mode`: (data, global) after zeroize, and the peak allocation.
     fn metal(&self, pf: &PreflightResults, mode: StepMode) -> (Vec<Val>, Vec<Val>, u64) {
+        self.hal.reset_peak_allocated_size();
+        let gpu = Gpu(&self.circuit, PreData::Auto);
+        let w = WitnessGenerator::new(self.hal.as_ref(), &gpu, pf.clone(), mode).unwrap();
+        let peak = self.hal.peak_allocated_size();
+        (w.data.as_ref().unwrap().to_vec(), w.global.to_vec(), peak)
+    }
+
+    /// The Metal circuit HAL's default witgen (the CPU kernel unless opted in): as [Self::metal].
+    fn default_path(&self, pf: &PreflightResults, mode: StepMode) -> (Vec<Val>, Vec<Val>, u64) {
         self.hal.reset_peak_allocated_size();
         let w = WitnessGenerator::new(self.hal.as_ref(), &self.circuit, pf.clone(), mode).unwrap();
         let peak = self.hal.peak_allocated_size();
@@ -226,8 +264,43 @@ fn witgen_params_layout() {
     assert!(describe_fault(0x14).contains("transaction") && describe_fault(0x14).contains("asser"));
 }
 
+/// Without the opt-in, the Metal circuit HAL runs the CPU witgen kernel with the CPU HAL's flags,
+/// and its witness equals the CPU HAL's.
+#[test]
+fn witgen_default_is_cpu() {
+    if gpu_phase("witgen") && !cpu_phase("witgen") {
+        eprintln!("RISC0_METAL_RV32IM_GPU_PHASES opts in to the GPU witgen: skipped");
+        return;
+    }
+    let h = Harness::new();
+    assert!(!h.circuit.writes_cycle_cols());
+    assert!(!h.circuit.takes_zeroed_data());
+    assert!(!defers_cycle_cols());
+    let mut bad = 0;
+    for (label, program) in [
+        ("basic", testutil::kernel::basic()),
+        ("simple_loop(40000)", testutil::kernel::simple_loop(40000)),
+    ] {
+        for pf in preflights(program, DEFAULT_SEGMENT_LIMIT_PO2) {
+            let rows = 1usize << pf.po2();
+            let (cpu_data, cpu_global) = h.cpu(&pf);
+            let w =
+                WitnessGenerator::new(h.hal.as_ref(), &h.circuit, pf.clone(), StepMode::Parallel)
+                    .unwrap();
+            let (data, global) = (w.data.as_ref().unwrap().to_vec(), w.global.to_vec());
+            bad += first_diff(&format!("{label} default data"), &cpu_data, &data, rows)
+                + first_diff(&format!("{label} default global"), &cpu_global, &global, 1);
+        }
+    }
+    assert_eq!(
+        bad, 0,
+        "the default Metal witgen path differs from the CPU HAL"
+    );
+}
+
 /// basic, multi_read and a two-segment simple_loop (table split > 0 and lookups) in all modes.
 #[test]
+#[ignore = "GPU witgen is opt-in: its kernels are nondeterministic (notes/R8.md); run with --ignored"]
 fn witgen_matches_cpu() {
     let h = Harness::new();
     let mut bad = 0;
@@ -249,6 +322,7 @@ fn witgen_matches_cpu() {
 
 /// The traces of the 46 riscv-tests cases (prove::tests::riscv), every mode.
 #[test]
+#[ignore = "GPU witgen is opt-in: its kernels are nondeterministic (notes/R8.md); run with --ignored"]
 fn witgen_matches_cpu_riscv() {
     let h = Harness::new();
     let mut bad = 0;
@@ -265,14 +339,17 @@ fn witgen_matches_cpu_riscv() {
 
 /// Larger segments (parallel mode only; the sequential kernels run ~40 us per cycle), with the
 /// peak Metal allocation of `WitnessGenerator::new` (process-wide: run this test alone for a
-/// clean figure).
+/// clean figure). `RISC0_METAL_WITGEN_LARGE_DEFAULT=1` measures the default path instead.
 #[test]
+#[ignore = "GPU witgen is opt-in: its kernels are nondeterministic (notes/R8.md); run with --ignored"]
 fn witgen_matches_cpu_large() {
     let po2s: Vec<usize> = std::env::var("RISC0_METAL_WITGEN_PO2S")
         .unwrap_or_else(|_| "16,18".into())
         .split(',')
         .map(|s| s.trim().parse().unwrap())
         .collect();
+    // RISC0_METAL_WITGEN_LARGE_DEFAULT=1: measure the circuit HAL's default path instead.
+    let default_path = env_or("RISC0_METAL_WITGEN_LARGE_DEFAULT", 0) == 1;
     let h = Harness::new();
     let mut bad = 0;
     for po2 in po2s {
@@ -285,7 +362,11 @@ fn witgen_matches_cpu_large() {
             h.hal.try_sync().unwrap();
             let before = h.hal.allocated_size();
             let t = Instant::now();
-            let (data, global, peak) = h.metal(pf, StepMode::Parallel);
+            let (data, global, peak) = if default_path {
+                h.default_path(pf, StepMode::Parallel)
+            } else {
+                h.metal(pf, StepMode::Parallel)
+            };
             let ms = t.elapsed().as_secs_f64() * 1e3;
             eprintln!(
                 "[r8] large po2={} rep={rep}: witgen_new {ms:.1} ms, allocated before {:.1} MB, \
@@ -412,6 +493,7 @@ fn witgen_snapshot_over_budget_is_an_error() {
 /// Single-buffer mode (CUDA's default `pre_data == data`) against the CPU: recorded for R15, not
 /// the default.
 #[test]
+#[ignore = "GPU witgen is opt-in: its kernels are nondeterministic (notes/R8.md); run with --ignored"]
 fn witgen_single_buffer_matches_cpu() {
     let h = Harness::new();
     let mut bad = 0;
@@ -435,13 +517,38 @@ fn witgen_single_buffer_matches_cpu() {
 
 /// [WitnessGenerator::new]'s buffer setup with the single-buffer kernels.
 fn single_buffer_witgen(h: &Harness, pf: &PreflightResults) -> (Vec<Val>, Vec<Val>) {
-    struct Single<'a>(&'a MetalCircuitHalPoseidon2);
-    impl CircuitWitnessGenerator<MetalHalPoseidon2> for Single<'_> {
+    let w = WitnessGenerator::new(
+        h.hal.as_ref(),
+        &Gpu(&h.circuit, PreData::Single),
+        pf.clone(),
+        StepMode::Parallel,
+    )
+    .unwrap();
+    (w.data.as_ref().unwrap().to_vec(), w.global.to_vec())
+}
+
+/// What one Metal witgen call saw and left, read back after syncs around it.
+struct Captured {
+    data_in: Vec<Val>,
+    data_out: Vec<Val>,
+    global_out: Vec<Val>,
+    pf_out: Vec<u8>,
+    result: Result<(), String>,
+}
+
+/// [WitnessGenerator::new]'s buffer setup, capturing the witgen call's inputs and outputs.
+fn captured_witgen(h: &Harness, pf: &PreflightResults, mode: StepMode, pre: PreData) -> Captured {
+    struct Cap<'a>(
+        &'a MetalCircuitHalPoseidon2,
+        PreData,
+        std::cell::RefCell<Option<Captured>>,
+    );
+    impl CircuitWitnessGenerator<MetalHalPoseidon2> for Cap<'_> {
         fn writes_cycle_cols(&self) -> bool {
-            self.0.writes_cycle_cols()
+            true
         }
         fn takes_zeroed_data(&self) -> bool {
-            self.0.takes_zeroed_data()
+            true
         }
         fn generate_witness(
             &self,
@@ -451,16 +558,148 @@ fn single_buffer_witgen(h: &Harness, pf: &PreflightResults) -> (Vec<Val>, Vec<Va
             data: &MetaBuffer<MetalHalPoseidon2>,
             pre_data: &MetaBuffer<MetalHalPoseidon2>,
         ) -> anyhow::Result<()> {
-            self.0
-                .metal_witgen(mode, preflight, global, data, pre_data, PreData::Single)
+            let data_in = data.buf.to_vec();
+            let result = self
+                .0
+                .metal_witgen(mode, preflight, global, data, pre_data, self.1);
+            let pf_out = self.0.ctx.scratch().pf.as_ref().unwrap().to_vec();
+            *self.2.borrow_mut() = Some(Captured {
+                data_in,
+                data_out: data.buf.to_vec(),
+                global_out: global.buf.to_vec(),
+                pf_out,
+                result: result.as_ref().map(|_| ()).map_err(|e| format!("{e:#}")),
+            });
+            result
         }
     }
+    let cap = Cap(&h.circuit, pre, Default::default());
+    let _ = WitnessGenerator::new(h.hal.as_ref(), &cap, pf.clone(), mode);
+    cap.2.into_inner().unwrap()
+}
+
+/// Rows (sorted, deduplicated) where two column-major matrices differ.
+fn diff_rows(a: &[Val], b: &[Val], rows: usize) -> Vec<usize> {
+    let mut out: Vec<usize> = a
+        .iter()
+        .zip(b)
+        .enumerate()
+        .filter(|(_, (x, y))| x != y)
+        .map(|(i, _)| i % rows)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Reproducer of the kernel nondeterminism (notes/R8.md): a segment dumped by a zkvm harness (`postcard` of `risc0_zkvm::Segment`, whose
+/// encoding starts with the index and this crate's [crate::execute::segment::Segment]), named by
+/// `RISC0_METAL_WITGEN_SEGMENT`, through the CPU witgen once and the Metal witgen
+/// `RISC0_METAL_WITGEN_REPS` times per mode of `RISC0_METAL_WITGEN_MODES` (`par,single,fwd,rev`,
+/// default `par`), with the input and output of every call compared. Skipped when unset.
+#[test]
+fn witgen_segment_file() {
+    let Ok(path) = std::env::var("RISC0_METAL_WITGEN_SEGMENT") else {
+        eprintln!("RISC0_METAL_WITGEN_SEGMENT unset: skipped");
+        return;
+    };
+    let bytes = std::fs::read(&path).unwrap();
+    let ((_index, segment), _) =
+        postcard::take_from_bytes::<(u32, crate::execute::segment::Segment)>(&bytes).unwrap();
+    let pf = PreflightResults::new(&segment, ExtVal::random(&mut rand::rng())).unwrap();
+    let rows = 1usize << pf.po2();
+    let h = Harness::new();
     let w = WitnessGenerator::new(
-        h.hal.as_ref(),
-        &Single(&h.circuit),
+        h.cpu_hal.as_ref(),
+        &CpuCircuitHal,
         pf.clone(),
-        StepMode::Parallel,
+        StepMode::SeqForward,
     )
     .unwrap();
-    (w.data.as_ref().unwrap().to_vec(), w.global.to_vec())
+    let (cpu_data, cpu_global) = (w.data.as_ref().unwrap().to_vec(), w.global.to_vec());
+    let trace = w.trace;
+    let modes = std::env::var("RISC0_METAL_WITGEN_MODES").unwrap_or_else(|_| "par".into());
+    let mut first_in: Option<Vec<Val>> = None;
+    let mut good_pf: Option<Vec<u8>> = None;
+    let mut failures = 0;
+    for mode_name in modes.split(',') {
+        let (mode, pre) = match mode_name.trim() {
+            "par" => (StepMode::Parallel, PreData::Auto),
+            "single" => (StepMode::Parallel, PreData::Single),
+            "fwd" => (StepMode::SeqForward, PreData::Auto),
+            "rev" => (StepMode::SeqReverse, PreData::Auto),
+            other => panic!("unknown mode {other}"),
+        };
+        for rep in 0..reps() {
+            let t = Instant::now();
+            let c = captured_witgen(&h, &pf, mode, pre);
+            let ms = t.elapsed().as_secs_f64() * 1e3;
+            let input_rows = match &first_in {
+                None => {
+                    first_in = Some(c.data_in.clone());
+                    vec![]
+                }
+                Some(first) => diff_rows(first, &c.data_in, rows),
+            };
+            let global: Vec<Val> = c.global_out.iter().map(|v| v.valid_or_zero()).collect();
+            let out_rows = diff_rows(&cpu_data, &c.data_out, rows);
+            let global_bad = first_diff("global", &cpu_global, &global, 1);
+            let pf_same = match (&good_pf, c.result.is_ok() && out_rows.is_empty()) {
+                (None, true) => {
+                    good_pf = Some(c.pf_out.clone());
+                    "ref".to_string()
+                }
+                (Some(g), _) => {
+                    let n = g.iter().zip(&c.pf_out).filter(|(a, b)| a != b).count();
+                    format!("{n} bytes differ")
+                }
+                (None, false) => "no ref yet".to_string(),
+            };
+            let ok = c.result.is_ok() && out_rows.is_empty() && global_bad == 0;
+            if !ok {
+                failures += 1;
+                first_diff(
+                    &format!("{mode_name} rep={rep} data"),
+                    &cpu_data,
+                    &c.data_out,
+                    rows,
+                );
+            }
+            eprintln!(
+                "[r8] seg po2={} {mode_name} rep={rep} {ms:.0} ms: {:?}; input rows differing \
+                 from rep 0: {} {:?}; output rows differing from cpu: {} {:?}; pf_out vs a good \
+                 run: {pf_same}",
+                pf.po2(),
+                c.result,
+                input_rows.len(),
+                &input_rows[..input_rows.len().min(8)],
+                out_rows.len(),
+                &out_rows[..out_rows.len().min(8)],
+            );
+            for (i, (a, b)) in cpu_data.iter().zip(&c.data_out).enumerate() {
+                if a != b {
+                    eprintln!(
+                        "[r8]   cell row {} col {}: cpu {:#x} metal {:#x}",
+                        i % rows,
+                        i / rows,
+                        a.as_u32(),
+                        b.as_u32()
+                    );
+                }
+            }
+            if !out_rows.is_empty() {
+                let r = out_rows[0];
+                let cyc = &trace.cycles[r];
+                eprintln!(
+                    "[r8]   first bad row {r}: cycle major {} minor {} pc {:#x} state {} \
+                     txn_idx {}; split {}",
+                    cyc.major, cyc.minor, cyc.pc, cyc.state, cyc.txn_idx, trace.table_split_cycle
+                );
+            }
+        }
+    }
+    assert_eq!(
+        failures, 0,
+        "Metal witgen calls that failed or differ from the CPU"
+    );
 }
