@@ -33,10 +33,14 @@ static VERBOSE: LazyLock<bool> = LazyLock::new(|| std::env::var("RISC0_VERBOSE")
 /// uploaded cycles, so the host injector leaves them out (5 of its ~5.1 entries per row at
 /// po2=20). Part of the witgen staging feature (`RISC0_CUDA_WITGEN_STAGE=0` keeps them in the
 /// injector).
+/// On Metal the witgen's `injectCycleCols` writes them (PLAN 4.2 R8), unless the rv32im Metal
+/// prover is disabled or witgen runs on the CPU (`RISC0_METAL_RV32IM_CPU_PHASES=witgen`).
 static DEFER_CYCLE_COLS: LazyLock<bool> = LazyLock::new(|| {
     #[cfg(any(feature = "cuda", feature = "rocm"))]
     return cuda_stage::enabled();
-    #[cfg(not(any(feature = "cuda", feature = "rocm")))]
+    #[cfg(all(feature = "metal", not(any(feature = "cuda", feature = "rocm"))))]
+    return super::hal::metal::defers_cycle_cols();
+    #[cfg(not(any(feature = "cuda", feature = "rocm", feature = "metal")))]
     false
 });
 

@@ -12,8 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Used by the CPU and Intel paths; the CUDA/ROCm path below takes an Arc.
-#[cfg_attr(any(feature = "cuda", feature = "rocm"), allow(unused_imports))]
+// Used by the CPU and Intel paths; the CUDA/ROCm/Metal paths below take an Arc.
+#[cfg_attr(
+    any(feature = "cuda", feature = "rocm", feature = "metal"),
+    allow(unused_imports)
+)]
 use std::rc::Rc;
 
 use risc0_binfmt::{MemoryImage, Program};
@@ -84,11 +87,11 @@ fn fwd_rev_ab_test(program: Program) {
             use crate::prove::hal::hip::HipCircuitHalPoseidon2;
             let hal = std::sync::Arc::new(HipHalPoseidon2::new());
             let circuit_hal = HipCircuitHalPoseidon2::new(hal.clone());
-        // } else if #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), target_os = "ios"))] {
-        //     use risc0_zkp::hal::metal::MetalHalSha256;
-        //     use crate::prove::hal::metal::MetalCircuitHal;
-        //     let hal = Rc::new(MetalHalSha256::new());
-        //     let circuit_hal = MetalCircuitHal::new(hal.clone());
+        } else if #[cfg(feature = "metal")] {
+            use risc0_zkp::hal::metal::MetalHalPoseidon2;
+            use crate::prove::hal::metal::MetalCircuitHalPoseidon2;
+            let hal = std::sync::Arc::new(MetalHalPoseidon2::new());
+            let circuit_hal = MetalCircuitHalPoseidon2::new(hal.clone()).unwrap();
         } else {
             let suite = risc0_zkp::core::hash::poseidon2::Poseidon2HashSuite::new_suite();
             let hal = Rc::new(risc0_zkp::hal::cpu::CpuHal::new(suite));
