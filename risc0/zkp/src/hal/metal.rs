@@ -31,9 +31,14 @@
 
 mod buffer;
 mod kernels;
+// `poseidon2` is taken by the `core::hash::poseidon2` import below.
+#[path = "metal/poseidon2.rs"]
+mod pv_poseidon2;
 mod runtime;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_z3;
 
 use std::{
     fmt::Debug,
@@ -60,6 +65,7 @@ use self::runtime::Runtime;
 pub use self::{
     buffer::BufferImpl,
     kernels::MetalKernels,
+    pv_poseidon2::{MetalHashPoseidon2, Poseidon2Config, Poseidon2Kernels},
     runtime::{as_bytes, Grid, KernelArg, DEFAULT_BATCH_DISPATCHES, MAX_SET_BYTES},
 };
 use super::{Buffer as _, Hal};
@@ -99,6 +105,20 @@ pub const KERNEL_NAMES: &[&str] = &[
     "sha_fold",
     "sha_rows",
     "zk_shift",
+    "pv_fold_k",
+    "pv_fold_k_m32",
+    "pv_fold_tail_k",
+    "pv_fold_tail_k_m32",
+    "pv_rows_k",
+    "pv_rows_k_m32",
+    "pvs_q_fold_k",
+    "pvs_q_fold_k_m32",
+    "pvs_q_rows_k",
+    "pvs_q_rows_k_m32",
+    "pvs_w_fold_k",
+    "pvs_w_fold_k_m32",
+    "pvs_w_rows_k",
+    "pvs_w_rows_k_m32",
 ];
 
 /// Whether the Metal backend may be used for `unit` (one of `zkp`, `rv32im`, `recursion`,
@@ -257,18 +277,20 @@ impl MetalHash for MetalHashSha256 {
     }
 }
 
-pub struct MetalHashPoseidon2 {
+/// The original `poseidon2.metal` kernels (oracle until Z7); [MetalHashPoseidon2] (pv.metal)
+/// can also select them at run time.
+pub struct MetalHashPoseidon2Legacy {
     suite: HashSuite<BabyBear>,
     round_constants: BufferImpl<BabyBearElem>,
     m_int_diag: BufferImpl<BabyBearElem>,
 }
 
-impl MetalHash for MetalHashPoseidon2 {
+impl MetalHash for MetalHashPoseidon2Legacy {
     fn new(hal: &MetalHal<Self>) -> Self {
         let round_constants =
             hal.copy_from_elem("round_constants", poseidon2::consts::ROUND_CONSTANTS);
         let m_int_diag = hal.copy_from_elem("m_int_diag", poseidon2::consts::M_INT_DIAG_HZN);
-        MetalHashPoseidon2 {
+        MetalHashPoseidon2Legacy {
             suite: Poseidon2HashSuite::new_suite(),
             round_constants,
             m_int_diag,
@@ -328,6 +350,7 @@ impl<MH: MetalHash> Debug for MetalHal<MH> {
 
 pub type MetalHalSha256 = MetalHal<MetalHashSha256>;
 pub type MetalHalPoseidon2 = MetalHal<MetalHashPoseidon2>;
+pub type MetalHalPoseidon2Legacy = MetalHal<MetalHashPoseidon2Legacy>;
 
 impl<MH: MetalHash> Default for MetalHal<MH> {
     fn default() -> Self {
