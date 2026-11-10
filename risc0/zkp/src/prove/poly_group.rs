@@ -196,6 +196,12 @@ impl<H: Hal> PolyGroup<H> {
     }
 }
 
+/// A GPU HAL whose buffers live in host-shared memory (Apple Metal): host spills of device buffers
+/// save nothing there. The CPU HAL also reports unified memory, but no GPU memory size.
+fn unified_memory_gpu<H: Hal>(hal: &H) -> bool {
+    hal.has_unified_memory() && hal.gpu_total_memory() != usize::MAX
+}
+
 impl<H: Hal> PolyGroup<H> {
     pub fn new(
         hal: &H,
@@ -256,7 +262,10 @@ impl<H: Hal> PolyGroup<H> {
         // PolyGroups plus witgen fit comfortably in 24 GB; spilling adds
         // H2D/D2H overhead and perturbs the driver mempool state in ways that
         // regress performance (and can OOM later stages via mempool churn).
-        let spill_enabled = size >= (1 << 22);
+        // Unified-memory GPU HALs (Metal) skip it: the "host" copy would sit in the same physical
+        // memory as the device buffer and save nothing (same test as prover.rs's
+        // `unified_memory_gpu`, which gates the evaluated spill).
+        let spill_enabled = size >= (1 << 22) && !unified_memory_gpu(hal);
         let coeffs_bytes = coeffs.size() * std::mem::size_of::<H::Elem>();
         let spill_threshold: usize = 512 << 20;
         let (coeffs_dev, coeffs_host) = if spill_enabled && coeffs_bytes >= spill_threshold {

@@ -11,6 +11,11 @@ repository = { workspace = true }
 name = "hash"
 harness = false
 
+[[bench]]
+name = "metal"
+harness = false
+required-features = ["metal"]
+
 [dependencies]
 anyhow = { version = "1.0", default-features = false }
 blake2 = { version = "0.10.6", default-features = false }

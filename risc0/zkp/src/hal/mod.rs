@@ -769,7 +769,9 @@ mod testutil {
         let mut rng = rand::rng();
         let hal_cpu = CpuHal::new(hal_gpu.get_hash_suite().clone());
         // 13 and 14 reach the quad-per-permutation small-level kernels (pv_small.cuh, 2048 < n <= 8192).
-        for layers in [1, 2, 7, 12, 13, 14] {
+        // Every layer count 1..=14: each crossover of the Poseidon2 fold kernels (pvs_w / pvs_q /
+        // pv, plan 4.1 Z3) and of the single-layer fold paths.
+        for layers in 1..=14 {
             let leaves = 1 << layers;
             let digests: Vec<Digest> = (0..leaves * 2)
                 .map(|_| Digest::from(std::array::from_fn(|_| rng.next_u32() / 3)))
@@ -878,6 +880,680 @@ mod testutil {
             let count = poly_count * steps;
             let io = generate_elem(&hal, &mut rng, count);
             hal.zk_shift(&io, poly_count);
+        }
+    }
+
+    // ---- Z6: CPU-vs-GPU conformance for every Hal method (plan 4.1 row Z6, 6.1) ----
+    //
+    // Methods `DualHal` forwards go through it (it compares both sides after each call). For the
+    // ones it does not forward (`scatter_bits`, `combos_prepare`, `combos_divide`,
+    // `alloc_extelem_zeroed`, the fused NTT entry points) the CPU HAL and the GPU HAL run
+    // separately on identical inputs and the buffers are compared.
+
+    use rand::{rngs::SmallRng, seq::SliceRandom, Rng, SeedableRng};
+    use risc0_core::field::{Field, RootsOfUnity};
+
+    use crate::{
+        adapter::{
+            CircuitCoreDef, CircuitInfo, MixState, PolyExt, ProtocolInfo, TapsProvider,
+            PROOF_SYSTEM_INFO,
+        },
+        core::{log2_ceil, poly::poly_divide},
+        hal::{AccumPreflight, CircuitHal},
+        prove::Prover,
+        taps::{TapData, TapSet},
+    };
+
+    fn dual<H: Hal>(hal_gpu: H) -> DualHal<H::Field, CpuHal<H::Field>, H> {
+        let hal_cpu = CpuHal::new(hal_gpu.get_hash_suite().clone());
+        DualHal::new(Rc::new(hal_cpu), Rc::new(hal_gpu))
+    }
+
+    fn cpu_of<H: Hal>(hal_gpu: &H) -> CpuHal<H::Field> {
+        CpuHal::new(hal_gpu.get_hash_suite().clone())
+    }
+
+    fn rand_elems<E: Elem>(rng: &mut SmallRng, n: usize) -> Vec<E> {
+        (0..n).map(|_| E::random(rng)).collect()
+    }
+
+    fn rand_exts<E: ExtElem>(rng: &mut SmallRng, n: usize) -> Vec<E> {
+        (0..n).map(|_| E::random(rng)).collect()
+    }
+
+    /// `scatter` through DualHal: cycle counts 1..2^16, 0..=5 entries per cycle (empty ranges
+    /// included), unique offsets in random order, and the empty-index no-op.
+    pub(crate) fn scatter<H: Hal>(hal_gpu: H) {
+        let hal = dual(hal_gpu);
+        let mut rng = SmallRng::seed_from_u64(0x5ca7);
+        for cycles in [1usize, 9, 1025, 1 << 16] {
+            let mut index = vec![0u32];
+            for _ in 0..cycles {
+                let last = *index.last().unwrap();
+                index.push(last + rng.random_range(0..=5));
+            }
+            let entries = *index.last().unwrap() as usize;
+            let size = entries * 2 + 7;
+            let mut perm: Vec<u32> = (0..size as u32).collect();
+            perm.shuffle(&mut rng);
+            let offsets = &perm[..entries];
+            let values: Vec<H::Elem> = rand_elems(&mut rng, entries);
+            let into = hal.copy_from_elem("into", &rand_elems::<H::Elem>(&mut rng, size));
+            hal.scatter(&into, &index, offsets, &values);
+        }
+        let into = hal.copy_from_elem("into", &rand_elems::<H::Elem>(&mut rng, 4));
+        hal.scatter(&into, &[], &[], &[]);
+    }
+
+    /// `scatter_bits` (not forwarded by DualHal): unique (row, base) cells, triples up to 2^13,
+    /// plus a trailing partial triple (ignored by every HAL).
+    pub(crate) fn scatter_bits<H: Hal>(hal_gpu: H) {
+        let hal_cpu = cpu_of(&hal_gpu);
+        let mut rng = SmallRng::seed_from_u64(0xb175);
+        let cycles = 4096u32;
+        let bases = 4u32;
+        for n in [0usize, 1, 7, 1000, 8192] {
+            let mut cells: Vec<(u32, u32)> = (0..cycles)
+                .flat_map(|r| (0..bases).map(move |b| (r, b * 32)))
+                .collect();
+            cells.shuffle(&mut rng);
+            let mut bit_data = Vec::with_capacity(n * 3 + 2);
+            for &(row, base) in &cells[..n] {
+                bit_data.extend([row, base, rng.random::<u32>()]);
+            }
+            bit_data.extend([1, 2]);
+            let size = (bases * 32 * cycles) as usize;
+            let init: Vec<H::Elem> = rand_elems(&mut rng, size);
+            let gpu = hal_gpu.copy_from_elem("into", &init);
+            let cpu = hal_cpu.copy_from_elem("into", &init);
+            hal_gpu.scatter_bits(&gpu, &bit_data, cycles);
+            hal_cpu.scatter_bits(&cpu, &bit_data, cycles);
+            assert!(gpu.to_vec() == cpu.to_vec(), "scatter_bits n={n}");
+        }
+    }
+
+    /// `eltwise_zeroize_elem` through DualHal: ~25% INVALID cells, every COUNTS size, and a
+    /// sub-slice at an offset.
+    pub(crate) fn eltwise_zeroize_elem<H: Hal>(hal_gpu: H) {
+        let hal = dual(hal_gpu);
+        let mut rng = SmallRng::seed_from_u64(0x2e70);
+        let mut make = |rng: &mut SmallRng, n: usize| -> Vec<H::Elem> {
+            (0..n)
+                .map(|_| {
+                    if rng.random_range(0..4) == 0 {
+                        H::Elem::INVALID
+                    } else {
+                        H::Elem::random(rng)
+                    }
+                })
+                .collect()
+        };
+        for count in COUNTS {
+            let buf = hal.copy_from_elem("elems", &make(&mut rng, count));
+            hal.eltwise_zeroize_elem(&buf);
+        }
+        let buf = hal.copy_from_elem("elems", &make(&mut rng, 5000));
+        hal.eltwise_zeroize_elem(&buf.slice(13, 4000));
+        assert!(
+            buf.to_vec()[..13]
+                .iter()
+                .chain(&buf.to_vec()[4013..])
+                .any(|e| !e.is_valid()),
+            "cells outside the slice must be left alone"
+        );
+    }
+
+    /// `eltwise_copy_elem_slice` through DualHal: offsets, strides != cols, empty shapes.
+    pub(crate) fn eltwise_copy_elem_slice<H: Hal>(hal_gpu: H) {
+        let hal = dual(hal_gpu);
+        let mut rng = SmallRng::seed_from_u64(0xc0b1);
+        // (rows, cols, from_offset, from_stride, into_offset, into_stride)
+        for (rows, cols, fo, fs, io, is) in [
+            (1usize, 1usize, 0usize, 1usize, 0usize, 1usize),
+            (5, 3, 2, 4, 1, 7),
+            (1000, 24, 13, 30, 5, 1024),
+            (65, 211, 0, 211, 0, 256),
+            (4096, 16, 0, 16, 3, 16),
+            (0, 5, 0, 5, 0, 5),
+            (7, 0, 0, 3, 0, 3),
+        ] {
+            let from: Vec<H::Elem> = rand_elems(&mut rng, fo + rows * fs + cols + 1);
+            let into_size = io + rows * is + cols + 1;
+            let into = hal.copy_from_elem("into", &rand_elems::<H::Elem>(&mut rng, into_size));
+            hal.eltwise_copy_elem_slice(&into, &from, rows, cols, fo, fs, io, is);
+        }
+    }
+
+    /// `alloc_elem_init` (DualHal) and `alloc_extelem_zeroed` (direct; the pool is dirtied at
+    /// each size first, so a fill that is skipped or lands late shows up).
+    pub(crate) fn alloc_init<H: Hal>(hal_gpu: H) {
+        let mut rng = SmallRng::seed_from_u64(0xa110);
+        for size in [1usize, 9, 1000, 1 << 20] {
+            let junk = hal_gpu.copy_from_extelem("junk", &rand_exts::<H::ExtElem>(&mut rng, size));
+            drop(junk);
+            let zeroed = hal_gpu.alloc_extelem_zeroed("zeroed", size);
+            assert!(
+                zeroed
+                    .to_vec()
+                    .iter()
+                    .all(|e| e.to_u32_words() == H::ExtElem::ZERO.to_u32_words()),
+                "alloc_extelem_zeroed size={size}"
+            );
+            let junk = hal_gpu.copy_from_elem("junk", &rand_elems::<H::Elem>(&mut rng, size));
+            drop(junk);
+            for value in [
+                H::Elem::ZERO,
+                H::Elem::ONE,
+                H::Elem::INVALID,
+                H::Elem::random(&mut rng),
+            ] {
+                let buf = hal_gpu.alloc_elem_init("init", size, value);
+                // Raw words: `==` asserts validity, and INVALID is one of the fill values.
+                let want = value.to_u32_words();
+                assert!(
+                    buf.to_vec().iter().all(|e| e.to_u32_words() == want),
+                    "alloc_elem_init size={size}"
+                );
+            }
+        }
+        let hal = dual(hal_gpu);
+        let buf = hal.alloc_elem_init("init", 1025, H::Elem::random(&mut rng));
+        hal.eltwise_zeroize_elem(&buf);
+    }
+
+    /// `combos_prepare` (not forwarded by DualHal): 300 registers of 1..=4 taps over 5 combos,
+    /// repeated combo ids, cycles 16..2^14.
+    pub(crate) fn combos_prepare<H: Hal>(hal_gpu: H) {
+        let hal_cpu = cpu_of(&hal_gpu);
+        let mut rng = SmallRng::seed_from_u64(0xc0b0);
+        let combo_count = 5;
+        for cycles in [16usize, 1024, 1 << 14] {
+            let regs = 300;
+            let reg_sizes: Vec<u32> = (0..regs).map(|_| rng.random_range(1..=4)).collect();
+            let reg_combo_ids: Vec<u32> = (0..regs)
+                .map(|_| rng.random_range(0..combo_count as u32))
+                .collect();
+            let taps: usize = reg_sizes.iter().map(|&s| s as usize).sum();
+            let coeff_u: Vec<H::ExtElem> = rand_exts(&mut rng, taps + H::CHECK_SIZE);
+            let mix = H::ExtElem::random(&mut rng);
+            let init: Vec<H::ExtElem> = rand_exts(&mut rng, cycles * (combo_count + 1));
+            let gpu = hal_gpu.copy_from_extelem("combos", &init);
+            let cpu = hal_cpu.copy_from_extelem("combos", &init);
+            hal_gpu.combos_prepare(
+                &gpu,
+                &coeff_u,
+                combo_count,
+                cycles,
+                &reg_sizes,
+                &reg_combo_ids,
+                &mix,
+            );
+            hal_cpu.combos_prepare(
+                &cpu,
+                &coeff_u,
+                combo_count,
+                cycles,
+                &reg_sizes,
+                &reg_combo_ids,
+                &mix,
+            );
+            assert!(
+                gpu.to_vec() == cpu.to_vec(),
+                "combos_prepare cycles={cycles}"
+            );
+        }
+    }
+
+    /// Polynomial of `n` coefficients: random, or (`divisible`) a random polynomial times
+    /// prod (X - r) over `roots`, so each division leaves a zero remainder.
+    fn divisible_poly<E: ExtElem>(
+        rng: &mut SmallRng,
+        n: usize,
+        roots: &[E],
+        divisible: bool,
+    ) -> Vec<E> {
+        if !divisible {
+            return rand_exts(rng, n);
+        }
+        let m = roots.len();
+        let mut p: Vec<E> = rand_exts(rng, n - m);
+        p.resize(n, E::ZERO);
+        for (deg, &z) in (n - m..).zip(roots) {
+            // p * (X - z): q[i] = p[i - 1] - z * p[i]
+            for i in (0..=deg).rev() {
+                let lo = if i > 0 { p[i - 1] } else { E::ZERO };
+                let hi = if i < deg { p[i] } else { E::ZERO };
+                p[i] = lo - z * hi;
+            }
+        }
+        p
+    }
+
+    /// The `tracing` output of `f` on this thread (for `report_nonzero_remainders`).
+    fn capture_logs(f: impl FnOnce()) -> Vec<String> {
+        use std::{
+            io::Write,
+            sync::{Arc, Mutex},
+        };
+        #[derive(Clone)]
+        struct W(Arc<Mutex<Vec<u8>>>);
+        impl Write for W {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Arc::new(Mutex::new(vec![]));
+        let w = W(buf.clone());
+        let sub = tracing_subscriber::fmt()
+            .with_writer(move || w.clone())
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::ERROR)
+            .finish();
+        {
+            let _guard = tracing_subscriber::util::SubscriberInitExt::set_default(sub);
+            f();
+        }
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        text.lines()
+            .filter(|l| l.contains("nonzero remainder"))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// `combos_divide` at `2^po2` cycles (not forwarded by DualHal).
+    ///
+    /// Zero remainders: 7 slices, 6 in-order chunks with 1/2/3/1/2/1 roots (the prover's shape:
+    /// the last chunk is the check combo), slice 6 untouched; the CPU HAL (which asserts zero
+    /// remainders) is the oracle.
+    ///
+    /// Nonzero remainders (GPU HALs only; the CPU HAL panics): chunks 1 and 4 hold random data. The
+    /// oracle is the CUDA/sppark `div_by_x_minus_z<rotate=true>` semantics the GPU HALs share:
+    /// `poly_divide`, then the remainder lands in `a[n - 1]`; one `report_nonzero_remainders`
+    /// line per nonzero remainder.
+    pub(crate) fn combos_divide<H: Hal>(hal_gpu: H, po2: usize) {
+        let hal_cpu = cpu_of(&hal_gpu);
+        let n = 1usize << po2;
+        let roots = [1usize, 2, 3, 1, 2, 1];
+        for bad in [&[][..], &[1usize, 4][..]] {
+            let mut rng = SmallRng::seed_from_u64(0xd1u64 << 8 | po2 as u64);
+            let mut data: Vec<H::ExtElem> = rand_exts(&mut rng, 7 * n);
+            let mut chunks = vec![];
+            for (c, &r) in roots.iter().enumerate() {
+                let pows: Vec<H::ExtElem> = rand_exts(&mut rng, r);
+                let slice = divisible_poly(&mut rng, n, &pows, !bad.contains(&c));
+                data[c * n..(c + 1) * n].copy_from_slice(&slice);
+                chunks.push((c, pows));
+            }
+            let gpu = hal_gpu.copy_from_extelem("combos", &data);
+            let logs = capture_logs(|| hal_gpu.combos_divide(&gpu, chunks.clone(), n));
+            let gpu = gpu.to_vec();
+            if bad.is_empty() {
+                let cpu = hal_cpu.copy_from_extelem("combos", &data);
+                hal_cpu.combos_divide(&cpu, chunks, n);
+                assert!(logs.is_empty(), "po2={po2}: unexpected {logs:?}");
+                assert!(gpu == cpu.to_vec(), "po2={po2}: combos differ");
+            } else {
+                let mut expect = data.clone();
+                let mut nonzero = 0;
+                for (c, pows) in &chunks {
+                    let slice = &mut expect[c * n..(c + 1) * n];
+                    for &pow in pows {
+                        let rem = poly_divide(slice, pow);
+                        slice[n - 1] = rem;
+                        nonzero += usize::from(rem != H::ExtElem::ZERO);
+                    }
+                }
+                assert!(nonzero >= 2, "po2={po2}: the bad chunks must not divide");
+                assert_eq!(logs.len(), nonzero, "po2={po2}: {logs:?}");
+                assert!(
+                    gpu == expect,
+                    "po2={po2}: combos differ (nonzero remainders)"
+                );
+            }
+        }
+    }
+
+    /// The zk-shift family at many shapes: `zk_shift` and `batch_interpolate_ntt` through
+    /// DualHal; the fused `batch_interpolate_ntt_zk_shift` / `_from` (which DualHal does not
+    /// forward) directly, with `src` checked unchanged.
+    pub(crate) fn zk_shift_variants<H: Hal>(hal_gpu: H) {
+        let hal_cpu = cpu_of(&hal_gpu);
+        let mut rng = SmallRng::seed_from_u64(0x2c5f);
+        for lg in [1usize, 2, 5, 10, 11, 12, 13, 16, 20] {
+            for cols in [1usize, 3, 211] {
+                if lg + log2_ceil(cols) > 22 {
+                    continue;
+                }
+                let size = cols << lg;
+                let values: Vec<H::Elem> = rand_elems(&mut rng, size);
+                let what = format!("lg={lg} cols={cols}");
+
+                let gpu = hal_gpu.copy_from_elem("io", &values);
+                let cpu = hal_cpu.copy_from_elem("io", &values);
+                hal_gpu.zk_shift(&gpu, cols);
+                hal_cpu.zk_shift(&cpu, cols);
+                assert!(gpu.to_vec() == cpu.to_vec(), "zk_shift {what}");
+
+                let gpu = hal_gpu.copy_from_elem("io", &values);
+                let cpu = hal_cpu.copy_from_elem("io", &values);
+                hal_gpu.batch_interpolate_ntt_zk_shift(&gpu, cols);
+                hal_cpu.batch_interpolate_ntt_zk_shift(&cpu, cols);
+                let fused = cpu.to_vec();
+                assert!(gpu.to_vec() == fused, "interpolate_zk_shift {what}");
+
+                let src = hal_gpu.copy_from_elem("src", &values);
+                let dst = hal_gpu.alloc_elem("dst", size);
+                hal_gpu.batch_interpolate_ntt_zk_shift_from(&dst, &src, cols);
+                assert!(dst.to_vec() == fused, "interpolate_zk_shift_from {what}");
+                assert!(
+                    src.to_vec() == values,
+                    "interpolate_zk_shift_from {what}: src changed"
+                );
+            }
+        }
+    }
+
+    /// `batch_evaluate_any` through DualHal at every dispatcher branch (Metal: eu2 S = 1, S capped
+    /// by deg / 4096, S stopped by S * nEvals >= 1024, nEvals >= 1024, Horner for deg < 4096,
+    /// deg % 4096 != 0 and a coeffs slice that is not 16-byte aligned, eu2 again at a 16-byte
+    /// aligned slice offset, and nEvals = 0).
+    pub(crate) fn eval_any_shapes<H: Hal>(hal_gpu: H) {
+        let hal = dual(hal_gpu);
+        let mut rng = SmallRng::seed_from_u64(0xe0a1);
+        // (deg, polys, evals, coeffs element offset); degrees are powers of two (the CPU HAL's
+        // contract), so the Horner gate is reached through deg < 4096 and misalignment.
+        for (deg, polys, evals, off) in [
+            (4096usize, 1usize, 1usize, 0usize),
+            (1 << 16, 4, 1, 0),
+            (1 << 16, 223, 865, 0),
+            (1 << 14, 8, 1100, 0),
+            (1 << 14, 300, 300, 0),
+            (1 << 20, 2, 4, 0),
+            (2048, 3, 9, 0),
+            (1, 3, 5, 0),
+            (8192, 3, 5, 1),
+            (8192, 3, 5, 3),
+            (8192, 3, 5, 4),
+            (4096, 1, 0, 0),
+        ] {
+            let all = hal.copy_from_elem(
+                "coeffs",
+                &rand_elems::<H::Elem>(&mut rng, off + deg * polys),
+            );
+            let coeffs = all.slice(off, deg * polys);
+            let which: Vec<u32> = (0..evals)
+                .map(|_| rng.random_range(0..polys as u32))
+                .collect();
+            let which = hal.copy_from_u32("which", &which);
+            let xs = hal.copy_from_extelem("xs", &rand_exts::<H::ExtElem>(&mut rng, evals));
+            let out = hal.alloc_extelem("out", evals);
+            hal.batch_evaluate_any(&coeffs, polys, &which, &xs, &out);
+        }
+    }
+
+    /// `mix_poly_coeffs` through DualHal at every kernel gate (Metal: v2 <= 1638 inputs,
+    /// v2 with device combo ids 1639..=2048, table-less above) and counts with count % 256 != 0.
+    /// Combo ids come in runs of 1..=5 (v2's run-end read-modify-write) and `out` starts random.
+    pub(crate) fn mix_poly_coeffs_shapes<H: Hal>(hal_gpu: H) {
+        let hal = dual(hal_gpu);
+        let mut rng = SmallRng::seed_from_u64(0x312);
+        for input_size in [1usize, 2, 7, 100, 1637, 1638, 1639, 2047, 2048, 2049, 2500] {
+            for count in [1usize, 255, 257, 1000, 4097] {
+                let mut combos = Vec::with_capacity(input_size);
+                let mut id = 0u32;
+                while combos.len() < input_size {
+                    let run = rng.random_range(1..=5);
+                    for _ in 0..run {
+                        if combos.len() < input_size {
+                            combos.push(id);
+                        }
+                    }
+                    id = (id + rng.random_range(1..=3)) % 8;
+                }
+                let ncombos = *combos.iter().max().unwrap() as usize + 1;
+                let out = hal
+                    .copy_from_extelem("out", &rand_exts::<H::ExtElem>(&mut rng, count * ncombos));
+                let input = hal.copy_from_elem(
+                    "input",
+                    &rand_elems::<H::Elem>(&mut rng, count * input_size),
+                );
+                let combos = hal.copy_from_u32("combos", &combos);
+                let mix_start = H::ExtElem::random(&mut rng);
+                let mix = H::ExtElem::random(&mut rng);
+                hal.mix_poly_coeffs(&out, &mix_start, &mix, &input, &combos, input_size, count);
+            }
+        }
+    }
+
+    // ---- a toy circuit for a full prove / verify round trip ----
+    //
+    // Groups (alphabetical, as the codegen orders them): accum (0) = [acc], code (1) = [k],
+    // data (2) = [a, c1, c2, c3]; `a` is also tapped one cycle back. Globals: out (1), mix (1).
+    // Constraints, cyclic over the 2^po2 rows:
+    //   c1 = a + a[-1] + k        c3 = c2 * a        acc = a * mix + out
+    // so the trace has degree-1 and degree-2 constraints, a two-tap combo (backs 0 and 1) and a
+    // one-tap combo, three committed groups and the accum mix drawn after code/data.
+
+    const fn tap(group: usize, offset: u16, back: u16, combo: u8, skip: u8) -> TapData {
+        TapData {
+            offset,
+            back,
+            group,
+            combo,
+            skip,
+        }
+    }
+
+    static TOY_TAPS: TapSet<'static> = TapSet {
+        taps: &[
+            tap(0, 0, 0, 0, 1),
+            tap(1, 0, 0, 0, 1),
+            tap(2, 0, 0, 1, 2),
+            tap(2, 0, 1, 1, 2),
+            tap(2, 1, 0, 0, 1),
+            tap(2, 2, 0, 0, 1),
+            tap(2, 3, 0, 0, 1),
+        ],
+        combo_taps: &[0, 0, 1],
+        combo_begin: &[0, 1, 3],
+        group_begin: &[0, 1, 2, 7],
+        combos_count: 2,
+        reg_count: 6,
+        tot_combo_backs: 3,
+        group_names: &["accum", "code", "data"],
+    };
+
+    pub(crate) struct ToyCircuit;
+
+    impl CircuitInfo for ToyCircuit {
+        const CIRCUIT_INFO: ProtocolInfo = ProtocolInfo(*b"Z6_TOY_CIRCUIT__");
+        const OUTPUT_SIZE: usize = 1;
+        const MIX_SIZE: usize = 1;
+    }
+
+    impl TapsProvider for ToyCircuit {
+        fn get_taps(&self) -> &'static TapSet<'static> {
+            &TOY_TAPS
+        }
+    }
+
+    /// The mixed constraint value: `u` = [acc, k, a, a[-1], c1, c2, c3] (taps order).
+    fn toy_constraints<E: ExtElem>(poly_mix: E, u: [E; 7], out: E, mix: E) -> E {
+        let [acc, k, a, a_back, c1, c2, c3] = u;
+        let c_sum = c1 - a - a_back - k;
+        let c_mul = c3 - c2 * a;
+        let c_acc = acc - a * mix - out;
+        c_sum + poly_mix * c_mul + poly_mix * poly_mix * c_acc
+    }
+
+    impl<F: Field> PolyExt<F> for ToyCircuit {
+        fn poly_ext(
+            &self,
+            mix: &F::ExtElem,
+            u: &[F::ExtElem],
+            args: &[&[F::Elem]],
+        ) -> MixState<F::ExtElem> {
+            let lift = |e: &F::Elem| F::ExtElem::from_subfield(e);
+            let tot = toy_constraints(
+                *mix,
+                std::array::from_fn(|i| u[i]),
+                lift(&args[0][0]),
+                lift(&args[1][0]),
+            );
+            MixState {
+                tot,
+                mul: F::ExtElem::ONE,
+            }
+        }
+    }
+
+    impl<F: Field> CircuitCoreDef<F> for ToyCircuit {}
+
+    /// Host eval_check (any HAL, through `to_vec`/`view_mut`): the same layout and point
+    /// convention as the circuits' CPU eval_check (`check[k * domain + i]` = component k of
+    /// `C(3 x_i) / ((3 x_i)^n - 1)`, `x_i = rou^i`, back b = row `i - b * INV_RATE`).
+    impl<H: Hal> CircuitHal<H> for ToyCircuit {
+        fn accumulate(
+            &self,
+            _preflight: &AccumPreflight,
+            _ctrl: &H::Buffer<H::Elem>,
+            _io: &H::Buffer<H::Elem>,
+            _data: &H::Buffer<H::Elem>,
+            _mix: &H::Buffer<H::Elem>,
+            _accum: &H::Buffer<H::Elem>,
+            _steps: usize,
+        ) {
+            unimplemented!("the toy circuit accumulates on the host")
+        }
+
+        fn eval_check(
+            &self,
+            check: &H::Buffer<H::Elem>,
+            groups: &[&H::Buffer<H::Elem>],
+            globals: &[&H::Buffer<H::Elem>],
+            poly_mix: H::ExtElem,
+            po2: usize,
+            steps: usize,
+        ) {
+            let domain = steps * INV_RATE;
+            let acc = groups[0].to_vec();
+            let code = groups[1].to_vec();
+            let data = groups[2].to_vec();
+            let lift = |e: H::Elem| H::ExtElem::from_subfield(&e);
+            let out = lift(globals[0].to_vec()[0]);
+            let mix = lift(globals[1].to_vec()[0]);
+            let rou = H::Elem::ROU_FWD[po2 + log2_ceil(INV_RATE)];
+            let three = H::Elem::from_u64(3);
+            let mut res = vec![H::Elem::ZERO; H::ExtElem::EXT_SIZE * domain];
+            let mut x = H::Elem::ONE;
+            for i in 0..domain {
+                let back = (i + domain - INV_RATE) % domain;
+                let u = [
+                    acc[i],
+                    code[i],
+                    data[i],
+                    data[back],
+                    data[domain + i],
+                    data[2 * domain + i],
+                    data[3 * domain + i],
+                ]
+                .map(lift);
+                let tot = toy_constraints(poly_mix, u, out, mix);
+                let y = (three * x).pow(steps) - H::Elem::ONE;
+                let ret = tot * lift(y.inv());
+                for (k, e) in ret.subelems().iter().enumerate() {
+                    res[k * domain + i] = *e;
+                }
+                x *= rou;
+            }
+            check.view_mut(|c| c.copy_from_slice(&res));
+        }
+    }
+
+    /// Prove the toy circuit at `2^po2` cycles on `hal`; the witness depends only on `seed`.
+    pub(crate) fn toy_prove<H: Hal + 'static>(hal: &H, po2: usize, seed: u64) -> Vec<u32> {
+        let n = 1usize << po2;
+        let mut rng = SmallRng::seed_from_u64(seed);
+        let k: Vec<H::Elem> = rand_elems(&mut rng, n);
+        let a: Vec<H::Elem> = rand_elems(&mut rng, n);
+        let c2: Vec<H::Elem> = rand_elems(&mut rng, n);
+        let out = H::Elem::random(&mut rng);
+        let c1: Vec<H::Elem> = (0..n).map(|i| a[i] + a[(i + n - 1) % n] + k[i]).collect();
+        let c3: Vec<H::Elem> = (0..n).map(|i| c2[i] * a[i]).collect();
+        let data = [a.as_slice(), &c1, &c2, &c3].concat();
+
+        let mut prover = Prover::new(hal, &TOY_TAPS);
+        let hashfn = hal.get_hash_suite().hashfn.clone();
+        prover
+            .iop()
+            .commit(&hashfn.hash_elem_slice(&PROOF_SYSTEM_INFO.encode()));
+        prover
+            .iop()
+            .commit(&hashfn.hash_elem_slice(&ToyCircuit::CIRCUIT_INFO.encode()));
+        let header = [out, H::Elem::from_u32_words(&[po2 as u32])];
+        prover.iop().commit(&hashfn.hash_elem_slice(&header));
+        prover.iop().write_field_elem_slice(&header);
+        prover.set_po2(po2);
+
+        let code_buf = hal.copy_from_elem("code", &k);
+        prover.commit_group(1, &code_buf);
+        let data_buf = hal.copy_from_elem("data", &data);
+        prover.commit_group(2, &data_buf);
+        let mix = prover.iop().random_elem();
+        let acc: Vec<H::Elem> = a.iter().map(|&a| a * mix + out).collect();
+        let accum_buf = hal.copy_from_elem("accum", &acc);
+        prover.commit_group(0, &accum_buf);
+
+        let out_buf = hal.copy_from_elem("out", &[out]);
+        let mix_buf = hal.copy_from_elem("mix", &[mix]);
+        prover.finalize(&[&out_buf, &mix_buf], &ToyCircuit)
+    }
+
+    /// Verify a toy seal with the CPU verifier.
+    pub(crate) fn toy_verify<F: Field>(
+        suite: &crate::core::hash::HashSuite<F>,
+        seal: &[u32],
+    ) -> Result<(), crate::verify::VerificationError> {
+        crate::verify::verify(&ToyCircuit, suite, seal, |_, _| Ok(()))
+    }
+
+    /// Full prove / verify round trip at each `po2`: the toy circuit proved on the CPU HAL, on the
+    /// GPU HAL alone (fused NTT entry points, GPU combos_divide etc.) and on DualHal(CPU, GPU)
+    /// (every forwarded method compared after each call). All three seals must be identical
+    /// (the prover is deterministic and every HAL is bit-exact) and verify; a corrupted seal must
+    /// not.
+    pub(crate) fn prove_verify_round_trip<H: Hal + 'static>(make: impl Fn() -> H, po2s: &[usize]) {
+        for &po2 in po2s {
+            let seed = 0x70e0 + po2 as u64;
+            let hal_gpu = make();
+            let suite = hal_gpu.get_hash_suite().clone();
+            let hal_cpu = cpu_of(&hal_gpu);
+            let seal_cpu = toy_prove(&hal_cpu, po2, seed);
+            toy_verify(&suite, &seal_cpu).unwrap_or_else(|e| panic!("po2={po2}: CPU seal: {e}"));
+            let seal_gpu = toy_prove(&hal_gpu, po2, seed);
+            toy_verify(&suite, &seal_gpu).unwrap_or_else(|e| panic!("po2={po2}: GPU seal: {e}"));
+            assert!(
+                seal_gpu == seal_cpu,
+                "po2={po2}: GPU seal differs from the CPU seal"
+            );
+            let hal_dual = dual(make());
+            let seal_dual = toy_prove(&hal_dual, po2, seed);
+            assert!(
+                seal_dual == seal_cpu,
+                "po2={po2}: DualHal seal differs from the CPU seal"
+            );
+            let mut bad = seal_gpu.clone();
+            let i = bad.len() / 2;
+            bad[i] ^= 1;
+            assert!(
+                toy_verify(&suite, &bad).is_err(),
+                "po2={po2}: a corrupted seal verified"
+            );
         }
     }
 }

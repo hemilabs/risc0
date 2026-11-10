@@ -77,7 +77,9 @@ pub use self::{
     buffer::BufferImpl,
     kernels::MetalKernels,
     pv_poseidon2::{MetalHashPoseidon2, Poseidon2Config, Poseidon2Kernels},
-    runtime::{as_bytes, Grid, KernelArg, DEFAULT_BATCH_DISPATCHES, MAX_SET_BYTES},
+    runtime::{
+        as_bytes, Grid, KernelArg, DEFAULT_BATCH_DISPATCHES, MAX_SET_BYTES, MAX_WORKING_SET_ENV,
+    },
 };
 use super::{Buffer as _, Hal};
 use crate::{
@@ -517,6 +519,36 @@ impl<MH: MetalHash> MetalHal<MH> {
         self.rt.set_batch_limit(dispatches);
     }
 
+    /// The working-set limit in bytes: `RISC0_METAL_MAX_WORKING_SET_BYTES` (or
+    /// [Self::set_working_set_limit]) when set and smaller, else `recommendedMaxWorkingSetSize`.
+    /// `gpu_total_memory` reports it.
+    pub fn working_set_limit(&self) -> u64 {
+        self.rt.working_set_limit()
+    }
+
+    /// Set (`Some`) or clear (`None`) an explicit working-set budget for this HAL, overriding
+    /// `RISC0_METAL_MAX_WORKING_SET_BYTES`: allocations that would take the device's
+    /// `currentAllocatedSize` above it fail early (after draining the pool).
+    pub fn set_working_set_limit(&self, bytes: Option<u64>) {
+        self.rt.set_working_set_limit(bytes);
+    }
+
+    /// The device's `currentAllocatedSize` (all Metal memory of this process on the device).
+    pub fn allocated_size(&self) -> u64 {
+        self.rt.allocated_size()
+    }
+
+    /// Highest `currentAllocatedSize` observed after any Metal allocation in this process since
+    /// the last [Self::reset_peak_allocated_size] (process-wide, covers every HAL).
+    pub fn peak_allocated_size(&self) -> u64 {
+        Runtime::peak_allocated()
+    }
+
+    /// Restart [Self::peak_allocated_size] from the current allocation level.
+    pub fn reset_peak_allocated_size(&self) {
+        self.rt.reset_peak_allocated();
+    }
+
     /// Turn the `RISC0_METAL_DEBUG` host-access check on or off for this HAL.
     pub fn set_debug(&self, on: bool) {
         self.rt.set_debug(on);
@@ -792,12 +824,11 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
     }
 
     fn gpu_total_memory(&self) -> usize {
-        self.device.recommended_max_working_set_size() as usize
+        self.rt.working_set_limit() as usize
     }
 
     fn gpu_free_memory(&self) -> usize {
-        (self.device.recommended_max_working_set_size() as usize)
-            .saturating_sub(self.device.current_allocated_size() as usize)
+        self.rt.free_size() as usize
     }
 
     fn get_hash_suite(&self) -> &HashSuite<Self::Field> {

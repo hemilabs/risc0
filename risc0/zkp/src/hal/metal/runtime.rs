@@ -56,6 +56,49 @@ pub const MAX_SET_BYTES: usize = 4096;
 /// Buffers below this size are always pooled; larger ones only within the pool cap.
 const POOL_SMALL_BYTES: u64 = 64 << 10;
 
+/// Environment variable naming an artificial GPU working-set budget in bytes (plan 9.1), e.g.
+/// `4294967296`, `4G`, `4GiB`, `512M` (suffixes are binary: K = 1024). When set, it replaces
+/// `recommendedMaxWorkingSetSize` as the working-set limit (if smaller): `gpu_total_memory` and
+/// `gpu_free_memory` report against it, the pool cap is half of it, and a new allocation that
+/// would bring the device's `currentAllocatedSize` above it fails (after draining the pool once)
+/// with an error naming the budget, instead of running into the OS memory pressure path.
+pub const MAX_WORKING_SET_ENV: &str = "RISC0_METAL_MAX_WORKING_SET_BYTES";
+
+/// Highest `currentAllocatedSize` observed after any Metal allocation in this process.
+static PEAK_ALLOCATED: AtomicU64 = AtomicU64::new(0);
+
+/// Parse a byte count with an optional binary suffix (`K`, `M`, `G`, `T`, optionally followed by
+/// `iB` or `B`); `None` if malformed or zero.
+pub(crate) fn parse_bytes(text: &str) -> Option<u64> {
+    let t = text.trim();
+    let t = t
+        .strip_suffix("iB")
+        .or_else(|| t.strip_suffix("ib"))
+        .or_else(|| t.strip_suffix('B'))
+        .or_else(|| t.strip_suffix('b'))
+        .unwrap_or(t);
+    let (digits, shift) = match t.chars().last()? {
+        'k' | 'K' => (&t[..t.len() - 1], 10),
+        'm' | 'M' => (&t[..t.len() - 1], 20),
+        'g' | 'G' => (&t[..t.len() - 1], 30),
+        't' | 'T' => (&t[..t.len() - 1], 40),
+        _ => (t, 0),
+    };
+    let n: u64 = digits.trim().parse().ok()?;
+    n.checked_mul(1u64 << shift).filter(|&b| b > 0)
+}
+
+/// The budget named by [MAX_WORKING_SET_ENV], if set and valid (a malformed value is reported and
+/// ignored).
+fn env_working_set_limit() -> Option<u64> {
+    let text = std::env::var(MAX_WORKING_SET_ENV).ok()?;
+    let parsed = parse_bytes(&text);
+    if parsed.is_none() {
+        tracing::error!("{MAX_WORKING_SET_ENV}={text:?} is not a byte count; ignored");
+    }
+    parsed
+}
+
 /// One argument bound at index `i` for the `i`-th entry of the slice given to a dispatch.
 pub enum KernelArg<'a> {
     /// No buffer bound (`set_buffer(i, None, 0)`).
@@ -115,9 +158,22 @@ impl Encoder {
 pub(crate) struct Bound {
     pso: usize,
     buffers: Vec<Option<(usize, u64)>>,
+    /// Threadgroup memory lengths set in this encoder, per `[[threadgroup(i)]]` index.
+    tg_lengths: Vec<Option<u64>>,
 }
 
 impl Bound {
+    /// Record threadgroup memory length `bytes` at `index`; true if it differs from what this
+    /// encoder already has (so `setThreadgroupMemoryLength` must be issued).
+    pub(crate) fn set_tg_length(&mut self, index: usize, bytes: u64) -> bool {
+        if self.tg_lengths.len() <= index {
+            self.tg_lengths.resize(index + 1, None);
+        }
+        let changed = self.tg_lengths[index] != Some(bytes);
+        self.tg_lengths[index] = Some(bytes);
+        changed
+    }
+
     fn set_buffer(&mut self, index: usize, value: Option<(usize, u64)>) -> bool {
         if self.buffers.len() <= index {
             self.buffers.resize(index + 1, None);
@@ -209,13 +265,21 @@ pub(crate) struct Runtime {
     batch_limit: AtomicUsize,
     pub(crate) max_tg_mem: u64,
     pub(crate) max_buffer_len: u64,
-    pool_cap: u64,
+    /// `recommendedMaxWorkingSetSize` of the device.
+    recommended_ws: u64,
+    /// Explicit working-set budget ([MAX_WORKING_SET_ENV] or [Runtime::set_working_set_limit]);
+    /// 0 = none (the limit is then `recommended_ws` and is not enforced on allocation).
+    budget: AtomicU64,
+    pool_cap: AtomicU64,
     /// Test hook: number of upcoming raw allocations to fail.
     #[cfg(test)]
     fail_allocs: AtomicUsize,
     /// Test hook: report the next committed batch as failed.
     #[cfg(test)]
     fail_next_batch: AtomicBool,
+    /// Test hook: zero buffers handed out from the pool, as new allocations are.
+    #[cfg(test)]
+    zero_pooled: AtomicBool,
 }
 
 fn env_flag(name: &str) -> bool {
@@ -260,7 +324,14 @@ impl Runtime {
         }
         let max_tg_mem = device.max_threadgroup_memory_length();
         let max_buffer_len = device.max_buffer_length();
-        let pool_cap = device.recommended_max_working_set_size() / 2;
+        let recommended_ws = device.recommended_max_working_set_size();
+        let budget = env_working_set_limit().unwrap_or(0);
+        let limit = if budget == 0 {
+            recommended_ws
+        } else {
+            budget.min(recommended_ws)
+        };
+        let pool_cap = limit / 2;
         Self {
             device,
             queue,
@@ -275,11 +346,15 @@ impl Runtime {
             batch_limit: AtomicUsize::new(batch_limit),
             max_tg_mem,
             max_buffer_len,
-            pool_cap,
+            recommended_ws,
+            budget: AtomicU64::new(budget),
+            pool_cap: AtomicU64::new(pool_cap),
             #[cfg(test)]
             fail_allocs: AtomicUsize::new(0),
             #[cfg(test)]
             fail_next_batch: AtomicBool::new(false),
+            #[cfg(test)]
+            zero_pooled: AtomicBool::new(false),
         }
     }
 
@@ -289,6 +364,83 @@ impl Runtime {
 
     pub(crate) fn debug(&self) -> bool {
         self.debug.load(Ordering::Relaxed)
+    }
+
+    /// The explicit working-set budget, if one is set.
+    pub(crate) fn budget(&self) -> Option<u64> {
+        match self.budget.load(Ordering::Relaxed) {
+            0 => None,
+            b => Some(b),
+        }
+    }
+
+    /// The working-set limit: the explicit budget if set (capped at
+    /// `recommendedMaxWorkingSetSize`), else `recommendedMaxWorkingSetSize`.
+    pub(crate) fn working_set_limit(&self) -> u64 {
+        match self.budget() {
+            Some(b) => b.min(self.recommended_ws),
+            None => self.recommended_ws,
+        }
+    }
+
+    /// Set (`Some`) or clear (`None`) the explicit working-set budget of this runtime, overriding
+    /// [MAX_WORKING_SET_ENV]. The pool cap follows (half the limit).
+    pub(crate) fn set_working_set_limit(&self, bytes: Option<u64>) {
+        self.budget
+            .store(bytes.map_or(0, |b| b.max(1)), Ordering::Relaxed);
+        self.pool_cap
+            .store(self.working_set_limit() / 2, Ordering::Relaxed);
+    }
+
+    /// `currentAllocatedSize` of the device (every Metal allocation of this process on it,
+    /// including pooled buffers and pipeline/library memory).
+    pub(crate) fn allocated_size(&self) -> u64 {
+        self.device.current_allocated_size()
+    }
+
+    /// Bytes left under the working-set limit.
+    pub(crate) fn free_size(&self) -> u64 {
+        self.working_set_limit()
+            .saturating_sub(self.allocated_size())
+    }
+
+    /// Highest `currentAllocatedSize` seen after any allocation in this process since the last
+    /// [reset_peak_allocated].
+    pub(crate) fn peak_allocated() -> u64 {
+        PEAK_ALLOCATED.load(Ordering::Relaxed)
+    }
+
+    /// Restart [Self::peak_allocated] from the current allocation level.
+    pub(crate) fn reset_peak_allocated(&self) {
+        PEAK_ALLOCATED.store(self.allocated_size(), Ordering::Relaxed);
+    }
+
+    fn record_peak(&self) {
+        PEAK_ALLOCATED.fetch_max(self.allocated_size(), Ordering::Relaxed);
+    }
+
+    /// With an explicit budget: fail early if a new allocation of `bytes` would exceed it. The
+    /// pool (which counts toward `currentAllocatedSize`) is drained once before giving up.
+    fn check_budget(&self, what: &str, bytes: u64) -> Result<()> {
+        let Some(budget) = self.budget() else {
+            return Ok(());
+        };
+        let limit = budget.min(self.recommended_ws);
+        if self.allocated_size().saturating_add(bytes) <= limit {
+            return Ok(());
+        }
+        let drained = self.drain_pool();
+        let current = self.allocated_size();
+        if current.saturating_add(bytes) <= limit {
+            tracing::debug!("working-set budget: drained {drained} pooled bytes for {what}");
+            return Ok(());
+        }
+        Err(anyhow!(
+            "Metal working-set budget exceeded: allocating {bytes} bytes for {what} with \
+             {current} bytes already allocated would exceed the limit of {limit} bytes \
+             ({MAX_WORKING_SET_ENV}={budget}, recommendedMaxWorkingSetSize={})",
+            self.recommended_ws
+        ))
     }
 
     pub(crate) fn set_batch_limit(&self, n: usize) {
@@ -494,8 +646,13 @@ impl Runtime {
                     }
                 }
             }
+            // The length persists in the encoder across dispatches; re-issuing an unchanged value
+            // is the validation layer's "redundant setting of (null)" (Z2 note).
             for (index, &bytes) in tg_bytes.iter().enumerate() {
-                enc.set_threadgroup_memory_length(index as u64, bytes.next_multiple_of(16));
+                let bytes = bytes.next_multiple_of(16);
+                if bound.set_tg_length(index, bytes) {
+                    enc.set_threadgroup_memory_length(index as u64, bytes);
+                }
             }
             if groups {
                 enc.dispatch_thread_groups(threads_per_grid, threads_per_group);
@@ -639,6 +796,14 @@ impl Runtime {
         self.fail_allocs.store(n, Ordering::Release);
     }
 
+    /// Test hook: buffers reused from the pool come back zeroed, like new Metal buffers (and like
+    /// the CPU HAL's). `DualHal` compares whole buffers, including cells a method never writes
+    /// (e.g. the unused head of a Merkle `nodes` buffer), so it needs this for full-prover runs.
+    #[cfg(test)]
+    pub(crate) fn set_zero_pooled(&self, on: bool) {
+        self.zero_pooled.store(on, Ordering::Relaxed);
+    }
+
     /// Test hook: the next committed batch is reported as `MTLCommandBufferStatus::Error`.
     #[cfg(test)]
     pub(crate) fn inject_batch_error(&self) {
@@ -664,17 +829,28 @@ impl Runtime {
             let mut pool = self.pool.lock();
             pool.reclaim(completed);
             if let Some(buf) = pool.pop(bytes) {
+                #[cfg(test)]
+                if self.zero_pooled.load(Ordering::Relaxed) {
+                    // SAFETY: every batch that used this buffer has completed; `bytes` is its
+                    // length.
+                    unsafe { std::ptr::write_bytes(buf.contents() as *mut u8, 0, bytes as usize) };
+                }
                 return Ok(buf);
             }
         }
+        self.check_budget(name, bytes)?;
         let options = MTLResourceOptions::StorageModeShared;
         if let Some(buf) = self.new_buffer_raw(bytes, options) {
+            self.record_peak();
             return Ok(buf);
         }
         tracing::warn!("Metal allocation of {bytes} bytes for {name} failed; draining the pool");
         self.drain_pool();
-        self.new_buffer_raw(bytes, options)
-            .ok_or_else(|| anyhow!("Metal allocation failed on {name}: {bytes} bytes"))
+        let buf = self
+            .new_buffer_raw(bytes, options)
+            .ok_or_else(|| anyhow!("Metal allocation failed on {name}: {bytes} bytes"))?;
+        self.record_peak();
+        Ok(buf)
     }
 
     pub(crate) fn alloc_private(&self, bytes: u64) -> Result<MtlBuffer> {
@@ -685,12 +861,17 @@ impl Runtime {
         );
         let options = MTLResourceOptions::StorageModePrivate;
         let bytes = bytes.max(16);
+        self.check_budget("a private buffer", bytes)?;
         if let Some(buf) = self.new_buffer_raw(bytes, options) {
+            self.record_peak();
             return Ok(buf);
         }
         self.drain_pool();
-        self.new_buffer_raw(bytes, options)
-            .ok_or_else(|| anyhow!("Metal private allocation failed: {bytes} bytes"))
+        let buf = self
+            .new_buffer_raw(bytes, options)
+            .ok_or_else(|| anyhow!("Metal private allocation failed: {bytes} bytes"))?;
+        self.record_peak();
+        Ok(buf)
     }
 
     /// Return a dropped buffer. Never blocks on GPU work and never takes the state mutex.
@@ -698,7 +879,9 @@ impl Runtime {
         let needed = self.open_seq.load(Ordering::Acquire);
         let completed = self.completed_seq.load(Ordering::Acquire);
         let mut pool = self.pool.lock();
-        if bytes >= POOL_SMALL_BYTES && pool.cached_bytes + bytes > self.pool_cap {
+        if bytes >= POOL_SMALL_BYTES
+            && pool.cached_bytes + bytes > self.pool_cap.load(Ordering::Relaxed)
+        {
             return;
         }
         pool.cached_bytes += bytes;
