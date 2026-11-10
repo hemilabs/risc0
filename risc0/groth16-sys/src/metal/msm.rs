@@ -721,9 +721,9 @@ pub struct MsmScratch {
 }
 
 impl MsmScratch {
-    /// Allocate (StorageModePrivate: the host never reads these) for up to `cap_n` scalars.
-    pub fn new(device: &DeviceRef, cap_n: u32, cfg: MsmConfig) -> Result<Self> {
-        cfg.validate();
+    /// The buffer sizes of a scratch for `cap_n` scalars, in allocation order: hist, offset,
+    /// piece_off, totals, sorted, pieces, piece_bucket, partial.
+    fn sizes(cap_n: u32, cfg: MsmConfig) -> [u64; 8] {
         let nwins = cfg.nwins() as u64;
         let table = nwins * cfg.nbuckets() as u64 * 4;
         let max_pieces = cfg.max_pieces(cap_n) as u64;
@@ -733,10 +733,38 @@ impl MsmScratch {
             .max_piece_bytes
             .checked_div(group)
             .map_or(1, |g| g.clamp(1, nwins));
+        // At least one element of every kernel argument type (the validation layer checks
+        // bound lengths even when no thread reads them).
+        [
+            table,
+            table,
+            table,
+            nwins * 8,
+            nwins * cap_n as u64 * 4,
+            groups * group,
+            // Sized for every window: G1 groups hold twice the windows of G2 groups.
+            nwins * max_pieces * 4,
+            nwins * max_segs * MAX_XYZZ_BYTES,
+        ]
+        .map(|b| b.max(MAX_XYZZ_BYTES))
+    }
+
+    /// Bytes [MsmScratch::new] allocates for `cap_n` scalars (for budgeting before allocating).
+    pub fn bytes_for(cap_n: u32, cfg: MsmConfig) -> u64 {
+        cfg.validate();
+        Self::sizes(cap_n, cfg).iter().sum()
+    }
+
+    /// Allocate (StorageModePrivate: the host never reads these) for up to `cap_n` scalars.
+    ///
+    /// Honours the working-set budget `RISC0_METAL_MAX_WORKING_SET_BYTES`
+    /// ([super::check_working_set]): fails, allocating nothing, if the whole scratch would take
+    /// the device's `currentAllocatedSize` above it.
+    pub fn new(device: &DeviceRef, cap_n: u32, cfg: MsmConfig) -> Result<Self> {
+        cfg.validate();
+        let sizes = Self::sizes(cap_n, cfg);
+        super::check_working_set(device, "the MSM scratch", sizes.iter().sum())?;
         let alloc = |bytes: u64, what: &str| -> Result<Buffer> {
-            // At least one element of every kernel argument type (the validation layer checks
-            // bound lengths even when no thread reads them).
-            let bytes = bytes.max(MAX_XYZZ_BYTES);
             ensure!(
                 bytes <= device.max_buffer_length(),
                 "MSM {what}: {bytes} bytes exceed the device's buffer limit"
@@ -744,20 +772,20 @@ impl MsmScratch {
             let b = device.new_buffer(bytes, MTLResourceOptions::StorageModePrivate);
             Ok(b)
         };
+        let [hist, offset, piece_off, totals, sorted, pieces, piece_bucket, partial] = sizes;
         Ok(Self {
             cfg,
             cap_n,
-            max_pieces: max_pieces as u32,
-            max_segs: max_segs as u32,
-            hist: alloc(table, "hist")?,
-            offset: alloc(table, "offset")?,
-            piece_off: alloc(table, "piece_off")?,
-            totals: alloc(nwins * 8, "totals")?,
-            sorted: alloc(nwins * cap_n as u64 * 4, "sorted")?,
-            pieces: alloc(groups * group, "pieces")?,
-            // Sized for every window: G1 groups hold twice the windows of G2 groups.
-            piece_bucket: alloc(nwins * max_pieces * 4, "piece_bucket")?,
-            partial: alloc(nwins * max_segs * MAX_XYZZ_BYTES, "partial")?,
+            max_pieces: cfg.max_pieces(cap_n),
+            max_segs: cfg.max_segs(cap_n),
+            hist: alloc(hist, "hist")?,
+            offset: alloc(offset, "offset")?,
+            piece_off: alloc(piece_off, "piece_off")?,
+            totals: alloc(totals, "totals")?,
+            sorted: alloc(sorted, "sorted")?,
+            pieces: alloc(pieces, "pieces")?,
+            piece_bucket: alloc(piece_bucket, "piece_bucket")?,
+            partial: alloc(partial, "partial")?,
             sorted_params: None,
         })
     }
