@@ -40,6 +40,8 @@ pub const METAL_KERNEL_NAMES: &[&str] = &[
     "par_stepExecW",
     "fwd_stepExec",
     "rev_stepExec",
+    // $OUT_DIR/metal/eval_check.metal (cuda2metal.py eval; baseline eval_check, R6)
+    "eval_check",
 ];
 
 #[cfg(feature = "cuda")]

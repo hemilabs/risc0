@@ -19,6 +19,7 @@ usage:
   cuda2metal.py --selftest [--headers DIR] [--keep DIR]
   cuda2metal.py steps -o OUTDIR [--compile] [--headers DIR] [--check] [--no-pin]
   cuda2metal.py incs -o OUTDIR [--check]
+  cuda2metal.py eval -o OUTDIR [--compile] [--check] [--no-pin]
   cuda2metal.py file IN.cu -o OUT.metal [--types types.cuh.inc]
 
 `steps` translates steps.cu -> OUTDIR/steps.metal and steps.cuh -> OUTDIR/steps.metal.h and
@@ -59,6 +60,22 @@ rewrote; anything it cannot translate faithfully raises TranslateError (no silen
                  without a ctx in scope -> C2M_ASSERT_NOCTX(c), a no-op like CUDA release.
 
 A final residual scan refuses output that still contains CUDA-only constructs.
+
+`eval` (item R6) translates the baseline eval_check -- eval_check.cuh, eval_check_0..3.cu (poly_fp
++ the 20 noinline rv32im_v2_* chain functions) and the eval_check kernel of eval_check_kernel.cu
+-- into one OUTDIR/eval_check.metal (written only when its text changes; build.rs runs it into
+$OUT_DIR/metal), with counts pinned in PINNED_EVAL. Its passes (EVAL_PASSES) add:
+
+  poly_mix       `__constant__ FpExt poly_mix[N];` (host-filled, no initializer) -> a
+                 `const FpExt* poly_mix` parameter on every function that uses it directly or
+                 through a call, `, poly_mix` at their call sites; the kernel binds it last.
+  fpext_index    `e[i]` on a by-value FpExt (CUDA FpExt::operator[]) -> `e.elems[i]`.
+  fpp (calls)    an Fp** argument that is a local `Fp* a[N] = {p, q, ...};` is passed as
+                 `p, q, ...` (`a[k]` elsewhere -> `(elem k)`, the array goes); the caller's own
+                 Fp** parameter is forwarded as `args_0, ..., args_{K-1}`.
+  eval_aspace    `const Fp*` -> `const device Fp*` (trace buffers), mutable `Fp*`/`FpExt*` ->
+                 `thread` (poly_fp's x33/x34 temporaries passed down the chain).
+The chain lives in namespace rv32im_metal_eval; the kernel `eval_check` is at global scope.
 """
 
 import argparse
@@ -156,6 +173,17 @@ INCLUDE_MAP = {
     '<cuda/std/array>': None,
 }
 
+# `__launch_bounds__(MACRO)` -> [[max_total_threads_per_threadgroup(C2M_LB_FIRST(MACRO))]]: the
+# first of a `256, 8` expansion (pass_kernel).
+LB_PRELUDE = '''\
+#ifndef C2M_LB_FIRST
+#define C2M_LB_FIRST_(a, ...) a
+#define C2M_LB_FIRST(...) C2M_LB_FIRST_(__VA_ARGS__, 0)
+#endif
+'''
+
+# Mixed Fp +- FpExt: build_kernel's fpext.h has them since R3 (it defines
+# C2M_NO_FPEXT_MIXED_ADDSUB / R0_FPEXT_MIXED_ADDSUB), so the R2 shim that lived here is gone.
 PRELUDE = '''\
 // Fault bit and assert mapping used by cuda2metal.py output (plan 2.9). A violated `assert` in
 // the CUDA source sets RV32IM_FAULT_ASSERT in the thread's ctx.tables.bad, which the kernel ORs
@@ -170,30 +198,7 @@ PRELUDE = '''\
 #ifndef C2M_ASSERT_NOCTX
 #define C2M_ASSERT_NOCTX(cond) ((void)0)
 #endif
-// Mixed Fp/FpExt addition and subtraction. CUDA's fpext.h has them (FpExt::operator+(Fp),
-// operator-(Fp), free operator+(Fp, FpExt), operator-(Fp, FpExt)); build_kernel's Metal fpext.h
-// has only the mixed multiplications, and its FpExt(Fp) constructor is explicit. Same values as
-// CUDA (an Fp is the FpExt (x, 0, 0, 0)). Define C2M_NO_FPEXT_MIXED_ADDSUB once fpext.h has them.
-#ifndef C2M_NO_FPEXT_MIXED_ADDSUB
-#define C2M_NO_FPEXT_MIXED_ADDSUB 1
-inline FpExt operator+(FpExt a, Fp b) {
-  return a + FpExt(b);
-}
-inline FpExt operator+(Fp a, FpExt b) {
-  return FpExt(a) + b;
-}
-inline FpExt operator-(FpExt a, Fp b) {
-  return a - FpExt(b);
-}
-inline FpExt operator-(Fp a, FpExt b) {
-  return FpExt(a) - b;
-}
-#endif
-#ifndef C2M_LB_FIRST
-#define C2M_LB_FIRST_(a, ...) a
-#define C2M_LB_FIRST(...) C2M_LB_FIRST_(__VA_ARGS__, 0)
-#endif
-'''
+''' + LB_PRELUDE
 
 
 class TranslateError(Exception):
@@ -385,6 +390,7 @@ def header_text(m, hdr_start, open_):
 
 def header_name(hdr):
     hdr = re.sub(r'__attribute__\s*\(\(.*?\)\)', '', hdr)
+    hdr = re.sub(r'\b__launch_bounds__\s*\([^()]*\)', '', hdr)
     mo = re.search(r'([~\w]+)\s*\(', hdr)
     return mo.group(1) if mo else None
 
@@ -421,15 +427,16 @@ def pass_strip(s, counts):
     return apply_edits(s, edits)
 
 
-def pass_include(s, counts):
+def pass_include(s, counts, include_map=None, metal_ns=METAL_NS):
+    include_map = INCLUDE_MAP if include_map is None else include_map
     out = []
     for line in s.split('\n'):
         mo = re.match(r'\s*#\s*include\s+(\S+)', line)
         if mo:
             key = mo.group(1)
-            if key not in INCLUDE_MAP:
+            if key not in include_map:
                 raise TranslateError('no Metal mapping for #include %s' % key)
-            rep = INCLUDE_MAP[key]
+            rep = include_map[key]
             counts.add('include')
             if rep is None:
                 continue
@@ -438,7 +445,7 @@ def pass_include(s, counts):
     s = '\n'.join(out)
     n = s.count(CUDA_NS)
     if n:
-        s = s.replace(CUDA_NS, METAL_NS)
+        s = s.replace(CUDA_NS, metal_ns)
     return s
 
 
@@ -722,47 +729,279 @@ def pass_lambda(s, counts, uniq):
     return apply_edits(s, edits)
 
 
+_FPP_RE = re.compile(r'\b((?:const\s+)?(?:Fp|FpExt|Val|ExtVal))\s*\*\s*\*\s*(\w+)')
+
+
+def _fpp_param_pos(m, hs, o, fname, at):
+    """Index of the parameter containing offset `at` in the header m[hs:o] of fname."""
+    mo = re.search(r'\b%s\s*\(' % re.escape(fname), m[hs:o])
+    po = hs + mo.end() - 1
+    pc = match_close(m, po)
+    for i, (a, b) in enumerate(split_top(m, po + 1, pc)):
+        if a <= at < b:
+            return i
+    raise TranslateError('cannot locate the Fp** parameter of %s' % fname)
+
+
 def pass_fpp(s, counts):
+    """`Fp** args` parameters -> K explicit `device Fp*` parameters (definitions, prototypes),
+    `args[k]` -> `args_k`, and call sites: an argument that is the caller's own Fp** parameter
+    is forwarded as `args_0, ..., args_{K-1}`; an argument that is a local pointer array
+    `Fp* a[N] = {e0, e1, ...};` is replaced by its first K initializer elements (`a[k]` ->
+    `(ek)` elsewhere in the function and the array declaration is removed). Anything else is an
+    error."""
     m = mask(s)
+    if not _FPP_RE.search(m):
+        return s
     funcs = find_functions(m)
-    pat = re.compile(r'\b((?:const\s+)?(?:Fp|FpExt|Val|ExtVal))\s*\*\s*\*\s*(\w+)')
-    sizes, edits = {}, []
-    defs = []
+    edits = []
+    # 1. definitions: fname -> {pos, pname, k, type, span}
+    fdefs = {}
     for hs, o, c in funcs:
         hdr = m[hs:o]
-        for mo in pat.finditer(hdr):
-            name = mo.group(2)
-            body = m[o:c]
-            idx = [int(x) for x in re.findall(r'\b%s\s*\[\s*(\d+)\s*\]' % name, body)]
-            bare = len(re.findall(r'\b%s\b' % name, body))
-            if bare != len(idx) or not idx:
-                raise TranslateError('%s %s in %s is used other than as %s[<literal>]'
-                                     % (mo.group(1) + '**', name, header_name(hdr), name))
-            k = max(idx) + 1
+        for mo in _FPP_RE.finditer(hdr):
             fname = header_name(_strip_pp(hdr))
-            sizes[(fname, name)] = k
-            defs.append((hs + mo.start(), hs + mo.end(), mo.group(1), name, k))
-            for mo2 in re.finditer(r'\b%s\s*\[\s*(\d+)\s*\]' % name, body):
-                edits.append((o + mo2.start(), o + mo2.end(), '%s_%s' % (name, mo2.group(1))))
-    covered = [(a, b) for a, b, _, _, _ in defs]
-    for a, b, t, name, k in defs:
-        edits.append((a, b, ', '.join('device %s* %s_%d' % (t, name, i) for i in range(k))))
+            if fname in fdefs:
+                raise TranslateError('two definitions of %s with an Fp** parameter' % fname)
+            name = mo.group(2)
+            idx = [int(x) for x in re.findall(r'\b%s\s*\[\s*(\d+)\s*\]' % name, m[o:c])]
+            fdefs[fname] = dict(pos=_fpp_param_pos(m, hs, o, fname, hs + mo.start()),
+                                pname=name, k=max(idx) + 1 if idx else 0, type=mo.group(1),
+                                decl=(hs + mo.start(), hs + mo.end()), body=(o, c))
+    if not fdefs:
+        # prototypes only: the size is unknown
+        mo = _FPP_RE.search(m)
+        raise TranslateError('%s** %s at %s: no definition in this input gives its size'
+                             % (mo.group(1), mo.group(2), where(s, mo.start())))
+    # 2. call sites of those functions inside function bodies
+    call_re = re.compile(r'(?<![\w.])(?:\w+::)*(%s)\s*\(' % '|'.join(map(re.escape, fdefs)))
+    calls = []  # (enclosing (hs, o, c), callee, arg span, arg text)
+    for hs, o, c in funcs:
+        for mo in call_re.finditer(m, o, c):
+            po = mo.end() - 1
+            pc = match_close(m, po)
+            spans = split_top(m, po + 1, pc)
+            callee = mo.group(1)
+            pos = fdefs[callee]['pos']
+            if pos >= len(spans):
+                raise TranslateError('call of %s at %s: too few arguments'
+                                     % (callee, where(s, mo.start())))
+            a, b = spans[pos]
+            calls.append(((hs, o, c), callee, (a, b), m[a:b].strip()))
+    # K of a forwarding function must cover its callees' K (fixpoint)
+    changed = True
+    while changed:
+        changed = False
+        for (hs, o, c), callee, _, arg in calls:
+            for f, d in fdefs.items():
+                if d['body'] == (o, c) and arg == d['pname'] and d['k'] < fdefs[callee]['k']:
+                    d['k'] = fdefs[callee]['k']
+                    changed = True
+    forwarded = set()
+    arrays = {}  # (o, decl_start) -> info
+    for (hs, o, c), callee, (a, b), arg in calls:
+        k = fdefs[callee]['k']
+        own = next((d for d in fdefs.values() if d['body'] == (o, c)), None)
+        if own is not None and arg == own['pname']:
+            rep = ', '.join('%s_%d' % (arg, i) for i in range(k))
+            forwarded.add(a)
+        else:
+            dm = None
+            if re.match(r'^\w+$', arg):
+                dm = re.search(r'\b(?:const\s+)?(?:Fp|FpExt|Val|ExtVal)\s*\*\s*%s\s*\[\s*\d*\s*\]'
+                               r'\s*=\s*\{([^{}]*)\}\s*;' % arg, m[o:c])
+            if dm is None:
+                raise TranslateError('call of %s at %s: the Fp** argument %r is neither the '
+                                     "caller's Fp** parameter nor a local `Fp* %s[N] = {...};`"
+                                     % (callee, where(s, a), arg, arg))
+            elems = [s[x:y].strip() for x, y in split_top(m, o + dm.start(1), o + dm.end(1))]
+            if any(not re.match(r'^[\w.]+$', e) for e in elems):
+                raise TranslateError('pointer array %s at %s: only plain names can be '
+                                     'substituted, got %r' % (arg, where(s, o + dm.start()), elems))
+            if len(elems) < k:
+                raise TranslateError('pointer array %s at %s has %d elements, %s takes %d'
+                                     % (arg, where(s, o + dm.start()), len(elems), callee, k))
+            rep = ', '.join(elems[:k])
+            arrays[(o, o + dm.start())] = dict(name=arg, elems=elems, span=(o + dm.start(),
+                                                                          o + dm.end()),
+                                               body=(o, c))
+        edits.append((a, b, (' ' if s[a:a + 1] == ' ' else '') + rep))
+        counts.add('fpp.call')
+    # 3. local pointer arrays: remaining a[k] -> (ek); the declaration goes
+    taken = [(a, b) for a, b, _ in edits]
+    for info in arrays.values():
+        name, (o, c) = info['name'], info['body']
+        ds, de = info['span']
+        for mo in re.finditer(r'\b%s\b' % name, m[o:c]):
+            p = o + mo.start()
+            if ds <= p < de or any(a <= p < b for a, b in taken):
+                continue
+            im = re.match(r'%s\s*\[\s*(\d+)\s*\]' % name, m[p:])
+            if not im or int(im.group(1)) >= len(info['elems']):
+                raise TranslateError('pointer array %s at %s is used other than as %s[<literal>] '
+                                     'or an Fp** call argument' % (name, where(s, p), name))
+            edits.append((p, p + im.end(), '(%s)' % info['elems'][int(im.group(1))]))
+        edits.append((ds, de, '/* cuda2metal: %s[] passed as explicit pointers */' % name))
+        counts.add('fpp.array')
+    # 4. definitions: a[k] -> a_k, the parameter -> K pointers
+    for fname, d in fdefs.items():
+        o, c = d['body']
+        name, k = d['pname'], d['k']
+        idx = list(re.finditer(r'\b%s\s*\[\s*(\d+)\s*\]' % name, m[o:c]))
+        bare = [o + x.start() for x in re.finditer(r'\b%s\b' % name, m[o:c])]
+        fwd = [p for p in bare if any(p == a or (a < p and not m[a:p].strip()) for a in forwarded)]
+        if len(bare) != len(idx) + len(fwd) or k == 0:
+            raise TranslateError('%s** %s in %s is used other than as %s[<literal>] or forwarded '
+                                 'to an Fp** call' % (d['type'], name, fname, name))
+        for mo2 in idx:
+            edits.append((o + mo2.start(), o + mo2.end(), '%s_%s' % (name, mo2.group(1))))
+        a, b = d['decl']
+        edits.append((a, b, ', '.join('device %s* %s_%d' % (d['type'], name, i)
+                                      for i in range(k))))
         counts.add('fpp')
     # prototypes: Fp** outside the definitions found above
-    for mo in pat.finditer(m):
+    covered = [d['decl'] for d in fdefs.values()]
+    for mo in _FPP_RE.finditer(m):
         if any(a <= mo.start() < b for a, b in covered):
             continue
         st = max(m.rfind(';', 0, mo.start()), m.rfind('}', 0, mo.start()),
                  m.rfind('{', 0, mo.start())) + 1
         fname = header_name(_strip_pp(m[st:mo.start()]))
-        k = sizes.get((fname, mo.group(2)))
-        if k is None:
+        d = fdefs.get(fname)
+        if d is None or d['pname'] != mo.group(2):
             raise TranslateError('%s** %s at %s: no definition of %s in this input gives its size'
                                  % (mo.group(1), mo.group(2), where(s, mo.start()), fname))
         edits.append((mo.start(), mo.end(),
                       ', '.join('device %s* %s_%d' % (mo.group(1), mo.group(2), i)
-                                for i in range(k))))
+                                for i in range(d['k']))))
         counts.add('fpp')
+    return apply_edits(s, edits)
+
+
+# ------------------------------------------------------------------------------------------------
+# Eval mode passes (R6): eval_check_0..3.cu + eval_check.cuh + the eval_check kernel
+# ------------------------------------------------------------------------------------------------
+
+POLY_MIX = 'poly_mix'
+
+
+def pass_poly_mix(s, counts, name=POLY_MIX):
+    """`__constant__ FpExt poly_mix[N];` (no initializer; CUDA fills it with
+    cudaMemcpyToSymbol) -> a `const FpExt* poly_mix` parameter (made `const device` by the
+    eval_aspace / kernel passes) threaded through every function that uses it, directly or
+    through a call, with `, poly_mix` appended at their call sites. A kernel in that set gets it
+    as its last buffer binding. A function that already has a `poly_mix` parameter is left
+    alone."""
+    m = mask(s)
+    decls = list(re.finditer(r'\b__constant__\s+FpExt\s+%s\s*\[([^\]]*)\]\s*([=;{])' % name, m))
+    if not decls:
+        return s
+    edits = []
+    for d in decls:
+        if d.group(2) != ';':
+            raise TranslateError('__constant__ FpExt %s at %s has an initializer: it is a '
+                                 'constant table, not a host-filled symbol' % (name, where(s, d.start())))
+        n = d.group(1).strip()
+        edits.append((d.start(), d.end(), '// cuda2metal: __constant__ FpExt %s[%s] -> a '
+                      '`const device FpExt* %s` parameter (a kernel buffer of %s entries)\n'
+                      'static_assert((%s) > 0, "%s: kernel buffer size");'
+                      % (name, n, name, n, n, name)))
+        counts.add('poly_mix.decl')
+    funcs = find_functions(m)
+    info = []
+    for hs, o, c in funcs:
+        hdr = header_text(m, hs, o)
+        fname = header_name(hdr)
+        own = re.search(r'\b%s\b' % name, hdr[hdr.find('('):]) is not None
+        info.append((fname, o, c, own))
+    need = set(f for f, o, c, own in info if not own and re.search(r'\b%s\b' % name, m[o:c]))
+    changed = bool(need)
+    while changed:
+        changed = False
+        alt = re.compile(r'(?<![\w.])(?:%s)\s*\(' % '|'.join(map(re.escape, sorted(need))))
+        for f, o, c, own in info:
+            if f in need or own:
+                continue
+            if alt.search(m, o, c):
+                need.add(f)
+                changed = True
+    if not need:
+        return apply_edits(s, edits)
+    bodies = sorted((o, c) for _, o, c, _ in info)
+    call_re = re.compile(r'(?<![\w.])(?:\w+::)*(%s)\s*\(' % '|'.join(map(re.escape, sorted(need))))
+    for mo in call_re.finditer(m):
+        po = mo.end() - 1
+        pc = match_close(m, po)
+        empty = not m[po + 1:pc].strip()
+        inside = any(o < mo.start() < c for o, c in bodies)
+        if inside:
+            edits.append((pc, pc, ('' if empty else ', ') + name))
+            counts.add('poly_mix.call')
+        else:
+            edits.append((pc, pc, ('' if empty else ', ') + 'const FpExt* ' + name))
+            counts.add('poly_mix.param')
+    return apply_edits(s, edits)
+
+
+def pass_fpext_index(s, counts):
+    """`e[i]` on an FpExt value (CUDA FpExt::operator[]) -> `e.elems[i]` (Metal fpext.h has no
+    operator[]). Only names declared as by-value FpExt parameters or `FpExt x` locals of the
+    same function are rewritten; FpExt arrays and pointers keep their subscripts. Subscripting
+    an `auto` local is refused (its type is not known here)."""
+    m = mask(s)
+    edits = []
+    for hs, o, c in find_functions(m):
+        hdr = header_text(m, hs, o)
+        body = m[o:c]
+        names = set()
+        if '(' in hdr:
+            for mo in re.finditer(r'\bFpExt\s+(\w+)\s*(?=[,)=])', hdr[hdr.find('('):]):
+                names.add(mo.group(1))
+        for mo in re.finditer(r'\bFpExt\s+(\w+)\s*(?=[=;({,])', body):
+            names.add(mo.group(1))
+        arrays = set(re.findall(r'\bFpExt\s+(\w+)\s*\[', body))
+        names -= arrays
+        autos = set(re.findall(r'\bauto\s+(\w+)\s*=', body))
+        for mo in re.finditer(r'(?<![\w.>])(\w+)\s*\[', body):
+            n = mo.group(1)
+            if n in names:
+                edits.append((o + mo.end(1), o + mo.end(1), '.elems'))
+                counts.add('fpext_index')
+            elif n in autos:
+                raise TranslateError('subscript of auto %s at %s: type unknown (FpExt needs '
+                                     '.elems[i])' % (n, where(s, o + mo.start())))
+    return apply_edits(s, edits)
+
+
+def pass_eval_aspace(s, counts):
+    """Address spaces of the eval chain: `const Fp*`/`const FpExt*` -> `const device` (trace
+    buffers, poly_mix); mutable `Fp*`/`FpExt*` -> `thread` (poly_fp's x33/x34 temporaries,
+    which the chain functions fill and read); `Fp&`/`FpExt&` is an error. Pointers that already
+    carry an address space (kernel parameters) are left alone."""
+    m = mask(s)
+    edits = []
+    rx = re.compile(r'(?<![\w:.>])(?P<const>const\s+)?(?P<type>Fp|FpExt|Val|ExtVal)\b'
+                    r'\s*(?P<op>\*(?!\s*\*)|&(?!&))')
+    for mo in rx.finditer(m):
+        start = mo.start()
+        if re.search(r'\b(%s)\s+(const\s+)?$' % '|'.join(ASPACES), m[max(0, start - 20):start]):
+            continue
+        after = m[mo.end():mo.end() + 40]
+        if not re.match(r'\s*(const\s+)?(\w|>|\)|,)', after):
+            continue
+        if mo.group('op') == '*' and re.match(r'\s+\w', after) and \
+                re.search(r'\s$', m[start:mo.end() - 1]) and \
+                re.search(r'[\w)\]]\s*$', m[max(0, start - 8):start]):
+            continue  # `a Fp * b` in an expression
+        if mo.group('op') == '&':
+            raise TranslateError('%s& at %s: spell its address space'
+                                 % (mo.group('type'), where(s, start)))
+        if mo.group('const'):
+            edits.append((start, mo.end('const'), 'const device '))
+            counts.add('aspace.device')
+        else:
+            edits.append((start, start, 'thread '))
+            counts.add('aspace.thread')
     return apply_edits(s, edits)
 
 
@@ -1076,8 +1315,10 @@ ALL_PASSES = ('kernel', 'strip', 'include', 'accum_guard', 'array', 'value_type'
               'lambda', 'fpp', 'qual', 'aspace', 'fp_zero', 'assert')
 
 
-def translate(src, typedefs=None, passes=ALL_PASSES, counts=None, uniq=None, strict=True):
-    """Translate CUDA text. Returns (text, counts). Raises TranslateError."""
+def translate(src, typedefs=None, passes=ALL_PASSES, counts=None, uniq=None, strict=True,
+              include_map=None, metal_ns=METAL_NS):
+    """Translate CUDA text. Returns (text, counts). Raises TranslateError. include_map and
+    metal_ns override INCLUDE_MAP and the target namespace (eval mode)."""
     counts = Counts() if counts is None else counts
     uniq = uniq or Uniq()
     typedefs = typedefs if typedefs is not None else {}
@@ -1090,7 +1331,13 @@ def translate(src, typedefs=None, passes=ALL_PASSES, counts=None, uniq=None, str
         elif p == 'strip':
             s = pass_strip(s, counts)
         elif p == 'include':
-            s = pass_include(s, counts)
+            s = pass_include(s, counts, include_map, metal_ns)
+        elif p == 'poly_mix':
+            s = pass_poly_mix(s, counts)
+        elif p == 'fpext_index':
+            s = pass_fpext_index(s, counts)
+        elif p == 'eval_aspace':
+            s = pass_eval_aspace(s, counts)
         elif p == 'accum_guard':
             s = pass_accum_guard(s, counts)
         elif p == 'array':
@@ -1172,6 +1419,102 @@ def translate_incs(cuda_dir=HERE):
         text, c = translate(read(os.path.join(cuda_dir, src_name)), passes=('array', 'qual'))
         res[dst] = (banner(src_name) + text, c, src_name)
     return res
+
+
+# Eval mode (R6): the baseline eval_check (phase-1 oracle) from eval_check.cuh, eval_check_0..3.cu
+# and the eval_check kernel of eval_check_kernel.cu, as one Metal translation unit. The chain
+# functions live in EVAL_NS (not rv32im_metal) so that they cannot collide with other
+# translation units of the same metallib (evalfast also defines a poly_fp).
+EVAL_SOURCES = ('eval_check.cuh', 'eval_check_0.cu', 'eval_check_1.cu', 'eval_check_2.cu',
+                'eval_check_3.cu', 'eval_check_kernel.cu')
+EVAL_NS = 'rv32im_metal_eval'
+EVAL_INCLUDE_MAP = {
+    '"supra/fp.h"': None,
+    '"eval_check.cuh"': None,  # inlined at the top of eval_check.metal
+    '<cstdint>': None,
+}
+EVAL_PASSES = ('poly_mix', 'kernel', 'strip', 'include', 'fpext_index', 'fpp', 'qual',
+               'eval_aspace', 'fp_zero')
+EVAL_KERNEL_ANCHOR = '__launch_bounds__(EVAL_CHECK_THREADS)\n__global__ void eval_check('
+
+# Rewrite counts of `eval` for the checked-in sources (see PINNED_STEPS).
+# 21 functions (poly_fp + rv32im_v2_0..19), each with a prototype in eval_check.cuh and a
+# definition: poly_mix.param = 2 * 21 + the kernel; poly_mix.call = 20 chain calls + the kernel's
+# poly_fp call; fpext_index = the kernel's ret[0..3].
+PINNED_EVAL = {
+    'eval_check': {
+        'aspace.device': 182,
+        'aspace.thread': 74,
+        'fpext_index': 4,
+        'include': 14,
+        'kernel': 1,
+        'kernel.hoisted': 1,
+        'poly_mix.call': 21,
+        'poly_mix.decl': 1,
+        'poly_mix.param': 43,
+        'qual.device_fn': 21,
+        'qual.extern_device': 21,
+        'qual.noinline': 20,
+        'qual.ns_constexpr': 2,
+        'strip.launch_bounds': 1,
+    },
+}
+
+
+def eval_kernel_source(text):
+    """The eval_check kernel of eval_check_kernel.cu (not eval_check_diag, not the host code),
+    in the CUDA namespace, with the EVAL_CHECK_THREADS default."""
+    e0 = text.index(EVAL_KERNEL_ANCHOR)
+    m = mask(text)
+    bo = m.index('{', m.index(')', e0 + len(EVAL_KERNEL_ANCHOR)))
+    bc = match_close(m, bo)
+    d0 = text.index('#ifndef EVAL_CHECK_THREADS')
+    d1 = text.index('#endif', d0) + len('#endif')
+    return ('// ---- eval_check_kernel.cu: the eval_check kernel ----\nnamespace %s {\n\n%s\n\n%s\n\n'
+            '} // namespace %s\n' % (CUDA_NS, text[d0:d1], text[e0:bc + 1], CUDA_NS))
+
+
+def eval_input(cuda_dir=HERE, srcs=None):
+    """The combined CUDA input of eval mode. srcs overrides file texts by name (selftest)."""
+    srcs = srcs or {}
+    parts = []
+    for name in EVAL_SOURCES:
+        text = srcs.get(name)
+        if text is None:
+            text = read(os.path.join(cuda_dir, name))
+        if name == 'eval_check_kernel.cu':
+            text = eval_kernel_source(text)
+        elif name == 'eval_check.cuh':
+            text = text.replace('#pragma once\n', '', 1)
+        parts.append('// ---- %s ----\n%s' % (name, text) if name != 'eval_check_kernel.cu'
+                     else text)
+    return '\n'.join(parts)
+
+
+def translate_eval(cuda_dir=HERE, srcs=None):
+    """-> (eval_check.metal text, counts)."""
+    src = eval_input(cuda_dir, srcs)
+    out, c = translate(src, passes=EVAL_PASSES, include_map=EVAL_INCLUDE_MAP, metal_ns=EVAL_NS)
+    head = (banner(', '.join(EVAL_SOURCES)) +
+            '// Baseline rv32im eval_check (phase-1 oracle, Metal port item R6): poly_fp and the\n'
+            '// 20 noinline rv32im_v2_* chain functions in namespace %s, kernel `eval_check`\n'
+            '// at global scope. CUDA\'s `__constant__ FpExt poly_mix[%s]` is the kernel\'s last\n'
+            '// buffer (`const device FpExt*`, kNumPolyMixPows entries) threaded through the chain.\n'
+            '#include <metal_stdlib>\n#include "fp.h"\n#include "fpext.h"\n\n'
+            % (EVAL_NS, 'kNumPolyMixPows') + LB_PRELUDE + '\n')
+    return head + out, c
+
+
+def write_if_changed(path, text):
+    """Write unless the file already holds exactly text (build.rs reruns on a new mtime)."""
+    try:
+        if read(path) == text:
+            return False
+    except FileNotFoundError:
+        pass
+    with open(path, 'w', newline='') as f:
+        f.write(text)
+    return True
 
 
 def check_pins(all_counts, pins=PINNED_STEPS):
@@ -1338,6 +1681,61 @@ def _selftest_cases():
           '  return tab[p];\n}\n')
     cases.append(dict(name='strip', pass_='strip', ctx='bare', src=st,
                       expect={'strip.asm': 1, 'strip.nvtx': 1, 'strip.restrict': 1}))
+    cases += _selftest_eval_cases()
+    return cases
+
+
+EVAL_TOPTS = dict(passes=EVAL_PASSES, include_map=EVAL_INCLUDE_MAP, metal_ns=EVAL_NS)
+
+# Fp** call sites (R6): a callee with an Fp** parameter, a function forwarding its own Fp**,
+# and a kernel passing a local pointer array (the eval_check_ef.cu ef_eval_split shape:
+# `Fp* args[5] = {accum, data, out, mix, slab}; poly_fp(..., args)` + `args[4]` elsewhere).
+FPP_CALL_PROBE = '''\
+namespace %s {
+__device__ FpExt c2m_fpp_leaf(uint32_t i, Fp** args) {
+  return FpExt(args[0][i] + args[2][i]) * args[1][i];
+}
+__device__ FpExt c2m_fpp_fwd(uint32_t i, Fp** args);
+__device__ FpExt c2m_fpp_fwd(uint32_t i, Fp** args) {
+  return c2m_fpp_leaf(i, args) + FpExt(args[3][i]);
+}
+__global__ void c2m_fpp_kernel(Fp* out, Fp* a, Fp* b, Fp* c, Fp* d, uint32_t n) {
+  uint32_t i = blockDim.x * blockIdx.x + threadIdx.x;
+  if (i >= n) return;
+  Fp* args[4] = {a, b, c, d};
+  FpExt t = c2m_fpp_fwd(i, args);
+  out[i] = t[0] + args[3][i];
+}
+} // namespace %s
+''' % (CUDA_NS, CUDA_NS)
+
+
+def _selftest_eval_cases():
+    """Eval mode (R6): the full eval_check.metal (pins checked separately), the smallest chain
+    function on its own, and an Fp** call-site probe."""
+    cases = []
+    out, c = translate_eval()
+    cases.append(dict(name='eval_full', pass_='eval (all)', ctx='eval', translated=(out, c),
+                      expect=dict(PINNED_EVAL['eval_check']), global_scope=True,
+                      kernels=['eval_check']))
+    # rv32im_v2_0 (the last link of the chain: no further call) with its prototype and the
+    # poly_mix declaration: poly_mix threading on a definition + prototype, chain aspaces.
+    e3 = read(os.path.join(HERE, 'eval_check_3.cu'))
+    cuh = read(os.path.join(HERE, 'eval_check.cuh'))
+    f0 = _extract_function(e3, r'__device__ FpExt rv32im_v2_0\(')
+    p0 = cuh.index('extern __device__ __noinline__ FpExt rv32im_v2_0(')
+    p1 = cuh.index(';', p0) + 1
+    src = ('namespace %s {\n%s\nconstexpr size_t INV_RATE = 4;\nconstexpr size_t kNumPolyMixPows = '
+           '458;\n__constant__ FpExt poly_mix[kNumPolyMixPows];\n%s\n} // namespace %s\n'
+           % (CUDA_NS, cuh[p0:p1], f0, CUDA_NS))
+    cases.append(dict(name='eval_chain_v2_0', pass_='poly_mix/eval_aspace', ctx='eval', src=src,
+                      topts=EVAL_TOPTS, global_scope=True,
+                      expect={'poly_mix.decl': 1, 'poly_mix.param': 2, 'poly_mix.call': 0,
+                              'qual.noinline': 1, 'aspace.thread': 2, 'aspace.device': 4}))
+    cases.append(dict(name='fpp_call', pass_='fpp call sites', ctx='eval', src=FPP_CALL_PROBE,
+                      topts=EVAL_TOPTS, global_scope=True, kernels=['c2m_fpp_kernel'],
+                      expect={'fpp': 3, 'fpp.call': 2, 'fpp.array': 1, 'fpext_index': 1,
+                              'kernel': 1}))
     return cases
 
 
@@ -1361,7 +1759,27 @@ def _selftest_negative():
     neg.append(('Fp& of unknown address space', '__device__ void f(Fp& x) { x = Fp(1); }\n',
                 'spell its address space'))
     neg.append(('unmapped include', '#include "unknown.cuh"\n', 'no Metal mapping'))
-    return neg
+    return [(w, src, needle, None) for w, src, needle in neg] + _selftest_eval_negative()
+
+
+def _selftest_eval_negative():
+    neg = []
+    neg.append(('__constant__ poly_mix with an initializer',
+                '__constant__ FpExt poly_mix[2] = {FpExt(1u), FpExt(2u)};\n'
+                '__device__ FpExt f() { return poly_mix[1]; }\n', 'has an initializer'))
+    neg.append(('Fp** argument that is not a pointer array',
+                FPP_CALL_PROBE.replace('c2m_fpp_fwd(i, args);\n  out', 'c2m_fpp_fwd(i, &a);\n  out'),
+                'neither the'))
+    neg.append(('pointer array used other than args[k]',
+                FPP_CALL_PROBE.replace('out[i] = t[0] + args[3][i];',
+                                       'out[i] = t[0] + *args[3];\n  Fp** q = args;'),
+                'used other than'))
+    neg.append(('subscript of an auto FpExt',
+                '__device__ FpExt g();\n__device__ Fp f() { auto t = g(); return t[0]; }\n',
+                'subscript of auto'))
+    neg.append(('Fp& in eval mode', '__device__ void f(Fp& x) { x = Fp(1); }\n',
+                'spell its address space'))
+    return [(w, src, needle, EVAL_TOPTS) for w, src, needle in neg]
 
 
 def selftest(headers=None, keep=None):
@@ -1404,11 +1822,33 @@ def selftest(headers=None, keep=None):
     else:
         print('  OK     pins catch a changed input (%s)' % '; '.join(bad))
 
+    # 2c. eval mode pins (R6), and their sensitivity: drop one __noinline__ from eval_check.cuh
+    bad = check_pins({'eval_check': translate_eval()[1]}, PINNED_EVAL)
+    print('  pins   eval_check: %s' % ('OK' if not bad else 'MISMATCH'))
+    for b in bad:
+        fails.append('pin: ' + b)
+        print('    ' + b)
+    cuh = read(os.path.join(HERE, 'eval_check.cuh'))
+    mut = cuh.replace('extern __device__ __noinline__ FpExt rv32im_v2_0(',
+                      'extern __device__ FpExt rv32im_v2_0(', 1)
+    bad = check_pins({'eval_check': translate_eval(srcs={'eval_check.cuh': mut})[1]},
+                     PINNED_EVAL)
+    want = ['eval_check qual.noinline: pinned 20, got 19']
+    if bad != want:
+        fails.append('eval pin check on a mutated eval_check.cuh reported %r, expected %r'
+                     % (bad, want))
+        print('  FAIL   eval pins catch a changed input: %r' % bad)
+    else:
+        print('  OK     eval pins catch a changed input (%s)' % bad[0])
+
     # 3. one snippet per pass: translate, check counts and residuals, compile
     incs = [work, headers, BK_METAL]
     for case in _selftest_cases():
         try:
-            out, c = translate(case['src'], typedefs)
+            if 'translated' in case:
+                out, c = case['translated']
+            else:
+                out, c = translate(case['src'], typedefs, **case.get('topts', {}))
         except TranslateError as e:
             fails.append('%s: %s' % (case['name'], e))
             print('  FAIL   %-18s translate: %s' % (case['name'], e))
@@ -1419,10 +1859,14 @@ def selftest(headers=None, keep=None):
                     fails.append('%s: expected some %s rewrites' % (case['name'], k))
             elif c.get(k, 0) != v:
                 fails.append('%s: %s = %d, expected %d' % (case['name'], k, c.get(k, 0), v))
-        tu = ['#define RV32IM_METAL_INCLUDE_GENERATED 1', '#include "witgen.h"']
-        if case['ctx'] == 'steps':
-            tu.append('#include "steps.metal.h"')
-        tu.append(PRELUDE)
+        if case['ctx'] == 'eval':
+            tu = [] if 'translated' in case else ['#include "fp.h"', '#include "fpext.h"',
+                                                  LB_PRELUDE]
+        else:
+            tu = ['#define RV32IM_METAL_INCLUDE_GENERATED 1', '#include "witgen.h"']
+            if case['ctx'] == 'steps':
+                tu.append('#include "steps.metal.h"')
+            tu.append(PRELUDE)
         if case.get('global_scope'):
             tu += [out, '']
         else:
@@ -1447,9 +1891,9 @@ def selftest(headers=None, keep=None):
         print('  %-6s %-18s %-22s %5.1fs  %s' % ('OK' if ok else 'FAIL', case['name'],
                                                  case['pass_'], dt, fmt_counts(c)))
     # 4. negative cases: the translator must refuse
-    for what, src, needle in _selftest_negative():
+    for what, src, needle, topts in _selftest_negative():
         try:
-            translate(src, typedefs)
+            translate(src, typedefs, **(topts or {}))
             fails.append('negative "%s": translated without error' % what)
             print('  FAIL   refuse %s' % what)
         except TranslateError as e:
@@ -1516,13 +1960,51 @@ def cmd_steps(args):
     return 0
 
 
+def cmd_eval(args):
+    t0 = time.time()
+    out, counts = translate_eval()
+    dt = time.time() - t0
+    print('cuda2metal eval_check: %s' % fmt_counts(counts))
+    bad = check_pins({'eval_check': counts}, PINNED_EVAL)
+    if bad:
+        print('cuda2metal: eval rewrite counts differ from PINNED_EVAL (the generated input '
+              'changed shape):')
+        for b in bad:
+            print('  ' + b)
+        if not args.no_pin:
+            return 1
+    else:
+        print('cuda2metal: counts match PINNED_EVAL')
+    os.makedirs(args.out, exist_ok=True)
+    path = os.path.join(args.out, 'eval_check.metal')
+    if args.check:
+        write_or_check(path, out, True)
+        what = 'checked'
+    else:
+        what = 'wrote' if write_if_changed(path, out) else 'unchanged'
+    print('cuda2metal: %s %s (%d lines; translation %.2f s)' % (what, path, out.count('\n'), dt))
+    if args.compile:
+        rc, err, dt, cmd = metal_compile(path, os.path.join(args.out, 'eval_check.air'), [BK_METAL])
+        print('cuda2metal: %s' % ' '.join(cmd))
+        nwarn = len(re.findall(r'\bwarning: ', err))
+        classes = error_classes(err)
+        print('cuda2metal: compile %s in %.1f s, %d error(s), %d warning(s)'
+              % ('OK' if rc == 0 else 'FAILED', dt, sum(classes.values()), nwarn))
+        for k, v in sorted(classes.items(), key=lambda kv: -kv[1]):
+            print('  %5d  %s' % (v, k))
+        if rc != 0 or nwarn:
+            sys.stderr.write(err[:5000])
+            return 1
+    return 0
+
+
 def main(argv):
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--selftest', action='store_true')
     ap.add_argument('--headers', help='rv32im Metal header dir (default: R1 witgen.h if present, '
                     'else the selftest stubs)')
     ap.add_argument('--keep', help='selftest: keep generated files in this dir')
-    ap.add_argument('mode', nargs='?', choices=('steps', 'incs', 'file'))
+    ap.add_argument('mode', nargs='?', choices=('steps', 'incs', 'eval', 'file'))
     ap.add_argument('input', nargs='?')
     ap.add_argument('-o', '--out')
     ap.add_argument('--types', default=os.path.join(HERE, 'types.cuh.inc'))
@@ -1537,6 +2019,10 @@ def main(argv):
             if not args.out:
                 ap.error('steps needs -o OUTDIR')
             return cmd_steps(args)
+        if args.mode == 'eval':
+            if not args.out:
+                ap.error('eval needs -o OUTDIR')
+            return cmd_eval(args)
         if args.mode == 'incs':
             if not args.out:
                 ap.error('incs needs -o OUTDIR')

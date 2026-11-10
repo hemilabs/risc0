@@ -2283,7 +2283,34 @@ fn build_metal_kernels() {
     // ---- END R5 witgen_tu (metal) ----
 
     // ---- BEGIN R6 eval_check (metal) ----
-    // R6: `cuda2metal.py` eval mode -> gen_dir/eval_check.metal; push onto `generated`.
+    // R6: the baseline eval_check (phase-1 oracle): `cuda2metal.py eval` translates
+    // eval_check.cuh + eval_check_0..3.cu + the eval_check kernel of eval_check_kernel.cu into
+    // gen_dir/eval_check.metal (rewritten only when its text changes) and fails when its pinned
+    // rewrite counts change. Kernel `eval_check`, buffers 0..9 = check, ctrl, data, accum, mix,
+    // out, rou, po2, domain, poly_mix (kNumPolyMixPows FpExt).
+    if !skip {
+        const R6_EVAL_INPUTS: &[&str] = &[
+            CUDA2METAL,
+            "kernels/cuda/eval_check.cuh",
+            "kernels/cuda/eval_check_0.cu",
+            "kernels/cuda/eval_check_1.cu",
+            "kernels/cuda/eval_check_2.cu",
+            "kernels/cuda/eval_check_3.cu",
+            "kernels/cuda/eval_check_kernel.cu",
+        ];
+        for input in R6_EVAL_INPUTS {
+            rerun_if_changed(input);
+        }
+        let gen = gen_dir.to_str().expect("OUT_DIR is not UTF-8");
+        run_metal_generator(
+            CUDA2METAL,
+            &["eval", "-o", gen],
+            "cuda2metal.py eval failed: if the eval_check sources were regenerated, review \
+             `python3 kernels/cuda/cuda2metal.py eval -o <dir> --compile --no-pin` and update \
+             PINNED_EVAL",
+        );
+        generated.push(gen_dir.join("eval_check.metal"));
+    }
     // ---- END R6 eval_check (metal) ----
 
     // The include dirs put the hand-written headers (witgen.h, buffers.h, ...), the checked-in
