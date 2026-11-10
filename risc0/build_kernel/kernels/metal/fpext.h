@@ -23,6 +23,13 @@
 
 // Defines instead of constexpr to appease CUDAs limitations around constants.
 // undef'd at the end of this file.
+// fpext.h provides mixed Fp/FpExt addition and subtraction: tells generated code that carries
+// its own fallback (rv32im cuda2metal.py's prelude) not to define a second set.
+#define R0_FPEXT_MIXED_ADDSUB 1
+#ifndef C2M_NO_FPEXT_MIXED_ADDSUB
+#define C2M_NO_FPEXT_MIXED_ADDSUB 1
+#endif
+
 #define BETA Fp(11)
 #define NBETA Fp(Fp::P - 11)
 
@@ -161,6 +168,54 @@ struct FpExt {
   }
 
   friend constexpr FpExt operator-(FpExt x) { return FpExt() - x; }
+
+  // Mixed addition and subtraction with the subfield Fp (CUDA fpext.h has them; an Fp is the
+  // FpExt (x, 0, 0, 0), so only elems[0] changes). FpExt(Fp) stays explicit: with these
+  // overloads `ext + fp`, `fp + ext`, `ext - fp`, `fp - ext` are each matched by exactly one
+  // candidate (no implicit Fp -> FpExt or FpExt -> Fp conversion exists).
+  constexpr FpExt operator+=(Fp rhs) {
+    elems[0] += rhs;
+    return *this;
+  }
+
+  constexpr FpExt operator+=(Fp rhs) device {
+    elems[0] += rhs;
+    return *this;
+  }
+
+  constexpr FpExt operator+=(Fp rhs) threadgroup {
+    elems[0] += rhs;
+    return *this;
+  }
+
+  constexpr FpExt operator-=(Fp rhs) {
+    elems[0] -= rhs;
+    return *this;
+  }
+
+  constexpr FpExt operator-=(Fp rhs) device {
+    elems[0] -= rhs;
+    return *this;
+  }
+
+  constexpr FpExt operator-=(Fp rhs) threadgroup {
+    elems[0] -= rhs;
+    return *this;
+  }
+
+  friend constexpr FpExt operator+(FpExt lhs, Fp rhs) {
+    lhs += rhs;
+    return lhs;
+  }
+
+  friend constexpr FpExt operator+(Fp lhs, FpExt rhs) { return rhs + lhs; }
+
+  friend constexpr FpExt operator-(FpExt lhs, Fp rhs) {
+    lhs -= rhs;
+    return lhs;
+  }
+
+  friend constexpr FpExt operator-(Fp lhs, FpExt rhs) { return lhs + (-rhs); }
 
   // Implement the simple multiplication case by the subfield Fp
   constexpr FpExt operator*=(Fp rhs) {

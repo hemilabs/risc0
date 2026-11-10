@@ -66,6 +66,7 @@ inline rv32im_index_t rv32im_cell(uint row, uint col, uint rows) {
 #define RV32IM_FAULT_LOOKUP_INDEX 0x2u  // u8/u16 lookup index out of range (clamped)
 #define RV32IM_FAULT_TXN_INDEX 0x4u     // memory transaction index out of range (clamped)
 #define RV32IM_FAULT_BIGINT_INDEX 0x8u  // bigint byte index out of range (clamped)
+#define RV32IM_FAULT_ASSERT 0x10u       // translated CUDA assert() failed (C2M_ASSERT)
 
 // ---------------------------------------------------------------------------------------------
 // Layout asserts for structs shared with Rust (`offsetof` is not a macro in MSL).

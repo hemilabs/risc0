@@ -2162,29 +2162,157 @@ fn build_intel_kernels() {
     }
 }
 
-/// The `metal` feature on macOS/iOS: compile `kernels/metal/*.metal` into
-/// `metal_kernels_rv32im.metallib` and point `RV32IM_METAL_PATH` at it for `src/lib.rs`
-/// (`METAL_LIB`). Generated sources, when the unit adds them, go to `$OUT_DIR/metal`.
+/// The `metal` feature on macOS/iOS: run the Metal generators and compile the hand-written
+/// `kernels/metal/*.metal` plus the generated sources into `metal_kernels_rv32im.metallib`, and
+/// point `RV32IM_METAL_PATH` at it for `src/lib.rs` (`METAL_LIB`).
+///
+/// Layout of the generated files (plan 2.0 "Translator language", 2.8):
+/// - `kernels/metal/{defs,types,layout}.metal.inc` are translations of the zirgen
+///   `kernels/cuda/{defs.cu.inc,types.cuh.inc,layout.cu.inc}` by `cuda2metal.py incs`. They are
+///   checked in next to the CUDA ones (witgen.h includes them under
+///   `RV32IM_METAL_INCLUDE_GENERATED`), and every build re-translates them with `--check`, so a
+///   regenerated circuit without regenerated Metal includes fails the build instead of drifting.
+/// - Everything else generated (kernel translation units) goes to `$OUT_DIR/metal`
+///   ([`metal_gen_dir`]), is never checked in, and is listed in `generated` below.
+///
+/// R4 (accum_tu), R5 (witgen_tu) and R6 (eval_check) each own exactly one delimited block
+/// below and edit nothing else in this file; a block runs its generator into `gen_dir` (with
+/// [`run_metal_generator`]; the generator must not rewrite an unchanged output, see
+/// [`write_if_changed`]), pushes the resulting `.metal` paths onto `generated`, may push extra
+/// compiler flags onto `flags`, and prints `rerun-if-changed` for its generator's inputs. Blocks
+/// do nothing when `skip` is set (RISC0_SKIP_BUILD_KERNELS: KernelBuild writes an empty
+/// metallib and nothing needs python or the generated files).
 fn build_metal_kernels() {
     const OUTPUT: &str = "metal_kernels_rv32im";
     const SOURCES: &[&str] = &["kernels/metal/misc.metal"];
 
-    // The include dir puts the hand-written headers (witgen.h, buffers.h, ...) on the `-I` path
-    // and into the metallib cache key, so editing one rebuilds.
-    KernelBuild::new(KernelType::Metal)
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let skip = env::var("RISC0_SKIP_BUILD_KERNELS").is_ok();
+    let gen_dir = metal_gen_dir();
+    // Generated `.metal` translation units (absolute paths under `gen_dir`), compiled after
+    // SOURCES into the same metallib.
+    let mut generated: Vec<PathBuf> = Vec::new();
+    // Extra compiler flags for every source of the metallib (they are part of its cache key).
+    #[allow(unused_mut)] // pushed to by the R4/R5/R6 blocks below
+    let mut flags: Vec<String> = Vec::new();
+
+    if !skip {
+        // Drift gate for the checked-in .metal.inc files (fast: ~0.2 s).
+        for input in METAL_INCS_INPUTS {
+            rerun_if_changed(input);
+        }
+        run_metal_generator(
+            CUDA2METAL,
+            &["incs", "-o", "kernels/metal", "--check"],
+            "kernels/metal/*.metal.inc are out of date: run \
+             `python3 kernels/cuda/cuda2metal.py incs -o kernels/metal` in rv32im-sys",
+        );
+
+        // witgen.h + the three .metal.inc compiled on their own, with the layout facts that
+        // hand-written Metal code (misc.metal, the host) hard-codes asserted.
+        write_if_changed(&gen_dir.join("rv32im_incs.metal"), METAL_INCS_CHECK_TU);
+        generated.push(gen_dir.join("rv32im_incs.metal"));
+    }
+
+    // ---- BEGIN R4 accum_tu (metal) ----
+    // R4: `accum_tu_gen.py --metal` -> gen_dir/accum_tu.metal; push it onto `generated`.
+    // ---- END R4 accum_tu (metal) ----
+
+    // ---- BEGIN R5 witgen_tu (metal) ----
+    // R5: `witgen_tu_gen.py --metal` -> gen_dir/witgen_tu.metal (+ fwd/rev); push onto
+    // `generated`.
+    // ---- END R5 witgen_tu (metal) ----
+
+    // ---- BEGIN R6 eval_check (metal) ----
+    // R6: `cuda2metal.py` eval mode -> gen_dir/eval_check.metal; push onto `generated`.
+    // ---- END R6 eval_check (metal) ----
+
+    // The include dirs put the hand-written headers (witgen.h, buffers.h, ...), the checked-in
+    // .metal.inc files and the generated headers on the `-I` path and into the metallib cache
+    // key, so editing one rebuilds.
+    let mut build = KernelBuild::new(KernelType::Metal);
+    build
         .files(SOURCES)
+        .files(&generated)
         .include("kernels/metal")
-        .compile(OUTPUT);
+        .include(&gen_dir);
+    for flag in flags.iter() {
+        build.flag(flag);
+    }
+    build.compile(OUTPUT);
 
     // KernelBuild writes `skip-<output>` (empty) under RISC0_SKIP_BUILD_KERNELS.
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let name = if env::var("RISC0_SKIP_BUILD_KERNELS").is_ok() {
+    let name = if skip {
         format!("skip-{OUTPUT}")
     } else {
         OUTPUT.to_string()
     };
     let metallib = out_dir.join(name).with_extension("metallib");
     println!("cargo:rustc-env=RV32IM_METAL_PATH={}", metallib.display());
+}
+
+/// R2's CUDA-to-Metal translator (relative to the crate root, the build script's cwd).
+const CUDA2METAL: &str = "kernels/cuda/cuda2metal.py";
+
+/// What `cuda2metal.py incs` reads: the translator and the zirgen includes it translates.
+const METAL_INCS_INPUTS: &[&str] = &[
+    CUDA2METAL,
+    "kernels/cuda/defs.cu.inc",
+    "kernels/cuda/types.cuh.inc",
+    "kernels/cuda/layout.cu.inc",
+];
+
+/// `$OUT_DIR/metal/rv32im_incs.metal`: compiles witgen.h with the generated includes and
+/// nothing else (the layout tables are `constant constexpr`, so their initializers are
+/// evaluated here), and pins the layout constants that are hard-coded elsewhere. `.elems[0]`:
+/// r0::array's `operator[]` is not constexpr.
+const METAL_INCS_CHECK_TU: &str = r#"// GENERATED by rv32im-sys/build.rs (build_metal_kernels) -- do not edit.
+// witgen.h + defs/types/layout.metal.inc on their own.
+#define RV32IM_METAL_INCLUDE_GENERATED 1
+#include "witgen.h"
+
+namespace rv32im_metal {
+// misc.metal's finalizeZeroizeAccum takes it as FinalizeAccumParams::userAccumSplit (CUDA:
+// kUserAccumSplit = kLayout_TopAccum.columns[0].col).
+static_assert(kLayout_TopAccum.columns.elems[0].col == 23, "kUserAccumSplit changed");
+static_assert(kRegCountAccum == 103 && kRegCountCode == 1 && kRegCountData == 211 &&
+                  kRegCountGlobal == 90 && kRegCountMix == 36,
+              "rv32im register counts changed: update the Metal HAL buffer sizes");
+} // namespace rv32im_metal
+"#;
+
+/// Where the Metal generators write: `$OUT_DIR/metal` (created).
+fn metal_gen_dir() -> PathBuf {
+    let dir = PathBuf::from(env::var("OUT_DIR").unwrap()).join("metal");
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Runs `python <script> <args>` (risc0_build_kernel::python_command, RISC0_PYTHON) from the
+/// crate root and panics with `hint` when it fails.
+fn run_metal_generator<S: AsRef<std::ffi::OsStr>>(script: &str, args: &[S], hint: &str) {
+    let mut cmd = risc0_build_kernel::python_command();
+    cmd.arg(script).args(args);
+    let output = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("could not run {cmd:?}: {e}"));
+    if !output.status.success() {
+        panic!(
+            "{cmd:?} failed with {}\n{}{}\n{hint}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// Writes `contents` to `path` unless it already holds exactly that: KernelBuild prints
+/// `rerun-if-changed` for every source, so rewriting an unchanged generated file (new mtime)
+/// would rerun this build script on every cargo invocation.
+fn write_if_changed(path: &Path, contents: &str) {
+    if std::fs::read(path).ok().as_deref() != Some(contents.as_bytes()) {
+        std::fs::write(path, contents).unwrap();
+    }
 }
 
 /// Whether to build the Metal kernels: the `metal` feature on a macOS/iOS target (on any other

@@ -37,9 +37,13 @@
 /// - String literals are `constant char*` (eqz, extern_log, extern_assert).
 /// - The extern_* functions are declared here and defined by the TU that owns them (R5/R8), as
 ///   in CUDA (ffi.cu / witgen_tu.cu).
-/// - The generated .inc files are not included by default (they are produced into OUT_DIR by
-///   R3): a TU defines RV32IM_METAL_INCLUDE_GENERATED to include defs/types/layout.metal.inc at
-///   the end of the namespace, as CUDA's witgen.h includes the .cu.inc files.
+/// - The generated .inc files (defs/types/layout.metal.inc in this directory: cuda2metal.py
+///   `incs` translations of the zirgen .cu.inc files, re-checked by build.rs on every build)
+///   are not included by default: a TU defines RV32IM_METAL_INCLUDE_GENERATED to include them at
+///   the end of the namespace, as CUDA's witgen.h includes the .cu.inc files. Layouts are
+///   `constant constexpr` tables; r0::array's `operator[]` is not constexpr, so a constant
+///   expression over a layout array spells `.elems[i]` (CUDA's
+///   `kLayout_TopAccum.columns[0].col` -> `kLayout_TopAccum.columns.elems[0].col`).
 ///
 /// Defines a TU may set: RISC0_ROWS_POW2 (rows are a power of two: mask instead of modulo, as in
 /// CUDA), RV32IM_ORDERED_ROWS (buffers.h), RV32IM_WIDE_INDEX (cuda_compat.h).
