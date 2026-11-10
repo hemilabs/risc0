@@ -123,6 +123,57 @@ pub fn cuda_warmup() {
     let _ = risc0_sys::ffi_wrap(|| unsafe { risc0_circuit_recursion_cuda_warmup_eval_check() });
 }
 
+/// Build the recursion Metal pipeline states (base kernels and the eval_check variant selected by
+/// `RISC0_METAL_REC_KERNELS`) and the zkp ones, so the first lift does not pay for them (tens of
+/// seconds cold, PLAN 9.1). Blocking: run it on a background thread ([start_metal_warmup]). Best
+/// effort: a failure is logged, and `recursion_prover` reports it again. Safe to run while another
+/// thread proves: the recursion PSOs are built without the GPU lock.
+#[cfg(feature = "metal")]
+pub fn metal_warmup() {
+    if !risc0_zkp::hal::metal::enabled("recursion") {
+        return;
+    }
+    if let Err(e) = self::hal::metal::warmup() {
+        tracing::warn!("recursion Metal warmup failed: {e:#}");
+    }
+}
+
+/// Run [metal_warmup] on a detached background thread, once per process. Never join it from a
+/// thread holding `risc0_zkp::hal::metal::exclusive()` (the warmup takes that lock briefly).
+#[cfg(feature = "metal")]
+pub fn start_metal_warmup() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        if !risc0_zkp::hal::metal::enabled("recursion") {
+            return;
+        }
+        if let Err(e) = std::thread::Builder::new()
+            .name("recursion-metal-warmup".into())
+            .spawn(metal_warmup)
+        {
+            tracing::warn!("recursion Metal warmup thread not started: {e}");
+        }
+    });
+}
+
+/// Whether this build's recursion prover runs host-executed witgen chains (the cfg alias for the
+/// CUDA/ROCm/Metal host-chain paths): CUDA and ROCm always, Metal unless the Metal recursion
+/// prover is disabled at run time (`RISC0_METAL=0` / `RISC0_METAL_SKIP=recursion`), in which case
+/// the CPU prover runs and would ignore them.
+pub(crate) fn host_chains_backend() -> bool {
+    cfg_if! {
+        if #[cfg(any(feature = "cuda", feature = "rocm"))] {
+            true
+        } else if #[cfg(feature = "metal")] {
+            static ON: LazyLock<bool> =
+                LazyLock::new(|| risc0_zkp::hal::metal::enabled("recursion"));
+            *ON
+        } else {
+            false
+        }
+    }
+}
+
 /// Drop this thread's cached recursion provers, and with them the device buffers they keep
 /// between proofs (each program's committed ctrl group). The next proof rebuilds them.
 pub fn release_cached_provers() {
@@ -230,6 +281,8 @@ impl Prover {
     pub fn prewarm(&self) -> Result<()> {
         #[cfg(feature = "cuda")]
         let _gpu = risc0_zkp::hal::cuda::exclusive();
+        #[cfg(feature = "metal")]
+        let _gpu = risc0_zkp::hal::metal::exclusive();
         let hashfn = self.hashfn.clone();
         PROVER_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
@@ -256,10 +309,7 @@ impl Prover {
         // Execute the host chains of the trace prefix on a background thread while the
         // preflight continues (from the point where a streaming preflight has consumed its whole
         // prefix, else at 3/5 of the rows); the rest after.
-        #[cfg(any(feature = "cuda", feature = "rocm"))]
-        let split = host_prep_enabled();
-        #[cfg(not(any(feature = "cuda", feature = "rocm")))]
-        let split = false;
+        let split = host_chains_backend() && host_prep_enabled();
         let streaming = preflight_is_streaming(&preflight);
         let split_row = self.program.code_rows() * 3 / 5;
         type EarlyChains = std::thread::JoinHandle<Result<(Option<witgen::HostChains>, usize)>>;
@@ -288,9 +338,6 @@ impl Prover {
                 }
             }
         }
-        // Read only where host chains run (CUDA and ROCm); the repository builds with -Dwarnings.
-        #[cfg(not(any(feature = "cuda", feature = "rocm")))]
-        let _ = early_at;
         tracing::debug!(
             "recursion preflight: rows={} {:.1}ms prefix_words={} consumed={} past_prefix_at={:.1}ms \
              stream_wait={:.1}ms",
@@ -317,8 +364,9 @@ impl Prover {
                 );
             }
         }
-        #[cfg(any(feature = "cuda", feature = "rocm"))]
-        if let Some(h) = early.take() {
+        if !host_chains_backend() {
+            // The CPU/Intel provers run every chain themselves.
+        } else if let Some(h) = early.take() {
             let t0 = std::time::Instant::now();
             // A panic on the early thread falls back like its error does.
             let first = h
@@ -425,9 +473,11 @@ impl Prover {
     /// program and input.
     pub fn run(&mut self) -> Result<RecursionReceipt> {
         // Exclusive use of the GPU against other threads for this proof; the cached prover's HAL
-        // doesn't hold it (see `risc0_zkp::hal::cuda::singleton`).
+        // doesn't hold it (see `risc0_zkp::hal::cuda::singleton` / `metal::singleton`).
         #[cfg(feature = "cuda")]
         let _gpu = risc0_zkp::hal::cuda::exclusive();
+        #[cfg(feature = "metal")]
+        let _gpu = risc0_zkp::hal::metal::exclusive();
         let hashfn = self.hashfn.clone();
         // Take input instead of cloning to avoid copying ~4-8MB of seal data per call.
         let input = std::mem::take(&mut self.input);
