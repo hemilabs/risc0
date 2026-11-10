@@ -1225,13 +1225,12 @@ impl ProverImpl {
         std::thread::scope(|scope| -> Result<()> {
             // On Intel and AMD GPUs a keccak proof's witness is made on the CPU, about half of
             // the proof's time: make each on a thread, a proof ahead of the GPU, so the two
-            // overlap. (On CUDA the GPU makes it.) Metal also makes it on the CPU until K6 ports
-            // the witgen; then its prover declines the host witness (`prove_host_witness` returns
-            // None) and `prove_keccak_with` proves from the inputs, so this only wastes the CPU
-            // thread and should be narrowed then. The thread uses no HAL, so it cannot block on
-            // the Metal GPU lock this session holds. Returning early drops `witnesses`, which
+            // overlap. (On CUDA the GPU makes it.) Metal is excluded: its prover makes the witness
+            // itself (`HOST_WITNESS = false`, `prove_host_witness` returns None), so a host
+            // witness would be dropped after a wasted CPU witgen while holding ~1.15 GB per
+            // witness at po2 18. The thread uses no HAL. Returning early drops `witnesses`, which
             // ends the thread.
-            let witnesses = (cfg!(any(feature = "intel", feature = "rocm", feature = "metal"))
+            let witnesses = (cfg!(any(feature = "intel", feature = "rocm"))
                 && session.pending_keccaks.len() > 1)
                 .then(|| {
                     let (tx, rx) = mpsc::sync_channel(1);
