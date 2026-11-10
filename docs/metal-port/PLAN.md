@@ -171,7 +171,7 @@ Kept source-compatible for existing callers: `dispatch_by_name`, `dispatch_with_
 | Compiler flags | `KernelBuild::flag("-std=metal3.2").flag("-O2")` (after F1 makes flags effective and part of the cache key); `-frecord-sources -gline-tables-only` under `RISC0_METAL_DEBUG_SOURCES=1` |
 | Build gating | `CARGO_FEATURE_METAL` && `CARGO_CFG_TARGET_OS ∈ {macos, ios}`; `RISC0_SKIP_BUILD_KERNELS` keeps writing an empty metallib |
 | Toolchain | `source /Users/user/zkminer/env.sh` before any cargo command; `build_kernel::find_metal_toolchain()` honours `METAL_TC`/PATH and panics with the env.sh hint |
-| Env knobs | `RISC0_METAL`, `RISC0_METAL_SKIP`, `RISC0_METAL_DEBUG`, `RISC0_METAL_LEGACY` (zkp A/B), `RISC0_METAL_REC_KERNELS`, `RISC0_KECCAK_METAL_EVAL_STAGES`, `RISC0_GROTH16_METAL_PROVER=docker`, `RISC0_METAL_G16_COLD`, `RISC0_VERBOSE` timings |
+| Env knobs | `RISC0_METAL`, `RISC0_METAL_SKIP`, `RISC0_METAL_DEBUG`, `RISC0_METAL_REC_KERNELS`, `RISC0_KECCAK_METAL_EVAL_STAGES`, `RISC0_GROTH16_METAL_PROVER=docker`, `RISC0_METAL_G16_COLD`, `RISC0_VERBOSE` timings |
 
 ### 2.9 Error handling
 - GPU-detectable faults (bad trace, inconsistent set, out-of-range index) → `device atomic_uint* fault` ORed once per thread; the host reads it after `sync()` and `anyhow::bail!`s with the circuit and phase. Indices derived from untrusted data are clamped before use so a corrupt trace cannot read out of bounds.
