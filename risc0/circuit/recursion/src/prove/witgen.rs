@@ -267,7 +267,6 @@ pub(crate) fn try_host_chains_range(
 }
 
 /// Concatenate the chains of two disjoint passes.
-#[cfg_attr(not(any(feature = "cuda", feature = "rocm")), allow(dead_code))]
 pub(crate) fn merge_host_chains(
     a: Option<HostChains>,
     b: Option<HostChains>,
@@ -402,7 +401,7 @@ where
             // Long chains from `prepare`, or computed here (a few ms of host time that saves
             // ~20 ms of single-thread GPU time).
             let mut chains = preflight.host_chains.lock().unwrap().take();
-            if chains.is_none() && cfg!(any(feature = "cuda", feature = "rocm")) {
+            if chains.is_none() && super::host_chains_backend() {
                 chains = host_chains(zkr, preflight);
             } else if let Some(hc) = chains.as_mut() {
                 // Upload the chain rows from the page-locked copy, if there is one.
