@@ -326,6 +326,7 @@ impl MetalHashPoseidon2 {
                 diag.as_arg(),
                 io.as_arg_with_offset(n),
                 io.as_arg_with_offset(n * 2),
+                KernelArg::Integer(n32),
             ];
             hal.launch("poseidon2_fold", n as u64, args);
             return;
