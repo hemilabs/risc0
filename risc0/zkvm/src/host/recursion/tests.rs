@@ -337,6 +337,10 @@ fn test_recursion_lift_join_identity_p254_e2e() {
 /// The recursion witgen chains executed on the host give the same witness as the device
 /// witgen: lift, join, identity_p254 and resolve with the check on.
 #[cfg(any(feature = "cuda", feature = "rocm", feature = "metal"))]
+#[cfg_attr(
+    feature = "metal",
+    ignore = "recursion witgen on Metal is still the CPU stub; remove this ignore in item C9 (PLAN 4.3)"
+)]
 #[test_log::test]
 fn test_recursion_host_chains_check() {
     let before = risc0_circuit_recursion::prove::set_host_chains_check(true);

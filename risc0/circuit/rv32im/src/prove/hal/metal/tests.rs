@@ -43,8 +43,8 @@ use crate::{
 fn missing_kernels_error_only_when_phase_required() {
     let hal = MetalHalSha256::new();
     let expected: &[(Phase, &[&str])] = &[
-        (Phase::Witgen, &["noop"]),
-        (Phase::Accum, &["r7_not_a_kernel", "noop"]),
+        (Phase::Witgen, &["injectCycleCols"]),
+        (Phase::Accum, &["r7_not_a_kernel", "finalizeZeroizeAccum"]),
         (Phase::EvalCheck, &[]),
     ];
     let k = Rv32imKernels::load_from(&hal, METAL_LIB, METAL_KERNEL_NAMES, expected).unwrap();
@@ -55,9 +55,10 @@ fn missing_kernels_error_only_when_phase_required() {
         err.contains("Accum") && err.contains("r7_not_a_kernel"),
         "{err}"
     );
-    assert!(!err.contains("noop"), "{err}");
+    assert!(!err.contains("finalizeZeroizeAccum"), "{err}");
     // Every present listed/expected kernel has a PSO.
-    assert!(k.kernels.get("noop").is_some());
+    assert!(k.kernels.get("injectCycleCols").is_some());
+    assert!(k.kernels.get("finalizeZeroizeAccum").is_some());
 }
 
 #[test]
