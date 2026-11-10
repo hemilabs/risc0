@@ -32,6 +32,7 @@
 mod buffer;
 mod eval;
 mod kernels;
+mod mdiv;
 mod ntt;
 // `poseidon2` is taken by the `core::hash::poseidon2` import below.
 #[path = "metal/poseidon2.rs"]
@@ -48,6 +49,8 @@ mod tests_z2;
 mod tests_z3;
 #[cfg(test)]
 mod tests_z4;
+#[cfg(test)]
+mod tests_z5;
 
 use std::{
     fmt::Debug,
@@ -152,6 +155,18 @@ pub const KERNEL_NAMES: &[&str] = &[
     "mix_poly_coeffs_v1",
     "mix_poly_coeffs_v2",
     "mix_poly_coeffs_v2_dcids",
+    // Z5: combos_divide (mdiv.metal)
+    "mdiv_agg0_e8",
+    "mdiv_agg0_e16",
+    "mdiv_apply_e8",
+    "mdiv_apply_e16",
+    "mdiv_scan_32",
+    "mdiv_scan_64",
+    "mdiv_scan_128",
+    "mdiv_scan_256",
+    "mdiv_scan_512",
+    "mdiv_scan_1024",
+    "mdiv_final",
 ];
 
 /// Whether the Metal backend may be used for `unit` (one of `zkp`, `rv32im`, `recursion`,
@@ -858,5 +873,16 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
             into_offset,
             into_stride,
         );
+    }
+
+    fn combos_divide(
+        &self,
+        combos: &Self::Buffer<Self::ExtElem>,
+        chunks: Vec<(usize, Vec<Self::ExtElem>)>,
+        cycles: usize,
+    ) {
+        scope!("combos_divide");
+        let remainders = self.mdiv_combos_divide(combos, &chunks, cycles);
+        super::report_nonzero_remainders(&chunks, &remainders);
     }
 }
