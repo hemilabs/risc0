@@ -2167,10 +2167,13 @@ fn build_intel_kernels() {
 /// (`METAL_LIB`). Generated sources, when the unit adds them, go to `$OUT_DIR/metal`.
 fn build_metal_kernels() {
     const OUTPUT: &str = "metal_kernels_rv32im";
-    const SOURCES: &[&str] = &["kernels/metal/noop.metal"];
+    const SOURCES: &[&str] = &["kernels/metal/misc.metal"];
 
+    // The include dir puts the hand-written headers (witgen.h, buffers.h, ...) on the `-I` path
+    // and into the metallib cache key, so editing one rebuilds.
     KernelBuild::new(KernelType::Metal)
         .files(SOURCES)
+        .include("kernels/metal")
         .compile(OUTPUT);
 
     // KernelBuild writes `skip-<output>` (empty) under RISC0_SKIP_BUILD_KERNELS.

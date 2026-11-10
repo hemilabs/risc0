@@ -29,7 +29,13 @@ pub const METAL_LIB: &[u8] = include_bytes!(env!("RV32IM_METAL_PATH"));
 
 /// Every kernel entry point in [METAL_LIB]; the HAL fails fast if one is missing.
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
-pub const METAL_KERNEL_NAMES: &[&str] = &["noop"];
+pub const METAL_KERNEL_NAMES: &[&str] = &[
+    // kernels/metal/misc.metal
+    "injectCycleCols",
+    "finalizeZeroizeAccum",
+    "seq_fwd_probe",
+    "seq_rev_probe",
+];
 
 #[cfg(feature = "cuda")]
 use cust::memory::DevicePointer;
