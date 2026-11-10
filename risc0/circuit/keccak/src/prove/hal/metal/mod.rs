@@ -294,11 +294,25 @@ mod tests {
         }
     }
 
+    /// Tests that create a Metal HAL take this lock, so they run one at a time even when the
+    /// harness runs tests in parallel. The working-set budget
+    /// (`RISC0_METAL_MAX_WORKING_SET_BYTES`) and `current_allocated_size` count the whole
+    /// process's Metal memory, so overlapping GPU tests (K4's po2 17 eval_check and reuse runs,
+    /// K6's prover runs) made the 4 GiB budget suite pass or fail depending on scheduling (K5
+    /// fix round 1). Declare the guard first in the test so it is dropped last, after the HALs.
+    static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(crate) fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        // A failed test poisons the lock; the next test still runs.
+        GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn phase_entries() -> [usize; PHASES] {
         PHASE_ENTRIES.with(|e| std::array::from_fn(|i| e[i].get()))
     }
 
     fn scatter_matches_host(po2: usize) {
+        let _gpu = gpu_test_lock();
         let hal = Rc::new(MetalHalSha256::new());
         let circuit_hal = MetalCircuitHal::new(hal.clone());
         let cycles = 1 << po2;
@@ -332,6 +346,7 @@ mod tests {
 
     #[test]
     fn metal_scatter_rejects_bad_info() {
+        let _gpu = gpu_test_lock();
         let hal = Rc::new(MetalHalSha256::new());
         let circuit_hal = MetalCircuitHal::new(hal.clone());
         let rows = 16;
@@ -386,6 +401,7 @@ mod tests {
     /// prover (unless `RISC0_METAL=0` / `RISC0_METAL_SKIP=keccak`), and it proves and verifies.
     #[test]
     fn metal_prover_runs_on_metal_hal() {
+        let _gpu = gpu_test_lock();
         if !risc0_zkp::hal::metal::enabled("keccak") {
             eprintln!("skipped: the Metal backend is disabled for keccak");
             return;
@@ -429,6 +445,7 @@ mod tests {
     /// every keccak proof) shares the first one's kernels and builds no PSO.
     #[test]
     fn kernels_are_process_wide() {
+        let _gpu = gpu_test_lock();
         let first = MetalCircuitHalPoseidon2::new(Rc::new(MetalHalPoseidon2::new()));
         let t0 = Instant::now();
         let second = MetalCircuitHalPoseidon2::new(Rc::new(MetalHalPoseidon2::new()));
@@ -450,6 +467,7 @@ mod tests {
     /// the metallib, K5), and were built through the binary archive unless it is disabled.
     #[test]
     fn warmup_builds_every_pso() {
+        let _gpu = gpu_test_lock();
         let names = super::kernel_names();
         assert_eq!(
             names.len(),
@@ -484,6 +502,7 @@ mod tests {
     #[test]
     #[ignore]
     fn metal_prover_reuse_under_budget() {
+        let _gpu = gpu_test_lock();
         let po2s: Vec<usize> = std::env::var("K4_SEQ_PO2S")
             .unwrap_or_else(|_| "14,17".into())
             .split(',')
@@ -521,6 +540,7 @@ mod tests {
     /// on random inputs, bit-exactly.
     #[test]
     fn eval_check() {
+        let _gpu = gpu_test_lock();
         const PO2: usize = 4;
         let cpu_hal: CpuHal<BabyBear> = CpuHal::new(Sha256HashSuite::new_suite());
         let metal_hal = Rc::new(MetalHalSha256::new());
@@ -541,6 +561,7 @@ mod tests {
     #[test]
     #[ignore]
     fn metal_peak_memory() {
+        let _gpu = gpu_test_lock();
         let po2s: Vec<usize> = std::env::var("K2_MEM_PO2S")
             .unwrap_or_else(|_| "8,12,14".into())
             .split(',')

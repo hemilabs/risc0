@@ -499,6 +499,7 @@ mod tests {
     /// Bit-exact against the CPU HAL at `po2s`, at the default chunk (one chunk up to po2 13,
     /// 2^(po2 - 13) chunks above).
     fn matches_cpu(po2s: &[usize]) {
+        let _gpu = super::super::tests::gpu_test_lock();
         let hal = Rc::new(MetalHalSha256::new());
         let circuit_hal = MetalCircuitHal::new(hal.clone());
         for &po2 in po2s {
@@ -530,6 +531,7 @@ mod tests {
     /// Many chunks, a partial last chunk, and a cached stride larger than the chunk.
     #[test]
     fn eval_check_multi_chunk() {
+        let _gpu = super::super::tests::gpu_test_lock();
         let hal = Rc::new(MetalHalSha256::new());
         let circuit_hal = MetalCircuitHal::new(hal.clone());
         circuit_hal.set_keep_eval_scratch(true);
@@ -595,6 +597,7 @@ mod tests {
     /// launcher shrinks the chunk and stays bit-exact.
     #[test]
     fn eval_check_shrinks_chunk_under_budget() {
+        let _gpu = super::super::tests::gpu_test_lock();
         let hal = Rc::new(MetalHalSha256::new());
         let circuit_hal = MetalCircuitHal::new(hal.clone());
         let params = EvalCheckParams::new(14);
@@ -657,6 +660,7 @@ mod tests {
     #[test]
     #[ignore]
     fn eval_check_stage_profile() {
+        let _gpu = super::super::tests::gpu_test_lock();
         let po2: usize = std::env::var("K4_PROFILE_PO2")
             .map(|s| s.parse().unwrap())
             .unwrap_or(17);

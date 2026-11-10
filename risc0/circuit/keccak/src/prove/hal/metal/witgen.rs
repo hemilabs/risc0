@@ -583,6 +583,7 @@ pub(super) mod tests {
     /// the Metal and the forward preflight orders, at po2 8/12/14 (`K6_PO2S` overrides).
     #[test]
     fn metal_witgen_matches_host() {
+        let _gpu = super::super::tests::gpu_test_lock();
         let hal = Rc::new(MetalHalSha256::new());
         let circuit_hal = MetalCircuitHal::new(hal.clone());
         let po2s: Vec<usize> = std::env::var("K6_PO2S")
@@ -635,6 +636,7 @@ pub(super) mod tests {
     /// the CPU's is ("Inconsistent set").
     #[test]
     fn metal_witgen_rejects_inconsistent_scatter() {
+        let _gpu = super::super::tests::gpu_test_lock();
         let hal = Rc::new(MetalHalSha256::new());
         let circuit_hal = MetalCircuitHal::new(hal.clone());
         let po2 = 8;
@@ -749,6 +751,7 @@ pub(super) mod tests {
     /// `RISC0_KECCAK_METAL_WITGEN` says otherwise), and the seal verifies; below it, the CPU's.
     #[test]
     fn metal_prover_uses_gpu_witgen() {
+        let _gpu = super::super::tests::gpu_test_lock();
         use crate::prove::{
             hal::metal::MetalCircuitHalPoseidon2, KeccakProver as _, KeccakProverImpl,
         };

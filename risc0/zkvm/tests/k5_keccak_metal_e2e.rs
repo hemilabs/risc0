@@ -66,6 +66,14 @@ fn keccak_e2e_po2_range() {
         .split(',')
         .map(|s| s.trim().parse().unwrap())
         .collect();
+    // With `--features metal` the keccak proofs must take the Metal path
+    // (`risc0_circuit_keccak::prove::keccak_prover` picks it when `enabled("keccak")`), so a
+    // silent fallback to the CPU prover fails here instead of passing as a Metal run.
+    #[cfg(feature = "metal")]
+    assert!(
+        risc0_zkp::hal::metal::enabled("keccak"),
+        "the Metal keccak prover is disabled (RISC0_METAL / RISC0_METAL_SKIP): not a Metal run"
+    );
     let prover = get_prover_server(&ProverOpts::fast()).unwrap();
     for po2 in po2s {
         assert!(KECCAK_PO2_RANGE.contains(&po2), "po2 {po2}");

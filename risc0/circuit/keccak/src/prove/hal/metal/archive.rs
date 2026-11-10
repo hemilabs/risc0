@@ -41,8 +41,12 @@
 //!   would have succeeded without it.
 //! - `RISC0_METAL_ARCHIVE=0` disables it.
 //!
-//! PSOs are created on a few threads at once (the compiler service compiles them in parallel);
-//! the archive is only appended to under a lock.
+//! PSOs are created on a few threads at once (the compiler service compiles them in parallel),
+//! and those threads add to the one archive concurrently, without a lock: Apple does not document
+//! `addComputePipelineFunctions` as thread-safe, so every add is checked by reloading the PSO
+//! with `FailOnBinaryArchiveMiss`, and a failed add or reload falls back to plain PSO creation
+//! (no failure was seen in the K5 runs). Each worker runs in its own autorelease pool, so the
+//! Objective-C objects the Metal calls autorelease (errors, descriptions) are freed per kernel.
 //!
 //! Nothing here is keccak-specific: rv32im and recursion (C11, M1) can move it into the zkp
 //! Metal HAL and use it with their own unit names.
@@ -442,7 +446,8 @@ fn build_all<'a>(
                 if i >= names.len() {
                     break;
                 }
-                let r = build_one(names[i]);
+                // These are not main-thread workers: give each PSO its own autorelease pool.
+                let r = metal::objc::rc::autoreleasepool(|| build_one(names[i]));
                 results.lock().unwrap()[i] = Some(r);
             });
         }
@@ -480,6 +485,20 @@ fn save_archive(archive: &BinaryArchiveRef, path: &Path, unit: &str) -> Result<(
             let name = entry.file_name();
             let s = name.to_string_lossy();
             if name != keep && s.starts_with(&format!("{unit}-")) && s.ends_with(ARCHIVE_EXT) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+            // The temporary file of a process that died between serialize and rename (~50 MB);
+            // only old ones, so another process's write in progress is left alone.
+            let old_tmp = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > Duration::from_secs(3600));
+            if s.starts_with(&format!(".{unit}-"))
+                && s.contains(&format!(".{ARCHIVE_EXT}.tmp"))
+                && old_tmp
+            {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
