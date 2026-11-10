@@ -17,6 +17,8 @@
 //! - [seal_matches_cpu]: with a fixed `rand_z` (the `witgen_debug` value, `ExtVal::ONE`) the
 //!   Metal segment prover's seal equals the CPU segment prover's, word for word, and verifies on
 //!   the CPU. Under `--features witgen_debug` the same holds through `SegmentProver::prove`.
+//! - [seal_matches_cpu_large] (ignored, slow): the same at po2 20 (simple_loop) and on dumped
+//!   real-guest segments (`R11_SEGMENTS`).
 //! - [prove_po2_sweep] (ignored, measurement): po2 14..21 (`R11_PO2S`), Metal vs CPU wall time and
 //!   the peak GPU memory of each prover phase ([super::PHASE_MARKS]); `R11_CPU=0` skips the CPU
 //!   prover. Over a `RISC0_METAL_MAX_WORKING_SET_BYTES` budget the failing allocation is reported.
@@ -109,7 +111,8 @@ fn riscv_programs(names: &[&str]) -> Vec<(String, Program)> {
 
 fn phases_label() -> &'static str {
     if gpu_phase("witgen") && !super::cpu_phase("witgen") {
-        "all three phases on the GPU"
+        "all three phases on the GPU (UNRELIABLE: the GPU witgen opt-in is not bit-exact, \
+         notes/R11.md; a pass here is not evidence that it is correct)"
     } else {
         "witgen on the CPU kernel, accum + eval_check on the GPU"
     }
@@ -184,6 +187,89 @@ fn seal_matches_cpu() {
         "[r11] seal_matches_cpu ({}): {checked} segments",
         phases_label()
     );
+}
+
+/// Large-segment seal equality (ignored: the CPU prover takes about a minute per po2 20 segment):
+/// a full simple_loop segment at each po2 of `R11_EQ_PO2S` (default 20) and every segment file in
+/// `R11_SEGMENTS` (comma list of `postcard` dumps of `risc0_zkvm::Segment`, the format of
+/// `witgen_segment_file`; e.g. the rv32im-torture / sha256-chain / memory-merkle po2 20 segments
+/// of notes/R11.md). The Metal seal must equal the CPU seal word for word for a fixed `rand_z` and
+/// verify; `R11_EQ_REPS` (default 1) Metal proofs per segment.
+#[test]
+#[ignore = "slow: po2 20 CPU proofs; run with --ignored --nocapture"]
+fn seal_matches_cpu_large() {
+    let metal = super::segment_prover().unwrap();
+    let cpu = cpu::segment_prover().unwrap();
+    let reps = env_or("R11_EQ_REPS", 1usize);
+    let mut cases: Vec<(String, Segment)> = Vec::new();
+    for po2 in std::env::var("R11_EQ_PO2S")
+        .unwrap_or_else(|_| "20".into())
+        .split(',')
+        .filter(|s| !s.trim().is_empty())
+    {
+        let po2: usize = po2.trim().parse().unwrap();
+        let seg = segments(testutil::kernel::simple_loop((1u32 << po2) / 4), po2)
+            .into_iter()
+            .next()
+            .unwrap();
+        cases.push((format!("simple_loop po2 {po2}"), seg));
+    }
+    for path in std::env::var("R11_SEGMENTS")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|s| !s.trim().is_empty())
+    {
+        let bytes = std::fs::read(path.trim()).unwrap();
+        let ((_index, seg), _) = postcard::take_from_bytes::<(u32, Segment)>(&bytes).unwrap();
+        cases.push((path.trim().to_string(), seg));
+    }
+    let rand_z = ExtVal::ONE;
+    let mut bad = Vec::new();
+    for (name, segment) in &cases {
+        let t = Instant::now();
+        let seal_cpu = cpu
+            .prove_core(PreflightResults::new(segment, rand_z).unwrap())
+            .unwrap();
+        let t_cpu = t.elapsed().as_secs_f64();
+        crate::verify(&seal_cpu).unwrap();
+        for rep in 0..reps {
+            let t = Instant::now();
+            let res = metal.prove_core(PreflightResults::new(segment, rand_z).unwrap());
+            let t_metal = t.elapsed().as_secs_f64();
+            let verdict = match res {
+                Err(e) => format!("Metal prove error: {e:#}"),
+                Ok(seal) => match crate::verify(&seal) {
+                    Err(e) => format!("Metal seal does not verify: {e:?}"),
+                    Ok(()) if seal != seal_cpu => format!(
+                        "Metal seal differs from the CPU seal (first word {:?})",
+                        seal_cpu.iter().zip(&seal).position(|(a, b)| a != b)
+                    ),
+                    Ok(()) => String::new(),
+                },
+            };
+            eprintln!(
+                "[r11] {name} po2 {} rep {rep}: {} (cpu {:.0} ms, metal {:.0} ms)",
+                segment.po2,
+                if verdict.is_empty() {
+                    "seals equal, verify"
+                } else {
+                    verdict.as_str()
+                },
+                t_cpu * 1e3,
+                t_metal * 1e3
+            );
+            if !verdict.is_empty() {
+                bad.push(format!("{name} rep {rep}: {verdict}"));
+            }
+        }
+    }
+    eprintln!(
+        "[r11] seal_matches_cpu_large ({}): {} cases x {reps}, {} bad",
+        phases_label(),
+        cases.len(),
+        bad.len()
+    );
+    assert!(bad.is_empty(), "{bad:#?}");
 }
 
 fn mb(b: u64) -> f64 {

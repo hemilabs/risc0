@@ -165,7 +165,20 @@ pub(crate) fn gpu_phase(phase: &str) -> bool {
 /// Witgen runs the CPU kernel: the default until the Metal witgen kernels are deterministic
 /// (module doc); `RISC0_METAL_RV32IM_GPU_PHASES=witgen` opts in to the GPU path,
 /// `RISC0_METAL_RV32IM_CPU_PHASES=witgen` forces the CPU. Read once per process.
-static CPU_WITGEN: LazyLock<bool> = LazyLock::new(|| cpu_phase("witgen") || !gpu_phase("witgen"));
+///
+/// The opt-in is a debug/development switch only: the GPU witgen kernel is wrong on most po2 20
+/// segments of real guests (notes/R11.md, "GPU witgen nondeterminism"), so it logs a warning.
+static CPU_WITGEN: LazyLock<bool> = LazyLock::new(|| {
+    let cpu = cpu_phase("witgen") || !gpu_phase("witgen");
+    if !cpu {
+        tracing::warn!(
+            "RISC0_METAL_RV32IM_GPU_PHASES=witgen: the rv32im Metal witgen kernel is NOT \
+             bit-exact (wrong witnesses / kernel faults on many po2 >= 20 segments, \
+             docs/metal-port/notes/R11.md); use it for debugging only"
+        );
+    }
+    cpu
+});
 
 /// The effective [CPU_WITGEN] (logged by `segment_prover`).
 pub(crate) fn cpu_witgen() -> bool {
