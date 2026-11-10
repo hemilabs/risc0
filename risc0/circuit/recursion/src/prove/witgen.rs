@@ -164,6 +164,39 @@ fn pinned_ptr<T>(_p: Option<&()>, _i: usize) -> Option<*const T> {
 /// Chains at least this long run on the host.
 const HOST_CHAIN_MIN_LEN: usize = 16;
 
+thread_local! {
+    /// Test / validation hook ([with_noise_seed]): when set, the ZK noise of the witness and
+    /// accum tails comes from a `StdRng` seeded with it instead of `rand::rng()`, so two provers
+    /// (CPU and Metal) given the same input produce bit-identical seals.
+    static NOISE_SEED: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with deterministic ZK noise on this thread (seed `seed`); restores the previous state.
+/// Only for seal-equality validation: deterministic noise removes zero knowledge.
+#[allow(dead_code)] // used by the Metal seal check and tests
+pub(crate) fn with_noise_seed<R>(seed: u64, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<u64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            NOISE_SEED.with(|s| s.set(self.0));
+        }
+    }
+    let _restore = Restore(NOISE_SEED.with(|s| s.replace(Some(seed))));
+    f()
+}
+
+/// The RNG for one noise fill: `rand::rng()` normally, a seeded `StdRng` under
+/// [with_noise_seed] (`stream` separates the data and accum fills).
+fn noise_rng(stream: u64) -> Box<dyn rand::RngCore> {
+    use rand::SeedableRng as _;
+    match NOISE_SEED.with(|s| s.get()) {
+        Some(seed) => Box::new(rand::rngs::StdRng::seed_from_u64(
+            seed ^ stream.wrapping_mul(0x9e37_79b9_7f4a_7c15),
+        )),
+        None => Box::new(rand::rng()),
+    }
+}
+
 /// When set, every witness generated with host chains is regenerated without them and compared
 /// (a test hook; see [crate::prove::set_host_chains_check]).
 pub(crate) static HOST_CHAINS_CHECK: AtomicBool = AtomicBool::new(false);
@@ -512,7 +545,7 @@ where
         // Add random noise to end of the data columns
         scope!("noise", {
             use risc0_zkp::ZK_CYCLES;
-            let mut rng = rand::rng();
+            let mut rng = noise_rng(1);
             if row_passes {
                 // The same noise: `vec![x; n]` repeats one random element.
                 circuit_hal.fill_tail(
@@ -569,7 +602,7 @@ where
         // Add random noise to end of accum
         scope!("noise", {
             use risc0_zkp::ZK_CYCLES;
-            let mut rng = rand::rng();
+            let mut rng = noise_rng(2);
             let total_cycles = self.total_cycles as usize;
             if circuit_hal.has_row_passes() {
                 // The same noise: `vec![x; n]` repeats one random element.

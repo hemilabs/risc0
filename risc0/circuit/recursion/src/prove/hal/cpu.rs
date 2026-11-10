@@ -66,8 +66,19 @@ impl CircuitWitnessGenerator<CpuHal> for CpuCircuitHal {
             data: data.as_ptr(),
             global: global.as_ptr(),
         };
+        // The witgen advances `cycles[c].iopIdx` in place (kernels/cxx/extern.cpp), so run it on
+        // a copy: the caller's trace stays pristine and a second witgen over it (the host-chain
+        // and prewitgen checks) sees the same input. 8 bytes per cycle.
+        // SAFETY: the trace's cycles pointer covers `num_cycles` entries (RawPreflightTrace).
+        let mut cycles =
+            unsafe { std::slice::from_raw_parts(preflight.cycles, preflight.num_cycles as usize) }
+                .to_vec();
+        let trace = RawPreflightTrace {
+            cycles: cycles.as_mut_ptr(),
+            ..*preflight
+        };
         ffi_wrap(|| unsafe {
-            risc0_circuit_recursion_cpu_witgen(mode, &buffers, preflight, total_cycles)
+            risc0_circuit_recursion_cpu_witgen(mode, &buffers, &trace, total_cycles)
         })
     }
 }

@@ -19,11 +19,11 @@
 //! the recursion metallib's PSOs ([RecursionKernels], `risc0_circuit_recursion_sys::METAL_LIB`)
 //! and HAL-owned scratch buffers grown with 25 % headroom ([ScratchBuffers], PLAN 2.6).
 //!
-//! Until C6 (witgen), C7 (accum) and C8 (eval_check) land, the circuit phases in the `witgen`,
-//! `accum` and `eval_check` submodules run the CPU circuit kernels
-//! (`risc0_circuit_recursion_cpu_*`, exactly as `hal/cpu.rs` calls them) over host views of the
-//! Metal HAL's shared buffers after a `sync()`. Everything else (NTT, Merkle hashing, FRI) runs on
-//! the GPU through the zkp Metal HAL, so a recursion proof is complete and verifiable.
+//! The circuit phases run on the GPU: `witgen` (C6; CPU WOM sort/scan between its two command
+//! buffers, Seq modes on the CPU), `accum` (C7, one batch) and `eval_check` (C8, monolith or
+//! split). NTT, Merkle hashing and FRI run through the zkp Metal HAL. `poseidon_254` uses the CPU
+//! prover until Z10. `RISC0_METAL_REC_SEAL_CHECK=1` re-proves every proof on the CPU with the same
+//! deterministic noise and requires identical seals (C9 validation knob).
 //!
 //! PSOs: the base kernels (C1's hand-written ones and C2's four step wrappers, ~7 s cold) are
 //! built once per process on first use; the eval_check PSOs (monolith ~20-60 s cold, split ~8 s,
@@ -32,6 +32,8 @@
 
 mod accum;
 mod eval_check;
+#[cfg(all(test, feature = "test"))]
+mod tests;
 mod witgen;
 
 use std::sync::{
@@ -53,7 +55,10 @@ use risc0_zkp::{
     },
 };
 
-use crate::prove::{RecursionProver, RecursionProverImpl};
+use crate::prove::{
+    witgen::with_noise_seed, Preflight, Program, RecursionProver, RecursionProverImpl,
+    RecursionReceipt,
+};
 
 /// Environment variable selecting the eval_check kernels: `monolith` (default) or `split`
 /// (PLAN 2.0; decided by measurement in C11).
@@ -364,7 +369,127 @@ pub(crate) fn warmup() -> Result<()> {
     Ok(())
 }
 
+/// Environment variable: `1` makes every Metal recursion proof (poseidon2, sha-256) a validation
+/// run (C9): the proof is made with deterministic ZK noise, then re-proved by the CPU prover with
+/// the same noise, and the two seals must be bit-identical (else the proof fails). Doubles the
+/// cost of a proof and removes zero knowledge: never set it in production.
+pub(crate) const SEAL_CHECK_ENV: &str = "RISC0_METAL_REC_SEAL_CHECK";
+
+/// Seal checks passed so far (tests).
+pub(crate) static SEAL_CHECKS_OK: AtomicUsize = AtomicUsize::new(0);
+
+fn seal_check_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var(SEAL_CHECK_ENV).as_deref() == Ok("1"))
+}
+
+/// The first index where `a` and `b` differ (or the shorter length), `None` if equal.
+pub(crate) fn first_diff(a: &[u32], b: &[u32]) -> Option<usize> {
+    a.iter()
+        .zip(b)
+        .position(|(x, y)| x != y)
+        .or((a.len() != b.len()).then(|| a.len().min(b.len())))
+}
+
+/// A copy of a preflight's trace and output (the parts a proof reads), for the CPU re-proof.
+fn clone_preflight(p: &Preflight) -> Preflight {
+    let mut c = Preflight::new(std::collections::VecDeque::new());
+    c.trace.wom = p.trace.wom.clone();
+    c.trace.cycles = p.trace.cycles.clone();
+    c.trace.iops = p.trace.iops.clone();
+    c.output = p.output.clone();
+    c
+}
+
+/// Prove with `metal` and then with `cpu`, both under the same deterministic noise seed, and
+/// require bit-identical seals and outputs ([SEAL_CHECK_ENV]).
+pub(crate) fn prove_seal_checked(
+    metal: &dyn RecursionProver,
+    cpu: &dyn RecursionProver,
+    program: &Arc<Program>,
+    input: std::collections::VecDeque<u32>,
+    preflight: Option<Preflight>,
+) -> Result<RecursionReceipt> {
+    let seed: u64 = rand::random();
+    let cpu_preflight = preflight.as_ref().map(clone_preflight);
+    let t0 = std::time::Instant::now();
+    let m = with_noise_seed(seed, || {
+        metal.prove_shared(program, input.clone(), preflight)
+    })?;
+    let metal_s = t0.elapsed().as_secs_f64();
+    let t0 = std::time::Instant::now();
+    let c = with_noise_seed(seed, || cpu.prove_shared(program, input, cpu_preflight))?;
+    let cpu_s = t0.elapsed().as_secs_f64();
+    if let Some(i) = first_diff(&m.output, &c.output) {
+        bail!("{SEAL_CHECK_ENV}: output differs from the CPU prover at word {i}");
+    }
+    if let Some(i) = first_diff(&m.seal, &c.seal) {
+        bail!(
+            "{SEAL_CHECK_ENV}: seal differs from the CPU prover at word {i} of {} / {}",
+            m.seal.len(),
+            c.seal.len()
+        );
+    }
+    let n = SEAL_CHECKS_OK.fetch_add(1, Ordering::Relaxed) + 1;
+    eprintln!(
+        "[{SEAL_CHECK_ENV}] #{n}: po2 {} ({} rows) seal == CPU seal ({} words); metal {metal_s:.2}s, \
+         cpu {cpu_s:.2}s",
+        program.po2,
+        program.code_rows(),
+        m.seal.len()
+    );
+    Ok(m)
+}
+
+/// The Metal prover under [SEAL_CHECK_ENV].
+struct SealCheckProver {
+    metal: Box<dyn RecursionProver>,
+    cpu: Box<dyn RecursionProver>,
+}
+
+impl RecursionProver for SealCheckProver {
+    fn prove(
+        &self,
+        program: &Program,
+        input: std::collections::VecDeque<u32>,
+        preflight: Option<Preflight>,
+    ) -> Result<RecursionReceipt> {
+        self.prove_shared(&Arc::new(program.clone()), input, preflight)
+    }
+
+    fn prewarm(&self, program: &Arc<Program>) -> Result<()> {
+        self.metal.prewarm(program)
+    }
+
+    fn prove_shared(
+        &self,
+        program: &Arc<Program>,
+        input: std::collections::VecDeque<u32>,
+        preflight: Option<Preflight>,
+    ) -> Result<RecursionReceipt> {
+        prove_seal_checked(
+            self.metal.as_ref(),
+            self.cpu.as_ref(),
+            program,
+            input,
+            preflight,
+        )
+    }
+}
+
 pub(crate) fn recursion_prover(hashfn: &str) -> Result<Box<dyn RecursionProver>> {
+    let metal = metal_recursion_prover(hashfn)?;
+    if seal_check_enabled() && hashfn != "poseidon_254" {
+        tracing::warn!("{SEAL_CHECK_ENV}=1: every recursion proof is re-proved on the CPU");
+        return Ok(Box::new(SealCheckProver {
+            metal,
+            cpu: super::cpu::recursion_prover(hashfn)?,
+        }));
+    }
+    Ok(metal)
+}
+
+fn metal_recursion_prover(hashfn: &str) -> Result<Box<dyn RecursionProver>> {
     match hashfn {
         "poseidon2" => {
             let hal = Arc::new(MetalHalPoseidon2::new());
