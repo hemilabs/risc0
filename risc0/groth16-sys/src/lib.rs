@@ -40,7 +40,10 @@ pub const METAL_KERNEL_NAMES: &[&str] =
 pub mod metal;
 
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
-pub use metal::{metal_preload, metal_prove, metal_release, metal_supported, MetalNotImplemented};
+pub use metal::{
+    metal_preload, metal_prove, metal_prove_witness, metal_release, metal_supported, metal_warmup,
+    MetalUnavailable,
+};
 
 use std::{
     ffi::{c_char, CStr, CString, NulError},
