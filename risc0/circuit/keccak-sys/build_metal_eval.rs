@@ -123,6 +123,44 @@ pub(crate) fn metal_eval_sources(kernel_dir: &Path, gen_dir: &Path) -> Vec<PathB
     paths
 }
 
+/// Under `RISC0_SKIP_BUILD_KERNELS` (no stage kernels in the empty metallib): writes a
+/// `$OUT_DIR/keccak_metal_eval.rs` with no stages (sizes 1) and points
+/// `KECCAK_METAL_EVAL_RS` at it, so `src/lib.rs` (`metal_eval`, `METAL_KERNEL_NAMES`) and the HAL
+/// still compile. Same items as [Translation::rust_consts].
+#[allow(dead_code)] // unused where tests include this file
+pub(crate) fn write_skip_consts(out_dir: &Path) {
+    let mut s = String::from(
+        "// Written by keccak-sys/build_metal_eval.rs under RISC0_SKIP_BUILD_KERNELS: no stages.\n\
+         pub const EVAL_STAGES: usize = 0;\n\
+         pub const EVAL_STAGE_NAMES: [&str; 0] = [];\n",
+    );
+    for name in [
+        "SCRATCH_ELEMS",
+        "MAX_STRIDE",
+        "CARRY_WORDS",
+        "MAX_COLUMN",
+        "INV_RATE",
+        "NUM_POLY_MIX_POWS",
+    ] {
+        // 1, not 0: the HAL's bounds checks stay meaningful expressions (clippy) and nothing
+        // runs with these values (no stages).
+        writeln!(s, "pub const EVAL_{name}: u32 = 1;").unwrap();
+    }
+    for (i, b) in [
+        "CHECK", "CTRL", "OUT", "DATA", "MIX", "ACCUM", "POLY_MIX", "SCRATCH", "CARRY", "PARAMS",
+    ]
+    .iter()
+    .enumerate()
+    {
+        writeln!(s, "pub const EVAL_BUF_{b}: u64 = {i};").unwrap();
+    }
+    writeln!(s, "pub const EVAL_PARAMS_SIZE: usize = 32;").unwrap();
+    let rs = out_dir.join("keccak_metal_eval.rs");
+    write_if_changed(&rs, &s);
+    println!("cargo:rustc-env=KECCAK_METAL_EVAL_RS={}", rs.display());
+    println!("cargo:rustc-env=KECCAK_METAL_EVAL_STAGES=0");
+}
+
 /// The stage count from [STAGES_ENV] (a positive integer), else [DEFAULT_STAGES].
 pub(crate) fn stages_from_env() -> usize {
     println!("cargo:rerun-if-env-changed={STAGES_ENV}");

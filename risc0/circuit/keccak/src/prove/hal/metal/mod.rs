@@ -20,49 +20,43 @@
 //!   witness generator over the HAL's shared (unified-memory) buffers (`HOST_WITNESS`, as on
 //!   Intel): see [witgen];
 //! - `accumulate` does nothing, exactly as cuda.rs (the keccak circuit has no accumulation step);
-//! - `eval_check` calls the CPU `poly_fp` through host views of the shared buffers, as
-//!   `CpuCircuitHal::eval_check` does.
+//! - `eval_check` runs the staged Metal kernels `eval_stage_0..S-1` (K3's translation of the CUDA
+//!   constraint code, K4's chunked launcher): see [eval_check].
 //!
-//! K3/K4 add the staged eval_check kernels, K6 the GPU witness.
+//! K6 adds the GPU witness.
 //!
 //! No `Drop` is needed: CUDA's (`cuda_reset`) resets a CUDA stack-size limit its witgen raised,
 //! and Metal has no such process state; the PSOs and the HAL reference drop on their own, and
 //! buffers return to the HAL's pool after their last batch completes.
 
+mod eval_check;
 mod witgen;
 
 use std::rc::Rc;
 
 use anyhow::Result;
 use metal::ComputePipelineState;
-use rayon::prelude::*;
-use risc0_circuit_keccak_sys::{risc0_circuit_keccak_cpu_poly_fp, METAL_KERNEL_NAMES, METAL_LIB};
-use risc0_core::{field::RootsOfUnity as _, scope};
-use risc0_zkp::{
-    core::log2_ceil,
-    field::{map_pow, Elem as _, ExtElem as _},
-    hal::{
-        metal::{
-            BufferImpl as MetalBuffer, MetalHal, MetalHalPoseidon2, MetalHash, MetalHashPoseidon2,
-            MetalKernels,
-        },
-        AccumPreflight, Buffer as _, CircuitHal,
+use risc0_circuit_keccak_sys::{METAL_KERNEL_NAMES, METAL_LIB};
+use risc0_core::scope;
+use risc0_zkp::hal::{
+    metal::{
+        BufferImpl as MetalBuffer, MetalHal, MetalHalPoseidon2, MetalHash, MetalHashPoseidon2,
+        MetalKernels,
     },
-    INV_RATE,
+    AccumPreflight, CircuitHal,
 };
 
 use crate::{
-    prove::{KeccakProver, KeccakProverImpl, GLOBAL_MIX, GLOBAL_OUT},
-    zirgen::{
-        circuit::{ExtVal, Val, REGISTER_GROUP_ACCUM, REGISTER_GROUP_DATA},
-        info::POLY_MIX_POWERS,
-    },
+    prove::{KeccakProver, KeccakProverImpl},
+    zirgen::circuit::{ExtVal, Val},
 };
 
 pub struct MetalCircuitHal<MH: MetalHash> {
     hal: Rc<MetalHal<MH>>,
     /// The keccak metallib, with a PSO for each of `METAL_KERNEL_NAMES`.
     kernels: MetalKernels,
+    /// eval_check's chunk size and cached scratch/carry ([eval_check]).
+    eval: eval_check::EvalCheckState,
 }
 
 impl<MH: MetalHash> MetalCircuitHal<MH> {
@@ -72,7 +66,11 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
             "load_keccak_metallib",
             hal.load_library(METAL_LIB, METAL_KERNEL_NAMES)
         );
-        Self { hal, kernels }
+        Self {
+            hal,
+            kernels,
+            eval: eval_check::EvalCheckState::new(),
+        }
     }
 
     /// The PSO of a keccak kernel (one of `METAL_KERNEL_NAMES`).
@@ -95,9 +93,7 @@ impl<MH: MetalHash> CircuitHal<MetalHal<MH>> for MetalCircuitHal<MH> {
         // Exactly as cuda.rs (and cpu.rs): the keccak circuit has no accumulation step.
     }
 
-    /// Milestone 1: the CPU `poly_fp` (as `CpuCircuitHal::eval_check`) over host views of the
-    /// shared buffers (`view` waits for the open batch first); K4 replaces it with the staged
-    /// Metal kernels.
+    /// The staged Metal kernels, a chunk of cycles at a time ([eval_check]).
     fn eval_check(
         &self,
         check: &MetalBuffer<Val>,
@@ -113,59 +109,8 @@ impl<MH: MetalHash> CircuitHal<MetalHal<MH>> for MetalCircuitHal<MH> {
         #[cfg(test)]
         tests::mark_phase(&self.hal.device, tests::Phase::EvalCheck);
 
-        const EXP_PO2: usize = log2_ceil(INV_RATE);
-        let domain = steps * INV_RATE;
-        let poly_mix_pows = map_pow(poly_mix, POLY_MIX_POWERS);
-        let poly_mix_pows = poly_mix_pows.as_slice();
-        let accum = groups[REGISTER_GROUP_ACCUM];
-        let data = groups[REGISTER_GROUP_DATA];
-        let mix = globals[GLOBAL_MIX];
-        let out = globals[GLOBAL_OUT];
-        tracing::debug!(
-            "check: {}, data: {}, accum: {}, mix: {} out: {}",
-            check.size(),
-            data.size(),
-            accum.size(),
-            mix.size(),
-            out.size()
-        );
-        assert_eq!(check.size(), ExtVal::EXT_SIZE * domain);
+        self.eval_check_metal(check, groups, globals, poly_mix, po2, steps, None);
 
-        data.view(|data| {
-            out.view(|out| {
-                check.view_mut(|check| {
-                    struct Check(*mut Val);
-                    // SAFETY: each cycle writes its own `EXT_SIZE` cells only.
-                    unsafe impl Sync for Check {}
-                    let check = Check(check.as_mut_ptr());
-                    (0..domain).into_par_iter().for_each(|cycle| {
-                        let check = &check;
-                        let args = &[data.as_ptr(), out.as_ptr()];
-                        let mut tot = ExtVal::ZERO;
-                        // SAFETY: `data` and `out` are the circuit's data and output groups, as
-                        // the CPU HAL passes them; `tot` is a single FpExt.
-                        unsafe {
-                            risc0_circuit_keccak_cpu_poly_fp(
-                                cycle,
-                                domain,
-                                poly_mix_pows.as_ptr(),
-                                args.as_ptr(),
-                                &mut tot,
-                            )
-                        };
-                        let x = Val::ROU_FWD[po2 + EXP_PO2].pow(cycle);
-                        // As CpuCircuitHal: 3 is the coset shift of the evaluation domain.
-                        let y = (Val::new(3) * x).pow(1 << po2);
-                        let ret = tot * (y - Val::new(1)).inv();
-                        for i in 0..ExtVal::EXT_SIZE {
-                            // SAFETY: i * domain + cycle < EXT_SIZE * domain == check.len(), and
-                            // only this cycle writes it.
-                            unsafe { *check.0.add(i * domain + cycle) = ret.elems()[i] };
-                        }
-                    });
-                })
-            })
-        });
         #[cfg(test)]
         tests::mark_phase(&self.hal.device, tests::Phase::Finalize);
     }
@@ -238,7 +183,7 @@ mod tests {
         /// From the end of witgen to eval_check: zeroize, commit of code/data/accum (NTTs,
         /// Merkle trees), mix, and the check buffer `finalize` allocates before eval_check.
         Commit,
-        /// `eval_check` (CPU `poly_fp` over the shared buffers).
+        /// `eval_check` (the staged Metal kernels).
         EvalCheck,
         /// After eval_check: check commit, DEEP-ALI, FRI, until the seal.
         Finalize,
@@ -409,7 +354,7 @@ mod tests {
         }
     }
 
-    /// Milestone-1 eval_check (CPU `poly_fp` over Metal buffer views) matches the CPU HAL's,
+    /// The staged Metal eval_check matches the CPU HAL's at PO2 4 (wider shapes: eval_check.rs),
     /// on random inputs, bit-exactly.
     #[test]
     fn eval_check() {

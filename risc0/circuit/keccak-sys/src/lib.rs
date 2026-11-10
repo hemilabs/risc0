@@ -29,7 +29,45 @@ pub const METAL_LIB: &[u8] = include_bytes!(env!("KECCAK_METAL_PATH"));
 
 /// Every kernel entry point in [METAL_LIB]; the HAL fails fast if one is missing.
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
-pub const METAL_KERNEL_NAMES: &[&str] = &["scatter_preflight"];
+pub const METAL_KERNEL_NAMES: &[&str] = &METAL_KERNEL_NAMES_ARRAY;
+
+/// The hand-written kernels of [METAL_LIB] (`kernels/metal/*.metal`).
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+const METAL_HAND_KERNEL_NAMES: [&str; 1] = ["scatter_preflight"];
+
+/// The hand-written kernels, then the eval_check stages ([metal_eval::EVAL_STAGE_NAMES]).
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+const METAL_KERNEL_NAMES_ARRAY: [&str; METAL_HAND_KERNEL_NAMES.len() + metal_eval::EVAL_STAGES] =
+    concat_names(METAL_HAND_KERNEL_NAMES, metal_eval::EVAL_STAGE_NAMES);
+
+/// `a` followed by `b` (`N` must be `A + B`), for building [METAL_KERNEL_NAMES] at compile time.
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+const fn concat_names<const A: usize, const B: usize, const N: usize>(
+    a: [&'static str; A],
+    b: [&'static str; B],
+) -> [&'static str; N] {
+    assert!(A + B == N);
+    let mut out = [""; N];
+    let mut i = 0;
+    while i < A {
+        out[i] = a[i];
+        i += 1;
+    }
+    while i < N {
+        out[i] = b[i - A];
+        i += 1;
+    }
+    out
+}
+
+/// The staged eval_check kernels' names and sizes, written by the translator
+/// (`build_metal_eval.rs`) next to the stage sources: see `kernels/metal/eval_check_prelude.h`.
+/// Under `RISC0_SKIP_BUILD_KERNELS` (empty metallib) build.rs writes a stub with no stages, so
+/// this crate and the HAL still compile; loading the empty metallib fails as before.
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+pub mod metal_eval {
+    include!(env!("KECCAK_METAL_EVAL_RS"));
+}
 
 #[cfg(feature = "cuda")]
 use cust::memory::DevicePointer;

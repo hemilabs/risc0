@@ -890,6 +890,8 @@ fn build_metal_kernels() {
         let gen_dir = out_dir.join("metal");
         std::fs::create_dir_all(&gen_dir).unwrap();
         sources.extend(build_metal_eval::metal_eval_sources(&kernel_dir, &gen_dir));
+    } else {
+        build_metal_eval::write_skip_consts(&out_dir);
     }
 
     KernelBuild::new(KernelType::Metal)
