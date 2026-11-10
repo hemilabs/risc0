@@ -198,9 +198,12 @@ impl<MH: MetalHash> MetalHal<MH> {
             return;
         }
         let count = index.len() - 1;
-        // Validate what the kernel will read: every index entry bounds the offsets/values it
-        // walks, and every offset reached must be inside `into`.
+        // Validate exactly what the kernel (and the CPU HAL) reads: for each cycle range
+        // [index[c], index[c+1]) with start < end, the range must lie inside offsets/values and
+        // every offset in it must be inside `into`. Offsets outside every range are never read,
+        // so they are not checked (the CPU HAL and CUDA accept them too).
         let limit = offsets.len().min(values.len());
+        let size = into.size();
         let mut max_end = 0usize;
         for cycle in 0..count {
             let (start, end) = (index[cycle] as usize, index[cycle + 1] as usize);
@@ -210,17 +213,14 @@ impl<MH: MetalHash> MetalHal<MH> {
                     "scatter: index[{}] = {end} beyond offsets/values ({limit})",
                     cycle + 1
                 );
+                if let Some(bad) = offsets[start..end].iter().find(|&&o| o as usize >= size) {
+                    panic!("scatter: offset {bad} out of bounds for a buffer of {size}");
+                }
                 max_end = max_end.max(end);
             }
         }
         if max_end == 0 {
             return;
-        }
-        let size = into.size();
-        // Only offsets[..max_end] are ever read; the ones outside a cycle range are skipped by
-        // the CPU HAL too, but are checked anyway (cheap and conservative).
-        if let Some(bad) = offsets[..max_end].iter().find(|&&o| o as usize >= size) {
-            panic!("scatter: offset {bad} out of bounds for a buffer of {size}");
         }
         let index = self.copy_from_slice("scatter_index", index);
         let offsets = self.copy_from_slice("scatter_offsets", &offsets[..max_end]);
@@ -248,12 +248,16 @@ impl<MH: MetalHash> MetalHal<MH> {
         if n == 0 {
             return;
         }
-        let size = into.size() as u64;
+        // The kernel indexes in u32; a buffer that fits in u32 plus the u64 bound below rules
+        // out wraparound. Only the highest write offset (bit 31) needs checking, since offsets
+        // increase with the bit index. No `row < cycles` requirement: the CPU HAL and CUDA
+        // accept any in-bounds triple.
+        let size = to_u32(into.size(), "scatter_bits into size") as u64;
         for t in bit_data[..n * 3].chunks_exact(3) {
             let (row, base) = (t[0] as u64, t[1] as u64);
             let last = (base + 31) * cycles as u64 + row;
             assert!(
-                last < size && row < cycles as u64,
+                last < size,
                 "scatter_bits: triple (row {row}, base_col {base}) out of bounds for a buffer of \
                  {size} with {cycles} cycles"
             );

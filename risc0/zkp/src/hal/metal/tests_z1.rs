@@ -211,6 +211,40 @@ fn scatter_bits_out_of_bounds_panics() {
     hal.scatter_bits(&into, &[0, 1, 5], 4);
 }
 
+/// Offsets outside every cycle range are never read, so the CPU HAL accepts them; Metal must
+/// too (fix-round-1 finding: Metal used to check all of offsets[..max_end]).
+#[test]
+fn scatter_unread_offset_out_of_range_is_accepted() {
+    let gpu = MetalHalSha256::new();
+    let cpu = cpu_for(&gpu);
+    let index = [1u32, 2, 3];
+    let offsets = [999_999u32, 0, 1];
+    let values: Vec<_> = [5u32, 6, 7].map(BabyBearElem::new).to_vec();
+    let c = cpu.copy_from_elem("into", &[BabyBearElem::ZERO; 4]);
+    let g = gpu.copy_from_elem("into", &[BabyBearElem::ZERO; 4]);
+    cpu.scatter(&c, &index, &offsets, &values);
+    gpu.scatter(&g, &index, &offsets, &values);
+    assert_eq!(c.to_vec(), g.to_vec());
+    assert_eq!(
+        g.to_vec()[..2],
+        [BabyBearElem::new(6), BabyBearElem::new(7)]
+    );
+}
+
+/// A triple with row >= cycles whose writes are all in bounds is accepted by the CPU HAL and
+/// CUDA; Metal must agree (fix-round-1 finding: Metal used to assert row < cycles).
+#[test]
+fn scatter_bits_row_ge_cycles_in_bounds() {
+    let gpu = MetalHalSha256::new();
+    let cpu = cpu_for(&gpu);
+    let data = [5u32, 0, 0xdead_beef];
+    let c = cpu.copy_from_elem("into", &[BabyBearElem::ZERO; 136]);
+    let g = gpu.copy_from_elem("into", &[BabyBearElem::ZERO; 136]);
+    cpu.scatter_bits(&c, &data, 4);
+    gpu.scatter_bits(&g, &data, 4);
+    assert_eq!(c.to_vec(), g.to_vec());
+}
+
 #[test]
 fn eltwise_copy_elem_slice() {
     let hal = dual();
