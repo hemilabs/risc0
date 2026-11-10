@@ -86,11 +86,11 @@ void multiply_by_m_ext(thread Fp* old_cells) {
   // See appendix B of Poseidon2 paper for additional details.
   Fp cells[CELLS];
   for (uint i = 0; i < CELLS; i++) {
-    cells[0] = 0;
+    cells[i] = Fp(0);
   }
   Fp tmp_sums[4];
   for (uint i = 0; i < 4; i++) {
-    tmp_sums[i] = 0;
+    tmp_sums[i] = Fp(0);
   }
   for (uint i = 0; i < CELLS / 4; i++) {
     multiply_by_4x4_circulant(old_cells + i * 4);
@@ -183,7 +183,7 @@ kernel void poseidon2_rows(const device Fp* ROUND_CONSTANTS,
   if (used != 0 || count == 0) {
     // Zero pad to get a CELLS_RATE-aligned number of inputs
     for (uint i = used; i < CELLS_RATE; i++)  {
-        cells[i] = 0;
+        cells[i] = Fp(0);
     }
     poseidon2_mix(ROUND_CONSTANTS, M_INT_DIAG, cells);
   }
