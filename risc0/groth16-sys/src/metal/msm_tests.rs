@@ -162,7 +162,6 @@ fn check_size_cap(
     w2.extend(words::<G2>(&p2));
     let mut ws = vec![0xffffffffu32; off_s * 8];
     ws.extend(s.iter().flat_map(scalar_words));
-    let before = allocated(g);
     let b1 = g.buffer(&w1);
     let b2 = g.buffer(&w2);
     let bs = g.buffer(&ws);
@@ -226,7 +225,7 @@ fn check_size_cap(
         best2 * 1e3,
         sc.bytes() as f64 / 1048576.0,
         peak as f64 / 1048576.0,
-        (peak - before) as f64 / 1048576.0,
+        (b1.length() + b2.length() + bs.length() + sc.bytes()) as f64 / 1048576.0,
     );
     (best, best2)
 }
