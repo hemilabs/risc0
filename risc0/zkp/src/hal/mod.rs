@@ -476,7 +476,8 @@ impl MemoryTracker {
 /// will not verify. Logged rather than asserted, so a bad proof still fails where callers already
 /// handle it (verifying the segment) instead of panicking the prover; but it is named here, at the
 /// stage it first shows.
-#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "metal"))]
+#[cfg_attr(not(any(feature = "cuda", feature = "rocm")), allow(dead_code))]
 pub(crate) fn report_nonzero_remainders<E: ExtElem>(chunks: &[(usize, Vec<E>)], remainders: &[E]) {
     let mut remainders = remainders.iter();
     for (combo, pows) in chunks {
