@@ -35,6 +35,8 @@ pub const METAL_KERNEL_NAMES: &[&str] = &[
     "finalizeZeroizeAccum",
     "seq_fwd_probe",
     "seq_rev_probe",
+    // $OUT_DIR/metal/eval_check.metal (cuda2metal.py eval; baseline eval_check, R6)
+    "eval_check",
 ];
 
 #[cfg(feature = "cuda")]
