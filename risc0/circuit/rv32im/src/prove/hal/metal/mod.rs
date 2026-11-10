@@ -34,6 +34,9 @@ mod accum;
 mod eval_check;
 mod witgen;
 
+// R8: preflight leaves the per-cycle columns to the Metal witgen (witgen::DEFER_CYCLE_COLS).
+pub(crate) use witgen::defers_cycle_cols;
+
 use std::{
     collections::HashSet,
     mem::size_of,
