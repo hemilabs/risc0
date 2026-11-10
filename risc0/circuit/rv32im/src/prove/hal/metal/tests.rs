@@ -33,6 +33,7 @@ use crate::{
     prove::hal::cpu::CpuCircuitHal,
     zirgen::{
         circuit::{Val, REGISTER_GROUP_ACCUM, REGISTER_GROUP_CODE, REGISTER_GROUP_DATA},
+        info::NUM_POLY_MIX_POWERS,
         taps::TAPSET,
         CircuitImpl,
     },
@@ -157,11 +158,39 @@ fn random_vals(n: usize) -> Vec<Val> {
     (0..n).map(|_| Val::random(&mut rng)).collect()
 }
 
-/// The (delegating) Metal eval_check equals the CPU circuit HAL's, as hal/cuda.rs tests it.
-#[test]
-fn eval_check_matches_cpu() {
-    const PO2: usize = 4;
-    let steps = 1 << PO2;
+/// Runs `CircuitHal::eval_check` of `c` on `hal` over copies of `bufs` and returns `check`.
+fn run_eval_check<H, C>(
+    hal: &H,
+    c: &C,
+    bufs: [&[Val]; 5],
+    poly_mix: ExtVal,
+    po2: usize,
+    steps: usize,
+) -> Vec<Val>
+where
+    H: Hal<Elem = Val, ExtElem = ExtVal>,
+    C: CircuitHal<H>,
+{
+    let check = hal.alloc_elem("check", ExtVal::EXT_SIZE * steps * INV_RATE);
+    let [code, data, accum, mix, out] = bufs.map(|b| hal.copy_from_elem("in", b));
+    c.eval_check(
+        &check,
+        &[&accum, &code, &data],
+        &[&mix, &out],
+        poly_mix,
+        po2,
+        steps,
+    );
+    c.eval_check_dep();
+    check.to_vec()
+}
+
+/// R10: the Metal eval_check (baseline `eval_check` kernel) is bit-exact with `CpuCircuitHal`'s on
+/// random canonical inputs (`Val::random` is uniform in [0, P)), as hal/cuda.rs tests CUDA. Also
+/// checks the CPU fallback (`RISC0_METAL_RV32IM_CPU_PHASES=eval`) and the `CircuitHal` entry
+/// point, and reports the GPU memory of the phase (PLAN 9.1).
+fn eval_check_matches_cpu(po2: usize) {
+    let steps = 1 << po2;
     let domain = steps * INV_RATE;
     let code = random_vals(TAPSET.group_size(REGISTER_GROUP_CODE) * domain);
     let data = random_vals(TAPSET.group_size(REGISTER_GROUP_DATA) * domain);
@@ -169,40 +198,132 @@ fn eval_check_matches_cpu() {
     let mix = random_vals(CircuitImpl::MIX_SIZE);
     let out = random_vals(CircuitImpl::OUTPUT_SIZE);
     let poly_mix = ExtVal::random(&mut rand::rng());
-
-    fn run<H, C>(
-        hal: &H,
-        c: &C,
-        bufs: [&[Val]; 5],
-        poly_mix: ExtVal,
-        po2: usize,
-        steps: usize,
-    ) -> Vec<Val>
-    where
-        H: Hal<Elem = Val, ExtElem = ExtVal>,
-        C: CircuitHal<H>,
-    {
-        let check = hal.alloc_elem("check", ExtVal::EXT_SIZE * steps * INV_RATE);
-        let [code, data, accum, mix, out] = bufs.map(|b| hal.copy_from_elem("in", b));
-        c.eval_check(
-            &check,
-            &[&accum, &code, &data],
-            &[&mix, &out],
-            poly_mix,
-            po2,
-            steps,
-        );
-        c.eval_check_dep();
-        check.to_vec()
-    }
-
     let bufs = [&code[..], &data, &accum, &mix, &out];
+
+    let t = std::time::Instant::now();
     let cpu_hal: CpuHal<BabyBear> = CpuHal::new(Sha256HashSuite::new_suite());
-    let cpu = run(&cpu_hal, &CpuCircuitHal, bufs, poly_mix, PO2, steps);
+    let cpu = run_eval_check(&cpu_hal, &CpuCircuitHal, bufs, poly_mix, po2, steps);
+    let cpu_time = t.elapsed();
+
     let hal = Arc::new(MetalHalSha256::new());
     let metal_c = MetalCircuitHal::new(hal.clone()).unwrap();
-    let metal = run(hal.as_ref(), &metal_c, bufs, poly_mix, PO2, steps);
-    assert_eq!(cpu, metal);
+    let check = hal.alloc_elem("check", ExtVal::EXT_SIZE * domain);
+    let [code_b, data_b, accum_b, mix_b, out_b] = bufs.map(|b| hal.copy_from_elem("in", b));
+    let groups = [&accum_b, &code_b, &data_b];
+    let globals = [&mix_b, &out_b];
+    hal.sync();
+    hal.reset_peak_allocated_size();
+    let before = hal.allocated_size();
+    let t = std::time::Instant::now();
+    metal_c
+        .eval_check_metal(&check, &groups, &globals, poly_mix, po2, steps)
+        .unwrap();
+    let gpu_time = t.elapsed();
+    let peak = hal.peak_allocated_size().max(hal.allocated_size());
+    let gpu = check.to_vec();
+    let mismatches = cpu.iter().zip(&gpu).filter(|(a, b)| a != b).count();
+    assert_eq!(
+        mismatches,
+        0,
+        "po2 {po2}: {mismatches} of {} differ",
+        cpu.len()
+    );
+    assert_eq!(cpu, gpu);
+    let inputs: usize = [&code[..], &data, &accum, &mix, &out]
+        .iter()
+        .map(|b| b.len() * 4)
+        .sum();
+    println!(
+        "R10 eval_check po2 {po2}: domain {domain}, bit-exact {} elements; GPU {gpu_time:?}, \
+         CPU HAL {cpu_time:?}; currentAllocatedSize before phase {before} B, peak during phase \
+         {peak} B (phase buffers: inputs {inputs} B + check {} B + poly_mix {} B)",
+        gpu.len(),
+        gpu.len() * 4,
+        NUM_POLY_MIX_POWERS * 16,
+    );
+
+    // The CPU fallback over the same Metal buffers.
+    let check2 = hal.alloc_elem("check", ExtVal::EXT_SIZE * domain);
+    metal_c
+        .eval_check_cpu(&check2, &groups, &globals, poly_mix, po2, steps)
+        .unwrap();
+    assert_eq!(cpu, check2.to_vec(), "CPU fallback, po2 {po2}");
+
+    // The CircuitHal entry point (Metal unless RISC0_METAL_RV32IM_CPU_PHASES selects eval).
+    if po2 <= 10 {
+        let calls = PHASE_CALLS[Phase::EvalCheck as usize].load(Ordering::Relaxed);
+        let via_trait = run_eval_check(hal.as_ref(), &metal_c, bufs, poly_mix, po2, steps);
+        assert_eq!(cpu, via_trait, "CircuitHal::eval_check, po2 {po2}");
+        assert!(PHASE_CALLS[Phase::EvalCheck as usize].load(Ordering::Relaxed) > calls);
+    }
+}
+
+#[test]
+fn eval_check_matches_cpu_po2_4() {
+    eval_check_matches_cpu(4);
+}
+
+#[test]
+fn eval_check_matches_cpu_po2_10() {
+    eval_check_matches_cpu(10);
+}
+
+#[test]
+fn eval_check_matches_cpu_po2_16() {
+    eval_check_matches_cpu(16);
+}
+
+/// The same poly_mix buffer is reused across calls with different poly_mix values and po2s.
+#[test]
+fn eval_check_reuses_poly_mix_buffer() {
+    let hal = Arc::new(MetalHalSha256::new());
+    let metal_c = MetalCircuitHal::new(hal.clone()).unwrap();
+    let cpu_hal: CpuHal<BabyBear> = CpuHal::new(Sha256HashSuite::new_suite());
+    let mut pm_ptr = None;
+    for po2 in [5, 4, 6] {
+        let steps = 1 << po2;
+        let domain = steps * INV_RATE;
+        let code = random_vals(TAPSET.group_size(REGISTER_GROUP_CODE) * domain);
+        let data = random_vals(TAPSET.group_size(REGISTER_GROUP_DATA) * domain);
+        let accum = random_vals(TAPSET.group_size(REGISTER_GROUP_ACCUM) * domain);
+        let mix = random_vals(CircuitImpl::MIX_SIZE);
+        let out = random_vals(CircuitImpl::OUTPUT_SIZE);
+        let poly_mix = ExtVal::random(&mut rand::rng());
+        let bufs = [&code[..], &data, &accum, &mix, &out];
+        let cpu = run_eval_check(&cpu_hal, &CpuCircuitHal, bufs, poly_mix, po2, steps);
+        // eval_check_metal directly, so the test holds under RISC0_METAL_RV32IM_CPU_PHASES=eval.
+        let check = hal.alloc_elem("check", ExtVal::EXT_SIZE * domain);
+        let [code_b, data_b, accum_b, mix_b, out_b] = bufs.map(|b| hal.copy_from_elem("in", b));
+        metal_c
+            .eval_check_metal(
+                &check,
+                &[&accum_b, &code_b, &data_b],
+                &[&mix_b, &out_b],
+                poly_mix,
+                po2,
+                steps,
+            )
+            .unwrap();
+        assert_eq!(cpu, check.to_vec(), "po2 {po2}");
+        let ptr = metal_c
+            .ctx()
+            .scratch()
+            .poly_mix
+            .as_ref()
+            .unwrap()
+            .as_device_ptr();
+        assert_eq!(*pm_ptr.get_or_insert(ptr), ptr, "poly_mix buffer reused");
+    }
+}
+
+#[test]
+fn cpu_phases_list_parsing() {
+    use super::eval_check::phase_listed;
+    assert!(phase_listed("eval", "eval"));
+    assert!(phase_listed("witgen, Eval ,accum", "eval"));
+    assert!(!phase_listed("witgen,accum", "eval"));
+    assert!(!phase_listed("", "eval"));
+    assert!(!phase_listed("evaluate", "eval"));
 }
 
 /// The default rv32im segment prover of a `metal` build is the Metal one: proving a segment
