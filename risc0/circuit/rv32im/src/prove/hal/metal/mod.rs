@@ -20,10 +20,12 @@
 //! present kernel, and the HAL-owned scratch buffers (lookup tables, the preflight copy, perm,
 //! scratch, poly_mix) that the Metal witgen/accum/eval_check paths bind.
 //!
-//! The three circuit phases run Metal kernels: `witgen` (R8), `accum` (R9) and `eval_check`
-//! (R10), integrated and gated by R11. Each phase keeps R7's delegation to the CPU circuit kernels
-//! (`risc0_circuit_rv32im_cpu_*` on host views of the shared buffers) as a debugging fallback,
-//! selected per phase with [CPU_PHASES_ENV].
+//! `accum` (R9) and `eval_check` (R10) run Metal kernels by default. `witgen` (R8) runs R7's
+//! delegation to the CPU circuit kernel by default, because the generated Metal witgen kernels are
+//! not deterministic yet (docs/metal-port/notes/R8.md, R11.md); its Metal path is an opt-in,
+//! `RISC0_METAL_RV32IM_GPU_PHASES=witgen` (`witgen.rs`). R11 integrated and gated the default
+//! configuration. Every phase keeps R7's delegation (`risc0_circuit_rv32im_cpu_*` on host views of
+//! the shared buffers) as a fallback, forced per phase with [CPU_PHASES_ENV].
 //!
 //! Kernel loading tolerates kernels that later items have not added yet: [EXPECTED_KERNELS] lists
 //! the entry points each phase will need; the ones missing from the metallib are recorded, and
@@ -102,6 +104,9 @@ pub(crate) const EXPECTED_KERNELS: &[(Phase, &[&str])] = &[
 ];
 
 /// Debug knob: path of a metallib to load instead of `risc0_circuit_rv32im_sys::METAL_LIB`.
+/// Honoured only in test and debug-assertion builds, so a release worker cannot be made to load
+/// unverified kernels through its environment.
+#[cfg(any(test, debug_assertions))]
 pub(crate) const METALLIB_OVERRIDE_ENV: &str = "RISC0_METAL_RV32IM_METALLIB";
 
 /// The rv32im metallib with a PSO for every [METAL_KERNEL_NAMES] entry and every
@@ -150,6 +155,10 @@ impl Rv32imKernels {
             .get_or_init(|| {
                 // Debug/experiments: `RISC0_METAL_RV32IM_METALLIB=<path>` loads a metallib built
                 // outside cargo (e.g. a witgen_tu.metal variant) instead of the embedded one.
+                // Release builds never read the variable (see METALLIB_OVERRIDE_ENV).
+                #[cfg(not(any(test, debug_assertions)))]
+                let override_lib: Option<std::result::Result<Vec<u8>, String>> = None;
+                #[cfg(any(test, debug_assertions))]
                 let override_lib = std::env::var_os(METALLIB_OVERRIDE_ENV).map(|path| {
                     tracing::warn!(
                         "rv32im: loading the metallib from {path:?} ({METALLIB_OVERRIDE_ENV})"
@@ -351,8 +360,9 @@ impl<MH: MetalHash> MetalRv32imCtx<MH> {
 
 /// Circuit phases named by this env var (a comma list of `witgen`, `accum`, `eval`;
 /// case-insensitive, whitespace ignored) run the CPU circuit kernels over host views of the Metal
-/// HAL's shared buffers instead of the Metal kernels. A debugging fallback: by default all three
-/// phases run on the GPU.
+/// HAL's shared buffers instead of the Metal kernels. A debugging fallback for accum and eval,
+/// which run on the GPU by default. Witgen runs the CPU kernel by default anyway; listing it here
+/// also overrides the `RISC0_METAL_RV32IM_GPU_PHASES=witgen` opt-in (`witgen.rs`).
 pub(crate) const CPU_PHASES_ENV: &str = "RISC0_METAL_RV32IM_CPU_PHASES";
 
 /// Whether the comma list `list` names `phase` ([CPU_PHASES_ENV] syntax).
@@ -381,6 +391,10 @@ fn count(phase: Phase) {
 /// sweep). Each mark stores the process-wide peak `currentAllocatedSize` since the previous mark
 /// (so the mark at a phase's start covers the zkp work before it, e.g. the data commit before
 /// accum), the current allocation and the time, then restarts the peak.
+///
+/// Because a mark resets the HAL's process-wide peak counter, the marks and any other reader of
+/// `peak_allocated_size` (e.g. M3's per-proof sampler) are mutually exclusive: never enable the
+/// marks in production.
 pub(crate) static PHASE_MARKS_ON: AtomicBool = AtomicBool::new(false);
 
 // Read by the R11 sweep test and debug tooling only.
@@ -456,10 +470,15 @@ pub fn segment_prover() -> Result<Box<dyn SegmentProver>> {
     // Fail here, not inside the prover, if the metallib cannot be loaded.
     Rv32imKernels::get(&MetalHalPoseidon2::new())?;
     tracing::debug!(
-        "rv32im segment prover: Metal HAL ({}), circuit phases on the GPU except {}={:?}",
+        "rv32im segment prover: Metal HAL ({}), witgen on the {}, accum on the {}, eval_check on \
+         the {} ({}={:?}, RISC0_METAL_RV32IM_GPU_PHASES={:?})",
         risc0_zkp::hal::metal::device_name().unwrap_or_default(),
+        if witgen::cpu_witgen() { "CPU" } else { "GPU" },
+        if cpu_phase("accum") { "CPU" } else { "GPU" },
+        if cpu_phase("eval") { "CPU" } else { "GPU" },
         CPU_PHASES_ENV,
-        std::env::var(CPU_PHASES_ENV).unwrap_or_default()
+        std::env::var(CPU_PHASES_ENV).unwrap_or_default(),
+        std::env::var("RISC0_METAL_RV32IM_GPU_PHASES").unwrap_or_default()
     );
     let hal_factory = || {
         let hal = Arc::new(MetalHalPoseidon2::new());

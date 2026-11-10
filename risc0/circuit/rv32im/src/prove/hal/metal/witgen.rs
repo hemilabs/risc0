@@ -167,6 +167,11 @@ pub(crate) fn gpu_phase(phase: &str) -> bool {
 /// `RISC0_METAL_RV32IM_CPU_PHASES=witgen` forces the CPU. Read once per process.
 static CPU_WITGEN: LazyLock<bool> = LazyLock::new(|| cpu_phase("witgen") || !gpu_phase("witgen"));
 
+/// The effective [CPU_WITGEN] (logged by `segment_prover`).
+pub(crate) fn cpu_witgen() -> bool {
+    *CPU_WITGEN
+}
+
 /// `RISC0_METAL_WITGEN_SINGLE_BUFFER=1`: bind `data` as `pre_data` (CUDA's default).
 fn single_buffer() -> bool {
     matches!(
