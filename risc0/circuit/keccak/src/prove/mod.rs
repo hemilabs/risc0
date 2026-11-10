@@ -127,6 +127,21 @@ fn initial_global(po2: usize) -> Vec<Val> {
     global
 }
 
+/// Build the keccak Metal pipeline states (through the binary archive on disk, K5) so the first
+/// keccak proof does not pay for them (minutes cold, PLAN 9.1). Best effort: a failure is
+/// logged; `keccak_prover()` reports it again. Takes no GPU lock (safe on a background thread
+/// beside a running session).
+#[cfg(feature = "metal")]
+pub fn metal_warmup() {
+    if !risc0_zkp::hal::metal::enabled("keccak") {
+        return;
+    }
+    match self::hal::metal::warmup() {
+        Ok(report) => tracing::debug!("keccak Metal warmup: {report:?}"),
+        Err(e) => tracing::warn!("keccak Metal warmup failed: {e:#}"),
+    }
+}
+
 pub fn keccak_prover() -> Result<Box<dyn KeccakProver>> {
     cfg_if! {
         if #[cfg(feature = "cuda")] {

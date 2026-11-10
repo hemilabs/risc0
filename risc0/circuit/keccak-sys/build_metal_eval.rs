@@ -123,6 +123,40 @@ pub(crate) fn metal_eval_sources(kernel_dir: &Path, gen_dir: &Path) -> Vec<PathB
     paths
 }
 
+/// Under `RISC0_SKIP_BUILD_KERNELS` (no stage kernels in the empty metallib): writes a
+/// `$OUT_DIR/keccak_metal_eval.rs` with no stages (sizes 1) and points
+/// `KECCAK_METAL_EVAL_RS` at it, so `src/lib.rs` (`metal_eval`, `METAL_KERNEL_NAMES`) and the HAL
+/// still compile. Same items as [Translation::rust_consts].
+#[allow(dead_code)] // unused where tests include this file
+pub(crate) fn write_skip_consts(out_dir: &Path) {
+    let mut s = String::from(
+        "// Written by keccak-sys/build_metal_eval.rs under RISC0_SKIP_BUILD_KERNELS: no stages.\n\
+         pub const EVAL_STAGES: usize = 0;\n\
+         pub const EVAL_STAGE_NAMES: [&str; 0] = [];\n\
+         pub const EVAL_STAGE_BINDINGS: [u32; 0] = [];\n",
+    );
+    for name in [
+        "SCRATCH_ELEMS",
+        "MAX_STRIDE",
+        "CARRY_WORDS",
+        "MAX_COLUMN",
+        "INV_RATE",
+        "NUM_POLY_MIX_POWS",
+    ] {
+        // 1, not 0: the HAL's bounds checks stay meaningful expressions (clippy) and nothing
+        // runs with these values (no stages).
+        writeln!(s, "pub const EVAL_{name}: u32 = 1;").unwrap();
+    }
+    for (i, b) in BUFS.iter().enumerate() {
+        writeln!(s, "pub const EVAL_BUF_{b}: u64 = {i};").unwrap();
+    }
+    writeln!(s, "pub const EVAL_PARAMS_SIZE: usize = 32;").unwrap();
+    let rs = out_dir.join("keccak_metal_eval.rs");
+    write_if_changed(&rs, &s);
+    println!("cargo:rustc-env=KECCAK_METAL_EVAL_RS={}", rs.display());
+    println!("cargo:rustc-env=KECCAK_METAL_EVAL_STAGES=0");
+}
+
 /// The stage count from [STAGES_ENV] (a positive integer), else [DEFAULT_STAGES].
 pub(crate) fn stages_from_env() -> usize {
     println!("cargo:rerun-if-env-changed={STAGES_ENV}");
@@ -222,6 +256,32 @@ pub(crate) struct Stage {
     pub lines: usize,
     /// Carry words it reads (its first function's `FpExt` parameters, 4 words each).
     pub carry_in_words: usize,
+    /// The buffer bindings (`EVAL_BUF_*` indices) it may access, as a bit mask (K4): the HAL
+    /// binds only these, so the Metal validation layer sees no unused bindings. A superset of
+    /// what the compiled kernel reads (any mention of an input counts), never a subset.
+    pub bindings: u32,
+}
+
+/// Binding indices (kernels/metal/eval_check_prelude.h), as [Translation::rust_consts] emits.
+pub(crate) const BUFS: [&str; 10] = [
+    "CHECK", "CTRL", "OUT", "DATA", "MIX", "ACCUM", "POLY_MIX", "SCRATCH", "CARRY", "PARAMS",
+];
+
+fn buf_bit(name: &str) -> u32 {
+    let upper = name.to_ascii_uppercase();
+    1 << BUFS
+        .iter()
+        .position(|b| *b == upper)
+        .unwrap_or_else(|| panic!("eval_check: no binding {name}"))
+}
+
+/// Whether `line` mentions the identifier `ident` (not as part of a longer identifier).
+fn mentions(line: &str, ident: &str) -> bool {
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    line.match_indices(ident).any(|(i, _)| {
+        !line[..i].chars().next_back().is_some_and(is_ident)
+            && !line[i + ident.len()..].chars().next().is_some_and(is_ident)
+    })
 }
 
 /// What [translate] produces.
@@ -338,15 +398,27 @@ impl Translation {
             writeln!(s, "pub const EVAL_{}: u32 = {value};", upper_snake(name)).unwrap();
         }
         writeln!(s, "/// Buffer bindings shared by every stage kernel.").unwrap();
-        for (i, b) in [
-            "CHECK", "CTRL", "OUT", "DATA", "MIX", "ACCUM", "POLY_MIX", "SCRATCH", "CARRY",
-            "PARAMS",
-        ]
-        .iter()
-        .enumerate()
-        {
+        for (i, b) in BUFS.iter().enumerate() {
             writeln!(s, "pub const EVAL_BUF_{b}: u64 = {i};").unwrap();
         }
+        let masks: Vec<String> = self
+            .stages
+            .iter()
+            .map(|st| format!("{:#05x}", st.bindings))
+            .collect();
+        writeln!(
+            s,
+            "/// Per stage, a bit mask of the bindings (`1 << EVAL_BUF_*`) it may access; the\n\
+             /// launcher binds only these (a superset of what the kernel reads)."
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "pub const EVAL_STAGE_BINDINGS: [u32; {}] = [{}];",
+            self.stages.len(),
+            masks.join(", ")
+        )
+        .unwrap();
         writeln!(s, "/// `sizeof(EvalParams)`.").unwrap();
         writeln!(s, "pub const EVAL_PARAMS_SIZE: usize = 32;").unwrap();
         s
@@ -1090,11 +1162,41 @@ pub(crate) fn translate(header: &str, sources: &[(String, String)], stages: usiz
         }
         text.push_str("}\n");
         files.push((format!("{name}.metal"), text));
+
+        // The bindings this stage may touch. Inputs: a member's `const Fp*` parameter mentioned
+        // on a line other than its tail call (a call within the stage hands it to the callee,
+        // which is a member too; a cut call does not pass inputs: the next kernel binds them).
+        let mut bindings = buf_bit("params") | buf_bit("scratch");
+        if last {
+            bindings |= buf_bit("check");
+        }
+        if !last || ext_in > 0 {
+            bindings |= buf_bit("carry");
+        }
+        for &fi in members {
+            let f = &functions[fi];
+            let call_line = f.call.as_ref().map(|c| c.line);
+            let read = |ident: &str| {
+                f.body
+                    .iter()
+                    .enumerate()
+                    .any(|(li, line)| Some(li) != call_line && mentions(line, ident))
+            };
+            for p in f.params.iter().filter(|p| p.kind == Kind::Input) {
+                if read(&p.name) {
+                    bindings |= buf_bit(&roots[&(fi, p.name.clone())]);
+                }
+            }
+            if read("poly_mix") {
+                bindings |= buf_bit("poly_mix");
+            }
+        }
         out_stages.push(Stage {
             name,
             functions: fn_names,
             lines,
             carry_in_words: 4 * ext_in,
+            bindings,
         });
     }
 

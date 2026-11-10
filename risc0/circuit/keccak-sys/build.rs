@@ -24,6 +24,9 @@ use risc0_build_kernel::{KernelBuild, KernelType};
 // K3 never edits this one.
 #[path = "build_metal_eval.rs"]
 mod build_metal_eval;
+// The Metal witgen translator (item K6, docs/metal-port/PLAN.md 8.2), likewise.
+#[path = "build_metal_witgen.rs"]
+mod build_metal_witgen;
 
 #[cfg(all(feature = "cuda", feature = "rocm"))]
 compile_error!("Features 'cuda' and 'rocm' are mutually exclusive. Enable only one GPU backend.");
@@ -890,7 +893,14 @@ fn build_metal_kernels() {
         let gen_dir = out_dir.join("metal");
         std::fs::create_dir_all(&gen_dir).unwrap();
         sources.extend(build_metal_eval::metal_eval_sources(&kernel_dir, &gen_dir));
+    } else {
+        build_metal_eval::write_skip_consts(&out_dir);
     }
+    // Witgen arm kernels (K6); also writes the HAL's constants under RISC0_SKIP_BUILD_KERNELS.
+    sources.extend(build_metal_witgen::metal_witgen_sources(
+        &kernel_dir,
+        &out_dir.join("metal"),
+    ));
 
     KernelBuild::new(KernelType::Metal)
         .files(&sources)
