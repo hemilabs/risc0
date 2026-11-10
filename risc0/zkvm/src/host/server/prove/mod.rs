@@ -491,7 +491,16 @@ pub(crate) fn exclusive_gpu() -> impl Sized {
     risc0_zkp::hal::cuda::exclusive()
 }
 
-#[cfg(not(feature = "cuda"))]
+/// Metal: the process-wide GPU lock every `MetalHal` takes per encode/commit/wait (see
+/// `risc0_zkp::hal::metal::exclusive`). Held for the whole call, a HAL call from another thread
+/// blocks until it drops, so code under it must not wait for a thread that uses a HAL (e.g. the
+/// Metal warmup, see `prover_impl::start_metal_warmup`).
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+pub(crate) fn exclusive_gpu() -> impl Sized {
+    risc0_zkp::hal::metal::exclusive()
+}
+
+#[cfg(not(any(feature = "cuda", feature = "metal")))]
 pub(crate) fn exclusive_gpu() -> impl Sized {}
 
 /// Return the STARK HAL's cached device memory to the driver, around the Groth16 wrap.
@@ -517,4 +526,14 @@ pub(crate) fn release_hal_buffers() {
     risc0_zkp::hal::hip::clear_buffer_pool();
     #[cfg(feature = "intel")]
     risc0_zkp::hal::intel::release_idle_buffers();
+    // Metal has no process-wide pool: each `MetalHal` pools its own buffers (capped at half of
+    // `recommendedMaxWorkingSetSize`) and frees them when it drops. The long-lived HALs are the
+    // ones this thread's cached segment and recursion provers hold, so dropping those provers
+    // returns their pools (and live scratch) to the system; the next proof rebuilds them (the
+    // PSOs are process-wide and stay). On unified memory this memory is the owner's RAM: on a
+    // 16 GB Mac (a ~4-8 GB GPU budget, PLAN 9.1) the wrap and the keccak proofs must not run
+    // beside a segment prover's idle pool. Callers run this on the proving thread, with the
+    // segment pipeline drained (`shrink_wrap_with` runs it on the calling thread).
+    #[cfg(feature = "metal")]
+    prover_impl::release_cached_provers();
 }

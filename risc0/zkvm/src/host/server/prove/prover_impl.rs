@@ -47,7 +47,7 @@ impl Drop for DrainSegmentProverOnExit {
 
 /// Drop this thread's cached segment prover and the device buffers it keeps between segments
 /// (see `release_cached_provers`). Only between sessions: the prover must be idle.
-#[cfg(any(feature = "rocm", feature = "intel"))]
+#[cfg(any(feature = "rocm", feature = "intel", feature = "metal"))]
 fn release_cached_segment_prover() {
     CACHED_SEGMENT_PROVER.with(|cell| {
         if let Ok(mut borrow) = cell.try_borrow_mut() {
@@ -63,7 +63,10 @@ fn release_cached_segment_prover() {
 /// slower. On an Arc B580 (12 GB, Windows) at po2=20 the next session's segments took 106 s
 /// instead of 28 (54-65 s with this alone; the rest was the HAL's pool, see `pool_max_bytes` in
 /// risc0-zkp's Intel HAL). Rebuilt by the next session, in device memory.
-#[cfg(any(feature = "rocm", feature = "intel"))]
+///
+/// On Metal this is also how `release_hal_buffers` returns pooled memory: the pools belong to the
+/// HALs these provers hold (see there).
+#[cfg(any(feature = "rocm", feature = "intel", feature = "metal"))]
 pub(crate) fn release_cached_provers() {
     release_cached_segment_prover();
     risc0_circuit_recursion::prove::release_cached_provers();
@@ -138,6 +141,32 @@ fn join_cuda_rec_warmup() {
     }
 }
 
+/// Metal: build the pipeline states (zkp + rv32im metallibs) on a background thread, once per
+/// process, started by [ProverImpl::new] so it overlaps guest execution. Only rv32im has a Metal
+/// warmup today (`risc0_circuit_rv32im::prove::metal_warmup`); recursion and keccak gain theirs
+/// with their Metal items (the keccak eval_check PSOs are ~94 s cold, PLAN 9.1).
+///
+/// The thread is never joined. `MetalHal::new` takes the GPU lock that a session holds for its
+/// whole run (`exclusive_gpu`), so a session joining it could deadlock; nothing needs to: the
+/// zkp PSOs are built once under that lock and the rv32im PSOs in a `OnceLock` whose
+/// initialization takes no lock, so a session that starts first just builds them itself (and the
+/// warmup then finds them built) and one that starts later waits for the warmup's build.
+#[cfg(feature = "metal")]
+fn start_metal_warmup() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        if !risc0_zkp::hal::metal::enabled("rv32im") {
+            return;
+        }
+        if let Err(e) = std::thread::Builder::new()
+            .name("metal-warmup".into())
+            .spawn(risc0_circuit_rv32im::prove::metal_warmup)
+        {
+            tracing::warn!("metal warmup thread not started: {e}");
+        }
+    });
+}
+
 /// An implementation of a Prover that runs locally.
 pub struct ProverImpl {
     opts: ProverOpts,
@@ -163,9 +192,12 @@ impl ProverImpl {
         // the warmup threads make the first HIP call.
         #[cfg(feature = "rocm")]
         risc0_zkp::hal::hip::auto_configure_hw_queues();
+        #[cfg(feature = "metal")]
+        start_metal_warmup();
         // Parse the Groth16 witness graph (and build its parallel schedule) while the guest
-        // executes instead of beside the STARK.
-        #[cfg(feature = "cuda")]
+        // executes instead of beside the STARK. (Metal: only when the Metal Groth16 prover is
+        // enabled; `preload_graph_background` checks.)
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         if opts.receipt_kind == ReceiptKind::Groth16 {
             risc0_groth16::prove::preload_graph_background();
         }
@@ -604,8 +636,14 @@ impl ProverImpl {
             risc0_groth16::prove::prestart_key();
         }
         // Preload circom graph on background thread so the ~728ms file read + parse
-        // overlaps with segment proving and recursion.  Only needed for Groth16.
-        #[cfg(any(feature = "cuda", feature = "rocm", feature = "intel"))]
+        // overlaps with segment proving and recursion.  Only needed for Groth16. (Metal: the
+        // thread does no GPU work, so the session's GPU lock does not block it; it is not joined.)
+        #[cfg(any(
+            feature = "cuda",
+            feature = "rocm",
+            feature = "intel",
+            feature = "metal"
+        ))]
         let _graph_preload = if self.opts.receipt_kind == ReceiptKind::Groth16 {
             Some(std::thread::spawn(|| {
                 if let Err(e) = risc0_groth16::prove::preload_graph() {
@@ -1187,9 +1225,13 @@ impl ProverImpl {
         std::thread::scope(|scope| -> Result<()> {
             // On Intel and AMD GPUs a keccak proof's witness is made on the CPU, about half of
             // the proof's time: make each on a thread, a proof ahead of the GPU, so the two
-            // overlap. (On CUDA the GPU makes it.) Returning early drops `witnesses`, which ends
-            // the thread.
-            let witnesses = (cfg!(any(feature = "intel", feature = "rocm"))
+            // overlap. (On CUDA the GPU makes it.) Metal also makes it on the CPU until K6 ports
+            // the witgen; then its prover declines the host witness (`prove_host_witness` returns
+            // None) and `prove_keccak_with` proves from the inputs, so this only wastes the CPU
+            // thread and should be narrowed then. The thread uses no HAL, so it cannot block on
+            // the Metal GPU lock this session holds. Returning early drops `witnesses`, which
+            // ends the thread.
+            let witnesses = (cfg!(any(feature = "intel", feature = "rocm", feature = "metal"))
                 && session.pending_keccaks.len() > 1)
                 .then(|| {
                     let (tx, rx) = mpsc::sync_channel(1);
@@ -1482,7 +1524,13 @@ impl ProverServer for ProverImpl {
         // the executor default: on the 32 GB Arc Pro B70, po2=21 ran out of device memory in long
         // sessions and after a Groth16 wrap in the same process (an Ethereum block, a STARK
         // proof after the Groth16 prover cached its key), where po2=20 did not.
-        #[cfg(any(feature = "intel", feature = "cuda"))]
+        //
+        // Metal honours the RISC0_SUCCINCT_SEGMENT_PO2 override but never bumps on its own: the
+        // minimum target is a 16 GB Mac with a ~4-8 GB GPU budget that must keep segments at
+        // po2 <= 18-19 (PLAN 9.1), and even the high end gains little while the recursion
+        // prover is still the CPU one. The segment size there is the caller's (zk-miner sizes
+        // it from `recommendedMaxWorkingSetSize`); see docs/metal-port/notes/M3.md.
+        #[cfg(any(feature = "intel", feature = "cuda", feature = "metal"))]
         if self.opts.receipt_kind != ReceiptKind::Composite && env.segment_limit_po2.is_none() {
             let po2 = std::env::var("RISC0_SUCCINCT_SEGMENT_PO2")
                 .or_else(|_| std::env::var("RISC0_INTEL_SUCCINCT_SEGMENT_PO2"))
