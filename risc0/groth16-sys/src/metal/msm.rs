@@ -238,13 +238,21 @@ impl MsmConfig {
         ((2 * n as u64).div_ceil(self.nbuckets() as u64) as u32).max(16)
     }
 
-    /// Bound on the pieces of one window: ceil(entries / piece) + one partial piece per
-    /// non-empty bucket. Non-decreasing in `n`.
+    /// Bound on the pieces of one window for any MSM of at most `n` scalars, and
+    /// non-decreasing in `n` (so a scratch sized for `cap_n` fits every `n <= cap_n`).
+    ///
+    /// The pieces of a window number at most ceil(n / piece(n)) + min(n, 2^c - 1) (full pieces
+    /// plus one partial piece per non-empty bucket). ceil(n / piece(n)) itself is *not*
+    /// monotone: piece(n) steps up by one at multiples of 2^(c-1), where it drops. It is bounded
+    /// by ceil(min(n, 8 * 2^c) / 16), which is: for n <= 8 * 2^c, piece(n) = 16; above,
+    /// piece(n) >= 2n / 2^c, so n / piece(n) <= 2^(c-1) = (8 * 2^c) / 16.
     pub fn max_pieces(&self, n: u32) -> u32 {
-        n.div_ceil(self.piece(n)) + n.min(self.nbuckets() - 1)
+        let nb = self.nbuckets();
+        let full = (n as u64).min(8 * nb as u64).div_ceil(16) as u32;
+        full + n.min(nb - 1)
     }
 
-    /// Bound on the segments of one window.
+    /// Bound on the segments of one window for any MSM of at most `n` scalars (non-decreasing).
     pub fn max_segs(&self, n: u32) -> u32 {
         self.max_pieces(n).div_ceil(self.seg)
     }
@@ -460,11 +468,20 @@ impl MsmKernels {
             nwins: cfg.nwins(),
             nbuckets: cfg.nbuckets(),
             piece: cfg.piece(n),
-            max_pieces: cfg.max_pieces(n),
+            // Strides of the piece and partial arrays: the scratch's, whatever n (the dispatch
+            // grids use the bound at n, which is no larger).
+            max_pieces: sc.max_pieces,
             seg: cfg.seg,
-            max_segs: cfg.max_segs(n),
+            max_segs: sc.max_segs,
             ..Default::default()
         };
+        assert!(
+            n.div_ceil(p.piece) + n.min(p.nbuckets - 1) <= cfg.max_pieces(n)
+                && cfg.max_pieces(n) <= sc.max_pieces
+                && cfg.max_segs(n) <= sc.max_segs,
+            "MSM piece bound of {n} scalars exceeds the scratch (sized for {})",
+            sc.cap_n
+        );
         let table = p.nwins as u64 * p.nbuckets as u64;
 
         enc.set_compute_pipeline_state(&self.clear);
@@ -536,7 +553,11 @@ impl MsmKernels {
         let sp = sc
             .sorted_params
             .expect("encode_msm before encode_sort on this scratch");
-        let first = first.min(sp.n);
+        assert!(
+            first <= sp.n,
+            "MSM first index {first} beyond the {} sorted scalars",
+            sp.n
+        );
         let npoints = sp.n - first;
         points.check(npoints as u64 * C::AFFINE_BYTES, "MSM points");
         out.check(sp.nwins as u64 * C::XYZZ_BYTES, "MSM window sums");
@@ -555,6 +576,10 @@ impl MsmKernels {
                 per_group as u64 * group_bytes <= sc.pieces.length()
                     && per_group as u64 * p.max_pieces as u64 * 4 <= sc.piece_bucket.length(),
                 "MSM pieces scratch too small"
+            );
+            assert!(
+                sp.nwins as u64 * p.max_segs as u64 * C::XYZZ_BYTES <= sc.partial.length(),
+                "MSM partial scratch too small"
             );
             let mut w0 = 0;
             while w0 < p.nwins {
@@ -600,7 +625,8 @@ impl MsmKernels {
                 enc.set_buffer(buf::buckets::PIECES, Some(&sc.pieces), 0);
                 enc.set_buffer(buf::buckets::PIECE_BUCKET, Some(&sc.piece_bucket), 0);
                 set_params(enc, buf::buckets::PARAMS, &p);
-                dispatch_2d(enc, &ps.buckets, p.max_pieces as u64, p.wcount as u64);
+                let grid = sc.cfg.max_pieces(p.n).min(p.max_pieces);
+                dispatch_2d(enc, &ps.buckets, grid as u64, p.wcount as u64);
             }
             MsmStage::SegmentReduce(p) => {
                 enc.set_compute_pipeline_state(&ps.segment_reduce);
@@ -609,7 +635,8 @@ impl MsmKernels {
                 enc.set_buffer(buf::segment_reduce::TOTALS, Some(&sc.totals), 0);
                 enc.set_buffer(buf::segment_reduce::PARTIAL, Some(&sc.partial), 0);
                 set_params(enc, buf::segment_reduce::PARAMS, &p);
-                dispatch_2d(enc, &ps.segment_reduce, p.max_segs as u64, p.wcount as u64);
+                let grid = sc.cfg.max_segs(p.n).min(p.max_segs);
+                dispatch_2d(enc, &ps.segment_reduce, grid as u64, p.wcount as u64);
             }
             MsmStage::WindowReduce(p) => {
                 let tw = window_reduce_width(&ps.window_reduce, C::XYZZ_BYTES);
@@ -678,6 +705,10 @@ fn dispatch_2d(enc: &ComputeCommandEncoderRef, pso: &ComputePipelineState, x: u6
 pub struct MsmScratch {
     cfg: MsmConfig,
     cap_n: u32,
+    /// cfg.max_pieces(cap_n) / cfg.max_segs(cap_n): the per-window strides of `pieces`,
+    /// `piece_bucket` and `partial` for every sort on this scratch.
+    max_pieces: u32,
+    max_segs: u32,
     hist: Buffer,
     offset: Buffer,
     piece_off: Buffer,
@@ -716,6 +747,8 @@ impl MsmScratch {
         Ok(Self {
             cfg,
             cap_n,
+            max_pieces: max_pieces as u32,
+            max_segs: max_segs as u32,
             hist: alloc(table, "hist")?,
             offset: alloc(table, "offset")?,
             piece_off: alloc(table, "piece_off")?,

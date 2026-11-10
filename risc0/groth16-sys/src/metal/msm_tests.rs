@@ -129,6 +129,18 @@ fn allocated(g: &MsmGpu) -> u64 {
 /// G1 and G2 MSMs of `n` random terms sharing one sort; points and scalars bound at a non-zero
 /// byte offset. Returns (sort, G1, G2) GPU seconds (best of `reps`) and the peak allocation.
 fn check_size(g: &MsmGpu, n: usize, seed: u64, cfg: MsmConfig, reps: usize) -> (MsmTiming, f64) {
+    check_size_cap(g, n, n, seed, cfg, reps)
+}
+
+/// [check_size] on a scratch sized for `cap >= n` scalars.
+fn check_size_cap(
+    g: &MsmGpu,
+    n: usize,
+    cap: usize,
+    seed: u64,
+    cfg: MsmConfig,
+    reps: usize,
+) -> (MsmTiming, f64) {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let t0 = Instant::now();
     let p1 = points::<G1Projective>(n, &mut rng);
@@ -154,7 +166,7 @@ fn check_size(g: &MsmGpu, n: usize, seed: u64, cfg: MsmConfig, reps: usize) -> (
     let b1 = g.buffer(&w1);
     let b2 = g.buffer(&w2);
     let bs = g.buffer(&ws);
-    let mut sc = MsmScratch::new(&g.device, n as u32, cfg).unwrap();
+    let mut sc = MsmScratch::new(&g.device, cap as u32, cfg).unwrap();
     let peak = allocated(g);
 
     let mut best = MsmTiming {
@@ -175,12 +187,12 @@ fn check_size(g: &MsmGpu, n: usize, seed: u64, cfg: MsmConfig, reps: usize) -> (
         assert_eq!(
             got1.into_affine(),
             want1.into_affine(),
-            "G1 MSM n = {n} {cfg:?}"
+            "G1 MSM n = {n} cap = {cap} {cfg:?}"
         );
         assert_eq!(
             got2.into_affine(),
             want2.into_affine(),
-            "G2 MSM n = {n} {cfg:?}"
+            "G2 MSM n = {n} cap = {cap} {cfg:?}"
         );
         best.sort = best.sort.min(ts);
         best.msm = best.msm.min(t1);
@@ -238,6 +250,75 @@ fn msm_sizes() {
 fn msm_2_20() {
     let Some(g) = gpu() else { return };
     check_size(&g, 1 << 20, 7, MsmConfig::default(), 3);
+}
+
+/// `max_pieces` / `max_segs` bound the pieces of every n up to their argument and never
+/// decrease, so a scratch sized for `cap_n` fits every sort of n <= cap_n. ceil(n / piece(n))
+/// alone drops where piece(n) steps up (e.g. c = 16: 2^19 -> 2^19 + 1), which a scratch sized
+/// from it at cap_n would miss. Exhaustive over n for each c.
+#[test]
+fn msm_piece_bound() {
+    for wbits in 1..=16u32 {
+        let cfg = MsmConfig {
+            wbits,
+            seg: 7,
+            ..Default::default()
+        };
+        let nb = cfg.nbuckets();
+        let top = (64 * nb).max(1 << 14);
+        let (mut prev_p, mut prev_s) = (0, 0);
+        for n in 0..=top {
+            let exact = n.div_ceil(cfg.piece(n)) + n.min(nb - 1);
+            let (mp, ms) = (cfg.max_pieces(n), cfg.max_segs(n));
+            assert!(
+                exact <= mp,
+                "c = {wbits} n = {n}: {exact} pieces > bound {mp}"
+            );
+            assert!(
+                mp >= prev_p && ms >= prev_s,
+                "c = {wbits} n = {n}: bound decreased"
+            );
+            (prev_p, prev_s) = (mp, ms);
+        }
+        // The bound is tight at the knee (no memory regression vs the old per-n formula there).
+        let knee = 8 * nb;
+        assert_eq!(
+            cfg.max_pieces(knee),
+            knee.div_ceil(cfg.piece(knee)) + knee.min(nb - 1)
+        );
+    }
+}
+
+/// A scratch sized for more scalars than the sort: the strides are the scratch's, and the piece
+/// bound of n must fit it, including just below a step of piece(n) (where the old per-n bound was
+/// larger than the bound at cap). Both curves (check_size_cap checks G1 and G2).
+#[test]
+fn msm_scratch_cap_above_n() {
+    let Some(g) = gpu() else { return };
+    let cases: [(u32, u32, usize, usize); 6] = [
+        // (wbits, seg, n, cap)
+        (8, 1, 1937, 2049),
+        (8, 1, 2048, 2049),
+        (8, 7, 33, 2049),
+        (6, 16, 497, 513),
+        (11, 1, 16085, 16385),
+        (16, 64, 1 << 19, (1 << 19) + 1),
+    ];
+    for (i, (wbits, seg, n, cap)) in cases.into_iter().enumerate() {
+        let cfg = MsmConfig {
+            wbits,
+            seg,
+            ..Default::default()
+        };
+        check_size_cap(&g, n, cap, 500 + i as u64, cfg, 1);
+    }
+    // Window groups with a cap above n (pieces buffer of a few windows at cap's stride).
+    let cfg = MsmConfig {
+        wbits: 8,
+        seg: 1,
+        max_piece_bytes: 3 * 1600 * 256,
+    };
+    check_size_cap(&g, 1937, 2049, 520, cfg, 1);
 }
 
 /// Window widths that do not divide 32 (digits straddle limbs) and window grouping (a pieces
