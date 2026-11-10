@@ -433,8 +433,11 @@ fn raw(e: Elem) -> u32 {
 #[test]
 fn c1_every_listed_kernel_builds_a_pipeline() {
     let gpu = Gpu::new();
-    assert_eq!(METAL_KERNEL_NAMES.len(), 10);
-    for name in METAL_KERNEL_NAMES {
+    // The first 10 names are rec_kernels.metal's; C4 appended the translated step/eval_check
+    // kernels, whose PSOs c4_metallib_smoke builds.
+    let names = &METAL_KERNEL_NAMES[..10];
+    assert_eq!(names.last(), Some(&"scatterHostChains"));
+    for name in names {
         let pso = gpu.try_pipeline(name).unwrap();
         let max: u64 = unsafe { msg!(u64; pso, "maxTotalThreadsPerThreadgroup") };
         let tg: u64 = unsafe { msg!(u64; pso, "staticThreadgroupMemoryLength") };

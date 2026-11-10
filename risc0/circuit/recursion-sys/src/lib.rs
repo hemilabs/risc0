@@ -23,7 +23,9 @@ compile_error!(
 #[cfg(all(feature = "metal", not(any(target_os = "macos", target_os = "ios"))))]
 compile_error!("Feature 'metal' is only supported on macOS and iOS targets.");
 
-/// The unit's Metal kernels (`kernels/metal`), compiled by build.rs into a metallib.
+/// The unit's Metal kernels, compiled by build.rs into a metallib: the hand-written
+/// `kernels/metal/rec_kernels.metal` plus the step and eval_check kernels translated from
+/// `kernels/cuda` at build time.
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub const METAL_LIB: &[u8] = include_bytes!(env!("RECURSION_METAL_PATH"));
 
@@ -41,6 +43,20 @@ pub const METAL_KERNEL_NAMES: &[&str] = &[
     "recZeroizeRows",
     "markHostChains",
     "scatterHostChains",
+    // $OUT_DIR/metal/step_*.metal (C2 `cuda2metal_steps.py --list-kernels`)
+    "parStepExec",
+    "parStepVerifyWom",
+    "parStepComputeAccum",
+    "parStepVerifyAccum",
+    // $OUT_DIR/metal/eval_check.metal (C3 `cuda2metal_eval.py --list-kernels`; monolith)
+    "eval_check",
+    // $OUT_DIR/metal/eval_check_split.metal (C3 `--split`; parts 0..5 in order)
+    "ec_part_0",
+    "ec_part_1",
+    "ec_part_2",
+    "ec_part_3",
+    "ec_part_4",
+    "ec_part_5",
 ];
 
 use risc0_core::field::baby_bear::{BabyBearElem, BabyBearExtElem};

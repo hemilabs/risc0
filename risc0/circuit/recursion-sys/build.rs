@@ -995,22 +995,93 @@ fn glob_paths(pattern: &str) -> Vec<PathBuf> {
     glob::glob(pattern).unwrap().map(|x| x.unwrap()).collect()
 }
 
-/// The `metal` feature on macOS/iOS: compile `kernels/metal/*.metal` into
+/// The `metal` feature on macOS/iOS: translate the zirgen CUDA step and eval_check kernels to MSL
+/// into `$OUT_DIR/metal` (C2's `cuda2metal_steps.py`, C3's `cuda2metal_eval.py`, run with
+/// [risc0_build_kernel::python_command]; generated MSL is never checked in), then compile them
+/// together with the hand-written `kernels/metal/rec_kernels.metal` (C1) into
 /// `metal_kernels_recursion.metallib` and point `RECURSION_METAL_PATH` at it for `src/lib.rs`
-/// (`METAL_LIB`). Generated sources, when the unit adds them, go to `$OUT_DIR/metal`.
+/// (`METAL_LIB`). The kernel names are listed in `src/lib.rs` (`METAL_KERNEL_NAMES`).
+///
+/// Only `kernels/metal` is an include directory (plus the shared `METAL_INCS` headers that
+/// KernelBuild writes to `$OUT_DIR/_sys_`): never `kernels/cuda`, whose `extern.h`/`context.h`
+/// would shadow the Metal ones.
 fn build_metal_kernels() {
     const OUTPUT: &str = "metal_kernels_recursion";
     // Hand-written kernels (C1). `kernels/metal` is the include dir for context.h/extern.h (it is
     // also hashed into the metallib cache key, so editing a header rebuilds).
     const SOURCES: &[&str] = &["kernels/metal/rec_kernels.metal"];
+    // (translator, extra args, its outputs in `$OUT_DIR/metal`, the CUDA inputs it reads).
+    type Translator = (
+        &'static str,
+        &'static [&'static str],
+        &'static [&'static str],
+        &'static [&'static str],
+    );
+    // The eval translator always runs with `--split`: both the monolith (`eval_check`) and the
+    // split (`ec_part_0..5`) go into the metallib so the HAL can choose at run time
+    // (`RISC0_METAL_REC_KERNELS`, PLAN 2.0); a PSO costs nothing until it is created.
+    const TRANSLATORS: &[Translator] = &[
+        (
+            "kernels/cuda/cuda2metal_steps.py",
+            &[],
+            &[
+                "step_exec.metal",
+                "step_verify_mem.metal",
+                "step_compute_accum.metal",
+                "step_verify_accum.metal",
+            ],
+            &[
+                "kernels/cuda/step_exec.cu",
+                "kernels/cuda/step_verify_mem.cu",
+                "kernels/cuda/step_compute_accum.cu",
+                "kernels/cuda/step_verify_accum.cu",
+            ],
+        ),
+        (
+            "kernels/cuda/cuda2metal_eval.py",
+            &["--split"],
+            &["eval_check.metal", "eval_check_split.metal"],
+            &[
+                "kernels/cuda/eval_check.cu",
+                "kernels/cuda/eval_check_split.cu",
+            ],
+        ),
+    ];
+
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let gen_dir = out_dir.join("metal");
+
+    rerun_if_changed("kernels/cuda/cuda2metal_common.py");
+    let mut files: Vec<PathBuf> = SOURCES.iter().map(PathBuf::from).collect();
+    for (script, args, outputs, inputs) in TRANSLATORS {
+        rerun_if_changed(script);
+        for input in inputs.iter() {
+            rerun_if_changed(input);
+        }
+        // The translators check their pinned rewrite counts and refuse residual CUDA constructs,
+        // and rewrite an output only when its text changes (stable mtimes, no spurious rebuilds).
+        // They need no Metal toolchain and write nothing into the source tree.
+        let mut cmd = risc0_build_kernel::python_command();
+        cmd.arg(script)
+            .arg("-o")
+            .arg(&gen_dir)
+            .arg("-q")
+            .args(args.iter());
+        let status = cmd
+            .status()
+            .unwrap_or_else(|e| panic!("could not run {cmd:?}: {e}"));
+        if !status.success() {
+            panic!("{script} failed ({status}): {cmd:?}");
+        }
+        files.extend(outputs.iter().map(|name| gen_dir.join(name)));
+    }
 
     KernelBuild::new(KernelType::Metal)
-        .files(SOURCES)
+        .files(&files)
         .include("kernels/metal")
         .compile(OUTPUT);
 
     // KernelBuild writes `skip-<output>` (empty) under RISC0_SKIP_BUILD_KERNELS.
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let name = if env::var("RISC0_SKIP_BUILD_KERNELS").is_ok() {
         format!("skip-{OUTPUT}")
     } else {
