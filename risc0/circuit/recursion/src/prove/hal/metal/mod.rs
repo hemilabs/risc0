@@ -198,6 +198,10 @@ pub(crate) struct ScratchBuffers {
     pub fault: Option<BufferImpl<u32>>,
     /// poly_mix powers for eval_check (C8).
     pub poly_mix: Option<BufferImpl<BabyBearExtElem>>,
+    /// Accum per-cycle FpExt products (C7; CUDA `g_accumCache.accum`), work_cycles elements.
+    pub accum_tmp: Option<BufferImpl<BabyBearExtElem>>,
+    /// Accum prefix-scan chunk totals (C7), ceil(work_cycles / 2048) elements.
+    pub accum_totals: Option<BufferImpl<BabyBearExtElem>>,
 }
 
 /// A buffer of at least `size` elements: `cur` if large enough, else a new one with 25 % headroom
