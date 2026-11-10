@@ -30,10 +30,13 @@
 //!   buffer of HAL A into a dispatch on HAL B can give stale reads and early pool reuse.
 
 mod buffer;
+mod eval;
 mod kernels;
 mod runtime;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_z4;
 
 use std::{
     fmt::Debug,
@@ -99,6 +102,14 @@ pub const KERNEL_NAMES: &[&str] = &[
     "sha_fold",
     "sha_rows",
     "zk_shift",
+    // Z4: eval_u (eval.metal) and mix (mix.metal)
+    "batch_evaluate_any",
+    "eu2_pows",
+    "eu2_main",
+    "eu2_reduce",
+    "mix_poly_coeffs_v1",
+    "mix_poly_coeffs_v2",
+    "mix_poly_coeffs_v2_dcids",
 ];
 
 /// Whether the Metal backend may be used for `unit` (one of `zkp`, `rv32im`, `recursion`,
@@ -640,25 +651,7 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
         out: &Self::Buffer<Self::ExtElem>,
     ) {
         scope!("batch_evaluate_any");
-        let po2 = log2_ceil(coeffs.size() / poly_count);
-        let count = 1 << po2;
-        assert_eq!(poly_count * count, coeffs.size());
-        let eval_count = which.size();
-        assert_eq!(xs.size(), eval_count);
-        assert_eq!(out.size(), eval_count);
-        let args = &[
-            out.as_arg(),
-            coeffs.as_arg(),
-            which.as_arg(),
-            xs.as_arg(),
-            KernelArg::Integer(count as u32),
-        ];
-        // One threadgroup of 256 threads per evaluation (the kernel's reduction assumes 256).
-        let grid = Grid::Groups {
-            groups: MTLSize::new(out.size() as u64, 1, 1),
-            threads: MTLSize::new(256, 1, 1),
-        };
-        self.dispatch(self.pipeline("multi_poly_eval"), args, grid, &[]);
+        eval::batch_evaluate_any(self, coeffs, poly_count, which, xs, out, None);
     }
 
     fn eltwise_add_elem(
@@ -739,18 +732,9 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
             combos.size(),
         );
 
-        let mix_start = [*mix_start];
-        let mix = [*mix];
-        let args = &[
-            output.as_arg(),
-            input.as_arg(),
-            combos.as_arg(),
-            KernelArg::Bytes(as_bytes(&mix_start)),
-            KernelArg::Bytes(as_bytes(&mix)),
-            KernelArg::Integer(input_size as u32),
-            KernelArg::Integer(count as u32),
-        ];
-        self.launch("mix_poly_coeffs", count as u64, args);
+        eval::mix_poly_coeffs(
+            self, output, mix_start, mix, input, combos, input_size, count, None,
+        );
     }
 
     fn hash_fold(&self, io: &Self::Buffer<Digest>, input_size: usize, output_size: usize) {
