@@ -2256,8 +2256,30 @@ fn build_metal_kernels() {
     // ---- END R4 accum_tu (metal) ----
 
     // ---- BEGIN R5 witgen_tu (metal) ----
-    // R5: `witgen_tu_gen.py --metal` -> gen_dir/witgen_tu.metal (+ fwd/rev); push onto
-    // `generated`.
+    // `witgen_tu_gen.py --metal` -> gen_dir/witgen_tu.metal: step_Top's call graph (noinline,
+    // cuda2metal.py passes with pinned rewrite counts) + par_stepExecW, fwd_stepExec,
+    // rev_stepExec. The generator rewrites the file only when it changed and fails when steps.cu
+    // or ffi.cu's extern section changed shape (pins).
+    if !skip {
+        const WITGEN_TU_GEN: &str = "kernels/cuda/witgen_tu_gen.py";
+        for input in [
+            WITGEN_TU_GEN,
+            CUDA2METAL,
+            "kernels/cuda/steps.cu",
+            "kernels/cuda/ffi.cu",
+            "kernels/cuda/types.cuh.inc",
+        ] {
+            rerun_if_changed(input);
+        }
+        let gen_dir_str = gen_dir.to_str().unwrap();
+        run_metal_generator(
+            WITGEN_TU_GEN,
+            &["--metal", "-o", gen_dir_str],
+            "witgen_tu_gen.py --metal failed: see its message (re-pin PINNED_METAL / re-port \
+             METAL_EXTERNS in kernels/cuda/witgen_tu_gen.py after a steps.cu or ffi.cu change)",
+        );
+        generated.push(gen_dir.join("witgen_tu.metal"));
+    }
     // ---- END R5 witgen_tu (metal) ----
 
     // ---- BEGIN R6 eval_check (metal) ----

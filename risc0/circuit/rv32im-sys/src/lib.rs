@@ -36,6 +36,10 @@ pub const METAL_KERNEL_NAMES: &[&str] = &[
     "seq_fwd_probe",
     "seq_rev_probe",
     "stepAccumA", // $OUT_DIR/metal/accum_tu.metal (kernels/cuda/accum_tu_gen.py --metal)
+    // $OUT_DIR/metal/witgen_tu.metal (kernels/cuda/witgen_tu_gen.py --metal)
+    "par_stepExecW",
+    "fwd_stepExec",
+    "rev_stepExec",
 ];
 
 #[cfg(feature = "cuda")]
