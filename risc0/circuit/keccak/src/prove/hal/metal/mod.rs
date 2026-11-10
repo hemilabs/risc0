@@ -16,9 +16,9 @@
 //!
 //! Milestone 1 (items K1, K2): the prover runs on [MetalHalPoseidon2] (NTTs, hashing, FRI and the
 //! rest of the zkp prover on the GPU). Of the circuit methods:
-//! - `scatter_preflight` runs the `scatter_preflight` Metal kernel and `generate_witness` the CPU
-//!   witness generator over the HAL's shared (unified-memory) buffers (`HOST_WITNESS`, as on
-//!   Intel): see [witgen];
+//! - `scatter_preflight` runs the `scatter_preflight` Metal kernel and `generate_witness` the
+//!   per-arm GPU witness kernels (K6; the CPU witness generator over the shared buffers below
+//!   po2 13 and in the sequential modes): see [witgen];
 //! - `accumulate` does nothing, exactly as cuda.rs (the keccak circuit has no accumulation step);
 //! - `eval_check` runs the staged Metal kernels `eval_stage_0..S-1` (K3's translation of the CUDA
 //!   constraint code, K4's chunked launcher): see [eval_check].
@@ -351,14 +351,10 @@ mod tests {
         }
         prover.verify(&seal).expect("Verification failed");
 
-        // The host-witness path goes through the same HAL.
+        // The Metal prover makes its own witness (K6: `HOST_WITNESS = false`), so it takes none
+        // from `host_witness`.
         let witness = crate::prove::host_witness(&inputs, po2).unwrap();
-        let seal = prover
-            .prove_host_witness(witness)
-            .expect("the Metal prover takes a host witness")
-            .unwrap();
-        assert_eq!(METAL_EVAL_CHECKS.with(Cell::get), before + 2);
-        prover.verify(&seal).expect("Verification failed");
+        assert!(prover.prove_host_witness(witness).is_none());
 
         // Constructing the Poseidon2 circuit HAL directly also loads every PSO.
         let hal = Rc::new(MetalHalPoseidon2::new());
