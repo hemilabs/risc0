@@ -14,12 +14,22 @@
 
 use std::env;
 
+#[cfg(all(
+    feature = "metal",
+    any(feature = "cuda", feature = "rocm", feature = "intel")
+))]
+compile_error!(
+    "Feature 'metal' is mutually exclusive with 'cuda', 'rocm' and 'intel'. Enable only one GPU backend."
+);
+
 fn main() {
-    if env::var("CARGO_FEATURE_PROVE").is_ok()
+    // Only the `metal` feature builds (and embeds) the zkp metallib; risc0-sys builds it under
+    // the same condition. A `metal` build for another target stops at the target guard.
+    if env::var("CARGO_FEATURE_METAL").is_ok()
         && env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "macos" || os == "ios")
     {
         let metal_bin =
-            env::var("DEP_RISC0_SYS_METAL_KERNELS_ZKP").expect("attempting to build risc0-zkp using the `prove` feature flag. This requires building the metal kernels but DEP_RISC0_SYS_METAL_KERNELS_ZKP is not defined.");
+            env::var("DEP_RISC0_SYS_METAL_KERNELS_ZKP").expect("attempting to build risc0-zkp using the `metal` feature flag. This requires building the metal kernels but DEP_RISC0_SYS_METAL_KERNELS_ZKP is not defined.");
         println!("cargo:rustc-env=ZKP_METAL_PATH={metal_bin}");
     }
 }

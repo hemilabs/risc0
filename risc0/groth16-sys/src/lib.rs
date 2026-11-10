@@ -12,6 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(all(
+    feature = "metal",
+    any(feature = "cuda", feature = "rocm", feature = "intel")
+))]
+compile_error!(
+    "Feature 'metal' is mutually exclusive with 'cuda', 'rocm' and 'intel'. Enable only one GPU backend."
+);
+
+#[cfg(all(feature = "metal", not(any(target_os = "macos", target_os = "ios"))))]
+compile_error!("Feature 'metal' is only supported on macOS and iOS targets.");
+
+/// The unit's Metal kernels (`kernels/metal`), compiled by build.rs into a metallib.
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+pub const METAL_LIB: &[u8] = include_bytes!(env!("GROTH16_METAL_PATH"));
+
+/// Every kernel entry point in [METAL_LIB]; the HAL fails fast if one is missing.
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+pub const METAL_KERNEL_NAMES: &[&str] = &["noop"];
+
 use std::{
     ffi::{c_char, CStr, CString, NulError},
     path::{Path, PathBuf},

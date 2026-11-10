@@ -19,6 +19,8 @@ pub(crate) mod cuda;
 pub(crate) mod hip;
 #[cfg(feature = "intel")]
 pub(crate) mod intel;
+#[cfg(feature = "metal")]
+pub(crate) mod metal;
 
 use std::{
     cell::RefCell,

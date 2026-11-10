@@ -54,6 +54,9 @@ risc0-sys = { workspace = true, optional = true }
 smallvec = { version = "1.13", optional = true }
 wide = { version = "0.7", optional = true }
 
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+metal = { workspace = true, optional = true }
+
 [dev-dependencies]
 clap = { version = "4.5", features = ["derive"] }
 flate2 = "1.0"
@@ -80,6 +83,12 @@ intel = [
   "risc0-circuit-rv32im-sys/intel",
   "risc0-sys/intel",
   "risc0-zkp/intel",
+]
+metal = [
+  "prove",
+  "dep:metal",
+  "risc0-circuit-rv32im-sys/metal",
+  "risc0-zkp/metal",
 ]
 default = []
 # entropy_finder = []

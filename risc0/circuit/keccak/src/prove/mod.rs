@@ -135,8 +135,12 @@ pub fn keccak_prover() -> Result<Box<dyn KeccakProver>> {
             self::hal::hip::keccak_prover()
         } else if #[cfg(feature = "intel")] {
             self::hal::intel::keccak_prover()
-        // } else if #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), target_os = "ios"))] {
-        //     self::metal::keccak_prover()
+        } else if #[cfg(feature = "metal")] {
+            if risc0_zkp::hal::metal::enabled("keccak") {
+                self::hal::metal::keccak_prover()
+            } else {
+                self::hal::cpu::keccak_prover()
+            }
         } else {
             self::hal::cpu::keccak_prover()
         }

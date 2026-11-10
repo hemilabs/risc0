@@ -29,7 +29,24 @@ compile_error!("Features 'cuda' and 'intel' are mutually exclusive. Enable only 
 #[cfg(all(feature = "rocm", feature = "intel"))]
 compile_error!("Features 'rocm' and 'intel' are mutually exclusive. Enable only one GPU backend.");
 
+#[cfg(all(
+    feature = "metal",
+    any(feature = "cuda", feature = "rocm", feature = "intel")
+))]
+compile_error!(
+    "Feature 'metal' is mutually exclusive with 'cuda', 'rocm' and 'intel'. Enable only one GPU backend."
+);
+
 fn main() {
+    // The same target guard as src/lib.rs, raised by the build script so that it is reported
+    // before dependencies that cannot be built for the target (e.g. C code without a cross
+    // compiler) stop the build.
+    if env::var("CARGO_FEATURE_METAL").is_ok()
+        && !env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "macos" || os == "ios")
+    {
+        panic!("Feature 'metal' is only supported on macOS and iOS targets.");
+    }
+
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let cxx_root = manifest_dir.join("cxx");
     println!("cargo:cxx_root={}", cxx_root.to_string_lossy());
@@ -54,7 +71,12 @@ fn main() {
         build_intel_kernels();
     }
 
-    if env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "macos" || os == "ios") {
+    // The zkp metallib is built only for the `metal` feature (never for a plain macOS `prove`
+    // build, which then needs no Metal toolchain). A `metal` build for any other target stops at
+    // the target guard in src/lib.rs.
+    if env::var("CARGO_FEATURE_METAL").is_ok()
+        && env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "macos" || os == "ios")
+    {
         println!(
             "cargo:metal_root={}",
             manifest_dir.join("kernels/zkp/metal").to_string_lossy()

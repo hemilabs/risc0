@@ -68,6 +68,26 @@ const KERNEL_NAMES: &[&str] = &[
     "zk_shift",
 ];
 
+/// Whether the Metal backend may be used for `unit` (one of `zkp`, `rv32im`, `recursion`,
+/// `keccak`, `groth16`): false if `RISC0_METAL=0`, or if the comma-separated list in
+/// `RISC0_METAL_SKIP` names the unit. Callers fall back to the CPU prover (groth16: Docker).
+pub fn enabled(unit: &str) -> bool {
+    if std::env::var("RISC0_METAL").is_ok_and(|v| v.trim() == "0") {
+        return false;
+    }
+    match std::env::var("RISC0_METAL_SKIP") {
+        Ok(skip) => !skip
+            .split(',')
+            .any(|name| name.trim().eq_ignore_ascii_case(unit)),
+        Err(_) => true,
+    }
+}
+
+/// The name of the system default Metal device, or `None` if there is none.
+pub fn device_name() -> Option<String> {
+    Device::system_default().map(|device| device.name().to_string())
+}
+
 // The GPU becomes unstable as the number of concurrent provers grow.
 fn singleton() -> &'static ReentrantMutex<()> {
     static ONCE: OnceLock<ReentrantMutex<()>> = OnceLock::new();

@@ -17,6 +17,9 @@ blst = { version = "0.3.15", optional = true }
 risc0-sys = { workspace = true, optional = true }
 sppark = { workspace = true, optional = true }
 
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+metal = { workspace = true, optional = true }
+
 [dev-dependencies]
 test-log = { version = "0.2.17", default-features = false, features = [
   "trace",
@@ -29,5 +32,5 @@ cuda = ["dep:blst", "dep:sppark", "dep:risc0-sys", "risc0-sys/cuda"]
 rocm = ["dep:blst", "dep:sppark", "dep:risc0-sys", "risc0-sys/rocm"]
 # The SYCL prover for Intel GPUs (kernels/intel); needs oneAPI (icpx).
 intel = []
-metal = []
+metal = ["dep:risc0-sys", "risc0-sys/metal", "dep:metal"]
 setup = []
