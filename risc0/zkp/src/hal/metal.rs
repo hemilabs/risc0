@@ -67,7 +67,7 @@ use parking_lot::{ReentrantMutex, ReentrantMutexGuard};
 use risc0_core::{
     field::{
         baby_bear::{BabyBear, BabyBearElem, BabyBearExtElem},
-        Elem, ExtElem,
+        ExtElem,
     },
     scope,
 };
@@ -88,7 +88,6 @@ use crate::{
             sha::Sha256HashSuite,
             HashSuite,
         },
-        log2_ceil,
     },
     FRI_FOLD,
 };
