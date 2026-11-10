@@ -20,6 +20,11 @@ use std::{
 
 use risc0_build_kernel::{KernelBuild, KernelType};
 
+// The Metal eval_check translator (item K3, docs/metal-port/PLAN.md 8.2): its own file so that
+// K3 never edits this one.
+#[path = "build_metal_eval.rs"]
+mod build_metal_eval;
+
 #[cfg(all(feature = "cuda", feature = "rocm"))]
 compile_error!("Features 'cuda' and 'rocm' are mutually exclusive. Enable only one GPU backend.");
 
@@ -865,19 +870,36 @@ fn rerun_if_include_roots_changed(roots: &[&str]) {
     }
 }
 
-/// The `metal` feature on macOS/iOS: compile `kernels/metal/*.metal` into
-/// `metal_kernels_keccak.metallib` and point `KECCAK_METAL_PATH` at it for `src/lib.rs`
-/// (`METAL_LIB`). Generated sources, when the unit adds them, go to `$OUT_DIR/metal`.
+/// The `metal` feature on macOS/iOS: compile the hand-written `kernels/metal/*.metal` and the
+/// generated sources (`build_metal_eval`, into `$OUT_DIR/metal`) into
+/// `metal_kernels_keccak.metallib`, and point `KECCAK_METAL_PATH` at it for `src/lib.rs`
+/// (`METAL_LIB`). `kernels/metal` is on the include path (and hashed into the build cache key) for
+/// the unit's own headers; the shared ones (`fp.h`, `fpext.h`, `cuda2metal.h`, `sppark_compat.h`)
+/// come from `risc0_build_kernel::METAL_INCS`. Every kernel entry point must be listed in
+/// `METAL_KERNEL_NAMES` (src/lib.rs); the HAL fails at load if one is missing.
 fn build_metal_kernels() {
     const OUTPUT: &str = "metal_kernels_keccak";
-    const SOURCES: &[&str] = &["kernels/metal/noop.metal"];
+
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let kernel_dir = std::path::absolute("kernels/metal").unwrap();
+    rerun_if_changed(&kernel_dir);
+
+    let mut sources = glob_paths("kernels/metal/*.metal");
+    sources.sort();
+    if env::var("RISC0_SKIP_BUILD_KERNELS").is_err() {
+        let gen_dir = out_dir.join("metal");
+        std::fs::create_dir_all(&gen_dir).unwrap();
+        sources.extend(build_metal_eval::metal_eval_sources(&kernel_dir, &gen_dir));
+    }
 
     KernelBuild::new(KernelType::Metal)
-        .files(SOURCES)
+        .files(&sources)
+        .include(&kernel_dir)
+        .flag("-std=metal3.2")
+        .flag("-O2")
         .compile(OUTPUT);
 
     // KernelBuild writes `skip-<output>` (empty) under RISC0_SKIP_BUILD_KERNELS.
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let name = if env::var("RISC0_SKIP_BUILD_KERNELS").is_ok() {
         format!("skip-{OUTPUT}")
     } else {
