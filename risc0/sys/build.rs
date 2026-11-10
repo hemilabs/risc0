@@ -403,6 +403,7 @@ fn build_metal_kernels() {
             "poseidon2.metal",
             "sha.metal",
             "zk.metal",
+            "misc.metal",
         ],
     )];
 
