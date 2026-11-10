@@ -198,6 +198,8 @@ pub(crate) struct ScratchBuffers {
     pub fault: Option<BufferImpl<u32>>,
     /// poly_mix powers for eval_check (C8).
     pub poly_mix: Option<BufferImpl<BabyBearExtElem>>,
+    /// The witgen's trace copies and WOM argument buffers (C6).
+    pub witgen: witgen::WitgenScratch,
 }
 
 /// A buffer of at least `size` elements: `cur` if large enough, else a new one with 25 % headroom
