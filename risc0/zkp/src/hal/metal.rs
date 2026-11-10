@@ -31,9 +31,12 @@
 
 mod buffer;
 mod kernels;
+mod mdiv;
 mod runtime;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_z5;
 
 use std::{
     fmt::Debug,
@@ -99,6 +102,18 @@ pub const KERNEL_NAMES: &[&str] = &[
     "sha_fold",
     "sha_rows",
     "zk_shift",
+    // Z5: combos_divide (mdiv.metal)
+    "mdiv_agg0_e8",
+    "mdiv_agg0_e16",
+    "mdiv_apply_e8",
+    "mdiv_apply_e16",
+    "mdiv_scan_32",
+    "mdiv_scan_64",
+    "mdiv_scan_128",
+    "mdiv_scan_256",
+    "mdiv_scan_512",
+    "mdiv_scan_1024",
+    "mdiv_final",
 ];
 
 /// Whether the Metal backend may be used for `unit` (one of `zkp`, `rv32im`, `recursion`,
@@ -872,6 +887,17 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
                 }
             }
         });
+    }
+
+    fn combos_divide(
+        &self,
+        combos: &Self::Buffer<Self::ExtElem>,
+        chunks: Vec<(usize, Vec<Self::ExtElem>)>,
+        cycles: usize,
+    ) {
+        scope!("combos_divide");
+        let remainders = self.mdiv_combos_divide(combos, &chunks, cycles);
+        super::report_nonzero_remainders(&chunks, &remainders);
     }
 }
 
