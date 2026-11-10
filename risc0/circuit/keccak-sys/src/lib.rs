@@ -29,7 +29,7 @@ pub const METAL_LIB: &[u8] = include_bytes!(env!("KECCAK_METAL_PATH"));
 
 /// Every kernel entry point in [METAL_LIB]; the HAL fails fast if one is missing.
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
-pub const METAL_KERNEL_NAMES: &[&str] = &["noop"];
+pub const METAL_KERNEL_NAMES: &[&str] = &["scatter_preflight"];
 
 #[cfg(feature = "cuda")]
 use cust::memory::DevicePointer;
@@ -39,6 +39,8 @@ use risc0_sys::cuda::DevicePointer;
 
 use risc0_core::field::baby_bear::{BabyBearElem, BabyBearExtElem};
 
+/// Where to put the preflight's packed words in the witness: see `scatter_preflight` in
+/// `kernels/cuda/ffi.cu` and `kernels/metal/scatter.metal`, which mirror this layout.
 #[derive(Debug)]
 #[repr(C)]
 pub struct ScatterInfo {
@@ -48,6 +50,18 @@ pub struct ScatterInfo {
     pub count: u16,
     pub bits: u32,
 }
+
+// The GPU kernels read `ScatterInfo` arrays as 16-byte structs with these field offsets
+// (kernels/metal/scatter.metal static_asserts the size on its side).
+const _: () = {
+    assert!(std::mem::size_of::<ScatterInfo>() == 16);
+    assert!(std::mem::align_of::<ScatterInfo>() == 4);
+    assert!(std::mem::offset_of!(ScatterInfo, offset) == 0);
+    assert!(std::mem::offset_of!(ScatterInfo, row) == 4);
+    assert!(std::mem::offset_of!(ScatterInfo, col) == 8);
+    assert!(std::mem::offset_of!(ScatterInfo, count) == 10);
+    assert!(std::mem::offset_of!(ScatterInfo, bits) == 12);
+};
 
 #[repr(C)]
 pub struct RawPreflightTrace {
