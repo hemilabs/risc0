@@ -406,6 +406,7 @@ fn build_metal_kernels() {
             "misc.metal",
             "ntt_x.metal",
             "pv.metal",
+            "eval.metal",
         ],
     )];
 
