@@ -107,6 +107,18 @@ pub fn segment_prover() -> Result<Box<dyn SegmentProver>> {
     }
 }
 
+/// Build the Metal pipeline states (zkp and rv32im metallibs) so the first segment doesn't pay
+/// for them. Best effort: a failure is logged; `segment_prover()` reports it again.
+#[cfg(feature = "metal")]
+pub fn metal_warmup() {
+    if !risc0_zkp::hal::metal::enabled("rv32im") {
+        return;
+    }
+    if let Err(e) = self::hal::metal::warmup() {
+        tracing::warn!("rv32im Metal warmup failed: {e:#}");
+    }
+}
+
 /// Trigger HIP module loading so the first kernel launch doesn't stall.
 /// This is a no-op on non-ROCm builds. Mirrors cuda_warmup() but adds
 /// hipInit/hipSetDevice for HIP runtime initialization.
