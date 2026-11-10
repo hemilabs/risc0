@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Z2 (NTT) conformance: every NTT entry point of the ported `ntt_x` path against the CPU HAL
-//! and against the legacy Metal kernels (`set_ntt_legacy`, the `RISC0_METAL_LEGACY=1` switch),
-//! bit for bit.
+//! Z2 (NTT) conformance: every NTT entry point of the ported `ntt_x` path against the CPU HAL,
+//! bit for bit. (Until Z7 the legacy Metal kernels were a third oracle; they were retired once
+//! this two-way equality and the DualHal suites held.)
 
 use std::time::Instant;
 
@@ -48,10 +48,8 @@ fn cpu() -> CpuHal<risc0_core::field::baby_bear::BabyBear> {
     CpuHal::new(crate::core::hash::sha::Sha256HashSuite::new_suite())
 }
 
-fn new_hal(legacy: bool) -> MetalHalSha256 {
-    let hal = MetalHalSha256::new();
-    hal.set_ntt_legacy(legacy);
-    hal
+fn new_hal() -> MetalHalSha256 {
+    MetalHalSha256::new()
 }
 
 #[track_caller]
@@ -74,18 +72,15 @@ fn expand_shape(lg: usize) -> (usize, usize) {
     (lg - e, e)
 }
 
-/// Run `f` on the CPU, the ported Metal path and the legacy Metal path with the same data and
-/// compare all three bit for bit.
-fn three_way<F>(what: &str, lg: usize, cols: usize, inputs: &[Vec<Fp>], f: F)
+/// Run `f` on the CPU and on Metal with the same data and compare bit for bit.
+fn two_way<F>(what: &str, lg: usize, cols: usize, inputs: &[Vec<Fp>], f: F)
 where
     F: Fn(&dyn NttRunner, &[Vec<Fp>]) -> Vec<Vec<Fp>>,
 {
     let want = f(&Runner(cpu()), inputs);
-    let got = f(&Runner(new_hal(false)), inputs);
-    let legacy = f(&Runner(new_hal(true)), inputs);
+    let got = f(&Runner(new_hal()), inputs);
     for (k, w) in want.iter().enumerate() {
         assert_same(&format!("{what}[{k}] metal"), lg, cols, &got[k], w);
-        assert_same(&format!("{what}[{k}] legacy"), lg, cols, &legacy[k], w);
     }
 }
 
@@ -262,7 +257,7 @@ fn ntt_host_logic() {
             "{name} missing from KERNEL_NAMES"
         );
     }
-    let hal = new_hal(false);
+    let hal = new_hal();
     for name in [
         "ct_x_1",
         "ct_x_8",
@@ -284,10 +279,9 @@ fn ntt_host_logic() {
     );
     assert!(hal.has_commit_coeffs_lde(10) && hal.has_commit_coeffs_lde(23));
     assert!(!hal.has_commit_coeffs_lde(9) && !hal.has_commit_coeffs_lde(24));
-    assert!(!new_hal(true).has_commit_coeffs_lde(16));
 }
 
-// ---- three-way equality (CPU / Metal / legacy Metal) for every entry point, lg 1..20 ----
+// ---- CPU / Metal equality for every entry point, lg 1..20 ----
 
 fn for_shapes(mut f: impl FnMut(usize, usize)) {
     for cols in COLS {
@@ -302,7 +296,7 @@ fn ntt_expand_into_evaluate_lg_1_20() {
     for_shapes(|lg, cols| {
         let (lg_in, _) = expand_shape(lg);
         let input = vec![random_vec(cols << lg_in)];
-        three_way("expand", lg, cols, &input, |r, i| {
+        two_way("expand", lg, cols, &input, |r, i| {
             vec![r.expand(&i[0], cols, cols << lg)]
         });
     });
@@ -312,7 +306,7 @@ fn ntt_expand_into_evaluate_lg_1_20() {
 fn ntt_interpolate_lg_1_20() {
     for_shapes(|lg, cols| {
         let io = vec![random_vec(cols << lg)];
-        three_way("interpolate", lg, cols, &io, |r, i| {
+        two_way("interpolate", lg, cols, &io, |r, i| {
             vec![r.interpolate(&i[0], cols)]
         });
     });
@@ -322,7 +316,7 @@ fn ntt_interpolate_lg_1_20() {
 fn ntt_interpolate_zk_shift_lg_1_20() {
     for_shapes(|lg, cols| {
         let io = vec![random_vec(cols << lg)];
-        three_way("interpolate_zk", lg, cols, &io, |r, i| {
+        two_way("interpolate_zk", lg, cols, &io, |r, i| {
             vec![r.interpolate_zk(&i[0], cols)]
         });
     });
@@ -332,7 +326,7 @@ fn ntt_interpolate_zk_shift_lg_1_20() {
 fn ntt_interpolate_zk_shift_from_lg_1_20() {
     for_shapes(|lg, cols| {
         let io = vec![random_vec(cols << lg)];
-        three_way("interpolate_zk_from", lg, cols, &io, |r, i| {
+        two_way("interpolate_zk_from", lg, cols, &io, |r, i| {
             let (dst, src) = r.interpolate_zk_from(&i[0], cols);
             assert!(src == i[0], "lg={lg} cols={cols}: src changed");
             vec![dst]
@@ -344,7 +338,7 @@ fn ntt_interpolate_zk_shift_from_lg_1_20() {
 fn ntt_zk_shift_lg_1_20() {
     for_shapes(|lg, cols| {
         let io = vec![random_vec(cols << lg)];
-        three_way("zk_shift", lg, cols, &io, |r, i| {
+        two_way("zk_shift", lg, cols, &io, |r, i| {
             vec![r.zk_shift(&i[0], cols)]
         });
     });
@@ -354,7 +348,7 @@ fn ntt_zk_shift_lg_1_20() {
 fn ntt_bit_reverse_lg_1_20() {
     for_shapes(|lg, cols| {
         let io = vec![random_vec(cols << lg)];
-        three_way("bit_reverse", lg, cols, &io, |r, i| {
+        two_way("bit_reverse", lg, cols, &io, |r, i| {
             vec![r.bit_reverse(&i[0], cols)]
         });
     });
@@ -372,7 +366,7 @@ fn ntt_expand_ratios_lg_1_20() {
                     continue;
                 }
                 let input = vec![random_vec(cols << (lg - e))];
-                three_way(&format!("expand by {e}"), lg, cols, &input, |r, i| {
+                two_way(&format!("expand by {e}"), lg, cols, &input, |r, i| {
                     vec![r.expand(&i[0], cols, cols << lg)]
                 });
             }
@@ -380,13 +374,13 @@ fn ntt_expand_ratios_lg_1_20() {
     }
 }
 
-/// commit_coeffs_lde over its whole lg range up to 20 (fused on Metal; unfused CPU and legacy).
+/// commit_coeffs_lde over its whole lg range up to 20 (fused on Metal; unfused CPU).
 #[test]
 fn ntt_commit_coeffs_lde_lg_10_20() {
     for cols in COLS {
         for lg in 10..=20 {
             let w = vec![random_vec(cols << lg)];
-            three_way("commit", lg, cols, &w, |r, i| {
+            two_way("commit", lg, cols, &w, |r, i| {
                 let (c, e, w_after) = r.commit(&i[0], cols);
                 assert!(w_after == i[0], "lg={lg} cols={cols}: witness changed");
                 vec![c, e]
@@ -401,7 +395,7 @@ fn ntt_commit_chunks_po2_20() {
     let (lg, cols) = (20, 9);
     let witness = random_vec(cols << lg);
     let (want_c, want_e, _) = Runner(cpu()).commit(&witness, cols);
-    let hal = new_hal(false);
+    let hal = new_hal();
     for chunk in [0usize, 1, 2, 4, 9] {
         let w = hal.copy_from_elem("witness", &witness);
         let c = hal.alloc_elem("coeffs", witness.len());
@@ -428,20 +422,18 @@ fn ntt_commit_chunks_po2_20() {
 
 #[test]
 fn batch_expand_into_evaluate_ntt_large() {
-    testutil::batch_expand_into_evaluate_ntt_large(new_hal(false));
+    testutil::batch_expand_into_evaluate_ntt_large(new_hal());
 }
 
 /// The 13 CUDA shapes, including po2 22.
 #[test]
 fn commit_coeffs_lde() {
-    testutil::commit_coeffs_lde(new_hal(false));
+    testutil::commit_coeffs_lde(new_hal());
 }
 
 #[test]
 fn zk_shift_testutil() {
-    let hal = MetalHalPoseidon2::new();
-    hal.set_ntt_legacy(false);
-    testutil::zk_shift(hal);
+    testutil::zk_shift(MetalHalPoseidon2::new());
 }
 
 /// The `_large` shapes at po2 22 (expand to 2^24, interpolate, fused zk-shift, bit reversal).
@@ -449,17 +441,17 @@ fn zk_shift_testutil() {
 fn ntt_large_po2_22() {
     let (lg, cols) = (22, 1);
     let input = vec![random_vec(cols << lg)];
-    three_way("expand", lg + 2, cols, &input, |r, i| {
+    two_way("expand", lg + 2, cols, &input, |r, i| {
         vec![r.expand(&i[0], cols, cols << (lg + 2))]
     });
-    three_way("interpolate_zk_from", lg, cols, &input, |r, i| {
+    two_way("interpolate_zk_from", lg, cols, &input, |r, i| {
         vec![r.interpolate_zk_from(&i[0], cols).0]
     });
-    three_way("bit_reverse", lg, cols, &input, |r, i| {
+    two_way("bit_reverse", lg, cols, &input, |r, i| {
         vec![r.bit_reverse(&i[0], cols)]
     });
     let input = vec![random_vec(2 << lg)];
-    three_way("interpolate", lg, 2, &input, |r, i| {
+    two_way("interpolate", lg, 2, &input, |r, i| {
         vec![r.interpolate(&i[0], 2)]
     });
 }
@@ -480,62 +472,57 @@ fn time_ms(hal: &MetalHalSha256, reps: usize, mut f: impl FnMut()) -> f64 {
 #[test]
 #[ignore]
 fn ntt_timings() {
-    for legacy in [false, true] {
-        let hal = new_hal(legacy);
-        let tag = if legacy { "legacy" } else { "ntt_x" };
-        for (lg, cols) in [(16usize, 211usize), (20, 211), (20, 9), (21, 3)] {
-            let n = cols << lg;
-            let a = hal.copy_from_elem("a", &random_vec(n));
-            let b = hal.alloc_elem("b", n);
-            let e = hal.alloc_elem("e", n * INV_RATE);
-            let small = hal.copy_from_elem("small", &random_vec(n));
-            let r = 3;
-            let t_exp = time_ms(&hal, r, || {
-                hal.batch_expand_into_evaluate_ntt(&e, &small, cols, 2)
-            });
-            let t_int = time_ms(&hal, r, || hal.batch_interpolate_ntt(&a, cols));
-            let t_izk = time_ms(&hal, r, || hal.batch_interpolate_ntt_zk_shift(&a, cols));
-            let t_from = time_ms(&hal, r, || {
-                hal.batch_interpolate_ntt_zk_shift_from(&b, &a, cols)
-            });
-            let t_zk = time_ms(&hal, r, || hal.zk_shift(&a, cols));
-            let t_br = time_ms(&hal, r, || hal.batch_bit_reverse(&a, cols));
-            let t_commit = if hal.has_commit_coeffs_lde(lg) {
-                time_ms(&hal, r, || hal.commit_coeffs_lde(&b, &e, &a, cols))
-            } else {
-                f64::NAN
-            };
-            println!(
-                "TIMING {tag} lg={lg} cols={cols}: expand(lg{}) {t_exp:.2} ms, interpolate {t_int:.2}, \
-                 interpolate_zk {t_izk:.2}, interpolate_zk_from {t_from:.2}, zk_shift {t_zk:.2}, \
-                 bit_reverse {t_br:.2}, commit_coeffs_lde {t_commit:.2}",
-                lg + 2
-            );
-            if !legacy {
-                // per kernel (one CT/GS pass or one bit reversal, synced on its own)
-                for (ct, steps) in [
-                    (true, test_hooks::ct_steps(lg)),
-                    (false, test_hooks::gs_steps(lg)),
-                ] {
-                    let mut stage = if ct { 0 } else { lg };
-                    for it in steps {
-                        let t = time_ms(&hal, r, || {
-                            test_hooks::step(&hal, ct, &a, lg, cols, stage, it)
-                        });
-                        println!(
-                            "TIMING ntt_x pass {} lg={lg} cols={cols} stage={stage} iterations={it}: {t:.2} ms",
-                            if ct { "ct" } else { "gs" }
-                        );
-                        if ct {
-                            stage += it;
-                        } else {
-                            stage -= it;
-                        }
-                    }
+    let hal = new_hal();
+    for (lg, cols) in [(16usize, 211usize), (20, 211), (20, 9), (21, 3)] {
+        let n = cols << lg;
+        let a = hal.copy_from_elem("a", &random_vec(n));
+        let b = hal.alloc_elem("b", n);
+        let e = hal.alloc_elem("e", n * INV_RATE);
+        let small = hal.copy_from_elem("small", &random_vec(n));
+        let r = 3;
+        let t_exp = time_ms(&hal, r, || {
+            hal.batch_expand_into_evaluate_ntt(&e, &small, cols, 2)
+        });
+        let t_int = time_ms(&hal, r, || hal.batch_interpolate_ntt(&a, cols));
+        let t_izk = time_ms(&hal, r, || hal.batch_interpolate_ntt_zk_shift(&a, cols));
+        let t_from = time_ms(&hal, r, || {
+            hal.batch_interpolate_ntt_zk_shift_from(&b, &a, cols)
+        });
+        let t_zk = time_ms(&hal, r, || hal.zk_shift(&a, cols));
+        let t_br = time_ms(&hal, r, || hal.batch_bit_reverse(&a, cols));
+        let t_commit = if hal.has_commit_coeffs_lde(lg) {
+            time_ms(&hal, r, || hal.commit_coeffs_lde(&b, &e, &a, cols))
+        } else {
+            f64::NAN
+        };
+        println!(
+            "TIMING ntt_x lg={lg} cols={cols}: expand(lg{}) {t_exp:.2} ms, interpolate {t_int:.2}, \
+             interpolate_zk {t_izk:.2}, interpolate_zk_from {t_from:.2}, zk_shift {t_zk:.2}, \
+             bit_reverse {t_br:.2}, commit_coeffs_lde {t_commit:.2}",
+            lg + 2
+        );
+        // per kernel (one CT/GS pass or one bit reversal, synced on its own)
+        for (ct, steps) in [
+            (true, test_hooks::ct_steps(lg)),
+            (false, test_hooks::gs_steps(lg)),
+        ] {
+            let mut stage = if ct { 0 } else { lg };
+            for it in steps {
+                let t = time_ms(&hal, r, || {
+                    test_hooks::step(&hal, ct, &a, lg, cols, stage, it)
+                });
+                println!(
+                    "TIMING ntt_x pass {} lg={lg} cols={cols} stage={stage} iterations={it}: {t:.2} ms",
+                    if ct { "ct" } else { "gs" }
+                );
+                if ct {
+                    stage += it;
+                } else {
+                    stage -= it;
                 }
-                let t = time_ms(&hal, r, || test_hooks::bitrev(&hal, &a, lg, cols));
-                println!("TIMING ntt_x bit_rev_z_batched_64 lg={lg} cols={cols}: {t:.2} ms");
             }
         }
+        let t = time_ms(&hal, r, || test_hooks::bitrev(&hal, &a, lg, cols));
+        println!("TIMING ntt_x bit_rev_z_batched_64 lg={lg} cols={cols}: {t:.2} ms");
     }
 }
