@@ -570,3 +570,32 @@ Source: completeness critic run on 2026-11-09, verified against code and with `x
 - The non-macOS target guard check needs `rustup target add x86_64-unknown-linux-gnu` first.
 - The worker's `--benchmark` flag is verified (`zkminer-prove-risc0/src/main.rs:68`).
 - F1: `compile_metal` must strip the source prefix before joining into `OUT_DIR` so `.air` files for absolute generated sources land under `<OUT_DIR>/<output>/`; `cuda2metal.h`/`sppark_compat.h` are appended to the existing `METAL_INCS` const.
+
+---
+
+## 9. Target hardware and wave-1 findings (binding from wave 2 on)
+
+Source: `/Users/user/zkminer/reports/Mac hardware prosumer distribution.md` (research, 2026-11-10) and the wave-1 item notes.
+
+### 9.1 Target hardware matrix
+The development machine (M5 Max, 40 GPU cores, 36 GB) is a **high-end** machine, not the tuning target. Steam (Oct 2026) puts Apple-GPU Macs at ~67% base chip, 21% Pro, 7% Max, Ultra unlisted; 16 GB is the most common memory size (43%), 8 GB still 29%.
+
+| Tier | Hardware | GPU budget, owner active / idle | Expectation |
+|---|---|---|---|
+| Not supported | Intel Macs, any 8 GB Mac, MacBook Neo (A18 Pro) | — | worker refuses with a clear message |
+| Minimum | M1–M6 base chip, 16 GB, 7–10 GPU cores, 68–170 GB/s | ~4 GB / ~7–8 GB | must prove correctly; small segments (po2 ≤ 18 active, ≤ 19 idle); MacBook Air derated (fanless) |
+| Primary tuning target | M4/M5 base 10-core at 24 GB; M4/M5 Pro 16/20-core at 24–48 GB | 6–12 GB / 12–28 GB | default segment size; tune here |
+| High end | Max 36–128 GB, Ultra 96–512 GB | 16–64 GB / 40–180+ GB | concurrency, large segments; first tier for SP1 |
+
+Binding consequences:
+- **Never assume a fraction of RAM.** Read `recommendedMaxWorkingSetSize` at runtime (≈75% of RAM by default, 84% measured on one 128 GB machine) and size segments/pools from it minus a host reserve.
+- **Peak GPU memory per phase is a first-class metric.** Every circuit item reports peak `current_allocated_size` per phase at the po2 values it tests, and the conformance suites run once under an artificial budget: `RISC0_METAL_MAX_WORKING_SET_BYTES=<n>` (F0 follow-up in Z6: the HAL treats it as the working-set limit and errors early when exceeded). The budgets to test are 4 GB and 8 GB.
+- **Tune for 8–10 and 16–20 GPU cores**, not 40: grid sizes, chunking and crossovers must not hard-code core counts; prefer occupancy-driven sizing. Optimization rounds (wave 5) record results at simulated small budgets and note anything that depends on the 40-core GPU.
+- **Cold-start cost matters on consumer machines.** Keccak's 58-stage eval_check takes ~94 s of cold PSO creation (K3), instant once the OS shader cache is warm. The worker must warm PSOs once at install/first start (M1, K5), never inside a job deadline.
+
+### 9.2 Wave-1 findings that change later items
+- **64-bit vs 32-bit arithmetic is kernel-specific.** D0 measured 64-bit mulhi ~5x slower than 32-bit mul in a microbenchmark, but Z3's Poseidon2 int64 HIP form beat its 32-bit mulhi form at every size. Optimization rounds measure both forms per kernel; neither is a blanket rule.
+- **GPU loses below po2 16 for combos_divide** (Z5: CPU 0.38 ms vs GPU 1.1 ms at po2 13) and similar small-size overheads exist elsewhere: Z9 sets per-method CPU/GPU crossovers.
+- **Poseidon2 crossovers** chosen on a shared GPU (pvs_w ≤ 256, pvs_q ≤ 2048, pv above) are provisional (Z9).
+- **groth16-sys now has optional arkworks dependencies** (ark-bn254/ec/ff/poly/serialize/std behind `metal`) and `rand`/`rand_chacha` dev-dependencies; G3–G6 use them and do not edit Cargo.toml.
+- **Open cross-item issues carried into wave 2:** the `poly_group.rs::new_impl` coeffs host spill still runs on unified memory (owner: Z6); `fpext.h` lacks mixed Fp±FpExt operators, so R2's translator ships a shim (owner: R3, coordinate with zkp-hal); F0's runtime re-sets threadgroup memory length redundantly (owner: Z6); fri.metal/mix.metal scalars should be `constant` (owner: Z6).
