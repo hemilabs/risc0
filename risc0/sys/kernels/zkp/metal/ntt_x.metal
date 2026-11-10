@@ -254,8 +254,12 @@ ct_x(const device Fp* in0 [[buffer(0)]],
         r0, r1, tiz, diff_mask, thread_ntt_pos, stage, partial, plus_one);
   }
 
+  // Levels [0, s0) are already done: with skip they are the lg_expand trivial
+  // levels folded into the load. supra ntt_x.cuh:123-124 tests `s0 == 1` here,
+  // which also re-runs level 0 when lg_expand == 1 and skip is set (producing
+  // (2c, 0) instead of (c, c)); test `!skip` instead.
   const uint s0 = skip ? p.lg_expand : 1u;
-  if (s0 == 1) {
+  if (!skip) {
     for (int z = 0; z < Z; z++) {
       Fp t = r1[z];
       r1[z] = r0[z] - t;

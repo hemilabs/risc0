@@ -360,6 +360,26 @@ fn ntt_bit_reverse_lg_1_20() {
     });
 }
 
+/// batch_expand_into_evaluate_ntt at every expand ratio other than log2(INV_RATE): 0, 1 (the
+/// skip_expand case supra ntt_x.cuh:123 gets wrong), 3, 5 (largest skip), 6 and 7 (synthesized
+/// zero padding, no skip).
+#[test]
+fn ntt_expand_ratios_lg_1_20() {
+    for e in [0usize, 1, 3, 5, 6, 7] {
+        for cols in COLS {
+            for lg in e.max(1)..=20 {
+                if cols == 211 && lg > 12 && lg != 16 && lg != 20 {
+                    continue;
+                }
+                let input = vec![random_vec(cols << (lg - e))];
+                three_way(&format!("expand by {e}"), lg, cols, &input, |r, i| {
+                    vec![r.expand(&i[0], cols, cols << lg)]
+                });
+            }
+        }
+    }
+}
+
 /// commit_coeffs_lde over its whole lg range up to 20 (fused on Metal; unfused CPU and legacy).
 #[test]
 fn ntt_commit_coeffs_lde_lg_10_20() {
@@ -408,18 +428,20 @@ fn ntt_commit_chunks_po2_20() {
 
 #[test]
 fn batch_expand_into_evaluate_ntt_large() {
-    testutil::batch_expand_into_evaluate_ntt_large(MetalHalSha256::new());
+    testutil::batch_expand_into_evaluate_ntt_large(new_hal(false));
 }
 
 /// The 13 CUDA shapes, including po2 22.
 #[test]
 fn commit_coeffs_lde() {
-    testutil::commit_coeffs_lde(MetalHalSha256::new());
+    testutil::commit_coeffs_lde(new_hal(false));
 }
 
 #[test]
 fn zk_shift_testutil() {
-    testutil::zk_shift(MetalHalPoseidon2::new());
+    let hal = MetalHalPoseidon2::new();
+    hal.set_ntt_legacy(false);
+    testutil::zk_shift(hal);
 }
 
 /// The `_large` shapes at po2 22 (expand to 2^24, interpolate, fused zk-shift, bit reversal).
