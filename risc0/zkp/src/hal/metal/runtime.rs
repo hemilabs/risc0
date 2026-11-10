@@ -38,7 +38,7 @@ use metal::{
     foreign_types::{ForeignType, ForeignTypeRef},
     objc::{msg_send, rc::autoreleasepool, runtime::Object, sel, sel_impl},
     BlitCommandEncoder, Buffer as MtlBuffer, BufferRef, CommandBuffer, CommandQueue,
-    ComputeCommandEncoder, ComputeCommandEncoderRef, ComputePipelineStateRef, Device,
+    ComputeCommandEncoder, ComputeCommandEncoderRef, ComputePipelineStateRef, Device, MTLBuffer,
     MTLCommandBufferStatus, MTLResourceOptions, MTLSize, NSRange,
 };
 use parking_lot::{Mutex, MutexGuard};
@@ -106,6 +106,11 @@ impl Encoder {
 
 /// What the current compute encoder has bound, to skip redundant state changes (the validation
 /// layer warns about them, and they cost encode time).
+///
+/// Keys are Objective-C object addresses. That is sound only because command buffers come from
+/// `new_command_buffer` and so retain every bound resource: a bound object cannot be freed and
+/// its address reused within the encoder. Switching to `commandBufferWithUnretainedReferences`
+/// would break this (a reused address could silently skip a `set_buffer`).
 #[derive(Default)]
 pub(crate) struct Bound {
     pso: usize,
@@ -137,6 +142,9 @@ struct InFlight {
     seq: u64,
     cmd: CommandBuffer,
     used: HashSet<usize>,
+    /// Test hook: report this batch as `Error` once it completes.
+    #[cfg(test)]
+    injected_error: bool,
 }
 
 #[derive(Default)]
@@ -202,6 +210,12 @@ pub(crate) struct Runtime {
     pub(crate) max_tg_mem: u64,
     pub(crate) max_buffer_len: u64,
     pool_cap: u64,
+    /// Test hook: number of upcoming raw allocations to fail.
+    #[cfg(test)]
+    fail_allocs: AtomicUsize,
+    /// Test hook: report the next committed batch as failed.
+    #[cfg(test)]
+    fail_next_batch: AtomicBool,
 }
 
 fn env_flag(name: &str) -> bool {
@@ -262,6 +276,10 @@ impl Runtime {
             max_tg_mem,
             max_buffer_len,
             pool_cap,
+            #[cfg(test)]
+            fail_allocs: AtomicUsize::new(0),
+            #[cfg(test)]
+            fail_next_batch: AtomicBool::new(false),
         }
     }
 
@@ -309,6 +327,8 @@ impl Runtime {
                 seq: open.seq,
                 cmd: open.cmd,
                 used: open.used,
+                #[cfg(test)]
+                injected_error: self.fail_next_batch.swap(false, Ordering::AcqRel),
             });
         }
     }
@@ -316,10 +336,21 @@ impl Runtime {
     /// Retire completed batches in commit order and advance `completed_seq`.
     fn poll(&self, st: &mut State) {
         while let Some(front) = st.in_flight.front() {
-            match front.cmd.status() {
+            #[allow(unused_mut)]
+            let mut status = front.cmd.status();
+            #[cfg(test)]
+            if front.injected_error && status == MTLCommandBufferStatus::Completed {
+                status = MTLCommandBufferStatus::Error;
+            }
+            match status {
                 MTLCommandBufferStatus::Completed => {}
                 MTLCommandBufferStatus::Error => {
-                    let msg = command_buffer_error(&front.cmd);
+                    #[allow(unused_mut)]
+                    let mut msg = command_buffer_error(&front.cmd);
+                    #[cfg(test)]
+                    if front.injected_error {
+                        msg = "injected test error".into();
+                    }
                     tracing::error!("Metal command buffer {} failed: {msg}", front.seq);
                     st.error
                         .get_or_insert_with(|| format!("Metal command buffer failed: {msg}"));
@@ -575,14 +606,43 @@ impl Runtime {
         );
     }
 
+    /// `newBufferWithLength:options:`, returning `None` on nil. metal-rs's `Device::new_buffer`
+    /// returns a `NonNull`-backed `Buffer`, so a nil result there is already undefined behaviour
+    /// and a later null check is folded away by the optimiser; the raw pointer is checked here
+    /// before it is wrapped.
+    // objc's `msg_send!` expands a `cfg(feature = "cargo-clippy")` this crate does not declare.
+    #[allow(unexpected_cfgs)]
     fn new_buffer_raw(&self, bytes: u64, options: MTLResourceOptions) -> Option<MtlBuffer> {
-        let buf = self.device.new_buffer(bytes, options);
-        if buf.as_ptr().is_null() {
-            mem::forget(buf);
+        #[cfg(test)]
+        if self
+            .fail_allocs
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return None;
+        }
+        // SAFETY: `newBufferWithLength:options:` returns a +1 (owned) reference or nil; only a
+        // non-nil result is wrapped, and `from_ptr` takes over that reference.
+        let ptr: *mut MTLBuffer = unsafe {
+            msg_send![self.device.as_ptr() as *mut Object, newBufferWithLength: bytes options: options]
+        };
+        if ptr.is_null() {
             None
         } else {
-            Some(buf)
+            Some(unsafe { MtlBuffer::from_ptr(ptr) })
         }
+    }
+
+    /// Test hook: the next `n` raw allocations fail as if `newBufferWithLength:` returned nil.
+    #[cfg(test)]
+    pub(crate) fn inject_alloc_failures(&self, n: usize) {
+        self.fail_allocs.store(n, Ordering::Release);
+    }
+
+    /// Test hook: the next committed batch is reported as `MTLCommandBufferStatus::Error`.
+    #[cfg(test)]
+    pub(crate) fn inject_batch_error(&self) {
+        self.fail_next_batch.store(true, Ordering::Release);
     }
 
     /// A shared buffer of `bytes` (> 0) bytes: from the pool when one of that size has been

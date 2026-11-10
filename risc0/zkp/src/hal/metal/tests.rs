@@ -404,3 +404,76 @@ fn debug_detects_unsynced_host_access() {
     let _ = acc.as_ptr();
     assert_eq!(acc.to_vec(), elems(std::iter::repeat_n(2, 64)));
 }
+
+/// Plan 2.9: a failed allocation drains the pool and retries once; a second failure returns an
+/// error naming the buffer and size.
+#[test]
+fn alloc_failure_drains_pool_and_retries() {
+    let hal = MetalHalSha256::new();
+    let small = hal.alloc_elem("small", 1 << 10);
+    let other = hal.alloc_elem("other", 1 << 12);
+    drop(small);
+    drop(other);
+    hal.sync();
+    assert_eq!(hal.rt.pool_stats(), (2, 0), "dropped buffers are pooled");
+
+    // One injected failure: pool drained, retry succeeds, buffer is usable.
+    let bytes = 4 * (1 << 16);
+    hal.rt.inject_alloc_failures(1);
+    let buf = hal.rt.alloc_shared("retry", bytes).expect("retry succeeds");
+    assert_eq!(hal.rt.pool_stats(), (0, 0), "failure drained the pool");
+    assert_eq!(buf.length(), bytes);
+    drop(buf);
+
+    // Two injected failures: the named error.
+    hal.rt.inject_alloc_failures(2);
+    let err = hal.rt.alloc_shared("doomed", bytes).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("doomed") && msg.contains(&bytes.to_string()),
+        "{msg}"
+    );
+
+    // Private allocations follow the same path.
+    hal.rt.inject_alloc_failures(1);
+    assert!(hal.rt.alloc_private(1024).is_ok());
+    hal.rt.inject_alloc_failures(2);
+    assert!(hal.rt.alloc_private(1024).is_err());
+
+    // Hooks consumed: normal allocation and compute still work.
+    let ones = hal.copy_from_elem("ones", &elems(std::iter::repeat_n(1, 64)));
+    let out = hal.alloc_elem("out", 64);
+    hal.eltwise_add_elem(&out, &ones, &ones);
+    assert_eq!(out.to_vec(), elems(std::iter::repeat_n(2, 64)));
+}
+
+/// Plan 2.9: a command buffer that ends in `Error` makes `try_sync` return the error once; the
+/// HAL keeps working afterwards.
+#[test]
+fn command_buffer_error_try_sync() {
+    let hal = MetalHalSha256::new();
+    let ones = hal.copy_from_elem("ones", &elems(std::iter::repeat_n(1, 64)));
+    let out = hal.alloc_elem("out", 64);
+    hal.rt.inject_batch_error();
+    hal.eltwise_add_elem(&out, &ones, &ones);
+    let err = hal.try_sync().unwrap_err();
+    assert!(
+        format!("{err:#}").contains("injected test error"),
+        "{err:#}"
+    );
+    hal.try_sync().expect("error reported once");
+    hal.eltwise_add_elem(&out, &out, &ones);
+    assert_eq!(out.to_vec(), elems(std::iter::repeat_n(3, 64)));
+}
+
+/// `sync` (and host reads through it) panic on a command-buffer error.
+#[test]
+#[should_panic(expected = "Metal command buffer failed: injected test error")]
+fn command_buffer_error_sync_panics() {
+    let hal = MetalHalSha256::new();
+    let ones = hal.copy_from_elem("ones", &elems(std::iter::repeat_n(1, 64)));
+    let out = hal.alloc_elem("out", 64);
+    hal.rt.inject_batch_error();
+    hal.eltwise_add_elem(&out, &ones, &ones);
+    let _ = out.to_vec();
+}
