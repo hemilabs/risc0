@@ -26,16 +26,17 @@
 //! K6 adds the GPU witness.
 //!
 //! No `Drop` is needed: CUDA's (`cuda_reset`) resets a CUDA stack-size limit its witgen raised,
-//! and Metal has no such process state; the PSOs and the HAL reference drop on their own, and
-//! buffers return to the HAL's pool after their last batch completes.
+//! and Metal has no such process state; the PSOs are process-wide ([keccak_kernels]) and stay,
+//! the HAL reference drops on its own, and buffers return to the HAL's pool after their last
+//! batch completes.
 
 mod eval_check;
 mod witgen;
 
-use std::rc::Rc;
+use std::{rc::Rc, sync::OnceLock};
 
 use anyhow::Result;
-use metal::ComputePipelineState;
+use metal::{ComputePipelineState, DeviceRef};
 use risc0_circuit_keccak_sys::{METAL_KERNEL_NAMES, METAL_LIB};
 use risc0_core::scope;
 use risc0_zkp::hal::{
@@ -53,19 +54,32 @@ use crate::{
 
 pub struct MetalCircuitHal<MH: MetalHash> {
     hal: Rc<MetalHal<MH>>,
-    /// The keccak metallib, with a PSO for each of `METAL_KERNEL_NAMES`.
-    kernels: MetalKernels,
+    /// The keccak metallib, with a PSO for each of `METAL_KERNEL_NAMES`: built once per process
+    /// ([keccak_kernels]) and shared by every circuit HAL.
+    kernels: &'static MetalKernels,
     /// eval_check's chunk size and cached scratch/carry ([eval_check]).
     eval: eval_check::EvalCheckState,
 }
 
+/// The keccak PSOs (the hand-written kernels and the eval_check stages), built once per process,
+/// as the zkp crate's own (`zkp_kernels`): the zkvm makes a new keccak prover, so a new circuit
+/// HAL, for every proof, and building the stage PSOs takes 40-190 s whenever the OS shader cache
+/// misses. Panics if the metallib does not load or lacks a kernel. Every MetalHal uses the
+/// system default device, which these PSOs are built on.
+fn keccak_kernels(device: &DeviceRef) -> &'static MetalKernels {
+    static ONCE: OnceLock<MetalKernels> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        scope!("load_keccak_metallib");
+        MetalKernels::new(device, METAL_LIB, METAL_KERNEL_NAMES)
+            .unwrap_or_else(|e| panic!("keccak metallib: {e:#}"))
+    })
+}
+
 impl<MH: MetalHash> MetalCircuitHal<MH> {
-    /// Loads the keccak metallib and builds every PSO; panics if a kernel is missing.
+    /// A circuit HAL on `hal`; the first one in the process loads the keccak metallib and builds
+    /// every PSO ([keccak_kernels]), later ones reuse them.
     pub fn new(hal: Rc<MetalHal<MH>>) -> Self {
-        let kernels = scope!(
-            "load_keccak_metallib",
-            hal.load_library(METAL_LIB, METAL_KERNEL_NAMES)
-        );
+        let kernels = keccak_kernels(&hal.device);
         Self {
             hal,
             kernels,
@@ -351,6 +365,69 @@ mod tests {
         let circuit_hal = MetalCircuitHalPoseidon2::new(hal);
         for name in risc0_circuit_keccak_sys::METAL_KERNEL_NAMES {
             let _ = circuit_hal.pipeline(name);
+        }
+    }
+
+    /// The keccak PSOs are built once per process: a second circuit HAL (as the zkvm makes for
+    /// every keccak proof) shares the first one's kernels and builds no PSO.
+    #[test]
+    fn kernels_are_process_wide() {
+        let first = MetalCircuitHalPoseidon2::new(Rc::new(MetalHalPoseidon2::new()));
+        let t0 = Instant::now();
+        let second = MetalCircuitHalPoseidon2::new(Rc::new(MetalHalPoseidon2::new()));
+        let elapsed = t0.elapsed();
+        assert!(std::ptr::eq(first.kernels, second.kernels));
+        for name in risc0_circuit_keccak_sys::METAL_KERNEL_NAMES {
+            assert!(
+                std::ptr::eq(first.pipeline(name), second.pipeline(name)),
+                "{name}"
+            );
+        }
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "second circuit HAL took {elapsed:?}"
+        );
+    }
+
+    /// One prover, proofs at the po2 values in `K4_SEQ_PO2S` (default 14,17) in turn, under the
+    /// working-set budget `K4_SEQ_BUDGET` (bytes, default 4 GiB, the minimum target): an earlier
+    /// proof's eval_check must not leave memory behind that a later, larger proof needs (K4
+    /// review: the cached eval_check scratch made po2 17 after po2 14 fail under 4 GB). Run it
+    /// alone (the budget counts all of the process's Metal memory):
+    /// `cargo test -p risc0-circuit-keccak --release --features metal --lib -- metal_prover_reuse_under_budget --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn metal_prover_reuse_under_budget() {
+        let po2s: Vec<usize> = std::env::var("K4_SEQ_PO2S")
+            .unwrap_or_else(|_| "14,17".into())
+            .split(',')
+            .map(|s| s.trim().parse().unwrap())
+            .collect();
+        let budget: u64 = std::env::var("K4_SEQ_BUDGET")
+            .map(|s| s.trim().parse().unwrap())
+            .unwrap_or(4 << 30);
+        let hal = Rc::new(MetalHalPoseidon2::new());
+        hal.set_working_set_limit(Some(budget));
+        let circuit_hal = Rc::new(MetalCircuitHalPoseidon2::new(hal.clone()));
+        // K4_SEQ_KEEP=1 restores the pre-review cache (to show this test catches it).
+        let keep = std::env::var("K4_SEQ_KEEP").is_ok_and(|v| v == "1");
+        circuit_hal.set_keep_eval_scratch(keep);
+        let prover = KeccakProverImpl {
+            hal: hal.clone(),
+            circuit_hal: circuit_hal.clone(),
+        };
+        let mib = |b: u64| b as f64 / (1u64 << 20) as f64;
+        for po2 in po2s {
+            let seal = prover.prove(&test_inputs(po2), po2).unwrap();
+            prover.verify(&seal).expect("Verification failed");
+            if !keep {
+                assert_eq!(circuit_hal.eval_scratch_bytes(), 0);
+            }
+            println!(
+                "po2 {po2}: ok under {:.0} MiB; allocated after the proof {:.1} MiB",
+                mib(budget),
+                mib(hal.allocated_size()),
+            );
         }
     }
 
