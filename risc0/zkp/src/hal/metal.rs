@@ -31,9 +31,12 @@
 
 mod buffer;
 mod kernels;
+mod ntt;
 mod runtime;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_z2;
 
 use std::{
     fmt::Debug,
@@ -51,7 +54,7 @@ use rayon::prelude::*;
 use risc0_core::{
     field::{
         baby_bear::{BabyBear, BabyBearElem, BabyBearExtElem},
-        Elem, ExtElem, RootsOfUnity,
+        Elem, ExtElem,
     },
     scope,
 };
@@ -99,6 +102,16 @@ pub const KERNEL_NAMES: &[&str] = &[
     "sha_fold",
     "sha_rows",
     "zk_shift",
+    // ntt_x.metal (Z2; also `ntt::NTT_X_KERNELS`)
+    "bit_rev_permutation_batched",
+    "bit_rev_z_batched_64",
+    "ct_x_1",
+    "ct_x_8",
+    "ct_x_8_coalesced",
+    "gs_x_1",
+    "gs_x_8",
+    "gs_x_8_coalesced",
+    "nttx_zk_shift_batched",
 ];
 
 /// Whether the Metal backend may be used for `unit` (one of `zkp`, `rv32im`, `recursion`,
@@ -316,6 +329,7 @@ pub struct MetalHal<MH: MetalHash> {
     rt: Arc<Runtime>,
     kernels: &'static MetalKernels,
     hash: Option<Box<MH>>,
+    ntt: ntt::NttState,
 }
 
 impl<MH: MetalHash> Debug for MetalHal<MH> {
@@ -350,6 +364,7 @@ impl<MH: MetalHash> MetalHal<MH> {
             rt,
             kernels,
             hash: None,
+            ntt: ntt::NttState::new(),
         };
         hal.hash = Some(Box::new(MH::new(&hal)));
         hal
@@ -530,18 +545,7 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
     }
 
     fn batch_bit_reverse(&self, io: &Self::Buffer<Self::Elem>, count: usize) {
-        let row_size = io.size() / count;
-        assert_eq!(row_size * count, io.size());
-        let bits = log2_ceil(row_size);
-        assert_eq!(row_size, 1 << bits);
-        tracing::debug!(
-            "io: {}, count: {count}, row_size: {row_size}, bits: {bits}",
-            io.size()
-        );
-        let args = &[io.as_arg(), KernelArg::Integer(bits as u32)];
-        self.launch("multi_bit_reverse", row_size as u64 * count as u64, args);
-        // CUDA ends this method with sync_stream(): close the batch (plan 2.6).
-        self.flush();
+        self.ntt_batch_bit_reverse(io, count);
     }
 
     fn batch_expand_into_evaluate_ntt(
@@ -549,86 +553,40 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
         output: &Self::Buffer<Self::Elem>,
         input: &Self::Buffer<Self::Elem>,
         count: usize,
-        expand_bits: usize,
+        _expand_bits: usize,
     ) {
-        scope!("batch_expand", {
-            tracing::debug!(
-                "output: {}, input: {}, count: {count}",
-                output.size(),
-                input.size()
-            );
-            let out_size = output.size() / count;
-            let in_size = input.size() / count;
-            let expand_bits = log2_ceil(out_size / in_size);
-            assert_eq!(output.size(), out_size * count);
-            assert_eq!(input.size(), in_size * count);
-            assert_eq!(out_size, in_size * (1 << expand_bits));
-            let args = &[
-                output.as_arg(),
-                input.as_arg(),
-                KernelArg::Integer(count as u32),
-                KernelArg::Integer(out_size as u32),
-                KernelArg::Integer(in_size as u32),
-                KernelArg::Integer(expand_bits as u32),
-            ];
-            self.launch("batch_expand", out_size as u64, args);
-        });
-
-        scope!("batch_evaluate_ntt", {
-            tracing::debug!(
-                "output: {}, count: {count}, expand_bits: {expand_bits}",
-                output.size()
-            );
-            let row_size = output.size() / count;
-            assert_eq!(row_size * count, output.size());
-            let n_bits = log2_ceil(row_size);
-            assert_eq!(row_size, 1 << n_bits);
-            assert!(n_bits >= expand_bits);
-            assert!(n_bits < Self::Elem::MAX_ROU_PO2);
-            let rou = as_bytes(Self::Elem::ROU_FWD);
-            let kernel = self.pipeline("multi_ntt_fwd_step");
-            for s_bits in 1 + expand_bits..=n_bits {
-                let args = &[
-                    output.as_arg(),
-                    KernelArg::Bytes(rou),
-                    KernelArg::Integer(n_bits as u32),
-                    KernelArg::Integer(s_bits as u32),
-                    KernelArg::Integer(count as u32),
-                ];
-                let grid = compute_launch_params(n_bits as u32, s_bits as u32, count as u32);
-                self.dispatch(kernel, args, grid, &[]);
-            }
-        });
-        self.flush();
+        self.ntt_batch_expand_into_evaluate(output, input, count);
     }
 
     fn batch_interpolate_ntt(&self, io: &Self::Buffer<Self::Elem>, count: usize) {
-        scope!("batch_interpolate_ntt");
-        tracing::debug!("io: {}, count: {count}", io.size());
-        let row_size = io.size() / count;
-        assert_eq!(row_size * count, io.size());
-        let n_bits = log2_ceil(row_size);
-        assert_eq!(row_size, 1 << n_bits);
-        assert!(n_bits < Self::Elem::MAX_ROU_PO2);
+        self.ntt_batch_interpolate(io, count);
+    }
 
-        let rou = as_bytes(Self::Elem::ROU_REV);
-        let kernel = self.pipeline("multi_ntt_rev_step");
-        for s_bits in (1..=n_bits).rev() {
-            let args = &[
-                io.as_arg(),
-                KernelArg::Bytes(rou),
-                KernelArg::Integer(n_bits as u32),
-                KernelArg::Integer(s_bits as u32),
-                KernelArg::Integer(count as u32),
-            ];
-            let grid = compute_launch_params(n_bits as u32, s_bits as u32, count as u32);
-            self.dispatch(kernel, args, grid, &[]);
-        }
+    fn batch_interpolate_ntt_zk_shift(&self, io: &Self::Buffer<Self::Elem>, count: usize) {
+        self.ntt_batch_interpolate_zk_shift(io, count);
+    }
 
-        let norm = [Self::Elem::new(row_size as u32).inv()];
-        let args = &[io.as_arg(), KernelArg::Bytes(as_bytes(&norm))];
-        self.launch("eltwise_mul_factor_fp", io.size() as u64, args);
-        self.flush();
+    fn batch_interpolate_ntt_zk_shift_from(
+        &self,
+        dst: &Self::Buffer<Self::Elem>,
+        src: &Self::Buffer<Self::Elem>,
+        count: usize,
+    ) {
+        self.ntt_batch_interpolate_zk_shift_from(dst, src, count);
+    }
+
+    fn has_commit_coeffs_lde(&self, po2: usize) -> bool {
+        self.ntt_has_commit_coeffs_lde(po2)
+    }
+
+    fn commit_coeffs_lde(
+        &self,
+        coeffs: &Self::Buffer<Self::Elem>,
+        evaluated: &Self::Buffer<Self::Elem>,
+        witness: &Self::Buffer<Self::Elem>,
+        count: usize,
+    ) {
+        self.ntt_commit_coeffs_lde(coeffs, evaluated, witness, count);
     }
 
     fn batch_evaluate_any(
@@ -770,13 +728,7 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
     }
 
     fn zk_shift(&self, io: &Self::Buffer<Self::Elem>, poly_count: usize) {
-        let bits = log2_ceil(io.size() / poly_count);
-        let count = io.size();
-        assert_eq!(io.size(), poly_count * (1 << bits));
-        let args = &[io.as_arg(), KernelArg::Integer(bits as u32)];
-        self.launch("zk_shift", count as u64, args);
-        // CUDA ends this method with sync_stream(): close the batch (plan 2.6).
-        self.flush();
+        self.ntt_zk_shift(io, poly_count);
     }
 
     fn gather_sample(
@@ -872,34 +824,5 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
                 }
             }
         });
-    }
-}
-
-fn compute_launch_params(n_bits: u32, s_bits: u32, c_size: u32) -> Grid {
-    let s_size = 1 << (s_bits - 1);
-    let g_size = 1 << (n_bits - s_bits);
-
-    let mut grid = MTLSize::new(1, 1, 1);
-    let mut block = MTLSize::new(1, 1, 1);
-
-    let mut threads = 128;
-    // First thread over S
-    block.width = threads.min(s_size);
-    threads /= block.width;
-    // Next thread over G
-    block.height = threads.min(g_size);
-    // Don't bother threading over C
-    let mut grids = 32;
-    // First grid over S
-    grid.width = grids.min(s_size / block.width);
-    grids /= grid.width;
-    // Next grid over G
-    grid.height = grids.min(g_size / block.height);
-    grids /= grid.height;
-    // Next grid over C
-    grid.depth = grids.min(c_size as u64);
-    Grid::Groups {
-        groups: grid,
-        threads: block,
     }
 }
