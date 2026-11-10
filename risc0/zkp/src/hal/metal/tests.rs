@@ -477,3 +477,308 @@ fn command_buffer_error_sync_panics() {
     hal.eltwise_add_elem(&out, &ones, &ones);
     let _ = out.to_vec();
 }
+
+// ---- Z6: generic testutil coverage of every Metal Hal method ----
+
+#[test]
+fn z6_scatter() {
+    testutil::scatter(MetalHalSha256::new());
+}
+
+#[test]
+fn z6_scatter_bits() {
+    testutil::scatter_bits(MetalHalSha256::new());
+}
+
+#[test]
+fn z6_eltwise_zeroize_elem() {
+    testutil::eltwise_zeroize_elem(MetalHalSha256::new());
+}
+
+#[test]
+fn z6_eltwise_copy_elem_slice() {
+    testutil::eltwise_copy_elem_slice(MetalHalSha256::new());
+}
+
+#[test]
+fn z6_alloc_init() {
+    testutil::alloc_init(MetalHalSha256::new());
+}
+
+#[test]
+fn z6_combos_prepare() {
+    testutil::combos_prepare(MetalHalSha256::new());
+}
+
+macro_rules! combos_divide_po2 {
+    ($($name:ident: $po2:expr,)*) => {$(
+        #[test]
+        fn $name() {
+            testutil::combos_divide(MetalHalSha256::new(), $po2);
+        }
+    )*};
+}
+
+combos_divide_po2! {
+    z6_combos_divide_po2_13: 13,
+    z6_combos_divide_po2_14: 14,
+    z6_combos_divide_po2_15: 15,
+    z6_combos_divide_po2_16: 16,
+    z6_combos_divide_po2_17: 17,
+    z6_combos_divide_po2_18: 18,
+    z6_combos_divide_po2_19: 19,
+    z6_combos_divide_po2_20: 20,
+    z6_combos_divide_po2_21: 21,
+    z6_combos_divide_po2_22: 22,
+}
+
+#[test]
+fn z6_zk_shift_variants() {
+    testutil::zk_shift_variants(MetalHalSha256::new());
+}
+
+#[test]
+fn z6_eval_any_shapes() {
+    testutil::eval_any_shapes(MetalHalSha256::new());
+}
+
+#[test]
+fn z6_mix_poly_coeffs_shapes() {
+    testutil::mix_poly_coeffs_shapes(MetalHalSha256::new());
+}
+
+/// Full prove / verify round trip of the toy circuit on CPU, Metal and DualHal(CPU, Metal):
+/// identical seals that the CPU verifier accepts.
+///
+/// The HALs zero pooled buffers on reuse (test hook): `DualHal` compares whole buffers after each
+/// call, including cells the method leaves unwritten (the head of a Merkle `nodes` buffer, which
+/// the CPU HAL allocates zeroed and the pool hands back with old contents).
+#[test]
+fn z6_prove_verify_round_trip_sha256() {
+    testutil::prove_verify_round_trip(
+        || {
+            let hal = MetalHalSha256::new();
+            hal.rt.set_zero_pooled(true);
+            hal
+        },
+        &[10, 13, 16],
+    );
+}
+
+#[test]
+fn z6_prove_verify_round_trip_poseidon2() {
+    testutil::prove_verify_round_trip(
+        || {
+            let hal = MetalHalPoseidon2::new();
+            hal.rt.set_zero_pooled(true);
+            hal
+        },
+        &[10, 12, 15, 17],
+    );
+}
+
+// ---- Z6: sync / pool stress ----
+
+/// Random interleaving of allocations (pooled sizes), dependent GPU adds, drops while a batch is
+/// open, host reads and host writes (both sync), explicit flush/sync, and batch limits 1..=9 or
+/// the default; every live buffer is mirrored on the host and compared on read and at the end.
+fn stress_one(seed: u64, iters: usize, debug: bool) {
+    use rand::{rngs::SmallRng, Rng, SeedableRng};
+
+    let hal = MetalHalSha256::new();
+    hal.set_debug(debug);
+    let mut rng = SmallRng::seed_from_u64(seed);
+    let sizes = [1usize, 255, 4096, 1 << 14, (1 << 16) + 3];
+    let mut live: Vec<(super::BufferImpl<BabyBearElem>, Vec<BabyBearElem>)> = vec![];
+    for it in 0..iters {
+        if it % 61 == 0 {
+            let limit = match rng.random_range(0..4) {
+                0 => super::DEFAULT_BATCH_DISPATCHES,
+                _ => rng.random_range(1..=9),
+            };
+            hal.set_batch_limit(limit);
+        }
+        match rng.random_range(0..12) {
+            0..=2 => {
+                let n = sizes[rng.random_range(0..sizes.len())];
+                let v: Vec<_> = (0..n).map(|_| BabyBearElem::random(&mut rng)).collect();
+                live.push((hal.copy_from_elem("stress", &v), v));
+            }
+            3..=6 if !live.is_empty() => {
+                let i = rng.random_range(0..live.len());
+                let n = live[i].1.len();
+                let same: Vec<usize> = (0..live.len()).filter(|&j| live[j].1.len() == n).collect();
+                let j = same[rng.random_range(0..same.len())];
+                hal.eltwise_add_elem(&live[i].0, &live[i].0, &live[j].0);
+                let src = live[j].1.clone();
+                for (d, s) in live[i].1.iter_mut().zip(src) {
+                    *d += s;
+                }
+            }
+            7 if !live.is_empty() => {
+                let i = rng.random_range(0..live.len());
+                live.swap_remove(i);
+            }
+            8 if !live.is_empty() => {
+                let i = rng.random_range(0..live.len());
+                assert!(
+                    live[i].0.to_vec() == live[i].1,
+                    "seed {seed} iter {it}: read"
+                );
+            }
+            9 if !live.is_empty() => {
+                let i = rng.random_range(0..live.len());
+                let k = rng.random_range(0..live[i].1.len());
+                let v = BabyBearElem::random(&mut rng);
+                live[i].0.view_mut(|s| s[k] = v);
+                live[i].1[k] = v;
+            }
+            10 => hal.flush(),
+            11 => hal.sync(),
+            _ => {}
+        }
+        if live.len() > 24 {
+            live.remove(0);
+        }
+    }
+    for (i, (buf, want)) in live.iter().enumerate() {
+        assert!(buf.to_vec() == *want, "seed {seed}: final buffer {i}");
+    }
+}
+
+#[test]
+fn z6_stress_sync_pool() {
+    stress_one(1, 4000, false);
+}
+
+#[test]
+fn z6_stress_sync_pool_debug() {
+    stress_one(2, 1500, true);
+}
+
+/// Four threads, each with its own HAL, stressing concurrently (shared `exclusive()` lock,
+/// per-HAL batches and pools).
+#[test]
+fn z6_stress_sync_pool_threads() {
+    let threads: Vec<_> = (0..4)
+        .map(|t| std::thread::spawn(move || stress_one(100 + t, 1200, t == 3)))
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+}
+
+// ---- Z6: working-set budget (RISC0_METAL_MAX_WORKING_SET_BYTES), peak, runtime fixes ----
+
+#[test]
+fn z6_parse_bytes() {
+    use super::runtime::parse_bytes;
+    assert_eq!(parse_bytes("4294967296"), Some(4 << 30));
+    assert_eq!(parse_bytes("4G"), Some(4 << 30));
+    assert_eq!(parse_bytes("4GiB"), Some(4 << 30));
+    assert_eq!(parse_bytes(" 8g "), Some(8 << 30));
+    assert_eq!(parse_bytes("512M"), Some(512 << 20));
+    assert_eq!(parse_bytes("512MB"), Some(512 << 20));
+    assert_eq!(parse_bytes("1k"), Some(1024));
+    assert_eq!(parse_bytes("1T"), Some(1 << 40));
+    for bad in ["", "abc", "0", "4X", "-1", "G", "1.5G"] {
+        assert_eq!(parse_bytes(bad), None, "{bad:?}");
+    }
+}
+
+/// `gpu_total_memory` / `gpu_free_memory` honour the budget; `None` restores
+/// `recommendedMaxWorkingSetSize`; a budget above it is capped.
+#[test]
+fn z6_working_set_limit_queries() {
+    let hal = MetalHalSha256::new();
+    let rec = hal.device.recommended_max_working_set_size();
+    hal.set_working_set_limit(None);
+    assert_eq!(hal.gpu_total_memory() as u64, rec);
+    assert_eq!(hal.working_set_limit(), rec);
+    let budget = (3u64 << 30).min(rec);
+    hal.set_working_set_limit(Some(budget));
+    assert_eq!(hal.gpu_total_memory() as u64, budget);
+    assert!(hal.gpu_free_memory() as u64 <= budget);
+    hal.set_working_set_limit(Some(u64::MAX));
+    assert_eq!(hal.gpu_total_memory() as u64, rec);
+    hal.set_working_set_limit(None);
+}
+
+/// Over budget, a new allocation drains the pool and then fails with a clear error (the Hal
+/// entry points panic with it); reusing a pooled buffer of the same size is not a new allocation.
+#[test]
+fn z6_working_set_budget_errors_early() {
+    let hal = MetalHalSha256::new();
+    let pooled = hal.alloc_elem("pooled", 1 << 18);
+    drop(pooled);
+    hal.sync();
+    assert!(hal.rt.pool_stats().0 >= 1);
+    hal.set_working_set_limit(Some(1));
+    assert_eq!(hal.gpu_total_memory(), 1);
+    assert_eq!(hal.gpu_free_memory(), 0);
+    // Same size as the pooled buffer: served from the pool, no new allocation.
+    drop(hal.alloc_elem("reused", 1 << 18));
+    let err = hal.rt.alloc_shared("over", 3 << 20).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("working-set budget exceeded")
+            && msg.contains("over")
+            && msg.contains(super::MAX_WORKING_SET_ENV),
+        "{msg}"
+    );
+    assert_eq!(hal.rt.pool_stats(), (0, 0), "the pool is drained first");
+    assert!(hal.rt.alloc_private(1 << 20).is_err());
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        hal.alloc_elem("hal_alloc", 1 << 20);
+    }));
+    let panic = res.expect_err("an over-budget Hal allocation must panic");
+    let panic = panic.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(panic.contains("working-set budget exceeded"), "{panic}");
+    hal.set_working_set_limit(None);
+    let ones = hal.copy_from_elem("ones", &elems(std::iter::repeat_n(1, 64)));
+    let out = hal.alloc_elem("out", 64);
+    hal.eltwise_add_elem(&out, &ones, &ones);
+    assert_eq!(out.to_vec(), elems(std::iter::repeat_n(2, 64)));
+}
+
+/// The process-wide peak follows allocations.
+#[test]
+fn z6_peak_allocated_size() {
+    let hal = MetalHalSha256::new();
+    hal.reset_peak_allocated_size();
+    let big = hal.alloc_elem("big", 16 << 20);
+    assert!(hal.peak_allocated_size() >= hal.allocated_size().min(64 << 20));
+    assert!(hal.peak_allocated_size() >= 64 << 20);
+    drop(big);
+}
+
+/// F0 open issue (Z2 note): an unchanged threadgroup memory length is not re-issued within an
+/// encoder (the validation layer reported "redundant setting of (null)").
+#[test]
+fn z6_threadgroup_length_dedupe() {
+    let mut bound = super::runtime::Bound::default();
+    assert!(bound.set_tg_length(0, 4096));
+    assert!(!bound.set_tg_length(0, 4096));
+    assert!(bound.set_tg_length(0, 8192));
+    assert!(bound.set_tg_length(2, 16));
+    assert!(!bound.set_tg_length(2, 16));
+    assert!(super::runtime::Bound::default().set_tg_length(0, 8192));
+    // Real dispatches with dynamic threadgroup memory, repeated in one encoder.
+    testutil::batch_evaluate_any(MetalHalSha256::new());
+}
+
+/// Plan 9.2: on a unified-memory GPU HAL, `PolyGroup::new` keeps large coefficient buffers on
+/// the device (no host spill at >= 2^22 rows and >= 512 MiB).
+#[test]
+fn z6_poly_group_no_coeffs_spill() {
+    use crate::prove::poly_group::PolyGroup;
+    let hal = MetalHalPoseidon2::new();
+    let count = 32;
+    let size = 1 << 22;
+    let coeffs = hal.alloc_elem_init("coeffs", count * size, BabyBearElem::new(5));
+    let pg = PolyGroup::new(&hal, coeffs, count, size, "data");
+    assert!(
+        pg.coeffs.is_some() && pg.coeffs_host.is_none(),
+        "coeffs were spilled"
+    );
+}

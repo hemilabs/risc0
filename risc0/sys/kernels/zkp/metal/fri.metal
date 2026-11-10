@@ -28,20 +28,32 @@ inline constexpr size_t log2Ceil(size_t in) {
   return r;
 }
 
-kernel void fri_fold(device Fp* out,
-                     const device Fp* in,
-                     const device FpExt& mix,
-                     const device uint32_t& count,
+// Bindings: 0 out (Fp[4 * count]), 1 in (Fp[4 * count * kFriFold]), 2 mix (FpExt as four raw
+// Montgomery words, set_bytes), 3 count (set_bytes). Scalars are `constant` (plan 2.1: set_bytes
+// data is read-only); the FpExt is rebuilt in a thread local before any arithmetic, since
+// fpext.h has no `constant` operators.
+kernel void fri_fold(device Fp* out [[buffer(0)]],
+                     const device Fp* in [[buffer(1)]],
+                     constant uint32_t* mixRaw [[buffer(2)]],
+                     constant uint32_t& countRef [[buffer(3)]],
                      uint gid [[thread_position_in_grid]]) {
+  const uint32_t count = countRef;
+  if (gid >= count) {
+    return;
+  }
+  const FpExt mix(Fp::fromRaw(mixRaw[0]),
+                  Fp::fromRaw(mixRaw[1]),
+                  Fp::fromRaw(mixRaw[2]),
+                  Fp::fromRaw(mixRaw[3]));
   FpExt tot;
   FpExt curMix(1);
   for (uint32_t i = 0; i < kFriFold; i++) {
     size_t rev_i = reverse_bits(i) >> (32 - log2Ceil(kFriFold));
     size_t rev_idx = rev_i * count + gid;
     FpExt factor(in[0 * count * kFriFold + rev_idx],
-               in[1 * count * kFriFold + rev_idx],
-               in[2 * count * kFriFold + rev_idx],
-               in[3 * count * kFriFold + rev_idx]);
+                 in[1 * count * kFriFold + rev_idx],
+                 in[2 * count * kFriFold + rev_idx],
+                 in[3 * count * kFriFold + rev_idx]);
     tot += curMix * factor;
     curMix *= mix;
   }
