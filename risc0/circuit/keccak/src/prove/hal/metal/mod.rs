@@ -14,35 +14,37 @@
 
 //! The keccak circuit on Apple GPUs, on the zkp crate's Metal HAL (docs/metal-port/PLAN.md 4.4).
 //!
-//! Skeleton (item K1): the prover runs on [MetalHalPoseidon2] (NTTs, hashing, FRI and the rest of
-//! the zkp prover on the GPU), and the circuit methods run the CPU implementations over the
-//! HAL's shared (unified-memory) buffers: the witness is made on the host (`HOST_WITNESS`, as on
-//! Intel), and eval_check calls the CPU `poly_fp` through host views. The keccak metallib
-//! (`risc0_circuit_keccak_sys::METAL_LIB`) is loaded with a PSO per kernel; so far it holds
-//! `scatter_preflight` ([MetalCircuitHal::scatter_preflight_gpu]), a port of the CUDA kernel,
-//! tested against the host path but not yet used by `scatter_preflight` (item K2 switches it on).
+//! Milestone 1 (items K1, K2): the prover runs on [MetalHalPoseidon2] (NTTs, hashing, FRI and the
+//! rest of the zkp prover on the GPU). Of the circuit methods:
+//! - `scatter_preflight` runs the `scatter_preflight` Metal kernel and `generate_witness` the CPU
+//!   witness generator over the HAL's shared (unified-memory) buffers (`HOST_WITNESS`, as on
+//!   Intel): see [witgen];
+//! - `accumulate` does nothing, exactly as cuda.rs (the keccak circuit has no accumulation step);
+//! - `eval_check` calls the CPU `poly_fp` through host views of the shared buffers, as
+//!   `CpuCircuitHal::eval_check` does.
+//!
 //! K3/K4 add the staged eval_check kernels, K6 the GPU witness.
 //!
 //! No `Drop` is needed: CUDA's (`cuda_reset`) resets a CUDA stack-size limit its witgen raised,
 //! and Metal has no such process state; the PSOs and the HAL reference drop on their own, and
 //! buffers return to the HAL's pool after their last batch completes.
 
+mod witgen;
+
 use std::rc::Rc;
 
-use anyhow::{bail, ensure, Result};
+use anyhow::Result;
 use metal::ComputePipelineState;
 use rayon::prelude::*;
-use risc0_circuit_keccak_sys::{
-    risc0_circuit_keccak_cpu_poly_fp, ScatterInfo, METAL_KERNEL_NAMES, METAL_LIB,
-};
+use risc0_circuit_keccak_sys::{risc0_circuit_keccak_cpu_poly_fp, METAL_KERNEL_NAMES, METAL_LIB};
 use risc0_core::{field::RootsOfUnity as _, scope};
 use risc0_zkp::{
     core::log2_ceil,
     field::{map_pow, Elem as _, ExtElem as _},
     hal::{
         metal::{
-            as_bytes, BufferImpl as MetalBuffer, Grid, KernelArg, MetalHal, MetalHalPoseidon2,
-            MetalHash, MetalHashPoseidon2, MetalKernels,
+            BufferImpl as MetalBuffer, MetalHal, MetalHalPoseidon2, MetalHash, MetalHashPoseidon2,
+            MetalKernels,
         },
         AccumPreflight, Buffer as _, CircuitHal,
     },
@@ -56,24 +58,6 @@ use crate::{
         info::POLY_MIX_POWERS,
     },
 };
-
-use super::{
-    cpu::{generate_witness_host, scatter_preflight_host, HostMetaBuffer},
-    CircuitWitnessGenerator, ForwardPreflightOrder, MetaBuffer, PreflightCycleOrder,
-    PreflightTrace, StepMode,
-};
-
-/// `scatter_preflight` (kernels/metal/scatter.metal) bindings.
-const SCATTER_INTO: usize = 0;
-const SCATTER_INFOS: usize = 1;
-const SCATTER_FROM: usize = 2;
-const SCATTER_FAULT: usize = 3;
-const SCATTER_PARAMS: usize = 4;
-const SCATTER_NARGS: usize = 5;
-
-/// `ScatterParams` of scatter.metal: `rows`, `cols`, `count`, `from_len` (16 bytes, set_bytes).
-type ScatterParams = [u32; 4];
-const _: () = assert!(std::mem::size_of::<ScatterParams>() == 16);
 
 pub struct MetalCircuitHal<MH: MetalHash> {
     hal: Rc<MetalHal<MH>>,
@@ -92,108 +76,8 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
     }
 
     /// The PSO of a keccak kernel (one of `METAL_KERNEL_NAMES`).
-    #[allow(dead_code)]
     pub(crate) fn pipeline(&self, name: &str) -> &ComputePipelineState {
         self.kernels.pipeline(name)
-    }
-
-    /// Scatter the preflight's packed words `from` into `into` on the GPU: the CUDA
-    /// `scatter_preflight` kernel, a thread per info. Syncs, and fails if the kernel rejected an
-    /// info (out of bounds, or bits not in 1..32), where the host path would panic.
-    // Used by the tests until K2 makes `scatter_preflight` call it.
-    #[allow(dead_code)]
-    pub(crate) fn scatter_preflight_gpu(
-        &self,
-        into: &MetaBuffer<MetalHal<MH>>,
-        infos: &[ScatterInfo],
-        from: &[u32],
-    ) -> Result<()> {
-        scope!("scatter");
-        ensure!(into.buf.size() == into.rows * into.cols);
-        ensure!(
-            u32::try_from(into.buf.size()).is_ok(),
-            "scatter: witness of {} elements does not fit 32-bit indexing",
-            into.buf.size()
-        );
-        if infos.is_empty() {
-            return Ok(());
-        }
-        let infos_buf: MetalBuffer<ScatterInfo> = self.hal.copy_from_slice("scatter_infos", infos);
-        // A zero-length Metal buffer cannot be made; a lone 0 is never read (count == 0 infos).
-        let from_buf = if from.is_empty() {
-            self.hal.copy_from_slice("scatter_from", &[0u32])
-        } else {
-            self.hal.copy_from_slice("scatter_from", from)
-        };
-        let fault = self.hal.copy_from_slice("scatter_fault", &[0u32]);
-        let params: ScatterParams = [
-            into.rows as u32,
-            into.cols as u32,
-            u32::try_from(infos.len())?,
-            u32::try_from(from.len())?,
-        ];
-
-        let mut args: [KernelArg; SCATTER_NARGS] = std::array::from_fn(|_| KernelArg::Null);
-        args[SCATTER_INTO] = into.buf.as_arg();
-        args[SCATTER_INFOS] = infos_buf.as_arg();
-        args[SCATTER_FROM] = from_buf.as_arg();
-        args[SCATTER_FAULT] = fault.as_arg();
-        args[SCATTER_PARAMS] = KernelArg::Bytes(as_bytes(&params));
-        self.hal.dispatch(
-            self.pipeline("scatter_preflight"),
-            &args,
-            Grid::Threads(infos.len() as u64),
-            &[],
-        );
-        self.hal.try_sync()?;
-        if fault.get_at(0) != 0 {
-            bail!(
-                "keccak scatter_preflight (Metal): the preflight trace has an invalid ScatterInfo"
-            );
-        }
-        Ok(())
-    }
-}
-
-impl<MH: MetalHash> CircuitWitnessGenerator<MetalHal<MH>> for MetalCircuitHal<MH> {
-    type PreferredPreflightOrder = ForwardPreflightOrder;
-    // The witness is the CPU's (`generate_witness` below), so a `host_witness` can be proved.
-    const HOST_WITNESS: bool = true;
-
-    fn scatter_preflight(
-        &self,
-        into: &MetaBuffer<MetalHal<MH>>,
-        infos: &[ScatterInfo],
-        from: &[u32],
-    ) -> Result<()> {
-        scope!("scatter");
-        // K1: the CPU path over the shared buffer; K2 switches to `scatter_preflight_gpu`.
-        into.buf
-            .view_mut(|into_host| scatter_preflight_host(into_host, into.rows, infos, from));
-        Ok(())
-    }
-
-    fn generate_witness<O: PreflightCycleOrder>(
-        &self,
-        mode: StepMode,
-        preflight: &PreflightTrace<O>,
-        global: &MetaBuffer<MetalHal<MH>>,
-        data: &MetaBuffer<MetalHal<MH>>,
-    ) -> Result<()> {
-        scope!("witgen");
-        // The CPU witness generator, writing straight into the shared buffers (unified memory).
-        let mut result = Ok(());
-        global.buf.view_mut(|global_host| {
-            data.buf.view_mut(|data_host| {
-                result = generate_witness_host(
-                    mode,
-                    preflight,
-                    HostMetaBuffer::of(global, global_host),
-                    HostMetaBuffer::of(data, data_host),
-                );
-            })
-        });
-        result
     }
 }
 
@@ -208,11 +92,12 @@ impl<MH: MetalHash> CircuitHal<MetalHal<MH>> for MetalCircuitHal<MH> {
         _accum: &MetalBuffer<Val>,
         _steps: usize,
     ) {
-        // Nothing to do, as in cuda.rs/cpu.rs: the keccak circuit has no accumulation step.
+        // Exactly as cuda.rs (and cpu.rs): the keccak circuit has no accumulation step.
     }
 
-    /// K1: the CPU `poly_fp` (as `CpuCircuitHal::eval_check`) over host views of the shared
-    /// buffers; K4 replaces it with the staged Metal kernels.
+    /// Milestone 1: the CPU `poly_fp` (as `CpuCircuitHal::eval_check`) over host views of the
+    /// shared buffers (`view` waits for the open batch first); K4 replaces it with the staged
+    /// Metal kernels.
     fn eval_check(
         &self,
         check: &MetalBuffer<Val>,
@@ -225,6 +110,8 @@ impl<MH: MetalHash> CircuitHal<MetalHal<MH>> for MetalCircuitHal<MH> {
         scope!("eval_check");
         #[cfg(test)]
         tests::METAL_EVAL_CHECKS.with(|n| n.set(n.get() + 1));
+        #[cfg(test)]
+        tests::mark_phase(&self.hal.device, tests::Phase::EvalCheck);
 
         const EXP_PO2: usize = log2_ceil(INV_RATE);
         let domain = steps * INV_RATE;
@@ -279,6 +166,8 @@ impl<MH: MetalHash> CircuitHal<MetalHal<MH>> for MetalCircuitHal<MH> {
                 })
             })
         });
+        #[cfg(test)]
+        tests::mark_phase(&self.hal.device, tests::Phase::Finalize);
     }
 
     /// Round 1 uses one command queue (plan 2.0): nothing to wait for.
@@ -296,22 +185,36 @@ pub fn keccak_prover() -> Result<Box<dyn KeccakProver>> {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, rc::Rc};
+    use std::{
+        cell::Cell,
+        rc::Rc,
+        sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        time::{Duration, Instant},
+    };
 
     use risc0_circuit_keccak_sys::ScatterInfo;
     use risc0_core::field::Elem as _;
-    use risc0_zkp::hal::{
-        metal::{MetalHalPoseidon2, MetalHalSha256},
-        Buffer as _,
+    use risc0_zkp::{
+        core::hash::sha::Sha256HashSuite,
+        field::baby_bear::BabyBear,
+        hal::{
+            cpu::CpuHal,
+            metal::{MetalHalPoseidon2, MetalHalSha256},
+            Buffer as _,
+        },
     };
     use test_log::test;
 
     use super::{MetalCircuitHal, MetalCircuitHalPoseidon2};
     use crate::{
         prove::{
-            hal::{cpu::scatter_preflight_host, MetaBuffer},
+            hal::{
+                cpu::{scatter_preflight_host, CpuCircuitHal},
+                MetaBuffer,
+            },
             preflight::{ForwardPreflightOrder, PreflightTrace},
             testutil::test_inputs,
+            KeccakProver as _, KeccakProverImpl,
         },
         zirgen::circuit::{Val, REGCOUNT_DATA},
     };
@@ -319,6 +222,60 @@ mod tests {
     thread_local! {
         /// Calls of the Metal circuit HAL's eval_check on this thread.
         pub(super) static METAL_EVAL_CHECKS: Cell<usize> = const { Cell::new(0) };
+        /// Phases the Metal circuit HAL entered on this thread ([mark_phase]), by [Phase].
+        static PHASE_ENTRIES: [Cell<usize>; PHASES] = const { [const { Cell::new(0) }; PHASES] };
+    }
+
+    /// The phases of a Metal keccak proof, as the circuit HAL sees them.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) enum Phase {
+        /// Preflight, the `data`/`global` allocation and INVALID fill (before `scatter_preflight`).
+        Setup = 0,
+        /// `scatter_preflight` (GPU kernel).
+        Scatter,
+        /// `generate_witness` (CPU witgen into the shared buffers).
+        Witgen,
+        /// From the end of witgen to eval_check: zeroize, commit of code/data/accum (NTTs,
+        /// Merkle trees), mix, and the check buffer `finalize` allocates before eval_check.
+        Commit,
+        /// `eval_check` (CPU `poly_fp` over the shared buffers).
+        EvalCheck,
+        /// After eval_check: check commit, DEEP-ALI, FRI, until the seal.
+        Finalize,
+    }
+    const PHASES: usize = 6;
+    const PHASE_NAMES: [&str; PHASES] = [
+        "setup",
+        "scatter",
+        "witgen",
+        "commit",
+        "eval_check",
+        "finalize",
+    ];
+
+    /// Peak `current_allocated_size` per phase while [SAMPLING] is on.
+    static PEAKS: [AtomicU64; PHASES] = [const { AtomicU64::new(0) }; PHASES];
+    static PHASE: AtomicUsize = AtomicUsize::new(0);
+    static SAMPLING: AtomicBool = AtomicBool::new(false);
+
+    fn record(phase: usize, bytes: u64) {
+        PEAKS[phase].fetch_max(bytes, Ordering::Relaxed);
+    }
+
+    /// Called by the Metal circuit HAL as it enters a phase: counts the entry, and while a
+    /// memory measurement runs, closes the previous phase and opens `phase` with a sample.
+    pub(crate) fn mark_phase(device: &metal::DeviceRef, phase: Phase) {
+        PHASE_ENTRIES.with(|e| e[phase as usize].set(e[phase as usize].get() + 1));
+        if SAMPLING.load(Ordering::Relaxed) {
+            let bytes = device.current_allocated_size();
+            record(PHASE.load(Ordering::Relaxed), bytes);
+            PHASE.store(phase as usize, Ordering::Relaxed);
+            record(phase as usize, bytes);
+        }
+    }
+
+    fn phase_entries() -> [usize; PHASES] {
+        PHASE_ENTRIES.with(|e| std::array::from_fn(|i| e[i].get()))
     }
 
     fn scatter_matches_host(po2: usize) {
@@ -416,6 +373,7 @@ mod tests {
         let po2 = 8;
         let inputs = test_inputs(po2);
         let before = METAL_EVAL_CHECKS.with(Cell::get);
+        let entries = phase_entries();
         let prover = crate::prove::keccak_prover().unwrap();
         let seal = prover.prove(&inputs, po2).unwrap();
         assert_eq!(
@@ -423,6 +381,15 @@ mod tests {
             before + 1,
             "keccak_prover() did not prove on the Metal circuit HAL"
         );
+        // The prover went through the Metal HAL's (GPU) scatter, witgen and eval_check once each.
+        let after = phase_entries();
+        for phase in [Phase::Scatter, Phase::Witgen, Phase::EvalCheck] {
+            assert_eq!(
+                after[phase as usize],
+                entries[phase as usize] + 1,
+                "{phase:?}"
+            );
+        }
         prover.verify(&seal).expect("Verification failed");
 
         // The host-witness path goes through the same HAL.
@@ -439,6 +406,92 @@ mod tests {
         let circuit_hal = MetalCircuitHalPoseidon2::new(hal);
         for name in risc0_circuit_keccak_sys::METAL_KERNEL_NAMES {
             let _ = circuit_hal.pipeline(name);
+        }
+    }
+
+    /// Milestone-1 eval_check (CPU `poly_fp` over Metal buffer views) matches the CPU HAL's,
+    /// on random inputs, bit-exactly.
+    #[test]
+    fn eval_check() {
+        const PO2: usize = 4;
+        let cpu_hal: CpuHal<BabyBear> = CpuHal::new(Sha256HashSuite::new_suite());
+        let metal_hal = Rc::new(MetalHalSha256::new());
+        let metal_eval = MetalCircuitHal::new(metal_hal.clone());
+        crate::prove::testutil::eval_check(
+            &cpu_hal,
+            CpuCircuitHal,
+            metal_hal.as_ref(),
+            metal_eval,
+            PO2,
+        );
+    }
+
+    /// Peak GPU memory (`MTLDevice.currentAllocatedSize`) per phase of a Metal keccak proof, at
+    /// the po2 values in `K2_MEM_PO2S` (default 8,12,14). Run it alone (other tests in the same
+    /// process allocate on the same device):
+    /// `cargo test -p risc0-circuit-keccak --release --features metal --lib -- metal_peak_memory --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn metal_peak_memory() {
+        let po2s: Vec<usize> = std::env::var("K2_MEM_PO2S")
+            .unwrap_or_else(|_| "8,12,14".into())
+            .split(',')
+            .map(|s| s.trim().parse().unwrap())
+            .collect();
+        let mib = |b: u64| b as f64 / (1u64 << 20) as f64;
+        for po2 in po2s {
+            let hal = Rc::new(MetalHalPoseidon2::new());
+            let device = hal.device.clone();
+            let circuit_hal = Rc::new(MetalCircuitHalPoseidon2::new(hal.clone()));
+            let prover = KeccakProverImpl { hal, circuit_hal };
+            let inputs = test_inputs(po2);
+
+            let baseline = device.current_allocated_size();
+            for p in &PEAKS {
+                p.store(0, Ordering::Relaxed);
+            }
+            PHASE.store(Phase::Setup as usize, Ordering::Relaxed);
+            record(Phase::Setup as usize, baseline);
+            SAMPLING.store(true, Ordering::Relaxed);
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let sampler = {
+                let stop = stop.clone();
+                let device = device.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        record(
+                            PHASE.load(Ordering::Relaxed),
+                            device.current_allocated_size(),
+                        );
+                        std::thread::sleep(Duration::from_micros(100));
+                    }
+                })
+            };
+            let t0 = Instant::now();
+            let seal = prover.prove(&inputs, po2).unwrap();
+            let elapsed = t0.elapsed();
+            record(
+                PHASE.load(Ordering::Relaxed),
+                device.current_allocated_size(),
+            );
+            SAMPLING.store(false, Ordering::Relaxed);
+            stop.store(true, Ordering::Relaxed);
+            sampler.join().unwrap();
+            prover.verify(&seal).expect("Verification failed");
+
+            let peaks: Vec<u64> = PEAKS.iter().map(|p| p.load(Ordering::Relaxed)).collect();
+            let overall = *peaks.iter().max().unwrap();
+            println!(
+                "po2 {po2}: prove {:.2} s, baseline {:.1} MiB, peak {:.1} MiB (working set limit {:.1} MiB)",
+                elapsed.as_secs_f64(),
+                mib(baseline),
+                mib(overall),
+                mib(device.recommended_max_working_set_size()),
+            );
+            for (name, peak) in PHASE_NAMES.iter().zip(&peaks) {
+                println!("  {name:>10}: {:>9.1} MiB", mib(*peak));
+            }
+            assert!(overall > 0);
         }
     }
 }

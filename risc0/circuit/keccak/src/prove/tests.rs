@@ -61,6 +61,13 @@ fn fwd_rev_ab() {
             use crate::prove::hal::hip::HipCircuitHalPoseidon2;
             let hal = Rc::new(HipHalPoseidon2::new());
             let circuit_hal = HipCircuitHalPoseidon2::new(hal.clone());
+        } else if #[cfg(feature = "metal")] {
+            // The Metal HAL: GPU scatter, host witness into the shared buffers (Seq modes are
+            // the host path), GPU zeroize.
+            use risc0_zkp::hal::metal::MetalHalPoseidon2;
+            use crate::prove::hal::metal::MetalCircuitHalPoseidon2;
+            let hal = Rc::new(MetalHalPoseidon2::new());
+            let circuit_hal = MetalCircuitHalPoseidon2::new(hal.clone());
         } else {
             use risc0_zkp::{core::hash::sha::Sha256HashSuite, hal::cpu::CpuHal};
             use crate::prove::hal::cpu::CpuCircuitHal;
