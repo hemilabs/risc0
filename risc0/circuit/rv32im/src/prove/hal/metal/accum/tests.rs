@@ -125,9 +125,9 @@ fn sort_window_env_values() {
     assert_eq!(parse_sort_win(Some("2")), Some(4));
     assert_eq!(parse_sort_win(Some("99")), Some(24));
     assert_eq!(parse_sort_win(Some("x")), Some(DEFAULT_SORT_WIN));
-    assert!(names_phase("witgen, accum", "accum"));
-    assert!(names_phase("ACCUM", "accum"));
-    assert!(!names_phase("witgen,eval", "accum"));
+    assert!(super::super::phase_listed("witgen, accum", "accum"));
+    assert!(super::super::phase_listed("ACCUM", "accum"));
+    assert!(!super::super::phase_listed("witgen,eval", "accum"));
     assert_eq!(user_accum_split(), 23);
 }
 

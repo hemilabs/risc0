@@ -59,7 +59,9 @@ use risc0_zkp::hal::{
     Buffer as _, Hal as _,
 };
 
-use super::{count, host_slice, MetalCircuitHal, Phase, TABLE_U16_CELLS, TABLE_U8_CELLS};
+use super::{
+    count, host_slice, phase_mark, MetalCircuitHal, Phase, TABLE_U16_CELLS, TABLE_U8_CELLS,
+};
 use crate::prove::{
     hal::{CircuitWitnessGenerator, MetaBuffer, PreflightTrace, StepMode},
     witgen::CYCLE_COLS,
@@ -151,17 +153,13 @@ fn no_panic<T>(what: &str, f: impl FnOnce() -> T) -> Result<T> {
 
 /// Whether `RISC0_METAL_RV32IM_CPU_PHASES` (comma list of `witgen,accum,eval`) names `phase`.
 pub(crate) fn cpu_phase(phase: &str) -> bool {
-    std::env::var("RISC0_METAL_RV32IM_CPU_PHASES")
-        .map(|v| v.split(',').any(|p| p.trim() == phase))
-        .unwrap_or(false)
+    super::cpu_phase(phase)
 }
 
 /// Whether `RISC0_METAL_RV32IM_GPU_PHASES` (comma list of `witgen,accum,eval`) names `phase`: an
 /// opt-in for a phase whose Metal kernels are not trusted yet.
 pub(crate) fn gpu_phase(phase: &str) -> bool {
-    std::env::var("RISC0_METAL_RV32IM_GPU_PHASES")
-        .map(|v| v.split(',').any(|p| p.trim() == phase))
-        .unwrap_or(false)
+    std::env::var("RISC0_METAL_RV32IM_GPU_PHASES").is_ok_and(|v| super::phase_listed(&v, phase))
 }
 
 /// Witgen runs the CPU kernel: the default until the Metal witgen kernels are deterministic
@@ -221,15 +219,19 @@ impl<MH: MetalHash> CircuitWitnessGenerator<MetalHal<MH>> for MetalCircuitHal<MH
         pre_data: &MetaBuffer<MetalHal<MH>>,
     ) -> Result<()> {
         count(Phase::Witgen);
-        if *CPU_WITGEN {
-            return self.cpu_witgen(mode, preflight, global, data);
-        }
-        let pre = if single_buffer() {
-            PreData::Single
+        phase_mark(&self.hal, "witgen start");
+        let res = if *CPU_WITGEN {
+            self.cpu_witgen(mode, preflight, global, data)
         } else {
-            PreData::Auto
+            let pre = if single_buffer() {
+                PreData::Single
+            } else {
+                PreData::Auto
+            };
+            self.metal_witgen(mode, preflight, global, data, pre_data, pre)
         };
-        self.metal_witgen(mode, preflight, global, data, pre_data, pre)
+        phase_mark(&self.hal, "witgen end");
+        res
     }
 }
 

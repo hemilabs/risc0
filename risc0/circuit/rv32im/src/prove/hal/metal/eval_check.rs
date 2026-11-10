@@ -44,7 +44,9 @@ use risc0_zkp::{
     INV_RATE,
 };
 
-use super::{count, grow, host_slice, MetalCircuitHal, Phase};
+use super::{
+    count, cpu_phase, grow, host_slice, phase_mark, MetalCircuitHal, Phase, CPU_PHASES_ENV,
+};
 use crate::{
     prove::{GLOBAL_MIX, GLOBAL_OUT},
     zirgen::{
@@ -53,23 +55,9 @@ use crate::{
     },
 };
 
-/// Environment variable selecting circuit phases that run on the CPU circuit kernels (over the
-/// Metal HAL's shared buffers) instead of the Metal kernels: a comma list of
-/// `witgen`, `accum`, `eval`. For debugging only.
-pub(crate) const CPU_PHASES_ENV: &str = "RISC0_METAL_RV32IM_CPU_PHASES";
-
-/// The name of this phase in [CPU_PHASES_ENV].
-const CPU_PHASE_NAME: &str = "eval";
-
-/// Whether the comma list `list` names `phase` (case-insensitive, whitespace ignored).
-pub(crate) fn phase_listed(list: &str, phase: &str) -> bool {
-    list.split(',')
-        .any(|p| p.trim().eq_ignore_ascii_case(phase))
-}
-
 /// Whether [CPU_PHASES_ENV] selects the CPU fallback for eval_check (read on every call).
 fn eval_on_cpu() -> bool {
-    std::env::var(CPU_PHASES_ENV).is_ok_and(|v| phase_listed(&v, CPU_PHASE_NAME))
+    cpu_phase("eval")
 }
 
 /// Threads per threadgroup: CUDA `EVAL_CHECK_THREADS` (eval_check_kernel.cu), which is also the
@@ -241,11 +229,13 @@ impl<MH: MetalHash> CircuitHal<MetalHal<MH>> for MetalCircuitHal<MH> {
         steps: usize,
     ) {
         count(Phase::EvalCheck);
+        phase_mark(&self.hal, "eval_check start");
         let res = if eval_on_cpu() {
             self.eval_check_cpu(check, groups, globals, poly_mix, po2, steps)
         } else {
             self.eval_check_metal(check, groups, globals, poly_mix, po2, steps)
         };
+        phase_mark(&self.hal, "eval_check end");
         // CircuitHal::eval_check cannot return an error (CUDA's ffi_wrap panics the same way).
         if let Err(e) = res {
             panic!(

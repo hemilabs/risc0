@@ -318,7 +318,7 @@ fn eval_check_reuses_poly_mix_buffer() {
 
 #[test]
 fn cpu_phases_list_parsing() {
-    use super::eval_check::phase_listed;
+    use super::phase_listed;
     assert!(phase_listed("eval", "eval"));
     assert!(phase_listed("witgen, Eval ,accum", "eval"));
     assert!(!phase_listed("witgen,accum", "eval"));

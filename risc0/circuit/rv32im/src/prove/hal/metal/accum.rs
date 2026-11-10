@@ -52,14 +52,13 @@ use risc0_zkp::hal::{
     Buffer as _,
 };
 
-use super::{count, grow, host_slice, MetalCircuitHal, Phase};
+use super::{
+    count, cpu_phase, grow, host_slice, phase_mark, MetalCircuitHal, Phase, CPU_PHASES_ENV,
+};
 use crate::{
     prove::hal::{CircuitAccumulator, MetaBuffer, PreflightTrace},
     zirgen::circuit::LAYOUT_TOP_ACCUM,
 };
-
-/// Phases named by this env var run the CPU circuit kernels over the Metal buffers (debugging).
-pub(crate) const CPU_PHASES_ENV: &str = "RISC0_METAL_RV32IM_CPU_PHASES";
 
 /// Accum sort window (log2 rows); `0`/`off` disables the perm.
 pub(crate) const ACCUM_SORT_ENV: &str = "RISC0_METAL_ACCUM_SORT";
@@ -100,19 +99,11 @@ pub(crate) fn fp_inclusive_scan(col: &mut [u32]) {
     }
 }
 
-/// Whether the comma list `list` names `phase` (`RISC0_METAL_RV32IM_CPU_PHASES` syntax).
-pub(crate) fn names_phase(list: &str, phase: &str) -> bool {
-    list.split(',')
-        .any(|p| p.trim().eq_ignore_ascii_case(phase))
-}
-
 /// `RISC0_METAL_RV32IM_CPU_PHASES` names `accum` (read once per process).
 fn accum_on_cpu() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var(CPU_PHASES_ENV)
-            .map(|v| names_phase(&v, "accum"))
-            .unwrap_or(false);
+        let on = cpu_phase("accum");
         if on {
             tracing::info!("rv32im Metal accum: CPU kernels ({CPU_PHASES_ENV})");
         }
@@ -437,11 +428,14 @@ impl<MH: MetalHash> CircuitAccumulator<MetalHal<MH>> for MetalCircuitHal<MH> {
         mix: &MetaBuffer<MetalHal<MH>>,
     ) -> Result<()> {
         count(Phase::Accum);
-        if accum_on_cpu() {
+        phase_mark(&self.hal, "accum start");
+        let res = if accum_on_cpu() {
             self.step_accum_cpu(preflight, data, accum, global, mix)
         } else {
             self.step_accum_metal(preflight, data, accum, global, mix, sort_win())
-        }
+        };
+        phase_mark(&self.hal, "accum end");
+        res
     }
 
     /// finalizeZeroizeAccum zeroizes (as CUDA); the CPU fallback leaves INVALID cells.
