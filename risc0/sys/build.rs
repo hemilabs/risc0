@@ -404,6 +404,7 @@ fn build_metal_kernels() {
             "sha.metal",
             "zk.metal",
             "misc.metal",
+            "ntt_x.metal",
         ],
     )];
 
