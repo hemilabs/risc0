@@ -371,7 +371,7 @@ impl MetalHash for MetalHashPoseidon2 {
         );
         for i in (0..layers).rev() {
             let n = 1usize << i;
-            if n as u32 <= cfg.tail_max {
+            if n <= cfg.tail_max as usize {
                 Self::encode_fold_tail(hal, cfg.kernels == Poseidon2Kernels::PvM32, io, n as u32);
                 break;
             }

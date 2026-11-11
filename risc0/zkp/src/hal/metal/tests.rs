@@ -179,6 +179,9 @@ fn dispatches_then_read_without_flush() {
 /// sync, the same allocation comes back from the pool and computes correctly.
 #[test]
 fn pool_reuse_across_batches() {
+    // Asserts this HAL's pool state, which another test's budget/allocation failure may drain
+    // (every pool is drained on those since Z8b): plan 8.7 lock.
+    let _lock = super::gpu_test_lock();
     let hal = MetalHalSha256::new();
     let n = 1 << 14;
     let ones = hal.copy_from_elem("ones", &elems(std::iter::repeat_n(1, n)));
@@ -409,6 +412,9 @@ fn debug_detects_unsynced_host_access() {
 /// error naming the buffer and size.
 #[test]
 fn alloc_failure_drains_pool_and_retries() {
+    // Asserts this HAL's pool state, which another test's budget/allocation failure may drain
+    // (every pool is drained on those since Z8b): plan 8.7 lock.
+    let _lock = super::gpu_test_lock();
     let hal = MetalHalSha256::new();
     let small = hal.alloc_elem("small", 1 << 10);
     let other = hal.alloc_elem("other", 1 << 12);
@@ -708,6 +714,9 @@ fn z6_working_set_limit_queries() {
 /// entry points panic with it); reusing a pooled buffer of the same size is not a new allocation.
 #[test]
 fn z6_working_set_budget_errors_early() {
+    // Asserts this HAL's pool state, which another test's budget/allocation failure may drain
+    // (every pool is drained on those since Z8b): plan 8.7 lock.
+    let _lock = super::gpu_test_lock();
     let hal = MetalHalSha256::new();
     let pooled = hal.alloc_elem("pooled", 1 << 18);
     drop(pooled);
@@ -744,6 +753,8 @@ fn z6_working_set_budget_errors_early() {
 /// The process-wide peak follows allocations.
 #[test]
 fn z6_peak_allocated_size() {
+    // Resets the process-wide peak (plan 8.7 lock).
+    let _lock = super::gpu_test_lock();
     let hal = MetalHalSha256::new();
     hal.reset_peak_allocated_size();
     let big = hal.alloc_elem("big", 16 << 20);
