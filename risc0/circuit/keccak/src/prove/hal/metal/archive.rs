@@ -24,10 +24,16 @@
 //! - **Location**: `RISC0_METAL_ARCHIVE_DIR`, else the risc0 cache directory
 //!   (`~/Library/Caches/com.risczero.RISC-Zero.risc0`, the directory `risc0-build-kernel` caches
 //!   compiler outputs in) `/metal-archives`.
-//! - **Key**: `<unit>-<sha256(metallib ‖ device name ‖ OS build ‖ kernel names)[..24]>.binarchive`.
+//! - **Key**: `<unit>-<sha256(metallib ‖ device name ‖ OS build ‖ kernel names)[..24]>`.
 //!   A new metallib, another GPU or an OS update (which can change the GPU compiler) therefore
 //!   never reads an old archive; old archives of the same unit are deleted when a new one is
 //!   written.
+//! - **Integrity**: the file is `<unit>-<key>-<sha256(file)[..16]>.binarchive`, and its content
+//!   is checked against that name before Metal sees it. Metal does not survive every damaged
+//!   archive: a file with some bytes flipped loads, and then creating a PSO from it aborts the
+//!   process with an uncaught C++ `std::length_error` (K8 review; Rust cannot catch it), which a
+//!   worker would hit again on every start until the cache is cleared. A file that does not
+//!   match its name (torn write, disk damage, edits) is deleted and rebuilt instead.
 //! - **Use**: every PSO is first created with the archive attached and
 //!   `MTLPipelineOptionFailOnBinaryArchiveMiss` (a hit loads the stored binary, no compile).
 //!   On a miss the function is compiled into the archive (`addComputePipelineFunctions`) and the
@@ -149,14 +155,14 @@ impl ArchivedKernels {
             bail!("metallib is missing kernel(s): {}", missing.join(", "));
         }
 
+        let base = dir.map(|dir| archive_base(&dir, device, unit, bytes, names));
         let mut report = ArchiveReport {
-            path: dir.map(|dir| archive_path(&dir, device, unit, bytes, names)),
+            path: base.as_deref().map(|b| b.with_extension(ARCHIVE_EXT)),
             ..Default::default()
         };
-        let archive = report
-            .path
-            .clone()
-            .and_then(|path| open_archive(device, &path, &mut report));
+        let archive = base
+            .as_deref()
+            .and_then(|base| open_archive(device, base, &mut report));
 
         let add_nanos = AtomicU64::new(0);
         let built = build_all(device, &library, names, archive.as_deref(), &add_nanos)?;
@@ -182,13 +188,16 @@ impl ArchivedKernels {
         }
         report.add_time = Duration::from_nanos(add_nanos.load(Ordering::Relaxed));
 
-        if let (Some(archive), Some(path)) = (archive.as_deref(), report.path.clone()) {
+        if let (Some(archive), Some(base)) = (archive.as_deref(), base.as_deref()) {
             if added > 0 {
                 let t_save = Instant::now();
-                match save_archive(archive, &path, unit) {
-                    Ok(()) => report.saved = true,
+                match save_archive(archive, base, unit) {
+                    Ok(path) => {
+                        report.saved = true;
+                        report.path = Some(path);
+                    }
                     Err(e) => {
-                        let msg = format!("saving {}: {e:#}", path.display());
+                        let msg = format!("saving {}: {e:#}", base.display());
                         tracing::warn!("{unit}: Metal binary archive: {msg}; PSOs unaffected");
                         report.errors.push(msg);
                     }
@@ -275,7 +284,9 @@ pub(crate) fn archive_key(device_name: &str, os: &str, bytes: &[u8], names: &[&s
     digest[..24].to_string()
 }
 
-pub(crate) fn archive_path(
+/// `<dir>/<unit>-<key>`: the archive file is this plus `-<checksum>.binarchive`
+/// ([archive_file]).
+pub(crate) fn archive_base(
     dir: &Path,
     device: &DeviceRef,
     unit: &str,
@@ -283,7 +294,33 @@ pub(crate) fn archive_path(
     names: &[&str],
 ) -> PathBuf {
     let key = archive_key(device.name(), &os_build(), bytes, names);
-    dir.join(format!("{unit}-{key}.{ARCHIVE_EXT}"))
+    dir.join(format!("{unit}-{key}"))
+}
+
+/// Hex digits of the content checksum in an archive's file name.
+const CHECKSUM_LEN: usize = 16;
+
+/// The first [CHECKSUM_LEN] hex digits of the sha256 of an archive's bytes.
+pub(crate) fn archive_checksum(content: &[u8]) -> String {
+    Sha256Impl::hash_bytes(content).to_string()[..CHECKSUM_LEN].to_string()
+}
+
+/// The file name of an archive with base `base` ([archive_base]) and content `content`.
+pub(crate) fn archive_file(base: &Path, content: &[u8]) -> PathBuf {
+    let mut name = base.file_name().unwrap_or_default().to_os_string();
+    name.push(format!("-{}.{ARCHIVE_EXT}", archive_checksum(content)));
+    base.with_file_name(name)
+}
+
+/// The checksum part of `name` if it is an archive file name of `base`'s stem
+/// (`<stem>-<checksum>.binarchive`).
+fn checksum_in_name<'a>(stem: &str, name: &'a str) -> Option<&'a str> {
+    let sum = name
+        .strip_prefix(stem)?
+        .strip_prefix('-')?
+        .strip_suffix(ARCHIVE_EXT)?
+        .strip_suffix('.')?;
+    (sum.len() == CHECKSUM_LEN && sum.bytes().all(|b| b.is_ascii_hexdigit())).then_some(sum)
 }
 
 /// A `file://` URL for `path` (percent-encoding everything but unreserved characters and `/`).
@@ -306,26 +343,64 @@ fn file_url(path: &Path) -> URL {
     url
 }
 
-/// The archive to build with: the file at `path` if it loads, else an empty one; None if the
-/// even an empty archive cannot be made (e.g. a device without archive support).
+/// The archive file of `base` whose content matches the checksum in its name, if any. Files of
+/// `base` that do not match (damaged, truncated, edited) are deleted and reported: Metal can
+/// abort the process on a damaged archive (module doc), so it never sees one.
+fn verified_archive_file(base: &Path, report: &mut ArchiveReport) -> Option<PathBuf> {
+    let dir = base.parent()?;
+    let stem = base.file_name()?.to_str()?;
+    let mut found = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let name = entry.file_name();
+        let Some(sum) = name.to_str().and_then(|n| checksum_in_name(stem, n)) else {
+            continue;
+        };
+        let path = entry.path();
+        if found.is_none() {
+            match std::fs::read(&path) {
+                Ok(content) if archive_checksum(&content) == sum => {
+                    found = Some(path);
+                    continue;
+                }
+                Ok(_) => {
+                    let msg = format!(
+                        "{}: content does not match its checksum; deleting it",
+                        path.display()
+                    );
+                    tracing::warn!("Metal binary archive: {msg}");
+                    report.errors.push(msg);
+                }
+                // Gone meanwhile (another process replaced it): not an error.
+                Err(_) => continue,
+            }
+        }
+        // A damaged file, or a second one (only one survives a save): remove it.
+        let _ = std::fs::remove_file(&path);
+    }
+    found
+}
+
+/// The archive to build with: the verified file of `base` if it loads, else an empty one; None
+/// if even an empty archive cannot be made (e.g. a device without archive support).
 fn open_archive(
     device: &DeviceRef,
-    path: &Path,
+    base: &Path,
     report: &mut ArchiveReport,
 ) -> Option<BinaryArchive> {
-    if path.exists() {
+    if let Some(path) = verified_archive_file(base, report) {
         let desc = BinaryArchiveDescriptor::new();
-        desc.set_url(&file_url(path));
+        desc.set_url(&file_url(&path));
         match device.new_binary_archive_with_descriptor(&desc) {
             Ok(archive) => {
                 report.loaded = true;
+                report.path = Some(path);
                 return Some(archive);
             }
             Err(e) => {
                 let msg = format!("loading {}: {e}; deleting it", path.display());
                 tracing::warn!("Metal binary archive: {msg}");
                 report.errors.push(msg);
-                let _ = std::fs::remove_file(path);
+                let _ = std::fs::remove_file(&path);
             }
         }
     }
@@ -460,16 +535,17 @@ fn build_all<'a>(
         .collect()
 }
 
-/// Write `archive` to `path` (temporary file, rename), then delete the unit's other (stale)
-/// archives in the directory.
-fn save_archive(archive: &BinaryArchiveRef, path: &Path, unit: &str) -> Result<()> {
-    let dir = path
+/// Write `archive` as the archive file of `base` (temporary file, checksum, rename to
+/// [archive_file]), then delete the unit's other (stale) archives in the directory. Returns the
+/// file written.
+fn save_archive(archive: &BinaryArchiveRef, base: &Path, unit: &str) -> Result<PathBuf> {
+    let dir = base
         .parent()
         .ok_or_else(|| anyhow!("no parent directory"))?;
     std::fs::create_dir_all(dir)?;
     let tmp = dir.join(format!(
-        ".{}.tmp{}",
-        path.file_name().unwrap().to_string_lossy(),
+        ".{}.{ARCHIVE_EXT}.tmp{}",
+        base.file_name().unwrap().to_string_lossy(),
         std::process::id()
     ));
     let _ = std::fs::remove_file(&tmp);
@@ -478,7 +554,10 @@ fn save_archive(archive: &BinaryArchiveRef, path: &Path, unit: &str) -> Result<(
         Ok(false) => bail!("serializeToURL returned NO"),
         Err(e) => bail!("serializeToURL: {e}"),
     }
-    std::fs::rename(&tmp, path)?;
+    let content = std::fs::read(&tmp)?;
+    let path = archive_file(base, &content);
+    drop(content);
+    std::fs::rename(&tmp, &path)?;
     let keep = path.file_name().unwrap().to_owned();
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
@@ -503,7 +582,7 @@ fn save_archive(archive: &BinaryArchiveRef, path: &Path, unit: &str) -> Result<(
             }
         }
     }
-    Ok(())
+    Ok(path)
 }
 
 #[cfg(test)]
@@ -535,6 +614,23 @@ mod tests {
         names
     }
 
+    /// Every archive file in `dir` matches the checksum in its name.
+    fn assert_archives_intact(dir: &std::path::Path) {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "binarchive") {
+                let content = std::fs::read(&path).unwrap();
+                let sum = super::archive_checksum(&content);
+                assert!(
+                    path.to_string_lossy()
+                        .ends_with(&format!("-{sum}.binarchive")),
+                    "{}: content does not match the name",
+                    path.display()
+                );
+            }
+        }
+    }
+
     fn device() -> Device {
         Device::system_default().expect("no Metal device")
     }
@@ -543,6 +639,7 @@ mod tests {
     /// every PSO is a hit (`FailOnBinaryArchiveMiss`), nothing is written.
     #[test]
     fn archive_roundtrip() {
+        let _gpu = super::super::tests::gpu_test_lock();
         let device = device();
         let dir = temp_dir("roundtrip");
         let names = small_set();
@@ -556,7 +653,16 @@ mod tests {
         assert!(r.saved);
         let path = r.path.clone().unwrap();
         assert!(path.starts_with(&dir));
-        assert!(std::fs::metadata(&path).unwrap().len() > 0);
+        // The file name carries the checksum of its content.
+        let content = std::fs::read(&path).unwrap();
+        assert!(!content.is_empty());
+        assert_eq!(
+            path,
+            super::archive_file(
+                &super::archive_base(&dir, &device, "keccak", METAL_LIB, &names),
+                &content
+            )
+        );
 
         let second =
             ArchivedKernels::new_in(Some(dir.clone()), &device, "keccak", METAL_LIB, &names)
@@ -564,6 +670,7 @@ mod tests {
         let r = &second.report;
         assert!(r.errors.is_empty(), "{r:?}");
         assert!(r.loaded);
+        assert_eq!(r.path.as_ref(), Some(&path));
         assert_eq!((r.hits, r.misses), (names.len(), 0), "{r:?}");
         assert!(!r.saved);
         for name in &names {
@@ -584,31 +691,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A corrupt archive file is reported, deleted and rewritten; the PSOs are built anyway.
+    /// A corrupt archive file is reported, deleted and rewritten; the PSOs are built anyway:
+    /// (1) garbage whose name carries its checksum (so Metal itself rejects it), (2) garbage
+    /// under another checksum (rejected before Metal sees it).
     #[test]
     fn corrupt_archive_falls_back() {
+        let _gpu = super::super::tests::gpu_test_lock();
         let device = device();
         let dir = temp_dir("corrupt");
         let names = small_set();
-        let path = super::archive_path(&dir, &device, "keccak", METAL_LIB, &names);
+        let base = super::archive_base(&dir, &device, "keccak", METAL_LIB, &names);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(&path, b"not a binary archive").unwrap();
-
-        let k = ArchivedKernels::new_in(Some(dir.clone()), &device, "keccak", METAL_LIB, &names)
-            .unwrap();
-        let r = &k.report;
-        assert!(!r.loaded);
-        assert_eq!(r.errors.len(), 1, "{r:?}");
-        assert!(r.errors[0].contains("loading"), "{r:?}");
-        assert_eq!((r.hits, r.misses), (0, names.len()));
-        assert!(r.saved);
-        for name in &names {
-            let _ = k.pipeline(name);
+        let garbage = b"not a binary archive";
+        let wrong_sum = super::archive_file(&base, b"other content");
+        for (path, what) in [
+            (super::archive_file(&base, garbage), "loading"),
+            (wrong_sum, "does not match its checksum"),
+        ] {
+            std::fs::write(&path, garbage).unwrap();
+            let k =
+                ArchivedKernels::new_in(Some(dir.clone()), &device, "keccak", METAL_LIB, &names)
+                    .unwrap();
+            let r = &k.report;
+            assert!(!r.loaded);
+            assert_eq!(r.errors.len(), 1, "{r:?}");
+            assert!(r.errors[0].contains(what), "{r:?}");
+            assert_eq!((r.hits, r.misses), (0, names.len()));
+            assert!(r.saved);
+            assert_archives_intact(&dir);
+            assert_ne!(r.path.as_ref(), Some(&path));
+            for name in &names {
+                let _ = k.pipeline(name);
+            }
+            let again =
+                ArchivedKernels::new_in(Some(dir.clone()), &device, "keccak", METAL_LIB, &names)
+                    .unwrap();
+            assert_eq!((again.report.hits, again.report.misses), (names.len(), 0));
+            assert!(again.report.errors.is_empty(), "{:?}", again.report);
+            std::fs::remove_file(again.report.path.as_ref().unwrap()).unwrap();
         }
-        let again =
-            ArchivedKernels::new_in(Some(dir.clone()), &device, "keccak", METAL_LIB, &names)
-                .unwrap();
-        assert_eq!((again.report.hits, again.report.misses), (names.len(), 0));
 
         // An unwritable directory (a file in its place): the PSOs are built, the save fails.
         let blocked = dir.join("blocked");
@@ -623,9 +744,233 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A real archive damaged on disk (truncated, bytes flipped inside, emptied) is rejected by
+    /// its checksum, deleted and rebuilt; the PSOs are always built. Before K8, some of these
+    /// loaded ("flipped middle", "last byte missing": hits from a damaged file) and
+    /// `archive_bitflip_sweep`'s flips aborted the process inside Metal.
+    #[test]
+    fn damaged_archive_falls_back() {
+        let _gpu = super::super::tests::gpu_test_lock();
+        let device = device();
+        let dir = temp_dir("damaged");
+        let names = small_set();
+        let good = ArchivedKernels::new_in(Some(dir.clone()), &device, "keccak", METAL_LIB, &names)
+            .unwrap();
+        let path = good.report.path.clone().unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.len() > 4096, "archive of {} bytes", bytes.len());
+        let flip = |from: usize, to: usize| {
+            let mut b = bytes.clone();
+            for x in &mut b[from..to] {
+                *x ^= 0x5a;
+            }
+            b
+        };
+        let n = bytes.len();
+        let variants: Vec<(&str, Vec<u8>)> = vec![
+            ("empty", Vec::new()),
+            ("header only", bytes[..64].to_vec()),
+            ("truncated to half", bytes[..n / 2].to_vec()),
+            ("last byte missing", bytes[..n - 1].to_vec()),
+            ("flipped header", flip(0, 64)),
+            ("flipped middle", flip(n / 2, n / 2 + 4096)),
+            ("flipped tail", flip(n - 4096, n)),
+        ];
+        for (what, damaged) in variants {
+            // Only the damaged file, under the intact archive's name.
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(&path, &damaged).unwrap();
+            let k =
+                ArchivedKernels::new_in(Some(dir.clone()), &device, "keccak", METAL_LIB, &names)
+                    .unwrap_or_else(|e| panic!("{what}: {e:#}"));
+            let r = &k.report;
+            println!(
+                "{what}: loaded {} hits {} misses {} saved {} errors {:?}",
+                r.loaded, r.hits, r.misses, r.saved, r.errors
+            );
+            // Never handed to Metal: it does not match the checksum in its name.
+            assert!(!r.loaded, "{what}: {r:?}");
+            assert!(r.errors[0].contains("checksum"), "{what}: {r:?}");
+            // (The rebuilt archive may serialize to the very bytes, so the same name, as the
+            // intact one: what is left must match its name.)
+            assert_archives_intact(&dir);
+            assert_eq!((r.hits, r.misses), (0, names.len()), "{what}: {r:?}");
+            for name in &names {
+                let pso = k.pipeline(name);
+                assert!(
+                    pso.max_total_threads_per_threadgroup() >= 32,
+                    "{what}: {name}"
+                );
+            }
+            // Whatever happened, the file on disk is usable again: all hits next time.
+            let again =
+                ArchivedKernels::new_in(Some(dir.clone()), &device, "keccak", METAL_LIB, &names)
+                    .unwrap();
+            assert_eq!(
+                (again.report.hits, again.report.misses),
+                (names.len(), 0),
+                "{what}: after the repair: {:?}",
+                again.report
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Run `scatter_preflight` (built by `k`) on a fixed input with raw Metal calls; returns the
+    /// written cells, or the command buffer's error.
+    fn run_scatter(device: &metal::DeviceRef, k: &ArchivedKernels) -> Result<Vec<u32>, String> {
+        use risc0_circuit_keccak_sys::ScatterInfo;
+        let (rows, cols) = (64u32, 16u32);
+        let infos: Vec<ScatterInfo> = (0..rows)
+            .map(|r| ScatterInfo {
+                offset: r,
+                row: r,
+                col: (r % 4) as u16,
+                count: 12,
+                bits: [1u32, 2, 4, 8][r as usize % 4],
+            })
+            .collect();
+        let from: Vec<u32> = (0..rows + 32)
+            .map(|i| 0x9e37_79b9u32.wrapping_mul(i + 1))
+            .collect();
+        let opts = metal::MTLResourceOptions::StorageModeShared;
+        let new_buf = |bytes: &[u8]| {
+            device.new_buffer_with_data(bytes.as_ptr().cast(), bytes.len() as u64, opts)
+        };
+        let into = new_buf(&vec![0xffu8; (rows * cols * 4) as usize]);
+        let infos_buf =
+            new_buf(unsafe { std::slice::from_raw_parts(infos.as_ptr().cast(), infos.len() * 16) });
+        let from_buf = new_buf(bytemuck::cast_slice(&from));
+        let fault = new_buf(&[0u8; 4]);
+        let params = [rows, cols, infos.len() as u32, from.len() as u32];
+        let queue = device.new_command_queue();
+        let cmd = queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+        let pso = k.pipeline("scatter_preflight");
+        enc.set_compute_pipeline_state(pso);
+        enc.set_buffer(0, Some(&into), 0);
+        enc.set_buffer(1, Some(&infos_buf), 0);
+        enc.set_buffer(2, Some(&from_buf), 0);
+        enc.set_buffer(3, Some(&fault), 0);
+        enc.set_bytes(4, 16, params.as_ptr().cast());
+        enc.dispatch_threads(
+            metal::MTLSize::new(infos.len() as u64, 1, 1),
+            metal::MTLSize::new(64, 1, 1),
+        );
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+        if cmd.status() != metal::MTLCommandBufferStatus::Completed {
+            return Err(format!("command buffer status {:?}", cmd.status()));
+        }
+        let mut out = vec![0u32; (rows * cols) as usize];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                into.contents().cast::<u32>(),
+                out.as_mut_ptr(),
+                out.len(),
+            );
+            out.push(*fault.contents().cast::<u32>());
+        }
+        Ok(out)
+    }
+
+    /// Flip 16 bytes at every `step`-th offset of a `scatter_preflight`-only archive (about
+    /// 20 KB); for each damaged file, build the PSO through the archive dir and, whenever the
+    /// archive served a hit, run the kernel and compare with the intact PSO's output. With
+    /// `bypass`, the damaged file is renamed to carry its own checksum, so Metal itself gets it
+    /// (this is what aborts the process: see the module doc). Returns
+    /// (rejected, loaded-but-recompiled, hits with the right output, bad hits).
+    fn bitflip_sweep(step: usize, from: usize, bypass: bool) -> (usize, usize, usize, Vec<String>) {
+        let device = device();
+        let dir = temp_dir(if bypass { "bitflip-bypass" } else { "bitflip" });
+        let names = ["scatter_preflight"];
+        let good = ArchivedKernels::new_in(Some(dir.clone()), &device, "keccak", METAL_LIB, &names)
+            .unwrap();
+        let expected = run_scatter(&device, &good).unwrap();
+        let path = good.report.path.clone().unwrap();
+        let base = super::archive_base(&dir, &device, "keccak", METAL_LIB, &names);
+        let bytes = std::fs::read(&path).unwrap();
+        let window = 16.min(step);
+        let trace = std::env::var("K8_FLIP_TRACE").is_ok();
+        let (mut rejected, mut recompiled, mut hits_ok, mut hits_bad) = (0, 0, 0, Vec::new());
+        let mut at = from;
+        while at < bytes.len() {
+            let mut b = bytes.clone();
+            for x in &mut b[at..(at + window).min(bytes.len())] {
+                *x ^= 0xa5;
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let target = if bypass {
+                super::archive_file(&base, &b)
+            } else {
+                path.clone()
+            };
+            std::fs::write(&target, &b).unwrap();
+            if trace {
+                eprintln!("flip at {at}");
+            }
+            let k =
+                ArchivedKernels::new_in(Some(dir.clone()), &device, "keccak", METAL_LIB, &names)
+                    .unwrap();
+            if !k.report.loaded {
+                rejected += 1;
+            } else if k.report.hits == 0 {
+                recompiled += 1;
+            } else {
+                if trace {
+                    eprintln!("  hit at {at}: running the kernel");
+                }
+                match run_scatter(&device, &k) {
+                    Ok(out) if out == expected => hits_ok += 1,
+                    Ok(_) => hits_bad.push(format!("{at}: wrong output")),
+                    Err(e) => hits_bad.push(format!("{at}: {e}")),
+                }
+            }
+            at += step;
+        }
+        println!(
+            "archive of {} bytes, {window}-byte flips every {step} from {from} (bypass {bypass}): \
+             file rejected {rejected}, loaded but kernel recompiled {recompiled}, hit with the \
+             right output {hits_ok}, hit with a wrong output or GPU error {}: {:?}",
+            bytes.len(),
+            hits_bad.len(),
+            &hits_bad[..hits_bad.len().min(10)]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        (rejected, recompiled, hits_ok, hits_bad)
+    }
+
+    /// Damage anywhere in an archive file is caught by its checksum: every flipped file is
+    /// rejected, and the process survives (before K8 the flip at byte 10240 of this archive
+    /// aborted it inside Metal: `std::length_error`, uncaught).
+    #[test]
+    fn archive_bitflip_sweep() {
+        let _gpu = super::super::tests::gpu_test_lock();
+        let (rejected, recompiled, hits_ok, bad) = bitflip_sweep(512, 0, false);
+        assert!(bad.is_empty(), "{bad:?}");
+        assert_eq!((recompiled, hits_ok), (0, 0));
+        assert!(rejected > 0);
+    }
+
+    /// Probe of Metal's own handling of damaged archives (`--ignored`; aborts the process on
+    /// macOS 27.2 build 26B131): the damaged file is renamed to match its checksum.
+    /// `K8_FLIP_STEP` (default 512), `K8_FLIP_FROM` (default 0), `K8_FLIP_TRACE=1`.
+    #[test]
+    #[ignore]
+    fn archive_bitflip_probe() {
+        let _gpu = super::super::tests::gpu_test_lock();
+        let env = |k: &str, d: usize| std::env::var(k).map_or(d, |s| s.parse().unwrap());
+        let (_, _, _, bad) = bitflip_sweep(env("K8_FLIP_STEP", 512), env("K8_FLIP_FROM", 0), true);
+        assert!(bad.is_empty(), "{bad:?}");
+    }
+
     /// No directory: no archive, plain PSOs.
     #[test]
     fn archive_disabled() {
+        let _gpu = super::super::tests::gpu_test_lock();
         let device = device();
         let names = small_set();
         let k = ArchivedKernels::new_in(None, &device, "keccak", METAL_LIB, &names).unwrap();

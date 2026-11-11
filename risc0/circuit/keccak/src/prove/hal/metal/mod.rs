@@ -204,7 +204,7 @@ pub fn keccak_prover() -> Result<Box<dyn KeccakProver>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{
         cell::Cell,
         rc::Rc,

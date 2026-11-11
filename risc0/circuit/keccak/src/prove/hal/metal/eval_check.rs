@@ -626,16 +626,13 @@ mod tests {
             params.steps,
         );
         hal.set_working_set_limit(None);
-        // The budget is against the whole process's Metal memory, which tests running in
-        // parallel change: the chunk is exactly 4096 when this test runs alone
-        // (`--test-threads=1`), and in any case a halving of the default ([fit_chunk] is
-        // tested exactly below).
+        // The budget is against the whole process's Metal memory: every test that allocates
+        // Metal memory takes `gpu_test_lock` (K5, K8), so nothing else allocates or frees while
+        // this runs and the chunk is exactly the one that fits, under the default parallel
+        // harness too (K8: the lock-free `prove::tests` and archive tests used to race it).
         let stride = circuit_hal.eval_scratch_bytes() / scratch_bytes(1);
         println!("po2 14 under a budget: chunk {stride}");
-        assert!(stride >= 1024 && stride <= DEFAULT_EVAL_CHUNK as u64 && stride.is_power_of_two());
-        if std::env::var("RUST_TEST_THREADS").as_deref() == Ok("1") {
-            assert_eq!(stride, 4096);
-        }
+        assert_eq!(stride, 4096);
         assert_same("po2 14 under budget", &check.to_vec(), &expected);
     }
 
