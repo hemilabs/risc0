@@ -48,6 +48,15 @@ const CTRL_CACHE_CAP: usize = 4;
 type HostCtrlCache = Vec<(super::CtrlKey, Arc<Vec<BabyBearElem>>)>;
 static CTRL_CACHE: LazyLock<Mutex<HostCtrlCache>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
+/// The host ctrl cache, poison-tolerant (C10): every entry is inserted whole, so a panic on
+/// another thread while it held the lock cannot leave a torn entry, and a poisoned lock must not
+/// fail every later proof of the process.
+pub(crate) fn ctrl_cache() -> std::sync::MutexGuard<'static, HostCtrlCache> {
+    CTRL_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn ctrl_matches(ctrl: &[BabyBearElem], zkr: &Program, total_cycles: usize) -> bool {
     use rayon::prelude::*;
     let ctrl_size = zkr.code_size;
@@ -66,9 +75,7 @@ fn ctrl_matches(ctrl: &[BabyBearElem], zkr: &Program, total_cycles: usize) -> bo
 pub(crate) fn host_ctrl_for(zkr: &Program) -> Arc<Vec<BabyBearElem>> {
     let total_cycles = 1usize << zkr.po2;
     let key = super::ctrl_cache_key(zkr);
-    let hit = CTRL_CACHE
-        .lock()
-        .unwrap()
+    let hit = ctrl_cache()
         .iter()
         .find(|e| e.0 == key)
         .map(|e| e.1.clone());
@@ -93,7 +100,7 @@ pub(crate) fn host_ctrl_for(zkr: &Program) -> Arc<Vec<BabyBearElem>> {
             });
     }
     let v = Arc::new(v);
-    let mut cache = CTRL_CACHE.lock().unwrap();
+    let mut cache = ctrl_cache();
     cache.retain(|e| e.0 != key);
     if cache.len() >= CTRL_CACHE_CAP {
         cache.remove(0);
@@ -115,7 +122,9 @@ fn prewitgen_check_due(key: super::CtrlKey) -> bool {
         Ok("0") => false,
         Ok("1") | Ok("always") => true,
         Ok("once") => {
-            let mut c = CHECKED.lock().unwrap();
+            let mut c = CHECKED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if c.contains(&key) {
                 false
             } else {

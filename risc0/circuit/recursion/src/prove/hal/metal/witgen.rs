@@ -55,7 +55,10 @@ use risc0_zkp::{
 };
 
 use super::{grow, host_slice, MetalCircuitHal, Phase};
-use crate::prove::{hal::CircuitWitnessGenerator, witgen::HostChains};
+use crate::{
+    prove::{hal::CircuitWitnessGenerator, witgen::HostChains},
+    CircuitImpl, CIRCUIT,
+};
 
 const CYCLE_WORDS: usize = std::mem::size_of::<RawPreflightCycle>() / 4;
 const _: () = assert!(std::mem::size_of::<RawPreflightCycle>() == 8);
@@ -316,6 +319,37 @@ fn apply_host_chains(
             unsafe { *p.0.add(col + c as usize) = rows[i * data_cols + k] };
         }
     });
+    Ok(())
+}
+
+/// The buffer shapes every witgen path relies on (C10): the step kernels and the CPU witgen
+/// write every data column and read every ctrl column at `col * total_cycles + (row & mask)`,
+/// and the globals at fixed indices, without further bounds checks. A short buffer would be an
+/// out-of-bounds GPU write into whatever follows it, so it is an error before anything is encoded.
+fn check_witgen_shapes(
+    total_cycles: u32,
+    preflight: &RawPreflightTrace,
+    ctrl: &BufferImpl<BabyBearElem>,
+    data: &BufferImpl<BabyBearElem>,
+    global: &BufferImpl<BabyBearElem>,
+) -> Result<()> {
+    use risc0_zkp::adapter::{CircuitInfo as _, TapsProvider as _};
+    let steps = total_cycles as usize;
+    ensure!(
+        steps.is_power_of_two() && preflight.num_cycles as usize <= steps,
+        "recursion Metal Witgen: {} cycles in {steps} rows",
+        preflight.num_cycles
+    );
+    for (name, have, need) in [
+        ("ctrl", ctrl.size(), CIRCUIT.ctrl_size() * steps),
+        ("data", data.size(), CIRCUIT.data_size() * steps),
+        ("global", global.size(), CircuitImpl::OUTPUT_SIZE),
+    ] {
+        ensure!(
+            have >= need,
+            "recursion Metal Witgen: {name} has {have} elements, needs {need} for {steps} rows"
+        );
+    }
     Ok(())
 }
 
@@ -670,6 +704,7 @@ impl<MH: MetalHash> CircuitWitnessGenerator<MetalHal<MH>> for MetalCircuitHal<MH
         global: &BufferImpl<BabyBearElem>,
     ) -> Result<()> {
         self.enter(Phase::Witgen);
+        check_witgen_shapes(total_cycles, preflight, ctrl, data, global)?;
         match mode {
             // As CUDA: host chains apply to the Parallel mode only.
             StepMode::Parallel if *WITGEN_CHECK => {
