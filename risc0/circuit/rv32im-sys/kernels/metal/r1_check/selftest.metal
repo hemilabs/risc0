@@ -109,6 +109,7 @@ kernel void witgen_selftest(device Fp* data [[buffer(0)]],
   }
   PreflightTrace pf;
   pf.cycles = cycles;
+  pf.cyclesLen = p.rows;
   pf.txns = txns;
   pf.bigintBytes = nullptr;
   pf.txnsLen = 0;

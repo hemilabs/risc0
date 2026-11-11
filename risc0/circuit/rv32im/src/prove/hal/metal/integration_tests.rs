@@ -23,8 +23,9 @@
 //!   the peak GPU memory of each prover phase ([super::PHASE_MARKS]); `R11_CPU=0` skips the CPU
 //!   prover. Over a `RISC0_METAL_MAX_WORKING_SET_BYTES` budget the failing allocation is reported.
 //!
-//! Which circuit phases run on the GPU is the production default (witgen on the CPU kernel unless
-//! `RISC0_METAL_RV32IM_GPU_PHASES=witgen`, see witgen.rs); run these once per configuration.
+//! Which circuit phases run on the GPU is the production default (all three since R17;
+//! `RISC0_METAL_RV32IM_CPU_PHASES=witgen` puts witgen on the CPU kernel, see witgen.rs); run these
+//! once per configuration.
 
 use std::{
     panic::{catch_unwind, AssertUnwindSafe},
@@ -37,7 +38,7 @@ use risc0_core::field::Elem as _;
 use risc0_zkp::hal::metal::MetalHalPoseidon2;
 use test_log::test;
 
-use super::{witgen::gpu_phase, PHASE_MARKS, PHASE_MARKS_ON};
+use super::{PHASE_MARKS, PHASE_MARKS_ON};
 use crate::{
     execute::{
         segment::Segment,
@@ -110,9 +111,8 @@ fn riscv_programs(names: &[&str]) -> Vec<(String, Program)> {
 }
 
 fn phases_label() -> &'static str {
-    if gpu_phase("witgen") && !super::cpu_phase("witgen") {
-        "all three phases on the GPU (UNRELIABLE: the GPU witgen opt-in is not bit-exact, \
-         notes/R11.md; a pass here is not evidence that it is correct)"
+    if !super::witgen::cpu_witgen() {
+        "all three phases on the GPU"
     } else {
         "witgen on the CPU kernel, accum + eval_check on the GPU"
     }

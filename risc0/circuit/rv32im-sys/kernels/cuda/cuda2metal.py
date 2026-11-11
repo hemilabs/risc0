@@ -49,7 +49,14 @@ rewrote; anything it cannot translate faithfully raises TranslateError (no silen
   sbind          `auto [a, b] = e;` -> `auto c2m_sbK = e; auto a = c2m_sbK[0]; ...`.
   lambda         `T x = map(a[, b], ([&](..) {..; return e;}));` and the reduce forms ->
                  explicit loops over the arrays (one top-level `return` at the end of the
-                 lambda body is required; anything else is an error).
+                 lambda body is required; anything else is an error). With
+                 `translate(map_lowering='unroll')` (witgen_tu_gen.py, R17) each site becomes one
+                 block per element instead, in element order, values in scalars: the map's array
+                 is brace-initialized from them, the reduce's accumulator is threaded through
+                 `c2m_accK_0..N` (the element count comes from the array typedef). A loop that
+                 writes a default-constructed private array after calling a noinline function is
+                 the shape in which the Apple GPU loses the last store (docs/metal-port/notes/
+                 R17.md).
   fpp            `Fp** args` -> `device Fp* args_0, ..., args_{K-1}`; `args[k]` -> `args_k`
                  (K = 1 + the largest literal index used in the definition).
   kernel         `__global__` kernel signature synthesis: [[max_total_threads_per_threadgroup]]
@@ -626,7 +633,7 @@ def _reindent(text, old, new):
     return '\n'.join(out)
 
 
-def expand_one_site(s, uniq, counts):
+def expand_one_site(s, uniq, counts, map_lowering='loop', typedefs=None):
     """Expand the last map/reduce call site of s (it contains no other site). Returns new s or
     None when there is no site."""
     m = mask(s)
@@ -692,18 +699,63 @@ def expand_one_site(s, uniq, counts):
                                      % where(s, bs))
             elem_params.append((params[2], 'LAYOUT_SUBSCRIPT(%s, %s)' % (bv, it)))
         sink = '%s = ' % acc
-    lines.append('%sfor (uint %s = 0; %s < %s.size(); %s++) {' % (ind, it, it, av, it))
-    for (pt, pn), src in elem_params:
-        lines.append('%s%s %s = %s;' % (ind2, pt, pn, src))
     body = s[bs:r].rstrip()
     body_lines = body.split('\n')
     # body indentation: that of its first non-blank line
     first = next((l for l in body_lines if l.strip()), '')
     old_ind = first[:len(first) - len(first.lstrip())]
     body = _reindent(body.strip('\n'), old_ind, ind2) if body.strip() else ''
+    expr = ' '.join(s[es:ee].split())
+    if map_lowering == 'unroll':
+        # One block per element, in element order (CUDA's loop order, so the calls' side effects
+        # keep their order), each leaving its value in its own scalar; a map's array is then
+        # brace-initialized from the scalars, a reduce's accumulator is threaded through the
+        # blocks as c2m_accK_0 .. c2m_accK_N. No private array is default-constructed and then
+        # written element by element in a loop that calls a function: the shape the Apple GPU
+        # loses the last store of (docs/metal-port/notes/R17.md).
+        if kind == 'map':
+            arr = rtype
+        else:
+            decls = re.findall(r'\b(\w+)\s+%s\s*=' % re.escape(arg_txt[0]), m[:mo.start()]) \
+                if re.match(r'^\w+$', arg_txt[0]) else []
+            arr = decls[-1] if decls else None
+        if arr not in (typedefs or {}):
+            raise TranslateError('%s at %s: the array type %s is not a known array typedef '
+                                 '(needed to unroll it)' % (kind, where(s, mo.start()), arr))
+        etype, n = typedefs[arr]
+        n = int(n)
+        if kind == 'map':
+            lines.pop()  # the default-constructed result declaration
+            outs = ['c2m_r%d_%d' % (k, j) for j in range(n)]
+        else:
+            lines[1] = lines[1].replace('auto %s =' % acc, '%s %s_0 =' % (rtype, acc), 1)
+            outs = ['%s_%d' % (acc, j + 1) for j in range(n)]
+        for j in range(n):
+            lines.append('%s%s %s;' % (ind, etype if kind == 'map' else rtype, outs[j]))
+            lines.append('%s{' % ind)
+            for (pt, pn), src in elem_params:
+                src = '%s_%d' % (acc, j) if kind == 'reduce' and src == acc \
+                    else src.replace('[%s]' % it, '[%d]' % j).replace(', %s)' % it, ', %d)' % j)
+                lines.append('%s%s %s = %s;' % (ind2, pt, pn, src))
+            if body.strip():
+                lines.append(body)
+            lines.append('%s%s = %s;' % (ind2, outs[j], expr))
+            lines.append('%s}' % ind)
+        if kind == 'map':
+            lines.append('%s%s %s = {{%s}};' % (ind, rtype, rname, ', '.join(outs)))
+        else:
+            lines.append('%s%s %s = %s;' % (ind, rtype, rname, outs[-1]))
+        counts.add('lambda.' + kind)
+        counts.add('lambda.%s.unroll' % kind)
+        return s[:decl_s] + '\n'.join(lines) + s[stmt_end:]
+    if map_lowering != 'loop':
+        raise TranslateError('unknown map_lowering %r' % map_lowering)
+    lines.append('%sfor (uint %s = 0; %s < %s.size(); %s++) {' % (ind, it, it, av, it))
+    for (pt, pn), src in elem_params:
+        lines.append('%s%s %s = %s;' % (ind2, pt, pn, src))
     if body.strip():
         lines.append(body)
-    lines.append('%s%s%s;' % (ind2, sink, ' '.join(s[es:ee].split())))
+    lines.append('%s%s%s;' % (ind2, sink, expr))
     lines.append('%s}' % ind)
     if kind == 'reduce':
         lines.append('%s%s %s = %s;' % (ind, rtype, rname, acc))
@@ -711,7 +763,7 @@ def expand_one_site(s, uniq, counts):
     return s[:decl_s] + '\n'.join(lines) + s[stmt_end:]
 
 
-def pass_lambda(s, counts, uniq):
+def pass_lambda(s, counts, uniq, map_lowering='loop', typedefs=None):
     m = mask(s)
     if '[&]' not in m and '[=]' not in m:
         return s
@@ -722,7 +774,7 @@ def pass_lambda(s, counts, uniq):
             continue
         body = s[o:c + 1]
         while True:
-            nb = expand_one_site(body, uniq, counts)
+            nb = expand_one_site(body, uniq, counts, map_lowering, typedefs)
             if nb is None:
                 break
             body = nb
@@ -1321,7 +1373,7 @@ ALL_PASSES = ('kernel', 'strip', 'include', 'accum_guard', 'array', 'value_type'
 
 
 def translate(src, typedefs=None, passes=ALL_PASSES, counts=None, uniq=None, strict=True,
-              include_map=None, metal_ns=METAL_NS):
+              include_map=None, metal_ns=METAL_NS, map_lowering='loop'):
     """Translate CUDA text. Returns (text, counts). Raises TranslateError. include_map and
     metal_ns override INCLUDE_MAP and the target namespace (eval mode)."""
     counts = Counts() if counts is None else counts
@@ -1352,7 +1404,7 @@ def translate(src, typedefs=None, passes=ALL_PASSES, counts=None, uniq=None, str
         elif p == 'sbind':
             s = pass_sbind(s, counts, uniq)
         elif p == 'lambda':
-            s = pass_lambda(s, counts, uniq)
+            s = pass_lambda(s, counts, uniq, map_lowering, typedefs)
         elif p == 'fpp':
             s = pass_fpp(s, counts)
         elif p == 'qual':
@@ -1617,6 +1669,15 @@ def _selftest_cases():
     cases.append(dict(name='lambda_reduce', pass_='lambda', ctx='steps',
                       src=_extract_function(steps, r'=\s*reduce\('),
                       expect={'lambda.reduce': 1, 'value_type': 2}))
+    # The R17 unrolled lowering (witgen_tu_gen.py) of the same map and reduce sites.
+    cases.append(dict(name='lambda_map3_unroll', pass_='value_type/lambda', ctx='steps',
+                      src=_extract_function(steps, r'NondetRegStruct3Array x2 =\s*map\('),
+                      topts={'map_lowering': 'unroll'},
+                      expect={'lambda.map': 1, 'lambda.map.unroll': 1, 'value_type': 2}))
+    cases.append(dict(name='lambda_reduce_unroll', pass_='lambda', ctx='steps',
+                      src=_extract_function(steps, r'=\s*reduce\('),
+                      topts={'map_lowering': 'unroll'},
+                      expect={'lambda.reduce': 1, 'lambda.reduce.unroll': 1, 'value_type': 2}))
     # structured bindings (getMemoryTxn: 5 names; bigIntExtern: 16 names).
     cases.append(dict(name='sbind5', pass_='sbind', ctx='steps',
                       src=_extract_function(steps, r'auto \[x3, x4, x5, x6, x7\] = INVOKE_EXTERN'),

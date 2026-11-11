@@ -228,7 +228,7 @@ PINNED_METAL_COMMON = {
 }
 PINNED_METAL = {
     'always': dict(PINNED_METAL_COMMON, **{'qual.forceinline': 58}),
-    'noinline': dict(PINNED_METAL_COMMON, **{'qual.noinline': 58}),
+    'noinline': dict(PINNED_METAL_COMMON, **{'qual.noinline': 58, 'lambda.map.unroll': 6}),
 }
 
 METAL_HEADER = '''\
@@ -264,9 +264,6 @@ namespace rv32im_metal {
 constant constexpr uint32_t kUserAccumSplitA = kLayout_TopAccum.columns.elems[0].col;
 } // namespace rv32im_metal
 
-#ifndef RV32IM_FAULT_ACCUM_PERM
-#define RV32IM_FAULT_ACCUM_PERM 0x20u // stepAccumA: perm[i] >= count (that row is skipped)
-#endif
 
 /// POD params (set_bytes); #[repr(C)] mirror on the Rust side, size asserted on both sides.
 struct AccumParams {
@@ -314,6 +311,7 @@ kernel void stepAccumA(device Fp* data [[buffer(0)]],
   // read (CUDA binds them anyway). C2M_ASSERT writes tables.bad.
   PreflightTrace preflight;
   preflight.cycles = nullptr;
+  preflight.cyclesLen = 0;
   preflight.txns = nullptr;
   preflight.bigintBytes = nullptr;
   preflight.txnsLen = 0;
@@ -372,7 +370,17 @@ def metal_tu(mode, tg=256):
     src = '\n'.join(['#include "witgen.h"', '', 'namespace %s {' % c2m.CUDA_NS] + protos + [''] +
                     fns + ['} // namespace %s' % c2m.CUDA_NS, ''])
     typedefs = c2m.collect_array_typedefs(c2m.read(os.path.join(HERE, 'types.cuh.inc')))
-    text, counts = c2m.translate(src, typedefs)
+    # R17: in the noinline fallback the map() loops would call the noinline back_* functions --
+    # the Apple GPU lost-store shape (docs/metal-port/notes/R17.md) -- so they are unrolled there.
+    # The default always-inline mode keeps CUDA's loop lowering (byte-identical output).
+    text, counts = c2m.translate(src, typedefs,
+                                 map_lowering='unroll' if mode == 'noinline' else 'loop')
+    if mode == 'noinline':
+        ns = text[text.index('namespace %s {' % c2m.METAL_NS):]
+        loops = len(re.findall(r'\b(for|while|do)\s*[({]', c2m.mask(ns)))
+        if loops:
+            raise c2m.TranslateError('%d loop(s) in the noinline accum call graph (R17 lost-store '
+                                     'shape): lower them without a loop first' % loops)
     n = text.count(qual_mid)
     text = text.replace(qual_mid, qual_out)
     counts.add('qual_rewrite', n)

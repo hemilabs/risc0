@@ -117,8 +117,245 @@ fn generator_ci_checks() {
     );
     // to_metal.py's pin is checked in this mode too (TO_METAL_EXPECT).
     run_ok(&["kernels/cuda/evalfast/regen.py", "--check"]);
-    // R17 owns witgen_tu_gen.py; its --check covers witgen_tu.cu only (see the R16 note).
-    run_ok(&["kernels/cuda/witgen_tu_gen.py", "--check"]);
+    // R17: witgen_tu_gen.py --check also translates --metal in memory (pins, no-loop check).
+    let log = run_ok(&["kernels/cuda/witgen_tu_gen.py", "--check"]);
+    assert!(
+        log.contains("--metal translates") && log.contains("map lowering unroll"),
+        "{log}"
+    );
+}
+
+/// `witgen_tu_gen.py --check` fails when the Metal translation no longer matches PINNED_METAL,
+/// and the translation refuses a loop in the call graph (R17: the shape of the Apple GPU
+/// lost-store defect, notes/R17.md), whatever the pins say.
+#[test]
+fn witgen_check_detects_pin_mismatch_and_loops() {
+    let script = r#"
+import sys
+sys.dont_write_bytecode = True
+sys.path.insert(0, 'kernels/cuda')
+import witgen_tu_gen as g
+import cuda2metal as c2m
+g.gen_metal()
+g.gen_metal(map_lowering='loop')
+g.PINNED_METAL['counts']['lambda.map.unroll'] += 1
+try:
+    g.main_cuda(True)
+except SystemExit as e:
+    assert e.code not in (None, 0), e.code
+    print('pin mismatch rejected')
+else:
+    raise AssertionError('--check accepted a changed pin')
+g.PINNED_METAL['counts']['lambda.map.unroll'] -= 1
+orig = c2m.translate
+def with_loop(*a, **k):
+    t, c = orig(*a, **k)
+    i = t.rindex('} // namespace rv32im_metal')
+    return t[:i] + 'static void c2m_extra() { for (uint i = 0; i < 2; i++) {} }\n' + t[i:], c
+c2m.translate = with_loop
+try:
+    g.gen_metal(no_pin=True)
+except c2m.TranslateError as e:
+    assert 'loop' in str(e), e
+    print('loop rejected')
+else:
+    raise AssertionError('a loop in the call graph was accepted')
+"#;
+    let log = run_ok(&["-c", script]);
+    assert!(
+        log.contains("pin mismatch rejected") && log.contains("loop rejected"),
+        "{log}"
+    );
+}
+
+/// R17 fix round 1: what the witgen TU actually compiles -- witgen_tu.metal preprocessed with this
+/// build's include path (`xcrun metal -E`) -- has no loop outside the Metal SDK beyond the ones
+/// reviewed in witgen_tu_gen.py's SCAN_LOOP_ALLOW, includes the generated witgen_fpext.h (the
+/// shared fpext.h with its 4-element loops unrolled) and not the shared fpext.h. Then the scanner
+/// must reject an extra loop in a header, and gen_fpext a loop it cannot unroll.
+#[test]
+fn witgen_tu_preprocessed_loops_reviewed() {
+    if skipped_build() {
+        eprintln!("RISC0_SKIP_BUILD_KERNELS build: no generator ran, nothing to check");
+        return;
+    }
+    let out_dir = PathBuf::from(env!("RV32IM_METAL_GENERATORS"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let gen_dir = out_dir.join("metal");
+    let scratch = Scratch::new("witgen_tu_i");
+    let pre = scratch.0.join("witgen_tu.i");
+    let out = Command::new("xcrun")
+        .args(["-sdk", "macosx", "metal", "-E", "-std=metal3.2", "-I"])
+        .arg(out_dir.join("_sys_"))
+        .arg("-I")
+        .arg(crate_dir().join("kernels/metal"))
+        .arg("-I")
+        .arg(&gen_dir)
+        .arg(gen_dir.join("witgen_tu.metal"))
+        .arg("-o")
+        .arg(&pre)
+        .output()
+        .expect("xcrun metal -E (source env.sh)");
+    assert!(out.status.success(), "metal -E failed:\n{}", text(&out));
+    let body = std::fs::read_to_string(&pre).unwrap();
+    assert!(
+        body.contains("/witgen_fpext.h\""),
+        "witgen_fpext.h not included"
+    );
+    assert!(
+        !body.contains("_sys_/fpext.h\""),
+        "the shared fpext.h is included"
+    );
+    let log = run_ok(&[
+        "kernels/cuda/witgen_tu_gen.py",
+        "--scan-loops",
+        pre.to_str().unwrap(),
+    ]);
+    assert!(log.contains("all reviewed"), "{log}");
+    let script = r#"
+import sys
+sys.dont_write_bytecode = True
+sys.path.insert(0, 'kernels/cuda')
+sys.argv = ['x']
+import witgen_tu_gen as g
+import cuda2metal as c2m
+pre = open(PRE).read()
+found, bad = g.scan_loops(pre)
+assert not bad, bad
+extra = pre + '\n# 1 "/x/kernels/metal/witgen.h"\ninline void f() { for (int j = 0; j < 2; j++) { g(); } }\n'
+found, bad = g.scan_loops(extra)
+assert any('witgen.h' in b for b in bad), bad
+print('extra loop rejected')
+src = open(g.FPEXT_SRC_DEFAULT).read()
+g.gen_fpext(src)
+try:
+    g.gen_fpext(src.replace('constexpr inline FpExt zeroize() {',
+                            'constexpr inline FpExt zeroize() {\n    for (int j = 0; j < 4; j++) {}', 1),
+                no_pin=True)
+except c2m.TranslateError as e:
+    assert 'loop' in str(e), e
+    print('fpext loop rejected')
+g.PINNED_FPEXT['loop.unroll4'] += 1
+try:
+    g.gen_fpext(src)
+except c2m.TranslateError as e:
+    print('fpext pin rejected')
+"#
+    .replace("PRE", &format!("{:?}", pre.to_str().unwrap()));
+    let log = run_ok(&["-c", &script]);
+    assert!(
+        log.contains("extra loop rejected")
+            && log.contains("fpext loop rejected")
+            && log.contains("fpext pin rejected"),
+        "{log}"
+    );
+    drop(scratch);
+}
+
+/// R17 round 2: no FpExt operation of the witgen TU is compiled out of line. The TU as built is
+/// compiled to LLVM IR at -O0 and -Oz (where the round-1 copy of fpext.h left `operator*(FpExt,
+/// Fp)` and friends out of line, and lost elems[3] of PoseidonState.zcheck), and `--scan-ir`
+/// must find no defined FpExt member, operator or inv(FpExt). The scanner must flag the
+/// round-1 shape (`--fpext-calls outline`, compiled at -O0) and gen_fpext must refuse a
+/// constexpr line it did not mark always_inline.
+#[test]
+fn witgen_tu_fpext_always_inline_in_ir() {
+    if skipped_build() {
+        eprintln!("RISC0_SKIP_BUILD_KERNELS build: no generator ran, nothing to check");
+        return;
+    }
+    let out_dir = PathBuf::from(env!("RV32IM_METAL_GENERATORS"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let gen_dir = out_dir.join("metal");
+    let scratch = Scratch::new("witgen_tu_ll");
+    let emit = |src_dir: &Path, opt: &str, ll: &Path| {
+        let out = Command::new("xcrun")
+            .args([
+                "-sdk",
+                "macosx",
+                "metal",
+                "-std=metal3.2",
+                "-Wno-unused-variable",
+            ])
+            .args(["-S", "-emit-llvm", opt, "-c"])
+            .arg(src_dir.join("witgen_tu.metal"))
+            .arg("-I")
+            .arg(out_dir.join("_sys_"))
+            .arg("-I")
+            .arg(crate_dir().join("kernels/metal"))
+            .arg("-I")
+            .arg(src_dir)
+            .arg("-o")
+            .arg(ll)
+            .output()
+            .expect("xcrun metal -S -emit-llvm (source env.sh)");
+        assert!(
+            out.status.success(),
+            "metal -emit-llvm {opt} failed:\n{}",
+            text(&out)
+        );
+    };
+    for opt in ["-O0", "-Oz"] {
+        let ll = scratch.0.join(format!("witgen_tu{opt}.ll"));
+        emit(&gen_dir, opt, &ll);
+        let log = run_ok(&[
+            "kernels/cuda/witgen_tu_gen.py",
+            "--scan-ir",
+            ll.to_str().unwrap(),
+        ]);
+        assert!(
+            log.contains("no out-of-line FpExt operation"),
+            "{opt}: {log}"
+        );
+    }
+    // Positive control: the round-1 copy, compiled at -O0, is flagged.
+    let base = scratch.0.join("outline");
+    std::fs::create_dir_all(&base).unwrap();
+    run_ok(&[
+        "kernels/cuda/witgen_tu_gen.py",
+        "--metal",
+        "-o",
+        base.to_str().unwrap(),
+        "--fpext-src",
+        out_dir.join("witgen_fpext_src.h").to_str().unwrap(),
+        "--fpext-calls",
+        "outline",
+    ]);
+    let ll = base.join("witgen_tu.ll");
+    emit(&base, "-O0", &ll);
+    let out = run(&[
+        "kernels/cuda/witgen_tu_gen.py",
+        "--scan-ir",
+        ll.to_str().unwrap(),
+    ]);
+    assert!(
+        !out.status.success() && text(&out).contains("_Zml5FpExt"),
+        "--scan-ir did not flag the round-1 fpext copy:\n{}",
+        text(&out)
+    );
+    let script = r#"
+import sys
+sys.dont_write_bytecode = True
+sys.path.insert(0, 'kernels/cuda')
+sys.argv = ['x']
+import witgen_tu_gen as g
+import cuda2metal as c2m
+src = open(g.FPEXT_SRC_DEFAULT).read()
+txt, _, bad = g.gen_fpext(src)
+assert not bad and txt.count(g.FPEXT_ALWAYS_INLINE) == g.PINNED_FPEXT['fn.always_inline'], bad
+try:
+    g.gen_fpext(src.replace('  constexpr Fp constPart() const', '  inline constexpr Fp constPart() const', 1), no_pin=True)
+except c2m.TranslateError as e:
+    assert 'always_inline' in str(e), e
+    print('unmarked constexpr rejected')
+"#;
+    let log = run_ok(&["-c", script]);
+    assert!(log.contains("unmarked constexpr rejected"), "{log}");
+    drop(scratch);
 }
 
 /// `accum_tu_gen.py --check` fails when the Metal translation no longer matches PINNED_METAL

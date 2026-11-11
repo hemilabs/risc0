@@ -14,7 +14,10 @@
 # limitations under the License.
 
 # usage: witgen_tu_gen.py [--check]
-#        witgen_tu_gen.py --metal -o OUTDIR [--check]
+#        witgen_tu_gen.py --metal -o OUTDIR [--check] [--no-pin] [--map-lowering unroll|loop]
+#                         [--fpext-src FPEXT_H] [--fpext-calls inline|outline]
+#        witgen_tu_gen.py --scan-loops PREPROCESSED_WITGEN_TU
+#        witgen_tu_gen.py --scan-ir WITGEN_TU_LL
 #
 # Writes witgen_tu.cu (CUDA only; build.rs compiles it as a whole-program TU, not
 # -dc): the step_Top call graph of steps.cu renamed (_W suffix) and marked
@@ -29,7 +32,9 @@
 # cannot move those loads either.
 #
 # Re-run it after regenerating steps.cu or changing the copied parts of ffi.cu;
-# --check (run in CI) fails if witgen_tu.cu is out of date.
+# --check (run in CI) fails if witgen_tu.cu is out of date, or if the Metal translation
+# (gen_metal(), in memory, no toolchain needed) fails or its rewrite counts differ from
+# PINNED_METAL.
 #
 # --metal (Metal port, item R5): writes OUTDIR/witgen_tu.metal instead (rv32im-sys/build.rs runs
 # it into $OUT_DIR/metal on every metal build; the output is never checked in). The same call
@@ -41,6 +46,15 @@
 # the chunked single-thread fwd_stepExec / rev_stepExec (seq_exec.h). An unchanged output file
 # is not rewritten (build.rs: a new mtime would rerun the build script). With --check it only
 # compares.
+#
+# map()/reduce() are unrolled in the Metal TU (R17, MAP_LOWERING): one block per element, values
+# in scalars, the result array brace-initialized. CUDA's lowering -- a default-constructed array
+# written element by element in a loop that calls a noinline step function -- is the code shape
+# in which the Apple GPU (M5 Max, macOS 27.2) loses the last iteration's store and the array
+# reads back its constructor value (docs/metal-port/notes/R17.md: ToBits<5>'s bit 4 in DynPo2,
+# ~1-200 wrong rows per po2 20 segment). The Metal call graph must not contain any loop
+# (gen_metal() refuses one); `--map-lowering loop` emits the old shape, only to build a
+# same-session baseline that still shows the defect (R17.md, "Re-verifying").
 import os, re, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -145,7 +159,9 @@ PINNED_METAL = {
         'aspace.thread': 388,
         'assert': 41,
         'lambda.map': 41,
+        'lambda.map.unroll': 41,
         'lambda.reduce': 1,
+        'lambda.reduce.unroll': 1,
         'qual.device_fn': 388,
         'qual.noinline': 388,
         'sbind': 6,
@@ -156,11 +172,255 @@ PINNED_METAL = {
 # METAL_EXTERNS below is a hand port of it; when ffi.cu changes there, re-port and update this.
 FFI_EXTERN_SHA256 = '2f7c235c64764221bafb61042fd535c4cec37405772e13af28a7b5ff7a7cf1c9'
 
+# How the call graph's map()/reduce() sites are lowered (cuda2metal.py `map_lowering`): 'unroll'
+# (the default, R17) or 'loop' (CUDA's shape, which the Apple GPU miscompiles/misexecutes; only
+# for a baseline build). See the header comment.
+MAP_LOWERINGS = ('unroll', 'loop')
+# A `for`/`while`/`do` statement in the translated call graph (not the externs or kernels).
+_GRAPH_LOOP_RE = re.compile(r'\b(for|while|do)\s*[({]')
 
 
-def gen_metal(no_pin=False):
+
+# ------------------------------------------------------------------------------------------------
+# R17 fix round 1: witgen_fpext.h, the witgen TU's own copy of the shared fpext.h
+# ------------------------------------------------------------------------------------------------
+# The shared fpext.h (risc0/build_kernel/kernels/metal, staged into $OUT_DIR/_sys_) implements
+# FpExt's per-element operators as `for (uint32_t i = 0; i < 4; i++) elems[i] op= x` loops over
+# the 4-element private array. When the compiler calls Fp's operator out of line (front-end -Os,
+# -O1, -O0, or a different inlining decision after a toolchain update), that is the same
+# lost-store shape as the map() loops: the witgen build at -Os/-O1 loses elems[3] of
+# PoseidonState.zcheck (col 67, Poseidon0 minor-2 rows). witgen_tu.metal therefore includes a
+# copy of fpext.h (gen_dir/witgen_fpext.h, selected by RV32IM_FPEXT_HEADER in witgen.h and
+# ef_fpext.h) derived from the shared text here: every 4-element loop unrolled (same statements,
+# i = 0..3), and FpExt pow (a while loop storing a whole FpExt after an FpExt multiply) removed,
+# since the witgen graph does not use it (a future use fails to compile instead of
+# reintroducing a loop). The shared header and every other kernel are unchanged.
+#
+# R17 fix round 2: unrolling is not enough. Built at -O0 or -Oz the round-1 copy still lost
+# elems[3] of zcheck (col 67; the wrong value is the right one times a per-row field constant),
+# with no loop left in the source. Narrowed by always_inline subsets at -O0 (sorted amplifier,
+# same-session baselines): only the FpExt friend operators matter -- `operator*(FpExt lhs, Fp
+# rhs) { lhs *= rhs; return lhs; }` and its relatives, which write a by-value private FpExt
+# element by element and return it; called out of line, the last element store is lost (the
+# same lost-store defect without a loop). So the copy also (a) marks every function
+# __attribute__((always_inline)), which the front end honours at every -O level (no FpExt
+# operation is ever an out-of-line call in the witgen TU; `--scan-ir` checks the compiled IR),
+# and (b) builds the thread-space value constructors in the member initializer (elems{a, b, c,
+# d}) instead of default-constructing elems (an IR array-constructor loop) and assigning.
+FPEXT_SRC_DEFAULT = os.path.normpath(os.path.join(HERE, '..', '..', '..', '..', 'build_kernel',
+                                                  'kernels', 'metal', 'fpext.h'))
+# Rewrites of the shared fpext.h (zeroize, += x3, -= x3, *=Fp x3, ==; pow removed). A change
+# means fpext.h changed shape: review the new copy, then update these numbers.
+PINNED_FPEXT = {'loop.unroll4': 11, 'pow.removed': 1, 'ctor.brace': 4, 'fn.always_inline': 50}
+# (shared-header text, witgen-copy text): FpExt's thread-space constructors, built in place.
+_FPEXT_CTORS = [
+    ('  constexpr FpExt() {}\n', '  constexpr FpExt() : elems{Fp(), Fp(), Fp(), Fp()} {}\n'),
+    ('  explicit constexpr FpExt(uint32_t x) {\n    elems[0] = x;\n    elems[1] = 0;\n'
+     '    elems[2] = 0;\n    elems[3] = 0;\n  }\n',
+     '  explicit constexpr FpExt(uint32_t x) : elems{Fp(x), Fp(), Fp(), Fp()} {}\n'),
+    ('  explicit constexpr FpExt(Fp x) {\n    elems[0] = x;\n    elems[1] = 0;\n'
+     '    elems[2] = 0;\n    elems[3] = 0;\n  }\n',
+     '  explicit constexpr FpExt(Fp x) : elems{x, Fp(), Fp(), Fp()} {}\n'),
+    ('  constexpr FpExt(Fp a, Fp b, Fp c, Fp d) {\n    elems[0] = a;\n    elems[1] = b;\n'
+     '    elems[2] = c;\n    elems[3] = d;\n  }\n',
+     '  constexpr FpExt(Fp a, Fp b, Fp c, Fp d) : elems{a, b, c, d} {}\n'),
+]
+# A function definition/declaration line of fpext.h: [static|friend|explicit ]constexpr ...
+_FPEXT_FN_RE = re.compile(r'(?m)^(\s*)((?:static |friend |explicit )*)(constexpr )')
+FPEXT_ALWAYS_INLINE = '__attribute__((always_inline)) '
+_FPEXT_LOOP_RE = re.compile(r'for \(uint32_t i = 0; i < 4; i\+\+\) \{')
+_FPEXT_POW_RE = re.compile(r'/// Raise an FpExt to a power\nconstexpr inline FpExt pow\(FpExt x, size_t n\) \{')
+FPEXT_GUARD = 'RV32IM_WITGEN_FPEXT'
+
+
+def gen_fpext(src, no_pin=False, inline=True):
+    """-> (witgen_fpext.h text, report, bad) from the shared fpext.h text. inline=False (only
+    for a same-session baseline, `--fpext-calls outline`) leaves out the round-2 rewrites."""
+    import cuda2metal as c2m
+    out, n_loop = src, 0
+    while True:
+        m = _FPEXT_LOOP_RE.search(c2m.mask(out))
+        if not m:
+            break
+        mk = c2m.mask(out)
+        ob = m.end() - 1
+        cb = c2m.match_close(mk, ob)
+        body = out[ob + 1:cb]
+        lines = [l for l in body.split('\n') if l.strip()]
+        ind = len(lines[0]) - len(lines[0].lstrip())
+        lines = [l[ind:] if l[:ind].strip() == '' else l for l in lines]
+        line0 = out.rfind('\n', 0, m.start()) + 1
+        pad = out[line0:m.start()]
+        rep = []
+        for k in range(4):
+            rep += [pad + re.sub(r'\bi\b', str(k), l) for l in lines]
+        out = out[:line0] + '\n'.join(rep) + out[cb + 1:]
+        n_loop += 1
+    n_pow = 0
+    m = _FPEXT_POW_RE.search(out)
+    if m:
+        cb = c2m.match_close(c2m.mask(out), m.end() - 1)
+        out = (out[:m.start()] + '// FpExt pow(FpExt, size_t): removed in the witgen copy (R17, '
+               'witgen_tu_gen.py gen_fpext).' + out[cb + 1:])
+        n_pow = 1
+    n_ctor = n_inl = 0
+    if inline:
+        for a, b in _FPEXT_CTORS:
+            n_ctor += out.count(a)
+            out = out.replace(a, b)
+        out, n_inl = _FPEXT_FN_RE.subn(r'\1\2' + FPEXT_ALWAYS_INLINE + r'\3', out)
+    got = {'loop.unroll4': n_loop, 'pow.removed': n_pow, 'ctor.brace': n_ctor,
+           'fn.always_inline': n_inl}
+    if not inline:
+        got.update({'ctor.brace': PINNED_FPEXT['ctor.brace'],
+                    'fn.always_inline': PINNED_FPEXT['fn.always_inline']})
+    bad = ['fpext %s: pinned %d, got %d' % (k, PINNED_FPEXT.get(k, 0), got.get(k, 0))
+           for k in sorted(set(PINNED_FPEXT) | set(got)) if PINNED_FPEXT.get(k, 0) != got.get(k, 0)]
+    report = 'fpext %s' % c2m.fmt_counts(got)
+    if bad and not no_pin:
+        raise c2m.TranslateError('fpext.h rewrite counts differ from PINNED_FPEXT (the shared '
+                                 'fpext.h changed shape; review gen_fpext):\n  ' + '\n  '.join(bad))
+    # Not waivable: no loop may be left (the point of the copy).
+    loops = _GRAPH_LOOP_RE.findall(c2m.mask(out))
+    if loops:
+        raise c2m.TranslateError('%d loop(s) left in the witgen fpext.h copy: the shared fpext.h '
+                                 'has a loop shape gen_fpext does not unroll' % len(loops))
+    if inline:
+        # Not waivable either: every constexpr function of the copy is always_inline.
+        plain = [l.strip() for l in c2m.mask(out).split('\n')
+                 if re.search(r'\bconstexpr\b', l) and FPEXT_ALWAYS_INLINE not in l]
+        if plain:
+            raise c2m.TranslateError('witgen fpext.h copy: constexpr line(s) without always_inline '
+                                     '(a declaration shape gen_fpext does not mark):\n  '
+                                     + '\n  '.join(plain[:5]))
+    if '#pragma once' not in out:
+        raise c2m.TranslateError('the shared fpext.h has no #pragma once')
+    out = out.replace('#pragma once', '#pragma once\n#define %s 1' % FPEXT_GUARD, 1)
+    head = ('// GENERATED by rv32im-sys/kernels/cuda/witgen_tu_gen.py --metal (gen_fpext) from the '
+            'shared\n// fpext.h -- do not edit. witgen_tu.metal\'s copy of fpext.h: every '
+            '4-element loop unrolled,\n// FpExt pow removed (R17 fix round 1), every function '
+            'always_inline and the value\n// constructors built in place (round 2); '
+            'docs/metal-port/notes/R17.md.\n')
+    if not inline:
+        head += '// BASELINE ONLY (--fpext-calls outline): no always_inline, no in-place ctors.\n'
+    return head + out, report, bad
+
+
+# Loops the preprocessed witgen TU may contain (outside the Metal SDK headers), keyed by
+# (file basename, loop header with whitespace collapsed) -> count, each reviewed for the
+# lost-store shape (a default-constructed private array written element by element in a loop
+# whose body calls an out-of-line function, then read). `--scan-loops FILE` (FILE: the output of
+# `xcrun metal -E` on witgen_tu.metal with the build's include path; tests/metal_generators.rs)
+# fails on any other loop.
+SCAN_LOOP_ALLOW = {
+    # Fp pow / inv: square-and-multiply on scalar Fp and an integer (no array).
+    ('fp.h', 'while (n != 0)'): 1,
+    # atomicCAS emulation (one per R0_C2M_ATOMICS instance) on device/threadgroup atomics, no
+    # private array.
+    ('cuda2metal.h', 'while (!metal::atomic_compare_exchange_weak_explicit('): 4,
+    # inv_chain: #pragma unroll, fixed trip count, scalar Fp only.
+    ('ef_fp.h', 'for (int i = 0; i < 3; i++)'): 1,
+    ('ef_fp.h', 'for (int i = 0; i < 4; i++)'): 1,
+    ('ef_fp.h', 'for (int k = 0; k < 4; k++)'): 1,
+    ('ef_fp.h', 'for (int i = 0; i < 6; i++)'): 1,
+    # fwd/rev_stepExec: one step per position; writes go to device buffers, no private array
+    # outlives an iteration.
+    ('seq_exec.h', 'for (uint32_t pos = p.begin; pos < p.end; pos++)'): 2,
+}
+_LINEMARK_RE = re.compile(r'^# (\d+) "([^"]*)"')
+_LOOP_HEAD_RE = re.compile(r'\b(for|while)\s*\(')
+
+
+def scan_loops(pre):
+    """Loops of preprocessed text outside the SDK -> ({(file, header): count}, unexpected)."""
+    import cuda2metal as c2m
+    cur, keep = None, []
+    for line in pre.split('\n'):
+        m = _LINEMARK_RE.match(line)
+        if m:
+            cur = m.group(2)
+            continue
+        own = cur and not cur.startswith('<') and '/usr/' not in cur and '.sdk/' not in cur \
+            and '/lib/clang/' not in cur and '/metal/macos' not in cur
+        keep.append((os.path.basename(cur) if own else None, line))
+    found = {}
+    # One file at a time, so a loop header never spans an SDK boundary.
+    texts = {}
+    for f, line in keep:
+        if f:
+            texts.setdefault(f, []).append(line)
+    for f, lines in texts.items():
+        t = '\n'.join(lines)
+        mk = c2m.mask(t)
+        for m in _LOOP_HEAD_RE.finditer(mk):
+            ob = m.end() - 1
+            try:
+                cb = c2m.match_close(mk, ob)
+            except c2m.TranslateError:
+                cb = ob
+            head = ' '.join(t[m.start():cb + 1].split())
+            if head.startswith('while (!metal::atomic_compare_exchange_weak_explicit('):
+                head = 'while (!metal::atomic_compare_exchange_weak_explicit('
+            key = (f, head)
+            found[key] = found.get(key, 0) + 1
+        for m in re.finditer(r'\bdo\s*\{', mk):
+            key = (f, 'do')
+            found[key] = found.get(key, 0) + 1
+    unexpected = ['%s: %r x%d (allowed %d)' % (k[0], k[1], v, SCAN_LOOP_ALLOW.get(k, 0))
+                  for k, v in sorted(found.items()) if v > SCAN_LOOP_ALLOW.get(k, 0)]
+    return found, unexpected
+
+
+def main_scan(args):
+    if len(args) != 2:
+        sys.exit('usage: witgen_tu_gen.py --scan-loops PREPROCESSED')
+    found, bad = scan_loops(open(args[1], errors='replace').read())
+    if 'witgen_fpext.h' not in open(args[1], errors='replace').read():
+        sys.exit('witgen_tu_gen --scan-loops: %s does not include witgen_fpext.h' % args[1])
+    if bad:
+        sys.exit('witgen_tu_gen --scan-loops: loop(s) not reviewed for the R17 lost-store shape '
+                 '(SCAN_LOOP_ALLOW, docs/metal-port/notes/R17.md):\n  ' + '\n  '.join(bad))
+    print('witgen_tu_gen --scan-loops: %d loop(s), all reviewed: %s'
+          % (sum(found.values()), ', '.join('%s %r x%d' % (k[0], k[1], v)
+                                            for k, v in sorted(found.items()))))
+    return 0
+
+
+# Out-of-line FpExt operations in the compiled witgen TU (R17 round 2): a defined function whose
+# mangled name is an FpExt member (_ZN5FpExt...), an operator taking an FpExt (_Z<op>...5FpExt...)
+# or inv(FpExt). witgen_fpext.h marks them all always_inline, so at any -O level none may be
+# left; `--scan-ir FILE` (FILE: `xcrun metal -S -emit-llvm` of witgen_tu.metal, at -O0, where
+# nothing else is inlined; tests/metal_generators.rs) fails on one.
+_IR_DEFINE_RE = re.compile(r'(?m)^define [^@\n]*@"?([\w.$]+)"?\(')
+_IR_FPEXT_FN_RE = re.compile(r'^_Z(?:N5FpExt|(?:pl|mi|ml|ng|eq|ne|pL|mI|mL)[\w]*5FpExt|3inv5FpExt)')
+
+
+def scan_ir(ll):
+    """-> (number of defined functions, [out-of-line FpExt functions]) of LLVM IR text."""
+    names = _IR_DEFINE_RE.findall(ll)
+    return len(names), [n for n in names if _IR_FPEXT_FN_RE.match(n)]
+
+
+def main_scan_ir(args):
+    if len(args) != 2:
+        sys.exit('usage: witgen_tu_gen.py --scan-ir WITGEN_TU_LL')
+    n, bad = scan_ir(open(args[1], errors='replace').read())
+    if n == 0:
+        sys.exit('witgen_tu_gen --scan-ir: no function definitions in %s (not LLVM IR?)' % args[1])
+    if bad:
+        sys.exit('witgen_tu_gen --scan-ir: out-of-line FpExt operation(s) in the witgen TU (the '
+                 'R17 round-2 lost-store shape; witgen_fpext.h must keep them always_inline):\n  '
+                 + '\n  '.join(bad))
+    print('witgen_tu_gen --scan-ir: %d functions, no out-of-line FpExt operation' % n)
+    return 0
+
+
+def gen_metal(no_pin=False, map_lowering='unroll'):
     import hashlib
     import cuda2metal as c2m
+    if map_lowering not in MAP_LOWERINGS:
+        raise c2m.TranslateError('unknown map lowering %r (%s)'
+                                 % (map_lowering, ' | '.join(MAP_LOWERINGS)))
     ext_sha = hashlib.sha256(ffi[e0:e1].encode()).hexdigest()
     if ext_sha != FFI_EXTERN_SHA256:
         raise c2m.TranslateError(
@@ -179,7 +439,7 @@ def gen_metal(no_pin=False):
                      ['} // namespace risc0::circuit::rv32im_v2::cuda', ''])
     typedefs = c2m.collect_array_typedefs(c2m.read(os.path.join(HERE, 'types.cuh.inc')))
     passes = tuple(p for p in c2m.ALL_PASSES if p not in ('kernel', 'accum_guard'))
-    text, counts = c2m.translate(cuda, typedefs, passes=passes)
+    text, counts = c2m.translate(cuda, typedefs, passes=passes, map_lowering=map_lowering)
     # The attribute becomes WITGEN_TU_FNATTR (default noinline; see the TU header).
     text, nattr = re.subn(r'(?m)^static __attribute__\(\(noinline\)\) ', 'static WITGEN_TU_FNATTR ',
                           text)
@@ -190,11 +450,14 @@ def gen_metal(no_pin=False):
     if nattr != PINNED_METAL['fnattr'] or text.count('__attribute__((noinline))'):
         bad.append('fnattr: pinned %d, got %d (+%d left)'
                    % (PINNED_METAL['fnattr'], nattr, text.count('__attribute__((noinline))')))
-    want = PINNED_METAL['counts']
+    want = dict(PINNED_METAL['counts'])
+    if map_lowering == 'loop':
+        want = {k: v for k, v in want.items() if not k.endswith('.unroll')}
     for k in sorted(set(want) | set(got)):
         if want.get(k, 0) != got.get(k, 0):
             bad.append('%s: pinned %d, got %d' % (k, want.get(k, 0), got.get(k, 0)))
-    report = 'functions=%d, fnattr=%d, %s' % (len(names), nattr, c2m.fmt_counts(got))
+    report = 'functions=%d, fnattr=%d, %s, map lowering %s' % (len(names), nattr,
+                                                               c2m.fmt_counts(got), map_lowering)
     if bad and not no_pin:
         raise c2m.TranslateError('rewrite counts differ from PINNED_METAL (steps.cu changed '
                                  'shape; re-run with --no-pin and review):\n  ' + '\n  '.join(bad)
@@ -202,40 +465,67 @@ def gen_metal(no_pin=False):
     ns0 = text.index('namespace %s {' % c2m.METAL_NS) + len('namespace %s {' % c2m.METAL_NS)
     ns1 = text.rindex('} // namespace %s' % c2m.METAL_NS)
     graph = text[ns0:ns1].strip('\n')
+    # R17: no loop in the call graph (every loop there would be a lowered map/reduce calling a
+    # noinline step function, the shape of the Apple GPU lost-store defect). Not waivable with
+    # --no-pin: a new loop shape in steps.cu must be lowered without a loop first.
+    loops = len(_GRAPH_LOOP_RE.findall(c2m.mask(graph)))
+    if map_lowering == 'unroll' and loops:
+        raise c2m.TranslateError(
+            '%d loop(s) in the translated call graph: steps.cu has a loop shape that the '
+            'unrolled lowering does not cover (docs/metal-port/notes/R17.md); lower it without '
+            'a loop in cuda2metal.py first' % loops)
     out = METAL_HEADER + c2m.PRELUDE + METAL_PRE + METAL_EXTERNS + graph + '\n' + METAL_KERNELS
     return out, report, bad
 
 
 def main_metal(args):
+    import argparse
     import cuda2metal as c2m
-    if '-o' not in args or args.index('-o') + 1 >= len(args):
-        sys.exit('usage: witgen_tu_gen.py --metal -o OUTDIR [--check] [--no-pin]')
-    outdir = args[args.index('-o') + 1]
+    ap = argparse.ArgumentParser(prog='witgen_tu_gen.py --metal')
+    ap.add_argument('--metal', action='store_true', required=True)
+    ap.add_argument('-o', dest='outdir', required=True, help='output directory')
+    ap.add_argument('--check', action='store_true')
+    ap.add_argument('--no-pin', action='store_true')
+    ap.add_argument('--map-lowering', choices=MAP_LOWERINGS, default='unroll')
+    ap.add_argument('--fpext-src', default=FPEXT_SRC_DEFAULT,
+                    help='the shared fpext.h to derive witgen_fpext.h from (build.rs passes the '
+                         'text risc0-build-kernel stages into _sys_)')
+    ap.add_argument('--fpext-calls', choices=('inline', 'outline'), default='inline',
+                    help='outline: leave out the round-2 always_inline / in-place constructors '
+                         '(only to build a same-session baseline, R17.md)')
+    a = ap.parse_args(args)
+    outdir = a.outdir
     try:
-        new, report, bad = gen_metal(no_pin='--no-pin' in args)
-    except c2m.TranslateError as e:
+        new, report, bad = gen_metal(no_pin=a.no_pin, map_lowering=a.map_lowering)
+        fpext, freport, fbad = gen_fpext(open(a.fpext_src, newline='').read(), no_pin=a.no_pin,
+                                         inline=a.fpext_calls == 'inline')
+    except (c2m.TranslateError, OSError) as e:
         sys.exit('witgen_tu_gen: error: %s' % e)
-    path = os.path.join(outdir, 'witgen_tu.metal')
-    try:
-        cur = open(path, newline='').read()
-    except FileNotFoundError:
-        cur = None
+    report += ', ' + freport
+    bad = bad + fbad
+    outs = [(os.path.join(outdir, 'witgen_tu.metal'), new),
+            (os.path.join(outdir, 'witgen_fpext.h'), fpext)]
     if bad:
-        print('witgen_tu_gen: counts differ from PINNED_METAL:\n  ' + '\n  '.join(bad))
-    if CHECK:
-        if cur != new:
-            sys.exit('witgen_tu_gen: %s is out of date; run kernels/cuda/witgen_tu_gen.py --metal -o %s'
-                     % (path, outdir))
-        print('witgen_tu_gen: %s is up to date (%s)' % (path, report))
-        return 0
-    os.makedirs(outdir, exist_ok=True)
-    if cur != new:
-        open(path, 'w', newline='').write(new)
-        print('witgen_tu_gen: wrote %s (%d lines; %s)' % (path, new.count('\n'), report))
-    else:
-        print('witgen_tu_gen: %s unchanged (%s)' % (path, report))
+        print('witgen_tu_gen: counts differ from PINNED_METAL / PINNED_FPEXT:\n  '
+              + '\n  '.join(bad))
+    for path, text in outs:
+        try:
+            cur = open(path, newline='').read()
+        except FileNotFoundError:
+            cur = None
+        if CHECK:
+            if cur != text:
+                sys.exit('witgen_tu_gen: %s is out of date; run kernels/cuda/witgen_tu_gen.py '
+                         '--metal -o %s' % (path, outdir))
+            print('witgen_tu_gen: %s is up to date (%s)' % (path, report))
+            continue
+        os.makedirs(outdir, exist_ok=True)
+        if cur != text:
+            open(path, 'w', newline='').write(text)
+            print('witgen_tu_gen: wrote %s (%d lines; %s)' % (path, text.count('\n'), report))
+        else:
+            print('witgen_tu_gen: %s unchanged (%s)' % (path, report))
     return 0
-
 
 METAL_HEADER = r'''// GENERATED by rv32im-sys/kernels/cuda/witgen_tu_gen.py --metal from steps.cu and ffi.cu -- do
 // not edit; re-run it instead (rv32im-sys/build.rs does, into $OUT_DIR/metal).
@@ -243,7 +533,9 @@ METAL_HEADER = r'''// GENERATED by rv32im-sys/kernels/cuda/witgen_tu_gen.py --me
 // Metal port of witgen_tu.cu (plan 4.2, item R5): step_Top's call graph renamed (_W), every
 // function WITGEN_TU_FNATTR (default __attribute__((noinline)): the CUDA comment in
 // witgen_tu_gen.py says the fully inlined build reorders the back-row loads of rows written by
-// neighbouring threads and is not bit-exact), translated by cuda2metal.py's passes; the
+// neighbouring threads and is not bit-exact), translated by cuda2metal.py's passes with every
+// map()/reduce() unrolled into straight-line blocks (R17: CUDA's loop lowering is the code shape
+// in which the Apple GPU loses a private-array store, docs/metal-port/notes/R17.md); the
 // extern_* functions as static externW_* copies (hand port of ffi.cu, see below); and the
 // kernels par_stepExecW (CUDA par_stepExecW, one thread per cycle; the HIP form's optional perm
 // is kept behind WitgenParams::usePerm) and fwd_stepExec / rev_stepExec (CUDA ffi.cu
@@ -274,8 +566,17 @@ METAL_HEADER = r'''// GENERATED by rv32im-sys/kernels/cuda/witgen_tu_gen.py --me
 // The host asserts rows * dataCols < 2^32 (32-bit indexing, cuda_compat.h).
 #define RISC0_ROWS_POW2 1
 #define RV32IM_METAL_INCLUDE_GENERATED 1
+// R17 fix round 1: FpExt from witgen_fpext.h (written next to this file by witgen_tu_gen.py:
+// the shared fpext.h with its 4-element loops unrolled), not the shared fpext.h; witgen.h and
+// ef_fpext.h include RV32IM_FPEXT_HEADER when it is defined.
+#define RV32IM_FPEXT_HEADER "witgen_fpext.h"
+// map()/reduce() are unrolled by the generator: witgen.h's loop templates are left out.
+#define RV32IM_NO_MAP_TEMPLATES 1
 #include "witgen.h"
 #include "seq_exec.h"
+#ifndef RV32IM_WITGEN_FPEXT
+#error "witgen_tu.metal must use witgen_fpext.h (R17), not the shared fpext.h"
+#endif
 
 '''
 
@@ -293,11 +594,7 @@ METAL_PRE = r'''
 #ifndef WITGEN_TU_MAX_THREADS
 #define WITGEN_TU_MAX_THREADS 256
 #endif
-// A cycle (start + i, perm[i] or a sequential position) outside the preflight cycles or the
-// data rows: the kernel skips it (CUDA would index out of bounds).
-#ifndef RV32IM_FAULT_CYCLE_INDEX
-#define RV32IM_FAULT_CYCLE_INDEX 0x20u
-#endif
+// RV32IM_FAULT_CYCLE_INDEX / RV32IM_FAULT_DIFF_COUNT_INDEX: cuda_compat.h.
 
 namespace rv32im_metal {
 
@@ -308,7 +605,8 @@ METAL_EXTERNS = r'''// ---- extern_*: hand port of ffi.cu divide_rv32im .. exter
 // TUs of the metallib may define their own). Differences, on invalid input only (plan 2.9):
 // a txnIdx / bigintIdx outside the uploaded preflight sets a RV32IM_FAULT_* bit in
 // ctx.tables.bad (ORed into the fault buffer by the kernel) and yields zeros instead of an
-// out-of-bounds read. The 7th structured binding of the TU (extern_divide) is a temp here.
+// out-of-bounds read; so does a getDiffCount cycle past the preflight cycles. The 7th
+// structured binding of the TU (extern_divide) is a temp here.
 
 __attribute__((unused)) static inline r0::array<uint32_t, 2>
 divide_rv32im(uint32_t numer, uint32_t denom, uint32_t signType) {
@@ -361,10 +659,8 @@ static inline r0::array<Val, 5> externW_getMemoryTxn(thread ExecContext& ctx, Va
   r0::array<Val, 5> ret;
   uint32_t txnIdx;
   if (!externW_txnIndex(ctx, true, txnIdx)) {
-    for (uint32_t i = 0; i < 5; i++) {
-      ret[i] = Val(0);
-    }
-    return ret;
+    // Straight-line, no loop (R17: the TU's loops are reviewed by --scan-loops).
+    return r0::array<Val, 5>{{Val(0), Val(0), Val(0), Val(0), Val(0)}};
   }
   const device MemoryTransaction& txn = ctx.preflight.txns[txnIdx];
   // Assertions removed (ffi.cu): in parallel witgen, union layout overwrites can cause transient
@@ -388,11 +684,17 @@ static inline Val externW_lookupCurrent(thread ExecContext& ctx, Val table, Val 
 static inline void externW_memoryDelta(
     thread ExecContext& ctx, Val addr, Val cycle, Val dataLow, Val dataHigh, Val count) {}
 
-/// Not clamped: R1's PreflightTrace carries no cycle count (the argument is the witness value of
-/// the current or a neighbouring cycle, 2 * cycle (+ 1)).
+/// The argument is the witness value of the current or a neighbouring cycle, 2 * cycle (+ 1);
+/// an index past the preflight cycles (a corrupt witness value) sets
+/// RV32IM_FAULT_DIFF_COUNT_INDEX and yields 0 instead of an out-of-bounds read (plan 2.9).
 static inline uint32_t externW_getDiffCount(thread ExecContext& ctx, Val cycle) {
   uint32_t cycleU32 = cycle.asUInt32();
-  return ctx.preflight.cycles[cycleU32 / 2].diffCount[cycleU32 % 2];
+  uint32_t idx = cycleU32 / 2;
+  if (idx >= ctx.preflight.cyclesLen) {
+    ctx.tables.bad |= RV32IM_FAULT_DIFF_COUNT_INDEX;
+    return 0;
+  }
+  return ctx.preflight.cycles[idx].diffCount[cycleU32 % 2];
 }
 
 static inline Val externW_isFirstCycle_0(thread ExecContext& ctx) {
@@ -448,16 +750,22 @@ static inline r0::array<Val, 2> externW_nextPagingIdx(thread ExecContext& ctx) {
 }
 
 static inline r0::array<Val, 16> externW_bigIntExtern(thread ExecContext& ctx) {
-  r0::array<Val, 16> ret;
   uint32_t bigintIdx = ctx.preflight.cycles[ctx.cycle].bigintIdx;
   uint32_t len = ctx.preflight.bigintBytesLen;
   bool ok = bigintIdx <= len && len - bigintIdx >= 16;
   if (!ok) {
     ctx.tables.bad |= RV32IM_FAULT_BIGINT_INDEX;
   }
-  for (uint32_t i = 0; i < 16; i++) {
-    ret[i] = ok ? Val(uint32_t(ctx.preflight.bigintBytes[bigintIdx + i])) : Val(0);
-  }
+  // Straight-line, no loop (R17: a default-constructed private array written in a loop whose
+  // body may call Fp's encoding out of line is the lost-store shape).
+#define C2M_BIGINT_BYTE(k) (ok ? Val(uint32_t(ctx.preflight.bigintBytes[bigintIdx + (k)])) : Val(0))
+  r0::array<Val, 16> ret{{C2M_BIGINT_BYTE(0), C2M_BIGINT_BYTE(1), C2M_BIGINT_BYTE(2),
+                          C2M_BIGINT_BYTE(3), C2M_BIGINT_BYTE(4), C2M_BIGINT_BYTE(5),
+                          C2M_BIGINT_BYTE(6), C2M_BIGINT_BYTE(7), C2M_BIGINT_BYTE(8),
+                          C2M_BIGINT_BYTE(9), C2M_BIGINT_BYTE(10), C2M_BIGINT_BYTE(11),
+                          C2M_BIGINT_BYTE(12), C2M_BIGINT_BYTE(13), C2M_BIGINT_BYTE(14),
+                          C2M_BIGINT_BYTE(15)}};
+#undef C2M_BIGINT_BYTE
   return ret;
 }
 
@@ -520,6 +828,7 @@ static inline uint32_t witgenStep(thread const WitgenBindings& b, uint32_t cycle
   }
   PreflightTrace preflight;
   preflight.cycles = b.cycles;
+  preflight.cyclesLen = p.cyclesLen;
   preflight.txns = b.txns;
   preflight.bigintBytes = b.bigintBytes;
   preflight.txnsLen = p.txnsLen;
@@ -617,18 +926,48 @@ kernel void rev_stepExec(WITGEN_TU_BINDINGS,
 '''
 
 
-if METAL:
+def main_cuda(check):
+    """Writes witgen_tu.cu, or with check compares it and translates --metal in memory."""
+    try:
+        cur = open(OUT, newline='').read()
+    except FileNotFoundError:
+        cur = ''
+    if not check:
+        open(OUT, 'w', newline='').write(new)
+        print('witgen_tu_gen: wrote witgen_tu.cu (%d functions)' % len(names))
+        return 0
+    if cur != new:
+        sys.exit('witgen_tu_gen: witgen_tu.cu is out of date; run kernels/cuda/witgen_tu_gen.py '
+                 'and commit the result')
+    # The Metal translation too (its output lives in the build's OUT_DIR, never checked in): in
+    # memory, with the pins and the no-loop check (R16 open issue, as accum_tu_gen.py).
+    sys.dont_write_bytecode = True
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    import cuda2metal as c2m
+    try:
+        _, report, bad = gen_metal()
+        _, freport, _ = gen_fpext(open(FPEXT_SRC_DEFAULT, newline='').read())
+        report += ', ' + freport
+    except (c2m.TranslateError, OSError) as e:
+        sys.exit('witgen_tu_gen: --metal translation: %s' % e)
+    print('witgen_tu_gen: witgen_tu.cu is up to date (%d functions); --metal translates (%s)'
+          % (len(names), report))
+    return 0
+
+
+if __name__ == '__main__':
     sys.dont_write_bytecode = True  # no __pycache__ in the source tree (build.rs runs this)
     sys.path.insert(0, HERE)
-    sys.exit(main_metal(ARGS))
-try:
-    cur = open(OUT, newline='').read()
-except FileNotFoundError:
-    cur = ''
-if CHECK:
-    if cur != new:
-        sys.exit('witgen_tu_gen: witgen_tu.cu is out of date; run kernels/cuda/witgen_tu_gen.py and commit the result')
-    print('witgen_tu_gen: witgen_tu.cu is up to date (%d functions)' % len(names))
-else:
-    open(OUT, 'w', newline='').write(new)
-    print('witgen_tu_gen: wrote witgen_tu.cu (%d functions)' % len(names))
+    if '--scan-loops' in ARGS:
+        sys.exit(main_scan(ARGS))
+    if '--scan-ir' in ARGS:
+        sys.exit(main_scan_ir(ARGS))
+    if not METAL and any(a != '--check' for a in ARGS):
+        sys.exit('usage: witgen_tu_gen.py [--check]\n'
+                 '       witgen_tu_gen.py --metal -o OUTDIR [--check] [--no-pin] '
+                 '[--map-lowering unroll|loop] [--fpext-src FPEXT_H] '
+                 '[--fpext-calls inline|outline]\n'
+                 '       witgen_tu_gen.py --scan-loops PREPROCESSED_WITGEN_TU\n'
+                 '       witgen_tu_gen.py --scan-ir WITGEN_TU_LL')
+    sys.exit(main_metal(ARGS) if METAL else main_cuda(CHECK))

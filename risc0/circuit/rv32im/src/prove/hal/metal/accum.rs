@@ -198,9 +198,10 @@ const _: () = assert!(std::mem::size_of::<FinalizeAccumParams>() == 16);
 unsafe impl bytemuck::Zeroable for FinalizeAccumParams {}
 unsafe impl bytemuck::Pod for FinalizeAccumParams {}
 
-/// stepAccumA fault bits (rv32im-sys kernels/metal/cuda_compat.h, accum_tu.metal).
+/// stepAccumA fault bits (rv32im-sys kernels/metal/cuda_compat.h `RV32IM_FAULT_*`; R17 gave
+/// `RV32IM_FAULT_ACCUM_PERM` its own bit, 0x40, distinct from witgen's cycle-index 0x20).
 const FAULT_ASSERT: u32 = 0x10;
-const FAULT_ACCUM_PERM: u32 = 0x20;
+const FAULT_ACCUM_PERM: u32 = 0x40;
 
 fn u32_of(what: &str, v: usize) -> Result<u32> {
     u32::try_from(v).map_err(|_| anyhow::anyhow!("rv32im Metal accum: {what} = {v} exceeds u32"))
