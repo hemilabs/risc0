@@ -35,10 +35,13 @@ struct Gpu {
     device: Device,
     queue: CommandQueue,
     k: SmallKernels,
+    /// The shared GPU test lock (`super::super::test_lock`), held for the test.
+    _lock: std::sync::RwLockReadGuard<'static, ()>,
 }
 
 impl Gpu {
     fn new() -> Option<Self> {
+        let _lock = super::super::test_lock::shared();
         let Some(device) = Device::system_default() else {
             eprintln!("no Metal device; skipping");
             return None;
@@ -53,7 +56,12 @@ impl Gpu {
         let lib = device.new_library_with_data(crate::METAL_LIB).unwrap();
         let k = SmallKernels::new(&device, &lib).unwrap();
         let queue = device.new_command_queue();
-        Some(Self { device, queue, k })
+        Some(Self {
+            device,
+            queue,
+            k,
+            _lock,
+        })
     }
 
     fn buf(&self, data: &[u32]) -> Buffer {

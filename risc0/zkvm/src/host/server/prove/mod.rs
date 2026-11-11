@@ -19,6 +19,8 @@ pub(crate) mod keccak;
 mod prover_impl;
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, feature = "metal"))]
+mod tests_metal_wrap;
 pub(crate) mod union_peak;
 
 use std::rc::Rc;
@@ -519,7 +521,14 @@ pub(crate) fn exclusive_gpu() -> impl Sized {}
 /// nor the keccak eval_check allocates through it. Without this, a session's keccak proofs and its
 /// wrap, and the next session's segments, ran with the segments' idle buffers still cached and
 /// spilled into shared system memory on an Arc Pro B70 (32 GB), at 2-5x the time.
-pub(crate) fn release_hal_buffers() {
+///
+/// Public on Metal builds (`risc0_zkvm::release_hal_buffers`, item G8): a long-lived worker calls
+/// it after a proof that failed before its wrap (the wrap releases on success), so the segment
+/// prover's pool (2-10 GB of the owner's unified memory) is not held until the next proof. It
+/// releases the provers cached by **the calling thread** (call it on the thread that proved), and
+/// only while that thread is not proving (a prover in use is left alone). Other builds keep it
+/// crate-private.
+pub fn release_hal_buffers() {
     #[cfg(feature = "cuda")]
     risc0_zkp::hal::cuda::clear_buffer_pool();
     #[cfg(feature = "rocm")]

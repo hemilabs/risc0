@@ -30,12 +30,27 @@ use rand_chacha::ChaCha8Rng;
 
 use super::*;
 
-fn gpu() -> Option<MsmGpu> {
+/// An [MsmGpu] holding the shared GPU test lock (`super::super::test_lock`) for the test.
+struct LockedGpu {
+    gpu: MsmGpu,
+    _lock: std::sync::RwLockReadGuard<'static, ()>,
+}
+
+impl std::ops::Deref for LockedGpu {
+    type Target = MsmGpu;
+
+    fn deref(&self) -> &MsmGpu {
+        &self.gpu
+    }
+}
+
+fn gpu() -> Option<LockedGpu> {
+    let lock = super::super::test_lock::shared();
     let g = MsmGpu::new().unwrap();
     if g.is_none() {
         eprintln!("no Metal device; skipping");
     }
-    g
+    g.map(|gpu| LockedGpu { gpu, _lock: lock })
 }
 
 /// The ark reference MSM, split over threads (ark-ec is built without `parallel`).

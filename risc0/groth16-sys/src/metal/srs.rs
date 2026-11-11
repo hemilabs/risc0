@@ -1072,6 +1072,8 @@ pub(crate) mod tests {
     /// curve and in the subgroup, load time and memory.
     #[test]
     fn component_srs() {
+        // Loads the real key (GBs): alone (PLAN 8.7).
+        let _lock = super::super::test_lock::exclusive();
         let Some(dir) = component_dir() else { return };
         let path = dir.join("stark_verify_final.zkey");
         let dev = device();

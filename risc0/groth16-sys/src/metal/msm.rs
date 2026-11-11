@@ -764,13 +764,9 @@ impl MsmScratch {
         cfg.validate();
         let sizes = Self::sizes(cap_n, cfg);
         super::check_working_set(device, "the MSM scratch", sizes.iter().sum())?;
+        // Nil-checked (G8): a refused allocation is an error, not a null `Buffer`.
         let alloc = |bytes: u64, what: &str| -> Result<Buffer> {
-            ensure!(
-                bytes <= device.max_buffer_length(),
-                "MSM {what}: {bytes} bytes exceed the device's buffer limit"
-            );
-            let b = device.new_buffer(bytes, MTLResourceOptions::StorageModePrivate);
-            Ok(b)
+            super::new_buffer_checked(device, bytes, true, &format!("the MSM {what}"))
         };
         let [hist, offset, piece_off, totals, sorted, pieces, piece_bucket, partial] = sizes;
         Ok(Self {

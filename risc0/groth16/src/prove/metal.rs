@@ -31,9 +31,11 @@
 //! Locking: the GPU part of a wrap (waiting for the key upload, the prove, reading the proof) and
 //! [release_srs] run under `risc0_zkp::hal::metal::exclusive()`, as CUDA runs its prove under the
 //! CUDA singleton. The witness is computed before the lock is taken, so STARK proofs on other
-//! threads are not blocked by CPU work. The key loader thread does not take the lock (it would
-//! deadlock against the waiting holder, see `exclusive()`); `metal_preload` therefore uses no
-//! `MetalHal` (its cache has its own mutex).
+//! threads are not blocked by CPU work. The key load does not take the lock either:
+//! `metal_preload` uses no `MetalHal` (its cache has its own mutex).
+//!
+//! Memory (G8): the key is loaded only after `pre_gpu` (the zkvm's `release_hal_buffers`) has
+//! returned, never beside the STARK prover's pools; [prestart] does not load it.
 
 use std::path::Path;
 
@@ -75,13 +77,19 @@ pub(crate) fn preload_graph() -> Result<()> {
     super::fast::preload()
 }
 
-/// Start loading the proving key onto the GPU in the background.
+/// Prepare a wrap in the background: build the witness graph (CPU). Unlike the Intel prestart,
+/// this does **not** load the proving key: the zkvm calls it before identity_p254, while the
+/// STARK prover's HAL pools are still allocated, and on unified memory a key loaded then sits
+/// beside them (5.7 GB on top of 2-11 GB of pools: 16.6-17.6 GB peaks at po2 20 without a
+/// budget, and a refused load under an 8 GiB one; zk-miner M1, fixed in G8). [shrink_wrap_with]
+/// loads the key after `pre_gpu` has released those pools, overlapped with the witness. Checks
+/// that the component is installed (the error the Intel prestart returns).
 pub(crate) fn prestart() -> Result<()> {
-    let dir = component_dir()?;
-    std::thread::spawn(move || match preload(&dir) {
-        Ok(()) => {}
-        Err(e) if is_unavailable(&e) => tracing::debug!("groth16 metal preload: {e:#}"),
-        Err(e) => tracing::warn!("groth16 proving key preload failed: {e:#}"),
+    component_dir()?;
+    std::thread::spawn(|| {
+        if let Err(e) = preload_graph() {
+            tracing::warn!("groth16 witness graph preload failed: {e:#}");
+        }
     });
     Ok(())
 }
@@ -142,6 +150,13 @@ fn shrink_wrap_or_docker(
     pre_gpu: impl FnOnce(),
     supported: impl Fn() -> Result<()>,
 ) -> Result<Seal> {
+    // `fast::witness` and `to_json` read the seal as `&[u32]` (bytemuck::cast_slice, which panics
+    // on unaligned data): give them an aligned copy when the caller's slice is not.
+    let copy = aligned_copy(identity_p254_seal_bytes);
+    let identity_p254_seal_bytes: &[u8] = match &copy {
+        Some(words) => bytemuck::cast_slice(words),
+        None => identity_p254_seal_bytes,
+    };
     let mut pre_gpu = Some(pre_gpu);
     let work_dir = tempdir().context("failed to create a temporary directory")?;
     let r = supported()
@@ -158,13 +173,38 @@ fn shrink_wrap_or_docker(
     }
 }
 
-/// The GPU wrap: witness (helper thread, beside `pre_gpu`) and key load (loader thread), then
-/// the prove under the GPU lock. Writes `proof.json` and `public.json` into `work_dir`.
+/// An aligned copy of `seal` as u32 words if it is not 4-byte aligned, else `None` (also for a
+/// ragged length, passed through for `fast::witness` to report). Native-endian, as
+/// `bytemuck::cast_slice` reads it (bytemuck's `pod_collect_to_vec` needs its
+/// `extern_crate_alloc` feature, which this crate does not enable).
+fn aligned_copy(seal: &[u8]) -> Option<Vec<u32>> {
+    if (seal.as_ptr() as usize).is_multiple_of(4) || !seal.len().is_multiple_of(4) {
+        return None;
+    }
+    Some(
+        seal.chunks_exact(4)
+            .map(|c| u32::from_ne_bytes(c.try_into().unwrap()))
+            .collect(),
+    )
+}
+
+/// The GPU wrap. The witness is computed on a helper thread while the calling thread runs
+/// `pre_gpu` (the zkvm releases the STARK prover's HAL pools there) and **then** loads the proving
+/// key if it is not cached, so the key never coexists with the pools it replaces (G8; before,
+/// the loader started first and raced the release). The key load (~1 s) still overlaps the
+/// witness (~0.7-1.4 s). Then the prove, under the GPU lock. Writes `proof.json` and
+/// `public.json` into `work_dir`.
 fn gpu_prove(
     identity_p254_seal_bytes: &[u8],
     pre_gpu: &mut Option<impl FnOnce()>,
     work_dir: &Path,
 ) -> Result<Seal> {
+    // Aligned for `fast::witness` (see shrink_wrap_or_docker; a no-op when called from there).
+    let copy = aligned_copy(identity_p254_seal_bytes);
+    let identity_p254_seal_bytes: &[u8] = match &copy {
+        Some(words) => bytemuck::cast_slice(words),
+        None => identity_p254_seal_bytes,
+    };
     let dir = component_dir()?;
     let setup = SetupParams::new(&dir).context("failed to create groth16 setup params")?;
 
@@ -172,30 +212,31 @@ fn gpu_prove(
     let t0 = std::time::Instant::now();
     let ms = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1000.0;
 
-    // The proving key's upload (first use only) overlaps the witness computation.
-    let loader = {
-        let dir = dir.clone();
-        std::thread::spawn(move || preload(&dir))
-    };
-    let witness = std::thread::scope(|sc| {
-        let h = sc.spawn(|| super::fast::witness(identity_p254_seal_bytes));
+    let mut pre_gpu_ms = 0.0;
+    let mut loaded_ms = 0.0;
+    let (witness, witness_ms, loaded) = std::thread::scope(|sc| {
+        let h = sc.spawn(|| {
+            let w = super::fast::witness(identity_p254_seal_bytes);
+            (w, ms(t0))
+        });
         if let Some(f) = pre_gpu.take() {
             f();
         }
-        h.join()
-            .unwrap_or_else(|_| Err(anyhow!("groth16 witness thread panicked")))
-    })
-    .context("failed to calculate the groth16 witness");
-    let witness_ms = ms(t0);
+        pre_gpu_ms = ms(t0);
+        // The proving key (first use, or after release_srs), now that pre_gpu has freed the
+        // STARK pools; overlaps the witness.
+        let loaded = preload(&dir);
+        loaded_ms = ms(t0);
+        let (w, w_ms) = h
+            .join()
+            .unwrap_or_else(|_| (Err(anyhow!("groth16 witness thread panicked")), ms(t0)));
+        (w, w_ms, loaded)
+    });
+    let witness = witness.context("failed to calculate the groth16 witness")?;
+    loaded?;
 
     let _gpu = risc0_zkp::hal::metal::exclusive();
-    // Join the loader before returning a witness error (it may hold the prover cache).
-    let loaded = loader
-        .join()
-        .map_err(|_| anyhow!("the groth16 proving key loader panicked"))?;
-    let witness = witness?;
-    loaded?;
-    let loaded_ms = ms(t0);
+    let locked_ms = ms(t0);
 
     const _: () = assert!(std::mem::size_of::<wtns_file::FieldElement<32>>() == 32);
     // Safety: FieldElement<32> is a plain [u8; 32] newtype (size asserted above, alignment 1).
@@ -207,7 +248,9 @@ fn gpu_prove(
         .context("groth16 prove failed")?;
     if verbose {
         eprintln!(
-            "[groth16-metal] witness={witness_ms:.1}ms key loaded={loaded_ms:.1}ms proved={:.1}ms",
+            "[groth16-metal] pre_gpu done={pre_gpu_ms:.1}ms key loaded={loaded_ms:.1}ms \
+             witness={witness_ms:.1}ms gpu lock={locked_ms:.1}ms proved={:.1}ms (since the wrap \
+             started)",
             ms(t0)
         );
     }
@@ -227,6 +270,7 @@ mod tests {
 
     #[test]
     fn gpu_selection() {
+        let _lock = super::metal_tests::gpu_test_lock();
         assert!(select_gpu(true, None, true));
         assert!(select_gpu(true, Some("metal"), true));
         assert!(!select_gpu(true, Some("docker"), true));
@@ -253,6 +297,7 @@ mod tests {
     /// Without Docker installed both fail with "Please install docker first.".
     #[test]
     fn falls_back_to_docker() {
+        let _lock = super::metal_tests::gpu_test_lock();
         let seal: &[u8] = &[];
         let docker = super::super::docker::shrink_wrap(seal).map(|_| ());
 
@@ -280,6 +325,7 @@ mod tests {
     /// `pre_gpu` runs exactly once.
     #[test]
     fn bad_seal_is_an_error() {
+        let _lock = super::metal_tests::gpu_test_lock();
         if !enabled() || component_dir().is_err() {
             eprintln!("skipped: no Metal prover or no risc0-groth16 component");
             return;
@@ -292,6 +338,7 @@ mod tests {
 
     #[test]
     fn cache_entry_points_succeed() {
+        let _lock = super::metal_tests::gpu_test_lock();
         // The component may be absent here; preload_srs then fails on it, which is the Intel
         // behaviour. Release and invalidate never fail.
         if component_dir().is_ok() {
