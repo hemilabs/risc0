@@ -1,0 +1,13 @@
+Mac model     : Mac17,14 (Apple M5 Max)
+macOS         : Version 27.2.1 (Build 26B131)
+GPU           : Apple M5 Max, architecture applegpu_g17s
+GPU families  : Apple1 Apple2 Apple3 Apple4 Apple5 Apple6 Apple7 Apple8 Apple9 Apple10
+
+BUG case (variant 0), 10 dispatches per cell: wrong dispatches, wrong threads per dispatch
+   threads   tg=32                 tg=256                tg=1024            
+        32   0/10, 0               0/10, 0               0/10, 0            
+       256   0/10, 0               0/10, 0               0/10, 0            
+      1024   0/10, 0               0/10, 0               10/10, 121         
+      4096   0/10, 0               0/10, 0               10/10, 409         
+     65536   10/10, 2649           10/10, 1449           10/10, 2932        
+   1048576   10/10, 390764         10/10, 420833         10/10, 431219      

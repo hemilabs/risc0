@@ -1,0 +1,16 @@
+name=Apple M5 Max
+architecture=applegpu_g17s
+registryID=0x1000008a6 lowPower=0 unified=1 maxThreadsPerTG=1024 recommendedMaxWorkingSet=30150672384
+family Apple7: 1
+family Apple8: 1
+family Apple9: 1
+family Apple10(1010): 1
+family Apple11(1011): 0
+family Mac2: 1
+family Common3: 1
+family Metal3: 1
+family Metal4(5002): 1
+os=Version 27.2.1 (Build 26B131)
+      Chipset Model: Apple M5 Max
+      Total Number of Cores: 32
+      Metal Support: Metal 4

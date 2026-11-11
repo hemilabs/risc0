@@ -1,0 +1,64 @@
+   0: 9e0996a218000000     imadd            r2.cache, r11.cache, u5, 0
+   8: ae8d0060290d0000     bfeil            r3.cache, 0, r11.cache, 13
+  10: 7e2d446a6400         xor              r11, r2, r3
+  16: 1402                 ret              r1
+
+  80: 622910000000         mov_imm          r10, 16, 0b0
+  86: 72051004             get_sr           r1, sr80 (thread_position_in_grid.x)
+  8a: 62020000             mov_imm          r0h, 0
+  8e: b50001052100         stack_store      i8, 1, 2, 0, 16, 0
+  94: 62120000             mov_imm          r4h, 0
+  98: e2000000             mov_imm          r0l.cache, 0
+  9c: 524888212c00         if_icmp          r0l, ugt, u4, r1.discard, 1
+  a2: 622d64000000         mov_imm          r11, 100, 0b0
+  a8: 623165000000         mov_imm          r12, 101, 0b0
+  ae: 623566000000         mov_imm          r13, 102, 0b0
+  b4: 623967000000         mov_imm          r14, 103, 0b0
+  ba: 20c03e010000         jmp_exec_none    0x1F8
+  c0: 7e21540a8000         mov              r8, r10
+  c6: b55a000500c0f200     stack_store      i32, 1, 0, xyzw, 4, r11_r12_r13_r14, 0, 0
+  ce: e22500000000         mov_imm          r9.cache, 0, 0b0
+  d4: 0e31000025001000     iadd             r12, 0, r8, lsl 2
+  dc: 624500000000         mov_imm          r17, 0, 0b0
+  e2: c21000000000         push_exec        r0l.cache, 2
+  e8: f21d1004             get_sr           r7.cache, sr80 (thread_position_in_grid.x)
+  ec: 8e0552e224000000     iadd             r1.cache, r9, r7
+  f4: 9e19c2ea188c0100     imsub            r6.cache, r1.discard, u7, u6
+  fc: 7e2d4c0a8000         mov              r11, r6
+ 102: 421000000000         push_exec        r0l, 2
+ 108: 10c0f8feffff         call             0x0
+ 10e: 521600000000         pop_exec         r0l, 2
+ 114: e215c0ffffff         mov_imm          r5.cache, 4294967232, 0b0
+ 11a: 8e054a2225001000     iadd             r1.cache, r5, r9, lsl 2
+ 122: 8e05c20225001000     iadd             r1.cache, r1.discard, r8, lsl 2
+ 12a: 8e0d580a02000000     isub             r3.cache, r12, 32
+ 132: ce09824200000000     iadd.sat         r2.cache, r1.cache, 4
+ 13a: 1205c4622cc6204c     icmpsel          ugt, r1, r2.discard, r3.discard, r3.discard, r1.discard
+ 142: b532200400c01200     stack_store      i32, 1, 0, x, 4, r6, r1, 0
+ 14a: 8e2501202d000000     iadd             r9.cache, 1, r9.discard
+ 152: 7e45d62a6600         xor              r17, r11.discard, r17
+ 158: 529552420000         while_icmp       r0l, nseq, r9, 4, 2
+ 15e: 62120000             mov_imm          r4h, 0
+ 162: 00c086ffffff         jmp_exec_any     0xE8
+ 168: 521600000000         pop_exec         r0l, 2
+ 16e: 6800                 threadgroup_barrier 
+ 170: 3562000500c0f200     stack_load       r12_r13_r14_r15, i32, 1, 0, xyzw, 4, 0, 0
+ 178: 3800                 wait             0
+ 17a: 9e058ee218000000     imadd            r1.cache, r7.cache, u7, 0
+ 182: 8e0d82ca18000000     isub             r3.cache, r1.cache, u6
+ 18a: 8e09820219000000     iadd             r2.cache, r1.cache, u8
+ 192: 9210d8622c001190     icmpsel          seq, r4l.cache, r12.discard, r3.discard, 0, 1
+ 19a: 9209da422c002190     icmpsel          seq, r2.cache, r13.discard, r2.discard, 0, 2
+ 1a2: 8e0d822a19000000     isub             r3.cache, r1.cache, u9
+ 1aa: 8e09c4820c000000     iadd             r2.cache, r2.discard, r4l.discard
+ 1b2: 920ddc622c004190     icmpsel          seq, r3.cache, r14.discard, r3.discard, 0, 4
+ 1ba: 8e09c4622c000000     iadd             r2.cache, r2.discard, r3.discard
+ 1c2: 8e0dc20299000000     iadd             r3.cache, r1.discard, u8, lsl 1
+ 1ca: 8e0500e0ac000000     iadd             r1.cache, 0, r7.discard, lsl 1
+ 1d2: 920d5e622c008190     icmpsel          seq, r3.cache, r15, r3.discard, 0, 8
+ 1da: 0e0500202c002000     iadd             r1, 0, r1.discard, lsl 4
+ 1e2: 0e39c4622c000000     iadd             r14, r2.discard, r3.discard
+ 1ea: 624100000000         mov_imm          r16, 0, 0b0
+ 1f0: 4571200e00c0f200     device_store     0, i32, xyzw, r14_r15_r16_r17, u0_u1, r1, unsigned, 0
+ 1f8: 520e00000000         pop_exec         r0l, 1
+ 1fe: 8800                 stop             

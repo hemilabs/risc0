@@ -1,0 +1,21 @@
+Mac model     : Mac17,14 (Apple M5 Max)
+macOS         : Version 27.2.1 (Build 26B131)
+GPU           : Apple M5 Max, architecture applegpu_g17s
+GPU families  : Apple1 Apple2 Apple3 Apple4 Apple5 Apple6 Apple7 Apple8 Apple9 Apple10
+Dispatch      : 1048576 threads, threadgroup 256, 10 dispatches per variant
+
+v  variant                                            wrong     thr/disp     first wrong    2nd read wrong
+0  BUG: store after call in non-unrolled loop         10/10     438296       mask 0x8 =103  n/a
+1  control: store before the call                     0/10      0            -              n/a
+2  control: loop unrolled (no #pragma nounroll)       0/10      0            -              n/a
+3  control: callee inlined                            0/10      0            -              n/a
+4  control: index-loop init instead of pointer loop   0/10      0            -              n/a
+5  control: read back through a dynamic index         0/10      0            -              n/a
+6  control: threadgroup_barrier(mem_none) after loop  0/10      0            -              n/a
+7  probe: later data-dependent second read            10/10     533889       mask 0x8 =103  0 threads
+8  probe: two inits (100+i then 200+i)                10/10     452091       mask 0x8 =203  0 threads
+9  no help: atomic_thread_fence(thread scope)         10/10     603960       mask 0x8 =103  n/a
+10 no help: simdgroup_barrier(mem_none)               10/10     571260       mask 0x8 =103  n/a
+11 no help: another call after the loop               10/10     239147       mask 0x8 =103  n/a
+
+RESULT: BUG REPRODUCED (variant 0 read stale values)
