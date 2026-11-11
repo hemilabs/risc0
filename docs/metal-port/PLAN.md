@@ -435,7 +435,7 @@ Granularity: **one agent per item ID**, owning exactly the files listed for that
 | **1 — kernel fan-out** | Z1 Z2 Z3 Z4 Z5 · R1 R2 R7 · C1 · K1 K3 · G1 G2 (13 agents). R2/C1/K3/G2 only need F1 and may start during wave 0 against scratchpad hand-compiles | each item's compile + unit tests |
 | **2 — translators & phase-1 host paths** | R3→R4/R5/R6 · C2 C3 → C4 · K2 K6 · G3 G4 G5 G6 · Z6 · M3 | TUs compile, PSO times recorded, phase-1 submodules exist |
 | **3 — integration per unit** | R8 R9 R10 → R11 · C5 → C6 C7 C8 → C9 · K4 → K5 · G7 · Z7 · M1 | section-6 conformance green per unit; seals verify |
-| **4 — review rounds** | Z8 · C10 · K8 · G8 · R11 fixes · R12 (evalfast) · R16 · M4 | review notes filed; no open P0 |
+| **4 — review rounds** | Z8 · C10 · K8 · G8 · R12 (evalfast) · R16 · M4 (R11 merged per 8.7; R17 follows wave 4) | review notes filed; no open P0 |
 | **5 — optimization rounds** (measure first, per kernel family, independent sub-tracks) | Z9 · R13 R14 R15 · C11 C12 · K7 · G9 G10 (G11) · Z10 (after G2) → recursion p254 switch | baselines in `BASELINES.md` improved and re-verified bit-exact |
 | **6 — end-to-end** | M5 benchmark + Groth16 wrap on the miner | worker scheduled by zk-miner on the Mac |
 
@@ -570,6 +570,12 @@ Source: completeness critic run on 2026-11-09, verified against code and with `x
 - The non-macOS target guard check needs `rustup target add x86_64-unknown-linux-gnu` first.
 - The worker's `--benchmark` flag is verified (`zkminer-prove-risc0/src/main.rs:68`).
 - F1: `compile_metal` must strip the source prefix before joining into `OUT_DIR` so `.air` files for absolute generated sources land under `<OUT_DIR>/<output>/`; `cuda2metal.h`/`sppark_compat.h` are appended to the existing `METAL_INCS` const.
+
+### 8.7 Wave-3 re-scoping (added 2026-11-10 after wave 3)
+- **R11 gate re-scoped to the default configuration.** R11's integration gates apply to the rv32im Metal prover as shipped: CPU witgen kernel over the Metal buffers (R8 fix 1), GPU accum (R9), GPU eval_check (R10). The "all three GPU phases active" gate is moved to **R17**. R11 merges on the strength of its round-3 evidence: 74/74 `prove::` tests, word-for-word seal equality vs CPU on 14 segments (also under `witgen_debug`), M3's composite→succinct round trip at po2 18 and 20.
+- **New item R17: GPU witgen correctness** (owns `rv32im-sys` witgen generation: `witgen_tu_gen.py`, `cuda2metal.py` witgen paths, the witgen TU build flags in `rv32im-sys/build.rs`; may add files under `rv32im-sys/kernels/metal/witgen*` and `docs/metal-port/r17/`). The generated witgen kernel gives different results on identical inputs (R8, R11 notes: 60–100% of calls wrong on the po2 20 rv32im-torture segment; first bad row always a major 3/4 cycle; bad rows cluster in one SIMD group; values look like failed bit decompositions). Goals: (1) decide whether this is an Apple Metal compiler/driver bug, a translation bug, or undefined behaviour in the translated source (e.g. uninitialised reads, aliasing, out-of-bounds, integer-width/overflow semantics, `select`/ternary evaluation order); (2) find a workaround (per-kernel compile options, `-O` level, splitting the kernel, disabling specific transforms, rewriting the miscompiled construct) that makes GPU witgen bit-exact on all six dumped segments over many reps; (3) if a compiler bug, produce a minimal standalone reproducer suitable for an Apple Feedback report. Gate to re-enable GPU witgen by default: R8's reproducer and R11's all-GPU gate pass ≥ 200 consecutive calls per segment, plus the zk-miner guests at po2 20 under 4/8 GB budgets. Runs after wave 4.
+- **Wave-4 additions:** M1 follow-ups go to G8/G9/M4 as noted: the worker's Groth16 wrap takes 16–17 s vs G7's 3.1–4.4 s (check per-job key reload vs `metal_warmup` / cached prover); the worker's process footprint (16.7 GB) is not bounded by the GPU budget (7.4 GB peak), which matters on 16 GB Macs. The zk-miner `worker_lifecycle` tests fail/hang on macOS independently of M1 (M4 investigates and documents).
+- **Test isolation rule:** tests that set or assert process-wide state (counters, switches, device-wide allocation totals, working-set budgets) take a shared poison-tolerant test lock (keccak `gpu_test_lock`, recursion `global_state_test_lock`); merge gates run under the default parallel harness.
 
 ---
 
