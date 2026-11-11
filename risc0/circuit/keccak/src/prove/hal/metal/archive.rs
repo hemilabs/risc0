@@ -64,7 +64,7 @@ use std::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Mutex,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{anyhow, bail, Result};
@@ -167,6 +167,7 @@ impl ArchivedKernels {
                 .errors
                 .push("OS build unknown: binary archive not used".into());
         }
+        let opened = SystemTime::now();
         let archive = base
             .as_deref()
             .and_then(|base| open_archive(device, base, &mut report));
@@ -198,7 +199,7 @@ impl ArchivedKernels {
         if let (Some(archive), Some(base)) = (archive.as_deref(), base.as_deref()) {
             if added > 0 {
                 let t_save = Instant::now();
-                match save_archive(archive, base, unit) {
+                match save_archive(archive, base, unit, opened) {
                     Ok(path) => {
                         report.saved = true;
                         report.path = Some(path);
@@ -412,7 +413,29 @@ fn open_archive(
     base: &Path,
     report: &mut ArchiveReport,
 ) -> Option<BinaryArchive> {
-    if let Some(path) = verified_archive_file(base, report) {
+    open_archive_with(device, base, report, &mut |_| {})
+}
+
+/// [open_archive], calling `before_load` between verifying a file and Metal opening it (a test
+/// seam for the race below).
+///
+/// The cache directory is shared by every process (and every checkout) on the machine. Between
+/// [verified_archive_file] and Metal's open, another process's [save_archive] can rename its own
+/// archive into place and delete the file just verified; Metal then fails ("Invalid URL"). A
+/// file that is gone is not damaged: no error, nothing to delete, and the newer file is picked
+/// up by verifying once more (one retry: a second loss falls back to an empty archive, which
+/// costs a rebuild, never a wrong PSO).
+fn open_archive_with(
+    device: &DeviceRef,
+    base: &Path,
+    report: &mut ArchiveReport,
+    before_load: &mut dyn FnMut(&Path),
+) -> Option<BinaryArchive> {
+    for _attempt in 0..2 {
+        let Some(path) = verified_archive_file(base, report) else {
+            break;
+        };
+        before_load(&path);
         let desc = BinaryArchiveDescriptor::new();
         desc.set_url(&file_url(&path));
         match device.new_binary_archive_with_descriptor(&desc) {
@@ -421,11 +444,19 @@ fn open_archive(
                 report.path = Some(path);
                 return Some(archive);
             }
+            Err(e) if !path.exists() => {
+                tracing::debug!(
+                    "Metal binary archive: {} replaced by another process before loading ({e}); \
+                     looking again",
+                    path.display()
+                );
+            }
             Err(e) => {
                 let msg = format!("loading {}: {e}; deleting it", path.display());
                 tracing::warn!("Metal binary archive: {msg}");
                 report.errors.push(msg);
                 let _ = std::fs::remove_file(&path);
+                break;
             }
         }
     }
@@ -561,9 +592,17 @@ fn build_all<'a>(
 }
 
 /// Write `archive` as the archive file of `base` (temporary file, checksum, rename to
-/// [archive_file]), then delete the unit's other (stale) archives in the directory. Returns the
-/// file written.
-fn save_archive(archive: &BinaryArchiveRef, base: &Path, unit: &str) -> Result<PathBuf> {
+/// [archive_file]), then delete the unit's other (stale) archives in the directory. A file of the
+/// same key written at or after `opened` (when this process looked for one) is another process's
+/// concurrent save and is kept: deleting it would make the processes overwrite each other's
+/// archives in turn. The next [verified_archive_file] keeps one of the two. Returns the file
+/// written.
+fn save_archive(
+    archive: &BinaryArchiveRef,
+    base: &Path,
+    unit: &str,
+    opened: SystemTime,
+) -> Result<PathBuf> {
     let dir = base
         .parent()
         .ok_or_else(|| anyhow!("no parent directory"))?;
@@ -584,11 +623,21 @@ fn save_archive(archive: &BinaryArchiveRef, base: &Path, unit: &str) -> Result<P
     drop(content);
     std::fs::rename(&tmp, &path)?;
     let keep = path.file_name().unwrap().to_owned();
+    let stem = base.file_name().unwrap().to_string_lossy().into_owned();
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let s = name.to_string_lossy();
-            if name != keep && s.starts_with(&format!("{unit}-")) && s.ends_with(ARCHIVE_EXT) {
+            let concurrent_save = checksum_in_name(&stem, &s).is_some()
+                && entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|t| t >= opened);
+            if name != keep
+                && !concurrent_save
+                && s.starts_with(&format!("{unit}-"))
+                && s.ends_with(ARCHIVE_EXT)
+            {
                 let _ = std::fs::remove_file(entry.path());
             }
             // The temporary file of a process that died between serialize and rename (~50 MB);
@@ -713,6 +762,118 @@ mod tests {
         assert_ne!(third.report.path.as_ref(), Some(&path));
         assert!(third.report.saved);
         assert!(!path.exists(), "stale archive kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The content of a valid archive holding only `names[..1]` (another key; only the content
+    /// is used, under the name a file of `base` would have).
+    fn partial_archive(device: &Device, names: &[&str], tag: &str) -> Vec<u8> {
+        let other = temp_dir(tag);
+        let k = ArchivedKernels::new_in(
+            Some(other.clone()),
+            device,
+            "keccak",
+            METAL_LIB,
+            &names[..1],
+        )
+        .unwrap();
+        let content = std::fs::read(k.report.path.as_ref().unwrap()).unwrap();
+        let _ = std::fs::remove_dir_all(&other);
+        content
+    }
+
+    /// Another process replaces the archive between verification and Metal's open (seen in the
+    /// K8 round-2 verification: "Invalid URL; deleting it", failing warmup_builds_every_pso).
+    /// Not an error: the newer file is loaded, or, if none is left, an empty archive is used.
+    /// Before the fix both cases reported an error and the first one did not load.
+    #[test]
+    fn archive_replaced_before_load() {
+        let _gpu = super::super::tests::gpu_test_lock();
+        let device = device();
+        let dir = temp_dir("replaced");
+        let names = small_set();
+        let base = super::archive_base(&dir, &device, "keccak", METAL_LIB, &names).unwrap();
+        let first =
+            ArchivedKernels::new_in(Some(dir.clone()), &device, "keccak", METAL_LIB, &names)
+                .unwrap();
+        let verified = first.report.path.clone().unwrap();
+        let newer = partial_archive(&device, &names, "replaced-partial");
+        let newer_path = super::archive_file(&base, &newer);
+        assert_ne!(newer_path, verified);
+
+        // (1) Replaced by another process's save: the newer file loads.
+        let mut calls = 0;
+        let mut report = super::ArchiveReport::default();
+        let archive = super::open_archive_with(&device, &base, &mut report, &mut |path| {
+            calls += 1;
+            if calls == 1 {
+                assert_eq!(path, verified.as_path());
+                std::fs::write(&newer_path, &newer).unwrap();
+                std::fs::remove_file(path).unwrap();
+            }
+        });
+        assert!(archive.is_some());
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert!(report.loaded, "{report:?}");
+        assert_eq!(report.path.as_ref(), Some(&newer_path));
+        assert_eq!(calls, 2);
+        assert!(newer_path.exists());
+
+        // (2) Deleted and nothing newer: an empty archive, still no error.
+        let mut report = super::ArchiveReport::default();
+        let archive = super::open_archive_with(&device, &base, &mut report, &mut |path| {
+            std::fs::remove_file(path).unwrap();
+        });
+        assert!(archive.is_some());
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert!(!report.loaded);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A save keeps a same-key archive another process saved after this one looked for one
+    /// (before the fix it deleted it, so concurrent processes deleted each other's archives),
+    /// and still deletes one that is older than that.
+    #[test]
+    fn save_keeps_concurrent_same_key_archive() {
+        let _gpu = super::super::tests::gpu_test_lock();
+        let device = device();
+        let dir = temp_dir("concurrent-save");
+        let names = small_set();
+        let base = super::archive_base(&dir, &device, "keccak", METAL_LIB, &names).unwrap();
+        let other = partial_archive(&device, &names, "concurrent-save-partial");
+        let other_path = super::archive_file(&base, &other);
+        // An archive with one added function to save (an empty one has "Nothing to
+        // serialize"), and not the function of `other`, so the two files differ. A fresh one per
+        // save: Metal does not serialize one archive twice after its file was renamed.
+        let library = device.new_library_with_data(METAL_LIB).unwrap();
+        let new_archive = || {
+            let archive = device
+                .new_binary_archive_with_descriptor(&metal::BinaryArchiveDescriptor::new())
+                .unwrap();
+            let desc = metal::ComputePipelineDescriptor::new();
+            desc.set_compute_function(Some(&library.get_function(names[1], None).unwrap()));
+            archive
+                .add_compute_pipeline_functions_with_descriptor(&desc)
+                .unwrap();
+            archive
+        };
+
+        std::fs::create_dir_all(&dir).unwrap();
+        let opened = std::time::SystemTime::now() - std::time::Duration::from_secs(1);
+        std::fs::write(&other_path, &other).unwrap();
+        let saved = super::save_archive(&new_archive(), &base, "keccak", opened).unwrap();
+        assert_ne!(saved, other_path);
+        assert!(saved.exists());
+        assert!(
+            other_path.exists(),
+            "a concurrent save of the same key was deleted"
+        );
+
+        // Written before this process looked: stale, deleted.
+        let opened = std::time::SystemTime::now() + std::time::Duration::from_secs(1);
+        let saved = super::save_archive(&new_archive(), &base, "keccak", opened).unwrap();
+        assert!(saved.exists());
+        assert!(!other_path.exists(), "a stale archive was kept");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
