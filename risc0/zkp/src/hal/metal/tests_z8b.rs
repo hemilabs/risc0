@@ -320,6 +320,8 @@ fn launch_shapes_fit_psos() {
 /// memory is reclaimed by draining this HAL's pool. Deterministic under the parallel harness.
 #[test]
 fn budget_scope_hal_counts_own_allocations() {
+    // Other tests drain every HAL's pool (F2), which would lower owned bytes mid-test (plan 8.7).
+    let _lock = gpu_test_lock();
     use super::BudgetScope;
     let other = MetalHalSha256::new();
     let hal = MetalHalSha256::new();

@@ -138,6 +138,41 @@ Run on the base plus only the new test file (before any fix):
 - **Plan 7 "pvs not audited"**: audited (see above).
 - **Plan 9.2 "fri.metal / mix.metal scalars should be constant"**: done (Z6, Z4); verified.
 
+## Fix round 1 (review findings)
+- **Blocking (P2, test isolation, plan 8.7), fixed**: `tests_z8b::budget_scope_hal_counts_own_allocations`
+  asserted exact owned byte counts of its HAL's pool without taking `gpu_test_lock`. Since F2, any other
+  test that hits a budget or allocation failure calls `drain_all_pools()`, which drains this HAL's pool too
+  and lowers `owned_allocated_size()` (between `drop(a); hal.sync()` and the "pooled bytes are still owned"
+  assert, or before the `before - 4 MiB` assert). The test now takes `gpu_test_lock()` first, like the other
+  F2/F3 tests. It passed in every observed run, so there is no failing-before run to show; the race is
+  shown by code inspection (`Pool::drain` subtracts from `owned_bytes` on every registered pool).
+- **Reporting gap, recorded**: an earlier hal-scope 4 GiB parallel run on intermediate code
+  (`b4g_hal_par1.log`) also failed `tests_z8b::budget_failure_drains_every_pool`. That was before the test
+  pinned its HAL to `set_budget_scope(BudgetScope::Device)`: under the hal-scope env the test's device-wide
+  premise did not hold. The pin fixed it; `b4g_hal_par2.log` and the runs below show only the known lg-20 case.
+- **Merge note (Z8a interaction, P2)**: Z8a's `misc.metal` computes the `gather_sample` source index in 64 bits.
+  Whoever merges second should relax Z8b's host assert `last <= u32::MAX` in `metal.rs::gather_sample` to the
+  `src.size()` bound only. Left as is here because Z8b's branch still has the 32-bit kernel.
+- **Merge note**: Z8b edits Z6's `tests.rs` only to add `gpu_test_lock()` to 4 tests that assert pool or peak
+  state (no assertion changes); `git merge-tree` with `metal/Z8a` is clean.
+- **Device-scope budgets under the parallel harness** fail by design from interference (reviewer saw
+  `ntt_interpolate_zk_shift_from_lg_1_20` at 4 GiB next to lg_10_20). M4 and the plan owner should state that
+  device-scope budget runs are serial or use `RISC0_METAL_BUDGET_SCOPE=hal`.
+- **Hal-scope private buffers (Z9, P2)**: private buffers are counted in `owned_bytes` until the HAL drops, so a
+  long-lived HAL allocating private scratch per call (keccak eval_check) grows without bound under hal scope.
+  Opt-in only; Z9 could track private frees through a RawBuffer-like wrapper.
+
+Re-verified after the fix (logs `r1_*.log` in the scratchpad folder above):
+- `cargo test -p risc0-zkp --features metal --lib`, default parallel harness: run 1 **183 passed, 0 failed,
+  8 ignored** (85 s, `r1_par1.log`); run 2 **183 passed, 0 failed, 8 ignored** (115 s, `r1_par2.log`).
+- Debug layer (same command as above), parallel: **153 passed, 8 ignored**; only "Metal API Validation Enabled".
+- `RISC0_METAL_BUDGET_SCOPE=hal`, parallel: 4 GiB **152 passed, 1 failed** (known lg_10_20 only);
+  8 GiB **153 passed**.
+- Device scope, `--test-threads=1`, split: 4 GiB tests_z2 14 passed / 1 failed (known lg_10_20), rest 138
+  passed; 8 GiB tests_z2 15 passed, rest 138 passed.
+- `cargo test -p risc0-zkp --features prove --lib`: 30 passed. `cargo check -p risc0-zkvm --features metal`:
+  exit 0. clippy (same flags): only the `block v0.1.6` future-incompat note. rustfmt `tests_z8b.rs`: clean.
+
 ## Issues for other items
 - **Z8a**:
   - (P2) `gather_sample` in `misc.metal` has no count or bounds check and computes `gid * stride + idx` in
