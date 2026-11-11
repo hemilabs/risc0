@@ -69,6 +69,19 @@ impl CompositeReceipt {
         &self,
         ctx: &VerifierContext,
     ) -> Result<(), VerificationError> {
+        self.verify_integrity_inner(ctx, true)
+    }
+
+    /// [Self::verify_integrity_with_context], optionally without verifying each segment's seal,
+    /// for a prover that has already verified every segment receipt as it produced it. Everything
+    /// else is still checked: the chaining of segments, their exit codes and outputs, and the
+    /// assumption receipts.
+    #[cfg_attr(not(feature = "prove"), allow(dead_code))]
+    pub(crate) fn verify_integrity_inner(
+        &self,
+        ctx: &VerifierContext,
+        verify_segment_seals: bool,
+    ) -> Result<(), VerificationError> {
         tracing::debug!("CompositeReceipt::verify_integrity_with_context");
         // Verify the continuation, by verifying every segment receipt in order.
         let (final_receipt, receipts) = self
@@ -80,7 +93,9 @@ impl CompositeReceipt {
         // Verify each segment and its chaining to the next.
         let mut expected_pre_state_digest = None;
         for receipt in receipts {
-            receipt.verify_integrity_with_context(ctx)?;
+            if verify_segment_seals {
+                receipt.verify_integrity_with_context(ctx)?;
+            }
             tracing::debug!("claim: {:#?}", receipt.claim);
             if let Some(id) = expected_pre_state_digest {
                 if id != receipt.claim.pre.digest::<sha::Impl>() {
@@ -104,7 +119,9 @@ impl CompositeReceipt {
         }
 
         // Verify the last receipt in the continuation.
-        final_receipt.verify_integrity_with_context(ctx)?;
+        if verify_segment_seals {
+            final_receipt.verify_integrity_with_context(ctx)?;
+        }
         tracing::debug!("final: {:#?}", final_receipt.claim);
         if let Some(id) = expected_pre_state_digest {
             if id != final_receipt.claim.pre.digest::<sha::Impl>() {

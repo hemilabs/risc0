@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! A Blake2b HashSuite.
-use alloc::{boxed::Box, rc::Rc, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::marker::PhantomData;
 
 use blake2::{
@@ -67,7 +67,7 @@ impl<T: Blake2b> Blake2bRngFactory<T> {
 }
 
 impl<T: Blake2b + 'static> RngFactory<BabyBear> for Blake2bRngFactory<T> {
-    fn new_rng(&self) -> Box<dyn Rng<BabyBear>> {
+    fn new_rng(&self) -> Box<dyn Rng<BabyBear> + Send> {
         let rng: Blake2bRng<T> = Blake2bRng::new();
         Box::new(rng)
     }
@@ -84,8 +84,8 @@ impl<T: Blake2b + 'static> Blake2bHashSuite<T> {
     pub fn new_suite() -> HashSuite<BabyBear> {
         HashSuite {
             name: "blake2b".into(),
-            hashfn: Rc::new(Blake2bHashFn::<T>::new()),
-            rng: Rc::new(Blake2bRngFactory::<T>::new()),
+            hashfn: Arc::new(Blake2bHashFn::<T>::new()),
+            rng: Arc::new(Blake2bRngFactory::<T>::new()),
         }
     }
 }

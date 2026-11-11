@@ -12,11 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#pragma once
+
 #include "context.h"
 
 #include <assert.h>
 #include <cstdio>
+#ifndef __HIPCC__
 #include <cuda_runtime.h>
+#endif
+
+#if defined(__HIPCC__) && !defined(__trap)
+// The generated accum steps (step_*_accum.cu and their _inl.cuh copies) end with a branch-free
+// assert, `if (c1_bad) __trap();`; HIP has no __trap.
+#define __trap() __builtin_trap()
+#endif
 
 inline __device__ void
 extern_readIOPHeader(void* ctx, size_t cycle, const char* extra, Fp* args, Fp* outs) {

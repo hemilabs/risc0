@@ -14,6 +14,8 @@
 
 #[cfg(feature = "bonsai")]
 pub(crate) mod bonsai;
+// Talks to `r0vm` over a Unix socket pair.
+#[cfg(unix)]
 pub(crate) mod default;
 pub(crate) mod external;
 #[cfg(feature = "prove")]
@@ -28,7 +30,9 @@ use anyhow::{anyhow, Result};
 #[cfg(feature = "bonsai")]
 use self::bonsai::BonsaiProver;
 
-use self::{default::DefaultProver, external::ExternalProver, opts::ProverOpts};
+#[cfg(unix)]
+use self::default::DefaultProver;
+use self::{external::ExternalProver, opts::ProverOpts};
 
 use crate::{
     get_version, host::prove_info::ProveInfo, ExecutorEnv, Receipt, SessionInfo, VerifierContext,
@@ -184,7 +188,10 @@ pub fn default_prover() -> Rc<dyn Prover> {
     let explicit = std::env::var("RISC0_PROVER").unwrap_or_default();
     if !explicit.is_empty() {
         return match explicit.to_lowercase().as_str() {
+            #[cfg(unix)]
             "actor" => Rc::new(DefaultProver::new(get_r0vm_path().unwrap()).unwrap()),
+            #[cfg(not(unix))]
+            "actor" => unimplemented!("the `actor` prover needs Unix sockets"),
             #[cfg(feature = "bonsai")]
             "bonsai" => Rc::new(BonsaiProver::new("bonsai")),
             "ipc" => Rc::new(ExternalProver::new("ipc", get_r0vm_path().unwrap())),

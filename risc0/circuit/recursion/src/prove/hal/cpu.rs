@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use risc0_circuit_recursion_sys::{
@@ -171,7 +171,7 @@ pub(crate) fn recursion_prover(hashfn: &str) -> Result<Box<dyn RecursionProver>>
         _ => bail!("Unsupported hashfn: {hashfn}"),
     };
 
-    let hal = Rc::new(CpuHal::new(suite));
-    let circuit_hal = Rc::new(CpuCircuitHal);
+    let hal = Arc::new(CpuHal::new(suite));
+    let circuit_hal = Arc::new(CpuCircuitHal);
     Ok(Box::new(RecursionProverImpl::new(hal, circuit_hal)))
 }

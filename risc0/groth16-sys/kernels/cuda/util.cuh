@@ -32,6 +32,8 @@ template <int ROUNDS, class field_t>
 __global__ __launch_bounds__(1024) void chacha_generate_random_scalars(field_t* output,
                                                                        const chacha_state state,
                                                                        size_t output_block_count) {
+#if defined(__HIPCC__) && !defined(__HIP_DEVICE_COMPILE__)
+#else
   union state_and_field {
     chacha_state state;
     field_t v[2];
@@ -58,6 +60,7 @@ __global__ __launch_bounds__(1024) void chacha_generate_random_scalars(field_t* 
       output[idx + WARP_SZ] = s.v[1];
     }
   }
+#endif
 }
 
 gpu_ptr_t<fr_t> generate_random_scalars(const gpu_t& gpu, size_t n) {
@@ -82,6 +85,9 @@ __global__ __launch_bounds__(1024) void coeff_wise_mul_and_sub(fr_t* inout,
                                                                const fr_t* in1,
                                                                const fr_t* in2,
                                                                uint32_t lg_domain_size) {
+#if defined(__HIPCC__) && !defined(__HIP_DEVICE_COMPILE__)
+  // HIP host pass: empty body (stub only needs the signature)
+#else
   size_t tid = threadIdx.x + (size_t)blockIdx.x * blockDim.x;
 
   size_t domain_size = (size_t)1 << lg_domain_size;
@@ -92,12 +98,15 @@ __global__ __launch_bounds__(1024) void coeff_wise_mul_and_sub(fr_t* inout,
     v1 -= v3;
     inout[i] = v1;
   }
+#endif
 }
 
 __global__ __launch_bounds__(1024) void coeff_wise_mul(fr_t* out,
                                                        const fr_t* in1,
                                                        const fr_t* in2,
                                                        uint32_t lg_domain_size) {
+#if defined(__HIPCC__) && !defined(__HIP_DEVICE_COMPILE__)
+#else
   size_t tid = threadIdx.x + (size_t)blockIdx.x * blockDim.x;
 
   size_t domain_size = (size_t)1 << lg_domain_size;
@@ -107,9 +116,12 @@ __global__ __launch_bounds__(1024) void coeff_wise_mul(fr_t* out,
     v1 *= v2;
     out[i] = v1;
   }
+#endif
 }
 
 __global__ __launch_bounds__(1024) void coeff_wise_add(fr_t inout[], const fr_t in[], size_t n) {
+#if defined(__HIPCC__) && !defined(__HIP_DEVICE_COMPILE__)
+#else
   size_t tid = threadIdx.x + (size_t)blockIdx.x * blockDim.x;
 
   for (size_t i = tid; i < n; i += (size_t)gridDim.x * blockDim.x) {
@@ -117,11 +129,12 @@ __global__ __launch_bounds__(1024) void coeff_wise_add(fr_t inout[], const fr_t 
     res += val;
     inout[i] = res;
   }
+#endif
 }
 
 template <class point_t, class affine_t>
 static void mult(point_t& ret, const affine_t& point, const fr_t& fr, size_t top = fr_t::nbits) {
-#ifndef __CUDA_ARCH__
+#if !defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
   fr_t::pow_t scalar;
   fr.to_scalar(scalar);
 

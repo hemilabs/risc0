@@ -54,20 +54,47 @@ private:
   // tweaking of the implementation later, for example switching to montgomery representation or
   // doing inline assembly or some crazy CUDA stuff.
 
+  // RISC0_INTEL_EVAL_FAST (defined only for the Intel mono eval_check build):
+  // 32-bit-only device forms. Xe2 has no 32x32->64 multiply, so the 64-bit
+  // temporaries below are emulated; these forms are bit-identical for
+  // canonical inputs (< P). Measured on the real kernel together with the
+  // inlined lazy FpExt multiply in fpext.h; alone they gain nothing.
+
   // Add two numbers
   static constexpr inline uint32_t add(uint32_t a, uint32_t b) {
     uint32_t r = a + b;
+#if defined(__SYCL_DEVICE_ONLY__) && defined(RISC0_INTEL_EVAL_FAST)
+    uint32_t s = r - P;
+    return (r < s ? r : s);
+#else
     return (r >= P ? r - P : r);
+#endif
   }
 
   // Subtract two numbers
   static constexpr inline uint32_t sub(uint32_t a, uint32_t b) {
     uint32_t r = a - b;
+#if defined(__SYCL_DEVICE_ONLY__) && defined(RISC0_INTEL_EVAL_FAST)
+    uint32_t s = r + P;
+    return (r < s ? r : s);
+#else
     return (r > P ? r + P : r);
+#endif
   }
 
   // Multiply two numbers
   static constexpr inline uint32_t mul(uint32_t a, uint32_t b) {
+#if defined(__SYCL_DEVICE_ONLY__) && defined(RISC0_INTEL_EVAL_FAST)
+    // Subtraction-form Montgomery REDC: with m = lo * P^-1 mod 2^32 the low
+    // words of a*b and m*P cancel exactly, so (a*b - m*P) / 2^32 =
+    // hi - mulhi(m, P), which lies in (-P, P); min() maps it into [0, P).
+    uint32_t lo = a * b;
+    uint32_t hi = uint32_t((uint64_t(a) * uint64_t(b)) >> 32);
+    uint32_t m = lo * M;
+    uint32_t r = hi - uint32_t((uint64_t(m) * uint64_t(P)) >> 32);
+    uint32_t s = r + P;
+    return (r < s ? r : s);
+#endif
     uint64_t o64 = uint64_t(a) * uint64_t(b);
     uint32_t low = -uint32_t(o64);
     uint32_t red = M * low;
@@ -95,6 +122,9 @@ public:
 
   /// Return the underlying value
   constexpr inline uint32_t asRaw() const { return val; }
+
+  /// Construct from the internal (Montgomery) representation.
+  static constexpr inline Fp fromRaw(uint32_t val) { return Fp(val, true); }
 
   /// Get the largest value, basically P - 1.
   static constexpr inline Fp maxVal() { return P - 1; }

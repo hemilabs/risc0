@@ -21,6 +21,9 @@
 
 namespace risc0::circuit::keccak::cuda {
 
+// ROCm builds this eval_check. CUDA builds its own, from eval_check_scratch_kernel.cuh (see
+// there and build.rs), with the scratch array in global memory.
+
 __constant__ FpExt poly_mix[kNumPolyMixPows];
 
 __global__ void eval_check(Fp* check,
@@ -35,8 +38,16 @@ __global__ void eval_check(Fp* check,
   uint32_t cycle = blockDim.x * blockIdx.x + threadIdx.x;
   if (cycle < domain) {
     FpExt tot = poly_fp(cycle, domain, ctrl, out, data, mix, accum);
+#ifdef __HIPCC__
+    // HIP/clang cmath pow() overloads are ambiguous with bb31_t; use the field's
+    // operator^ (== exponentiation, see supra/fp.h: `pow(b, e) { return b ^ e; }`).
+    // Mirrors the rv32im eval_check_combined.cu HIP path.
+    Fp x = rou ^ (unsigned)cycle;
+    Fp y = (Fp(3) * x) ^ (unsigned)(1 << po2);
+#else
     Fp x = pow(rou, cycle);
     Fp y = pow(Fp(3) * x, 1 << po2);
+#endif
     FpExt ret = tot * inv(y - Fp(1));
     check[domain * 0 + cycle] = ret[0];
     check[domain * 1 + cycle] = ret[1];
@@ -62,13 +73,19 @@ const char* risc0_circuit_keccak_cuda_eval_check(Fp* check,
                                                  uint32_t domain,
                                                  const FpExt* poly_mix_pows) {
   try {
-    CUDA_OK(cudaDeviceSynchronize());
-    CudaStream stream;
+    cudaStream_t stream = getPersistentStream();
     auto cfg = getSimpleConfig(domain);
+#ifdef __HIPCC__
+    {
+      void* dev_ptr = nullptr;
+      hipGetSymbolAddress(&dev_ptr, HIP_SYMBOL(poly_mix));
+      hipMemcpy(dev_ptr, poly_mix_pows, sizeof(poly_mix), hipMemcpyHostToDevice);
+    }
+#else
     cudaMemcpyToSymbol(poly_mix, poly_mix_pows, sizeof(poly_mix));
+#endif
     eval_check<<<cfg.grid, cfg.block, 0, stream>>>(
         check, ctrl, data, accum, mix, out, rou, po2, domain);
-    CUDA_OK(cudaStreamSynchronize(stream));
   } catch (const std::exception& err) {
     return strdup(err.what());
   } catch (...) {
