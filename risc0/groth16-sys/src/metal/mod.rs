@@ -36,10 +36,17 @@
 //! honoured: [check_working_set] fails before any allocation that would take the device's
 //! `currentAllocatedSize` above it, and the prover checks its whole footprint before loading.
 
-use std::{fmt, sync::Mutex};
+use std::{
+    fmt,
+    sync::{Mutex, MutexGuard},
+};
 
 use anyhow::{anyhow, Result};
-use metal::DeviceRef;
+use metal::{
+    foreign_types::{ForeignType as _, ForeignTypeRef as _},
+    objc::{msg_send, runtime::Object, sel, sel_impl},
+    Buffer, DeviceRef, MTLBuffer, MTLResourceOptions,
+};
 
 use crate::{ProverParams, SetupParams};
 
@@ -121,6 +128,89 @@ pub fn check_working_set(device: &DeviceRef, what: &str, bytes: u64) -> Result<(
     ))
 }
 
+/// The device's `currentAllocatedSize` (process-wide), 0 without a Metal device. Diagnostics:
+/// callers that report peak GPU memory per phase (PLAN 9.1) sample it.
+pub fn allocated_bytes() -> u64 {
+    match prover::kernels() {
+        Ok(k) => k.device.current_allocated_size(),
+        Err(_) => metal::Device::system_default()
+            .map(|d| d.current_allocated_size())
+            .unwrap_or(0),
+    }
+}
+
+/// A new buffer of `bytes` (at least 16) bytes, `StorageModePrivate` if `private` else
+/// `StorageModeShared`, after the `max_buffer_length` and working-set budget checks.
+///
+/// Every buffer of this module comes from here or from `srs`'s loader: metal-rs 0.29's
+/// `new_buffer` wraps the result of `newBufferWithLength:options:` in a non-null pointer type, so a
+/// nil result (allocation refused by the OS) is undefined behaviour there and crashed later in
+/// `contents()`; here it is an error (`"Metal allocation failed ..."`, the zkp HAL's wording, which
+/// zk-miner's worker classifies as out-of-memory). Same approach as zkp's
+/// `Runtime::new_buffer_raw` (PLAN 2.9), without a pool to drain.
+pub fn new_buffer_checked(
+    device: &DeviceRef,
+    bytes: u64,
+    private: bool,
+    what: &str,
+) -> Result<Buffer> {
+    let bytes = bytes.max(16);
+    anyhow::ensure!(
+        bytes <= device.max_buffer_length(),
+        "groth16-metal: {what}: {bytes} bytes exceed this GPU's max_buffer_length {}",
+        device.max_buffer_length()
+    );
+    check_working_set(device, what, bytes)?;
+    let options = if private {
+        MTLResourceOptions::StorageModePrivate
+    } else {
+        MTLResourceOptions::StorageModeShared
+    };
+    new_buffer_raw(device, bytes, options).ok_or_else(|| {
+        anyhow!(
+            "Metal allocation failed on {what}: {bytes} bytes (currentAllocatedSize {})",
+            device.current_allocated_size()
+        )
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: the next `n` [new_buffer_raw] calls on this thread return nil.
+    static FAIL_ALLOCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test hook: the next `n` allocations of [new_buffer_checked] on this thread fail as if
+/// `newBufferWithLength:` returned nil.
+#[cfg(test)]
+pub(crate) fn inject_alloc_failures(n: usize) {
+    FAIL_ALLOCS.with(|c| c.set(n));
+}
+
+/// `newBufferWithLength:options:` with a nil check on the raw pointer.
+// objc's `msg_send!` expands a `cfg(feature = "cargo-clippy")` this crate does not declare.
+#[allow(unexpected_cfgs)]
+fn new_buffer_raw(device: &DeviceRef, bytes: u64, options: MTLResourceOptions) -> Option<Buffer> {
+    #[cfg(test)]
+    if FAIL_ALLOCS.with(|c| {
+        let n = c.get();
+        c.set(n.saturating_sub(1));
+        n > 0
+    }) {
+        return None;
+    }
+    // SAFETY: `newBufferWithLength:options:` returns a +1 (owned) reference or nil; only a
+    // non-nil result is wrapped, and `from_ptr` takes over that reference.
+    let ptr: *mut MTLBuffer = unsafe {
+        msg_send![device.as_ptr() as *mut Object, newBufferWithLength: bytes options: options]
+    };
+    if ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { Buffer::from_ptr(ptr) })
+    }
+}
+
 /// Whether this build can prove on the GPU: `Ok` if a Metal device is present and the build
 /// embeds the groth16 kernels, else [MetalUnavailable]. Cheap: needs no proving key, so callers
 /// check it before computing a witness they could not use.
@@ -139,10 +229,35 @@ pub fn metal_supported() -> Result<()> {
 
 /// The cached prover (key, pipelines, scratch); `None` until the first preload or prove, and
 /// after [metal_release]. Its own mutex: [metal_preload] runs without the GPU lock.
+///
+/// The mutex is held for a whole build (key load, ~1 s) or proof (~3 s): a second caller (a
+/// prestart preload, [metal_release], [metal_is_loaded]) waits that long; callers in
+/// `risc0-groth16` serialize proofs with the GPU lock anyway, so nothing is lost by it.
 static PROVER: Mutex<Option<prover::MetalProver>> = Mutex::new(None);
 
-fn cache() -> std::sync::MutexGuard<'static, Option<prover::MetalProver>> {
-    PROVER.lock().unwrap_or_else(|e| e.into_inner())
+fn cache() -> MutexGuard<'static, Option<prover::MetalProver>> {
+    lock_discarding_poisoned(&PROVER)
+}
+
+/// Lock a cache slot; if a holder panicked (the mutex is poisoned), discard what it cached and
+/// clear the poison. A panic inside a build or proof can leave the cached prover half-built or
+/// with its scratch in an unknown state, so it is rebuilt by the next user instead of reused (a
+/// rebuild costs one key load, ~1 s).
+fn lock_discarding_poisoned<T>(m: &Mutex<Option<T>>) -> MutexGuard<'_, Option<T>> {
+    match m.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            let mut g = poisoned.into_inner();
+            if g.take().is_some() {
+                eprintln!(
+                    "groth16-metal: a previous build or proof panicked; discarding the cached \
+                     prover"
+                );
+            }
+            m.clear_poison();
+            g
+        }
+    }
 }
 
 /// The cached prover for `setup`, built (key loaded, pipelines and scratch created) if absent or
@@ -234,6 +349,26 @@ pub fn metal_is_loaded() -> bool {
     cache().is_some()
 }
 
+/// Test isolation (PLAN 8.7): the tests that build the prover or load the real key (GBs of
+/// device memory) run alone ([test_lock::exclusive]); the other GPU tests of real size share
+/// ([test_lock::shared]). Under a `RISC0_METAL_MAX_WORKING_SET_BYTES` budget a kernel test would
+/// otherwise be refused because a concurrent prover build holds most of the budget. Each test
+/// takes it once (no reentrancy). Poison-tolerant.
+#[cfg(test)]
+pub(crate) mod test_lock {
+    use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+    static LOCK: RwLock<()> = RwLock::new(());
+
+    pub(crate) fn shared() -> RwLockReadGuard<'static, ()> {
+        LOCK.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn exclusive() -> RwLockWriteGuard<'static, ()> {
+        LOCK.write().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 #[cfg(test)]
 #[path = "tests.rs"]
 mod bn254_tests;
@@ -265,6 +400,66 @@ mod tests {
             format!("{err:#}").contains("nonexistent-risc0-groth16"),
             "{err:#}"
         );
+    }
+
+    /// A panic while the cache is locked discards the cached value and clears the poison (G8:
+    /// before, the next user reused whatever the panicking build or proof had left).
+    #[test]
+    fn poisoned_cache_is_discarded() {
+        static SLOT: Mutex<Option<u32>> = Mutex::new(None);
+        *lock_discarding_poisoned(&SLOT) = Some(7);
+        let r = std::thread::spawn(|| {
+            let mut g = lock_discarding_poisoned(&SLOT);
+            *g = Some(8);
+            panic!("a build or proof panicked");
+        })
+        .join();
+        assert!(r.is_err());
+        assert!(SLOT.is_poisoned());
+        assert_eq!(*lock_discarding_poisoned(&SLOT), None);
+        assert!(!SLOT.is_poisoned());
+        *lock_discarding_poisoned(&SLOT) = Some(9);
+        assert_eq!(*lock_discarding_poisoned(&SLOT), Some(9));
+    }
+
+    /// A nil `newBufferWithLength:` is an error, not undefined behaviour (G8), exercised with the
+    /// injected failure; a length above `max_buffer_length` is refused before reaching Metal.
+    #[test]
+    fn allocation_failure_is_an_error() {
+        let _lock = test_lock::shared();
+        let Some(device) = ::metal::Device::system_default() else {
+            return;
+        };
+        inject_alloc_failures(1);
+        let err = new_buffer_checked(&device, 1 << 20, true, "a test buffer").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Metal allocation failed on a test buffer"),
+            "{err:#}"
+        );
+        assert!(new_buffer_checked(&device, 1 << 20, true, "a test buffer").is_ok());
+        let too_big = device.max_buffer_length() + (1 << 20);
+        assert!(new_buffer_checked(&device, too_big, true, "too big").is_err());
+        // The MSM scratch and the NTT tables allocate through it.
+        inject_alloc_failures(1);
+        let err = msm::MsmScratch::new(&device, 1 << 10, msm::MsmConfig::default())
+            .err()
+            .expect("MsmScratch::new ignored a failed allocation");
+        assert!(
+            format!("{err:#}").contains("Metal allocation failed"),
+            "{err:#}"
+        );
+        let Ok(k) = prover::kernels() else {
+            return;
+        };
+        inject_alloc_failures(1);
+        let err = ntt::NttPlan::new(&k.device, &k.queue, &k.library, 10)
+            .err()
+            .expect("NttPlan::new ignored a failed allocation");
+        assert!(
+            format!("{err:#}").contains("Metal allocation failed"),
+            "{err:#}"
+        );
+        inject_alloc_failures(0);
     }
 
     #[test]

@@ -25,7 +25,16 @@
 //! without it. Under a `RISC0_METAL_MAX_WORKING_SET_BYTES` budget too small for the prover, the
 //! wrap must fail with the clean budget error (and the test passes, saying so).
 
-use std::{path::Path, sync::OnceLock, time::Instant};
+use std::{
+    ffi::OsString,
+    path::Path,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex, MutexGuard, OnceLock,
+    },
+    thread::JoinHandle,
+    time::{Duration, Instant},
+};
 
 use hex::FromHex as _;
 use risc0_zkp::core::digest::Digest;
@@ -47,6 +56,84 @@ fn seal_words() -> &'static [u8] {
             .collect()
     });
     bytemuck::cast_slice(words)
+}
+
+/// Serializes this crate's tests that use the GPU prover, its process-wide cache, the device-wide
+/// allocation figure or the working-set budget variable (PLAN 8.7), so that they hold under the
+/// default parallel harness. Poison-tolerant.
+pub(super) fn gpu_test_lock() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Sets (or removes) an environment variable for the life of the guard, then restores it. Only
+/// under [gpu_test_lock].
+struct EnvGuard {
+    name: &'static str,
+    old: Option<OsString>,
+}
+
+impl EnvGuard {
+    fn set(name: &'static str, value: Option<String>) -> Self {
+        let old = std::env::var_os(name);
+        match value {
+            Some(v) => std::env::set_var(name, v),
+            None => std::env::remove_var(name),
+        }
+        Self { name, old }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match self.old.take() {
+            Some(v) => std::env::set_var(self.name, v),
+            None => std::env::remove_var(self.name),
+        }
+    }
+}
+
+/// Peak of the device's `currentAllocatedSize`, sampled every millisecond on its own thread.
+struct PeakSampler {
+    stop: Arc<AtomicBool>,
+    peak: Arc<AtomicU64>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl PeakSampler {
+    fn start() -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let peak = Arc::new(AtomicU64::new(risc0_groth16_sys::metal::allocated_bytes()));
+        let handle = {
+            let (stop, peak) = (stop.clone(), peak.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    peak.fetch_max(
+                        risc0_groth16_sys::metal::allocated_bytes(),
+                        Ordering::Relaxed,
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            })
+        };
+        Self {
+            stop,
+            peak,
+            handle: Some(handle),
+        }
+    }
+
+    fn finish(mut self) -> u64 {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            h.join().unwrap();
+        }
+        self.peak.load(Ordering::Relaxed)
+    }
+}
+
+fn mib(b: u64) -> f64 {
+    b as f64 / (1u64 << 20) as f64
 }
 
 /// (control_root, claim_digest, bn254_control_id) of the fixture.
@@ -136,6 +223,7 @@ fn check_proof(seal: &Seal, dir: &Path) {
 /// blinding makes every proof different.
 #[test]
 fn metal_shrink_wrap() {
+    let _lock = gpu_test_lock();
     if !available() {
         return;
     }
@@ -159,6 +247,7 @@ fn metal_shrink_wrap() {
 /// `prove::shrink_wrap`, `prove::shrink_wrap_with`), every proof verified against the claim.
 #[test]
 fn metal_proofs_verify() {
+    let _lock = gpu_test_lock();
     if !available() {
         return;
     }
@@ -198,4 +287,141 @@ fn metal_proofs_verify() {
         verify(&seal);
     }
     crate::prove::release_srs().unwrap();
+}
+
+/// What the STARK prover's HAL pools hold when the wrap starts, in the M1 failure: 4602757120
+/// bytes ("already allocated") at po2 18 under an 8 GiB budget.
+const STARK_POOL_BYTES: u64 = 4602757120;
+
+/// The zkvm's wrap after a STARK proof (`succinct_to_groth16`), with the STARK HAL's pools
+/// modelled by `STARK_POOL_BYTES` of device buffers that `pre_gpu` frees (as
+/// `release_hal_buffers` drops the cached provers, after ~100 ms): `prestart_prover` first (the
+/// zkvm calls it before identity_p254), then `shrink_wrap_with`. Under `budget` (None: no budget,
+/// whatever the environment says). Returns (seal, peak allocation, allocation before).
+fn wrap_beside_stark_pools(budget: Option<u64>) -> (Result<Seal>, u64, u64) {
+    let _env = EnvGuard::set(
+        risc0_groth16_sys::metal::MAX_WORKING_SET_ENV,
+        budget.map(|b| b.to_string()),
+    );
+    crate::prove::release_srs().unwrap();
+    let device = &risc0_groth16_sys::metal::prover::kernels().unwrap().device;
+    let before = risc0_groth16_sys::metal::allocated_bytes();
+    let sampler = PeakSampler::start();
+    let pools: Vec<_> = (0..4)
+        .map(|_| {
+            risc0_groth16_sys::metal::new_buffer_checked(
+                device,
+                STARK_POOL_BYTES / 4,
+                true,
+                "a modelled STARK pool",
+            )
+            .unwrap()
+        })
+        .collect();
+    crate::prove::prestart_prover().unwrap();
+    // identity_p254 runs on the CPU meanwhile (~13 s in the worker).
+    std::thread::sleep(Duration::from_millis(1500));
+    let seal = crate::prove::shrink_wrap_with(seal_words(), move || {
+        std::thread::sleep(Duration::from_millis(100));
+        drop(pools);
+    });
+    let peak = sampler.finish();
+    (seal, peak, before)
+}
+
+/// M1's P0 for 16 GB Macs (G8): under an 8 GiB budget, a wrap after a STARK proof must load the
+/// key only after `pre_gpu` has released the STARK pools. Before, the key loader started before
+/// `pre_gpu` (and `prestart_prover` loaded during identity_p254), so the load was checked against
+/// memory about to be freed and failed: "Metal working-set budget exceeded: allocating 5930236936
+/// bytes for the Groth16 prover ... with 4602757120 bytes already allocated ...".
+#[test]
+fn wrap_after_stark_under_8gib_budget() {
+    let _lock = gpu_test_lock();
+    if !available() {
+        return;
+    }
+    let budget = 8u64 << 30;
+    let (seal, peak, before) = wrap_beside_stark_pools(Some(budget));
+    let seal = seal.unwrap_or_else(|e| panic!("the wrap failed under the 8 GiB budget: {e:#}"));
+    let (control_root, claim_digest, bn254_id) = fixture_meta();
+    Verifier::new(
+        &seal.to_vec(),
+        control_root,
+        claim_digest,
+        bn254_id,
+        &verifying_key(),
+    )
+    .unwrap()
+    .verify()
+    .unwrap();
+    eprintln!(
+        "wrap after modelled STARK pools under 8 GiB: before {:.1} MiB, peak {:.1} MiB",
+        mib(before),
+        mib(peak)
+    );
+    assert!(peak <= budget, "peak {peak} above the budget {budget}");
+    crate::prove::release_srs().unwrap();
+}
+
+/// Without a budget the same wrap must not hold the key beside the STARK pools: the peak is about
+/// max(pools, key), not pools + key (M1 measured 16.6-17.6 GB instead of ~7.4 GB at po2 20).
+#[test]
+fn wrap_after_stark_peak_is_not_stark_plus_key() {
+    let _lock = gpu_test_lock();
+    if !available() {
+        return;
+    }
+    let (seal, peak, before) = wrap_beside_stark_pools(None);
+    seal.unwrap();
+    let key = risc0_groth16_sys::metal::allocated_bytes().saturating_sub(before);
+    eprintln!(
+        "wrap after modelled STARK pools, no budget: before {:.1} MiB, peak {:.1} MiB, prover \
+         {:.1} MiB",
+        mib(before),
+        mib(peak),
+        mib(key)
+    );
+    assert!(
+        key > STARK_POOL_BYTES,
+        "the prover is not cached ({key} bytes)"
+    );
+    assert!(
+        peak < before + key + STARK_POOL_BYTES / 2,
+        "the key was loaded beside the STARK pools: peak {:.1} MiB, before {:.1}, prover {:.1}, \
+         pools {:.1}",
+        mib(peak),
+        mib(before),
+        mib(key),
+        mib(STARK_POOL_BYTES)
+    );
+    crate::prove::release_srs().unwrap();
+}
+
+/// A seal that is not 4-byte aligned (any `&[u8]` a caller may pass) wraps like an aligned one.
+/// Before (G8), `fast::witness` and `to_json` read it with `bytemuck::cast_slice::<u8, u32>`,
+/// which panics on unaligned data ("groth16 witness thread panicked").
+#[test]
+fn unaligned_seal_wraps() {
+    let _lock = gpu_test_lock();
+    if !available() {
+        return;
+    }
+    let mut buf = vec![0u32; SEAL_BYTES.len() / 4 + 1];
+    let bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut buf);
+    bytes[1..=SEAL_BYTES.len()].copy_from_slice(SEAL_BYTES);
+    let unaligned = &bytes[1..=SEAL_BYTES.len()];
+    assert_ne!(unaligned.as_ptr() as usize % 4, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let seal = match gpu_prove(unaligned, &mut Some(|| {}), dir.path()) {
+        Err(e) if refused_by_budget(&e) => return,
+        r => r.unwrap_or_else(|e| panic!("{e:#}")),
+    };
+    check_proof(&seal, dir.path());
+    // And through the public entry point.
+    match crate::prove::shrink_wrap(unaligned) {
+        Err(e) if refused_by_budget(&e) => {}
+        r => {
+            r.unwrap_or_else(|e| panic!("{e:#}"));
+        }
+    }
 }

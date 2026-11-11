@@ -125,6 +125,12 @@ pub use self::host::{
     },
 };
 
+/// Metal builds: drop the provers (and their GPU buffer pools) this thread caches between
+/// proofs; see the function's docs.
+#[cfg(not(target_os = "zkvm"))]
+#[cfg(feature = "metal")]
+pub use self::host::server::prove::release_hal_buffers;
+
 #[cfg(not(target_os = "zkvm"))]
 #[cfg(feature = "bonsai")]
 pub use self::host::client::prove::bonsai::BonsaiProver;

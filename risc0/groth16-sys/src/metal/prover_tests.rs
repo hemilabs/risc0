@@ -44,6 +44,38 @@ fn component_dir() -> Option<PathBuf> {
     }
 }
 
+/// The tests that build a [MetalProver] (5.6 GB each with the rzup key) run alone (PLAN 8.7):
+/// two builds never coexist, and no kernel test is refused under a budget because of one.
+fn prover_test_lock() -> std::sync::RwLockWriteGuard<'static, ()> {
+    super::super::test_lock::exclusive()
+}
+
+/// [MetalProver::new] for `dir`, or `None` (with the clean budget error checked) when a
+/// `RISC0_METAL_MAX_WORKING_SET_BYTES` budget refuses it.
+fn build_or_refused(dir: &std::path::Path) -> Option<MetalProver> {
+    let setup = SetupParams::new(dir).unwrap();
+    match MetalProver::new(&setup) {
+        Ok(p) => Some(p),
+        Err(e) if super::super::working_set_budget().is_some() => {
+            let msg = format!("{e:#}");
+            assert!(msg.contains("working-set budget exceeded"), "{msg}");
+            eprintln!("prover build refused under the budget: {msg}");
+            None
+        }
+        Err(e) => panic!("{e:#}"),
+    }
+}
+
+fn no_pre_blinding() -> PreBlinding {
+    PreBlinding {
+        a: G1Affine::zero(),
+        b1: G1Affine::zero(),
+        b2: G2Affine::zero(),
+        c: G1Affine::zero(),
+        h: G1Affine::zero(),
+    }
+}
+
 fn mib(b: u64) -> f64 {
     b as f64 / (1u64 << 20) as f64
 }
@@ -53,20 +85,13 @@ fn mib(b: u64) -> f64 {
 /// Also checks a wrong-length witness is rejected and the build/release cycle.
 #[test]
 fn fuzz_msm_cancels_fuzzed_results() {
+    let _lock = prover_test_lock();
     let Some(dir) = component_dir() else {
         return;
     };
-    let setup = SetupParams::new(&dir).unwrap();
-    let mut prover = match MetalProver::new(&setup) {
-        Ok(p) => p,
-        Err(e) if super::super::working_set_budget().is_some() => {
-            // Budget runs: the error must be the clean budget error, before loading.
-            let msg = format!("{e:#}");
-            assert!(msg.contains("working-set budget exceeded"), "{msg}");
-            eprintln!("prover build refused under the budget: {msg}");
-            return;
-        }
-        Err(e) => panic!("{e:#}"),
+    // Budget runs: the error must be the clean budget error, before loading.
+    let Some(mut prover) = build_or_refused(&dir) else {
+        return;
     };
     let st = &prover.build_stats;
     eprintln!(
@@ -111,6 +136,7 @@ fn proof_json_format() {
         b: g2,
         c: (g1 + g1).into(),
         public: vec![Fr::from(0u64), Fr::from(33u64), -Fr::from(1u64)],
+        pre_blinding: no_pre_blinding(),
         stats: ProveStats::default(),
     };
     let j = proof.proof_json();
@@ -130,6 +156,7 @@ fn proof_json_format() {
         b: G2Affine::new_unchecked(Fq2::zero(), Fq2::zero()),
         c: G1Affine::new_unchecked(Fq::zero(), Fq::zero()),
         public: vec![],
+        pre_blinding: no_pre_blinding(),
         stats: ProveStats::default(),
     };
     assert!(inf
@@ -152,4 +179,67 @@ fn canonical_and_random_scalars() {
     assert_eq!(fr_from_canonical(&rb), None);
     let (x, y) = (random_fr().unwrap(), random_fr().unwrap());
     assert!(!x.is_zero() && x != y);
+}
+
+/// The pre-blinding MSM results (G8, dumped under `RISC0_VERBOSE`) depend only on the witness:
+/// two proofs of one witness with different blinding scalars give the same values and different
+/// proofs, and with r = s = 0 the proof is the pre-blinding values plus the verifying key's
+/// alpha/beta terms. The witness is arbitrary canonical data (the MSMs and H do not need a
+/// satisfying assignment).
+#[test]
+fn pre_blinding_is_independent_of_blinding() {
+    use ark_ec::CurveGroup as _;
+    use rand::{Rng as _, SeedableRng as _};
+
+    let _lock = prover_test_lock();
+    let Some(dir) = component_dir() else {
+        return;
+    };
+    let Some(mut prover) = build_or_refused(&dir) else {
+        return;
+    };
+    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(8);
+    let mut witness = vec![0u8; prover.witness_len() * 32];
+    for e in witness.chunks_exact_mut(32) {
+        rng.fill(&mut e[..31]);
+    }
+    let opts = ProveOptions::default();
+    let p1 = prover
+        .prove_with_blinding(&witness, &opts, Fr::from(3u64), Fr::from(5u64))
+        .unwrap();
+    let p2 = prover
+        .prove_with_blinding(&witness, &opts, Fr::from(7u64), Fr::from(11u64))
+        .unwrap();
+    assert_eq!(p1.pre_blinding, p2.pre_blinding);
+    assert!(p1.a != p2.a && p1.b != p2.b && p1.c != p2.c);
+    let p0 = prover
+        .prove_with_blinding(&witness, &opts, Fr::zero(), Fr::zero())
+        .unwrap();
+    assert_eq!(p0.pre_blinding, p1.pre_blinding);
+    let vk = prover.verifying_key();
+    let pre = &p0.pre_blinding;
+    assert_eq!(p0.a, (pre.a + vk.alpha_g1).into_affine());
+    assert_eq!(p0.b, (pre.b2 + vk.beta_g2).into_affine());
+    assert_eq!(p0.c, (pre.c + pre.h).into_affine());
+    let dump = pre.dump();
+    assert_eq!(dump.lines().count(), 5, "{dump}");
+    assert!(dump.starts_with("A'=(0x"), "{dump}");
+    assert!(dump.contains("\nB2'=((0x"), "{dump}");
+}
+
+/// A stage that panics (a programming-error `assert!` in an encoder) unwinds cleanly: the open
+/// encoder is ended and nothing is committed (G8; before, dropping the unended compute encoder
+/// made Metal abort the process), and the queue keeps working.
+#[test]
+fn run_survives_a_panicking_stage() {
+    let Ok(k) = kernels() else {
+        return;
+    };
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut run = Run::new(&k.queue, false);
+        run.stage("first", 0, |_| {});
+        run.stage("second", 1, |_| panic!("an encoder assert"));
+    }));
+    assert!(r.is_err());
+    run_one(&k.queue, |_| {}).unwrap();
 }

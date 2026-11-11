@@ -530,6 +530,8 @@ mod tests {
     /// valid curve points.
     #[test]
     fn component_coeffs_and_fuzz() {
+        // Loads the real key (GBs): alone (PLAN 8.7).
+        let _lock = super::super::test_lock::exclusive();
         let Some(dir) = component_dir() else { return };
         let header = srs::read_zkey_header(&dir.join("stark_verify_final.zkey")).unwrap();
         let dev = device();

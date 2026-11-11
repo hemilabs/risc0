@@ -55,7 +55,7 @@ use ark_ff::{BigInt, PrimeField as _, Zero as _};
 use metal::{
     Buffer, BufferRef, CommandBuffer, CommandBufferRef, CommandQueue, CommandQueueRef,
     ComputeCommandEncoder, ComputeCommandEncoderRef, Device, DeviceRef, Library,
-    MTLCommandBufferStatus, MTLResourceOptions, NSRange,
+    MTLCommandBufferStatus, NSRange,
 };
 
 use super::{
@@ -179,6 +179,60 @@ impl ProveStats {
     }
 }
 
+/// The proof's MSM results with the fuzz removed and before blinding: A' = MSM(A, w),
+/// B1' = MSM(B1, w), B2' = MSM(B2, w), C' = MSM(C, w[wn - |C|..]), H = MSM(H, h). They depend only
+/// on the proving key and the witness, not on the blinding scalars or the fuzz, so they are the
+/// values to compare with another backend (CUDA, Intel) proving the same seal when a proof does
+/// not verify. Printed with `RISC0_VERBOSE` ([PreBlinding::dump]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreBlinding {
+    pub a: G1Affine,
+    pub b1: G1Affine,
+    pub b2: G2Affine,
+    pub c: G1Affine,
+    pub h: G1Affine,
+}
+
+impl PreBlinding {
+    /// One line per point, coordinates as canonical `0x` hex (the CUDA prover's `operator<<`
+    /// form); `infinity` for the identity.
+    pub fn dump(&self) -> String {
+        fn hex<F: ark_ff::PrimeField>(v: F) -> String {
+            let b = v.into_bigint();
+            let l = b.as_ref();
+            format!(
+                "0x{}",
+                l.iter()
+                    .rev()
+                    .map(|w| format!("{w:016x}"))
+                    .collect::<String>()
+            )
+        }
+        let g1 = |name: &str, p: &G1Affine| match p.xy() {
+            Some((x, y)) => format!("{name}=({}, {})", hex(x), hex(y)),
+            None => format!("{name}=infinity"),
+        };
+        let b2 = match self.b2.xy() {
+            Some((x, y)) => format!(
+                "B2'=(({}, {}), ({}, {}))",
+                hex(x.c0),
+                hex(x.c1),
+                hex(y.c0),
+                hex(y.c1)
+            ),
+            None => "B2'=infinity".into(),
+        };
+        [
+            g1("A'", &self.a),
+            g1("B1'", &self.b1),
+            b2,
+            g1("C'", &self.c),
+            g1("H", &self.h),
+        ]
+        .join("\n")
+    }
+}
+
 /// A Groth16 proof and its public inputs.
 #[derive(Clone, Debug)]
 pub struct Proof {
@@ -187,6 +241,8 @@ pub struct Proof {
     pub c: G1Affine,
     /// The witness' public signals (`witness[1..=num_public]`).
     pub public: Vec<Fr>,
+    /// The MSM results before blinding (diagnostics).
+    pub pre_blinding: PreBlinding,
     pub stats: ProveStats,
 }
 
@@ -259,6 +315,15 @@ pub struct MetalProver {
     c_len: usize,
     num_public: usize,
     pub build_stats: BuildStats,
+}
+
+/// [PreBlinding] before the affine conversion.
+struct PreBlindingProjective {
+    a: G1Projective,
+    b1: G1Projective,
+    b2: G2Projective,
+    c: G1Projective,
+    h: G1Projective,
 }
 
 /// Window-sum slots of [MetalProver::wsums].
@@ -585,8 +650,22 @@ impl MetalProver {
         let msm_b1 = self.window_sum::<G1>(Slot::B1);
         let msm_c = self.window_sum::<G1>(Slot::C);
         let msm_b2 = self.window_sum::<G2>(Slot::B2);
-        let (a, b, c) = self.finish_proof(h, msm_a, msm_b1, msm_b2, msm_c, r, s);
+        let pre = self.remove_fuzz(h, msm_a, msm_b1, msm_b2, msm_c);
+        let (a, b, c) = self.finish_proof(&pre, r, s);
         let host_ms = ms(t);
+        let pre_blinding = PreBlinding {
+            a: pre.a.into_affine(),
+            b1: pre.b1.into_affine(),
+            b2: pre.b2.into_affine(),
+            c: pre.c.into_affine(),
+            h: pre.h.into_affine(),
+        };
+        if opts.verbose {
+            eprintln!(
+                "[groth16-metal] pre-blinding MSM results (fuzz removed):\n{}",
+                pre_blinding.dump()
+            );
+        }
 
         let stats = ProveStats {
             gpu_ms,
@@ -621,32 +700,46 @@ impl MetalProver {
             b,
             c,
             public,
+            pre_blinding,
             stats,
         })
     }
 
-    /// The Intel prover's last step: remove the fuzz (the file's results are already negated)
-    /// and blind with r, s:
-    /// A = A' + alpha + r delta, B = B2' + beta + s delta, B1 = B1' + beta + s delta (G1),
-    /// C = C' + H + s A + r B1 - r s delta.
-    #[allow(clippy::too_many_arguments)]
-    fn finish_proof(
+    /// Remove the fuzz: the fuzzed results file holds `-MSM(P, f)` for A, B1, B2 and C (H has no
+    /// fuzz).
+    fn remove_fuzz(
         &self,
         h: G1Projective,
         msm_a: G1Projective,
         msm_b1: G1Projective,
         msm_b2: G2Projective,
         msm_c: G1Projective,
+    ) -> PreBlindingProjective {
+        let f = &self.fuzzed;
+        PreBlindingProjective {
+            a: msm_a + f.a,
+            b1: msm_b1 + f.b_g1,
+            b2: msm_b2 + f.b_g2,
+            c: msm_c + f.c,
+            h,
+        }
+    }
+
+    /// The Intel prover's last step: blind with r, s:
+    /// A = A' + alpha + r delta, B = B2' + beta + s delta, B1 = B1' + beta + s delta (G1),
+    /// C = C' + H + s A + r B1 - r s delta.
+    fn finish_proof(
+        &self,
+        pre: &PreBlindingProjective,
         r: Fr,
         s: Fr,
     ) -> (G1Affine, G2Affine, G1Affine) {
         let vk = &self.vk;
-        let f = &self.fuzzed;
         let delta1 = vk.delta_g1.into_group();
-        let ra = msm_a + f.a + vk.alpha_g1 + delta1 * r;
-        let rb2 = msm_b2 + f.b_g2 + vk.beta_g2 + vk.delta_g2.into_group() * s;
-        let rb1 = msm_b1 + f.b_g1 + vk.beta_g1 + delta1 * s;
-        let rc = msm_c + f.c + h + ra * s + rb1 * r - delta1 * (r * s);
+        let ra = pre.a + vk.alpha_g1 + delta1 * r;
+        let rb2 = pre.b2 + vk.beta_g2 + vk.delta_g2.into_group() * s;
+        let rb1 = pre.b1 + vk.beta_g1 + delta1 * s;
+        let rc = pre.c + pre.h + ra * s + rb1 * r - delta1 * (r * s);
         (ra.into_affine(), rb2.into_affine(), rc.into_affine())
     }
 
@@ -742,21 +835,9 @@ fn slot_offset(cfg: MsmConfig, slot: Slot) -> u64 {
     }
 }
 
-/// A new buffer, after the working-set budget and buffer-size checks.
+/// A new buffer, after the working-set budget and buffer-size checks (nil-checked).
 fn alloc_buffer(device: &DeviceRef, bytes: u64, private: bool, what: &str) -> Result<Buffer> {
-    let bytes = bytes.max(16);
-    ensure!(
-        bytes <= device.max_buffer_length(),
-        "groth16-metal: {what}: {bytes} bytes exceed this GPU's max_buffer_length {}",
-        device.max_buffer_length()
-    );
-    check_working_set(device, what, bytes)?;
-    let mode = if private {
-        MTLResourceOptions::StorageModePrivate
-    } else {
-        MTLResourceOptions::StorageModeShared
-    };
-    Ok(device.new_buffer(bytes, mode))
+    super::new_buffer_checked(device, bytes, private, what)
 }
 
 /// An Fr from canonical little-endian bytes; `None` if not below the modulus.
@@ -861,9 +942,7 @@ impl<'q> Run<'q> {
     /// Commit the open command buffer, wait for all, check their status; GPU ms per buffer.
     fn finish(mut self) -> Result<Vec<(String, f64)>> {
         self.close();
-        for cb in &self.done {
-            cb.wait_until_completed();
-        }
+        self.wait_all();
         let mut out = Vec::with_capacity(self.done.len());
         for (cb, label) in self.done.iter().zip(&self.labels) {
             if cb.status() != MTLCommandBufferStatus::Completed {
@@ -875,6 +954,28 @@ impl<'q> Run<'q> {
             out.push((label.clone(), gpu_seconds(cb) * 1e3));
         }
         Ok(out)
+    }
+}
+
+impl Run<'_> {
+    fn wait_all(&self) {
+        for cb in &self.done {
+            cb.wait_until_completed();
+        }
+    }
+}
+
+/// A [Run] dropped without [Run::finish] (a stage panicked, e.g. one of the encoders' `assert!`s
+/// on a programming error): end the open encoder (Metal aborts the process when a compute
+/// encoder is released without `endEncoding`), never commit it, and wait for the command buffers
+/// already committed, so that no GPU work still writes the prover's buffers once the panic has
+/// released the prover cache (whose next user rebuilds it, see `lock_discarding_poisoned`).
+impl Drop for Run<'_> {
+    fn drop(&mut self) {
+        if let Some((_cb, enc, _)) = self.cur.take() {
+            enc.end_encoding();
+        }
+        self.wait_all();
     }
 }
 

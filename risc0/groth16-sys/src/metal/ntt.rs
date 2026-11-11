@@ -44,7 +44,7 @@ use ark_ff::{BigInt, FftField, Field, One};
 use metal::{
     objc::{msg_send, sel, sel_impl},
     Buffer, BufferRef, CommandQueueRef, ComputeCommandEncoderRef, ComputePipelineState, DeviceRef,
-    LibraryRef, MTLCommandBufferStatus, MTLResourceOptions, MTLSize,
+    LibraryRef, MTLCommandBufferStatus, MTLSize,
 };
 
 /// Bytes per Fr element.
@@ -286,16 +286,14 @@ impl NttPlan {
         let ninv = Fr::from(n).inverse().unwrap();
         let shift_hi = shift.pow([1u64 << lg_lo]);
 
+        // Nil-checked (G8): a refused allocation is an error, not a null `Buffer`.
         let private = |count: u64| {
-            device.new_buffer(
-                count.max(1) * FR_BYTES,
-                MTLResourceOptions::StorageModePrivate,
-            )
+            super::new_buffer_checked(device, count.max(1) * FR_BYTES, true, "the NTT tables")
         };
-        let tw = private(n / 2);
-        let coset_lo = private(1 << lg_lo);
-        let coset_hi = private(1 << (lg - lg_lo));
-        let coset_hi_ninv = private(1 << (lg - lg_lo));
+        let tw = private(n / 2)?;
+        let coset_lo = private(1 << lg_lo)?;
+        let coset_hi = private(1 << (lg - lg_lo))?;
+        let coset_hi_ninv = private(1 << (lg - lg_lo))?;
 
         submit_and_wait(queue, |enc| {
             encode_powers(&kernels, enc, &tw, (n / 2).max(1), Fr::one(), w);
@@ -618,7 +616,7 @@ mod tests {
 
     use ark_ff::{PrimeField, UniformRand, Zero};
     use ark_poly::{EvaluationDomain, Radix2EvaluationDomain};
-    use metal::{CommandQueue, Device, Library};
+    use metal::{CommandQueue, Device, Library, MTLResourceOptions};
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
 
@@ -628,16 +626,24 @@ mod tests {
         device: Device,
         queue: CommandQueue,
         lib: Library,
+        /// The shared GPU test lock (`super::super::test_lock`), held for the test.
+        _lock: std::sync::RwLockReadGuard<'static, ()>,
     }
 
     fn ctx() -> Option<Ctx> {
+        let _lock = super::super::test_lock::shared();
         let Some(device) = Device::system_default() else {
             eprintln!("no Metal device; skipping");
             return None;
         };
         let lib = device.new_library_with_data(crate::METAL_LIB).unwrap();
         let queue = device.new_command_queue();
-        Some(Ctx { device, queue, lib })
+        Some(Ctx {
+            device,
+            queue,
+            lib,
+            _lock,
+        })
     }
 
     fn upload(c: &Ctx, v: &[Fr]) -> Buffer {
