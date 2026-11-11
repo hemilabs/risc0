@@ -696,12 +696,21 @@ mod ef_tests {
         let inp = Inputs::random(po2);
         let hal = Arc::new(MetalHalSha256::new());
         let c = MetalCircuitHal::new(hal.clone()).unwrap();
-        let (base, base_t, _) = gpu_checks(&c, &inp, po2, Which::Baseline, 2);
-        assert_eq!(
-            mismatches(&base[0], &base[1]),
-            0,
-            "baseline not deterministic"
+        // R17 audit: `R12_BASE_REPS` (default 2) baseline runs, each compared with the first.
+        let base_reps: usize = std::env::var("R12_BASE_REPS").map_or(2, |v| v.parse().unwrap());
+        let (base, base_t, _) = gpu_checks(&c, &inp, po2, Which::Baseline, base_reps.max(2));
+        let base_bad: Vec<(usize, usize)> = base
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (i, mismatches(&base[0], b)))
+            .filter(|(_, n)| *n > 0)
+            .collect();
+        println!(
+            "R17AUDIT rv32im eval_check baseline po2 {po2}: {}/{} runs differ from run 0 {base_bad:?}",
+            base_bad.len(),
+            base.len()
         );
+        assert!(base_bad.is_empty(), "baseline not deterministic");
         let (fast, fast_t, peak) = gpu_checks(&c, &inp, po2, Which::Evalfast, reps);
         let bad: Vec<(usize, usize)> = fast
             .iter()

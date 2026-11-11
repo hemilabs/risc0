@@ -572,7 +572,13 @@ pub(super) mod tests {
         Ok((global.buf.to_vec(), data.buf.to_vec(), secs))
     }
 
-    fn first_diff(a: &[Val], b: &[Val], rows: usize) -> Option<(usize, usize, Val, Val)> {
+    /// Compares raw words: `Val`'s `==` asserts validity, and unused cells hold `INVALID` (R17
+    /// audit: the debug-assertion test build panicked here before any comparison).
+    fn first_diff(a: &[Val], b: &[Val], rows: usize) -> Option<(usize, usize, u32, u32)> {
+        let (a, b) = (
+            Val::as_u32_slice_unchecked(a),
+            Val::as_u32_slice_unchecked(b),
+        );
         a.iter()
             .zip(b)
             .position(|(x, y)| x != y)
@@ -619,7 +625,10 @@ pub(super) mod tests {
                 None,
                 "po2 {po2}: forward"
             );
-            let unset = host_data.iter().filter(|v| **v == Val::INVALID).count();
+            let unset = Val::as_u32_slice_unchecked(&host_data)
+                .iter()
+                .filter(|v| **v == 0xffff_ffff)
+                .count();
             println!(
                 "po2 {po2}: {} inputs, {} cells ({unset} unset) identical; witgen host {:.1} ms, \
                  metal {:.1} ms",
