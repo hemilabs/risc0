@@ -117,22 +117,34 @@ pub(crate) fn host_ctrl_for(zkr: &Program) -> Arc<Vec<BabyBearElem>> {
 /// i.e. it compares two independently computed witnesses (unlike the host
 /// shadow check, which only compares a buffer with its own upload source).
 fn prewitgen_check_due(key: super::CtrlKey) -> bool {
-    static CHECKED: LazyLock<Mutex<Vec<super::CtrlKey>>> = LazyLock::new(|| Mutex::new(Vec::new()));
     match std::env::var("RISC0_RECURSION_PREWITGEN_CHECK").as_deref() {
         Ok("0") => false,
         Ok("1") | Ok("always") => true,
-        Ok("once") => {
-            let mut c = CHECKED
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if c.contains(&key) {
-                false
-            } else {
-                c.push(key);
-                true
-            }
-        }
+        Ok("once") => first_prewitgen_check(key),
         _ => std::env::var_os("RISC0_RECURSION_SHADOW_CHECK").is_some(),
+    }
+}
+
+/// Programs already checked by `RISC0_RECURSION_PREWITGEN_CHECK=once` in this process.
+static PREWITGEN_CHECKED: LazyLock<Mutex<Vec<super::CtrlKey>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// The set of checked programs, poison-tolerant (C10): an entry is pushed whole, so a poisoned
+/// lock holds no torn state and must not fail every later proof of the process.
+pub(crate) fn prewitgen_checked() -> std::sync::MutexGuard<'static, Vec<super::CtrlKey>> {
+    PREWITGEN_CHECKED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// True the first time `key` is seen (`RISC0_RECURSION_PREWITGEN_CHECK=once`).
+pub(crate) fn first_prewitgen_check(key: super::CtrlKey) -> bool {
+    let mut c = prewitgen_checked();
+    if c.contains(&key) {
+        false
+    } else {
+        c.push(key);
+        true
     }
 }
 

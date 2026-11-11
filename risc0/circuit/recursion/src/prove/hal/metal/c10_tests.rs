@@ -41,16 +41,22 @@ fn test_input() -> VecDeque<u32> {
 /// HAL succeeds and matches the CPU prover.
 #[test]
 fn scratch_poison_recovers_after_budget_panic() {
+    // A full Metal proof: serialized with the tests that assert on process-wide state (PLAN 8.7).
+    let _guard = crate::prove::hal::metal::global_state_test_lock();
     let hal = Arc::new(MetalHalPoseidon2::new());
     let circuit_hal = Arc::new(MetalCircuitHal::new(hal.clone()).unwrap());
     let before = SCRATCH_POISON_RECOVERIES.load(Ordering::Relaxed);
 
     // A budget no allocation fits: the first scratch allocation (the fault word) panics with the
     // zkp HAL's "working-set budget exceeded" while `scratch()` is held.
-    let limit = hal.working_set_limit();
     hal.set_working_set_limit(Some(1));
     let r = std::panic::catch_unwind(AssertUnwindSafe(|| circuit_hal.fault_word()));
-    hal.set_working_set_limit(Some(limit));
+    // Back to what a fresh HAL has: the env budget if one is set (the acceptance runs use plain
+    // byte counts), else no explicit budget.
+    let env_budget = std::env::var(risc0_zkp::hal::metal::MAX_WORKING_SET_ENV)
+        .ok()
+        .and_then(|t| t.trim().parse::<u64>().ok());
+    hal.set_working_set_limit(env_budget);
     let msg = r
         .err()
         .and_then(|p| {
@@ -87,6 +93,8 @@ fn scratch_poison_recovers_after_budget_panic() {
 /// least 5 columns and returned `Ok` for an empty trace (and would write past a short one).
 #[test]
 fn witgen_rejects_short_buffers() {
+    // Runs the Parallel witgen: serialized with the tests that assert on process-wide state.
+    let _guard = crate::prove::hal::metal::global_state_test_lock();
     const PO2: u32 = 4;
     let steps = 1usize << PO2;
     let hal = Arc::new(MetalHalPoseidon2::new());
@@ -131,6 +139,19 @@ fn witgen_rejects_short_buffers() {
         }
     }
     // A row count that is not a power of two is rejected on every path too.
+    // A rejected call never reaches the Parallel witgen.
+    let parallel = witgen::thread_calls(witgen::Call::Parallel);
+    assert!(circuit_hal
+        .generate_witness(
+            StepMode::Parallel,
+            steps as u32,
+            &trace,
+            &ctrl,
+            &short_data,
+            &global
+        )
+        .is_err());
+    assert_eq!(witgen::thread_calls(witgen::Call::Parallel), parallel);
     let err = circuit_hal
         .generate_witness(
             StepMode::SeqForward,
@@ -158,4 +179,63 @@ fn host_ctrl_cache_survives_poison() {
     let b = crate::prove::witgen::host_ctrl_for(&program);
     assert_eq!(a.len(), b.len());
     assert!(a.iter().zip(b.iter()).all(|(x, y)| x == y));
+}
+
+/// PLAN 8.7: the witgen call counters the tests assert on are per thread, so a witgen on another
+/// thread (another test of the parallel harness) does not move them. Before the fix the C6 hook
+/// test asserted that the process-wide Parallel count stayed unchanged across one proof, which a
+/// concurrent Parallel witgen on any other test thread broke.
+#[test]
+fn witgen_call_counters_are_per_thread() {
+    use witgen::{process_calls, thread_calls, Call};
+    let mine = thread_calls(Call::Parallel);
+    let total = process_calls(Call::Parallel);
+    std::thread::spawn(|| {
+        const STEPS: usize = 16;
+        let hal = Arc::new(MetalHalPoseidon2::new());
+        let circuit_hal = MetalCircuitHal::new(hal.clone()).unwrap();
+        let trace = RawPreflightTrace {
+            wom: std::ptr::null(),
+            cycles: std::ptr::null(),
+            iops: std::ptr::null(),
+            num_woms: 0,
+            num_cycles: 0,
+            num_iops: 0,
+        };
+        let full = |n: usize| hal.alloc_elem_init("c10", n, BabyBearElem::INVALID);
+        let before = thread_calls(Call::Parallel);
+        circuit_hal
+            .generate_witness(
+                StepMode::Parallel,
+                STEPS as u32,
+                &trace,
+                &full(CIRCUIT.ctrl_size() * STEPS),
+                &full(CIRCUIT.data_size() * STEPS),
+                &full(CircuitImpl::OUTPUT_SIZE),
+            )
+            .unwrap();
+        assert_eq!(thread_calls(Call::Parallel), before + 1);
+    })
+    .join()
+    .unwrap();
+    assert!(process_calls(Call::Parallel) > total);
+    assert_eq!(thread_calls(Call::Parallel), mine);
+}
+
+/// The `RISC0_RECURSION_PREWITGEN_CHECK=once` set stays usable after a panic poisoned its lock.
+#[test]
+fn prewitgen_once_set_survives_poison() {
+    let key = (usize::MAX - 7, 0xc10, 0xc10c10);
+    assert!(crate::prove::witgen::first_prewitgen_check(key));
+    let _ = std::thread::spawn(|| {
+        let _guard = crate::prove::witgen::prewitgen_checked();
+        panic!("C10: poison the prewitgen-once set on purpose");
+    })
+    .join();
+    assert!(!crate::prove::witgen::first_prewitgen_check(key));
+    assert!(crate::prove::witgen::first_prewitgen_check((
+        usize::MAX - 8,
+        0xc10,
+        0xc10c10
+    )));
 }
