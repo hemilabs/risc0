@@ -36,6 +36,14 @@
 
 #include <metal_stdlib>
 
+// R17b (docs/metal-port/notes/R17.md, "R17b hardening"): FpExt * FpExt is always_inline in this
+// TU. Declared before fpext.h so that the friend definition there inherits the attribute. At -O2
+// the compiler otherwise calls it out of line inside this file's FpExt loops (ir_scan.py tier A:
+// a default-constructed private FpExt / FpExt array written after the call and read after the
+// loop, the Apple GPU lost-store shape). Same arithmetic, bit-exact.
+#include "fp.h"
+struct FpExt;
+__attribute__((always_inline)) constexpr FpExt operator*(FpExt lhs, FpExt rhs);
 #include "context.h"
 #include "cuda2metal.h"
 

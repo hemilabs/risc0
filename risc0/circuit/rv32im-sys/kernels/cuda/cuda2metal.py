@@ -56,7 +56,14 @@ rewrote; anything it cannot translate faithfully raises TranslateError (no silen
                  `c2m_accK_0..N` (the element count comes from the array typedef). A loop that
                  writes a default-constructed private array after calling a noinline function is
                  the shape in which the Apple GPU loses the last store (docs/metal-port/notes/
-                 R17.md).
+                 R17.md). R17b: each element scalar is declared with its value through a GNU
+                 statement expression (`T c2m_rK_j = ({ ...; e; });`), never default-constructed
+                 and assigned after the block's calls.
+  mux_init       (R17b; not in ALL_PASSES: pass_mux_init(text, counts, zero), run by
+                 witgen_tu_gen.py and accum_tu_gen.py after translate) `T x; if (c0) {..; x = v0;}
+                 else if .. else {<no value>}` -> `T x = (c0) ? ({..; v0;}) : .. : ({..; Z;});`
+                 with Z an explicit all-zero initializer of T (zero_init_fn over
+                 types.metal.inc): mux results declared with their value, no constructor loop.
   fpp            `Fp** args` -> `device Fp* args_0, ..., args_{K-1}`; `args[k]` -> `args_k`
                  (K = 1 + the largest literal index used in the definition).
   kernel         `__global__` kernel signature synthesis: [[max_total_threads_per_threadgroup]]
@@ -730,17 +737,21 @@ def expand_one_site(s, uniq, counts, map_lowering='loop', typedefs=None):
         else:
             lines[1] = lines[1].replace('auto %s =' % acc, '%s %s_0 =' % (rtype, acc), 1)
             outs = ['%s_%d' % (acc, j + 1) for j in range(n)]
+        # R17b: each element's scalar is declared with its value (a GNU statement expression,
+        # `T out = ({ ...; expr; });`), not default-constructed and assigned after the block's
+        # calls: a default-constructed private aggregate (an IR constructor loop for array
+        # members) that is written after a call and then read is the lost-store shape again,
+        # without a loop (docs/metal-port/notes/R17.md, "R17b hardening").
         for j in range(n):
-            lines.append('%s%s %s;' % (ind, etype if kind == 'map' else rtype, outs[j]))
-            lines.append('%s{' % ind)
+            lines.append('%s%s %s = ({' % (ind, etype if kind == 'map' else rtype, outs[j]))
             for (pt, pn), src in elem_params:
                 src = '%s_%d' % (acc, j) if kind == 'reduce' and src == acc \
                     else src.replace('[%s]' % it, '[%d]' % j).replace(', %s)' % it, ', %d)' % j)
                 lines.append('%s%s %s = %s;' % (ind2, pt, pn, src))
             if body.strip():
                 lines.append(body)
-            lines.append('%s%s = %s;' % (ind2, outs[j], expr))
-            lines.append('%s}' % ind)
+            lines.append('%s%s;' % (ind2, expr))
+            lines.append('%s});' % ind)
         if kind == 'map':
             lines.append('%s%s %s = {{%s}};' % (ind, rtype, rname, ', '.join(outs)))
         else:
@@ -761,6 +772,143 @@ def expand_one_site(s, uniq, counts, map_lowering='loop', typedefs=None):
         lines.append('%s%s %s = %s;' % (ind, rtype, rname, acc))
     counts.add('lambda.' + kind)
     return s[:decl_s] + '\n'.join(lines) + s[stmt_end:]
+
+
+_STRUCT_RE = re.compile(r'(?ms)^struct (\w+) \{\n(.*?)^\};')
+_FIELD_RE = re.compile(r'^\s*([A-Za-z_][\w:<>, ]*?)\s+(\w+);\s*$')
+
+
+def zero_init_fn(text):
+    """R17b: T -> an explicit brace initializer of T with every Val zero, from the generated
+    types (the text of kernels/metal/types.metal.inc), e.g. `BigIntTopStateStruct{Val(0), Val(0),
+    Val16Array{{Val(0), ...}}}`. Value-initializing T (T{}) default-constructs its Val arrays in
+    an IR constructor loop; this is the same value written by straight-line stores."""
+    arrays = {}
+    for m in re.finditer(r'(?m)^using (\w+) = r0::array<([\w:]+),\s*(\d+)>;', text):
+        arrays[m.group(1)] = (m.group(2), int(m.group(3)))
+    structs = {}
+    for m in _STRUCT_RE.finditer(text):
+        fields = []
+        for line in m.group(2).split('\n'):
+            if not line.strip():
+                continue
+            fm = _FIELD_RE.match(line)
+            if not fm:
+                raise TranslateError('zero_init: unsupported member line %r in struct %s'
+                                         % (line, m.group(1)))
+            fields.append(fm.group(1).strip())
+        structs[m.group(1)] = fields
+
+    def zero(t):
+        if t in ('Val', 'Fp'):
+            return '%s(0)' % t
+        if t in ('ExtVal', 'FpExt'):
+            return '%s(0u)' % t
+        if t in arrays:
+            et, n = arrays[t]
+            return '%s{{%s}}' % (t, ', '.join(zero(et) for _ in range(n)))
+        if t in structs:
+            return '%s{%s}' % (t, ', '.join(zero(f) for f in structs[t]))
+        raise TranslateError('zero_init: unknown type %r (not Val, an r0::array alias or a '
+                                 'struct of types.metal.inc)' % t)
+    return zero
+
+
+_MUX_DECL_RE = re.compile(r'(?m)^([ \t]*)([A-Za-z_][\w:<>, ]*?)[ \t]+(\w+);\n\1if \(')
+
+
+def _mux_arm(s, m, ob, cb, name, where_):
+    """Body of a mux arm s[ob+1:cb] -> (statements before the value, value text). The arm's
+    last top-level statement must be `name = VALUE;` and name must not appear before it."""
+    body = s[ob + 1:cb]
+    mb = m[ob + 1:cb]
+    ends, depth = [], 0
+    for j, c in enumerate(mb):
+        if c in _OPEN:
+            depth += 1
+        elif c in _CLOSE:
+            depth -= 1
+        elif c == ';' and depth == 0:
+            ends.append(j)
+    if not ends or mb[ends[-1] + 1:].strip():
+        raise TranslateError('mux arm at %s does not end with a statement' % where_)
+    st = (ends[-2] + 1) if len(ends) > 1 else 0
+    last = mb[st:ends[-1]]
+    am = re.match(r'\s*%s\s*=(?!=)' % re.escape(name), last)
+    if not am:
+        return body.rstrip(), None
+    if re.search(r'\b%s\b' % re.escape(name), mb[:st]) or re.search(r'\breturn\b', mb):
+        raise TranslateError('mux arm at %s reads or assigns %s before its value (or returns)'
+                             % (where_, name))
+    return body[:st].rstrip(), body[st + am.end():ends[-1]].strip()
+
+
+def pass_mux_init(s, counts, zero=None):
+    """R17b: `T x; if (c0) { ...; x = v0; } else if (c1) { ...; x = v1; } else { <no value> }`
+    -> `T x = (c0) ? ({ ...; v0; }) : (c1) ? ({ ...; v1; }) : ({ <no value>; T{}; });`, so
+    the mux result is declared with its value instead of default-constructed (an IR
+    constructor loop for array members) and assigned after the arm's calls: the R17 lost-store
+    shape without a loop. Same conditions, evaluated in the same order; the same arm runs. A
+    final arm without a value (the unreachable-arm C2M_ASSERT, or no else) yields zero(T) (an
+    explicit all-zero brace initializer, so no constructor loop either), or T{} without zero,
+    the value the default-constructed declaration had. Innermost (last) first."""
+    while True:
+        m = mask(s)
+        hits = list(_MUX_DECL_RE.finditer(m))
+        if not hits:
+            return s
+        mo = hits[-1]
+        ind, typ, name = mo.group(1), mo.group(2).strip(), mo.group(3)
+        if typ in ('return', 'break', 'continue', 'goto'):
+            raise TranslateError('mux_init: unexpected statement %r at %s'
+                                 % (mo.group(0), where(s, mo.start())))
+        pos = mo.end() - len('if (')
+        arms = []  # (cond or None, stmts, value or None)
+        while True:
+            assert m.startswith('if (', pos), pos
+            po = pos + 3
+            pc = match_close(m, po)
+            cond = s[po + 1:pc].strip()
+            ob = pc + 1
+            while m[ob] in ' \t\n':
+                ob += 1
+            if m[ob] != '{':
+                raise TranslateError('mux at %s: if without a block' % where(s, pos))
+            cb = match_close(m, ob)
+            stmts, val = _mux_arm(s, m, ob, cb, name, where(s, ob))
+            if val is None:
+                raise TranslateError('mux at %s: arm %d does not end with `%s = ...;`'
+                                     % (where(s, pos), len(arms), name))
+            arms.append((cond, stmts, val))
+            em = re.match(r'[ \t\n]*else[ \t\n]*', m[cb + 1:])
+            end = cb + 1
+            if not em:
+                break
+            nxt = cb + 1 + em.end()
+            if m.startswith('if (', nxt):
+                pos = nxt
+                continue
+            if m[nxt] != '{':
+                raise TranslateError('mux at %s: else without a block' % where(s, nxt))
+            ecb = match_close(m, nxt)
+            stmts, val = _mux_arm(s, m, nxt, ecb, name, where(s, nxt))
+            arms.append((None, stmts, val))
+            end = ecb + 1
+            break
+        if arms[-1][0] is not None:
+            arms.append((None, '', None))
+        ind2 = ind + '  '
+        out = ['%s%s %s =' % (ind, typ, name)]
+        for k, (cond, stmts, val) in enumerate(arms):
+            head = ('%s  (%s) ? ({' % (ind, cond)) if cond is not None else ('%s  ({' % ind)
+            out.append(head)
+            if stmts.strip():
+                out.append(_reindent(stmts.strip('\n'), ind2, ind2 + '  '))
+            out.append('%s    %s;' % (ind, val if val is not None else
+                                        (zero(typ) if zero else '%s{}' % typ)))
+            out.append('%s  })%s' % (ind, ' :' if cond is not None else ';'))
+        s = s[:mo.start()] + '\n'.join(out) + s[end:]
+        counts.add('mux.init')
 
 
 def pass_lambda(s, counts, uniq, map_lowering='loop', typedefs=None):

@@ -28,7 +28,7 @@
 ///                                          (or keep fp.h's operators: same bits)
 ///   `mulhi`/`rk_mulhi` lambdas          -> `ef_mulhi(x, y)` (32-bit `metal::mulhi`)
 
-#include "fp.h"
+#include "rv32im_fp.h"
 
 #include <metal_stdlib>
 

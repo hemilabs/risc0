@@ -30,8 +30,31 @@
 //   (v2: 20 B * inputSize, v1/v2_dcids: 16 B * inputSize); grid = ceil(count/256) groups x 256.
 //   mix_poly_coeffs: dispatch_threads(count).
 
+// R17b (docs/metal-port/notes/R17.md, "R17b hardening"): FpExt * FpExt is always_inline in this
+// TU. Declared before fpext.h so that the friend definition there inherits the attribute. At -O2
+// the compiler otherwise calls it out of line inside this file's FpExt loops (ir_scan.py tier A:
+// a default-constructed private FpExt / FpExt array written after the call and read after the
+// loop, the Apple GPU lost-store shape). Same arithmetic, bit-exact.
+#include "fp.h"
+struct FpExt;
+__attribute__((always_inline)) constexpr FpExt operator*(FpExt lhs, FpExt rhs);
 #include "fp.h"
 #include "fpext.h"
+
+// R17b: FpExt pow for this TU: fpext.h's pow, with `tot *= x; x *= x` spelled through the
+// always_inline FpExt * FpExt above (fpext.h's FpExt::operator*=(FpExt) stays an out-of-line
+// call at -O2 here, inside the caller's loops). Same square-and-multiply, bit-exact.
+static inline __attribute__((always_inline)) FpExt pow_r17b(FpExt x, size_t n) {
+  FpExt tot(1);
+  while (n != 0) {
+    if (n % 2 == 1) {
+      tot = tot * x;
+    }
+    n = n / 2;
+    x = x * x;
+  }
+  return tot;
+}
 
 using namespace metal;
 
@@ -63,7 +86,7 @@ kernel void mix_poly_coeffs(device FpExt* out [[buffer(0)]],
   for (uint32_t i = 0; i < inputSize; i++) {
     size_t id = combos[i];
     out[count * id + gid] += cur * Fp(in[(size_t)count * i + gid]);
-    cur *= mix;
+    cur = cur * mix;
   }
 }
 
@@ -87,7 +110,7 @@ kernel void mix_poly_coeffs_v1(device FpExt* out [[buffer(0)]],
       for (int k = 0; k < 4; k++) {
         mixPowsRaw[4 * i + k] = cur.elems[k].asRaw();
       }
-      cur *= m;
+      cur = cur * m;
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -142,7 +165,7 @@ kernel void mix_poly_coeffs_v2_t(device FpExt* out [[buffer(0)]],
     FpExt ms = mx_load_ext(p.mixStart);
     FpExt m = mx_load_ext(p.mix);
     for (uint32_t i = threadIdx.x; i < inputSize; i += blockDim.x) {
-      FpExt v = ms * pow(m, (size_t)i);
+      FpExt v = ms * pow_r17b(m, (size_t)i);
       for (int k = 0; k < 4; k++) {
         mixPows[4 * i + k] = v.elems[k].asRaw();
       }

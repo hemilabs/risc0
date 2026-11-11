@@ -29,8 +29,31 @@
 //               6 Eu2Params. grid = (S, nEvals) groups x 256 threads.
 //   eu2_reduce: 0 out, 1 partial, 2 Eu2Params. grid = nEvals groups x 32 threads.
 
+// R17b (docs/metal-port/notes/R17.md, "R17b hardening"): FpExt * FpExt is always_inline in this
+// TU. Declared before fpext.h so that the friend definition there inherits the attribute. At -O2
+// the compiler otherwise calls it out of line inside this file's FpExt loops (ir_scan.py tier A:
+// a default-constructed private FpExt / FpExt array written after the call and read after the
+// loop, the Apple GPU lost-store shape). Same arithmetic, bit-exact.
+#include "fp.h"
+struct FpExt;
+__attribute__((always_inline)) constexpr FpExt operator*(FpExt lhs, FpExt rhs);
 #include "fp.h"
 #include "fpext.h"
+
+// R17b: FpExt pow for this TU: fpext.h's pow, with `tot *= x; x *= x` spelled through the
+// always_inline FpExt * FpExt above (fpext.h's FpExt::operator*=(FpExt) stays an out-of-line
+// call at -O2 here, inside the caller's loops). Same square-and-multiply, bit-exact.
+static inline __attribute__((always_inline)) FpExt pow_r17b(FpExt x, size_t n) {
+  FpExt tot(1);
+  while (n != 0) {
+    if (n % 2 == 1) {
+      tot = tot * x;
+    }
+    n = n / 2;
+    x = x * x;
+  }
+  return tot;
+}
 
 using namespace metal;
 
@@ -63,18 +86,18 @@ kernel void batch_evaluate_any(device FpExt* out [[buffer(0)]],
   const uint32_t deg = p.deg;
   const device Fp* cur_poly = coeffs + (size_t)which[blockIdx.x] * deg;
   FpExt x = xs[blockIdx.x];
-  FpExt stepx = pow(x, (size_t)blockDim.x);
+  FpExt stepx = pow_r17b(x, (size_t)blockDim.x);
   // Horner's method: evaluate each thread's strided subsequence from high to low degree.
   uint32_t K = (deg + blockDim.x - 1) / blockDim.x;
   FpExt tot;
   for (int k = K - 1; k >= 0; k--) {
-    tot *= stepx;
+    tot = tot * stepx;
     size_t i = threadIdx.x + (size_t)k * blockDim.x;
     if (i < deg) {
       tot += FpExt(Fp(cur_poly[i]));
     }
   }
-  tot *= pow(x, (size_t)threadIdx.x);
+  tot = tot * pow_r17b(x, (size_t)threadIdx.x);
   threadgroup FpExt* tots = reinterpret_cast<threadgroup FpExt*>(totsBuf);
   tots[threadIdx.x] = tot;
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -134,9 +157,9 @@ kernel void eu2_pows(device FpExt* pw [[buffer(0)]],
   const uint32_t S = p.S;
   const uint32_t chunk = p.chunk;
   FpExt x = xs[e];
-  pw[(size_t)e * EU_THREADS + t] = pow(x, (size_t)EU_J * t);
+  pw[(size_t)e * EU_THREADS + t] = pow_r17b(x, (size_t)EU_J * t);
   for (uint32_t s = t; s < S; s += blockDim.x) {
-    ps[(size_t)e * S + s] = pow(x, (size_t)s * chunk);
+    ps[(size_t)e * S + s] = pow_r17b(x, (size_t)s * chunk);
   }
 }
 

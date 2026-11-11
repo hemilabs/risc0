@@ -208,6 +208,12 @@ fn witgen_tu_preprocessed_loops_reviewed() {
         !body.contains("_sys_/fpext.h\""),
         "the shared fpext.h is included"
     );
+    // R17b: Fp from witgen_fp.h (every function always_inline), not the shared fp.h.
+    assert!(body.contains("/witgen_fp.h\""), "witgen_fp.h not included");
+    assert!(
+        !body.contains("_sys_/fp.h\""),
+        "the shared fp.h is included"
+    );
     let log = run_ok(&[
         "kernels/cuda/witgen_tu_gen.py",
         "--scan-loops",
@@ -254,65 +260,107 @@ except c2m.TranslateError as e:
     drop(scratch);
 }
 
-/// R17 round 2: no FpExt operation of the witgen TU is compiled out of line. The TU as built is
-/// compiled to LLVM IR at -O0 and -Oz (where the round-1 copy of fpext.h left `operator*(FpExt,
-/// Fp)` and friends out of line, and lost elems[3] of PoseidonState.zcheck), and `--scan-ir`
-/// must find no defined FpExt member, operator or inv(FpExt). The scanner must flag the
-/// round-1 shape (`--fpext-calls outline`, compiled at -O0) and gen_fpext must refuse a
-/// constexpr line it did not mark always_inline.
+/// The audit IR scanner (tools/metal_audit/ir_scan.py).
+fn ir_scan_py() -> PathBuf {
+    crate_dir().join("../../../tools/metal_audit/ir_scan.py")
+}
+
+/// `xcrun metal -S -emit-llvm` of `src_dir/witgen_tu.metal` with the build's include path and
+/// `flags` (an -O level, -D...) into `ll`.
+fn emit_witgen_ll(out_dir: &Path, src_dir: &Path, flags: &[&str], ll: &Path) {
+    let out = Command::new("xcrun")
+        .args([
+            "-sdk",
+            "macosx",
+            "metal",
+            "-std=metal3.2",
+            "-Wno-unused-variable",
+        ])
+        .args(["-S", "-emit-llvm"])
+        .args(flags)
+        .arg("-c")
+        .arg(src_dir.join("witgen_tu.metal"))
+        .arg("-I")
+        .arg(out_dir.join("_sys_"))
+        .arg("-I")
+        .arg(crate_dir().join("kernels/metal"))
+        .arg("-I")
+        .arg(src_dir)
+        .arg("-o")
+        .arg(ll)
+        .output()
+        .expect("xcrun metal -S -emit-llvm (source env.sh)");
+    assert!(
+        out.status.success(),
+        "metal -emit-llvm {flags:?} failed:\n{}",
+        text(&out)
+    );
+}
+
+fn build_out_dir() -> PathBuf {
+    PathBuf::from(env!("RV32IM_METAL_GENERATORS"))
+        .parent()
+        .unwrap()
+        .to_path_buf()
+}
+
+/// R17 round 2 + R17b: the witgen TU as built, compiled to LLVM IR at -O2 (shipped), -O0, -Oz
+/// and with compiler-decided inlining (`WITGEN_TU_FNATTR=` at -O2, -O0, -Oz):
+/// - `--scan-ir`: no Fp / FpExt operation and no FpExt helper (inv_ext_chain, inv_0(FpExt),
+///   loadExt, storeExt, ef_ext_mul) is defined out of line (round 2: the round-1 copy of fpext.h
+///   lost elems[3] of PoseidonState.zcheck at -O0/-Oz), only the three kernels have external
+///   linkage, and no call leaves the TU (R17b: the metallib linker could bind a linkonce_odr call
+///   to another TU's copy; a stale accum_tu.air broke witgen that way);
+/// - `ir_scan.py --fail-tiers ABS`: no tier A (constructor-initialized private aggregate written
+///   after a call and read, in a loop or straight line), B (any aggregate written after a call in
+///   a loop and read after it) or S (an out-of-line function writing a by-value aggregate after
+///   or through a call, the round-2 trigger) site.
+/// Positive controls: the round-1 copy (`--fpext-calls outline`, -O0) fails `--scan-ir`; the
+/// original map-loop lowering (`--map-lowering loop`, -O2) fails the tier scan; gen_fpext and
+/// gen_fp refuse a constexpr line they did not mark always_inline.
 #[test]
 fn witgen_tu_fpext_always_inline_in_ir() {
     if skipped_build() {
         eprintln!("RISC0_SKIP_BUILD_KERNELS build: no generator ran, nothing to check");
         return;
     }
-    let out_dir = PathBuf::from(env!("RV32IM_METAL_GENERATORS"))
-        .parent()
-        .unwrap()
-        .to_path_buf();
+    let out_dir = build_out_dir();
     let gen_dir = out_dir.join("metal");
     let scratch = Scratch::new("witgen_tu_ll");
-    let emit = |src_dir: &Path, opt: &str, ll: &Path| {
-        let out = Command::new("xcrun")
-            .args([
-                "-sdk",
-                "macosx",
-                "metal",
-                "-std=metal3.2",
-                "-Wno-unused-variable",
-            ])
-            .args(["-S", "-emit-llvm", opt, "-c"])
-            .arg(src_dir.join("witgen_tu.metal"))
-            .arg("-I")
-            .arg(out_dir.join("_sys_"))
-            .arg("-I")
-            .arg(crate_dir().join("kernels/metal"))
-            .arg("-I")
-            .arg(src_dir)
-            .arg("-o")
-            .arg(ll)
-            .output()
-            .expect("xcrun metal -S -emit-llvm (source env.sh)");
-        assert!(
-            out.status.success(),
-            "metal -emit-llvm {opt} failed:\n{}",
-            text(&out)
-        );
-    };
-    for opt in ["-O0", "-Oz"] {
-        let ll = scratch.0.join(format!("witgen_tu{opt}.ll"));
-        emit(&gen_dir, opt, &ll);
+    let settings: [(&str, &[&str]); 6] = [
+        ("O2", &["-O2"]),
+        ("O0", &["-O0"]),
+        ("Oz", &["-Oz"]),
+        ("auto", &["-O2", "-DWITGEN_TU_FNATTR="]),
+        ("autoO0", &["-O0", "-DWITGEN_TU_FNATTR="]),
+        ("autoOz", &["-Oz", "-DWITGEN_TU_FNATTR="]),
+    ];
+    for (tag, flags) in settings {
+        let ll = scratch.0.join(format!("witgen_tu_{tag}.ll"));
+        emit_witgen_ll(&out_dir, &gen_dir, flags, &ll);
         let log = run_ok(&[
             "kernels/cuda/witgen_tu_gen.py",
             "--scan-ir",
             ll.to_str().unwrap(),
         ]);
         assert!(
-            log.contains("no out-of-line FpExt operation"),
-            "{opt}: {log}"
+            log.contains("no out-of-line FpExt operation")
+                && log.contains("no call outside the TU"),
+            "{tag}: {log}"
         );
+        let log = run_ok(&[
+            "-I",
+            ir_scan_py().to_str().unwrap(),
+            "--tiers",
+            "ABS",
+            "--fail-tiers",
+            "ABS",
+            ll.to_str().unwrap(),
+        ]);
+        eprintln!("{tag}: {}", log.lines().nth(1).unwrap_or(""));
+        std::fs::remove_file(&ll).unwrap();
     }
-    // Positive control: the round-1 copy, compiled at -O0, is flagged.
+    // Positive control 1: the round-1 copies (no always_inline), compiled at -O0, are flagged.
     let base = scratch.0.join("outline");
     std::fs::create_dir_all(&base).unwrap();
     run_ok(&[
@@ -322,19 +370,52 @@ fn witgen_tu_fpext_always_inline_in_ir() {
         base.to_str().unwrap(),
         "--fpext-src",
         out_dir.join("witgen_fpext_src.h").to_str().unwrap(),
+        "--fp-src",
+        out_dir.join("witgen_fp_src.h").to_str().unwrap(),
         "--fpext-calls",
         "outline",
     ]);
     let ll = base.join("witgen_tu.ll");
-    emit(&base, "-O0", &ll);
+    emit_witgen_ll(&out_dir, &base, &["-O0"], &ll);
     let out = run(&[
         "kernels/cuda/witgen_tu_gen.py",
         "--scan-ir",
         ll.to_str().unwrap(),
     ]);
     assert!(
-        !out.status.success() && text(&out).contains("_Zml5FpExt"),
+        !out.status.success() && text(&out).contains("out of line: _ZmlL5FpExt"),
         "--scan-ir did not flag the round-1 fpext copy:\n{}",
+        text(&out)
+    );
+    // Positive control 2: the map-loop lowering at -O2 has tier-A/B sites (ToBits<5> & co).
+    let loop_dir = scratch.0.join("loop");
+    std::fs::create_dir_all(&loop_dir).unwrap();
+    run_ok(&[
+        "kernels/cuda/witgen_tu_gen.py",
+        "--metal",
+        "-o",
+        loop_dir.to_str().unwrap(),
+        "--fpext-src",
+        out_dir.join("witgen_fpext_src.h").to_str().unwrap(),
+        "--fp-src",
+        out_dir.join("witgen_fp_src.h").to_str().unwrap(),
+        "--map-lowering",
+        "loop",
+    ]);
+    let ll = loop_dir.join("witgen_tu.ll");
+    emit_witgen_ll(&out_dir, &loop_dir, &["-O2"], &ll);
+    let out = run(&[
+        "-I",
+        ir_scan_py().to_str().unwrap(),
+        "--tiers",
+        "AB",
+        "--fail-tiers",
+        "AB",
+        ll.to_str().unwrap(),
+    ]);
+    assert!(
+        !out.status.success() && text(&out).contains("exec_ToBits_5"),
+        "ir_scan.py did not flag the map-loop lowering:\n{}",
         text(&out)
     );
     let script = r#"
@@ -352,9 +433,78 @@ try:
 except c2m.TranslateError as e:
     assert 'always_inline' in str(e), e
     print('unmarked constexpr rejected')
+fsrc = open(g.FP_SRC_DEFAULT).read()
+txt, _, bad = g.gen_fp(fsrc)
+assert not bad and txt.count(g.FPEXT_ALWAYS_INLINE) == g.PINNED_FP['fn.always_inline'], bad
+try:
+    g.gen_fp(fsrc.replace('  constexpr uint32_t asRaw() const', '  inline constexpr uint32_t asRaw() const', 1), no_pin=True)
+except c2m.TranslateError as e:
+    assert 'always_inline' in str(e), e
+    print('unmarked fp constexpr rejected')
 "#;
     let log = run_ok(&["-c", script]);
-    assert!(log.contains("unmarked constexpr rejected"), "{log}");
+    assert!(
+        log.contains("unmarked constexpr rejected")
+            && log.contains("unmarked fp constexpr rejected"),
+        "{log}"
+    );
+    drop(scratch);
+}
+
+/// R17b: the linked metallib's witgen kernels (par_stepExecW, fwd_stepExec, rev_stepExec)
+/// contain only the witgen TU's own code: the build's metallib is disassembled
+/// (`metal-objdump -d`) and every function of the three kernel modules must be one the witgen
+/// TU (compiled here at -O2 with the build's flags) defines, with the same instruction count
+/// (R17's -O0 build linked accum_tu's load / loadExt / inRange / inv_chain instead of its own).
+/// The scanner's logic is also checked on a synthetic disassembly with a foreign function and
+/// a foreign body.
+#[test]
+fn witgen_metallib_links_only_witgen_code() {
+    if skipped_build() {
+        eprintln!("RISC0_SKIP_BUILD_KERNELS build: no generator ran, nothing to check");
+        return;
+    }
+    let out_dir = build_out_dir();
+    let scratch = Scratch::new("witgen_metallib");
+    let ll = scratch.0.join("witgen_tu.ll");
+    emit_witgen_ll(&out_dir, &out_dir.join("metal"), &["-O2"], &ll);
+    let log = run_ok(&[
+        "kernels/cuda/witgen_tu_gen.py",
+        "--scan-metallib",
+        env!("RV32IM_METAL_PATH"),
+        ll.to_str().unwrap(),
+    ]);
+    assert!(
+        log.contains("par_stepExecW") && log.contains("every function from the witgen TU"),
+        "{log}"
+    );
+    let script = r#"
+import sys
+sys.dont_write_bytecode = True
+sys.path.insert(0, 'kernels/cuda')
+sys.argv = ['x']
+import witgen_tu_gen as g
+import re
+ll = open(LL).read()
+fns = re.findall(r'(?ms)^define .*?^}$', ll)[:3]
+dis = ''.join('0x0000 -- %s:\n' % k + '\n'.join(fns) + '\n' for k in g.WITGEN_KERNELS)
+mods, bad = g.scan_metallib(dis, ll)
+assert not bad and all(len(v) == 3 for v in mods.values()), (bad, mods)
+foreign = 'define internal void @_ZN12rv32im_metal7loadExtERNS_11ExecContextENS_11BoundLayoutINS_3RegEEEm() {\n  ret void\n}\n'
+mods, bad = g.scan_metallib(dis + foreign, ll)
+assert len(bad) == 1 and 'loadExt' in bad[0], bad
+print('foreign function rejected')
+grown = fns[0].replace('\n', '\n  %x = add i32 0, 0\n', 1)
+mods, bad = g.scan_metallib(dis.replace(fns[0], grown, 1), ll)
+assert len(bad) == 1 and 'another TU' in bad[0], bad
+print('foreign body rejected')
+"#
+    .replace("LL", &format!("{:?}", ll.to_str().unwrap()));
+    let log = run_ok(&["-c", &script]);
+    assert!(
+        log.contains("foreign function rejected") && log.contains("foreign body rejected"),
+        "{log}"
+    );
     drop(scratch);
 }
 
