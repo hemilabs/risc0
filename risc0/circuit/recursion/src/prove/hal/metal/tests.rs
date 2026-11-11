@@ -298,3 +298,50 @@ fn p254_cpu_fallback_with_host_chains_check() {
         assert!(after > before, "{hashfn}: no host-chain check ran");
     }
 }
+
+/// R17 audit: repeated Metal proofs of one input with a fixed noise seed are bit-identical with
+/// each other and with the CPU prover's seal (`R17_AUDIT_REPS` proofs, default 10, per hash
+/// function in `R17_AUDIT_HASHFNS`, default `poseidon2,sha-256`, at `R17_AUDIT_PO2`, default
+/// 18). The whole pipeline runs, so every recursion kernel (steps, accum incl.
+/// `prefixProductsChunks`, eval_check, the zkp kernels) is covered. Prints `R17AUDIT` k/n lines.
+#[test]
+#[ignore]
+fn r17_seal_repeat() {
+    let _guard = crate::prove::hal::metal::global_state_test_lock();
+    let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
+    let reps: usize = env("R17_AUDIT_REPS", "10").parse().unwrap();
+    let po2: usize = env("R17_AUDIT_PO2", "18").parse().unwrap();
+    let program = get_zkr("test_recursion_circuit.zkr", po2).unwrap();
+    let mut bad = vec![];
+    for hashfn in env("R17_AUDIT_HASHFNS", "poseidon2,sha-256").split(',') {
+        let metal = metal_recursion_prover(hashfn).unwrap();
+        let cpu = crate::prove::hal::cpu::recursion_prover(hashfn).unwrap();
+        let want = with_noise_seed(7, || cpu.prove(&program, test_input(), None))
+            .unwrap()
+            .seal;
+        let (mut vs_first, mut vs_cpu) = (0, 0);
+        let mut first: Option<Vec<u32>> = None;
+        let t = std::time::Instant::now();
+        for _ in 0..reps {
+            let seal = with_noise_seed(7, || metal.prove(&program, test_input(), None))
+                .unwrap()
+                .seal;
+            if seal != want {
+                vs_cpu += 1;
+            }
+            match &first {
+                None => first = Some(seal),
+                Some(f) => vs_first += usize::from(*f != seal),
+            }
+        }
+        println!(
+            "R17AUDIT recursion seal {hashfn} po2 {po2}: {vs_first}/{reps} reps differ from rep 0, \
+             {vs_cpu}/{reps} differ from CPU ({:.0} ms/proof)",
+            t.elapsed().as_secs_f64() * 1e3 / reps as f64
+        );
+        if vs_first + vs_cpu > 0 {
+            bad.push(hashfn.to_string());
+        }
+    }
+    assert!(bad.is_empty(), "R17AUDIT recursion seals differ: {bad:?}");
+}

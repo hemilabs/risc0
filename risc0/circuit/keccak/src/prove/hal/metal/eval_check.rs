@@ -534,6 +534,49 @@ mod tests {
         matches_cpu(&[17]);
     }
 
+    /// R17 audit: `R17_AUDIT_REPS` (default 10) Metal eval_checks of one `R17_AUDIT_PO2` (default
+    /// 17) input, each compared bit for bit with the first and with the CPU HAL. Prints
+    /// `R17AUDIT keccak eval_check ...: k/n` (all 58 stages run in every rep).
+    #[test]
+    #[ignore]
+    fn r17_eval_check_repeat() {
+        let _gpu = super::super::tests::gpu_test_lock();
+        let reps: usize = std::env::var("R17_AUDIT_REPS").map_or(10, |v| v.parse().unwrap());
+        let po2: usize = std::env::var("R17_AUDIT_PO2").map_or(17, |v| v.parse().unwrap());
+        let hal = Rc::new(MetalHalSha256::new());
+        let circuit_hal = MetalCircuitHal::new(hal.clone());
+        let params = EvalCheckParams::new(po2);
+        let expected = cpu_check(&params);
+        let (mut vs_first, mut vs_cpu) = (0, 0);
+        let mut first: Option<Vec<Val>> = None;
+        let mut detail = vec![];
+        let t0 = Instant::now();
+        for rep in 0..reps {
+            let actual = metal_check(&hal, &circuit_hal, &params, DEFAULT_EVAL_CHUNK);
+            let n = actual.iter().zip(&expected).filter(|(a, b)| a != b).count();
+            if n > 0 {
+                vs_cpu += 1;
+                detail.push(format!("rep {rep}: {n} vs CPU"));
+            }
+            match &first {
+                None => first = Some(actual),
+                Some(f) => {
+                    let n = actual.iter().zip(f).filter(|(a, b)| a != b).count();
+                    if n > 0 {
+                        vs_first += 1;
+                        detail.push(format!("rep {rep}: {n} vs rep 0"));
+                    }
+                }
+            }
+        }
+        println!(
+            "R17AUDIT keccak eval_check po2 {po2} ({EVAL_STAGES} stages): {vs_first}/{reps} reps \
+             differ from rep 0, {vs_cpu}/{reps} differ from CPU ({:.2} s/rep) {detail:?}",
+            t0.elapsed().as_secs_f64() / reps as f64
+        );
+        assert_eq!(vs_first + vs_cpu, 0);
+    }
+
     /// Many chunks, a partial last chunk, and a cached stride larger than the chunk.
     #[test]
     fn eval_check_multi_chunk() {

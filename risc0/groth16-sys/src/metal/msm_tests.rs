@@ -537,3 +537,16 @@ fn msm_kernel_names_listed() {
         eprintln!("MSM pipelines built in {:.2} s", t0.elapsed().as_secs_f64());
     }
 }
+
+/// R17 audit: `R17_AUDIT_REPS` (default 10) G1 + G2 MSMs of 2^`R17_AUDIT_LG` (default 20) terms
+/// on one input, each checked against ark (check_size asserts every rep). msm_reduce.metal has
+/// the scanner's tier-B shape (Xyzz accumulators updated by calls in loops).
+#[test]
+#[ignore]
+fn r17_msm_repeat() {
+    let Some(g) = gpu() else { return };
+    let reps: usize = std::env::var("R17_AUDIT_REPS").map_or(10, |v| v.parse().unwrap());
+    let lg: u32 = std::env::var("R17_AUDIT_LG").map_or(20, |v| v.parse().unwrap());
+    check_size(&g, 1 << lg, 17, MsmConfig::default(), reps);
+    println!("R17AUDIT groth16 msm G1+G2 2^{lg}: {reps}/{reps} reps equal ark (0 differ)");
+}

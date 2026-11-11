@@ -53,6 +53,8 @@ mod tests_z5;
 mod tests_z7;
 #[cfg(test)]
 mod tests_z8b;
+#[cfg(test)]
+mod tests_r17;
 
 use std::{
     fmt::Debug,

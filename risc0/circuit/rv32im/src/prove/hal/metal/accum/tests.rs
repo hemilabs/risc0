@@ -539,3 +539,103 @@ fn prove_segment_measure() {
         Err(_) => panic!("po2 {po2}: prove panicked"),
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// R17 audit: repeated-run determinism of the accum kernel on real segments
+// ---------------------------------------------------------------------------------------------
+
+/// R17 audit (the Apple GPU private-array store defect found in witgen): `stepAccumA` has the
+/// same IR shape (`back_PoseidonState_A`'s 24-element and `back_BigIntState_A`'s 16-element
+/// map loops: constructor-initialised array, loop calling the non-inlined `load`, store after
+/// the call; tools/metal_audit/ir_scan.py tier A). Accumulates each `R17_AUDIT_SEGMENTS`
+/// segment (comma list of postcard files `(u32, Segment)`) `R17_AUDIT_REPS` times (default 10)
+/// per perm variant on one witness and compares every accum buffer bit for bit with the first
+/// run and with the CPU circuit HAL. Prints `R17AUDIT rv32im accum ...: k/n` lines.
+#[test]
+#[ignore]
+fn r17_accum_segment_stress() {
+    let Ok(paths) = std::env::var("R17_AUDIT_SEGMENTS") else {
+        eprintln!("R17_AUDIT_SEGMENTS unset: skipped");
+        return;
+    };
+    let reps: usize = std::env::var("R17_AUDIT_REPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    let hal = Arc::new(MetalHalPoseidon2::new());
+    let circuit_hal = MetalCircuitHalPoseidon2::new(hal.clone()).unwrap();
+    let mut bad = vec![];
+    for path in paths.split(',').filter(|p| !p.is_empty()) {
+        let bytes = std::fs::read(path).unwrap();
+        let ((_idx, seg), _) =
+            postcard::take_from_bytes::<(u32, crate::execute::segment::Segment)>(&bytes).unwrap();
+        let r = reference(&seg);
+        let rows = r.rows;
+        let mut wg = WitnessGenerator::new(
+            hal.as_ref(),
+            &circuit_hal,
+            r.preflight.clone(),
+            StepMode::Parallel,
+        )
+        .unwrap();
+        {
+            let data = wg.data.as_ref().unwrap();
+            data.buf.view_mut(|v| v.copy_from_slice(&r.data));
+            wg.global.buf.view_mut(|v| v.copy_from_slice(&r.global));
+        }
+        hal.sync();
+        let name = std::path::Path::new(path)
+            .iter()
+            .rev()
+            .take(2)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        for variant in [Variant::Gpu(Some(DEFAULT_SORT_WIN)), Variant::Gpu(None)] {
+            let (mut vs_first, mut vs_cpu) = (0, 0);
+            let mut first: Option<Vec<Val>> = None;
+            let mut detail = vec![];
+            let t = Instant::now();
+            for rep in 0..reps {
+                wg.accum(hal.as_ref(), &WithVariant(&circuit_hal, variant), &r.mix)
+                    .unwrap();
+                hal.sync();
+                let got = wg.accum.as_ref().unwrap().buf.to_vec();
+                let n = count_diffs(words(&r.accum), words(&got));
+                if n > 0 {
+                    vs_cpu += 1;
+                    let (row, col, a, b) = first_diff(words(&r.accum), words(&got), rows).unwrap();
+                    detail.push(format!(
+                        "rep {rep}: {n} cells vs CPU, first row {row} col {col} cpu {a:#x} gpu {b:#x}"
+                    ));
+                }
+                match &first {
+                    None => first = Some(got),
+                    Some(f) => {
+                        let n = count_diffs(words(f), words(&got));
+                        if n > 0 {
+                            vs_first += 1;
+                            detail.push(format!("rep {rep}: {n} cells vs rep 0"));
+                        }
+                    }
+                }
+            }
+            println!(
+                "R17AUDIT rv32im accum {name} po2 {} {variant:?}: {vs_first}/{reps} reps differ \
+                 from rep 0, {vs_cpu}/{reps} differ from CPU ({:.0} ms/rep) {detail:?}",
+                seg.po2,
+                t.elapsed().as_secs_f64() * 1e3 / reps as f64
+            );
+            if vs_first + vs_cpu > 0 {
+                bad.push(format!("{name} {variant:?}"));
+            }
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "R17AUDIT accum nondeterministic or wrong: {bad:?}"
+    );
+}

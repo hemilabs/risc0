@@ -854,6 +854,23 @@ mod tests {
         check_lg(&c, 23, &[NttSchedule::default(), NttSchedule::Radix2], true);
     }
 
+    /// R17 audit: [check_lg] (forward, inverse, roundtrip, coset forward, to_coset vs ark-poly)
+    /// `R17_AUDIT_REPS` times (default 10) at lg `R17_AUDIT_LG` (default 20), every schedule.
+    #[test]
+    #[ignore]
+    fn r17_ntt_repeat() {
+        let Some(c) = ctx() else { return };
+        let reps: usize = std::env::var("R17_AUDIT_REPS").map_or(10, |v| v.parse().unwrap());
+        let lg: u32 = std::env::var("R17_AUDIT_LG").map_or(20, |v| v.parse().unwrap());
+        for _ in 0..reps {
+            check_lg(&c, lg, ALL, false);
+        }
+        println!(
+            "R17AUDIT groth16 ntt lg {lg} x{} schedules: {reps}/{reps} reps equal ark",
+            ALL.len()
+        );
+    }
+
     /// Two transforms at different offsets of one buffer, in one command buffer.
     #[test]
     fn ntt_offsets_and_batching() {
