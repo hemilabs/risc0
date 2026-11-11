@@ -2264,8 +2264,9 @@ fn build_metal_kernels() {
     // `witgen_tu_gen.py --metal` -> gen_dir/witgen_tu.metal: step_Top's call graph (noinline,
     // cuda2metal.py passes with pinned rewrite counts, map/reduce unrolled: R17, no loop in the
     // graph) + par_stepExecW, fwd_stepExec, rev_stepExec, and gen_dir/witgen_fpext.h (the shared
-    // fpext.h with its 4-element loops unrolled, which witgen_tu.metal includes instead of it). The generator rewrites the file only
-    // when it changed and fails when steps.cu or ffi.cu's extern section changed shape (pins) or
+    // fpext.h with its 4-element loops unrolled, every function always_inline and the value
+    // constructors built in place, which witgen_tu.metal includes instead of it). The generator
+    // rewrites the file only when it changed and fails when steps.cu or ffi.cu's extern section changed shape (pins) or
     // the graph would contain a loop (docs/metal-port/notes/R17.md).
     if !skip {
         const WITGEN_TU_GEN: &str = "kernels/cuda/witgen_tu_gen.py";
