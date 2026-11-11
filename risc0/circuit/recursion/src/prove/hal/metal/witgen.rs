@@ -33,9 +33,12 @@
 //! witgen (`risc0_circuit_recursion_cpu_witgen`) over host views of the shared buffers.
 //! `upload_host_witness` (errata 8.4) copies a host witness into the shared `data` / `global`.
 
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    LazyLock,
+use std::{
+    cell::Cell,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        LazyLock,
+    },
 };
 
 use anyhow::{bail, ensure, Result};
@@ -55,7 +58,10 @@ use risc0_zkp::{
 };
 
 use super::{grow, host_slice, MetalCircuitHal, Phase};
-use crate::prove::{hal::CircuitWitnessGenerator, witgen::HostChains};
+use crate::{
+    prove::{hal::CircuitWitnessGenerator, witgen::HostChains},
+    CircuitImpl, CIRCUIT,
+};
 
 const CYCLE_WORDS: usize = std::mem::size_of::<RawPreflightCycle>() / 4;
 const _: () = assert!(std::mem::size_of::<RawPreflightCycle>() == 8);
@@ -100,11 +106,47 @@ pub(crate) struct WitgenScratch {
     pub wom_index: Option<BufferImpl<u32>>,
 }
 
-/// Calls served by the Metal Parallel path / the CPU (sequential modes), for tests and logs.
-pub(crate) static PARALLEL_CALLS: AtomicUsize = AtomicUsize::new(0);
-pub(crate) static SEQ_CPU_CALLS: AtomicUsize = AtomicUsize::new(0);
-/// Witgens that applied host chains.
-pub(crate) static CHAIN_CALLS: AtomicUsize = AtomicUsize::new(0);
+/// Witgen calls counted for tests and logs.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Call {
+    /// Served by the Metal Parallel path.
+    Parallel = 0,
+    /// Served by the CPU witgen (sequential modes).
+    SeqCpu = 1,
+    /// Witgens that applied host chains.
+    Chain = 2,
+}
+
+/// Process-wide call counts, indexed by [Call].
+static CALLS: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
+
+thread_local! {
+    /// The same counts for the calling thread only. The witgen runs on the thread that called
+    /// the prover, so a test asserts on the calls its own thread made: the process-wide counts
+    /// also move with every other test of the parallel harness (PLAN 8.7, C10 fix round 1).
+    static THREAD_CALLS: Cell<[usize; 3]> = const { Cell::new([0; 3]) };
+}
+
+fn count(call: Call) {
+    CALLS[call as usize].fetch_add(1, Ordering::Relaxed);
+    THREAD_CALLS.with(|c| {
+        let mut v = c.get();
+        v[call as usize] += 1;
+        c.set(v);
+    });
+}
+
+/// Calls of kind `call` in this process.
+#[allow(dead_code)]
+pub(crate) fn process_calls(call: Call) -> usize {
+    CALLS[call as usize].load(Ordering::Relaxed)
+}
+
+/// Calls of kind `call` made on the current thread.
+#[allow(dead_code)]
+pub(crate) fn thread_calls(call: Call) -> usize {
+    THREAD_CALLS.with(|c| c.get()[call as usize])
+}
 
 /// `RISC0_RECURSION_FAST_SORT=0` disables the counting sort (as for the CPU witgen).
 static FAST_SORT: LazyLock<bool> =
@@ -319,6 +361,37 @@ fn apply_host_chains(
     Ok(())
 }
 
+/// The buffer shapes every witgen path relies on (C10): the step kernels and the CPU witgen
+/// write every data column and read every ctrl column at `col * total_cycles + (row & mask)`,
+/// and the globals at fixed indices, without further bounds checks. A short buffer would be an
+/// out-of-bounds GPU write into whatever follows it, so it is an error before anything is encoded.
+fn check_witgen_shapes(
+    total_cycles: u32,
+    preflight: &RawPreflightTrace,
+    ctrl: &BufferImpl<BabyBearElem>,
+    data: &BufferImpl<BabyBearElem>,
+    global: &BufferImpl<BabyBearElem>,
+) -> Result<()> {
+    use risc0_zkp::adapter::{CircuitInfo as _, TapsProvider as _};
+    let steps = total_cycles as usize;
+    ensure!(
+        steps.is_power_of_two() && preflight.num_cycles as usize <= steps,
+        "recursion Metal Witgen: {} cycles in {steps} rows",
+        preflight.num_cycles
+    );
+    for (name, have, need) in [
+        ("ctrl", ctrl.size(), CIRCUIT.ctrl_size() * steps),
+        ("data", data.size(), CIRCUIT.data_size() * steps),
+        ("global", global.size(), CircuitImpl::OUTPUT_SIZE),
+    ] {
+        ensure!(
+            have >= need,
+            "recursion Metal Witgen: {name} has {have} elements, needs {need} for {steps} rows"
+        );
+    }
+    Ok(())
+}
+
 impl<MH: MetalHash> MetalCircuitHal<MH> {
     /// The sequential modes: the CPU witgen over host views (C5's path).
     fn witgen_cpu(
@@ -331,7 +404,7 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
         global: &BufferImpl<BabyBearElem>,
     ) -> Result<()> {
         scope!("metal_witgen(cpu)");
-        SEQ_CPU_CALLS.fetch_add(1, Ordering::Relaxed);
+        count(Call::SeqCpu);
         let num_cycles = preflight.num_cycles as usize;
         let cycles = grow(
             &self.hal,
@@ -384,7 +457,7 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
         global: &BufferImpl<BabyBearElem>,
     ) -> Result<()> {
         scope!("metal_witgen");
-        PARALLEL_CALLS.fetch_add(1, Ordering::Relaxed);
+        count(Call::Parallel);
         let t0 = std::time::Instant::now();
         let steps = total_cycles as usize;
         let num_cycles = preflight.num_cycles as usize;
@@ -485,7 +558,7 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
                 )
             };
             apply_host_chains(hc, steps, num_cycles, data.size() / steps, cyc, d, wr, wi)?;
-            CHAIN_CALLS.fetch_add(1, Ordering::Relaxed);
+            count(Call::Chain);
         }
         let t_host = t0.elapsed();
 
@@ -669,6 +742,8 @@ impl<MH: MetalHash> CircuitWitnessGenerator<MetalHal<MH>> for MetalCircuitHal<MH
         data: &BufferImpl<BabyBearElem>,
         global: &BufferImpl<BabyBearElem>,
     ) -> Result<()> {
+        // Shapes first: a rejected call is not counted as a served witgen phase (C10).
+        check_witgen_shapes(total_cycles, preflight, ctrl, data, global)?;
         self.enter(Phase::Witgen);
         match mode {
             // As CUDA: host chains apply to the Parallel mode only.

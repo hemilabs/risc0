@@ -216,13 +216,13 @@ fn witgen_matches_cpu(po2: usize) {
     let pristine = pf.trace.cycles.clone();
     let cpu = cpu_witness(&program, &pf, StepMode::Parallel);
     let m = MetalRun::new();
-    let calls = PARALLEL_CALLS.load(Ordering::Relaxed);
+    let calls = thread_calls(Call::Parallel);
     let t0 = std::time::Instant::now();
     let (d, g, peak) = m
         .witness(&program, &trace, StepMode::Parallel, None)
         .unwrap();
     let first_s = t0.elapsed().as_secs_f64();
-    assert!(PARALLEL_CALLS.load(Ordering::Relaxed) > calls);
+    assert!(thread_calls(Call::Parallel) > calls);
     assert_same("parallel", total, &(d, g), &cpu);
     assert_eq!(pf.trace.cycles, pristine, "caller's trace modified");
     // Again on the same circuit HAL (scratch reused), then with the production host chains and
@@ -243,11 +243,11 @@ fn witgen_matches_cpu(po2: usize) {
         assert_same("parallel + host chains (min 16)", total, &(d, g), &cpu);
     }
     let small = chains_with_min_len(&program, &pf, 2).expect("chains of >= 2 cycles");
-    let chain_calls = CHAIN_CALLS.load(Ordering::Relaxed);
+    let chain_calls = thread_calls(Call::Chain);
     let (d, g, _) = m
         .witness(&program, &trace, StepMode::Parallel, Some(&small))
         .unwrap();
-    assert!(CHAIN_CALLS.load(Ordering::Relaxed) > chain_calls);
+    assert!(thread_calls(Call::Chain) > chain_calls);
     assert_same("parallel + host chains (min 2)", total, &(d, g), &cpu);
     assert_eq!(pf.trace.cycles, pristine, "caller's trace modified");
     eprintln!(
@@ -279,9 +279,9 @@ fn witgen_seq_modes_match_cpu() {
     let m = MetalRun::new();
     for mode in [StepMode::SeqForward, StepMode::SeqReverse] {
         let cpu = cpu_witness(&program, &pf, mode);
-        let calls = SEQ_CPU_CALLS.load(Ordering::Relaxed);
+        let calls = thread_calls(Call::SeqCpu);
         let (d, g, _) = m.witness(&program, &trace, mode, None).unwrap();
-        assert!(SEQ_CPU_CALLS.load(Ordering::Relaxed) > calls);
+        assert!(thread_calls(Call::SeqCpu) > calls);
         assert_same("seq", total, &(d, g), &cpu);
     }
     // The sequential witness equals the parallel one.
@@ -391,11 +391,11 @@ fn prewitgen_and_shadow_check_hooks() {
         std::env::remove_var("RISC0_RECURSION_PREWITGEN_CHECK");
         std::env::remove_var("RISC0_RECURSION_SHADOW_CHECK");
         std::env::set_var(var, val);
-        let calls = PARALLEL_CALLS.load(Ordering::Relaxed);
+        let calls = thread_calls(Call::Parallel);
         let (program, pf) = with_host_witness(false);
         let r = prove_metal(&program, pf).unwrap();
         assert!(
-            PARALLEL_CALLS.load(Ordering::Relaxed) > calls,
+            thread_calls(Call::Parallel) > calls,
             "{var}: no Metal witgen"
         );
         assert_eq!(r.output, cpu_receipt.output, "{var}");
@@ -411,10 +411,10 @@ fn prewitgen_and_shadow_check_hooks() {
     std::env::remove_var("RISC0_RECURSION_SHADOW_CHECK");
     // Without a check, the host witness is uploaded as is (upload_host_witness): the proof is
     // the CPU prover's.
-    let calls = PARALLEL_CALLS.load(Ordering::Relaxed);
+    let calls = thread_calls(Call::Parallel);
     let (program, pf) = with_host_witness(false);
     let r = prove_metal(&program, pf).unwrap();
-    assert_eq!(PARALLEL_CALLS.load(Ordering::Relaxed), calls);
+    assert_eq!(thread_calls(Call::Parallel), calls);
     assert_eq!(r.output, cpu_receipt.output);
     assert_eq!(r.seal[..globals], cpu_receipt.seal[..globals]);
 }

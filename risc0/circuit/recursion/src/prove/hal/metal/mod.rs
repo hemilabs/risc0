@@ -31,6 +31,8 @@
 //! time a phase asks for them or by [warmup] on a background thread. Never per proof.
 
 mod accum;
+#[cfg(all(test, feature = "test"))]
+mod c10_tests;
 mod eval_check;
 #[cfg(all(test, feature = "test"))]
 mod tests;
@@ -249,6 +251,9 @@ pub(crate) static PHASE_CALLS: [AtomicUsize; 3] = [
 pub(crate) static PHASE_ALLOC: [AtomicU64; 3] =
     [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
+/// Poisoned scratch mutexes recovered by [MetalCircuitHal::scratch] (tests and logs).
+pub(crate) static SCRATCH_POISON_RECOVERIES: AtomicUsize = AtomicUsize::new(0);
+
 /// The calls served so far, `[witgen, accum, eval_check]`.
 #[allow(dead_code)]
 pub(crate) fn phase_calls() -> [usize; 3] {
@@ -299,8 +304,26 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
     }
 
     /// The HAL-owned scratch buffers. Do not hold the guard across a call that borrows it again.
+    ///
+    /// Poison-tolerant (C10): a panic while the guard is held (in practice the zkp HAL's
+    /// working-set budget panic inside [grow], M1) used to poison the mutex, and every later proof
+    /// of this cached prover failed with `PoisonError`. The scratch holds no state a proof relies
+    /// on across calls (every phase sizes, fills or zeroes what it binds), so a poisoned guard is
+    /// recovered by dropping all scratch buffers (their memory goes back to the HAL's pool once no
+    /// batch uses them; after an out-of-memory panic that is what we want anyway) and clearing the
+    /// poison. The next proof regrows what it needs.
     pub(crate) fn scratch(&self) -> MutexGuard<'_, ScratchBuffers> {
-        self.scratch.lock().unwrap()
+        self.scratch.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!(
+                "recursion Metal: scratch mutex poisoned by an earlier panic; dropping the \
+                 scratch buffers and continuing"
+            );
+            let mut guard = poisoned.into_inner();
+            *guard = ScratchBuffers::default();
+            self.scratch.clear_poison();
+            SCRATCH_POISON_RECOVERIES.fetch_add(1, Ordering::Relaxed);
+            guard
+        })
     }
 
     /// Count a call of `phase` and record the device allocation (PLAN 9.1 peak per phase).

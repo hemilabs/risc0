@@ -48,6 +48,15 @@ const CTRL_CACHE_CAP: usize = 4;
 type HostCtrlCache = Vec<(super::CtrlKey, Arc<Vec<BabyBearElem>>)>;
 static CTRL_CACHE: LazyLock<Mutex<HostCtrlCache>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
+/// The host ctrl cache, poison-tolerant (C10): every entry is inserted whole, so a panic on
+/// another thread while it held the lock cannot leave a torn entry, and a poisoned lock must not
+/// fail every later proof of the process.
+pub(crate) fn ctrl_cache() -> std::sync::MutexGuard<'static, HostCtrlCache> {
+    CTRL_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn ctrl_matches(ctrl: &[BabyBearElem], zkr: &Program, total_cycles: usize) -> bool {
     use rayon::prelude::*;
     let ctrl_size = zkr.code_size;
@@ -66,9 +75,7 @@ fn ctrl_matches(ctrl: &[BabyBearElem], zkr: &Program, total_cycles: usize) -> bo
 pub(crate) fn host_ctrl_for(zkr: &Program) -> Arc<Vec<BabyBearElem>> {
     let total_cycles = 1usize << zkr.po2;
     let key = super::ctrl_cache_key(zkr);
-    let hit = CTRL_CACHE
-        .lock()
-        .unwrap()
+    let hit = ctrl_cache()
         .iter()
         .find(|e| e.0 == key)
         .map(|e| e.1.clone());
@@ -93,7 +100,7 @@ pub(crate) fn host_ctrl_for(zkr: &Program) -> Arc<Vec<BabyBearElem>> {
             });
     }
     let v = Arc::new(v);
-    let mut cache = CTRL_CACHE.lock().unwrap();
+    let mut cache = ctrl_cache();
     cache.retain(|e| e.0 != key);
     if cache.len() >= CTRL_CACHE_CAP {
         cache.remove(0);
@@ -110,20 +117,34 @@ pub(crate) fn host_ctrl_for(zkr: &Program) -> Arc<Vec<BabyBearElem>> {
 /// i.e. it compares two independently computed witnesses (unlike the host
 /// shadow check, which only compares a buffer with its own upload source).
 fn prewitgen_check_due(key: super::CtrlKey) -> bool {
-    static CHECKED: LazyLock<Mutex<Vec<super::CtrlKey>>> = LazyLock::new(|| Mutex::new(Vec::new()));
     match std::env::var("RISC0_RECURSION_PREWITGEN_CHECK").as_deref() {
         Ok("0") => false,
         Ok("1") | Ok("always") => true,
-        Ok("once") => {
-            let mut c = CHECKED.lock().unwrap();
-            if c.contains(&key) {
-                false
-            } else {
-                c.push(key);
-                true
-            }
-        }
+        Ok("once") => first_prewitgen_check(key),
         _ => std::env::var_os("RISC0_RECURSION_SHADOW_CHECK").is_some(),
+    }
+}
+
+/// Programs already checked by `RISC0_RECURSION_PREWITGEN_CHECK=once` in this process.
+static PREWITGEN_CHECKED: LazyLock<Mutex<Vec<super::CtrlKey>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// The set of checked programs, poison-tolerant (C10): an entry is pushed whole, so a poisoned
+/// lock holds no torn state and must not fail every later proof of the process.
+pub(crate) fn prewitgen_checked() -> std::sync::MutexGuard<'static, Vec<super::CtrlKey>> {
+    PREWITGEN_CHECKED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// True the first time `key` is seen (`RISC0_RECURSION_PREWITGEN_CHECK=once`).
+pub(crate) fn first_prewitgen_check(key: super::CtrlKey) -> bool {
+    let mut c = prewitgen_checked();
+    if c.contains(&key) {
+        false
+    } else {
+        c.push(key);
+        true
     }
 }
 
