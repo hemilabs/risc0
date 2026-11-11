@@ -78,13 +78,19 @@ use crate::{
 };
 
 /// Default cycles per chunk (the scratch/carry stride): 32768 cycles take 1.08 GB of scratch.
+/// Why chunk at all: the scratch is ~33 KB per cycle, so a whole po2 18 domain (2^20 cycles)
+/// would need ~34 GB; a fixed chunk keeps it constant from po2 13 up. Why 32768: one dispatch
+/// of 32768 threads fills any Apple GPU, and 16 chunks × 58 stages at po2 17 keep the encode
+/// overhead small (K4 note). K7 re-tunes it for base-chip budgets.
 pub const DEFAULT_EVAL_CHUNK: u32 = 32768;
 
 /// Overrides [DEFAULT_EVAL_CHUNK] (cycles per chunk; for the K7 sweep).
 pub const EVAL_CHUNK_ENV: &str = "RISC0_KECCAK_METAL_EVAL_CHUNK";
 
 /// The smallest chunk the launcher shrinks to when the scratch does not fit the working-set
-/// budget (`MetalHal::working_set_limit`).
+/// budget (`MetalHal::working_set_limit`). 1024 cycles is ~34 MB of scratch; smaller chunks
+/// would save little memory while the dispatch count (domain / chunk × stages: 59k at po2 18)
+/// would dominate the time.
 pub const MIN_EVAL_CHUNK: u32 = 1024;
 
 /// Bytes of scratch plus carry for a stride of `stride` cycles.
@@ -626,16 +632,13 @@ mod tests {
             params.steps,
         );
         hal.set_working_set_limit(None);
-        // The budget is against the whole process's Metal memory, which tests running in
-        // parallel change: the chunk is exactly 4096 when this test runs alone
-        // (`--test-threads=1`), and in any case a halving of the default ([fit_chunk] is
-        // tested exactly below).
+        // The budget is against the whole process's Metal memory: every test that allocates
+        // Metal memory takes `gpu_test_lock` (K5, K8), so nothing else allocates or frees while
+        // this runs and the chunk is exactly the one that fits, under the default parallel
+        // harness too (K8: the lock-free `prove::tests` and archive tests used to race it).
         let stride = circuit_hal.eval_scratch_bytes() / scratch_bytes(1);
         println!("po2 14 under a budget: chunk {stride}");
-        assert!(stride >= 1024 && stride <= DEFAULT_EVAL_CHUNK as u64 && stride.is_power_of_two());
-        if std::env::var("RUST_TEST_THREADS").as_deref() == Ok("1") {
-            assert_eq!(stride, 4096);
-        }
+        assert_eq!(stride, 4096);
         assert_same("po2 14 under budget", &check.to_vec(), &expected);
     }
 

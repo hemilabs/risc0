@@ -631,6 +631,60 @@ pub(super) mod tests {
         }
     }
 
+    /// The GPU scatter + witness `reps` times at each po2, each time into fresh buffers, every
+    /// result bit-identical to the CPU witness (K8: the generated rv32im GPU witgen gives
+    /// different results on identical inputs, PLAN 8.7 / R17; this checks the keccak one does
+    /// not). Prints the witgen time range.
+    fn repeat_witgen(po2s: &[usize], reps: usize) {
+        let _gpu = super::super::tests::gpu_test_lock();
+        let hal = Rc::new(MetalHalSha256::new());
+        let circuit_hal = MetalCircuitHal::new(hal.clone());
+        for &po2 in po2s {
+            let cycles = 1 << po2;
+            let inputs = varied_inputs(po2);
+            let (host_global, host_data, _) = host(&inputs, po2);
+            let (mut lo, mut hi) = (f64::MAX, 0f64);
+            for rep in 0..reps {
+                let (global, data, secs) =
+                    metal::<MetalPreflightOrder>(&circuit_hal, &hal, &inputs, po2).unwrap();
+                assert_eq!(
+                    first_diff(&data, &host_data, cycles),
+                    None,
+                    "po2 {po2} rep {rep}: data (row, col, metal, host)"
+                );
+                assert_eq!(
+                    first_diff(&global, &host_global, 1),
+                    None,
+                    "po2 {po2} rep {rep}: global"
+                );
+                (lo, hi) = (lo.min(secs), hi.max(secs));
+            }
+            println!(
+                "po2 {po2}: {reps} GPU witnesses bit-identical to the CPU's; witgen {:.1}..{:.1} ms",
+                lo * 1e3,
+                hi * 1e3
+            );
+        }
+    }
+
+    #[test]
+    fn metal_witgen_repeatable() {
+        repeat_witgen(&[14], 20);
+    }
+
+    /// [repeat_witgen] at `K8_WITGEN_PO2S` (default 16,18) × `K8_WITGEN_REPS` (default 200).
+    #[test]
+    #[ignore]
+    fn metal_witgen_repeatable_long() {
+        let po2s: Vec<usize> = std::env::var("K8_WITGEN_PO2S")
+            .unwrap_or_else(|_| "16,18".into())
+            .split(',')
+            .map(|s| s.trim().parse().unwrap())
+            .collect();
+        let reps = std::env::var("K8_WITGEN_REPS").map_or(200, |s| s.parse().unwrap());
+        repeat_witgen(&po2s, reps);
+    }
+
     /// An inconsistent scatter (a cycle's control state that disagrees with the one the circuit
     /// computes from the previous row) sets the fault flag, and the GPU witness is an `Err`, as
     /// the CPU's is ("Inconsistent set").

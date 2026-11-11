@@ -886,6 +886,10 @@ fn build_metal_kernels() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let kernel_dir = std::path::absolute("kernels/metal").unwrap();
     rerun_if_changed(&kernel_dir);
+    // The translators read kernels/cuda (eval_check_<n>.cu, steps_<n>.cu, ...) by directory
+    // listing: track the directory, so an added or removed source also re-runs them (they emit
+    // rerun-if-changed only for the files that existed).
+    rerun_if_changed(std::path::absolute("kernels/cuda").unwrap());
 
     let mut sources = glob_paths("kernels/metal/*.metal");
     sources.sort();
