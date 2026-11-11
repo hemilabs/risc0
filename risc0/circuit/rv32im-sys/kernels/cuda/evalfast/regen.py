@@ -17,6 +17,7 @@
 from the generated circuit.
 
 usage: regen.py [--check]
+       regen.py --metal DIR [--check]
 
 The CUDA eval_check kernel is the Intel evalfast pipeline output converted by
 to_cuda.py. The chain, the same one build.rs runs for the Intel mono kernel
@@ -67,7 +68,15 @@ plain links outside the WMMA chains. archsel_hip.py merges the outputs,
 the runs of lines that differ under #if defined(__GFX12__), and checks that
 each side selects back its input.
 
-The results are committed, so the GPU builds need no Python. Re-run this after
+Metal (regen.py --metal DIR, run by rv32im-sys/build.rs for the `metal` feature): the chain's
+output after HIP_LAST (as the ROCm kernel: no mksm2.py, no mksub.py) converted by to_metal.py into
+DIR/eval_check_ef.metal and DIR/ef_tables.rs (the host half of the poly_mix table: rk_hoist and
+the product indices as Rust). Only the passes up to HIP_LAST run. The files are rewritten only when
+their text changes, and are not committed (generated .metal lives in OUT_DIR, PLAN 2.0); with
+--check they are compared instead. The plain mode runs to_metal.py too, so its EXPECT pin is
+checked by CI.
+
+The CUDA / ROCm results are committed, so those GPU builds need no Python. Re-run this after
 changing the generated circuit (kernels/cxx/rust_poly_fp_*.cpp) or any of the
 passes; --check (run in CI) fails if a committed file is out of date.
 """
@@ -88,6 +97,7 @@ import opq_hip  # noqa: E402
 import pmlag_hip  # noqa: E402
 import smem_hip  # noqa: E402
 import to_hip  # noqa: E402
+import to_metal  # noqa: E402
 import wmma_hip  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -114,6 +124,12 @@ PMLAG_EXPECT = ('pmlag_hip: 22 functions, 5034 links and 157 closures with lagge
 PMLAG_GFX12_EXPECT = ('pmlag_hip: 22 functions, 364 plain links and 157 closures with lagged constants (W 4)')
 # opq_hip.py (both variants; the barriers are empty outside gfx11)
 OPQ_EXPECT = 'opq_hip: EF_OPQ64 at 5 multiply-accumulate sites (gfx11)'
+# to_metal.py (on the HIP_LAST output, regen.py --metal): the Metal kernel and its host tables.
+TO_METAL_EXPECT = ('to_metal: 106 signatures and 20 calls take EfCtx instead of 117 pointer arguments, 5 pointer '
+                   'locals, 5357 table-helper calls, 62 hoisted terms and 107 products on the host')
+# Files regen.py --metal DIR writes (the Metal build's OUT_DIR; never committed, PLAN 2.0).
+METAL_OUT = 'eval_check_ef.metal'
+METAL_RS_OUT = 'ef_tables.rs'
 # The gfx12 variant (archsel_hip.py): 12 WMMA staging slots per wave (7.5 KB of LDS per block) and
 # smem_hip.py's LDS words on gfx12 too, 16 per phase (8 KB).
 WMMA_GFX12_SLOTS = 12
@@ -253,8 +269,23 @@ def amalgamate(poly_fp_dir):
     return ''.join(out)
 
 
+def metal_convert(hip):
+    mstats = []
+    metal, rust = to_metal.convert(hip, stats=mstats)
+    if mstats != [TO_METAL_EXPECT]:
+        sys.exit('regen: EXPECT failed: to_metal.py printed\n  %s\nnot\n  %s' % (mstats, TO_METAL_EXPECT))
+    return metal, rust
+
+
 def main():
-    check = '--check' in sys.argv[1:]
+    argv = sys.argv[1:]
+    check = '--check' in argv
+    metal_dir = None
+    if '--metal' in argv:
+        i = argv.index('--metal')
+        if i + 1 >= len(argv):
+            sys.exit('usage: regen.py --metal DIR [--check]')
+        metal_dir = argv[i + 1]
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(('RISC0_', 'SINK_LEAD', 'PYTHON'))}
     env.update(PYTHONHASHSEED='0', PYTHONDONTWRITEBYTECODE='1', RISC0_INTEL_EVAL_XMX='0')
@@ -281,6 +312,10 @@ def main():
             if tool == HIP_LAST:
                 with open(gen, newline='') as f:
                     hip = f.read()
+                if metal_dir is not None:
+                    break
+        if metal_dir is not None:
+            return metal_main(hip, metal_dir, check)
         with open(gen, newline='') as f:
             new = f.read()
     outputs = []
@@ -315,6 +350,7 @@ def main():
         if ostats != [OPQ_EXPECT]:
             sys.exit('regen: EXPECT failed: opq_hip.py printed\n  %s\nnot\n  %s' % (ostats, OPQ_EXPECT))
         return hip
+    metal_convert(hip)  # the Metal pins, checked in every mode
     hip = to_hip.convert(hip)
     # gfx12 (RDNA4) devices compile the variant, every other target the default (archsel_hip.py).
     default = chain(hip, 24, WMMA_EXPECT, 32, 32, HOIST_EXPECT, SMEM_EXPECT, False, PMLAG_EXPECT)
@@ -355,6 +391,32 @@ def main():
     if stale:
         sys.exit('regen: %s out of date; run kernels/cuda/evalfast/regen.py and commit the result'
                  % ' and '.join(stale))
+
+
+def metal_main(hip, out_dir, check):
+    metal, rust = metal_convert(hip)
+    stale = []
+    for name, text in ((METAL_OUT, metal), (METAL_RS_OUT, rust)):
+        path = os.path.join(out_dir, name)
+        try:
+            with open(path, newline='') as f:
+                old = f.read()
+        except FileNotFoundError:
+            old = None
+        if check:
+            if old != text:
+                stale.append(path)
+            else:
+                print('regen: %s is up to date' % path)
+        elif old != text:
+            os.makedirs(out_dir, exist_ok=True)
+            with open(path, 'w', newline='') as f:
+                f.write(text)
+            print('regen: wrote %s' % path)
+        else:
+            print('regen: %s unchanged' % path)
+    if stale:
+        sys.exit('regen: %s out of date (regen.py --metal %s)' % (' and '.join(stale), out_dir))
 
 
 if __name__ == '__main__':

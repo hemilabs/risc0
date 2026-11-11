@@ -21,13 +21,18 @@ usage:
   cuda2metal.py incs -o OUTDIR [--check]
   cuda2metal.py eval -o OUTDIR [--compile] [--check] [--no-pin]
   cuda2metal.py file IN.cu -o OUT.metal [--types types.cuh.inc]
+  cuda2metal.py check
 
 `steps` translates steps.cu -> OUTDIR/steps.metal and steps.cuh -> OUTDIR/steps.metal.h and
 checks the per-pass rewrite counts against PINNED_STEPS (it fails when the generated input
 changes shape; --no-pin only reports). `--compile` also writes the three .metal.inc files
 (`incs`) and compiles steps.metal with `xcrun metal`, reporting the time and every residual
 error class. `incs` translates defs.cu.inc, types.cuh.inc and layout.cu.inc. `--check` compares
-the would-be outputs with the files already in OUTDIR instead of writing them (CI drift check).
+the would-be outputs with the files already in OUTDIR instead of writing them (and creates
+nothing). `check` (item R16) is the drift check CI runs without the Metal toolchain: the
+checked-in kernels/metal/*.metal.inc must equal their translation, and `steps` and `eval` must
+translate with their pinned counts (their outputs live in the build's OUT_DIR and are never
+checked in; `eval -o $OUT_DIR/metal --check` compares a build's file).
 
 The translator is a sequence of text passes over the CUDA source. Every pass counts what it
 rewrote; anything it cannot translate faithfully raises TranslateError (no silent fallbacks):
@@ -1783,8 +1788,16 @@ def _selftest_eval_negative():
 
 
 def selftest(headers=None, keep=None):
-    headers = headers or default_headers()
     work = keep or tempfile.mkdtemp(prefix='cuda2metal_selftest_')
+    try:
+        return _selftest(headers or default_headers(), work)
+    finally:
+        # also when a check raises: the temp dir holds ~10 MB of translations and .air files
+        if not keep:
+            shutil.rmtree(work, ignore_errors=True)
+
+
+def _selftest(headers, work):
     os.makedirs(work, exist_ok=True)
     print('cuda2metal selftest: headers %s%s' % (headers, ' (R1 witgen.h)' if headers == R1_METAL
                                                  else ' (local stubs)' if headers == STUBS else ''))
@@ -1902,8 +1915,6 @@ def selftest(headers=None, keep=None):
                 print('  FAIL   refuse %s: %s' % (what, e))
             else:
                 print('  OK     refuse %s' % what)
-    if not keep:
-        shutil.rmtree(work, ignore_errors=True)
     if fails:
         print('cuda2metal selftest: %d FAILURE(S)' % len(fails))
         for f in fails:
@@ -1927,7 +1938,8 @@ def cmd_steps(args):
             return 1
     else:
         print('cuda2metal: counts match PINNED_STEPS')
-    os.makedirs(args.out, exist_ok=True)
+    if not args.check:
+        os.makedirs(args.out, exist_ok=True)
     write_or_check(os.path.join(args.out, 'steps.metal'), out, args.check)
     write_or_check(os.path.join(args.out, 'steps.metal.h'), out_h, args.check)
     if args.compile or args.check:
@@ -1975,7 +1987,8 @@ def cmd_eval(args):
             return 1
     else:
         print('cuda2metal: counts match PINNED_EVAL')
-    os.makedirs(args.out, exist_ok=True)
+    if not args.check:
+        os.makedirs(args.out, exist_ok=True)
     path = os.path.join(args.out, 'eval_check.metal')
     if args.check:
         write_or_check(path, out, True)
@@ -1998,13 +2011,44 @@ def cmd_eval(args):
     return 0
 
 
+def cmd_check():
+    """CI drift check (R16; no Metal toolchain needed): the checked-in .metal.inc files are
+    up to date and the steps / eval translations succeed with their pinned rewrite counts."""
+    fails = []
+    for name, (text, c, src_name) in translate_incs().items():
+        try:
+            write_or_check(os.path.join(R1_METAL, name), text, True)
+            print('cuda2metal check: kernels/metal/%s is up to date' % name)
+        except TranslateError as e:
+            fails.append(str(e))
+    _, _, counts = translate_steps()
+    bad = check_pins(counts)
+    fails += ['steps pin: ' + b for b in bad]
+    print('cuda2metal check: steps translation %s' % ('matches PINNED_STEPS' if not bad else
+                                                       'differs from PINNED_STEPS'))
+    _, counts = translate_eval()
+    bad = check_pins({'eval_check': counts}, PINNED_EVAL)
+    fails += ['eval pin: ' + b for b in bad]
+    print('cuda2metal check: eval translation %s' % ('matches PINNED_EVAL' if not bad else
+                                                      'differs from PINNED_EVAL'))
+    if fails:
+        for f in fails:
+            print('cuda2metal check: ' + f, file=sys.stderr)
+        print('cuda2metal check: regenerate with `python3 kernels/cuda/cuda2metal.py incs -o '
+              'kernels/metal` (in rv32im-sys) or review the counts with `steps|eval -o DIR '
+              '--compile --no-pin` and update the pins', file=sys.stderr)
+        return 1
+    print('cuda2metal check: all up to date')
+    return 0
+
+
 def main(argv):
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--selftest', action='store_true')
     ap.add_argument('--headers', help='rv32im Metal header dir (default: R1 witgen.h if present, '
                     'else the selftest stubs)')
     ap.add_argument('--keep', help='selftest: keep generated files in this dir')
-    ap.add_argument('mode', nargs='?', choices=('steps', 'incs', 'eval', 'file'))
+    ap.add_argument('mode', nargs='?', choices=('steps', 'incs', 'eval', 'file', 'check'))
     ap.add_argument('input', nargs='?')
     ap.add_argument('-o', '--out')
     ap.add_argument('--types', default=os.path.join(HERE, 'types.cuh.inc'))
@@ -2015,6 +2059,8 @@ def main(argv):
     try:
         if args.selftest:
             return selftest(args.headers, args.keep)
+        if args.mode == 'check':
+            return cmd_check()
         if args.mode == 'steps':
             if not args.out:
                 ap.error('steps needs -o OUTDIR')
@@ -2026,7 +2072,8 @@ def main(argv):
         if args.mode == 'incs':
             if not args.out:
                 ap.error('incs needs -o OUTDIR')
-            os.makedirs(args.out, exist_ok=True)
+            if not args.check:
+                os.makedirs(args.out, exist_ok=True)
             for name, (text, c, src_name) in translate_incs().items():
                 write_or_check(os.path.join(args.out, name), text, args.check)
                 print('cuda2metal %s -> %s: %s' % (src_name, name, fmt_counts(c)))
