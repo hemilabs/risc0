@@ -34,7 +34,9 @@
 #    its ptxas time).
 #
 # Both edits are idempotent; --check (run in CI) fails if either file is out of
-# date. Re-run it after changing DeviceAccumContext in ffi.cu too.
+# date, or if the Metal translation below (both inline modes) no longer translates with its
+# pinned rewrite counts (R16: accum_tu.metal is never checked in, so this is its drift check
+# outside a Metal build). Re-run it after changing DeviceAccumContext in ffi.cu too.
 #
 # --metal (Metal port item R4) writes OUTDIR/accum_tu.metal instead and touches no checked-in
 # file: the same call graph (same functions, same order, same _A renaming), translated by
@@ -48,6 +50,10 @@
 # is written only when it changed (a fresh mtime would rerun the cargo build script); --check
 # fails instead of writing.
 import os, re, sys
+
+# build.rs runs this script from the source tree: importing cuda2metal must not leave a
+# __pycache__ there (Python's default unless a pycache prefix is configured).
+sys.dont_write_bytecode = True
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STEPS = os.path.join(HERE, 'steps.cu')
@@ -170,6 +176,13 @@ def main_cuda(check):
             sys.exit('accum_tu_gen: %s out of date; run kernels/cuda/accum_tu_gen.py and commit the result'
                      % ' and '.join(stale))
         print('accum_tu_gen: accum_tu.cu and steps.cu are up to date (%d functions)' % len(names))
+        bad = metal_pin_check()
+        if bad:
+            sys.exit('accum_tu_gen: the Metal translation (--metal) changed shape:\n  %s\nre-run '
+                     '`accum_tu_gen.py --metal -o <dir> --no-pin`, review the compile and update '
+                     'PINNED_METAL' % '\n  '.join(bad))
+        print('accum_tu_gen: --metal translation matches PINNED_METAL (%s)'
+              % ', '.join(sorted(INLINE_MODES)))
     else:
         if new_steps != steps:
             open(STEPS, 'w', newline='').write(new_steps)
@@ -321,12 +334,40 @@ kernel void stepAccumA(device Fp* data [[buffer(0)]],
 '''
 
 
+# The only externs the accum graph may call: stepAccumA binds no preflight trace and no lookup
+# tables (both null), so any other INVOKE_EXTERN would read through a null pointer on Metal
+# (CUDA binds them). witgen.h's extern_assert / extern_log are no-ops.
+ACCUM_EXTERNS = {'assert', 'log'}
+
+
+def metal_pin_check():
+    """Translate --metal in every inline mode in memory: [] or the pin/translation errors."""
+    sys.path.insert(0, HERE)
+    import cuda2metal as c2m
+    bad = []
+    for mode in sorted(INLINE_MODES):
+        try:
+            _, counts = metal_tu(mode)
+        except (c2m.TranslateError, ValueError) as e:
+            bad.append('%s: %s' % (mode, e))
+            continue
+        bad += ['%s: %s' % (mode, b)
+                for b in c2m.check_pins({'accum': counts}, {'accum': PINNED_METAL[mode]})]
+    return bad
+
+
 def metal_tu(mode, tg=256):
     """-> (accum_tu.metal text, counts)."""
     sys.path.insert(0, HERE)
     import cuda2metal as c2m
     qual_in, qual_mid, qual_out = INLINE_MODES[mode]
     _, _, names, defs, order, ren = call_graph()
+    externs = {e for n in names
+               for e in re.findall(r'\bINVOKE_EXTERN\(\s*\w+\s*,\s*(\w+)', defs[n])}
+    if not externs <= ACCUM_EXTERNS:
+        raise ValueError('the step_TopAccum graph calls extern(s) %s, but stepAccumA binds no '
+                         'preflight trace or lookup tables: bind them in METAL_KERNEL (and on '
+                         'the host) first' % sorted(externs - ACCUM_EXTERNS))
     protos, fns = graph_text(defs, order, ren, qual_in)
     src = '\n'.join(['#include "witgen.h"', '', 'namespace %s {' % c2m.CUDA_NS] + protos + [''] +
                     fns + ['} // namespace %s' % c2m.CUDA_NS, ''])
@@ -359,7 +400,7 @@ def main_metal(argv):
     import cuda2metal as c2m
     try:
         text, counts = metal_tu(args.inline, args.tg)
-    except c2m.TranslateError as e:
+    except (c2m.TranslateError, ValueError) as e:
         print('accum_tu_gen --metal: error: %s' % e, file=sys.stderr)
         return 1
     print('accum_tu_gen --metal (%s): %s' % (args.inline, c2m.fmt_counts(counts)))
