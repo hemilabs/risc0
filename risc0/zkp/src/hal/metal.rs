@@ -787,8 +787,8 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
         size: usize,
         stride: usize,
     ) {
-        // The CPU HAL panics on these; the kernel reads src[gid * stride + idx] with 32-bit math
-        // and no bounds check.
+        // The CPU HAL panics on these; the kernel reads src[gid * stride + idx] (64-bit index math)
+        // with no bounds check.
         assert!(
             dst.size() >= size,
             "gather_sample: dst holds {} elements, size {size}",
@@ -807,9 +807,11 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
              {stride})",
             src.size()
         );
+        // The kernel computes the src index in 64 bits (Z8a), so `last` is bounded only by
+        // src.size(); idx and stride are still passed as 32-bit kernel arguments.
         assert!(
-            last <= u32::MAX as usize,
-            "gather_sample: src index {last} exceeds the kernel's 32-bit index"
+            idx <= u32::MAX as usize && (size == 1 || stride <= u32::MAX as usize),
+            "gather_sample: idx {idx} / stride {stride} exceed the kernel's 32-bit arguments"
         );
         let args = &[
             dst.as_arg(),
