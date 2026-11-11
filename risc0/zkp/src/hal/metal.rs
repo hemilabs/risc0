@@ -51,6 +51,8 @@ mod tests_z4;
 mod tests_z5;
 #[cfg(test)]
 mod tests_z7;
+#[cfg(test)]
+mod tests_z8b;
 
 use std::{
     fmt::Debug,
@@ -78,7 +80,8 @@ pub use self::{
     kernels::MetalKernels,
     poseidon2::{MetalHashPoseidon2, Poseidon2Config, Poseidon2Kernels},
     runtime::{
-        as_bytes, Grid, KernelArg, DEFAULT_BATCH_DISPATCHES, MAX_SET_BYTES, MAX_WORKING_SET_ENV,
+        as_bytes, BudgetScope, Grid, KernelArg, BUDGET_SCOPE_ENV, DEFAULT_BATCH_DISPATCHES,
+        MAX_SET_BYTES, MAX_WORKING_SET_ENV,
     },
 };
 use super::{Buffer as _, Hal};
@@ -204,6 +207,15 @@ pub fn exclusive() -> ReentrantMutexGuard<'static, ()> {
     singleton().lock()
 }
 
+/// Test-only lock for tests that read or change process-wide state (other HALs' pools, the
+/// device-wide allocation total, working-set budgets, the peak counter): plan 8.7. Poison-tolerant,
+/// so one failing test does not fail every later one.
+#[cfg(test)]
+pub(crate) fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The zkp PSOs, built once per process.
 fn zkp_kernels(device: &Device) -> &'static MetalKernels {
     static ONCE: OnceLock<MetalKernels> = OnceLock::new();
@@ -286,10 +298,11 @@ impl MetalHash for MetalHashSha256 {
     }
 
     fn hash_fold(&self, hal: &MetalHal<Self>, io: &BufferImpl<Digest>, output_size: usize) {
+        let n = u32::try_from(output_size).expect("hash_fold: too many outputs");
         let args = &[
             io.as_arg_with_offset(output_size),
             io.as_arg_with_offset(output_size * 2),
-            KernelArg::Integer(output_size as u32),
+            KernelArg::Integer(n),
         ];
         hal.launch("sha_fold", output_size as u64, args);
     }
@@ -301,13 +314,18 @@ impl MetalHash for MetalHashSha256 {
         matrix: &BufferImpl<BabyBearElem>,
     ) {
         let row_size = output.size();
-        let col_size = matrix.size() / output.size();
+        if row_size == 0 {
+            return;
+        }
+        let col_size = matrix.size() / row_size;
         assert_eq!(matrix.size(), col_size * row_size);
+        let rows = u32::try_from(row_size).expect("hash_rows: too many rows");
+        let cols = u32::try_from(col_size).expect("hash_rows: too many columns");
         let args = &[
             output.as_arg(),
             matrix.as_arg(),
-            KernelArg::Integer(row_size as u32),
-            KernelArg::Integer(col_size as u32),
+            KernelArg::Integer(rows),
+            KernelArg::Integer(cols),
         ];
         hal.launch("sha_rows", row_size as u64, args);
     }
@@ -468,6 +486,23 @@ impl<MH: MetalHash> MetalHal<MH> {
     /// `currentAllocatedSize` above it fail early (after draining the pool).
     pub fn set_working_set_limit(&self, bytes: Option<u64>) {
         self.rt.set_working_set_limit(bytes);
+    }
+
+    /// What an explicit budget is checked against ([BUDGET_SCOPE_ENV], default
+    /// [BudgetScope::Device]).
+    pub fn budget_scope(&self) -> BudgetScope {
+        self.rt.budget_scope()
+    }
+
+    /// Override [BUDGET_SCOPE_ENV] for this HAL.
+    pub fn set_budget_scope(&self, scope: BudgetScope) {
+        self.rt.set_budget_scope(scope);
+    }
+
+    /// Bytes this HAL allocated and has not freed (live and pooled shared buffers, plus private
+    /// buffers until the HAL drops): what a [BudgetScope::Hal] budget is checked against.
+    pub fn owned_allocated_size(&self) -> u64 {
+        self.rt.owned_bytes()
     }
 
     /// The device's `currentAllocatedSize` (all Metal memory of this process on the device).
@@ -679,12 +714,13 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
         let count = output.size() / Self::ExtElem::EXT_SIZE;
         assert_eq!(output.size(), count * Self::ExtElem::EXT_SIZE);
         assert_eq!(input.size(), output.size() * FRI_FOLD);
+        let count32 = u32::try_from(count).expect("fri_fold: too many outputs");
         let mix = [*mix];
         let args = &[
             output.as_arg(),
             input.as_arg(),
             KernelArg::Bytes(as_bytes(&mix)),
-            KernelArg::Integer(count as u32),
+            KernelArg::Integer(count32),
         ];
         self.launch("fri_fold", count as u64, args);
     }
@@ -712,12 +748,24 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
     }
 
     fn hash_fold(&self, io: &Self::Buffer<Digest>, input_size: usize, output_size: usize) {
+        // The CPU HAL's checks: the kernels read io[input_size..2 * input_size].
+        assert!(
+            io.size() >= 2 * input_size,
+            "hash_fold: io holds {} digests, input_size {input_size} needs {}",
+            io.size(),
+            2 * input_size
+        );
         assert_eq!(input_size, 2 * output_size);
         self.hash().hash_fold(self, io, output_size);
         self.flush();
     }
 
     fn hash_fold_tree(&self, io: &Self::Buffer<Digest>, layers: usize) {
+        assert!(
+            layers < usize::BITS as usize - 1 && io.size() >= 2 << layers,
+            "hash_fold_tree: {} digests for {layers} layers",
+            io.size()
+        );
         self.hash().hash_fold_tree(self, io, layers);
         self.flush();
     }
@@ -739,6 +787,30 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
         size: usize,
         stride: usize,
     ) {
+        // The CPU HAL panics on these; the kernel reads src[gid * stride + idx] with 32-bit math
+        // and no bounds check.
+        assert!(
+            dst.size() >= size,
+            "gather_sample: dst holds {} elements, size {size}",
+            dst.size()
+        );
+        if size == 0 {
+            return;
+        }
+        let last = (size - 1)
+            .checked_mul(stride)
+            .and_then(|o| o.checked_add(idx))
+            .expect("gather_sample: index overflow");
+        assert!(
+            last < src.size(),
+            "gather_sample: reads src[{last}] of {} elements (idx {idx}, size {size}, stride \
+             {stride})",
+            src.size()
+        );
+        assert!(
+            last <= u32::MAX as usize,
+            "gather_sample: src index {last} exceeds the kernel's 32-bit index"
+        );
         let args = &[
             dst.as_arg(),
             src.as_arg(),

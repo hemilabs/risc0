@@ -30,7 +30,10 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     ffi::{c_char, c_void, CStr},
     mem,
-    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        Arc, Weak,
+    },
 };
 
 use anyhow::{anyhow, Result};
@@ -60,12 +63,68 @@ const POOL_SMALL_BYTES: u64 = 64 << 10;
 /// `4294967296`, `4G`, `4GiB`, `512M` (suffixes are binary: K = 1024). When set, it replaces
 /// `recommendedMaxWorkingSetSize` as the working-set limit (if smaller): `gpu_total_memory` and
 /// `gpu_free_memory` report against it, the pool cap is half of it, and a new allocation that
-/// would bring the device's `currentAllocatedSize` above it fails (after draining the pool once)
-/// with an error naming the budget, instead of running into the OS memory pressure path.
+/// would bring the device's `currentAllocatedSize` (or, with [BUDGET_SCOPE_ENV]`=hal`, this HAL's
+/// own allocations) above it fails (after draining every HAL's pool once; with `hal` scope, this
+/// HAL's pool) with an error naming the budget, instead of running into the OS memory pressure
+/// path.
 pub const MAX_WORKING_SET_ENV: &str = "RISC0_METAL_MAX_WORKING_SET_BYTES";
+
+/// Environment variable choosing what an explicit working-set budget is checked against:
+/// `device` (default): the device's `currentAllocatedSize`, i.e. every Metal allocation of this
+/// process (all HALs, pipelines, libraries) -- the faithful model of a smaller GPU for a whole
+/// prover process; `hal`: only the bytes this HAL allocated (live and pooled shared buffers, plus
+/// its private buffers, which are counted until the HAL is dropped). `hal` makes budget runs of a
+/// test suite independent of the other tests running in parallel (plan 8.7, Z8b).
+pub const BUDGET_SCOPE_ENV: &str = "RISC0_METAL_BUDGET_SCOPE";
+
+/// What an explicit working-set budget is checked against (see [BUDGET_SCOPE_ENV]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BudgetScope {
+    /// The device's `currentAllocatedSize` (default).
+    Device,
+    /// The bytes this HAL allocated.
+    Hal,
+}
+
+fn env_budget_scope() -> BudgetScope {
+    match std::env::var(BUDGET_SCOPE_ENV) {
+        Ok(v) if v.trim().eq_ignore_ascii_case("hal") => BudgetScope::Hal,
+        Ok(v) if v.trim().eq_ignore_ascii_case("device") || v.trim().is_empty() => {
+            BudgetScope::Device
+        }
+        Ok(v) => {
+            tracing::error!("{BUDGET_SCOPE_ENV}={v:?} is not `device` or `hal`; using `device`");
+            BudgetScope::Device
+        }
+        Err(_) => BudgetScope::Device,
+    }
+}
 
 /// Highest `currentAllocatedSize` observed after any Metal allocation in this process.
 static PEAK_ALLOCATED: AtomicU64 = AtomicU64::new(0);
+
+/// Every live runtime's pool. The working-set budget and the allocation-failure retry look at
+/// the device's `currentAllocatedSize`, which counts the buffers idling in *every* HAL's pool, so
+/// they drain all pools, not just the allocating HAL's (Z8b; CUDA's OOM hook drains its single
+/// process-wide pool the same way).
+static POOLS: parking_lot::Mutex<Vec<Weak<Mutex<Pool>>>> = parking_lot::Mutex::new(Vec::new());
+
+/// Drain every live runtime's pool; returns the bytes released. Takes each pool mutex in turn
+/// (never two at once, never the registry lock while holding a pool), so it cannot deadlock with
+/// [Runtime::release] or another drain.
+fn drain_all_pools() -> u64 {
+    let pools: Vec<Arc<Mutex<Pool>>> = {
+        let mut reg = POOLS.lock();
+        reg.retain(|w| w.strong_count() > 0);
+        reg.iter().filter_map(Weak::upgrade).collect()
+    };
+    pools.iter().map(|p| p.lock().drain()).sum()
+}
+
+/// Largest grid extent per dimension: every zkp and circuit kernel indexes with a 32-bit
+/// `thread_position_in_grid` (`uint`), which silently wraps beyond this (Metal accepts the
+/// dispatch; Z8b measured it running a 2^32-thread grid without an error).
+const MAX_GRID_DIM: u64 = u32::MAX as u64;
 
 /// Parse a byte count with an optional binary suffix (`K`, `M`, `G`, `T`, optionally followed by
 /// `iB` or `B`); `None` if malformed or zero.
@@ -219,6 +278,10 @@ struct Pool {
     ready: HashMap<u64, Vec<MtlBuffer>>,
     pending: Vec<(u64, u64, MtlBuffer)>,
     cached_bytes: u64,
+    /// Bytes this runtime allocated and has not freed: live and pooled shared buffers, plus
+    /// private buffers (never subtracted; their drop is not observable). The [BudgetScope::Hal]
+    /// budget is checked against it.
+    owned_bytes: u64,
 }
 
 impl Pool {
@@ -247,6 +310,7 @@ impl Pool {
         self.ready.clear();
         self.pending.clear();
         self.cached_bytes = 0;
+        self.owned_bytes = self.owned_bytes.saturating_sub(bytes);
         bytes
     }
 }
@@ -256,7 +320,7 @@ pub(crate) struct Runtime {
     pub(crate) device: Device,
     pub(crate) queue: CommandQueue,
     state: Mutex<State>,
-    pool: Mutex<Pool>,
+    pool: Arc<Mutex<Pool>>,
     /// Sequence number of the most recently opened batch (0: none yet).
     open_seq: AtomicU64,
     /// Every batch with a sequence number up to this one has completed.
@@ -270,6 +334,8 @@ pub(crate) struct Runtime {
     /// Explicit working-set budget ([MAX_WORKING_SET_ENV] or [Runtime::set_working_set_limit]);
     /// 0 = none (the limit is then `recommended_ws` and is not enforced on allocation).
     budget: AtomicU64,
+    /// [BudgetScope::Hal] if true.
+    hal_scope: AtomicBool,
     pool_cap: AtomicU64,
     /// Test hook: number of upcoming raw allocations to fail.
     #[cfg(test)]
@@ -332,6 +398,12 @@ impl Runtime {
             budget.min(recommended_ws)
         };
         let pool_cap = limit / 2;
+        let pool = Arc::new(Mutex::new(Pool::default()));
+        {
+            let mut reg = POOLS.lock();
+            reg.retain(|w| w.strong_count() > 0);
+            reg.push(Arc::downgrade(&pool));
+        }
         Self {
             device,
             queue,
@@ -339,7 +411,7 @@ impl Runtime {
                 next_seq: 1,
                 ..Default::default()
             }),
-            pool: Mutex::new(Pool::default()),
+            pool,
             open_seq: AtomicU64::new(0),
             completed_seq: AtomicU64::new(0),
             debug: AtomicBool::new(debug),
@@ -348,6 +420,7 @@ impl Runtime {
             max_buffer_len,
             recommended_ws,
             budget: AtomicU64::new(budget),
+            hal_scope: AtomicBool::new(env_budget_scope() == BudgetScope::Hal),
             pool_cap: AtomicU64::new(pool_cap),
             #[cfg(test)]
             fail_allocs: AtomicUsize::new(0),
@@ -392,16 +465,48 @@ impl Runtime {
             .store(self.working_set_limit() / 2, Ordering::Relaxed);
     }
 
+    /// What the explicit budget is checked against.
+    pub(crate) fn budget_scope(&self) -> BudgetScope {
+        if self.hal_scope.load(Ordering::Relaxed) {
+            BudgetScope::Hal
+        } else {
+            BudgetScope::Device
+        }
+    }
+
+    /// Override [BUDGET_SCOPE_ENV] for this runtime.
+    pub(crate) fn set_budget_scope(&self, scope: BudgetScope) {
+        self.hal_scope
+            .store(scope == BudgetScope::Hal, Ordering::Relaxed);
+    }
+
+    /// Bytes this runtime allocated and has not freed (see [Pool::owned_bytes]).
+    pub(crate) fn owned_bytes(&self) -> u64 {
+        self.pool.lock().owned_bytes
+    }
+
+    /// The allocation level the budget is checked against.
+    fn budget_level(&self) -> u64 {
+        match self.budget_scope() {
+            BudgetScope::Device => self.allocated_size(),
+            BudgetScope::Hal => self.owned_bytes(),
+        }
+    }
+
     /// `currentAllocatedSize` of the device (every Metal allocation of this process on it,
     /// including pooled buffers and pipeline/library memory).
     pub(crate) fn allocated_size(&self) -> u64 {
         self.device.current_allocated_size()
     }
 
-    /// Bytes left under the working-set limit.
+    /// Bytes left under the working-set limit (against the budget scope's allocation level when
+    /// a budget is set, else against `currentAllocatedSize`).
     pub(crate) fn free_size(&self) -> u64 {
-        self.working_set_limit()
-            .saturating_sub(self.allocated_size())
+        let level = match self.budget() {
+            Some(_) => self.budget_level(),
+            None => self.allocated_size(),
+        };
+        self.working_set_limit().saturating_sub(level)
     }
 
     /// Highest `currentAllocatedSize` seen after any allocation in this process since the last
@@ -419,26 +524,40 @@ impl Runtime {
         PEAK_ALLOCATED.fetch_max(self.allocated_size(), Ordering::Relaxed);
     }
 
-    /// With an explicit budget: fail early if a new allocation of `bytes` would exceed it. The
-    /// pool (which counts toward `currentAllocatedSize`) is drained once before giving up.
+    /// With an explicit budget: fail early if a new allocation of `bytes` would exceed it. Every
+    /// HAL's pool (all of them count toward the device-wide `currentAllocatedSize`) is drained
+    /// once before giving up.
     fn check_budget(&self, what: &str, bytes: u64) -> Result<()> {
         let Some(budget) = self.budget() else {
             return Ok(());
         };
         let limit = budget.min(self.recommended_ws);
-        if self.allocated_size().saturating_add(bytes) <= limit {
+        if self.budget_level().saturating_add(bytes) <= limit {
             return Ok(());
         }
-        let drained = self.drain_pool();
-        let current = self.allocated_size();
+        let scope = self.budget_scope();
+        let drained = match scope {
+            BudgetScope::Device => drain_all_pools(),
+            BudgetScope::Hal => self.drain_pool(),
+        };
+        let current = self.budget_level();
         if current.saturating_add(bytes) <= limit {
             tracing::debug!("working-set budget: drained {drained} pooled bytes for {what}");
             return Ok(());
         }
+        let level = match scope {
+            BudgetScope::Device => "already allocated on the device",
+            BudgetScope::Hal => "already allocated by this HAL",
+        };
         Err(anyhow!(
             "Metal working-set budget exceeded: allocating {bytes} bytes for {what} with \
-             {current} bytes already allocated would exceed the limit of {limit} bytes \
-             ({MAX_WORKING_SET_ENV}={budget}, recommendedMaxWorkingSetSize={})",
+             {current} bytes {level} would exceed the limit of {limit} bytes \
+             ({MAX_WORKING_SET_ENV}={budget}, {BUDGET_SCOPE_ENV}={}, \
+             recommendedMaxWorkingSetSize={})",
+            match scope {
+                BudgetScope::Device => "device",
+                BudgetScope::Hal => "hal",
+            },
             self.recommended_ws
         ))
     }
@@ -579,6 +698,29 @@ impl Runtime {
             threads_per_group.width * threads_per_group.height * threads_per_group.depth;
         if total == 0 || group_threads == 0 {
             return;
+        }
+        // Thread positions per dimension (groups x threads for dispatch_thread_groups).
+        let extent = |grid: u64, group: u64| {
+            if groups {
+                grid.checked_mul(group)
+            } else {
+                Some(grid)
+            }
+        };
+        for (dim, (g, t)) in [
+            (threads_per_grid.width, threads_per_group.width),
+            (threads_per_grid.height, threads_per_group.height),
+            (threads_per_grid.depth, threads_per_group.depth),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let n = extent(g, t);
+            assert!(
+                n.is_some_and(|n| n <= MAX_GRID_DIM),
+                "grid dimension {dim} of {g} x {t} threads exceeds the 32-bit thread index \
+                 (thread_position_in_grid is uint): split the dispatch"
+            );
         }
         assert!(
             group_threads <= pso.max_total_threads_per_threadgroup(),
@@ -841,15 +983,15 @@ impl Runtime {
         self.check_budget(name, bytes)?;
         let options = MTLResourceOptions::StorageModeShared;
         if let Some(buf) = self.new_buffer_raw(bytes, options) {
-            self.record_peak();
+            self.allocated(bytes);
             return Ok(buf);
         }
-        tracing::warn!("Metal allocation of {bytes} bytes for {name} failed; draining the pool");
-        self.drain_pool();
+        tracing::warn!("Metal allocation of {bytes} bytes for {name} failed; draining the pools");
+        drain_all_pools();
         let buf = self
             .new_buffer_raw(bytes, options)
             .ok_or_else(|| anyhow!("Metal allocation failed on {name}: {bytes} bytes"))?;
-        self.record_peak();
+        self.allocated(bytes);
         Ok(buf)
     }
 
@@ -863,15 +1005,28 @@ impl Runtime {
         let bytes = bytes.max(16);
         self.check_budget("a private buffer", bytes)?;
         if let Some(buf) = self.new_buffer_raw(bytes, options) {
-            self.record_peak();
+            self.allocated(bytes);
             return Ok(buf);
         }
-        self.drain_pool();
+        drain_all_pools();
         let buf = self
             .new_buffer_raw(bytes, options)
             .ok_or_else(|| anyhow!("Metal private allocation failed: {bytes} bytes"))?;
-        self.record_peak();
+        self.allocated(bytes);
         Ok(buf)
+    }
+
+    /// Book-keeping after a new allocation of `bytes`.
+    fn allocated(&self, bytes: u64) {
+        self.pool.lock().owned_bytes += bytes;
+        self.record_peak();
+    }
+
+    /// A shared buffer of `bytes` this runtime allocated was freed without going to the pool
+    /// (`set_bypass_pool`).
+    pub(crate) fn freed(&self, bytes: u64) {
+        let mut pool = self.pool.lock();
+        pool.owned_bytes = pool.owned_bytes.saturating_sub(bytes);
     }
 
     /// Return a dropped buffer. Never blocks on GPU work and never takes the state mutex.
@@ -882,6 +1037,8 @@ impl Runtime {
         if bytes >= POOL_SMALL_BYTES
             && pool.cached_bytes + bytes > self.pool_cap.load(Ordering::Relaxed)
         {
+            // Freed (the command buffers that use it keep their own reference).
+            pool.owned_bytes = pool.owned_bytes.saturating_sub(bytes);
             return;
         }
         pool.cached_bytes += bytes;
@@ -892,7 +1049,8 @@ impl Runtime {
         }
     }
 
-    /// Release every pooled buffer; returns the bytes released.
+    /// Release every buffer pooled by this runtime (`trim_device_memory`); returns the bytes
+    /// released. Budget and allocation failures use [drain_all_pools] instead.
     pub(crate) fn drain_pool(&self) -> u64 {
         self.pool.lock().drain()
     }

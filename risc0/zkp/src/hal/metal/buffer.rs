@@ -63,7 +63,10 @@ impl Drop for RawBuffer {
         tracker().lock().unwrap().free(self.bytes as usize);
         // SAFETY: `buf` is not used again after this point.
         let buf = unsafe { ManuallyDrop::take(&mut self.buf) };
-        if !self.bypass_pool.load(Ordering::Relaxed) {
+        if self.bypass_pool.load(Ordering::Relaxed) {
+            drop(buf);
+            self.rt.freed(self.bytes);
+        } else {
             self.rt.release(self.bytes, buf);
         }
     }
@@ -145,8 +148,15 @@ impl<T> BufferImpl<T> {
         }
     }
 
-    /// A kernel argument `off` elements past the start of this view.
+    /// A kernel argument `off` elements past the start of this view (`off <= size`; binding at
+    /// the end is allowed, past it panics: the kernel would get an out-of-bounds pointer).
     pub fn as_arg_with_offset(&self, off: usize) -> KernelArg<'_> {
+        assert!(
+            off <= self.size,
+            "as_arg_with_offset({off}) past the end of '{}' ({} elements)",
+            self.raw.name,
+            self.size
+        );
         KernelArg::Buffer {
             buffer: &self.raw.buf,
             offset: ((self.offset + off) * mem::size_of::<T>()) as u64,
@@ -176,8 +186,14 @@ impl<T> BufferImpl<T> {
         self.raw.buf.gpu_address() + self.byte_offset()
     }
 
-    /// GPU virtual address `off` elements past the start of this view.
+    /// GPU virtual address `off` elements past the start of this view (`off <= size`).
     pub fn gpu_address_at(&self, off: usize) -> u64 {
+        assert!(
+            off <= self.size,
+            "gpu_address_at({off}) past the end of '{}' ({} elements)",
+            self.raw.name,
+            self.size
+        );
         self.raw.buf.gpu_address() + ((self.offset + off) * mem::size_of::<T>()) as u64
     }
 
