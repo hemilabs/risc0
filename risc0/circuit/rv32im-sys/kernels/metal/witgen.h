@@ -53,7 +53,13 @@
 #include "ef_fp.h"
 #include "ef_fpext.h"
 #include "fp.h"
+// R17: a TU may substitute its own copy of fpext.h (witgen_tu.metal: witgen_fpext.h, the shared
+// header with its 4-element loops unrolled; kernels/cuda/witgen_tu_gen.py gen_fpext).
+#ifdef RV32IM_FPEXT_HEADER
+#include RV32IM_FPEXT_HEADER
+#else
 #include "fpext.h"
+#endif
 #include "preflight.h"
 #include "tables.h"
 
@@ -237,10 +243,16 @@ inline void setGlobal(thread ExecContext& ctx, thread BufferObj* buf, size_t off
   buf->storeGlobal(offset, val);
 }
 
+// storeExt / loadExt are straight-line (R17): a loop over a private 4-element array whose body
+// calls an out-of-line function is the code shape in which the Apple GPU loses a store
+// (docs/metal-port/notes/R17.md). Same loads and stores, in the same order.
+static_assert(EXT_SIZE == 4, "storeExt/loadExt are unrolled for 4 elements");
+
 inline void storeExt(thread ExecContext& ctx, BoundLayout<Reg> reg, ExtVal val) {
-  for (uint32_t i = 0; i < EXT_SIZE; i++) {
-    reg.buf->store(ctx, reg.layout.col + i, val.elems[i]);
-  }
+  reg.buf->store(ctx, reg.layout.col + 0, val.elems[0]);
+  reg.buf->store(ctx, reg.layout.col + 1, val.elems[1]);
+  reg.buf->store(ctx, reg.layout.col + 2, val.elems[2]);
+  reg.buf->store(ctx, reg.layout.col + 3, val.elems[3]);
 }
 
 inline Val load(thread ExecContext& ctx, BoundLayout<Reg> reg, size_t back) {
@@ -248,11 +260,11 @@ inline Val load(thread ExecContext& ctx, BoundLayout<Reg> reg, size_t back) {
 }
 
 inline ExtVal loadExt(thread ExecContext& ctx, BoundLayout<Reg> reg, size_t back) {
-  Fp elems[EXT_SIZE];
-  for (uint32_t i = 0; i < EXT_SIZE; i++) {
-    elems[i] = reg.buf->load(ctx, reg.layout.col + i, back);
-  }
-  return FpExt(elems[0], elems[1], elems[2], elems[3]);
+  Fp e0 = reg.buf->load(ctx, reg.layout.col + 0, back);
+  Fp e1 = reg.buf->load(ctx, reg.layout.col + 1, back);
+  Fp e2 = reg.buf->load(ctx, reg.layout.col + 2, back);
+  Fp e3 = reg.buf->load(ctx, reg.layout.col + 3, back);
+  return FpExt(e0, e1, e2, e3);
 }
 
 /// CUDA casts to MutableBufObj: a mutable load whatever the kind.
@@ -269,7 +281,10 @@ inline Val getGlobal(thread ExecContext& ctx, thread BufferObj* buf, size_t offs
 #define STORE(reg, val) store(ctx, reg, val)
 #define STORE_EXT(reg, val) storeExt(ctx, reg, val)
 
-// Map + reduce support
+// Map + reduce support. A TU that lowers map()/reduce() itself defines RV32IM_NO_MAP_TEMPLATES
+// (witgen_tu.metal, R17: these loops are the lost-store shape when f is out of line), so a call
+// that slipped through fails to compile instead.
+#ifndef RV32IM_NO_MAP_TEMPLATES
 template <typename T1, typename F, size_t N> inline auto map(::cuda::std::array<T1, N> a, F f) {
   ::cuda::std::array<decltype(f(a[0])), N> out;
   for (size_t i = 0; i < N; i++) {
@@ -314,6 +329,7 @@ reduce(::cuda::std::array<T1, N> elems, T2 start, thread const BoundLayout<T3>& 
   }
   return cur;
 }
+#endif // RV32IM_NO_MAP_TEMPLATES
 
 // All the extern handling (definitions live in the TU that runs the step functions).
 #define INVOKE_EXTERN(ctx, name, ...) extern_##name(ctx, ##__VA_ARGS__)

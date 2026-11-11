@@ -30,7 +30,13 @@
 /// GPUs, kept selectable for the R15 A/B per plan 2.4).
 
 #include "ef_fp.h"
+// R17: a TU may substitute its own copy of fpext.h (witgen_tu.metal: witgen_fpext.h, the shared
+// header with its 4-element loops unrolled; kernels/cuda/witgen_tu_gen.py gen_fpext).
+#ifdef RV32IM_FPEXT_HEADER
+#include RV32IM_FPEXT_HEADER
+#else
 #include "fpext.h"
+#endif
 
 /// Exact sum x0*y0 + x1*y1 + x2*y2 + x3*y3 of canonical raw words, reduced to an Fp.
 inline Fp ef_redc4(uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1,
