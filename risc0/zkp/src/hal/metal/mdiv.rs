@@ -199,8 +199,12 @@ pub(crate) fn mdiv_plan(
         scratch_len <= u32::MAX as usize,
         "mdiv scratch of {scratch_len} elements"
     );
+    // Two jobs on one slice would run concurrently on the same elements (a race, silently wrong
+    // results); the host loop asserts the same (Z8a).
+    let mut seen = std::collections::HashSet::with_capacity(active.len());
     for &c in &active {
         let idx = chunks[c].0;
+        assert!(seen.insert(idx), "combos_divide: combo {idx} listed twice");
         assert!(
             (idx + 1) * n <= combos_len && (idx + 1) * n <= u32::MAX as usize,
             "combos_divide: combo {idx} of {n} elements is outside the {combos_len}-element buffer"
@@ -399,6 +403,8 @@ impl<MH: MetalHash> MetalHal<MH> {
         plan: &MdPlan,
     ) {
         for step in &plan.steps {
+            let pso = self.pipeline(&step.kernel);
+            super::kernels::assert_simd_width(pso, &step.kernel);
             let jobs = [step.jobs];
             let mut args = vec![
                 combos.as_arg(),
@@ -409,7 +415,7 @@ impl<MH: MetalHash> MetalHal<MH> {
                 args.push(KernelArg::Integer(nj));
             }
             self.dispatch(
-                self.pipeline(&step.kernel),
+                pso,
                 &args,
                 Grid::Groups {
                     groups: step.groups,
@@ -418,5 +424,47 @@ impl<MH: MetalHash> MetalHal<MH> {
                 &[],
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_z8a {
+    //! Z8a review regressions for the mdiv host side.
+    use risc0_core::field::{baby_bear::BabyBearExtElem, Elem as _};
+
+    use super::*;
+    use crate::hal::{metal::MetalHalSha256, Hal};
+
+    fn root(k: u32) -> BabyBearExtElem {
+        BabyBearExtElem::from_u32_words(&[k, 2 * k + 1, 3, 4])
+    }
+
+    /// A combo listed twice used to become two concurrent jobs on the same slice (a race with
+    /// silently wrong output); the host loop already rejected it. Both paths now panic alike.
+    #[test]
+    #[should_panic(expected = "combos_divide: combo 1 listed twice")]
+    fn plan_rejects_duplicate_combo() {
+        let n = 1 << 13;
+        let chunks = vec![(0, vec![root(1)]), (1, vec![root(2)]), (1, vec![root(3)])];
+        mdiv_plan(mdiv_shape(n, 8).unwrap(), 3 * n, n, &chunks);
+    }
+
+    #[test]
+    #[should_panic(expected = "combos_divide: combo 0 listed twice")]
+    fn gpu_path_rejects_duplicate_combo() {
+        let n = 1 << 13;
+        let hal = MetalHalSha256::new();
+        let combos = hal.alloc_extelem_zeroed("combos", 2 * n);
+        let chunks = vec![(0, vec![root(1)]), (0, vec![root(2)])];
+        hal.mdiv_combos_divide_with(&combos, &chunks, n, mdiv_shape(n, 8));
+    }
+
+    /// The host fallback keeps its own check (same message).
+    #[test]
+    #[should_panic(expected = "combos_divide: combo 0 listed twice")]
+    fn host_path_rejects_duplicate_combo() {
+        let n = 1 << 5;
+        let mut combos = vec![BabyBearExtElem::ZERO; 2 * n];
+        host_combos_divide(&mut combos, &[(0, vec![root(1)]), (0, vec![root(2)])], n);
     }
 }

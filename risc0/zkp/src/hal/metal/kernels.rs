@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 
 use anyhow::{anyhow, Context, Result};
-use metal::{ComputePipelineState, DeviceRef, Library};
+use metal::{ComputePipelineState, ComputePipelineStateRef, DeviceRef, Library};
 
 /// A loaded metallib with a PSO built for every requested kernel name.
 pub struct MetalKernels {
@@ -80,4 +80,20 @@ impl MetalKernels {
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.pipelines.keys().map(String::as_str)
     }
+}
+
+/// SIMD-group width the cross-lane code of the zkp kernels is written for: the NTT butterflies
+/// (`simd_shuffle_xor` up to lane mask 16, 8-lane transposes), the mdiv scans and the eu2
+/// reductions (`simd_shuffle_down` over 32 lanes, `t & 31` / `t >> 5` lane/warp split), exactly as
+/// CUDA's 32-wide warps. Every Apple GPU has 32-wide SIMD groups; a PSO reporting another
+/// `threadExecutionWidth` would compute wrong results silently, so this is checked (Z8a).
+pub(crate) const SIMD_WIDTH: u64 = 32;
+
+/// Panics if `pso` (kernel `name`) does not run in [SIMD_WIDTH]-wide SIMD groups.
+pub(crate) fn assert_simd_width(pso: &ComputePipelineStateRef, name: &str) {
+    let width = pso.thread_execution_width();
+    assert_eq!(
+        width, SIMD_WIDTH,
+        "Metal kernel {name}: threadExecutionWidth {width}, the kernel assumes {SIMD_WIDTH}"
+    );
 }

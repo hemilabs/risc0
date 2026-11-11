@@ -118,11 +118,14 @@ kernel void fill_u32(device uint32_t* out,
 }
 
 // dst[gid] = src[gid * stride + idx], one thread per output (MetalHal::gather_sample launches
-// exactly `size` threads).
+// exactly `size` threads with dispatch_threads, so no thread runs past `size`). The source index
+// is computed in 64 bits (Z8a): CUDA's 32-bit `gid * stride + idx` wraps once the source matrix
+// passes 2^32 elements (16 GiB), which a Metal buffer can (max_buffer_length is ~22 GiB on 36 GB
+// machines).
 kernel void gather_sample(device Fp* dst,
                           const device Fp* src,
                           constant uint32_t& idx,
                           constant uint32_t& stride,
                           uint gid [[thread_position_in_grid]]) {
-  dst[gid] = src[gid * stride + idx];
+  dst[gid] = src[ulong(gid) * stride + idx];
 }

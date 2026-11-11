@@ -59,8 +59,9 @@ kernel void eltwise_sum_fpext(device Fp* out,
     return;
   }
   FpExt tot;
+  // 64-bit input index, as CUDA (`size_t i`): count * to_add FpExt may exceed 2^32 elements.
   for (uint32_t i = 0; i < to_add; i++) {
-    tot += in[count * i + gid];
+    tot += in[ulong(count) * i + gid];
   }
   out[gid + 0 * count] = tot.elems[0];
   out[gid + 1 * count] = tot.elems[1];

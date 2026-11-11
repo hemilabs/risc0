@@ -326,9 +326,14 @@ ct_x(const device Fp* in0 [[buffer(0)]],
   rotw = (rotw >> 1) | (rotw << (iterations - 1));
   idx1 = (idx1 & ~mask) | (rotw & mask);
 
-  // V3 barrier fix: WAR on the exchange buffer before the transpose.
+  // V3 barrier fix: WAR on the exchange buffer before the transpose. With iterations <= 6 the
+  // only earlier use of the exchange buffer is the load transpose of the same 8-lane group, whose
+  // row reads by one lane overlap the column writes of the others: a simdgroup barrier orders
+  // them (Z8a; CUDA relies on warp lockstep here, the shuffles in between are not barriers).
   if (COALESCED && iterations > 6) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
+  } else if (COALESCED) {
+    simdgroup_barrier(mem_flags::mem_threadgroup);
   }
   if (COALESCED) {
     transpose<Z>(r0, sh, tx);
@@ -473,9 +478,14 @@ gs_x(const device Fp* in0 [[buffer(0)]],
   rotw = (rotw << 1) | (rotw >> (iterations - 1));
   idx1 = (idx1 & ~mask) | (rotw & mask);
 
-  // V3 barrier fix: WAR on the exchange buffer before the transpose.
+  // V3 barrier fix: WAR on the exchange buffer before the transpose. With iterations <= 6 the
+  // only earlier use of the exchange buffer is the load transpose of the same 8-lane group, whose
+  // row reads by one lane overlap the column writes of the others: a simdgroup barrier orders
+  // them (Z8a; CUDA relies on warp lockstep here, the shuffles in between are not barriers).
   if (COALESCED && iterations > 6) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
+  } else if (COALESCED) {
+    simdgroup_barrier(mem_flags::mem_threadgroup);
   }
   if (COALESCED) {
     transpose<Z>(r0, sh, tx);
