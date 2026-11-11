@@ -264,9 +264,6 @@ namespace rv32im_metal {
 constant constexpr uint32_t kUserAccumSplitA = kLayout_TopAccum.columns.elems[0].col;
 } // namespace rv32im_metal
 
-#ifndef RV32IM_FAULT_ACCUM_PERM
-#define RV32IM_FAULT_ACCUM_PERM 0x20u // stepAccumA: perm[i] >= count (that row is skipped)
-#endif
 
 /// POD params (set_bytes); #[repr(C)] mirror on the Rust side, size asserted on both sides.
 struct AccumParams {
@@ -314,6 +311,7 @@ kernel void stepAccumA(device Fp* data [[buffer(0)]],
   // read (CUDA binds them anyway). C2M_ASSERT writes tables.bad.
   PreflightTrace preflight;
   preflight.cycles = nullptr;
+  preflight.cyclesLen = 0;
   preflight.txns = nullptr;
   preflight.bigintBytes = nullptr;
   preflight.txnsLen = 0;

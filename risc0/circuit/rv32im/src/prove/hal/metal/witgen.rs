@@ -38,13 +38,18 @@
 //! `pre_data == data`, saving `rows * 211 * 4` bytes). A separate `pre_data` from the prover
 //! (`RISC0_USE_PRE_DATA`) already holds the scattered rows and cycle columns and is bound as is.
 //!
-//! **The GPU path is opt-in** (`RISC0_METAL_RV32IM_GPU_PHASES` containing `witgen`). By default,
-//! and whenever `RISC0_METAL_RV32IM_CPU_PHASES` contains `witgen` (which wins), witgen runs the CPU
-//! kernel over host views of the shared buffers (R7's delegation), with the CPU HAL's flags. The
-//! generated witgen kernels give wrong results on identical inputs from time to time, even
-//! single-threaded (`fwd_stepExec`), so a proof made with them can fail verification
-//! (docs/metal-port/notes/R8.md, "Kernel nondeterminism"). Enable the GPU path only to work on
-//! that issue (`witgen_segment_file` reproduces it).
+//! **The GPU path is the default** (again since R17). `RISC0_METAL_RV32IM_CPU_PHASES` containing
+//! `witgen` is the kill switch: witgen then runs the CPU kernel over host views of the shared
+//! buffers (R7's delegation), with the CPU HAL's flags. `RISC0_METAL_RV32IM_GPU_PHASES=witgen`, the
+//! opt-in of R8-R16, is still accepted and changes nothing.
+//!
+//! From R8 to R16 the GPU path was opt-in: the generated kernel gave wrong witnesses on identical
+//! inputs from time to time (notes/R8.md, R11.md). R17 traced that to the Apple GPU losing a
+//! private-array store in the code shape of CUDA's `map()` lowering (a default-constructed array
+//! written in a loop that calls a noinline function). `witgen_tu_gen.py` now unrolls every
+//! map/reduce and refuses any loop in the call graph (docs/metal-port/notes/R17.md: mechanism,
+//! gate, and how to re-verify after a macOS or Metal toolchain update with
+//! `witgen_segment_file`, `RISC0_METAL_WITGEN_PERM=sorted` and a `--map-lowering loop` baseline).
 
 use std::sync::LazyLock;
 
@@ -115,8 +120,8 @@ const _: () = assert!(std::mem::size_of::<InjectParams>() == 32);
 /// `RV32IM_SEQ_CHUNK` (seq_exec.h): positions per sequential dispatch.
 pub(crate) const SEQ_CHUNK: u32 = 4096;
 
-/// Fault bits of the witgen kernels (`cuda_compat.h` `RV32IM_FAULT_*`, plus
-/// `RV32IM_FAULT_CYCLE_INDEX` from the generated TU).
+/// Fault bits of the witgen kernels (`cuda_compat.h` `RV32IM_FAULT_*`; 0x40 is accum's
+/// `RV32IM_FAULT_ACCUM_PERM`, never set by witgen).
 const FAULT_BITS: &[(u32, &str)] = &[
     (0x1, "lookup into an unknown table"),
     (0x2, "lookup index out of range"),
@@ -124,6 +129,7 @@ const FAULT_BITS: &[(u32, &str)] = &[
     (0x8, "bigint byte index out of range"),
     (0x10, "assertion failed"),
     (0x20, "cycle index out of range"),
+    (0x80, "getDiffCount cycle out of range"),
 ];
 
 pub(crate) fn describe_fault(fault: u32) -> String {
@@ -132,7 +138,7 @@ pub(crate) fn describe_fault(fault: u32) -> String {
         .filter(|(bit, _)| fault & bit != 0)
         .map(|(_, what)| *what)
         .collect();
-    if fault & !0x3f != 0 {
+    if fault & !FAULT_BITS.iter().fold(0, |m, (bit, _)| m | bit) != 0 {
         parts.push("unknown bits");
     }
     format!("{fault:#x} ({})", parts.join(", "))
@@ -156,29 +162,9 @@ pub(crate) fn cpu_phase(phase: &str) -> bool {
     super::cpu_phase(phase)
 }
 
-/// Whether `RISC0_METAL_RV32IM_GPU_PHASES` (comma list of `witgen,accum,eval`) names `phase`: an
-/// opt-in for a phase whose Metal kernels are not trusted yet.
-pub(crate) fn gpu_phase(phase: &str) -> bool {
-    std::env::var("RISC0_METAL_RV32IM_GPU_PHASES").is_ok_and(|v| super::phase_listed(&v, phase))
-}
-
-/// Witgen runs the CPU kernel: the default until the Metal witgen kernels are deterministic
-/// (module doc); `RISC0_METAL_RV32IM_GPU_PHASES=witgen` opts in to the GPU path,
-/// `RISC0_METAL_RV32IM_CPU_PHASES=witgen` forces the CPU. Read once per process.
-///
-/// The opt-in is a debug/development switch only: the GPU witgen kernel is wrong on most po2 20
-/// segments of real guests (notes/R11.md, "GPU witgen nondeterminism"), so it logs a warning.
-static CPU_WITGEN: LazyLock<bool> = LazyLock::new(|| {
-    let cpu = cpu_phase("witgen") || !gpu_phase("witgen");
-    if !cpu {
-        tracing::warn!(
-            "RISC0_METAL_RV32IM_GPU_PHASES=witgen: the rv32im Metal witgen kernel is NOT \
-             bit-exact (wrong witnesses / kernel faults on many po2 >= 20 segments, \
-             docs/metal-port/notes/R11.md); use it for debugging only"
-        );
-    }
-    cpu
-});
+/// Witgen runs the CPU kernel: only when `RISC0_METAL_RV32IM_CPU_PHASES` names `witgen` (the kill
+/// switch; the GPU kernel is the default, module doc). Read once per process.
+static CPU_WITGEN: LazyLock<bool> = LazyLock::new(|| cpu_phase("witgen"));
 
 /// The effective [CPU_WITGEN] (logged by `segment_prover`).
 pub(crate) fn cpu_witgen() -> bool {
@@ -426,11 +412,25 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
         };
 
         let last_cycle = cycles as u32;
+        let mut perm_bufs = Vec::new();
         match mode {
             StepMode::Parallel => {
                 // CUDA: par_stepExec over [0, split), then [split, lastCycle).
                 let pso = ctx.pipeline("par_stepExecW");
                 for (start, count) in [(0, split), (split, last_cycle - split)] {
+                    // Tests only: a launch order other than start + i (`test_perm`).
+                    if let Some(p) = test_perm(preflight, start, count) {
+                        let params = WitgenParams {
+                            start,
+                            count: p.len() as u32,
+                            use_perm: 1,
+                            ..base
+                        };
+                        let pb = hal.copy_from_u32("witgen_perm", &p);
+                        encode(pso, &params, arg(bind(&pb)), Grid::Threads(p.len() as u64))?;
+                        perm_bufs.push(pb);
+                        continue;
+                    }
                     let params = WitgenParams {
                         start,
                         count,
@@ -469,6 +469,7 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
 
         // Phase end: wait, then the fault word.
         hal.try_sync()?;
+        drop(perm_bufs);
         drop(snapshot);
         // SAFETY: synced above; nothing using `fault` is encoded.
         let fault = unsafe { host_slice(&fault) }[0];
@@ -534,6 +535,19 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
             risc0_circuit_rv32im_cpu_witgen(mode as u32, &buffers, &preflight, cycles as u32)
         })
     }
+}
+
+/// The cycles of a parallel launch `[start, start + count)` in the order `par_stepExecW` runs
+/// them (`WitgenParams::usePerm`), or `None` for `start + i`. Production always runs `start + i`;
+/// tests can pick another order (`tests::launch_perm`, e.g. the R17 `sorted` amplifier).
+#[cfg(test)]
+fn test_perm(preflight: &PreflightTrace, start: u32, count: u32) -> Option<Vec<u32>> {
+    tests::launch_perm(preflight, start, count)
+}
+
+#[cfg(not(test))]
+fn test_perm(_: &PreflightTrace, _: u32, _: u32) -> Option<Vec<u32>> {
+    None
 }
 
 #[cfg(test)]

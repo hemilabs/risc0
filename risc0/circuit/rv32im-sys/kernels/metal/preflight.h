@@ -80,6 +80,7 @@ struct PreflightTrace {
   uint32_t txnsLen;
   uint32_t bigintBytesLen;
   uint32_t tableSplitCycle;
+  uint32_t cyclesLen; // entries in cycles (getDiffCount's clamp; Metal only, not in CUDA)
 };
 
 } // namespace rv32im_metal

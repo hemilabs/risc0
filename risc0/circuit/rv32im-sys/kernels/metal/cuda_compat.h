@@ -67,6 +67,11 @@ inline rv32im_index_t rv32im_cell(uint row, uint col, uint rows) {
 #define RV32IM_FAULT_TXN_INDEX 0x4u     // memory transaction index out of range (clamped)
 #define RV32IM_FAULT_BIGINT_INDEX 0x8u  // bigint byte index out of range (clamped)
 #define RV32IM_FAULT_ASSERT 0x10u       // translated CUDA assert() failed (C2M_ASSERT)
+// Kernel-specific bits, one value each so a bit means the same thing in every phase (R17; each
+// phase still has its own fault word and decoder: witgen.rs FAULT_BITS, accum.rs).
+#define RV32IM_FAULT_CYCLE_INDEX 0x20u      // witgen: cycle outside the preflight / data rows (skipped)
+#define RV32IM_FAULT_ACCUM_PERM 0x40u       // stepAccumA: perm[i] >= count (that row is skipped)
+#define RV32IM_FAULT_DIFF_COUNT_INDEX 0x80u // witgen getDiffCount: cycle past the preflight (0)
 
 // ---------------------------------------------------------------------------------------------
 // Layout asserts for structs shared with Rust (`offsetof` is not a macro in MSL).

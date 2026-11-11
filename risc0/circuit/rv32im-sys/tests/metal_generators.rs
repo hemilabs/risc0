@@ -117,8 +117,55 @@ fn generator_ci_checks() {
     );
     // to_metal.py's pin is checked in this mode too (TO_METAL_EXPECT).
     run_ok(&["kernels/cuda/evalfast/regen.py", "--check"]);
-    // R17 owns witgen_tu_gen.py; its --check covers witgen_tu.cu only (see the R16 note).
-    run_ok(&["kernels/cuda/witgen_tu_gen.py", "--check"]);
+    // R17: witgen_tu_gen.py --check also translates --metal in memory (pins, no-loop check).
+    let log = run_ok(&["kernels/cuda/witgen_tu_gen.py", "--check"]);
+    assert!(
+        log.contains("--metal translates") && log.contains("map lowering unroll"),
+        "{log}"
+    );
+}
+
+/// `witgen_tu_gen.py --check` fails when the Metal translation no longer matches PINNED_METAL,
+/// and the translation refuses a loop in the call graph (R17: the shape of the Apple GPU
+/// lost-store defect, notes/R17.md), whatever the pins say.
+#[test]
+fn witgen_check_detects_pin_mismatch_and_loops() {
+    let script = r#"
+import sys
+sys.dont_write_bytecode = True
+sys.path.insert(0, 'kernels/cuda')
+import witgen_tu_gen as g
+import cuda2metal as c2m
+g.gen_metal()
+g.gen_metal(map_lowering='loop')
+g.PINNED_METAL['counts']['lambda.map.unroll'] += 1
+try:
+    g.main_cuda(True)
+except SystemExit as e:
+    assert e.code not in (None, 0), e.code
+    print('pin mismatch rejected')
+else:
+    raise AssertionError('--check accepted a changed pin')
+g.PINNED_METAL['counts']['lambda.map.unroll'] -= 1
+orig = c2m.translate
+def with_loop(*a, **k):
+    t, c = orig(*a, **k)
+    i = t.rindex('} // namespace rv32im_metal')
+    return t[:i] + 'static void c2m_extra() { for (uint i = 0; i < 2; i++) {} }\n' + t[i:], c
+c2m.translate = with_loop
+try:
+    g.gen_metal(no_pin=True)
+except c2m.TranslateError as e:
+    assert 'loop' in str(e), e
+    print('loop rejected')
+else:
+    raise AssertionError('a loop in the call graph was accepted')
+"#;
+    let log = run_ok(&["-c", script]);
+    assert!(
+        log.contains("pin mismatch rejected") && log.contains("loop rejected"),
+        "{log}"
+    );
 }
 
 /// `accum_tu_gen.py --check` fails when the Metal translation no longer matches PINNED_METAL

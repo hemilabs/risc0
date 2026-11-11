@@ -14,7 +14,7 @@
 # limitations under the License.
 
 # usage: witgen_tu_gen.py [--check]
-#        witgen_tu_gen.py --metal -o OUTDIR [--check]
+#        witgen_tu_gen.py --metal -o OUTDIR [--check] [--no-pin] [--map-lowering unroll|loop]
 #
 # Writes witgen_tu.cu (CUDA only; build.rs compiles it as a whole-program TU, not
 # -dc): the step_Top call graph of steps.cu renamed (_W suffix) and marked
@@ -29,7 +29,9 @@
 # cannot move those loads either.
 #
 # Re-run it after regenerating steps.cu or changing the copied parts of ffi.cu;
-# --check (run in CI) fails if witgen_tu.cu is out of date.
+# --check (run in CI) fails if witgen_tu.cu is out of date, or if the Metal translation
+# (gen_metal(), in memory, no toolchain needed) fails or its rewrite counts differ from
+# PINNED_METAL.
 #
 # --metal (Metal port, item R5): writes OUTDIR/witgen_tu.metal instead (rv32im-sys/build.rs runs
 # it into $OUT_DIR/metal on every metal build; the output is never checked in). The same call
@@ -41,6 +43,15 @@
 # the chunked single-thread fwd_stepExec / rev_stepExec (seq_exec.h). An unchanged output file
 # is not rewritten (build.rs: a new mtime would rerun the build script). With --check it only
 # compares.
+#
+# map()/reduce() are unrolled in the Metal TU (R17, MAP_LOWERING): one block per element, values
+# in scalars, the result array brace-initialized. CUDA's lowering -- a default-constructed array
+# written element by element in a loop that calls a noinline step function -- is the code shape
+# in which the Apple GPU (M5 Max, macOS 27.2) loses the last iteration's store and the array
+# reads back its constructor value (docs/metal-port/notes/R17.md: ToBits<5>'s bit 4 in DynPo2,
+# ~1-200 wrong rows per po2 20 segment). The Metal call graph must not contain any loop
+# (gen_metal() refuses one); `--map-lowering loop` emits the old shape, only to build a
+# same-session baseline that still shows the defect (R17.md, "Re-verifying").
 import os, re, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -145,7 +156,9 @@ PINNED_METAL = {
         'aspace.thread': 388,
         'assert': 41,
         'lambda.map': 41,
+        'lambda.map.unroll': 41,
         'lambda.reduce': 1,
+        'lambda.reduce.unroll': 1,
         'qual.device_fn': 388,
         'qual.noinline': 388,
         'sbind': 6,
@@ -156,11 +169,21 @@ PINNED_METAL = {
 # METAL_EXTERNS below is a hand port of it; when ffi.cu changes there, re-port and update this.
 FFI_EXTERN_SHA256 = '2f7c235c64764221bafb61042fd535c4cec37405772e13af28a7b5ff7a7cf1c9'
 
+# How the call graph's map()/reduce() sites are lowered (cuda2metal.py `map_lowering`): 'unroll'
+# (the default, R17) or 'loop' (CUDA's shape, which the Apple GPU miscompiles/misexecutes; only
+# for a baseline build). See the header comment.
+MAP_LOWERINGS = ('unroll', 'loop')
+# A `for`/`while`/`do` statement in the translated call graph (not the externs or kernels).
+_GRAPH_LOOP_RE = re.compile(r'\b(for|while|do)\s*[({]')
 
 
-def gen_metal(no_pin=False):
+
+def gen_metal(no_pin=False, map_lowering='unroll'):
     import hashlib
     import cuda2metal as c2m
+    if map_lowering not in MAP_LOWERINGS:
+        raise c2m.TranslateError('unknown map lowering %r (%s)'
+                                 % (map_lowering, ' | '.join(MAP_LOWERINGS)))
     ext_sha = hashlib.sha256(ffi[e0:e1].encode()).hexdigest()
     if ext_sha != FFI_EXTERN_SHA256:
         raise c2m.TranslateError(
@@ -179,7 +202,7 @@ def gen_metal(no_pin=False):
                      ['} // namespace risc0::circuit::rv32im_v2::cuda', ''])
     typedefs = c2m.collect_array_typedefs(c2m.read(os.path.join(HERE, 'types.cuh.inc')))
     passes = tuple(p for p in c2m.ALL_PASSES if p not in ('kernel', 'accum_guard'))
-    text, counts = c2m.translate(cuda, typedefs, passes=passes)
+    text, counts = c2m.translate(cuda, typedefs, passes=passes, map_lowering=map_lowering)
     # The attribute becomes WITGEN_TU_FNATTR (default noinline; see the TU header).
     text, nattr = re.subn(r'(?m)^static __attribute__\(\(noinline\)\) ', 'static WITGEN_TU_FNATTR ',
                           text)
@@ -190,11 +213,14 @@ def gen_metal(no_pin=False):
     if nattr != PINNED_METAL['fnattr'] or text.count('__attribute__((noinline))'):
         bad.append('fnattr: pinned %d, got %d (+%d left)'
                    % (PINNED_METAL['fnattr'], nattr, text.count('__attribute__((noinline))')))
-    want = PINNED_METAL['counts']
+    want = dict(PINNED_METAL['counts'])
+    if map_lowering == 'loop':
+        want = {k: v for k, v in want.items() if not k.endswith('.unroll')}
     for k in sorted(set(want) | set(got)):
         if want.get(k, 0) != got.get(k, 0):
             bad.append('%s: pinned %d, got %d' % (k, want.get(k, 0), got.get(k, 0)))
-    report = 'functions=%d, fnattr=%d, %s' % (len(names), nattr, c2m.fmt_counts(got))
+    report = 'functions=%d, fnattr=%d, %s, map lowering %s' % (len(names), nattr,
+                                                               c2m.fmt_counts(got), map_lowering)
     if bad and not no_pin:
         raise c2m.TranslateError('rewrite counts differ from PINNED_METAL (steps.cu changed '
                                  'shape; re-run with --no-pin and review):\n  ' + '\n  '.join(bad)
@@ -202,6 +228,15 @@ def gen_metal(no_pin=False):
     ns0 = text.index('namespace %s {' % c2m.METAL_NS) + len('namespace %s {' % c2m.METAL_NS)
     ns1 = text.rindex('} // namespace %s' % c2m.METAL_NS)
     graph = text[ns0:ns1].strip('\n')
+    # R17: no loop in the call graph (every loop there would be a lowered map/reduce calling a
+    # noinline step function, the shape of the Apple GPU lost-store defect). Not waivable with
+    # --no-pin: a new loop shape in steps.cu must be lowered without a loop first.
+    loops = len(_GRAPH_LOOP_RE.findall(c2m.mask(graph)))
+    if map_lowering == 'unroll' and loops:
+        raise c2m.TranslateError(
+            '%d loop(s) in the translated call graph: steps.cu has a loop shape that the '
+            'unrolled lowering does not cover (docs/metal-port/notes/R17.md); lower it without '
+            'a loop in cuda2metal.py first' % loops)
     out = METAL_HEADER + c2m.PRELUDE + METAL_PRE + METAL_EXTERNS + graph + '\n' + METAL_KERNELS
     return out, report, bad
 
@@ -209,10 +244,16 @@ def gen_metal(no_pin=False):
 def main_metal(args):
     import cuda2metal as c2m
     if '-o' not in args or args.index('-o') + 1 >= len(args):
-        sys.exit('usage: witgen_tu_gen.py --metal -o OUTDIR [--check] [--no-pin]')
+        sys.exit('usage: witgen_tu_gen.py --metal -o OUTDIR [--check] [--no-pin] '
+                 '[--map-lowering unroll|loop]')
     outdir = args[args.index('-o') + 1]
+    lowering = 'unroll'
+    if '--map-lowering' in args:
+        if args.index('--map-lowering') + 1 >= len(args):
+            sys.exit('witgen_tu_gen: --map-lowering needs a value (%s)' % ' | '.join(MAP_LOWERINGS))
+        lowering = args[args.index('--map-lowering') + 1]
     try:
-        new, report, bad = gen_metal(no_pin='--no-pin' in args)
+        new, report, bad = gen_metal(no_pin='--no-pin' in args, map_lowering=lowering)
     except c2m.TranslateError as e:
         sys.exit('witgen_tu_gen: error: %s' % e)
     path = os.path.join(outdir, 'witgen_tu.metal')
@@ -243,7 +284,9 @@ METAL_HEADER = r'''// GENERATED by rv32im-sys/kernels/cuda/witgen_tu_gen.py --me
 // Metal port of witgen_tu.cu (plan 4.2, item R5): step_Top's call graph renamed (_W), every
 // function WITGEN_TU_FNATTR (default __attribute__((noinline)): the CUDA comment in
 // witgen_tu_gen.py says the fully inlined build reorders the back-row loads of rows written by
-// neighbouring threads and is not bit-exact), translated by cuda2metal.py's passes; the
+// neighbouring threads and is not bit-exact), translated by cuda2metal.py's passes with every
+// map()/reduce() unrolled into straight-line blocks (R17: CUDA's loop lowering is the code shape
+// in which the Apple GPU loses a private-array store, docs/metal-port/notes/R17.md); the
 // extern_* functions as static externW_* copies (hand port of ffi.cu, see below); and the
 // kernels par_stepExecW (CUDA par_stepExecW, one thread per cycle; the HIP form's optional perm
 // is kept behind WitgenParams::usePerm) and fwd_stepExec / rev_stepExec (CUDA ffi.cu
@@ -293,11 +336,7 @@ METAL_PRE = r'''
 #ifndef WITGEN_TU_MAX_THREADS
 #define WITGEN_TU_MAX_THREADS 256
 #endif
-// A cycle (start + i, perm[i] or a sequential position) outside the preflight cycles or the
-// data rows: the kernel skips it (CUDA would index out of bounds).
-#ifndef RV32IM_FAULT_CYCLE_INDEX
-#define RV32IM_FAULT_CYCLE_INDEX 0x20u
-#endif
+// RV32IM_FAULT_CYCLE_INDEX / RV32IM_FAULT_DIFF_COUNT_INDEX: cuda_compat.h.
 
 namespace rv32im_metal {
 
@@ -308,7 +347,8 @@ METAL_EXTERNS = r'''// ---- extern_*: hand port of ffi.cu divide_rv32im .. exter
 // TUs of the metallib may define their own). Differences, on invalid input only (plan 2.9):
 // a txnIdx / bigintIdx outside the uploaded preflight sets a RV32IM_FAULT_* bit in
 // ctx.tables.bad (ORed into the fault buffer by the kernel) and yields zeros instead of an
-// out-of-bounds read. The 7th structured binding of the TU (extern_divide) is a temp here.
+// out-of-bounds read; so does a getDiffCount cycle past the preflight cycles. The 7th
+// structured binding of the TU (extern_divide) is a temp here.
 
 __attribute__((unused)) static inline r0::array<uint32_t, 2>
 divide_rv32im(uint32_t numer, uint32_t denom, uint32_t signType) {
@@ -388,11 +428,17 @@ static inline Val externW_lookupCurrent(thread ExecContext& ctx, Val table, Val 
 static inline void externW_memoryDelta(
     thread ExecContext& ctx, Val addr, Val cycle, Val dataLow, Val dataHigh, Val count) {}
 
-/// Not clamped: R1's PreflightTrace carries no cycle count (the argument is the witness value of
-/// the current or a neighbouring cycle, 2 * cycle (+ 1)).
+/// The argument is the witness value of the current or a neighbouring cycle, 2 * cycle (+ 1);
+/// an index past the preflight cycles (a corrupt witness value) sets
+/// RV32IM_FAULT_DIFF_COUNT_INDEX and yields 0 instead of an out-of-bounds read (plan 2.9).
 static inline uint32_t externW_getDiffCount(thread ExecContext& ctx, Val cycle) {
   uint32_t cycleU32 = cycle.asUInt32();
-  return ctx.preflight.cycles[cycleU32 / 2].diffCount[cycleU32 % 2];
+  uint32_t idx = cycleU32 / 2;
+  if (idx >= ctx.preflight.cyclesLen) {
+    ctx.tables.bad |= RV32IM_FAULT_DIFF_COUNT_INDEX;
+    return 0;
+  }
+  return ctx.preflight.cycles[idx].diffCount[cycleU32 % 2];
 }
 
 static inline Val externW_isFirstCycle_0(thread ExecContext& ctx) {
@@ -520,6 +566,7 @@ static inline uint32_t witgenStep(thread const WitgenBindings& b, uint32_t cycle
   }
   PreflightTrace preflight;
   preflight.cycles = b.cycles;
+  preflight.cyclesLen = p.cyclesLen;
   preflight.txns = b.txns;
   preflight.bigintBytes = b.bigintBytes;
   preflight.txnsLen = p.txnsLen;
@@ -617,18 +664,35 @@ kernel void rev_stepExec(WITGEN_TU_BINDINGS,
 '''
 
 
-if METAL:
+def main_cuda(check):
+    """Writes witgen_tu.cu, or with check compares it and translates --metal in memory."""
+    try:
+        cur = open(OUT, newline='').read()
+    except FileNotFoundError:
+        cur = ''
+    if not check:
+        open(OUT, 'w', newline='').write(new)
+        print('witgen_tu_gen: wrote witgen_tu.cu (%d functions)' % len(names))
+        return 0
+    if cur != new:
+        sys.exit('witgen_tu_gen: witgen_tu.cu is out of date; run kernels/cuda/witgen_tu_gen.py '
+                 'and commit the result')
+    # The Metal translation too (its output lives in the build's OUT_DIR, never checked in): in
+    # memory, with the pins and the no-loop check (R16 open issue, as accum_tu_gen.py).
+    sys.dont_write_bytecode = True
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    import cuda2metal as c2m
+    try:
+        _, report, bad = gen_metal()
+    except c2m.TranslateError as e:
+        sys.exit('witgen_tu_gen: --metal translation: %s' % e)
+    print('witgen_tu_gen: witgen_tu.cu is up to date (%d functions); --metal translates (%s)'
+          % (len(names), report))
+    return 0
+
+
+if __name__ == '__main__':
     sys.dont_write_bytecode = True  # no __pycache__ in the source tree (build.rs runs this)
     sys.path.insert(0, HERE)
-    sys.exit(main_metal(ARGS))
-try:
-    cur = open(OUT, newline='').read()
-except FileNotFoundError:
-    cur = ''
-if CHECK:
-    if cur != new:
-        sys.exit('witgen_tu_gen: witgen_tu.cu is out of date; run kernels/cuda/witgen_tu_gen.py and commit the result')
-    print('witgen_tu_gen: witgen_tu.cu is up to date (%d functions)' % len(names))
-else:
-    open(OUT, 'w', newline='').write(new)
-    print('witgen_tu_gen: wrote witgen_tu.cu (%d functions)' % len(names))
+    sys.exit(main_metal(ARGS) if METAL else main_cuda(CHECK))

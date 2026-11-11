@@ -2262,9 +2262,10 @@ fn build_metal_kernels() {
 
     // ---- BEGIN R5 witgen_tu (metal) ----
     // `witgen_tu_gen.py --metal` -> gen_dir/witgen_tu.metal: step_Top's call graph (noinline,
-    // cuda2metal.py passes with pinned rewrite counts) + par_stepExecW, fwd_stepExec,
-    // rev_stepExec. The generator rewrites the file only when it changed and fails when steps.cu
-    // or ffi.cu's extern section changed shape (pins).
+    // cuda2metal.py passes with pinned rewrite counts, map/reduce unrolled: R17, no loop in the
+    // graph) + par_stepExecW, fwd_stepExec, rev_stepExec. The generator rewrites the file only
+    // when it changed and fails when steps.cu or ffi.cu's extern section changed shape (pins) or
+    // the graph would contain a loop (docs/metal-port/notes/R17.md).
     if !skip {
         const WITGEN_TU_GEN: &str = "kernels/cuda/witgen_tu_gen.py";
         for input in [
