@@ -695,6 +695,7 @@ mod c7_tests {
     /// (lift/join: risc0-zkvm host::recursion tests with RISC0_METAL_REC_ACCUM_CHECK=1).
     #[test]
     fn accum_real_trace_shadow_check() {
+        let _guard = crate::prove::hal::metal::global_state_test_lock();
         for po2 in [16, 18] {
             let program = get_zkr("test_recursion_circuit.zkr", po2).unwrap();
             let input: VecDeque<u32> = (0..16u32).map(|i| i * 0x101 + 7).collect();

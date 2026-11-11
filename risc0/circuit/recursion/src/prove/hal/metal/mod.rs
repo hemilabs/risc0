@@ -378,6 +378,15 @@ pub(crate) const SEAL_CHECK_ENV: &str = "RISC0_METAL_REC_SEAL_CHECK";
 /// Seal checks passed so far (tests).
 pub(crate) static SEAL_CHECKS_OK: AtomicUsize = AtomicUsize::new(0);
 
+/// Serializes the tests that set or assert process-wide prover state (the seal-check and
+/// phase counters, the host chain check switch). Poison-tolerant, so one failing test does
+/// not fail the rest.
+#[cfg(test)]
+pub(crate) fn global_state_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn seal_check_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var(SEAL_CHECK_ENV).as_deref() == Ok("1"))
@@ -597,6 +606,7 @@ mod c5_tests {
 
     #[test]
     fn factory_hashfns() {
+        let _guard = crate::prove::hal::metal::global_state_test_lock();
         for h in ["poseidon2", "sha-256", "poseidon_254"] {
             recursion_prover(h).unwrap();
         }

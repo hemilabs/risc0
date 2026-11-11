@@ -135,6 +135,7 @@ fn metallib_smoke() {
 /// (ZK noise); with the same seed they are identical; with different seeds they differ.
 #[test]
 fn noise_seed_controls_the_seal() {
+    let _guard = crate::prove::hal::metal::global_state_test_lock();
     let program = get_zkr("test_recursion_circuit.zkr", 16).unwrap();
     let cpu = crate::prove::hal::cpu::recursion_prover("poseidon2").unwrap();
     let a = cpu.prove(&program, test_input(), None).unwrap();
@@ -153,6 +154,7 @@ fn noise_seed_controls_the_seal() {
 /// Full Metal proofs (all three circuit phases on the GPU) with deterministic noise give the CPU
 /// prover's seal bit for bit. Prints wall time and peak device memory per phase (PLAN 9.1).
 fn seal_matches_cpu(hashfn: &str, po2: usize) {
+    let _guard = crate::prove::hal::metal::global_state_test_lock();
     let program = get_zkr("test_recursion_circuit.zkr", po2).unwrap();
     let metal = metal_recursion_prover(hashfn).unwrap();
     let cpu = crate::prove::hal::cpu::recursion_prover(hashfn).unwrap();
@@ -202,6 +204,7 @@ fn seal_matches_cpu_sha256_po2_16() {
 /// A seal mismatch is reported (not vacuous): the "CPU" side proves with another seed.
 #[test]
 fn seal_check_detects_a_difference() {
+    let _guard = crate::prove::hal::metal::global_state_test_lock();
     struct Reseeded(Box<dyn RecursionProver>);
     impl RecursionProver for Reseeded {
         fn prove(
@@ -277,6 +280,7 @@ fn cpu_witgen_keeps_trace() {
 /// `test_recursion_host_chains_check` ignored on Metal.
 #[test]
 fn p254_cpu_fallback_with_host_chains_check() {
+    let _guard = crate::prove::hal::metal::global_state_test_lock();
     for hashfn in ["poseidon_254", "poseidon2"] {
         let program = get_zkr("test_recursion_circuit.zkr", 16).unwrap();
         let before = crate::prove::set_host_chains_check(true);

@@ -295,6 +295,7 @@ fn witgen_seq_modes_match_cpu() {
 /// A corrupted trace element makes the witgen fail with a fault error, and the HAL stays usable.
 #[test]
 fn witgen_fault_on_corrupt_trace() {
+    let _guard = crate::prove::hal::metal::global_state_test_lock();
     let (program, pf) = preflight_for(16);
     let trace = raw_trace(&program, &pf);
     let m = MetalRun::new();
@@ -358,6 +359,7 @@ fn prove_metal(program: &Program, pf: Preflight) -> Result<crate::prove::Recursi
 /// witness with `upload_host_witness`. A corrupted host witness is caught.
 #[test]
 fn prewitgen_and_shadow_check_hooks() {
+    let _guard = crate::prove::hal::metal::global_state_test_lock();
     let po2 = 16;
     let cpu_receipt = crate::prove::hal::cpu::recursion_prover("poseidon2")
         .unwrap()
@@ -439,6 +441,7 @@ fn upload_host_witness_rejects_wrong_sizes() {
 /// peak allocation per po2.
 #[test]
 fn prove_with_host_chains_check() {
+    let _guard = crate::prove::hal::metal::global_state_test_lock();
     for po2 in [16, 18] {
         let program = get_zkr("test_recursion_circuit.zkr", po2).unwrap();
         let (_, pf) = preflight_for(po2);
