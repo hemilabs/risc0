@@ -408,6 +408,7 @@ mod c8_tests {
     /// Prints the warm wall time of encode + sync per variant (indicative GPU time) and the peak
     /// device allocation of the step.
     fn variants_match_cpu(po2: usize) {
+        let _guard = crate::prove::hal::metal::global_state_test_lock();
         let hal = Arc::new(MetalHalPoseidon2::new());
         let c = MetalCircuitHal::new(hal.clone()).unwrap();
         let mono = variant_kernels(&c, EvalKernels::Monolith);
@@ -487,7 +488,7 @@ mod c8_tests {
             "C8 po2 {po2}: CPU eval_check {:.1} ms; device alloc before inputs {before} B, peak \
              {peak} B (+{} B), limit {} B",
             cpu_s * 1e3,
-            peak - before,
+            peak.saturating_sub(before),
             hal.working_set_limit()
         );
     }
