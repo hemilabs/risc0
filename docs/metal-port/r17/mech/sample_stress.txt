@@ -1,0 +1,21 @@
+Mac model     : Mac17,14 (Apple M5 Max)
+macOS         : Version 27.2.1 (Build 26B131)
+GPU           : Apple M5 Max, architecture applegpu_g17s
+GPU families  : Apple1 Apple2 Apple3 Apple4 Apple5 Apple6 Apple7 Apple8 Apple9 Apple10
+
+BUG case (variant 0), 20 dispatches per row
+stride   threads   tg     wrong    threads/dispatch
+8        1048576   256    20/20    190236
+8        1048576   1024   20/20    194614
+8        4194304   256    20/20    1693987
+8        4194304   1024   20/20    1760558
+32       1048576   256    20/20    416608
+32       1048576   1024   20/20    434700
+32       4194304   256    20/20    1779939
+32       4194304   1024   20/20    1825287
+64       1048576   256    20/20    425447
+64       1048576   1024   20/20    428712
+64       4194304   256    20/20    1761847
+64       4194304   1024   20/20    1784431
+
+RESULT: BUG REPRODUCED
