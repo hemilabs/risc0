@@ -25,7 +25,8 @@
 //!   copy of each output.
 //!
 //! The scripts run with `RISC0_PYTHON` if set, else `python3`. None of these tests touches
-//! process-wide state, so they run under the default parallel harness.
+//! process-wide state, so they run under the default parallel harness; scratch copies are per
+//! process (`Scratch`), so overlapping `cargo test` runs of this crate do not collide either.
 
 #![cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 
@@ -120,6 +121,37 @@ fn generator_ci_checks() {
     run_ok(&["kernels/cuda/witgen_tu_gen.py", "--check"]);
 }
 
+/// `accum_tu_gen.py --check` fails when the Metal translation no longer matches PINNED_METAL
+/// (before R16 it never translated --metal in --check and passed regardless): one pinned
+/// rewrite count is changed in memory and the --check entry point must exit non-zero.
+#[test]
+fn accum_check_detects_pin_mismatch() {
+    let script = r#"
+import sys
+sys.path.insert(0, 'kernels/cuda')
+import accum_tu_gen as g
+assert g.metal_pin_check() == [], g.metal_pin_check()
+for mode in g.PINNED_METAL:
+    pins = g.PINNED_METAL[mode]
+    key = sorted(pins)[0]
+    pins[key] += 1
+    bad = g.metal_pin_check()
+    assert any(mode in b for b in bad), (mode, bad)
+    pins[key] -= 1
+key = sorted(g.PINNED_METAL['always'])[0]
+g.PINNED_METAL['always'][key] += 1
+try:
+    g.main_cuda(True)
+except SystemExit as e:
+    assert e.code not in (None, 0), e.code
+    print('pin mismatch rejected')
+else:
+    raise AssertionError('--check accepted a changed pin')
+"#;
+    let log = run_ok(&["-c", script]);
+    assert!(log.contains("pin mismatch rejected"), "{log}");
+}
+
 /// The generated sources this build compiled are what the generators produce from the sources
 /// now (each command re-run with `--check`).
 #[test]
@@ -140,6 +172,31 @@ fn build_outputs_up_to_date() {
     }
     for cmd in cmds.iter() {
         run_ok(&with_check(cmd));
+    }
+}
+
+/// A scratch directory under CARGO_TARGET_TMPDIR unique to this process and `tag`; removed
+/// when dropped (also while unwinding from a failed assertion).
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(tag: &str) -> Self {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("r16_stale-{}", std::process::id()))
+            .join(tag);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Scratch(dir)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+        // The per-process parent, once its last output dir is gone.
+        if let Some(parent) = self.0.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
     }
 }
 
@@ -172,11 +229,10 @@ fn check_detects_stale_output() {
             .iter()
             .find(|(s, _)| *s == cmd[0])
             .unwrap_or_else(|| panic!("no known output for {cmd:?}"));
-        let tmp = Path::new(env!("CARGO_TARGET_TMPDIR"))
-            .join("r16_stale")
-            .join(file.replace('.', "_"));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        // Unique to this process and output, removed on success and on panic: concurrent
+        // `cargo test` runs of this crate share CARGO_TARGET_TMPDIR (R16 fix round 1).
+        let scratch = Scratch::new(&file.replace('.', "_"));
+        let tmp = scratch.0.clone();
         for entry in std::fs::read_dir(&gen_dir).unwrap() {
             let path = entry.unwrap().path();
             if path.is_file() {
@@ -208,7 +264,7 @@ fn check_detects_stale_output() {
             "{cmd:?} accepted a changed {file}:\n{}",
             text(&out)
         );
-        let _ = std::fs::remove_dir_all(&tmp);
+        drop(scratch);
         checked += 1;
     }
     assert_eq!(
@@ -216,4 +272,47 @@ fn check_detects_stale_output() {
         outputs.len(),
         "generators writing into OUT_DIR/metal"
     );
+}
+
+/// Regression for R16 fix round 1: `check_detects_stale_output` used one fixed scratch dir, so
+/// two overlapping `cargo test` runs of this crate corrupted each other's copies. Runs three more
+/// copies of that test (this test binary, filtered to it) at the same time as each other and as
+/// the in-harness copy; all must pass.
+#[test]
+fn stale_check_concurrent_processes() {
+    const CHILD: &str = "R16_STALE_CHECK_CHILD";
+    if std::env::var_os(CHILD).is_some() || skipped_build() {
+        return;
+    }
+    let exe = std::env::current_exe().unwrap();
+    // Staggered starts, so that one copy's steps (copy, check, append, check, remove) overlap
+    // the others' at different points; started in lockstep they write identical copies and the
+    // old shared dir did not fail.
+    let children: Vec<_> = [0u64, 1000, 2500]
+        .iter()
+        .map(|&delay_ms| {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            Command::new(&exe)
+                .args(["check_detects_stale_output", "--exact", "--test-threads=1"])
+                .env(CHILD, "1")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap_or_else(|e| panic!("could not run {exe:?}: {e}"))
+        })
+        .collect();
+    for child in children {
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "concurrent check_detects_stale_output failed ({}):\n{}",
+            out.status,
+            text(&out)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("1 passed"),
+            "{}",
+            text(&out)
+        );
+    }
 }
