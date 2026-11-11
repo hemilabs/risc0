@@ -20,11 +20,12 @@
 //! present kernel, and the HAL-owned scratch buffers (lookup tables, the preflight copy, perm,
 //! scratch, poly_mix) that the Metal witgen/accum/eval_check paths bind.
 //!
-//! Until R8 (witgen), R9 (accum) and R10 (eval_check) land, every circuit phase runs the CPU
-//! circuit kernels (`risc0_circuit_rv32im_cpu_*`) on host views of the Metal HAL's shared
-//! buffers, after a `sync()`: the zkp side (NTT, hashing, FRI) runs on the GPU and the segment
-//! proof is complete and verifiable. The phase submodules (`witgen`, `accum`, `eval_check`)
-//! contain only that delegation.
+//! `accum` (R9) and `eval_check` (R10) run Metal kernels by default. `witgen` (R8) runs R7's
+//! delegation to the CPU circuit kernel by default, because the generated Metal witgen kernels are
+//! not deterministic yet (docs/metal-port/notes/R8.md, R11.md); its Metal path is an opt-in,
+//! `RISC0_METAL_RV32IM_GPU_PHASES=witgen` (`witgen.rs`). R11 integrated and gated the default
+//! configuration. Every phase keeps R7's delegation (`risc0_circuit_rv32im_cpu_*` on host views of
+//! the shared buffers) as a fallback, forced per phase with [CPU_PHASES_ENV].
 //!
 //! Kernel loading tolerates kernels that later items have not added yet: [EXPECTED_KERNELS] lists
 //! the entry points each phase will need; the ones missing from the metallib are recorded, and
@@ -41,7 +42,7 @@ use std::{
     collections::HashSet,
     mem::size_of,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex, MutexGuard, OnceLock,
     },
 };
@@ -102,6 +103,12 @@ pub(crate) const EXPECTED_KERNELS: &[(Phase, &[&str])] = &[
     (Phase::EvalCheck, &["eval_check"]),
 ];
 
+/// Debug knob: path of a metallib to load instead of `risc0_circuit_rv32im_sys::METAL_LIB`.
+/// Honoured only in test and debug-assertion builds, so a release worker cannot be made to load
+/// unverified kernels through its environment.
+#[cfg(any(test, debug_assertions))]
+pub(crate) const METALLIB_OVERRIDE_ENV: &str = "RISC0_METAL_RV32IM_METALLIB";
+
 /// The rv32im metallib with a PSO for every [METAL_KERNEL_NAMES] entry and every
 /// [EXPECTED_KERNELS] entry the library contains. Built once per process (one Metal device),
 /// like the zkp PSO cache.
@@ -146,7 +153,25 @@ impl Rv32imKernels {
         static KERNELS: OnceLock<std::result::Result<Rv32imKernels, String>> = OnceLock::new();
         KERNELS
             .get_or_init(|| {
-                Self::load_from(hal, METAL_LIB, METAL_KERNEL_NAMES, EXPECTED_KERNELS)
+                // Debug/experiments: `RISC0_METAL_RV32IM_METALLIB=<path>` loads a metallib built
+                // outside cargo (e.g. a witgen_tu.metal variant) instead of the embedded one.
+                // Release builds never read the variable (see METALLIB_OVERRIDE_ENV).
+                #[cfg(not(any(test, debug_assertions)))]
+                let override_lib: Option<std::result::Result<Vec<u8>, String>> = None;
+                #[cfg(any(test, debug_assertions))]
+                let override_lib = std::env::var_os(METALLIB_OVERRIDE_ENV).map(|path| {
+                    tracing::warn!(
+                        "rv32im: loading the metallib from {path:?} ({METALLIB_OVERRIDE_ENV})"
+                    );
+                    std::fs::read(&path)
+                        .map_err(|e| format!("reading {path:?} ({METALLIB_OVERRIDE_ENV}): {e}"))
+                });
+                let bytes: &[u8] = match &override_lib {
+                    None => METAL_LIB,
+                    Some(Ok(bytes)) => bytes,
+                    Some(Err(e)) => return Err(e.clone()),
+                };
+                Self::load_from(hal, bytes, METAL_KERNEL_NAMES, EXPECTED_KERNELS)
                     .map_err(|e| format!("{e:#}"))
             })
             .as_ref()
@@ -333,6 +358,24 @@ impl<MH: MetalHash> MetalRv32imCtx<MH> {
     }
 }
 
+/// Circuit phases named by this env var (a comma list of `witgen`, `accum`, `eval`;
+/// case-insensitive, whitespace ignored) run the CPU circuit kernels over host views of the Metal
+/// HAL's shared buffers instead of the Metal kernels. A debugging fallback for accum and eval,
+/// which run on the GPU by default. Witgen runs the CPU kernel by default anyway; listing it here
+/// also overrides the `RISC0_METAL_RV32IM_GPU_PHASES=witgen` opt-in (`witgen.rs`).
+pub(crate) const CPU_PHASES_ENV: &str = "RISC0_METAL_RV32IM_CPU_PHASES";
+
+/// Whether the comma list `list` names `phase` ([CPU_PHASES_ENV] syntax).
+pub(crate) fn phase_listed(list: &str, phase: &str) -> bool {
+    list.split(',')
+        .any(|p| p.trim().eq_ignore_ascii_case(phase))
+}
+
+/// Whether [CPU_PHASES_ENV] currently names `phase` (`witgen`, `accum` or `eval`).
+pub(crate) fn cpu_phase(phase: &str) -> bool {
+    std::env::var(CPU_PHASES_ENV).is_ok_and(|v| phase_listed(&v, phase))
+}
+
 /// Per-phase counts of circuit-phase calls served by the Metal circuit HAL (tests and logs).
 pub(crate) static PHASE_CALLS: [AtomicUsize; 3] = [
     AtomicUsize::new(0),
@@ -342,6 +385,48 @@ pub(crate) static PHASE_CALLS: [AtomicUsize; 3] = [
 
 fn count(phase: Phase) {
     PHASE_CALLS[phase as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Per-phase peak GPU memory (PLAN 9.1), recorded only while [PHASE_MARKS_ON] is set (R11 po2
+/// sweep). Each mark stores the process-wide peak `currentAllocatedSize` since the previous mark
+/// (so the mark at a phase's start covers the zkp work before it, e.g. the data commit before
+/// accum), the current allocation and the time, then restarts the peak.
+///
+/// Because a mark resets the HAL's process-wide peak counter, the marks and any other reader of
+/// `peak_allocated_size` (e.g. M3's per-proof sampler) are mutually exclusive: never enable the
+/// marks in production.
+pub(crate) static PHASE_MARKS_ON: AtomicBool = AtomicBool::new(false);
+
+// Read by the R11 sweep test and debug tooling only.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct PhaseMark {
+    pub label: &'static str,
+    /// Peak `currentAllocatedSize` since the previous mark.
+    pub peak: u64,
+    /// `currentAllocatedSize` at the mark.
+    pub allocated: u64,
+    pub at: std::time::Instant,
+}
+
+pub(crate) static PHASE_MARKS: Mutex<Vec<PhaseMark>> = Mutex::new(Vec::new());
+
+/// Record a [PhaseMark] (no-op unless [PHASE_MARKS_ON]).
+pub(crate) fn phase_mark<MH: MetalHash>(hal: &MetalHal<MH>, label: &'static str) {
+    if !PHASE_MARKS_ON.load(Ordering::Relaxed) {
+        return;
+    }
+    let mark = PhaseMark {
+        label,
+        peak: hal.peak_allocated_size(),
+        allocated: hal.allocated_size(),
+        at: std::time::Instant::now(),
+    };
+    hal.reset_peak_allocated_size();
+    PHASE_MARKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(mark);
 }
 
 pub struct MetalCircuitHal<MH: MetalHash> {
@@ -385,8 +470,15 @@ pub fn segment_prover() -> Result<Box<dyn SegmentProver>> {
     // Fail here, not inside the prover, if the metallib cannot be loaded.
     Rv32imKernels::get(&MetalHalPoseidon2::new())?;
     tracing::debug!(
-        "rv32im segment prover: Metal HAL ({}), circuit kernels on CPU until R8/R9/R10",
-        risc0_zkp::hal::metal::device_name().unwrap_or_default()
+        "rv32im segment prover: Metal HAL ({}), witgen on the {}, accum on the {}, eval_check on \
+         the {} ({}={:?}, RISC0_METAL_RV32IM_GPU_PHASES={:?})",
+        risc0_zkp::hal::metal::device_name().unwrap_or_default(),
+        if witgen::cpu_witgen() { "CPU" } else { "GPU" },
+        if cpu_phase("accum") { "CPU" } else { "GPU" },
+        if cpu_phase("eval") { "CPU" } else { "GPU" },
+        CPU_PHASES_ENV,
+        std::env::var(CPU_PHASES_ENV).unwrap_or_default(),
+        std::env::var("RISC0_METAL_RV32IM_GPU_PHASES").unwrap_or_default()
     );
     let hal_factory = || {
         let hal = Arc::new(MetalHalPoseidon2::new());
@@ -400,3 +492,7 @@ pub fn segment_prover() -> Result<Box<dyn SegmentProver>> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "integration_tests.rs"]
+mod integration_tests;
