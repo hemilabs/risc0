@@ -22,7 +22,7 @@ class Interp:
     def __init__(s,Fs,seed=1,mode='num',qt=()):
         s.F={F.name:F for F in Fs}; s.mode=mode; s.seed=seed
         rnd=random.Random(seed)
-        s.pm=[tuple(rnd.randrange(P) for _ in range(4)) for _ in range(458)]
+        s.pm=[tuple(rnd.randrange(P) for _ in range(4)) for _ in range(484)]
         for a,b in qt: s.pm.append(emul(s.pm[a],s.pm[b]))
         s.cache={}; s.vals={}   # vals[(fn,node)] -> value
     def loadv(s,buf,col,back):
@@ -54,11 +54,16 @@ class Interp:
                     b=src if src.startswith('args[') else ptr[src][1]
                     v=s.loadv(b,n['col'],n['back'])
                 elif op=='aload':
-                    pp=ptr[n['src']]
-                    if isinstance(pp,tuple):
-                        assert pp[1] in ('args[2]','args[3]'), pp
-                        v=s.loadv(pp[1],n['idx'],'u')
-                    else: v=pp[n['idx']]
+                    src=n['src']
+                    if src.startswith('args['):
+                        assert src in ('args[2]','args[3]'), src
+                        v=s.loadv(src,n['idx'],'u')
+                    else:
+                        pp=ptr[src]
+                        if isinstance(pp,tuple):
+                            assert pp[1] in ('args[2]','args[3]'), pp
+                            v=s.loadv(pp[1],n['idx'],'u')
+                        else: v=pp[n['idx']]
                 elif op in '+-*':
                     a,b=V[n['args'][0]],V[n['args'][1]]
                     v=(a and b) if u else (add(a,b) if op=='+' else sub(a,b) if op=='-' else mul(a,b))
@@ -131,7 +136,7 @@ class Interp:
             if mm: tab[int(mm.group(1))]=lift(val(mm.group(2))); continue
             raise Exception('hoist unparsed '+l)
         mq=re.search(r'constexpr uint32_t RK_QN = (\d+);',src)
-        base=458+(int(mq.group(1)) if mq else 0)
+        base=484+(int(mq.group(1)) if mq else 0)
         assert len(s.pm)==base
         for k in range(len(tab)): s.pm.append(tab[k])
     def go(s):

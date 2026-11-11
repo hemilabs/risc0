@@ -26,11 +26,16 @@ def gen(Fs):
                     assert b in ('args[0]','args[1]'), ('cycle-indexed load from uniform buffer', b)
                     v=None
                 elif op=='aload':
-                    pp=ptr[n['src']]
-                    if isinstance(pp,tuple):
-                        assert pp[1] in ('args[2]','args[3]')
-                        nmx=fresh(); code.append('  Fp %s = %s[%d];'%(nmx,{'args[2]':'out','args[3]':'mix'}[pp[1]],n['idx'])); v=(nmx,'F')
-                    else: v=pp.get(n['idx'])
+                    src=n['src']
+                    if src.startswith('args['):
+                        assert src in ('args[2]','args[3]'), src
+                        nmx=fresh(); code.append('  Fp %s = %s[%d];'%(nmx,{'args[2]':'out','args[3]':'mix'}[src],n['idx'])); v=(nmx,'F')
+                    else:
+                        pp=ptr[src]
+                        if isinstance(pp,tuple):
+                            assert pp[1] in ('args[2]','args[3]')
+                            nmx=fresh(); code.append('  Fp %s = %s[%d];'%(nmx,{'args[2]':'out','args[3]':'mix'}[pp[1]],n['idx'])); v=(nmx,'F')
+                        else: v=pp.get(n['idx'])
                 elif op in ('+','-','*'):
                     a,b=V[n['args'][0]],V[n['args'][1]]
                     if a is not None and b is not None:

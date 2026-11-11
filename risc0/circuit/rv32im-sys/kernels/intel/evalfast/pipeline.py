@@ -44,9 +44,9 @@ def run(script, *args, capture=False):
 # skipped fusion silently costs time). Pin what they do on the current
 # generated circuit so a generator change fails here instead of regressing.
 EXPECT = [
-    'idx32: 21 functions, 3474 loads',
-    'lincomb: 248 trees fused',
-    'lincombF: 346 Fp trees fused',
+    'idx32: 21 functions, 3481 loads',
+    'lincomb: 255 trees fused',
+    'lincombF: 347 Fp trees fused',
 ]
 
 

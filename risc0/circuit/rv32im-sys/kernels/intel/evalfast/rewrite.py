@@ -14,7 +14,7 @@ QT=[]
 mq=re.search(r'constexpr uint16_t rk_qa\[\] = \{([^}]*)\};\s*constexpr uint16_t rk_qb\[\] = \{([^}]*)\};',src)
 if mq:
     QT=list(zip([int(v) for v in mq.group(1).split(',') if v.strip()],[int(v) for v in mq.group(2).split(',') if v.strip()]))
-PMBASE=458
+PMBASE=484
 def fresh():
     _ctr[0]+=1; return 'x%d'%_ctr[0]
 def nm(F,i):

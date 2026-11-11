@@ -111,8 +111,8 @@ RV_EVAL_FN(risc0_circuit_rv32im_intel_eval_check)(
 #ifdef RISC0_INTEL_EVAL_FAST
         // The vanishing quotient 1/((3*rou^cycle)^(2^po2) - 1) takes only 4
         // values over the coset (rou^(2^po2) is a primitive 4th root), so the
-        // host appends them after the 458 poly_mix powers (see intel.rs).
-        const Fp* qtab = reinterpret_cast<const Fp*>(poly_mix + 458);
+        // host appends them after the 484 poly_mix powers (see intel.rs).
+        const Fp* qtab = reinterpret_cast<const Fp*>(poly_mix + 484);
 #endif
         Fp rou_val;
         std::memcpy(&rou_val, &rou_raw, sizeof(uint32_t));
@@ -129,7 +129,7 @@ RV_EVAL_FN(risc0_circuit_rv32im_intel_eval_check)(
             }
         }
         const uint32_t wgsz = WG_SIZE;
-        constexpr uint32_t POLY_MIX_COUNT = 458;
+        constexpr uint32_t POLY_MIX_COUNT = 484;
 #ifdef RK_NWORDS
         std::lock_guard<std::mutex> slab_lock(g_slab_mutex);
         const uint32_t tile = slab_tile(q, domain);

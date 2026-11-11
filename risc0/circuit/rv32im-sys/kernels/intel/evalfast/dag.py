@@ -33,6 +33,13 @@ def build(lines,f):
         if m: var[m.group(1)]=mk(op='load',args=(),t='F',src='args[%s]'%m.group(2),col=int(m.group(3)),back=int(m.group(4)),line=i); continue
         m=re.match(r'auto (x\d+) = (_h\w+);',l)
         if m: var[m.group(1)]=var[m.group(2)] if m.group(2) in var else mk(op='param',args=(),t='F',name=m.group(2)); continue
+        m=re.match(r'auto (x\d+) = /\*\w+=\*/(args\[\d\])\[(\d+)\];',l)
+        if m:
+            # Direct uniform global/mix load (e.g. 3.1.0's total_cycles read):
+            # args[2]/args[3] indexed by a constant, no cycle term. Same uniform
+            # ('u') semantics as an aload via a hoisted pointer, src kept as args[N]
+            # (handled by the args[ prefix branch in interp.py / hoist_gen.py).
+            var[m.group(1)]=mk(op='aload',args=(),t='F',src=m.group(2),idx=int(m.group(3)),line=i); continue
         m=re.match(r'auto (x\d+) = (\w+)\[(\d+)\];',l)
         if m:
             b=m.group(2); k=int(m.group(3))

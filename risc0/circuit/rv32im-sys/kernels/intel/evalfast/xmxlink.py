@@ -22,7 +22,7 @@ import re, sys
 
 src, dst = sys.argv[1], sys.argv[2]
 LMIN = int(sys.argv[3]) if len(sys.argv) > 3 else 4
-PMBASE = 458          # global poly_mix entries (rewrite.py PMBASE)
+PMBASE = 484          # global poly_mix entries (rewrite.py PMBASE)
 MAX_BLOCKS = 512      # 512 * 32 * 255^2 < 2^31
 
 L = open(src).read().split('\n')

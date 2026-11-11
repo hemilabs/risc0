@@ -25,8 +25,8 @@ import sys
 src, out = sys.argv[1], sys.argv[2]
 # Shapes of the current circuit; a change here means the pipeline output
 # changed, so re-verify the kernel (bit-exactness harness) before updating.
-EXPECT_LOADS = 3474
-POLY_MIX_COUNT = 458  # NUM_POLY_MIX_POWERS (risc0-circuit-rv32im info.rs)
+EXPECT_LOADS = 3481
+POLY_MIX_COUNT = 484  # NUM_POLY_MIX_POWERS (risc0-circuit-rv32im info.rs)
 full = open(src).read()
 lines = full.split('\n')
 end = next(i for i, l in enumerate(lines) if l.startswith('// Intel SYCL eval_check kernel'))

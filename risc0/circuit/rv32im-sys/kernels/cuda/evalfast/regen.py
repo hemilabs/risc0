@@ -154,10 +154,10 @@ MKSUB = [
 # (pass, extra arguments, lines its output must contain)
 PASSES = [
     ('remat.py', ['--maxops', '4', '--maxloads', '4'],
-     ['remat: 675 values, 1421 loads rematerialized, 675 stores dropped, slab words 324']),
-    ('lazyfp.py', [], ["lazyfp: {'cand': 6032, 'add': 94, 'sub': 503, 'mul': 265}"]),
+     ['remat: 676 values, 1440 loads rematerialized, 676 stores dropped, slab words 304']),
+    ('lazyfp.py', [], ["lazyfp: {'cand': 5987, 'add': 88, 'sub': 494, 'mul': 265}"]),
     ('close.py', ['--chain'], ['close: 231 closures, 157 chained']),
-    ('linkext.py', [], ['linkext: 5118 call sites']),
+    ('linkext.py', [], ['linkext: 5211 call sites']),
     ('accfirst_cuda.py', [], ['accfirst_cuda: 209 tail lines, 41 pulled-in defs']),
     ('mksplit2.py', [], []),
     ('remat_lu.py', ['--maxg', '4', '--maxops', '8'],
