@@ -14,10 +14,27 @@
 # limitations under the License.
 
 """accfirst_cuda.py: CUDA port of the "accum block first" eval_check pass. Slices the LogUp/accum block (tail of
-rv32im_v2_3 from the first accum load after the accumulator x1102, plus v2_2..v2_0 via the tail
-call) into rk_accblk(); v2_3 returns x1102, so poly_fp() = main block and
+rv32im_v2_3 from the first accum load after the accumulator ACC, plus v2_2..v2_0 via the tail
+call) into rk_accblk(); v2_3 returns rk_fin(ACC), so poly_fp() = main block and
 tot = poly_fp() + rk_accblk() (the accumulator enters the tail only additively; the tail gets
-x1102 := 0). The kernel runs the main block first, then the acc block.
+ACC := 0). The kernel runs the main block first, then the acc block.
+
+In the 3.1.0 circuit ACC (= x997) is a lazy mid-chain RkAcc, `RkAcc x997 = rk_link_k(x995, ..., 454u)`,
+that the LogUp block extends through poly_mix[455..463] before finalizing at
+`FpExt x1062 = rk_fin(rk_link_k(x1050, x1061, 463u))`, after which x1062 feeds the first LogUp closure
+as its base (rk_cl0(x1062, ...)). The split therefore finalizes ACC at the cut: poly_fp returns
+rk_fin(x997) (the reduced main-chain value); the acc block restarts the same link chain from a zero
+base (`const FpExt x997 = FpExt(0)` -> rk_acc gives the {lo=0,hi=0} RkAcc); and the kernel adds the
+two FpExts. This is bit-exact because (1) ACC is read in the tail ONLY as the base of the next link
+(verified: x997's single downstream use is `rk_link_nf_k(x997, x1023, 455u)`), (2) rk_fin is a linear
+Montgomery REDC and the lazy links only add into / fold the accumulator (fold subtracts a multiple of
+P*R, value-preserving mod P), so rk_fin(base + delta) == rk_fin(base) + rk_fin(delta) per FpExt lane,
+and (3) the acc block's lanes are bounded by the original's (it drops the base term), so the
+hi<P / hi<1.47P link-discipline and the single-conditional rk_fin reduction stay exact. The chain
+always ends on a fold before rk_fin, so both sides reduce to canonical [0,P). (Earlier circuits put a
+fully-finalized FpExt accumulator at the cut; returning rk_fin(ACC) subsumes that case, since
+rk_fin(rk_acc(FpExt b)) == b.)
+
 Asserts: the tail and the pulled-in defs use no FpExt argument other than the zero base arg2,
 pulled-in defs are pure (no slab stores / links), and every slab word the acc block reads is
 written earlier inside the acc block (so the blocks can run in either order).
@@ -28,10 +45,16 @@ src = open(sys.argv[1]).read()
 m = re.search(r'^__device__ EF_NOINLINE FpExt rv32im_v2_3\(([^)]*)\) \{\n', src, re.M)
 params = m.group(1); start = m.end(); end = src.index('\n}\n', start)
 body = src[start:end].split('\n')
-ACC = 'x1102'
-sp = [i for i, l in enumerate(body) if re.match(r'\s*auto x231 = EF_LD\(arg8, ', l)]
-assert len(sp) == 1, sp; sp = sp[0]
-assert any(re.match(r'\s*FpExt %s = ' % ACC, l) for l in body[:sp])
+ACC = 'x997'
+# Split at the first accum-buffer (arg8) load. In the 3.1.0 circuit the running
+# accumulator at the split is a lazy mid-chain RkAcc (ACC = rk_link_k(...)) that the
+# LogUp block extends via rk_link(ACC, ...); poly_fp returns rk_fin(ACC) (the reduced
+# main-chain value) and the acc block restarts the chain from a zero base. rk_fin is a
+# linear (Montgomery REDC) map and ACC enters the tail only as the base of the next link,
+# so rk_fin(ACC) + accblk(ACC:=0) == the original value (see the module docstring).
+sp = [i for i, l in enumerate(body) if re.match(r'\s*auto x\d+ = EF_LD\(arg8, ', l)]
+assert sp, 'no accum (arg8) load found'; sp = sp[0]
+assert any(re.match(r'\s*(?:FpExt|RkAcc) %s = ' % ACC, l) for l in body[:sp]), 'ACC not defined before split'
 dre = re.compile(r'\s*(?:auto|FpExt|Fp|RkAcc|RkW|RkW1|constexpr Fp|constexpr FpExt) (_?c?x\w+)\b')
 defs = {}
 for i, l in enumerate(body[:sp]):
@@ -60,7 +83,7 @@ hdr = [l for l in body[:sp] if 'size_t mask' in l]
 acc_fn = ('__device__ EF_NOINLINE FpExt rk_accblk(size_t cycle, size_t steps, FpExt* poly_mix, %s) {\n'
           '  const FpExt arg2 = FpExt(0); const FpExt %s = FpExt(0);\n' % (', '.join(ptr_params), ACC)
           + '\n'.join(hdr) + '\n' + '\n'.join(pre) + '\n' + '\n'.join(tail) + '\n}\n')
-src = src[:start] + '\n'.join(body[:sp] + ['  return %s;' % ACC]) + src[end:]
+src = src[:start] + '\n'.join(body[:sp] + ['  return rk_fin(%s);' % ACC]) + src[end:]
 k = src.index('__device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args) {')
 src = src[:k] + acc_fn + '\n' + src[k:]
 # slab self-containment of the acc block: loads after stores within acc block (program order: tail, v2_2, v2_1, v2_0)

@@ -30,7 +30,7 @@ MAXG=int(opt('--maxg',99)); MAXOPS=int(opt('--maxops',999)); ONLY=('rv32im_v2_0'
 s=open(a[1]).read(); F=functions(s); L=s.split('\n')
 order=['rk_accblk','rv32im_v2_2','rv32im_v2_1','rv32im_v2_0']
 # pointer-arg -> buffer per function (D=data, A=accum, M=mix)
-bufmap={'rk_accblk':{'arg7':'D','arg8':'A','arg9':'M'},'rv32im_v2_2':{'arg3':'D','arg4':'A','arg5':'M'},
+bufmap={'rk_accblk':{'arg7':'D','arg8':'A','arg9':'M'},'rv32im_v2_2':{'arg4':'D','arg5':'A','arg6':'M'},
         'rv32im_v2_1':{'arg4':'D','arg5':'A'},'rv32im_v2_0':{'arg4':'D'}}
 ST=[]  # store instances in execution order: dict(fn, idx, word, val, slice, ok, reads)
 info={}

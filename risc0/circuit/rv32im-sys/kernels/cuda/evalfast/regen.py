@@ -129,26 +129,26 @@ NS = 'namespace risc0::circuit::rv32im_v2 {'
 # mksub.py cut points: function, body lines, cut line, live values passed to the tail (+ input
 # loads re-issued there instead).
 MKSUB = [
-    'rv32im_v2_0: 1329 lines, cut at 640 (0.48), live 28 (+90 reloaded)',
-    'rv32im_v2_1: 1238 lines, cut at 592 (0.48), live 32 (+69 reloaded)',
-    'rv32im_v2_2: 1131 lines, cut at 528 (0.47), live 35 (+57 reloaded)',
-    'rv32im_v2_3: 999 lines, cut at 452 (0.45), live 8 (+23 reloaded)',
-    'rv32im_v2_4: 1322 lines, cut at 594 (0.45), live 76 (+2 reloaded)',
-    'rv32im_v2_5: 1283 lines, cut at 581 (0.45), live 15 (+0 reloaded)',
-    'rv32im_v2_6: 1132 lines, cut at 509 (0.45), live 85 (+40 reloaded)',
-    'rv32im_v2_7: 1335 lines, cut at 687 (0.51), live 29 (+10 reloaded)',
-    'rv32im_v2_8: 1023 lines, cut at 481 (0.47), live 35 (+1 reloaded)',
-    'rv32im_v2_9: 1077 lines, cut at 486 (0.45), live 35 (+7 reloaded)',
-    'rv32im_v2_10: 1378 lines, cut at 620 (0.45), live 12 (+36 reloaded)',
-    'rv32im_v2_11: 1088 lines, cut at 489 (0.45), live 102 (+43 reloaded)',
-    'rv32im_v2_12: 1222 lines, cut at 642 (0.53), live 65 (+25 reloaded)',
-    'rv32im_v2_13: 1250 lines, cut at 591 (0.47), live 13 (+51 reloaded)',
-    'rv32im_v2_14: 1240 lines, cut at 672 (0.54), live 43 (+83 reloaded)',
-    'rv32im_v2_15: 1280 lines, cut at 610 (0.48), live 67 (+57 reloaded)',
-    'rv32im_v2_16: 998 lines, cut at 541 (0.54), live 15 (+24 reloaded)',
-    'rv32im_v2_17: 1186 lines, cut at 533 (0.45), live 46 (+18 reloaded)',
-    'rv32im_v2_18: 1038 lines, cut at 504 (0.49), live 19 (+13 reloaded)',
-    'rv32im_v2_19: 1015 lines, cut at 465 (0.46), live 112 (+25 reloaded)',
+    'rv32im_v2_0: 1333 lines, cut at 672 (0.50), live 28 (+89 reloaded)',
+    'rv32im_v2_1: 1228 lines, cut at 571 (0.46), live 32 (+74 reloaded)',
+    'rv32im_v2_2: 1130 lines, cut at 508 (0.45), live 36 (+63 reloaded)',
+    'rv32im_v2_3: 908 lines, cut at 409 (0.45), live 6 (+22 reloaded)',
+    'rv32im_v2_4: 1340 lines, cut at 603 (0.45), live 90 (+2 reloaded)',
+    'rv32im_v2_5: 1288 lines, cut at 701 (0.54), live 13 (+0 reloaded)',
+    'rv32im_v2_6: 1126 lines, cut at 506 (0.45), live 88 (+47 reloaded)',
+    'rv32im_v2_7: 1343 lines, cut at 683 (0.51), live 29 (+10 reloaded)',
+    'rv32im_v2_8: 1031 lines, cut at 485 (0.47), live 35 (+1 reloaded)',
+    'rv32im_v2_9: 1083 lines, cut at 494 (0.46), live 35 (+7 reloaded)',
+    'rv32im_v2_10: 1404 lines, cut at 632 (0.45), live 12 (+35 reloaded)',
+    'rv32im_v2_11: 1124 lines, cut at 505 (0.45), live 92 (+45 reloaded)',
+    'rv32im_v2_12: 1252 lines, cut at 672 (0.54), live 65 (+25 reloaded)',
+    'rv32im_v2_13: 1217 lines, cut at 548 (0.45), live 13 (+57 reloaded)',
+    'rv32im_v2_14: 1247 lines, cut at 644 (0.52), live 44 (+82 reloaded)',
+    'rv32im_v2_15: 1288 lines, cut at 590 (0.46), live 67 (+57 reloaded)',
+    'rv32im_v2_16: 1007 lines, cut at 518 (0.51), live 17 (+26 reloaded)',
+    'rv32im_v2_17: 1185 lines, cut at 533 (0.45), live 50 (+17 reloaded)',
+    'rv32im_v2_18: 1051 lines, cut at 499 (0.47), live 19 (+13 reloaded)',
+    'rv32im_v2_19: 1021 lines, cut at 462 (0.45), live 111 (+25 reloaded)',
 ]
 
 # (pass, extra arguments, lines its output must contain)
@@ -158,11 +158,11 @@ PASSES = [
     ('lazyfp.py', [], ["lazyfp: {'cand': 5987, 'add': 88, 'sub': 494, 'mul': 265}"]),
     ('close.py', ['--chain'], ['close: 231 closures, 157 chained']),
     ('linkext.py', [], ['linkext: 5211 call sites']),
-    ('accfirst_cuda.py', [], ['accfirst_cuda: 209 tail lines, 41 pulled-in defs']),
+    ('accfirst_cuda.py', [], ['accfirst_cuda: 240 tail lines, 41 pulled-in defs']),
     ('mksplit2.py', [], []),
     ('remat_lu.py', ['--maxg', '4', '--maxops', '8'],
-     ["loads 135 {'keep': 41, 'remat': 94} stores 115 dropped 89"]),
-    ('mksm2.py', ['64', '64'], ['main words 85 acc 751 hot 683 | lu words 104 acc 268 hot 188']),
+     ["loads 130 {'keep': 37, 'remat': 93} stores 111 dropped 89"]),
+    ('mksm2.py', ['64', '64'], ['main words 84 acc 767 hot 701 | lu words 84 acc 236 hot 196']),
     ('mksub.py', ['--fns', ','.join('rv32im_v2_%d' % i for i in range(20)), '--lo', '0.45', '--hi', '0.55'],
      MKSUB),
 ]
@@ -315,16 +315,19 @@ def main():
         if ostats != [OPQ_EXPECT]:
             sys.exit('regen: EXPECT failed: opq_hip.py printed\n  %s\nnot\n  %s' % (ostats, OPQ_EXPECT))
         return hip
-    hip = to_hip.convert(hip)
-    # gfx12 (RDNA4) devices compile the variant, every other target the default (archsel_hip.py).
-    default = chain(hip, 24, WMMA_EXPECT, 32, 32, HOIST_EXPECT, SMEM_EXPECT, False, PMLAG_EXPECT)
-    variant = chain(hip, WMMA_GFX12_SLOTS, WMMA_GFX12_EXPECT, SMEM_GFX12_WORDS, SMEM_GFX12_LU_WORDS,
-                    HOIST_GFX12_EXPECT, SMEM_GFX12_EXPECT, True, PMLAG_GFX12_EXPECT)
-    mstats = []
-    hip = archsel_hip.merge(default, variant, '__GFX12__', stats=mstats)
-    if mstats != [ARCHSEL_EXPECT]:
-        sys.exit('regen: EXPECT failed: archsel_hip.py printed\n  %s\nnot\n  %s' % (mstats, ARCHSEL_EXPECT))
-    for path, text, post in ((OUT, new, POST_HEADER), (OUT_HIP, hip, HIP_POST_HEADER)):
+    cuda_only = os.environ.get('REGEN_CUDA_ONLY')
+    if not cuda_only:
+        hip = to_hip.convert(hip)
+        # gfx12 (RDNA4) devices compile the variant, every other target the default (archsel_hip.py).
+        default = chain(hip, 24, WMMA_EXPECT, 32, 32, HOIST_EXPECT, SMEM_EXPECT, False, PMLAG_EXPECT)
+        variant = chain(hip, WMMA_GFX12_SLOTS, WMMA_GFX12_EXPECT, SMEM_GFX12_WORDS, SMEM_GFX12_LU_WORDS,
+                        HOIST_GFX12_EXPECT, SMEM_GFX12_EXPECT, True, PMLAG_GFX12_EXPECT)
+        mstats = []
+        hip = archsel_hip.merge(default, variant, '__GFX12__', stats=mstats)
+        if mstats != [ARCHSEL_EXPECT]:
+            sys.exit('regen: EXPECT failed: archsel_hip.py printed\n  %s\nnot\n  %s' % (mstats, ARCHSEL_EXPECT))
+    _pairs = ((OUT, new, POST_HEADER),) if cuda_only else ((OUT, new, POST_HEADER), (OUT_HIP, hip, HIP_POST_HEADER))
+    for path, text, post in _pairs:
         assert text.count(HEADER_END) == 1
         text = text.replace(HEADER_END, HEADER_END + post)
         bad = [i + 1 for i, l in enumerate(text.split('\n')) if l != l.rstrip()]

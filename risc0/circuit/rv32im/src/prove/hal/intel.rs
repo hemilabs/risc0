@@ -38,7 +38,7 @@ use crate::{
     prove::{witgen::preflight::PreflightTrace, GLOBAL_MIX, GLOBAL_OUT},
     zirgen::{
         circuit::{ExtVal, Val, REGISTER_GROUP_ACCUM, REGISTER_GROUP_DATA},
-        info::POLY_MIX_POWERS,
+        info::{NUM_POLY_MIX_POWERS, POLY_MIX_POWERS},
     },
 };
 
@@ -208,7 +208,7 @@ impl<IH: IntelHash> CircuitHal<IntelHal<IH>> for IntelCircuitHal<IH> {
         let poly_mix_pows = map_pow(poly_mix, POLY_MIX_POWERS);
         // eval_check.cpp hardcodes this count (POLY_MIX_COUNT) and, in the
         // RISC0_INTEL_EVAL_FAST build, reads the quotient table right after it.
-        assert_eq!(poly_mix_pows.len(), 458);
+        assert_eq!(poly_mix_pows.len(), NUM_POLY_MIX_POWERS);
 
         let rou = Val::ROU_FWD[po2 + EXP_PO2];
 

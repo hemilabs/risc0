@@ -153,7 +153,7 @@ def convert(s):
         if n != count:
             sys.exit('to_hip: expected %d of %r, found %d' % (count, pat, n))
     resub(r'EF_LD\((\w+|args\[\d\]), \(uint32_t\)\((\d+)u \* rk_s \+ \(\(rk_c - (\d+)u\) & rk_m\)\)\)',
-          r'EF_LDC(\1, \2u, \3u)', 5973)
+          r'EF_LDC(\1, \2u, \3u)', 5997)
     resub(r'\b(arg\d+)\[(\d+)\]', r'EF_LDU(\1, \2)', 86)
     resub(r'\b((?:s\.|w\.)?lo(?:\[j\])?) \* (::risc0::)?Fp::M\b', r'\2Fp::mulM(\1)', 4)
     sub('#include <cuda_runtime.h>\n', '#if !defined(__HIPCC__)\n#include <cuda_runtime.h>\n#endif\n')
