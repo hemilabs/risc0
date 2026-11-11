@@ -155,11 +155,18 @@ impl ArchivedKernels {
             bail!("metallib is missing kernel(s): {}", missing.join(", "));
         }
 
-        let base = dir.map(|dir| archive_base(&dir, device, unit, bytes, names));
+        let base = dir
+            .as_deref()
+            .and_then(|dir| archive_base(dir, device, unit, bytes, names));
         let mut report = ArchiveReport {
             path: base.as_deref().map(|b| b.with_extension(ARCHIVE_EXT)),
             ..Default::default()
         };
+        if dir.is_some() && base.is_none() {
+            report
+                .errors
+                .push("OS build unknown: binary archive not used".into());
+        }
         let archive = base
             .as_deref()
             .and_then(|base| open_archive(device, base, &mut report));
@@ -249,8 +256,10 @@ pub(crate) fn archive_dir() -> Option<PathBuf> {
 }
 
 /// The OS build (`ProductBuildVersion`, e.g. `25A354`): a new build can bring a new GPU compiler,
-/// whose binaries the old archive does not hold.
-pub(crate) fn os_build() -> String {
+/// whose binaries the old archive does not hold. None when neither the plist nor `sysctl` gives
+/// it: the archive is then not used at all ([archive_base]), because a key without the OS build
+/// would survive an OS update (K8).
+pub(crate) fn os_build() -> Option<String> {
     let plist = std::fs::read_to_string("/System/Library/CoreServices/SystemVersion.plist")
         .unwrap_or_default();
     let from_plist = plist
@@ -259,17 +268,14 @@ pub(crate) fn os_build() -> String {
         .and_then(|rest| rest.split("<string>").nth(1))
         .and_then(|rest| rest.split("</string>").next())
         .map(|s| s.trim().to_string());
-    from_plist
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            std::process::Command::new("/usr/sbin/sysctl")
-                .args(["-n", "kern.osversion"])
-                .output()
-                .ok()
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                .filter(|s| !s.is_empty())
-        })
-        .unwrap_or_else(|| "unknown".into())
+    from_plist.filter(|s| !s.is_empty()).or_else(|| {
+        std::process::Command::new("/usr/sbin/sysctl")
+            .args(["-n", "kern.osversion"])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+    })
 }
 
 /// The archive key: metallib, device, OS build and the kernel names.
@@ -285,16 +291,35 @@ pub(crate) fn archive_key(device_name: &str, os: &str, bytes: &[u8], names: &[&s
 }
 
 /// `<dir>/<unit>-<key>`: the archive file is this plus `-<checksum>.binarchive`
-/// ([archive_file]).
+/// ([archive_file]). None (no archive) when the OS build is unknown ([os_build]).
 pub(crate) fn archive_base(
     dir: &Path,
     device: &DeviceRef,
     unit: &str,
     bytes: &[u8],
     names: &[&str],
-) -> PathBuf {
-    let key = archive_key(device.name(), &os_build(), bytes, names);
-    dir.join(format!("{unit}-{key}"))
+) -> Option<PathBuf> {
+    archive_base_for(
+        dir,
+        device.name(),
+        os_build().as_deref(),
+        unit,
+        bytes,
+        names,
+    )
+}
+
+/// [archive_base] with the device name and OS build given.
+pub(crate) fn archive_base_for(
+    dir: &Path,
+    device_name: &str,
+    os: Option<&str>,
+    unit: &str,
+    bytes: &[u8],
+    names: &[&str],
+) -> Option<PathBuf> {
+    let key = archive_key(device_name, os?, bytes, names);
+    Some(dir.join(format!("{unit}-{key}")))
 }
 
 /// Hex digits of the content checksum in an archive's file name.
@@ -587,7 +612,7 @@ fn save_archive(archive: &BinaryArchiveRef, base: &Path, unit: &str) -> Result<P
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use metal::Device;
     use risc0_circuit_keccak_sys::METAL_LIB;
@@ -659,7 +684,7 @@ mod tests {
         assert_eq!(
             path,
             super::archive_file(
-                &super::archive_base(&dir, &device, "keccak", METAL_LIB, &names),
+                &super::archive_base(&dir, &device, "keccak", METAL_LIB, &names).unwrap(),
                 &content
             )
         );
@@ -700,7 +725,7 @@ mod tests {
         let device = device();
         let dir = temp_dir("corrupt");
         let names = small_set();
-        let base = super::archive_base(&dir, &device, "keccak", METAL_LIB, &names);
+        let base = super::archive_base(&dir, &device, "keccak", METAL_LIB, &names).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         let garbage = b"not a binary archive";
         let wrong_sum = super::archive_file(&base, b"other content");
@@ -890,7 +915,7 @@ mod tests {
             .unwrap();
         let expected = run_scatter(&device, &good).unwrap();
         let path = good.report.path.clone().unwrap();
-        let base = super::archive_base(&dir, &device, "keccak", METAL_LIB, &names);
+        let base = super::archive_base(&dir, &device, "keccak", METAL_LIB, &names).unwrap();
         let bytes = std::fs::read(&path).unwrap();
         let window = 16.min(step);
         let trace = std::env::var("K8_FLIP_TRACE").is_ok();
@@ -1002,7 +1027,27 @@ mod tests {
         ] {
             assert_ne!(base, other);
         }
-        assert!(!super::os_build().is_empty());
+        assert!(super::os_build().is_some_and(|os| !os.is_empty()));
+    }
+
+    /// An unknown OS build disables the archive instead of keying it without the OS (an OS
+    /// update would otherwise keep the old archive). Before K8 the key used "unknown".
+    #[test]
+    fn unknown_os_build_disables_archive() {
+        let dir = Path::new("/nonexistent");
+        assert!(
+            super::archive_base_for(dir, "Apple M5 Max", None, "keccak", b"lib", &["a"]).is_none()
+        );
+        let base =
+            super::archive_base_for(dir, "Apple M5 Max", Some("25A1"), "keccak", b"lib", &["a"])
+                .unwrap();
+        assert_eq!(
+            base,
+            dir.join(format!(
+                "keccak-{}",
+                archive_key("Apple M5 Max", "25A1", b"lib", &["a"])
+            ))
+        );
     }
 
     /// Cold vs warm PSO creation of every keccak kernel (K5 measurement; `--ignored`). Three
@@ -1013,6 +1058,7 @@ mod tests {
     #[test]
     #[ignore]
     fn archive_cold_warm_profile() {
+        let _gpu = super::super::tests::gpu_test_lock();
         let device = device();
         let names = super::super::kernel_names();
         let dir = std::env::var_os("K5_ARCHIVE_DIR")
@@ -1063,6 +1109,7 @@ mod tests {
     #[ignore]
     fn probe_archive_file() {
         let path = PathBuf::from(std::env::var("K5_PROBE_ARCHIVE").expect("K5_PROBE_ARCHIVE"));
+        let _gpu = super::super::tests::gpu_test_lock();
         let device = device();
         let library = device.new_library_with_data(METAL_LIB).unwrap();
         let desc = metal::BinaryArchiveDescriptor::new();
