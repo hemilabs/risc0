@@ -44,7 +44,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, 'eval_check_split.cu')
 CHECK = '--check' in sys.argv[1:]
 TARGET_OPS, GROUP_OPS = 2200, 3000
-EXPECT = 'total ops 12075 leaves 65 groups 6 max leaf 2049'
+EXPECT = 'total ops 12087 leaves 65 groups 6 max leaf 2049'
 target, gtarget = TARGET_OPS, GROUP_OPS
 src = open(os.path.join(HERE, 'eval_check.cu'), newline='').read().split('\n')
 defs = {}; order = []

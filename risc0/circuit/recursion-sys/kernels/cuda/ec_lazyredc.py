@@ -57,7 +57,7 @@ MARK = '// ---- ec_lazyredc.py: lazy Montgomery accumulation of FpExt += poly_mi
 NS = 'namespace risc0::circuit::recursion::cuda {'
 NS_END = '} // namespace risc0::circuit::recursion::cuda'
 # chain terms, folds, chains started from a materialized FpExt, materializations
-EXPECT = (1060, 400, 18, 119)
+EXPECT = (1062, 401, 18, 119)
 
 CHAIN = re.compile(r'^(\s*)FpExt (x\d+) = (x\d+) \+ poly_mix\[(\d+)\] \* (x\d+);$')
 TOK = re.compile(r'\bx\d+\b')
