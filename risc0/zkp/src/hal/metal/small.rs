@@ -123,6 +123,8 @@ impl<MH: MetalHash> MetalHal<MH> {
         let to_add = input.size() / count;
         assert_eq!(output.size(), count * BabyBearExtElem::EXT_SIZE);
         assert_eq!(input.size(), count * to_add);
+        // The kernel writes out[gid + 3 * count] in 32 bits (as CUDA); the input index is 64-bit.
+        to_u32(output.size(), "eltwise_sum output size");
         let args = &[
             output.as_arg(),
             input.as_arg(),
@@ -262,6 +264,8 @@ impl<MH: MetalHash> MetalHal<MH> {
                  {size} with {cycles} cycles"
             );
         }
+        // The kernel reads data[gid * 3 + 2] in 32 bits.
+        to_u32(n * 3, "scatter_bits data length");
         let data = self.copy_from_slice("scatter_bits_data", &bit_data[..n * 3]);
         let count = to_u32(n, "scatter_bits count");
         let args = &[

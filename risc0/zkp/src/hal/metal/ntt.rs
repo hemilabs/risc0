@@ -396,13 +396,16 @@ impl<MH: MetalHash> MetalHal<MH> {
             };
             (name, num_blocks / Z_COUNT, Z_COUNT * shared_sz)
         };
+        // Column strides are 32-bit in the kernel (offsets within a column are < 2^27).
+        let in_stride = u32::try_from(a.in_stride).expect("NTT input column stride exceeds u32");
+        let out_stride = u32::try_from(a.out_stride).expect("NTT output column stride exceeds u32");
         let params = [NttXParams {
             radix: radix as u32,
             lg: lg as u32,
             stage: stage as u32,
             iterations: iterations as u32,
-            in_stride: a.in_stride as u32,
-            out_stride: a.out_stride as u32,
+            in_stride,
+            out_stride,
             lg_expand: a.lg_expand as u32,
             skip_expand: a.skip_expand as u32,
             is_intt: !ct as u32,
@@ -449,7 +452,9 @@ impl<MH: MetalHash> MetalHal<MH> {
             groups: MTLSize::new(groups, cols as u64, 1),
             threads: MTLSize::new(block_size, 1, 1),
         };
-        self.dispatch(self.pipeline(name), &args, grid, &[tg_bytes]);
+        let pso = self.pipeline(name);
+        super::kernels::assert_simd_width(pso, name);
+        self.dispatch(pso, &args, grid, &[tg_bytes]);
     }
 
     /// `ct_x`: forward CT (RN), first pass out of place from `input` (optionally synthesising

@@ -177,6 +177,9 @@ pub(crate) fn batch_evaluate_any<MH: MetalHash>(
             }];
             let p = || KernelArg::Bytes(as_bytes(&params));
             let threads = MTLSize::new(EU_THREADS as u64, 1, 1);
+            for name in ["eu2_main", "eu2_reduce"] {
+                super::kernels::assert_simd_width(hal.pipeline(name), name);
+            }
             hal.dispatch(
                 hal.pipeline("eu2_pows"),
                 &[pw.as_arg(), ps.as_arg(), xs.as_arg(), p()],
@@ -319,4 +322,131 @@ pub(crate) fn mix_poly_coeffs<MH: MetalHash>(
     };
     hal.dispatch(hal.pipeline(kernel.name()), args, grid, &[tg]);
     kernel
+}
+
+#[cfg(test)]
+mod tests_z8a {
+    //! Z8a review tests for the eval_u kernels.
+    use rand::{rngs::SmallRng, Rng, SeedableRng};
+    use risc0_core::field::{
+        baby_bear::{BabyBearElem, BabyBearExtElem},
+        Elem as _,
+    };
+
+    use super::*;
+    use crate::hal::{metal::MetalHalSha256, Hal};
+
+    /// Every kernel with cross-lane code reports 32-wide SIMD groups (the assumption checked by
+    /// `kernels::assert_simd_width` at dispatch).
+    #[test]
+    fn simd_width_is_32() {
+        let hal = MetalHalSha256::new();
+        for name in [
+            "eu2_main",
+            "eu2_reduce",
+            "ct_x_1",
+            "ct_x_8",
+            "ct_x_8_coalesced",
+            "gs_x_1",
+            "gs_x_8",
+            "gs_x_8_coalesced",
+            "mdiv_agg0_e8",
+            "mdiv_agg0_e16",
+            "mdiv_apply_e8",
+            "mdiv_apply_e16",
+            "mdiv_scan_32",
+            "mdiv_scan_1024",
+        ] {
+            super::super::kernels::assert_simd_width(hal.pipeline(name), name);
+        }
+    }
+
+    /// `eu2_main` alone, `Z8A_REPS` times (default 20) on the testutil shape (deg 2^16, 223 polys,
+    /// 865 evals, S = 2), each partial checked against the CPU. Deterministic and exact in normal
+    /// runs; with `MTL_SHADER_VALIDATION=1` (Metal GPU validation) most reps return a few wrong
+    /// partials, see docs/metal-port/notes/Z8a.md. Ignored: a reproducer, not a gate.
+    #[test]
+    #[ignore]
+    fn eu2_main_repeat() {
+        let reps: usize = std::env::var("Z8A_REPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20);
+        let (deg, polys, n_evals, s) = (1usize << 16, 223usize, 865usize, 2u32);
+        let chunk = deg as u32 / s;
+        let mut rng = SmallRng::seed_from_u64(32);
+        let coeffs: Vec<BabyBearElem> = (0..deg * polys)
+            .map(|_| BabyBearElem::random(&mut rng))
+            .collect();
+        let which: Vec<u32> = (0..n_evals)
+            .map(|_| rng.random_range(0..polys as u32))
+            .collect();
+        let xs: Vec<BabyBearExtElem> = (0..n_evals)
+            .map(|_| BabyBearExtElem::random(&mut rng))
+            .collect();
+        let mut want = vec![BabyBearExtElem::ZERO; n_evals * s as usize];
+        for e in 0..n_evals {
+            let poly = &coeffs[which[e] as usize * deg..];
+            for si in 0..s as usize {
+                let base = si * chunk as usize;
+                let mut acc = BabyBearExtElem::ZERO;
+                for i in (0..chunk as usize).rev() {
+                    acc = acc * xs[e] + poly[base + i];
+                }
+                want[e * s as usize + si] = acc * xs[e].pow(base);
+            }
+        }
+        let hal = MetalHalSha256::new();
+        let m_coeffs = hal.copy_from_elem("coeffs", &coeffs);
+        let m_which = hal.copy_from_u32("which", &which);
+        let m_xs = hal.copy_from_extelem("xs", &xs);
+        let pw: BufferImpl<BabyBearExtElem> = hal.alloc_buffer("pw", n_evals * 256);
+        let ps: BufferImpl<BabyBearExtElem> = hal.alloc_buffer("ps", n_evals * s as usize);
+        let params = [Eu2Params {
+            deg: deg as u32,
+            chunk,
+            s,
+            _pad: 0,
+        }];
+        let p = || KernelArg::Bytes(as_bytes(&params));
+        let threads = MTLSize::new(EU_THREADS as u64, 1, 1);
+        hal.dispatch(
+            hal.pipeline("eu2_pows"),
+            &[pw.as_arg(), ps.as_arg(), m_xs.as_arg(), p()],
+            Grid::Groups {
+                groups: MTLSize::new(n_evals as u64, 1, 1),
+                threads,
+            },
+            &[],
+        );
+        let mut bad_reps = 0;
+        for rep in 0..reps {
+            let part: BufferImpl<BabyBearExtElem> = hal.alloc_buffer("part", n_evals * s as usize);
+            hal.dispatch(
+                hal.pipeline("eu2_main"),
+                &[
+                    part.as_arg(),
+                    m_coeffs.as_arg(),
+                    m_which.as_arg(),
+                    m_xs.as_arg(),
+                    pw.as_arg(),
+                    ps.as_arg(),
+                    p(),
+                ],
+                Grid::Groups {
+                    groups: MTLSize::new(s as u64, n_evals as u64, 1),
+                    threads,
+                },
+                &[],
+            );
+            let got = part.to_vec();
+            let bad = (0..got.len()).filter(|&i| got[i] != want[i]).count();
+            if bad > 0 {
+                bad_reps += 1;
+                println!("rep {rep}: {bad} wrong partials");
+            }
+        }
+        println!("eu2_main: {bad_reps}/{reps} reps with wrong partials");
+        assert_eq!(bad_reps, 0);
+    }
 }
