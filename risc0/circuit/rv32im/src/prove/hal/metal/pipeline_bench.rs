@@ -26,8 +26,10 @@
 //!   `A:;B:` (A-vs-A spread).
 //! - `R14_PAIRS` (default 7) rounds after one warm-up round.
 //!
-//! Run alone: `<bin> pipeline_bench --ignored --nocapture --test-threads 1` (it sets process
-//! environment variables between rounds).
+//! Run alone: `<bin> pipeline_bench --ignored --nocapture --test-threads 1`. It sets process
+//! environment variables between rounds, so it refuses to run unless the harness runs one test
+//! at a time (PLAN 8.7: a `setenv` racing another test's `getenv` is a data race), and it holds
+//! the rv32im Metal test lock for its whole run.
 
 use std::{
     sync::{atomic::Ordering, Arc},
@@ -118,8 +120,8 @@ fn apply(kvs: &[(String, String)]) -> Vec<(String, Option<String>)> {
     kvs.iter()
         .map(|(k, v)| {
             let old = std::env::var(k).ok();
-            // SAFETY (edition 2021 API): the bench runs with --test-threads 1 and sets variables
-            // only between rounds, while no prover thread runs.
+            // SAFETY (edition 2021 API): pipeline_bench asserts a single-threaded harness and sets
+            // variables only between rounds, while no prover thread runs.
             if v.is_empty() {
                 std::env::remove_var(k);
             } else {
@@ -197,6 +199,11 @@ fn load_average() -> String {
 #[test]
 #[ignore = "measurement: run alone with --ignored --nocapture --test-threads 1"]
 fn pipeline_bench() {
+    assert!(
+        super::tests::harness_is_single_threaded(),
+        "pipeline_bench sets environment variables: run it with --test-threads 1"
+    );
+    let _lock = super::tests::metal_test_lock();
     let segs = Arc::new(load_segments());
     let variants =
         parse_variants(&std::env::var("R14_VARIANTS").unwrap_or_else(|_| "A:;B:".into()));

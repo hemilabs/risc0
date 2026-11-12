@@ -150,6 +150,10 @@ impl ArchivedKernels {
         names: &[&str],
     ) -> Result<Self> {
         let t0 = Instant::now();
+        // A relative directory (e.g. `RISC0_METAL_ARCHIVE_DIR=rel`) would become a `file://rel/..`
+        // URL that `serializeToURL` cannot open, so nothing would ever be saved: resolve it
+        // against the current directory first.
+        let dir = dir.map(|d| std::path::absolute(&d).unwrap_or(d));
         let library = device
             .new_library_with_data(bytes)
             .map_err(|e| anyhow!("loading metallib ({} bytes): {e}", bytes.len()))?;

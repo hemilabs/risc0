@@ -40,6 +40,34 @@ use crate::{
     MAX_INSN_CYCLES,
 };
 
+/// The rv32im Metal tests' shared lock (PLAN 8.7), poison-tolerant like keccak's
+/// `gpu_test_lock`. Taken for their whole run by the tests that change or depend on
+/// process-wide state: `pipeline_bench` (environment variables between rounds, the
+/// [R14_STATS] counters), the binary-archive tests (archive files, timings), so two of them never
+/// overlap under the default parallel harness, e.g. with `--include-ignored`.
+pub(crate) fn metal_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Whether the test harness runs one test at a time (`--test-threads 1`, `--test-threads=1` or
+/// `RUST_TEST_THREADS=1`). A test that sets environment variables needs this: every other test
+/// may read them (a `getenv` racing a `setenv` is a data race in libc), and a lock taken only by
+/// some tests cannot exclude the readers.
+pub(crate) fn harness_is_single_threaded() -> bool {
+    let args: Vec<String> = std::env::args().collect();
+    for (i, a) in args.iter().enumerate() {
+        if a == "--test-threads" {
+            return args.get(i + 1).is_some_and(|v| v.trim() == "1");
+        }
+        if let Some(v) = a.strip_prefix("--test-threads=") {
+            return v.trim() == "1";
+        }
+    }
+    std::env::var("RUST_TEST_THREADS").is_ok_and(|v| v.trim() == "1")
+}
+
 #[test]
 fn missing_kernels_error_only_when_phase_required() {
     let hal = MetalHalSha256::new();
@@ -373,27 +401,31 @@ fn archive_temp_dir(name: &str) -> std::path::PathBuf {
 /// R14: the rv32im PSOs through the zkp binary archive. A first load into an empty directory
 /// misses every kernel and writes the archive; a second load hits every kernel and writes
 /// nothing; both have a PSO for every requested kernel, with the same thread limits. Small,
-/// quick kernels only (the full set is `archive_cold_start`). Never sets [ARCHIVE_ENV], so it
-/// needs no process-wide test lock; if another process disabled the archive through it the test
-/// only checks the plain load.
-#[test]
-fn archive_roundtrip_small_set() {
-    let hal = MetalHalSha256::new();
+/// quick kernels only (the full set is `archive_cold_start`). The loader is chosen by parameter,
+/// never through [ARCHIVE_ENV]; `RISC0_METAL_ARCHIVE=0` set for the whole process (all units)
+/// leaves no archive, and the test then only checks the load.
+fn archive_roundtrip(hal: &MetalHalSha256, dir: &std::path::Path, abs_dir: &std::path::Path) {
     let names = ["injectCycleCols", "finalizeZeroizeAccum", "ef_combine"];
     let expected: &[(Phase, &[&str])] = &[];
-    let dir = archive_temp_dir("small");
-    let first = Rv32imKernels::load_from_in(
-        &hal,
-        METAL_LIB,
-        &names,
-        expected,
-        Some(dir.clone()),
-        "rv32im",
-    )
-    .unwrap();
-    let Some(r) = first.kernels.archive_report() else {
-        return;
+    let load = || {
+        Rv32imKernels::load_from_in(
+            hal,
+            METAL_LIB,
+            &names,
+            expected,
+            true,
+            Some(dir.to_path_buf()),
+            "rv32im",
+        )
+        .unwrap()
     };
+    let first = load();
+    let Some(r) = first.kernels.archive_report() else {
+        panic!("the archived loader must report");
+    };
+    if r.path.is_none() && r.errors.is_empty() {
+        return; // archive disabled for the process (or the OS build is unknown)
+    }
     assert!(r.errors.is_empty(), "{r:?}");
     assert_eq!(
         (r.hits, r.misses, r.loaded, r.saved),
@@ -401,16 +433,14 @@ fn archive_roundtrip_small_set() {
         "{r:?}"
     );
     let path = r.path.clone().unwrap();
-    assert!(path.starts_with(&dir) && path.exists(), "{path:?}");
-    let second = Rv32imKernels::load_from_in(
-        &hal,
-        METAL_LIB,
-        &names,
-        expected,
-        Some(dir.clone()),
-        "rv32im",
-    )
-    .unwrap();
+    assert!(path.starts_with(abs_dir), "{path:?} not in {abs_dir:?}");
+    let saved: Vec<_> = std::fs::read_dir(abs_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".binarchive"))
+        .collect();
+    assert_eq!(saved.len(), 1, "one archive file in {abs_dir:?}");
+    let second = load();
     let r = second.kernels.archive_report().unwrap();
     assert!(r.errors.is_empty(), "{r:?}");
     assert_eq!(
@@ -438,44 +468,62 @@ fn archive_roundtrip_small_set() {
         .function_names()
         .iter()
         .any(|f| f == "eval_check"));
+}
+
+#[test]
+fn archive_roundtrip_small_set() {
+    let _lock = metal_test_lock();
+    let hal = MetalHalSha256::new();
+    let dir = archive_temp_dir("small");
+    archive_roundtrip(&hal, &dir, &dir);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// R14 fix 1: a relative archive directory (`RISC0_METAL_ARCHIVE_DIR=rel`) is resolved against
+/// the current directory; before, the archive's `file://rel/..` URL could not be opened and
+/// nothing was ever saved. The relative path is built from the current directory to a temp
+/// directory, so the test changes no process-wide state (no `chdir`).
+#[test]
+fn archive_roundtrip_relative_dir() {
+    let _lock = metal_test_lock();
+    let hal = MetalHalSha256::new();
+    let abs = archive_temp_dir("relative");
+    let cwd = std::env::current_dir().unwrap();
+    let mut rel = std::path::PathBuf::new();
+    for _ in cwd.components().skip(1) {
+        rel.push("..");
+    }
+    rel.push(abs.strip_prefix("/").unwrap());
+    assert!(rel.is_relative());
+    archive_roundtrip(&hal, &rel, &std::path::absolute(&rel).unwrap());
+    let _ = std::fs::remove_dir_all(&abs);
 }
 
 /// R14 measurement: cold and warm PSO creation of the full rv32im set ([METAL_KERNEL_NAMES] and
 /// [EXPECTED_KERNELS]): the plain loader, then the archive into an empty directory (misses), then
 /// the archive again (hits). Run with `MTL_SHADER_CACHE_SIZE=0` (OS shader cache off) to see
-/// cold times: `<bin> archive_cold_start --ignored --nocapture --test-threads 1`. It sets
-/// [ARCHIVE_ENV] for the plain load.
+/// cold times: `<bin> archive_cold_start --ignored --nocapture --test-threads 1`. The loader is
+/// chosen by parameter (no environment change); the test lock keeps the other archive tests and
+/// the pipeline bench out of the timings.
 #[test]
 #[ignore = "measurement: cold PSO builds take minutes; run alone"]
 fn archive_cold_start() {
+    let _lock = metal_test_lock();
     let hal = MetalHalSha256::new();
     let dir = archive_temp_dir("cold");
     let order = std::env::var("R14_ARCHIVE_ORDER").unwrap_or_else(|_| "plain,miss,hit".into());
     for step in order.split(',') {
         let t = std::time::Instant::now();
-        let k = if step == "plain" {
-            std::env::set_var(ARCHIVE_ENV, "0");
-            let k = Rv32imKernels::load_from_in(
-                &hal,
-                METAL_LIB,
-                METAL_KERNEL_NAMES,
-                EXPECTED_KERNELS,
-                None,
-                "rv32im",
-            );
-            std::env::remove_var(ARCHIVE_ENV);
-            k
-        } else {
-            Rv32imKernels::load_from_in(
-                &hal,
-                METAL_LIB,
-                METAL_KERNEL_NAMES,
-                EXPECTED_KERNELS,
-                Some(dir.clone()),
-                "rv32im",
-            )
-        }
+        let plain = step == "plain";
+        let k = Rv32imKernels::load_from_in(
+            &hal,
+            METAL_LIB,
+            METAL_KERNEL_NAMES,
+            EXPECTED_KERNELS,
+            !plain,
+            (!plain).then(|| dir.clone()),
+            "rv32im",
+        )
         .unwrap();
         eprintln!(
             "[r14] archive {step}: {:.2} s, report {:?}",

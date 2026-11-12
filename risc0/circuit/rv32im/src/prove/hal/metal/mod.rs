@@ -187,16 +187,27 @@ impl Rv32imKernels {
         listed: &[&str],
         expected: &[(Phase, &[&'static str])],
     ) -> Result<Self> {
-        Self::load_from_in(hal, bytes, listed, expected, None, ARCHIVE_UNIT)
+        Self::load_from_in(
+            hal,
+            bytes,
+            listed,
+            expected,
+            use_archive(),
+            None,
+            ARCHIVE_UNIT,
+        )
     }
 
-    /// Load `bytes`, building the PSOs through the binary archive in `archive_dir` (None: no
-    /// archive) under `unit`, unless [ARCHIVE_ENV] selects the plain loader.
+    /// Load `bytes`. With `archived` (production: [use_archive], i.e. [ARCHIVE_ENV] unset or not
+    /// `0`) the PSOs are built concurrently through the binary archive in `archive_dir` (None: no
+    /// archive) under `unit`; without it, by the plain pre-R14 loader. The loader choice is a
+    /// parameter so tests never have to set [ARCHIVE_ENV] (process-wide state, PLAN 8.7).
     fn load_from_in<MH: MetalHash>(
         hal: &MetalHal<MH>,
         bytes: &[u8],
         listed: &[&str],
         expected: &[(Phase, &[&'static str])],
+        archived: bool,
         archive_dir: Option<std::path::PathBuf>,
         unit: &str,
     ) -> Result<Self> {
@@ -220,7 +231,7 @@ impl Rv32imKernels {
         }
         // Names listed by rv32im-sys must be present (both loaders fail fast otherwise).
         let t = std::time::Instant::now();
-        let kernels = if use_archive() {
+        let kernels = if archived {
             let k = ArchivedKernels::new_in(archive_dir, &hal.device, unit, bytes, &wanted)?;
             let r = &k.report;
             tracing::info!(
@@ -279,6 +290,7 @@ impl Rv32imKernels {
                     bytes,
                     METAL_KERNEL_NAMES,
                     EXPECTED_KERNELS,
+                    use_archive(),
                     archive::archive_dir(),
                     unit,
                 )
