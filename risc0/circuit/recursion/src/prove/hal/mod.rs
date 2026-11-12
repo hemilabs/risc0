@@ -81,6 +81,9 @@ pub(crate) trait CircuitWitnessGenerator<H: Hal> {
     }
 
     /// `value` in the last `zk` rows of every column.
+    // Set aside with the fork's row-pass witgen fast path (v3.1.0 uses independent-random
+    // tail blinding instead); kept for re-application. See the v3.1.0 rebase decision log.
+    #[allow(dead_code)]
     fn fill_tail(
         &self,
         _buf: &H::Buffer<H::Elem>,
