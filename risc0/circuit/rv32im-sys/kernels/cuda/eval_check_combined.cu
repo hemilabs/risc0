@@ -16,7 +16,10 @@
 
 namespace risc0::circuit::rv32im_v2::cuda {
 
-// poly_mix is defined in eval_check.cuh (included by eval_check_0.cu)
+// 3.1.0's eval_check.cuh declares poly_mix `extern` (the NVIDIA path defines it in a
+// separate object). This ROCm-only combined build is one TU compiled without -dc and
+// links no such object, so it must own the definition itself.
+__constant__ FpExt poly_mix[kNumPolyMixPows];
 
 #ifdef __HIPCC__
 // RDNA4: 128 threads reduces scratch working set → better cache reuse
