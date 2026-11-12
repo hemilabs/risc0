@@ -248,8 +248,10 @@ impl<IH: IntelHash> CircuitHal<IntelHal<IH>> for IntelCircuitHal<IH> {
 
         if use_multipass {
             // 2-way multi-pass: allocate intermediate buffer, run pass1 then pass2
-            // Intermediate: 197 Fp (u32) + 9 FpExt (7 by-val + 2 x34 cross-boundary)
-            let n_inter_fp = 197 * domain;
+            // Intermediate: 196 Fp (u32) + 9 FpExt (7 by-val + 2 x34 cross-boundary).
+            // These counts are re-derived for the v3.1.0 circuit and MUST match
+            // gen_multipass.py (len(CROSS_X33_INDICES) and 7 + len(CROSS_X34_INDICES)).
+            let n_inter_fp = 196 * domain;
             let n_inter_ext = 9 * domain * 4;
             let verbose = std::env::var_os("RISC0_VERBOSE").is_some();
             let t0 = if verbose {
@@ -429,14 +431,14 @@ mod tests {
     };
 
     /// Whether the 2-way multipass eval_check kernel is built for the current
-    /// circuit. Deferred (`false`) for the risc0 v3.1.0 rebase: the
-    /// cross-boundary live-set in `gen_multipass.py` is pinned to the
-    /// pre-3.1.0 circuit DAG and has not been re-derived, so it emits stub
-    /// pass1/pass2 entry points that error at runtime. Mono
-    /// (`RISC0_INTEL_EVAL_FAST`) is the production path. Flip to `true` once
-    /// `gen_multipass.py`'s `MULTIPASS_SUPPORTED` is set and the constants are
-    /// re-derived; the multipass assertions below then run again.
-    const MULTIPASS_SUPPORTED: bool = false;
+    /// circuit. Re-derived (`true`) for the risc0 v3.1.0 circuit: the
+    /// cross-boundary live-set in `gen_multipass.py` (CROSS_X33_INDICES,
+    /// BOUNDARY_BYVAL_EXTS, CROSS_X34_INDICES) was recomputed from the v3.1.0
+    /// mono amalgamation and its buffer counts mirrored above. Mono
+    /// (`RISC0_INTEL_EVAL_FAST`) remains the production path; multipass is
+    /// opt-in (`RISC0_MULTIPASS`). The multipass assertions below run and
+    /// gate bit-exactness vs mono and CPU.
+    const MULTIPASS_SUPPORTED: bool = true;
 
     /// Process-global lock acquired by every test that mutates env vars.
     /// `cargo test` runs in parallel by default and `libc::setenv` is not
@@ -840,8 +842,6 @@ mod tests {
 
     /// 2. Random differential — Intel multipass path matches CPU reference.
     #[test]
-    #[ignore = "multipass deferred for the v3.1.0 circuit — gen_multipass.py \
-                MULTIPASS_SUPPORTED=False (stub kernel); mono is production"]
     fn eval_check_random_multipass() {
         const PO2: usize = 4;
         let params = EvalCheckParams::random(PO2, SEED_RANDOM);
@@ -855,8 +855,6 @@ mod tests {
     /// multipass would miss a shared kernel bug where both produce the
     /// same wrong answer; anchoring against CPU closes that gap.
     #[test]
-    #[ignore = "multipass deferred for the v3.1.0 circuit — gen_multipass.py \
-                MULTIPASS_SUPPORTED=False (stub kernel); mono is production"]
     fn eval_check_mono_vs_multipass() {
         const PO2: usize = 4;
         let params = EvalCheckParams::random(PO2, SEED_RANDOM);

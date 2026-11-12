@@ -14,23 +14,30 @@ Usage: python3 gen_multipass.py <mono_amalg.cpp> <pass1_output.cpp> <pass2_outpu
 import re
 import sys
 
-# --- v3.1.0 rebase: multipass deferred -------------------------------------
-# Every constant below (the v10->v9 split boundary, CROSS_X33_INDICES,
-# BOUNDARY_BYVAL_EXTS, CROSS_X34_INDICES, the v9 arg mapping, and PM=458 in the
-# kernel wrappers) is pinned to the PRE-3.1.0 circuit DAG. risc0 v3.1.0
-# regenerated the rv32im circuit: the split function's arg2 is no longer the
-# x34 FpExt array (so pass1 no longer compiles), the cross-boundary live-set
-# differs, and poly_mix is now 484 wide, not 458. A wrong derivation would not
-# fail to build loudly -- it would emit a silently-incorrect kernel.
-#
-# Multipass is an opt-in, off-by-default perf experiment (RISC0_MULTIPASS),
-# set nowhere in production; the shipping Intel path is the mono
-# RISC0_INTEL_EVAL_FAST kernel. Until the cross-boundary live-set is re-derived
-# for the v3.1.0 circuit, emit stub pass1/pass2 entry points that fail loudly
-# at runtime instead of generating wrong code. Flip to True (and re-derive the
-# constants below) to re-enable. Kept parallel to the deferred ROCm gfx12 WMMA
-# perf path. See risc0-v3.1.0-rebase notes.
-MULTIPASS_SUPPORTED = False
+# --- v3.1.0 rebase: multipass re-derived --------------------------------
+# The cross-boundary constants below (CROSS_X33_INDICES, BOUNDARY_BYVAL_EXTS,
+# CROSS_X34_INDICES) and PM=484 were re-derived for the risc0 v3.1.0 rv32im
+# circuit DAG by a dataflow analysis of the mono amalgamation
+# (intel_eval_check_mono.cpp). The poly_fp accumulator chain threads two local
+# arrays -- x33 (Fp[1018]) and x34 (FpExt[125]) -- plus the running FpExt total
+# (passed by value) down through rv32im_v2_19..0. Splitting at the v10->v9 call
+# means pass2 (v9..v0) must see exactly the x33/x34 slots and by-value args that
+# v10..v19 produced. Because each vN renumbers its locals, the identity of the
+# x33/x34 arrays is followed by propagating the parameter position through every
+# vN->v(N-1) call from poly_fp's v19 call (where they are literally x33/x34):
+#   CROSS_X33 = {k : x33[k] written by v10..v19} ∩ {k : x33[k] read by v9..v0}.
+#   CROSS_X34 = the same intersection on the x34[] FpExt array.
+# A slot read by v9..v0 and NOT written by the preamble, by v10..v19, or by
+# v9..v0 itself would be an uninitialized read -- the completeness invariant
+# (verified: no such slot exists) is what makes this set provably sufficient.
+#   BOUNDARY_BYVAL_EXTS = the 7 by-value FpExt args at the v10->v9 call, in
+#   storage order; pass2's v9 call reorders them to v9's parameter order.
+#   Buffer sizes are mirrored in rv32im/src/prove/hal/intel.rs
+#   (n_inter_fp = len(CROSS_X33), n_inter_ext = 7 + len(CROSS_X34)) -- keep in sync.
+#   Validated bit-exact vs mono and CPU by the eval_check_*_multipass tests (PO2=4).
+#   Multipass stays opt-in (RISC0_MULTIPASS), set nowhere in production; mono
+#   RISC0_INTEL_EVAL_FAST remains the shipping Intel path.
+MULTIPASS_SUPPORTED = True
 
 
 def gen_stub(pass_num):
@@ -66,32 +73,35 @@ def gen_stub(pass_num):
     )
 
 
-# Cross-boundary x33 indices (197 indices, computed from amalgamation analysis)
+# Cross-boundary x33 indices (196): x33[k] written in pass1 (v10..v19) and read
+# in pass2 (v9..v0), from the dataflow analysis of the v3.1.0 mono described above.
 CROSS_X33_INDICES = [
-    123, 127, 130, 133, 135, 179, 184, 198, 207, 221, 247, 278, 279, 280, 282, 292,
-    306, 310, 325, 349, 355, 368, 371, 382, 384, 388, 389, 390, 391, 392, 396, 398,
-    399, 413, 425, 426, 428, 433, 435, 445, 446, 447, 448, 449, 450, 451, 452, 453,
-    454, 455, 456, 457, 470, 471, 472, 473, 475, 481, 488, 492, 493, 506, 507, 508,
-    509, 510, 533, 538, 539, 540, 541, 542, 543, 544, 563, 570, 581, 589, 593, 597,
-    601, 602, 621, 622, 623, 624, 625, 626, 627, 628, 629, 630, 631, 632, 633, 634,
-    635, 637, 661, 662, 663, 664, 665, 666, 667, 668, 669, 670, 671, 696, 697, 698,
-    699, 700, 703, 704, 705, 706, 707, 708, 709, 710, 711, 712, 713, 714, 715, 716,
-    717, 718, 719, 720, 721, 724, 729, 730, 732, 733, 734, 735, 736, 737, 738, 739,
-    740, 741, 742, 743, 744, 745, 746, 747, 748, 749, 751, 752, 753, 754, 755, 756,
-    757, 758, 759, 760, 761, 858, 860, 861, 867, 946, 955, 967, 969, 970, 971, 972,
-    973, 974, 979, 981, 982, 983, 984, 986, 988, 989, 990, 991, 992, 993, 994, 996,
-    997, 999, 1000, 1004, 1006,
+    124, 129, 132, 135, 137, 183, 197, 206, 238, 253, 270, 271, 272, 274, 285, 299,
+    300, 305, 320, 344, 362, 365, 376, 377, 385, 387, 388, 403, 404, 405, 406, 409,
+    414, 416, 422, 428, 430, 434, 435, 441, 443, 444, 445, 446, 447, 448, 449, 450,
+    451, 452, 453, 463, 464, 465, 466, 468, 474, 481, 504, 505, 506, 507, 508, 538,
+    544, 545, 546, 547, 548, 549, 550, 569, 572, 577, 589, 597, 601, 605, 609, 610,
+    629, 630, 631, 633, 634, 635, 636, 637, 638, 639, 640, 641, 642, 643, 644, 645,
+    646, 650, 673, 674, 675, 676, 677, 678, 679, 680, 681, 682, 683, 708, 709, 710,
+    711, 712, 713, 716, 717, 718, 719, 720, 721, 722, 723, 724, 725, 726, 727, 728,
+    729, 730, 731, 732, 733, 734, 737, 742, 743, 745, 746, 747, 748, 749, 750, 751,
+    752, 753, 754, 755, 756, 757, 758, 759, 760, 761, 762, 763, 764, 765, 766, 767,
+    768, 769, 770, 771, 772, 773, 774, 867, 869, 870, 876, 960, 969, 981, 983, 984,
+    985, 986, 987, 988, 992, 994, 995, 996, 997, 999, 1001, 1002, 1003, 1004, 1006, 1008,
+    1009, 1010, 1015, 1017,
 ]
 
 PASS1_FNS = list(range(19, 9, -1))  # 19..10
 PASS2_FNS = list(range(9, -1, -1))   # 9..0
 
 # The by-value FpExt args at the v10→v9 boundary
-BOUNDARY_BYVAL_EXTS = ['x1368', 'x708', 'x699', 'arg23', 'arg24', 'arg25', 'arg26']
+BOUNDARY_BYVAL_EXTS = ['x1396', 'x745', 'x736', 'arg23', 'arg24', 'arg25', 'arg26']
 
-# Cross-boundary x34 (FpExt) indices: written by pass1 (v13/v12), read by pass2 (v9).
-# x34[1] is written by v13, x34[3] is written by v12, both read by v9.
-# (x34[0] and x34[2] are also written by pass1 but only read internally by pass1's v11.)
+# Cross-boundary x34 (FpExt) indices: arg2[k] written by pass1 (v10..v19) and
+# read by pass2 (v9..v0). v3.1.0: x34[1] is written by v13 and read by v9;
+# x34[3] is written by v12 and read by v9. Neither is written by the poly_fp
+# preamble, so both must cross (a pass2 that omits x34[1] reads an
+# uninitialized FpExt slot). Derived by the dataflow analysis described above.
 CROSS_X34_INDICES = [1, 3]
 
 
