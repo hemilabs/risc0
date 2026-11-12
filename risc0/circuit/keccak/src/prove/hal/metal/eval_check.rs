@@ -40,7 +40,10 @@
 //! - `RISC0_KECCAK_METAL_EVAL_MACC=lazy|strict`: the stage kernels with the lazy
 //!   multiply-accumulate (default; ~44% less eval_check time at po2 17, bit-identical) or K4's
 //!   (`eval_strict_stage_<k>`, built on first use);
-//! - `RISC0_KECCAK_METAL_EVAL_CHUNK` (default now 16384, K4's 32768).
+//! - `RISC0_KECCAK_METAL_EVAL_CHUNK` (K7: 16384, K4: 32768; K9: unset or `auto` picks the chunk
+//!   per call, see [auto_chunk]: 32768 when the domain spans at least
+//!   [LARGE_CHUNK_MIN_CHUNKS] such chunks and the working-set budget has room for the larger
+//!   scratch, else 16384; a number fixes the chunk, so `=16384` restores K7's behaviour).
 //!
 //! A tiled scratch layout and a runtime threadgroup size were measured and showed no change, so
 //! they are not kept (K7.md).
@@ -96,9 +99,27 @@ use crate::{
 /// with half the peak memory; 8192 was 30% slower (too few threads per dispatch to hide latency
 /// on 40 cores). 16384 threads still fill a 10-core GPU many times over.
 /// `RISC0_KECCAK_METAL_EVAL_CHUNK=32768` restores K4's value.
+///
+/// K9: this is the base chunk of the automatic choice ([auto_chunk]), which takes
+/// [LARGE_EVAL_CHUNK] instead for large domains when the budget allows.
 pub const DEFAULT_EVAL_CHUNK: u32 = 16384;
 
-/// Overrides [DEFAULT_EVAL_CHUNK] (cycles per chunk; for the K7 sweep).
+/// The larger chunk [auto_chunk] picks when it pays and fits (K9; K4's default). On a quiet
+/// M5 Max it makes eval_check ~6% faster at po2 16-18 (half the dispatches: 58 stages per chunk,
+/// ~40 us of GPU drain/fill each), and ~10 ms slower at po2 13-14, where the domain is only 1-2
+/// such chunks and the extra 541 MB of fresh private memory (paged in per call) costs more than
+/// the dispatches it saves. Measurements in docs/metal-port/notes/K9.md.
+pub const LARGE_EVAL_CHUNK: u32 = 32768;
+
+/// [auto_chunk] takes [LARGE_EVAL_CHUNK] only when the domain is at least this many such chunks
+/// (po2 16 and up: 2^18 cycles): a fixed cost (allocating the larger scratch) against a gain per
+/// chunk (the dispatches saved). The crossover measured on the M5 Max is between 4 (po2 15, no
+/// change) and 8 chunks (po2 16, faster); it is a ratio of the domain to the chunk, not a
+/// property of the core count.
+pub const LARGE_CHUNK_MIN_CHUNKS: u32 = 8;
+
+/// Overrides the automatic chunk ([auto_chunk]) with a fixed number of cycles per chunk (K7's
+/// sweep; `16384` reverts K9 to K7's fixed default); `auto` (or unset) is the automatic choice.
 pub const EVAL_CHUNK_ENV: &str = "RISC0_KECCAK_METAL_EVAL_CHUNK";
 
 /// The smallest chunk the launcher shrinks to when the scratch does not fit the working-set
@@ -122,6 +143,31 @@ pub(super) fn fit_chunk(want: u32, allocated: u64, limit: u64) -> u32 {
         chunk /= 2;
     }
     chunk
+}
+
+/// The chunk eval_check runs with over a domain of `domain` cycles when no fixed chunk is set
+/// (K9): [LARGE_EVAL_CHUNK] if the domain is at least [LARGE_CHUNK_MIN_CHUNKS] of them and the
+/// larger scratch fits in `free` bytes (the HAL's `gpu_free_memory`: the working-set limit
+/// minus what the budget counts as allocated), else [DEFAULT_EVAL_CHUNK] (capped at the
+/// domain). `cached` is the stride of a scratch kept from an earlier call (0 if none): that
+/// one is freed before the new one is allocated, so only the difference must fit.
+///
+/// The memory test is exact because eval_check is the peak of a keccak proof (K7: every phase
+/// before it allocates less, and the scratch is freed before the phases after it), and the
+/// scratch is the last thing it allocates: so `allocated + scratch_bytes(LARGE) <= limit` is
+/// "the proof's peak with the larger chunk fits the budget". The extra bytes come from the
+/// circuit's scratch/carry sizes ([scratch_bytes]); at the 4 GiB budget po2 17 keeps 16384
+/// (3411 MiB allocated + 1082 MiB > 4096 MiB) and at 8 GiB po2 18 takes 32768 (6833 + 1082).
+/// [fit_chunk] still halves the chosen chunk if even that does not fit.
+pub(super) fn auto_chunk(domain: u32, free: u64, cached: u32) -> u32 {
+    let large = LARGE_EVAL_CHUNK.min(EVAL_MAX_STRIDE);
+    if large > DEFAULT_EVAL_CHUNK && domain / LARGE_CHUNK_MIN_CHUNKS >= large {
+        let need = scratch_bytes(large).saturating_sub(scratch_bytes(cached));
+        if need <= free {
+            return large;
+        }
+    }
+    DEFAULT_EVAL_CHUNK.min(domain)
 }
 
 /// Selects the stage kernels: `lazy` (default; K7's lazy multiply-accumulate, ~40% faster) or
@@ -154,8 +200,11 @@ struct EvalScratch {
 
 /// The circuit HAL's eval_check state.
 pub(super) struct EvalCheckState {
-    /// Cycles per chunk ([DEFAULT_EVAL_CHUNK], [EVAL_CHUNK_ENV], [MetalCircuitHal::set_eval_chunk]).
-    chunk: Cell<u32>,
+    /// Fixed cycles per chunk ([EVAL_CHUNK_ENV], [MetalCircuitHal::set_eval_chunk]), or None for
+    /// the automatic choice ([auto_chunk], K9).
+    chunk: Cell<Option<u32>>,
+    /// The chunk the last call ran with (0 before the first; tests and measurements).
+    last_chunk: Cell<u32>,
     /// Keep the scratch cached after a call ([MetalCircuitHal::set_keep_eval_scratch]).
     keep: Cell<bool>,
     scratch: RefCell<Option<EvalScratch>>,
@@ -170,17 +219,21 @@ pub(super) struct EvalCheckState {
 impl EvalCheckState {
     pub(super) fn new() -> Self {
         let chunk = match std::env::var(EVAL_CHUNK_ENV) {
+            Ok(text) if matches!(text.trim(), "" | "auto") => None,
             Ok(text) => match text.trim().parse::<u32>() {
-                Ok(c) if c > 0 => c,
+                Ok(c) if c > 0 => Some(c.min(EVAL_MAX_STRIDE)),
                 _ => {
-                    tracing::error!("{EVAL_CHUNK_ENV}={text:?} is not a positive cycle count; using {DEFAULT_EVAL_CHUNK}");
-                    DEFAULT_EVAL_CHUNK
+                    tracing::error!(
+                        "{EVAL_CHUNK_ENV}={text:?} is not auto or a positive cycle count; using auto"
+                    );
+                    None
                 }
             },
-            Err(_) => DEFAULT_EVAL_CHUNK,
+            Err(_) => None,
         };
         Self {
-            chunk: Cell::new(chunk.min(EVAL_MAX_STRIDE)),
+            chunk: Cell::new(chunk),
+            last_chunk: Cell::new(0),
             keep: Cell::new(false),
             scratch: RefCell::new(None),
             strict: Cell::new(strict_from_env()),
@@ -209,8 +262,9 @@ pub(super) fn vanishing_quotients(po2: usize) -> [u32; 4] {
 }
 
 impl<MH: MetalHash> MetalCircuitHal<MH> {
-    /// Cycles per eval_check chunk (the scratch stride) for later calls; a smaller chunk takes
-    /// less memory (33 KB a cycle) and more dispatches. Panics if 0 or above `EVAL_MAX_STRIDE`.
+    /// Cycles per eval_check chunk (the scratch stride) for later calls, fixed in place of the
+    /// automatic choice; a smaller chunk takes less memory (33 KB a cycle) and more dispatches.
+    /// Panics if 0 or above `EVAL_MAX_STRIDE`.
     // Tuning/memory knobs for tests, K7 and the miner; not called by the prover itself.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn set_eval_chunk(&self, cycles: u32) {
@@ -218,7 +272,14 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
             cycles > 0 && cycles <= EVAL_MAX_STRIDE,
             "eval_check chunk {cycles} not in 1..={EVAL_MAX_STRIDE}"
         );
-        self.eval.chunk.set(cycles);
+        self.eval.chunk.set(Some(cycles));
+    }
+
+    /// Later calls choose the chunk per call ([auto_chunk], the default unless
+    /// `RISC0_KECCAK_METAL_EVAL_CHUNK` is a number).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn set_eval_chunk_auto(&self) {
+        self.eval.chunk.set(None);
     }
 
     /// Whether later calls run the strict stage kernels (K4's code) instead of the lazy ones.
@@ -227,11 +288,17 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
         self.eval.strict.set(strict);
     }
 
-    /// Cycles per eval_check chunk.
+    /// The fixed cycles per eval_check chunk, or None when it is chosen per call ([auto_chunk]).
     // Tuning/memory knobs for tests, K7 and the miner; not called by the prover itself.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub fn eval_chunk(&self) -> u32 {
+    pub fn eval_chunk(&self) -> Option<u32> {
         self.eval.chunk.get()
+    }
+
+    /// The cycles per chunk the last eval_check ran with (0 before the first).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn last_eval_chunk(&self) -> u32 {
+        self.eval.last_chunk.get()
     }
 
     /// Whether eval_check keeps its scratch and carry (about 0.5 GB at the default chunk) cached for
@@ -392,8 +459,16 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
             .copy_from_slice::<ExtVal>("eval_poly_mix", &poly_mix_pows);
         let quot = vanishing_quotients(po2);
 
-        let want = self.eval.chunk.get().min(domain);
+        let want = match self.eval.chunk.get() {
+            Some(c) => c.min(domain),
+            None => {
+                let cached = self.eval.scratch.borrow().as_ref().map_or(0, |s| s.stride);
+                auto_chunk(domain, self.hal.gpu_free_memory() as u64, cached)
+            }
+        };
         let (scratch, carry, stride, chunk) = self.eval_scratch(want);
+        self.eval.last_chunk.set(chunk);
+        tracing::debug!("keccak eval_check: po2 {po2}, chunk {chunk} (wanted {want})");
         assert!(stride <= EVAL_MAX_STRIDE && chunk <= stride);
         assert!(EVAL_SCRATCH_ELEMS as u64 * stride as u64 <= 1 << 32);
         assert!(EVAL_CARRY_WORDS as u64 * stride as u64 <= 1 << 32);
@@ -504,8 +579,8 @@ mod tests {
     use test_log::test;
 
     use super::{
-        fit_chunk, scratch_bytes, vanishing_quotients, MetalCircuitHal, DEFAULT_EVAL_CHUNK,
-        MIN_EVAL_CHUNK,
+        auto_chunk, fit_chunk, scratch_bytes, vanishing_quotients, MetalCircuitHal,
+        DEFAULT_EVAL_CHUNK, EVAL_CARRY_WORDS, EVAL_SCRATCH_ELEMS, LARGE_EVAL_CHUNK, MIN_EVAL_CHUNK,
     };
     use crate::{
         prove::{
@@ -546,6 +621,18 @@ mod tests {
         eval_check_impl(params, hal.as_ref(), circuit_hal)
     }
 
+    /// The Metal check polynomial for `params` with the chunk the prover picks ([auto_chunk]);
+    /// returns it and the chunk it ran with.
+    fn metal_check_auto(
+        hal: &Rc<MetalHalSha256>,
+        circuit_hal: &MetalCircuitHal<risc0_zkp::hal::metal::MetalHashSha256>,
+        params: &EvalCheckParams,
+    ) -> (Vec<Val>, u32) {
+        circuit_hal.set_eval_chunk_auto();
+        let check = eval_check_impl(params, hal.as_ref(), circuit_hal);
+        (check, circuit_hal.last_eval_chunk())
+    }
+
     /// The four host quotients equal the CPU HAL's per-cycle `1 / ((3 x)^(2^po2) - 1)`.
     #[test]
     fn vanishing_quotients_match_cpu() {
@@ -564,8 +651,8 @@ mod tests {
         }
     }
 
-    /// Bit-exact against the CPU HAL at `po2s`, at the default chunk (one chunk up to po2 12,
-    /// 2^(po2 - 12) chunks above).
+    /// Bit-exact against the CPU HAL at `po2s`, with the prover's automatic chunk (16384 up to
+    /// po2 15, 32768 from po2 16 when the budget allows: K9).
     fn matches_cpu(po2s: &[usize]) {
         let _gpu = super::super::tests::gpu_test_lock();
         let hal = Rc::new(MetalHalSha256::new());
@@ -574,9 +661,9 @@ mod tests {
             let params = EvalCheckParams::new(po2);
             let expected = cpu_check(&params);
             let t0 = Instant::now();
-            let actual = metal_check(&hal, &circuit_hal, &params, DEFAULT_EVAL_CHUNK);
+            let (actual, chunk) = metal_check_auto(&hal, &circuit_hal, &params);
             println!(
-                "po2 {po2}: {EVAL_STAGES} stages, domain {}, chunk {DEFAULT_EVAL_CHUNK}: Metal eval_check {:.3} s (incl. upload/readback)",
+                "po2 {po2}: {EVAL_STAGES} stages, domain {}, chunk {chunk}: Metal eval_check {:.3} s (incl. upload/readback)",
                 params.domain,
                 t0.elapsed().as_secs_f64()
             );
@@ -607,7 +694,8 @@ mod tests {
         }
     }
 
-    /// PO2 17 (domain 2^19: 32 chunks of 16384 at the default chunk); ~10 GB of host memory.
+    /// PO2 17 (domain 2^19: 16 chunks of 32768 with room in the budget, else 32 of 16384);
+    /// ~10 GB of host memory.
     #[test]
     #[ignore]
     fn eval_check_matches_cpu_po2_17() {
@@ -615,7 +703,8 @@ mod tests {
     }
 
     /// R17 audit: `R17_AUDIT_REPS` (default 10) Metal eval_checks of one `R17_AUDIT_PO2` (default
-    /// 17) input, each compared bit for bit with the first and with the CPU HAL. Prints
+    /// 17) input, each compared bit for bit with the first and with the CPU HAL, with the
+    /// prover's automatic chunk (K9) unless `R17_AUDIT_CHUNK` fixes one. Prints
     /// `R17AUDIT keccak eval_check ...: k/n` (all 58 stages run in every rep).
     #[test]
     #[ignore]
@@ -623,6 +712,9 @@ mod tests {
         let _gpu = super::super::tests::gpu_test_lock();
         let reps: usize = std::env::var("R17_AUDIT_REPS").map_or(10, |v| v.parse().unwrap());
         let po2: usize = std::env::var("R17_AUDIT_PO2").map_or(17, |v| v.parse().unwrap());
+        let fixed_chunk: Option<u32> = std::env::var("R17_AUDIT_CHUNK")
+            .ok()
+            .map(|v| v.parse().unwrap());
         let hal = Rc::new(MetalHalSha256::new());
         let circuit_hal = MetalCircuitHal::new(hal.clone());
         let params = EvalCheckParams::new(po2);
@@ -632,7 +724,10 @@ mod tests {
         let mut detail = vec![];
         let t0 = Instant::now();
         for rep in 0..reps {
-            let actual = metal_check(&hal, &circuit_hal, &params, DEFAULT_EVAL_CHUNK);
+            let actual = match fixed_chunk {
+                Some(c) => metal_check(&hal, &circuit_hal, &params, c),
+                None => metal_check_auto(&hal, &circuit_hal, &params).0,
+            };
             let n = actual.iter().zip(&expected).filter(|(a, b)| a != b).count();
             if n > 0 {
                 vs_cpu += 1;
@@ -650,8 +745,9 @@ mod tests {
             }
         }
         println!(
-            "R17AUDIT keccak eval_check po2 {po2} ({EVAL_STAGES} stages): {vs_first}/{reps} reps \
-             differ from rep 0, {vs_cpu}/{reps} differ from CPU ({:.2} s/rep) {detail:?}",
+            "R17AUDIT keccak eval_check po2 {po2} ({EVAL_STAGES} stages, chunk {}): {vs_first}/{reps} \
+             reps differ from rep 0, {vs_cpu}/{reps} differ from CPU ({:.2} s/rep) {detail:?}",
+            circuit_hal.last_eval_chunk(),
             t0.elapsed().as_secs_f64() / reps as f64
         );
         assert_eq!(vs_first + vs_cpu, 0);
@@ -955,6 +1051,41 @@ mod tests {
         assert_eq!(fit_chunk(32768, 3452 << 20, 4 << 30), 16384);
     }
 
+    /// K9: the automatic chunk takes 32768 only for domains of at least 8 such chunks (po2 16
+    /// up) and only when the larger scratch fits the free memory, counting a cached scratch
+    /// that would be freed first.
+    #[test]
+    fn auto_chunk_follows_domain_and_budget() {
+        let large = LARGE_EVAL_CHUNK;
+        let po2_domain = |po2: u32| 4u32 << po2;
+        let roomy = u64::MAX;
+        // Domain too small for the larger chunk to pay (po2 13-15), or below one base chunk.
+        assert_eq!(auto_chunk(po2_domain(8), roomy, 0), 1024);
+        assert_eq!(auto_chunk(po2_domain(12), roomy, 0), DEFAULT_EVAL_CHUNK);
+        assert_eq!(auto_chunk(po2_domain(15), roomy, 0), DEFAULT_EVAL_CHUNK);
+        // Large domains with room.
+        for po2 in 16..=18 {
+            assert_eq!(auto_chunk(po2_domain(po2), roomy, 0), large);
+        }
+        // Exactly the larger scratch free: fits; one byte less: the base chunk.
+        let need = scratch_bytes(large);
+        assert_eq!(auto_chunk(po2_domain(17), need, 0), large);
+        assert_eq!(auto_chunk(po2_domain(17), need - 1, 0), DEFAULT_EVAL_CHUNK);
+        // A cached base-chunk scratch is freed first: only the difference must be free.
+        let diff = scratch_bytes(large) - scratch_bytes(DEFAULT_EVAL_CHUNK);
+        assert_eq!(auto_chunk(po2_domain(17), diff, DEFAULT_EVAL_CHUNK), large);
+        assert_eq!(
+            auto_chunk(po2_domain(17), diff - 1, DEFAULT_EVAL_CHUNK),
+            DEFAULT_EVAL_CHUNK
+        );
+        assert_eq!(auto_chunk(po2_domain(17), 0, large), large);
+        // The extra memory is the circuit's scratch + carry for 16384 more cycles (~541 MB).
+        assert_eq!(
+            diff,
+            (EVAL_SCRATCH_ELEMS as u64 + EVAL_CARRY_WORDS as u64) * 4 * 16384
+        );
+    }
+
     /// PSO creation and GPU time per stage (measurement, prints a table). `K4_PROFILE_PO2`
     /// (default 17) and `RISC0_KECCAK_METAL_EVAL_CHUNK` pick the shape. Each stage's time is the
     /// sum over the chunks of (encode + commit + wait) of its dispatch, synced one at a time.
@@ -1019,18 +1150,15 @@ mod tests {
         let mut stages = Vec::new();
         run(Some(&mut stages));
         let mib = |b: u64| b as f64 / (1u64 << 20) as f64;
+        let chunk = circuit_hal.last_eval_chunk();
         println!(
             "po2 {po2}: {EVAL_STAGES} stages, domain {}, chunk {} ({} chunks), scratch {:.1} MiB; \
              eval_check (batched, one sync) {:.3} s; per-stage synced sum {:.3} s; \
              PSO creation total {:.3} s",
             params.domain,
-            circuit_hal.eval_chunk().min(params.domain as u32),
-            params
-                .domain
-                .div_ceil(circuit_hal.eval_chunk().min(params.domain as u32) as usize),
-            mib(scratch_bytes(
-                circuit_hal.eval_chunk().min(params.domain as u32)
-            )),
+            chunk,
+            params.domain.div_ceil(chunk as usize),
+            mib(scratch_bytes(chunk)),
             batched.as_secs_f64(),
             stages.iter().sum::<Duration>().as_secs_f64(),
             pso_times.iter().sum::<Duration>().as_secs_f64(),
