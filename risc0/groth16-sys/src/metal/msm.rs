@@ -524,15 +524,36 @@ fn pso(device: &DeviceRef, lib: &LibraryRef, name: &str) -> Result<ComputePipeli
 
 impl MsmKernels {
     pub fn new(device: &DeviceRef, lib: &LibraryRef) -> Result<Self> {
+        Self::from_source(
+            device,
+            lib,
+            &super::pipelines::PsoSource::plain(device, lib),
+        )
+    }
+
+    /// Take the eager PSOs from `src` (item G11: the binary archive, or a plain build); the lazy
+    /// revert-path ones are built plainly from `lib` on first use.
+    pub fn from_source(
+        device: &DeviceRef,
+        lib: &LibraryRef,
+        src: &super::pipelines::PsoSource,
+    ) -> Result<Self> {
+        let curve = |g: &str| -> Result<CurvePsos> {
+            Ok(CurvePsos {
+                buckets: src.pso(&format!("msm_buckets_{g}"))?,
+                segment_reduce: src.pso(&format!("msm_segment_reduce_{g}"))?,
+                window_reduce: src.pso(&format!("msm_window_reduce_{g}"))?,
+            })
+        };
         let k = Self {
-            clear: pso(device, lib, "msm_clear")?,
-            hist_count: pso(device, lib, "msm_hist_count")?,
-            window_scan: pso(device, lib, "msm_window_scan")?,
-            scatter: pso(device, lib, "msm_scatter")?,
+            clear: src.pso("msm_clear")?,
+            hist_count: src.pso("msm_hist_count")?,
+            window_scan: src.pso("msm_window_scan")?,
+            scatter: src.pso("msm_scatter")?,
             g1: Default::default(),
             g2: Default::default(),
-            g1w: curve_psos(device, lib, "g1w")?,
-            g2w: curve_psos(device, lib, "g2w")?,
+            g1w: curve("g1w")?,
+            g2w: curve("g2w")?,
             device: device.to_owned(),
             lib: lib.to_owned(),
         };

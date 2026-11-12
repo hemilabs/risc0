@@ -15,6 +15,9 @@ risc0-build-kernel = { workspace = true }
 anyhow = "1.0.98"
 blst = { version = "0.3.15", optional = true }
 risc0-sys = { workspace = true, optional = true }
+# Metal: the shared MTLBinaryArchive module (`risc0_zkp::hal::metal::archive`) for the groth16
+# pipelines (item G11).
+risc0-zkp = { workspace = true, optional = true }
 sppark = { workspace = true, optional = true }
 # Metal Groth16 prover host side (src/metal/): BN254 reference arithmetic, SRS/zkey parsing, host-side
 # group operations (blinding, Horner) and polynomial domains. Same versions risc0-groth16 already uses.
@@ -46,6 +49,8 @@ intel = []
 metal = [
   "dep:risc0-sys",
   "risc0-sys/metal",
+  "dep:risc0-zkp",
+  "risc0-zkp/metal",
   "dep:metal",
   "dep:ark-bn254",
   "dep:ark-ec",

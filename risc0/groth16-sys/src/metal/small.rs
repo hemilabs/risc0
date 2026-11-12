@@ -37,7 +37,7 @@
 
 use std::ffi::c_void;
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use ark_bn254::Fr;
 use ark_ff::{BigInt, Field};
 use metal::{
@@ -249,14 +249,12 @@ pub struct SmallKernels {
 impl SmallKernels {
     /// Build the PSOs from `library` (normally `device.new_library_with_data(METAL_LIB)`).
     pub fn new(device: &DeviceRef, library: &LibraryRef) -> Result<Self> {
-        let pso = |name: &str| -> Result<ComputePipelineState> {
-            let f = library
-                .get_function(name, None)
-                .map_err(|e| anyhow!("groth16 metallib: kernel {name}: {e}"))?;
-            device
-                .new_compute_pipeline_state_with_function(&f)
-                .map_err(|e| anyhow!("groth16 metallib: pipeline {name}: {e}"))
-        };
+        Self::from_source(&super::pipelines::PsoSource::plain(device, library))
+    }
+
+    /// Take the PSOs from `src` (item G11: the binary archive, or a plain build).
+    pub fn from_source(src: &super::pipelines::PsoSource) -> Result<Self> {
+        let pso = |name: &str| src.pso(name);
         Ok(Self {
             fr_mul: pso("fr_mul")?,
             fr_mul_sub_from_mont: pso("fr_mul_sub_from_mont")?,
