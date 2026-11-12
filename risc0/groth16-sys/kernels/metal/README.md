@@ -27,4 +27,15 @@ SYCL prover in `../intel` is the template.
   (`(s, value index)` pairs into a table of distinct values, per-row output indices; built and
   disk-cached by `src/metal/compact.rs`); same summation order as `witness_into_poly`, so
   bit-identical.
+- `msm_window.metal` (item G12) holds `msm_window_reduce_*`, compiled with every function
+  always_inline: with out-of-line point additions in its loops (the R17 shape) the G2 kernel
+  returned wrong window sums under concurrent GPU load. `msm_reduce.metal` keeps the out-of-line
+  additions of the bucket and segment kernels (inlining them was 8 % slower and 2.7x the cold
+  pipeline compile; no wrong result was found in them).
+- Item G12 (docs/metal-port/notes/G12.md): `msm_sort.metal`'s `msm_len_*` kernels list each
+  window's pieces longest first after the sort, and `msm_reduce.metal`'s `msm_buckets_perm_*`
+  sum them in that order (the SIMD lanes of a group then add about as many points each).
+  `bn254_g12.h` (lazy-reduction Fp2 product, mulhi REDC step) and `g12_bench.metal` (those, and
+  a batch-affine accumulation probe) are measured and rejected variants, used only by the tests
+  `g12_fast_field_ops` and `g12_batch_affine_probe`.
 - With no `.metal` file present the metallib is an empty file and the name list is empty.

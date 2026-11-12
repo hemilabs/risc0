@@ -41,6 +41,22 @@
 //   sorted[w * n + pos] = i for each (i, w) with digit d != 0, pos taken from the cursor of
 //   bucket d. Grid: n threads. The order inside a bucket is not deterministic (the sum is).
 //
+// Length order (item G12; MsmParams::lenperm), after msm_scatter, over the bucket-cut pieces:
+// msm_len_clear    0 lhist uint[nwins * MSM_LEN_BINS]  1 constant MsmParams
+//   lhist = 0. Grid: nwins * MSM_LEN_BINS threads.
+// msm_len_count    0 offset  1 hist (bucket ends)  2 lhist atomic_uint  3 constant MsmParams
+//   lhist[w][min(len, bins - 1)] += 1 for every piece of window w. Grid: (nbuckets, nwins).
+// msm_len_scan     0 lhist (counts in; exclusive starts out, longest bin first)
+//                  1 constant MsmParams. Grid: nwins threads.
+// msm_len_scatter  0 offset  1 hist  2 piece_off  3 lhist atomic_uint (cursors)
+//                  4 perm uint[nwins * max_pieces] (out)  5 constant MsmParams
+//   perm[w][pos] = piece index, pos from the cursor of the piece's length bin: the pieces of a
+//   window listed longest first, so that the 32 lanes of a SIMD group of msm_buckets_perm sum
+//   pieces of about the same length (msm_buckets: consecutive pieces, i.e. buckets of any size,
+//   and a SIMD group runs as long as its largest). The order inside a bin is not deterministic;
+//   every piece is still summed by one thread in entry order, so the outputs are.
+//   Grid: (nbuckets, nwins).
+//
 // Booth digits (MsmParams::booth, item G9): bucket |d| of a signed digit (msm_digit_booth),
 // nbuckets = 2^(c-1) + 1, and sorted entries i | MSM_NEG for d < 0 (n < 2^31, host-checked).
 
@@ -149,5 +165,79 @@ kernel void msm_scatter(const device uint32_t* scalars [[buffer(0)]],
           atomic_fetch_add_explicit(&hist[w * p.nbuckets + d], 1u, memory_order_relaxed);
       sorted[(size_t)w * p.n + pos] = gid | (neg ? MSM_NEG : 0u);
     }
+  }
+}
+
+// Item G12 length order (see the header).
+[[max_total_threads_per_threadgroup(256)]]
+kernel void msm_len_clear(device uint32_t* lhist [[buffer(0)]],
+                          constant MsmParams& p [[buffer(1)]],
+                          uint gid [[thread_position_in_grid]]) {
+  if (gid >= p.nwins * MSM_LEN_BINS)
+    return;
+  lhist[gid] = 0;
+}
+
+[[max_total_threads_per_threadgroup(256)]]
+kernel void msm_len_count(const device uint32_t* offset [[buffer(0)]],
+                          const device uint32_t* hist [[buffer(1)]],
+                          device atomic_uint* lhist [[buffer(2)]],
+                          constant MsmParams& p [[buffer(3)]],
+                          uint2 gid [[thread_position_in_grid]]) {
+  const uint32_t b = gid.x;
+  const uint32_t w = gid.y;
+  if (b >= p.nbuckets || w >= p.nwins)
+    return;
+  const size_t at = (size_t)w * p.nbuckets + b;
+  const uint32_t c = hist[at] - offset[at];
+  if (c == 0)
+    return;
+  const uint32_t T = p.piece;
+  device atomic_uint* lh = lhist + (size_t)w * MSM_LEN_BINS;
+  if (c / T)
+    atomic_fetch_add_explicit(&lh[min(T, MSM_LEN_BINS - 1)], c / T, memory_order_relaxed);
+  if (c % T)
+    atomic_fetch_add_explicit(&lh[min(c % T, MSM_LEN_BINS - 1)], 1u, memory_order_relaxed);
+}
+
+[[max_total_threads_per_threadgroup(256)]]
+kernel void msm_len_scan(device uint32_t* lhist [[buffer(0)]],
+                         constant MsmParams& p [[buffer(1)]],
+                         uint w [[thread_position_in_grid]]) {
+  if (w >= p.nwins)
+    return;
+  device uint32_t* lh = lhist + (size_t)w * MSM_LEN_BINS;
+  uint32_t a = 0;
+  for (uint32_t k = MSM_LEN_BINS; k-- > 0;) {
+    uint32_t c = lh[k];
+    lh[k] = a;
+    a += c;
+  }
+}
+
+[[max_total_threads_per_threadgroup(256)]]
+kernel void msm_len_scatter(const device uint32_t* offset [[buffer(0)]],
+                            const device uint32_t* hist [[buffer(1)]],
+                            const device uint32_t* piece_off [[buffer(2)]],
+                            device atomic_uint* lhist [[buffer(3)]],
+                            device uint32_t* perm [[buffer(4)]],
+                            constant MsmParams& p [[buffer(5)]],
+                            uint2 gid [[thread_position_in_grid]]) {
+  const uint32_t b = gid.x;
+  const uint32_t w = gid.y;
+  if (b >= p.nbuckets || w >= p.nwins)
+    return;
+  const size_t at = (size_t)w * p.nbuckets + b;
+  const uint32_t c = hist[at] - offset[at];
+  const uint32_t T = p.piece;
+  device atomic_uint* lh = lhist + (size_t)w * MSM_LEN_BINS;
+  device uint32_t* pw = perm + (size_t)w * p.max_pieces;
+  uint32_t pc = piece_off[at];
+  for (uint32_t done = 0; done < c; done += T, pc++) {
+    uint32_t len = min(T, c - done);
+    uint32_t pos = atomic_fetch_add_explicit(&lh[min(len, MSM_LEN_BINS - 1)], 1u,
+                                             memory_order_relaxed);
+    if (pos < p.max_pieces) // the pieces of a window fit (host bound); keeps a bad call in bounds
+      pw[pos] = pc;
   }
 }

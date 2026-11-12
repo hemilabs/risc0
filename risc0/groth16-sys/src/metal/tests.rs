@@ -1545,6 +1545,232 @@ fn g9_fast_field_ops() {
     }
 }
 
+/// G12: `bn254_g12.h` formulations (lazy-reduction Fp2 product, mulhi REDC step) against the
+/// G9 kernels, bit-exact on random and edge inputs, and their GPU time, interleaved (indicative).
+/// `G12_MICRO_REPS` (default 3) rounds.
+#[test]
+fn g12_fast_field_ops() {
+    let _lock = crate::metal::test_lock::shared();
+    let Some(gpu) = Gpu::new() else { return };
+    let f = fp();
+    let mut rng = Rng::new(0x12);
+    let reps: usize = std::env::var("G12_MICRO_REPS").map_or(3, |v| v.parse().unwrap());
+    // Edge values first (0, 1, 2, p - 1, p - 2), then random ones.
+    let edges: Vec<L> = {
+        let p = f.p;
+        let one = [1u64, 0, 0, 0];
+        let two = [2u64, 0, 0, 0];
+        vec![
+            [0; 4],
+            one,
+            two,
+            p_minus(&p, 1),
+            p_minus(&p, 2),
+            f.random(&mut rng),
+        ]
+    };
+    let fill = |n: usize, rng: &mut Rng| -> Vec<u32> {
+        let mut w = Vec::with_capacity(n * 8);
+        for i in 0..n {
+            let v = if i < edges.len() * 2 {
+                edges[i % edges.len()]
+            } else {
+                f.random(rng)
+            };
+            words_of(&v, &mut w);
+        }
+        w
+    };
+
+    // Fp2 products: 2^19 threads x 64 products.
+    let count = 1usize << 19;
+    let p = Params {
+        count: count as u32,
+        iters: 64,
+        ..Default::default()
+    };
+    let bin = gpu.buf(&fill(count * 2, &mut rng));
+    // One-product check over all edge pairs (iters = 1, every in[gid] * in[gid + 1]).
+    let p1 = Params { iters: 1, ..p };
+    for (a, b) in [
+        ("g12_bench_fp2_mul_l", "g12_bench_fp2_mul_r"),
+        ("g12_bench_fp2_mul_l", "g12_bench_fp2_mul_rh"),
+        ("g12_bench_fp2_mul_l", "g12_bench_fp2_mul_lh"),
+    ] {
+        let (oa, ob) = (gpu.out(count * 16), gpu.out(count * 16));
+        gpu.run(a, &[&oa, &bin], p1);
+        gpu.run(b, &[&ob, &bin], p1);
+        assert_eq!(
+            Gpu::read(&oa, count * 16),
+            Gpu::read(&ob, count * 16),
+            "{b} differs from {a} (one product)"
+        );
+        let (mut ta, mut tb) = (Vec::new(), Vec::new());
+        for _ in 0..reps {
+            ta.push(gpu.run(a, &[&oa, &bin], p));
+            tb.push(gpu.run(b, &[&ob, &bin], p));
+        }
+        assert_eq!(
+            Gpu::read(&oa, count * 16),
+            Gpu::read(&ob, count * 16),
+            "{b} differs from {a}"
+        );
+        g9_print(a, b, ta, tb);
+    }
+
+    // Mixed additions: 2^18 threads x 64 additions over 4096 "points" of field elements.
+    let np = 4096usize;
+    let count = 1usize << 18;
+    let p = Params {
+        count: count as u32,
+        iters: 64,
+        k: np as u32,
+        ..Default::default()
+    };
+    for (a, b, coords) in [
+        ("g9_bench_madd_g1f", "g12_bench_madd_g1h", 2usize),
+        ("g9_bench_madd_g2l", "g12_bench_madd_g2r", 4),
+        ("g9_bench_madd_g2l", "g12_bench_madd_g2rh", 4),
+        ("g9_bench_madd_g2l", "g12_bench_madd_g2lh", 4),
+    ] {
+        let bpts = gpu.buf(&fill(np * coords, &mut rng));
+        let out_words = count * 8 * 2 * coords;
+        let (oa, ob) = (gpu.out(out_words), gpu.out(out_words));
+        let (mut ta, mut tb) = (Vec::new(), Vec::new());
+        for _ in 0..reps {
+            ta.push(gpu.run(a, &[&oa, &bpts], p));
+            tb.push(gpu.run(b, &[&ob, &bpts], p));
+        }
+        assert_eq!(
+            Gpu::read(&oa, out_words),
+            Gpu::read(&ob, out_words),
+            "{b} differs from {a}"
+        );
+        g9_print(a, b, ta, tb);
+    }
+}
+
+/// G12 track 2 probe (ignored, timing only): batch-affine accumulation with K slots per thread
+/// against XYZZ mixed additions, same number of additions. `G12_BA_K` (default "8,16,32,64"),
+/// `G12_BA_LOG_SLOTS` (default 18), `G12_BA_ITERS` (default 64).
+#[test]
+#[ignore]
+fn g12_batch_affine_probe() {
+    let _lock = crate::metal::test_lock::exclusive();
+    let Some(gpu) = Gpu::new() else { return };
+    let f = fp();
+    let mut rng = Rng::new(0x13);
+    let reps: usize = std::env::var("G12_MICRO_REPS").map_or(5, |v| v.parse().unwrap());
+    let ks: Vec<u32> = std::env::var("G12_BA_K")
+        .unwrap_or_else(|_| "8,16,32,64".into())
+        .split(',')
+        .map(|v| v.parse().unwrap())
+        .collect();
+    let np = 4096usize;
+    let slots: usize = 1 << std::env::var("G12_BA_LOG_SLOTS").map_or(18, |v| v.parse().unwrap());
+    let iters: u32 = std::env::var("G12_BA_ITERS").map_or(64, |v| v.parse().unwrap());
+    for (g, coords, madd) in [
+        ("g2", 4usize, "g9_bench_madd_g2l"),
+        ("g1", 2, "g9_bench_madd_g1f"),
+    ] {
+        let mut w = Vec::new();
+        for _ in 0..np * coords {
+            words_of(&f.random(&mut rng), &mut w);
+        }
+        let bpts = gpu.buf(&w);
+        let mut w = Vec::new();
+        for _ in 0..slots * coords {
+            words_of(&f.random(&mut rng), &mut w);
+        }
+        let acc0 = w;
+        let pm = Params {
+            count: slots as u32,
+            iters,
+            k: np as u32,
+            ..Default::default()
+        };
+        let om = gpu.out(slots * 8 * 2 * coords);
+        let mut tm = Vec::new();
+        let mut tk: Vec<Vec<f64>> = vec![Vec::new(); ks.len()];
+        let pre = gpu.out(slots * 8 * coords / 2);
+        for _ in 0..reps {
+            tm.push(gpu.run(madd, &[&om, &bpts], pm));
+            for (i, &k) in ks.iter().enumerate() {
+                let acc = gpu.buf(&acc0);
+                let p = Params { op: k, ..pm };
+                let name = format!("g12_bench_batch_affine_{g}");
+                tk[i].push(gpu.run_grid(&name, &[&acc, &bpts, &pre], p, slots / k as usize));
+            }
+        }
+        let med = |v: &mut Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2] * 1e3
+        };
+        println!("G12BA {g} madd {:.2} ms", med(&mut tm));
+        for (i, &k) in ks.iter().enumerate() {
+            println!("G12BA {g} batch-affine K={k} {:.2} ms", med(&mut tk[i]));
+        }
+    }
+    let count = 1usize << 16;
+    let mut w = Vec::new();
+    for _ in 0..count * 2 {
+        words_of(&f.random(&mut rng), &mut w);
+    }
+    let bin = gpu.buf(&w);
+    let o = gpu.out(count * 16);
+    let p = Params {
+        count: count as u32,
+        iters: 4,
+        ..Default::default()
+    };
+    let mut t = Vec::new();
+    for _ in 0..reps {
+        t.push(gpu.run("g12_bench_fp2_inv", &[&o, &bin], p));
+    }
+    t.sort_by(f64::total_cmp);
+    println!(
+        "G12BA fp2 inv: {:.2} ms for {} inversions",
+        t[t.len() / 2] * 1e3,
+        count * 4
+    );
+}
+
+/// G12 profile helper (ignored): the PSO limits of the MSM point kernels (a register-pressure
+/// indicator: `maxTotalThreadsPerThreadgroup` drops below 1024 when a thread needs many registers).
+#[test]
+#[ignore]
+fn g12_pso_limits() {
+    let _lock = crate::metal::test_lock::shared();
+    let Some(gpu) = Gpu::new() else { return };
+    for name in crate::metal::msm::MSM_KERNEL_NAMES
+        .iter()
+        .copied()
+        .chain(["g9_bench_madd_g2l", "g9_bench_madd_g1f"])
+    {
+        let f = gpu.lib.get_function(name, None).unwrap();
+        let pso = gpu
+            .device
+            .new_compute_pipeline_state_with_function(&f)
+            .unwrap();
+        println!(
+            "G12PSO {name}: max threads {} width {}",
+            pso.max_total_threads_per_threadgroup(),
+            pso.thread_execution_width()
+        );
+    }
+}
+
+/// p - k for a small k.
+fn p_minus(p: &L, k: u64) -> L {
+    let mut r = *p;
+    let (v, b) = r[0].overflowing_sub(k);
+    r[0] = v;
+    if b {
+        r[1] -= 1;
+    }
+    r
+}
+
 fn g9_print(a: &str, b: &str, mut ta: Vec<f64>, mut tb: Vec<f64>) {
     let reps = ta.len();
     ta.sort_by(f64::total_cmp);

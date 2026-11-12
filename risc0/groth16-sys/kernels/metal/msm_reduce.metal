@@ -39,13 +39,13 @@
 //                             8 constant MsmParams
 //   Grid: (max_pieces, wcount) threads; thread (p, wl) handles piece p of window w0 + wl.
 //   With MsmParams::booth (item G9), a sorted entry with MSM_NEG adds the negated point.
+// msm_buckets_perm_{g1w,g2w}  (item G12) msm_buckets' buffers, 9 perm uint[nwins * max_pieces]
+//                             (msm_len_scatter); thread (t, wl) sums piece perm[w][t].
 // msm_segment_reduce_{g1,g2}  0 pieces  1 piece_bucket  2 totals
 //                             3 partial Xyzz[nwins * max_segs] (out)  4 constant MsmParams
 //   Grid: (max_segs, wcount) threads; partial[w][s] = sum over the segment's pieces of
 //   bucket(piece) * piece.
-// msm_window_reduce_{g1,g2}   0 partial  1 totals  2 wsum Xyzz[nwins] (out)
-//                             3 constant MsmParams  threadgroup(0) Xyzz[threads]
-//   Grid: nwins threadgroups of a power-of-two width; wsum[w] = sum of window w's partials.
+// msm_window_reduce_{g1,g2,g1w,g2w}: in msm_window.metal (item G12).
 
 #include "bn254.h"
 #include "bn254_fast.h"
@@ -69,24 +69,14 @@ template <class F> inline Xyzz<F> msm_mul_var(Xyzz<F> p, uint32_t k) {
   return acc;
 }
 
+// Sums piece pc of window w0 + wl (msm_buckets, msm_buckets_perm).
 template <class F>
-kernel void msm_buckets(const device Affine<F>* points [[buffer(0)]],
-                        const device uint32_t* sorted [[buffer(1)]],
-                        const device uint32_t* offset [[buffer(2)]],
-                        const device uint32_t* hist [[buffer(3)]],
-                        const device uint32_t* piece_off [[buffer(4)]],
-                        const device uint32_t* totals [[buffer(5)]],
-                        device Xyzz<F>* pieces [[buffer(6)]],
-                        device uint32_t* piece_bucket [[buffer(7)]],
-                        constant MsmParams& p [[buffer(8)]],
-                        uint2 gid [[thread_position_in_grid]]) {
-  const uint32_t pc = gid.x;
-  const uint32_t wl = gid.y;
-  if (wl >= p.wcount)
-    return;
+inline void msm_bucket_piece(const device Affine<F>* points, const device uint32_t* sorted,
+                             const device uint32_t* offset, const device uint32_t* hist,
+                             const device uint32_t* piece_off, device Xyzz<F>* pieces,
+                             device uint32_t* piece_bucket, constant MsmParams& p, uint32_t pc,
+                             uint32_t wl) {
   const uint32_t w = p.w0 + wl;
-  if (pc >= totals[2 * w + 1] || pc >= p.max_pieces)
-    return;
   const uint32_t nb = p.nbuckets;
   const device uint32_t* poff = piece_off + (size_t)w * nb;
 
@@ -123,6 +113,55 @@ kernel void msm_buckets(const device Affine<F>* points [[buffer(0)]],
   const size_t out = (size_t)wl * p.max_pieces + pc;
   pieces[out] = acc;
   piece_bucket[out] = b;
+}
+
+template <class F>
+kernel void msm_buckets(const device Affine<F>* points [[buffer(0)]],
+                        const device uint32_t* sorted [[buffer(1)]],
+                        const device uint32_t* offset [[buffer(2)]],
+                        const device uint32_t* hist [[buffer(3)]],
+                        const device uint32_t* piece_off [[buffer(4)]],
+                        const device uint32_t* totals [[buffer(5)]],
+                        device Xyzz<F>* pieces [[buffer(6)]],
+                        device uint32_t* piece_bucket [[buffer(7)]],
+                        constant MsmParams& p [[buffer(8)]],
+                        uint2 gid [[thread_position_in_grid]]) {
+  const uint32_t pc = gid.x;
+  const uint32_t wl = gid.y;
+  if (wl >= p.wcount)
+    return;
+  const uint32_t w = p.w0 + wl;
+  if (pc >= totals[2 * w + 1] || pc >= p.max_pieces)
+    return;
+  msm_bucket_piece(points, sorted, offset, hist, piece_off, pieces, piece_bucket, p, pc, wl);
+}
+
+// Item G12: msm_buckets with thread t summing piece perm[w][t] (msm_len_scatter: the pieces
+// longest first), so that a SIMD group's lanes sum pieces of about the same length. Same outputs.
+//   Grid: (max_pieces bound at n, wcount).
+template <class F>
+kernel void msm_buckets_perm(const device Affine<F>* points [[buffer(0)]],
+                             const device uint32_t* sorted [[buffer(1)]],
+                             const device uint32_t* offset [[buffer(2)]],
+                             const device uint32_t* hist [[buffer(3)]],
+                             const device uint32_t* piece_off [[buffer(4)]],
+                             const device uint32_t* totals [[buffer(5)]],
+                             device Xyzz<F>* pieces [[buffer(6)]],
+                             device uint32_t* piece_bucket [[buffer(7)]],
+                             constant MsmParams& p [[buffer(8)]],
+                             const device uint32_t* perm [[buffer(9)]],
+                             uint2 gid [[thread_position_in_grid]]) {
+  const uint32_t t = gid.x;
+  const uint32_t wl = gid.y;
+  if (wl >= p.wcount)
+    return;
+  const uint32_t w = p.w0 + wl;
+  if (t >= totals[2 * w + 1] || t >= p.max_pieces)
+    return;
+  const uint32_t pc = perm[(size_t)w * p.max_pieces + t];
+  if (pc >= p.max_pieces)
+    return;
+  msm_bucket_piece(points, sorted, offset, hist, piece_off, pieces, piece_bucket, p, pc, wl);
 }
 
 template <class F>
@@ -163,36 +202,6 @@ kernel void msm_segment_reduce(const device Xyzz<F>* pieces [[buffer(0)]],
   partial[(size_t)w * p.max_segs + s] = total;
 }
 
-template <class F>
-kernel void msm_window_reduce(const device Xyzz<F>* partial [[buffer(0)]],
-                              const device uint32_t* totals [[buffer(1)]],
-                              device Xyzz<F>* wsum [[buffer(2)]],
-                              constant MsmParams& p [[buffer(3)]],
-                              threadgroup Xyzz<F>* tg [[threadgroup(0)]],
-                              uint w [[threadgroup_position_in_grid]],
-                              uint tid [[thread_position_in_threadgroup]],
-                              uint nthr [[threads_per_threadgroup]]) {
-  if (w >= p.nwins)
-    return;
-  const uint32_t np = min(totals[2 * w + 1], p.max_pieces);
-  const uint32_t nsegs = (np + p.seg - 1) / p.seg;
-  Xyzz<F> acc = Xyzz<F>::inf();
-  for (uint32_t j = tid; j < nsegs; j += nthr)
-    acc = acc.add(partial[(size_t)w * p.max_segs + j]);
-  tg[tid] = acc;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (uint32_t stride = nthr >> 1; stride > 0; stride >>= 1) {
-    if (tid < stride) {
-      Xyzz<F> a = tg[tid];
-      Xyzz<F> b = tg[tid + stride];
-      tg[tid] = a.add(b);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-  }
-  if (tid == 0)
-    wsum[w] = tg[0];
-}
-
 // Explicit instantiations, written out (build.rs reads the host_name strings literally).
 // `_g1`/`_g2`: bn254.h's Fp / Fp2. `_g1w`/`_g2w` (item G9): bn254_fast.h's FpF / Fp2L, the same
 // values with the 64-bit-accumulate (no-carry CIOS) Montgomery multiplication and, for G2,
@@ -204,9 +213,6 @@ msm_buckets<Fp>(const device Affine<Fp>*, const device uint32_t*, const device u
 template [[host_name("msm_segment_reduce_g1")]] kernel void
 msm_segment_reduce<Fp>(const device Xyzz<Fp>*, const device uint32_t*, const device uint32_t*,
                         device Xyzz<Fp>*, constant MsmParams&, uint2);
-template [[host_name("msm_window_reduce_g1")]] kernel void
-msm_window_reduce<Fp>(const device Xyzz<Fp>*, const device uint32_t*, device Xyzz<Fp>*,
-                       constant MsmParams&, threadgroup Xyzz<Fp>*, uint, uint, uint);
 template [[host_name("msm_buckets_g2")]] kernel void
 msm_buckets<Fp2>(const device Affine<Fp2>*, const device uint32_t*, const device uint32_t*,
                  const device uint32_t*, const device uint32_t*, const device uint32_t*,
@@ -214,9 +220,6 @@ msm_buckets<Fp2>(const device Affine<Fp2>*, const device uint32_t*, const device
 template [[host_name("msm_segment_reduce_g2")]] kernel void
 msm_segment_reduce<Fp2>(const device Xyzz<Fp2>*, const device uint32_t*, const device uint32_t*,
                         device Xyzz<Fp2>*, constant MsmParams&, uint2);
-template [[host_name("msm_window_reduce_g2")]] kernel void
-msm_window_reduce<Fp2>(const device Xyzz<Fp2>*, const device uint32_t*, device Xyzz<Fp2>*,
-                       constant MsmParams&, threadgroup Xyzz<Fp2>*, uint, uint, uint);
 template [[host_name("msm_buckets_g1w")]] kernel void
 msm_buckets<FpF>(const device Affine<FpF>*, const device uint32_t*, const device uint32_t*,
                  const device uint32_t*, const device uint32_t*, const device uint32_t*,
@@ -224,9 +227,6 @@ msm_buckets<FpF>(const device Affine<FpF>*, const device uint32_t*, const device
 template [[host_name("msm_segment_reduce_g1w")]] kernel void
 msm_segment_reduce<FpF>(const device Xyzz<FpF>*, const device uint32_t*, const device uint32_t*,
                         device Xyzz<FpF>*, constant MsmParams&, uint2);
-template [[host_name("msm_window_reduce_g1w")]] kernel void
-msm_window_reduce<FpF>(const device Xyzz<FpF>*, const device uint32_t*, device Xyzz<FpF>*,
-                       constant MsmParams&, threadgroup Xyzz<FpF>*, uint, uint, uint);
 template [[host_name("msm_buckets_g2w")]] kernel void
 msm_buckets<Fp2L>(const device Affine<Fp2L>*, const device uint32_t*, const device uint32_t*,
                  const device uint32_t*, const device uint32_t*, const device uint32_t*,
@@ -234,6 +234,13 @@ msm_buckets<Fp2L>(const device Affine<Fp2L>*, const device uint32_t*, const devi
 template [[host_name("msm_segment_reduce_g2w")]] kernel void
 msm_segment_reduce<Fp2L>(const device Xyzz<Fp2L>*, const device uint32_t*, const device uint32_t*,
                         device Xyzz<Fp2L>*, constant MsmParams&, uint2);
-template [[host_name("msm_window_reduce_g2w")]] kernel void
-msm_window_reduce<Fp2L>(const device Xyzz<Fp2L>*, const device uint32_t*, device Xyzz<Fp2L>*,
-                       constant MsmParams&, threadgroup Xyzz<Fp2L>*, uint, uint, uint);
+template [[host_name("msm_buckets_perm_g1w")]] kernel void
+msm_buckets_perm<FpF>(const device Affine<FpF>*, const device uint32_t*, const device uint32_t*,
+                      const device uint32_t*, const device uint32_t*, const device uint32_t*,
+                      device Xyzz<FpF>*, device uint32_t*, constant MsmParams&,
+                      const device uint32_t*, uint2);
+template [[host_name("msm_buckets_perm_g2w")]] kernel void
+msm_buckets_perm<Fp2L>(const device Affine<Fp2L>*, const device uint32_t*,
+                       const device uint32_t*, const device uint32_t*, const device uint32_t*,
+                       const device uint32_t*, device Xyzz<Fp2L>*, device uint32_t*,
+                       constant MsmParams&, const device uint32_t*, uint2);
