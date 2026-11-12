@@ -303,6 +303,47 @@ fn msm_piece_bound() {
     }
 }
 
+/// G9: the piece bound with the Booth bucket count nb = 2^c + 1 ([MsmConfig::layout]) holds and
+/// is non-decreasing for every n up to 64 nb, and the scratch's bound (sized for nb, either digit
+/// mode) covers the prover's sizes (witness 5,635,930, domain 2^23).
+#[test]
+fn msm_piece_bound_booth() {
+    for wbits in 1..=16u32 {
+        let cfg = MsmConfig {
+            wbits,
+            seg: 7,
+            ..Default::default()
+        };
+        let nb = cfg.nbuckets() + 1;
+        let top = (64 * nb).max(1 << 14);
+        let (mut prev_p, mut prev_s) = (0, 0);
+        for n in 0..=top {
+            let exact = n.div_ceil(MsmConfig::piece_nb(n, nb)) + n.min(nb - 1);
+            let (mp, ms) = (MsmConfig::max_pieces_nb(n, nb), cfg.max_segs_nb(n, nb));
+            assert!(
+                exact <= mp,
+                "c = {wbits} n = {n}: {exact} pieces > bound {mp}"
+            );
+            assert!(
+                mp >= prev_p && ms >= prev_s,
+                "c = {wbits} n = {n}: bound decreased"
+            );
+            (prev_p, prev_s) = (mp, ms);
+        }
+        // The unsigned layout's bound is the old one, and below the Booth sizing.
+        for n in [0, 1, 1000, top] {
+            assert_eq!(MsmConfig::max_pieces_nb(n, nb - 1), cfg.max_pieces(n));
+            assert!(cfg.max_pieces(n) <= MsmConfig::max_pieces_nb(n, nb));
+        }
+    }
+    let cfg = MsmConfig::default();
+    for n in [5_635_930u32, 1 << 23] {
+        let nb = cfg.nbuckets() + 1;
+        let exact = n.div_ceil(MsmConfig::piece_nb(n, nb)) + n.min(nb - 1);
+        assert!(exact <= MsmConfig::max_pieces_nb(n, nb), "n = {n}");
+    }
+}
+
 /// A scratch sized for more scalars than the sort: the strides are the scratch's, and the piece
 /// bound of n must fit it, including just below a step of piece(n) (where the old per-n bound was
 /// larger than the bound at cap). Both curves (check_size_cap checks G1 and G2).
@@ -549,4 +590,75 @@ fn r17_msm_repeat() {
     let lg: u32 = std::env::var("R17_AUDIT_LG").map_or(20, |v| v.parse().unwrap());
     check_size(&g, 1 << lg, 17, MsmConfig::default(), reps);
     println!("R17AUDIT groth16 msm G1+G2 2^{lg}: {reps}/{reps} reps equal ark (0 differ)");
+}
+
+/// G9: every [MsmTune] combination, with scalars declared below 2^256 and below 2^254 (the
+/// prover's canonical Fr, fewer Booth windows), against ark, on one scratch re-sorted for each.
+/// Scalars include Booth edge patterns: windows of all ones, digits of exactly +-2^16 at c = 17,
+/// every window's top bit set, and 2^253 - 1.
+#[test]
+fn msm_tune_variants() {
+    let Some(g) = gpu() else { return };
+    let mut rng = ChaCha8Rng::seed_from_u64(0x99);
+    let n = 3000usize;
+    let p1 = points::<G1Projective>(n, &mut rng);
+    let p2 = points::<G2Projective>(n, &mut rng);
+    let mut s = scalars(n, &mut rng);
+    let two = Fr::from(2u64);
+    let pow2 = |k: u64| two.pow([k]);
+    let mut edges = vec![
+        pow2(253) - Fr::one(),
+        pow2(253),
+        pow2(252) + pow2(16),
+        (0..15).map(|k| pow2(17 * k + 16)).sum::<Fr>(),
+        (0..15)
+            .map(|k| pow2(17 * k + 16) * Fr::from(3u64))
+            .sum::<Fr>(),
+        pow2(17) - Fr::one(),
+        pow2(16),
+        pow2(16) - Fr::one(),
+        pow2(15),
+        pow2(34) - Fr::one(),
+        -Fr::one(),
+        -two,
+    ];
+    for k in 0..15 {
+        edges.push(pow2(17 * k) * (pow2(17) - Fr::one()));
+        edges.push(pow2(17 * k + 16));
+    }
+    for (i, e) in edges.into_iter().enumerate() {
+        s[7 * i + 1] = e;
+    }
+    let want1: G1Projective = ark_msm(&p1, &s);
+    let want2: G2Projective = ark_msm(&p2, &s);
+    let b1 = g.buffer(&words::<G1>(&p1));
+    let b2 = g.buffer(&words::<G2>(&p2));
+    let sw: Vec<u32> = s.iter().flat_map(scalar_words).collect();
+    let bs = g.buffer(&sw);
+    for cfg in [MsmConfig::default(), MsmConfig::for_size(n as u32)] {
+        let mut sc = MsmScratch::new(&g.device, n as u32, cfg).unwrap();
+        for bits in [256, 254] {
+            sc.set_scalar_bits(bits);
+            for (wide_mul, booth) in [(false, false), (true, false), (false, true), (true, true)] {
+                sc.set_tune(MsmTune { wide_mul, booth });
+                g.sort(&mut sc, MsmBuf::new(&bs), n as u32).unwrap();
+                let what = format!("{cfg:?} bits {bits} wide {wide_mul} booth {booth}");
+                let (nw, _) = sc.sorted_layout().unwrap();
+                let expect_nw = if booth {
+                    (bits + 1).div_ceil(cfg.wbits + 1)
+                } else {
+                    cfg.nwins()
+                };
+                assert_eq!(nw, expect_nw, "{what}");
+                let (got1, _) = g.msm_sorted::<G1>(&sc, MsmBuf::new(&b1), 0).unwrap();
+                assert_eq!(got1.into_affine(), want1.into_affine(), "G1 {what}");
+                let (got2, _) = g.msm_sorted::<G2>(&sc, MsmBuf::new(&b2), 0).unwrap();
+                assert_eq!(got2.into_affine(), want2.into_affine(), "G2 {what}");
+                // C-style offset (the first 1000 scalars skipped).
+                let (got, _) = g.msm_sorted::<G1>(&sc, MsmBuf::new(&b1), 1000).unwrap();
+                let want: G1Projective = ark_msm(&p1[..n - 1000], &s[1000..]);
+                assert_eq!(got.into_affine(), want.into_affine(), "G1 first {what}");
+            }
+        }
+    }
 }

@@ -778,6 +778,11 @@ impl Gpu {
 
     /// Dispatch `count` threads of `name`, buffers at 0.., params after them. Returns GPU seconds.
     fn run(&self, name: &str, bufs: &[&Buffer], params: Params) -> f64 {
+        self.run_grid(name, bufs, params, params.count as usize)
+    }
+
+    /// [Self::run] over `threads` threads (the lane-pair kernels run two per output).
+    fn run_grid(&self, name: &str, bufs: &[&Buffer], params: Params, threads: usize) -> f64 {
         let f = self.lib.get_function(name, None).unwrap();
         let pso = self
             .device
@@ -795,10 +800,7 @@ impl Gpu {
             &params as *const Params as *const c_void,
         );
         let tg = pso.max_total_threads_per_threadgroup().min(256);
-        enc.dispatch_threads(
-            MTLSize::new(params.count as u64, 1, 1),
-            MTLSize::new(tg, 1, 1),
-        );
+        enc.dispatch_threads(MTLSize::new(threads as u64, 1, 1), MTLSize::new(tg, 1, 1));
         enc.end_encoding();
         cb.commit();
         cb.wait_until_completed();
@@ -1456,5 +1458,104 @@ fn throughput() {
         rate / 1e6,
         iters - 1,
         best * 1e3
+    );
+}
+
+/// G9: `bn254_fast.h` formulations against bn254.h's, bit-exact on the bench inputs, and their
+/// GPU time, interleaved (indicative; other GPU work may be running).
+#[test]
+fn g9_fast_field_ops() {
+    let Some(gpu) = Gpu::new() else { return };
+    let f = fp();
+    let mut rng = Rng::new(0x99);
+    let count = 1usize << 20;
+    let iters = 256u32;
+    let input: Vec<L> = (0..count).map(|_| f.random(&mut rng)).collect();
+    let mut w = Vec::with_capacity(count * 8);
+    input.iter().for_each(|x| words_of(x, &mut w));
+    let bin = gpu.buf(&w);
+    let p = Params {
+        count: count as u32,
+        iters,
+        ..Default::default()
+    };
+    let reps: usize = std::env::var("G9_MICRO_REPS").map_or(3, |v| v.parse().unwrap());
+    let pairs = [
+        ("bn254_bench_fp_mul", "g9_bench_fp_mul_wide"),
+        ("g9_bench_fp_add", "g9_bench_fp_add_wide"),
+        ("g9_bench_fp_mul_wide", "g9_bench_fp_mul_nc"),
+    ];
+    for (a, b) in pairs {
+        let (oa, ob) = (gpu.out(count * 8), gpu.out(count * 8));
+        let (mut ta, mut tb) = (Vec::new(), Vec::new());
+        for _ in 0..reps {
+            ta.push(gpu.run(a, &[&oa, &bin], p));
+            tb.push(gpu.run(b, &[&ob, &bin], p));
+        }
+        assert_eq!(
+            Gpu::read(&oa, count * 8),
+            Gpu::read(&ob, count * 8),
+            "{b} differs from {a}"
+        );
+        g9_print(a, b, ta, tb);
+    }
+
+    // Mixed additions (G1, G2): 2^18 threads x 64 additions over 4096 "points" of random
+    // canonical field elements.
+    let np = 4096usize;
+    let count = 1usize << 18;
+    let p = Params {
+        count: count as u32,
+        iters: 64,
+        k: np as u32,
+        ..Default::default()
+    };
+    // Final: g1f / g2l (FpF = mul_nc, lazy Karatsuba sums); the others are the variants of the
+    // G9 note (bn254.h, mul_wide, sqr_wide, wide add/sub, no lazy sums, lane pairs).
+    for (a, b, coords) in [
+        ("g9_bench_madd_g1", "g9_bench_madd_g1f", 2usize),
+        ("g9_bench_madd_g1w", "g9_bench_madd_g1f", 2),
+        ("g9_bench_madd_g1f", "g9_bench_madd_g1s", 2),
+        ("g9_bench_madd_g1f", "g9_bench_madd_g1a", 2),
+        ("g9_bench_madd_g2", "g9_bench_madd_g2l", 4),
+        ("g9_bench_madd_g2w", "g9_bench_madd_g2l", 4),
+        ("g9_bench_madd_g2f", "g9_bench_madd_g2l", 4),
+        ("g9_bench_madd_g2l", "g9_bench_madd_g2p", 4),
+    ] {
+        let mut w = Vec::new();
+        for _ in 0..np * coords {
+            words_of(&f.random(&mut rng), &mut w);
+        }
+        let bpts = gpu.buf(&w);
+        let out_words = count * 8 * 2 * coords;
+        let (oa, ob) = (gpu.out(out_words), gpu.out(out_words));
+        let (mut ta, mut tb) = (Vec::new(), Vec::new());
+        // The lane-pair kernel runs two threads per output.
+        let threads = if b.ends_with("g2p") { 2 * count } else { count };
+        for _ in 0..reps {
+            ta.push(gpu.run(a, &[&oa, &bpts], p));
+            tb.push(gpu.run_grid(b, &[&ob, &bpts], p, threads));
+        }
+        assert_eq!(
+            Gpu::read(&oa, out_words),
+            Gpu::read(&ob, out_words),
+            "{b} differs from {a}"
+        );
+        g9_print(a, b, ta, tb);
+    }
+}
+
+fn g9_print(a: &str, b: &str, mut ta: Vec<f64>, mut tb: Vec<f64>) {
+    let reps = ta.len();
+    ta.sort_by(f64::total_cmp);
+    tb.sort_by(f64::total_cmp);
+    println!(
+        "G9MICRO {a} {:.2} ms [{:.2}..{:.2}] vs {b} {:.2} ms [{:.2}..{:.2}]",
+        ta[reps / 2] * 1e3,
+        ta[0] * 1e3,
+        ta[reps - 1] * 1e3,
+        tb[reps / 2] * 1e3,
+        tb[0] * 1e3,
+        tb[reps - 1] * 1e3
     );
 }

@@ -50,6 +50,7 @@
 // ntt_scale         0 x Fr[count] (in place)  1 constant NttScaleParams   x[i] *= c
 
 #include "bn254.h"
+#include "bn254_fast.h"
 
 using namespace metal;
 using namespace bn254;
@@ -93,19 +94,22 @@ struct NttScaleParams {
   uint32_t c[8];
 };
 
-inline void ntt_butterfly(thread Fr& a, thread Fr& b, const device Fr* tw, uint32_t jj,
+// F: Fr (bn254.h) or FrF (bn254_fast.h, item G9: the same values with the 64-bit-accumulate
+// multiplication); the `_w` kernels are the FrF instantiations.
+template <class F>
+inline void ntt_butterfly(thread F& a, thread F& b, const device F* tw, uint32_t jj,
                           uint32_t half_n, uint32_t flags) {
-  Fr u = a;
-  Fr v = b;
+  F u = a;
+  F v = b;
   if (jj == 0) {
     a = u + v;
     b = u - v;
     return;
   }
   bool inv = (flags & NTT_INVERSE) != 0;
-  Fr t = tw[inv ? half_n - jj : jj];
+  F t = tw[inv ? half_n - jj : jj];
   if ((flags & NTT_DIF) == 0) {
-    Fr vt = v * t;
+    F vt = v * t;
     a = inv ? u - vt : u + vt;
     b = inv ? u + vt : u - vt;
   } else {
@@ -114,9 +118,10 @@ inline void ntt_butterfly(thread Fr& a, thread Fr& b, const device Fr* tw, uint3
   }
 }
 
+template <class F>
 [[max_total_threads_per_threadgroup(256)]]
-kernel void ntt_stage(device Fr* x [[buffer(0)]],
-                      const device Fr* tw [[buffer(1)]],
+kernel void ntt_stage(device F* x [[buffer(0)]],
+                      const device F* tw [[buffer(1)]],
                       constant NttStageParams& p [[buffer(2)]],
                       uint gid [[thread_position_in_grid]]) {
   uint32_t half_n = (1u << p.lg) >> 1;
@@ -127,18 +132,19 @@ kernel void ntt_stage(device Fr* x [[buffer(0)]],
   uint32_t i0 = ((gid >> q) << (q + 1)) | j;
   uint32_t i1 = i0 + (1u << q);
   uint32_t jj = j << (p.lg - 1 - q);
-  Fr a = x[i0];
-  Fr b = x[i1];
-  ntt_butterfly(a, b, tw, jj, half_n, p.flags);
+  F a = x[i0];
+  F b = x[i1];
+  ntt_butterfly<F>(a, b, tw, jj, half_n, p.flags);
   x[i0] = a;
   x[i1] = b;
 }
 
+template <class F>
 [[max_total_threads_per_threadgroup(256)]]
-kernel void ntt_fused_stages(device Fr* x [[buffer(0)]],
-                             const device Fr* tw [[buffer(1)]],
+kernel void ntt_fused_stages(device F* x [[buffer(0)]],
+                             const device F* tw [[buffer(1)]],
                              constant NttFusedParams& p [[buffer(2)]],
-                             threadgroup Fr* sh [[threadgroup(0)]],
+                             threadgroup F* sh [[threadgroup(0)]],
                              uint tid [[thread_index_in_threadgroup]],
                              uint g [[threadgroup_position_in_grid]]) {
   const uint32_t cols = p.cols;
@@ -169,9 +175,9 @@ kernel void ntt_fused_stages(device Fr* x [[buffer(0)]],
     uint32_t jj = ((jr << q0) | low) << (p.lg - 1 - q);
     uint32_t e0 = (r0 << cols) | c;
     uint32_t e1 = (r1 << cols) | c;
-    Fr a = sh[e0];
-    Fr b = sh[e1];
-    ntt_butterfly(a, b, tw, jj, half_n, p.flags);
+    F a = sh[e0];
+    F b = sh[e1];
+    ntt_butterfly<F>(a, b, tw, jj, half_n, p.flags);
     sh[e0] = a;
     sh[e1] = b;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -195,16 +201,17 @@ kernel void ntt_powers(device Fr* out [[buffer(0)]],
   out[gid] = r;
 }
 
+template <class F>
 [[max_total_threads_per_threadgroup(256)]]
-kernel void ntt_mul_powers(device Fr* x [[buffer(0)]],
-                           const device Fr* lo [[buffer(1)]],
-                           const device Fr* hi [[buffer(2)]],
+kernel void ntt_mul_powers(device F* x [[buffer(0)]],
+                           const device F* lo [[buffer(1)]],
+                           const device F* hi [[buffer(2)]],
                            constant NttMulPowersParams& p [[buffer(3)]],
                            uint gid [[thread_position_in_grid]]) {
   if (gid >= (1u << p.lg))
     return;
   uint32_t k = (p.bitrev != 0 && p.lg != 0) ? reverse_bits(gid) >> (32 - p.lg) : gid;
-  Fr f = lo[k & ((1u << p.lg_lo) - 1)] * hi[k >> p.lg_lo];
+  F f = lo[k & ((1u << p.lg_lo) - 1)] * hi[k >> p.lg_lo];
   x[gid] = x[gid] * f;
 }
 
@@ -216,3 +223,21 @@ kernel void ntt_scale(device Fr* x [[buffer(0)]],
     return;
   x[gid] = x[gid] * Fr::from_limbs(p.c);
 }
+
+// Explicit instantiations (build.rs reads the host_name strings literally).
+template [[host_name("ntt_stage")]] kernel void
+ntt_stage<Fr>(device Fr*, const device Fr*, constant NttStageParams&, uint);
+template [[host_name("ntt_stage_w")]] kernel void
+ntt_stage<FrF>(device FrF*, const device FrF*, constant NttStageParams&, uint);
+template [[host_name("ntt_fused_stages")]] kernel void
+ntt_fused_stages<Fr>(device Fr*, const device Fr*, constant NttFusedParams&, threadgroup Fr*,
+                     uint, uint);
+template [[host_name("ntt_fused_stages_w")]] kernel void
+ntt_fused_stages<FrF>(device FrF*, const device FrF*, constant NttFusedParams&,
+                      threadgroup FrF*, uint, uint);
+template [[host_name("ntt_mul_powers")]] kernel void
+ntt_mul_powers<Fr>(device Fr*, const device Fr*, const device Fr*, constant NttMulPowersParams&,
+                   uint);
+template [[host_name("ntt_mul_powers_w")]] kernel void
+ntt_mul_powers<FrF>(device FrF*, const device FrF*, const device FrF*,
+                    constant NttMulPowersParams&, uint);

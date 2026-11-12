@@ -34,11 +34,22 @@
 //! [ProveOptions::profile] every stage gets its own command buffer (finer timings, a little
 //! slower). Pipelines (PSOs) are built once per process ([kernels]) and survive
 //! [crate::metal_release]; the NTT plan's pipelines are built with the plan (once per key load).
+//! `RISC0_G16_METAL_PROFILE_MSM=1` (with the profile) also splits each MSM into its dispatches.
 //!
-//! Memory (rzup component: 5,635,930 witness elements, domain 2^23): key 2.34 GB of points +
-//! 1.44 GB of coefficients, then a, b, c (768 MiB), witness (172 MiB), fuzz (172 MiB), NTT tables
-//! (128 MiB), MSM scratch (~640 MiB). Everything is allocated at construction (nothing during a
-//! proof), after one budget check of the whole footprint ([super::check_working_set]).
+//! Item G9 optimizations ([Tuning], every one on by default, each with a revert switch:
+//! `RISC0_G16_METAL_G9=0` for the G7/G8 kernels, `RISC0_G16_METAL_G9_OFF=wide_mul,wide_ntt,booth`
+//! for single ones): the MSM and NTT kernels over bn254_fast.h's 64-bit-accumulate Montgomery
+//! multiplication, and Booth MSM digits (15 windows). All bit-exact (`g9_tuning_bit_exact`).
+//!
+//! Memory (rzup component: 5,635,930 witness elements, domain 2^23; device allocation 3890 MiB
+//! with the item G10 [MemOptions], 5624 MiB without): key points 2232 MiB (mapped from the zkey
+//! without a copy: file-backed pages, outside the process' physical footprint), coefficients
+//! 309 MiB compact (1375 MiB full), a, b 512 MiB (c lives in the MSM scratch's `sorted` buffer
+//! during the NTT phase, and a, b hold the regenerated fuzz and the MSM pieces once MSM H's sort
+//! has consumed h; without `alias` a, b, c 768 MiB + fuzz 172 MiB + pieces 240 MiB), witness
+//! 172 MiB, NTT tables 128 MiB, MSM scratch 536 MiB. Everything is allocated at construction
+//! (nothing during a proof), after one budget check of the whole footprint
+//! ([super::check_working_set]); the smallest working-set budget that builds it is ~3.84 GiB.
 
 use std::{
     fs::File,
@@ -61,10 +72,11 @@ use metal::{
 use super::{
     check_working_set,
     coeffs::{Coeffs, FuzzedResults, FuzzedResultsArk},
-    msm::{MsmBuf, MsmConfig, MsmCurve, MsmKernels, MsmScratch, G1, G2},
+    compact::CompactCoeffs,
+    msm::{MsmBuf, MsmConfig, MsmCurve, MsmKernels, MsmScratch, MsmStage, MsmTune, G1, G2},
     ntt::NttPlan,
     small::{self, BufSlice, SmallKernels},
-    srs::{self, Srs, VerifyingKeyArk},
+    srs::{self, SharedBuf, Srs, VerifyingKeyArk},
 };
 use crate::SetupParams;
 
@@ -122,17 +134,266 @@ pub struct ProveOptions {
     pub profile: bool,
     /// Print the stage timings to stderr (`[groth16-metal]` lines).
     pub verbose: bool,
+    /// Optimization switches (item G9); the default is every optimization on.
+    pub tune: Tuning,
 }
 
 impl ProveOptions {
-    /// `RISC0_VERBOSE` set: verbose; `RISC0_G16_METAL_PROFILE=1`: profile (and verbose).
+    /// `RISC0_VERBOSE` set: verbose; `RISC0_G16_METAL_PROFILE=1`: profile (and verbose);
+    /// [Tuning::from_env] for the optimization switches.
     pub fn from_env() -> Self {
         let profile = std::env::var("RISC0_G16_METAL_PROFILE").as_deref() == Ok("1");
         Self {
             profile,
             verbose: profile || std::env::var_os("RISC0_VERBOSE").is_some(),
+            tune: Tuning::from_env(),
         }
     }
+}
+
+/// The optimization switches of item G9, each with a revert knob so that a baseline can A/B
+/// them. `RISC0_G16_METAL_G9=0` turns every one off (the G7/G8 code paths);
+/// `RISC0_G16_METAL_G9_OFF=<name>,<name>` turns off single ones (names: [Tuning::NAMES]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tuning {
+    /// `wide_mul`: the MSM point kernels with the 64-bit-accumulate Montgomery multiplication
+    /// (bn254_fast.h).
+    pub wide_mul: bool,
+    /// `wide_ntt`: the NTT kernels (`ntt_*_w`) with the same multiplication.
+    pub wide_ntt: bool,
+    /// `booth`: signed MSM digits of 17 bits, 15 windows (the scalars are canonical Fr).
+    pub booth: bool,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Self::all()
+    }
+}
+
+impl Tuning {
+    /// Switch names for `RISC0_G16_METAL_G9_OFF`.
+    pub const NAMES: &'static [&'static str] = &["wide_mul", "wide_ntt", "booth"];
+
+    /// The MSM switches.
+    pub fn msm(&self) -> MsmTune {
+        MsmTune {
+            wide_mul: self.wide_mul,
+            booth: self.booth,
+        }
+    }
+
+    /// Every optimization on.
+    pub fn all() -> Self {
+        Self {
+            wide_mul: true,
+            wide_ntt: true,
+            booth: true,
+        }
+    }
+
+    /// Every optimization off: the G7/G8 prover.
+    pub fn none() -> Self {
+        Self {
+            wide_mul: false,
+            wide_ntt: false,
+            booth: false,
+        }
+    }
+
+    /// Turn the switch `name` on or off; false for an unknown name.
+    pub fn set(&mut self, name: &str, on: bool) -> bool {
+        match name {
+            "wide_mul" => self.wide_mul = on,
+            "wide_ntt" => self.wide_ntt = on,
+            "booth" => self.booth = on,
+            _ => return false,
+        }
+        true
+    }
+
+    /// `none()` for "base", `all()` for "all", else `all()` with "-name" items off and "+name"
+    /// items on (comma separated, applied in order to `all()`, or to `none()` after "base,").
+    pub fn parse(spec: &str) -> Option<Self> {
+        let mut t = Self::all();
+        for item in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            match item {
+                "base" => t = Self::none(),
+                "all" => t = Self::all(),
+                _ => {
+                    let (on, name) = match item.as_bytes()[0] {
+                        b'-' => (false, &item[1..]),
+                        b'+' => (true, &item[1..]),
+                        _ => (true, item),
+                    };
+                    if !t.set(name, on) {
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(t)
+    }
+
+    /// The switches from the environment (see [Tuning]); unknown names are ignored with a
+    /// warning on stderr.
+    pub fn from_env() -> Self {
+        if std::env::var("RISC0_G16_METAL_G9").as_deref() == Ok("0") {
+            return Self::none();
+        }
+        let mut t = Self::all();
+        if let Ok(off) = std::env::var("RISC0_G16_METAL_G9_OFF") {
+            for name in off.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                if !t.set(name, false) {
+                    eprintln!("[groth16-metal] RISC0_G16_METAL_G9_OFF: unknown switch {name}");
+                }
+            }
+        }
+        t
+    }
+}
+
+/// The memory switches of item G10 (how the prover is built), each with a revert knob:
+/// `RISC0_G16_METAL_G10=0` turns every one off (the G9 layout), `RISC0_G16_METAL_G10_OFF=<name>,..`
+/// single ones (names: [MemOptions::NAMES]). All keep the proof bit-exact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemOptions {
+    /// `compact`: the compact coefficients ([CompactCoeffs], disk cached): ~0.3 GB instead of
+    /// the 1.44 GB `coeff_t` array.
+    pub compact: bool,
+    /// `mmap`: the zkey's points (and the compact cache file) as no-copy buffers over read-only
+    /// file mappings (page cache, not anonymous memory; no copy at load).
+    pub mmap: bool,
+    /// `alias`: no persistent fuzz (regenerated per proof into a, b once MSM H's sort has
+    /// consumed h) and the third polynomial c in the MSM scratch's `sorted` buffer during the NTT
+    /// phase, and the MSM piece buffer in a, b (free once MSM H's sort has consumed h): -668 MiB
+    /// at the rzup sizes.
+    pub alias: bool,
+}
+
+impl Default for MemOptions {
+    fn default() -> Self {
+        Self::all()
+    }
+}
+
+impl MemOptions {
+    /// Switch names for `RISC0_G16_METAL_G10_OFF`.
+    pub const NAMES: &'static [&'static str] = &["compact", "mmap", "alias"];
+
+    pub fn all() -> Self {
+        Self {
+            compact: true,
+            mmap: true,
+            alias: true,
+        }
+    }
+
+    /// The G9 layout.
+    pub fn none() -> Self {
+        Self {
+            compact: false,
+            mmap: false,
+            alias: false,
+        }
+    }
+
+    /// Turn the switch `name` on or off; false for an unknown name.
+    pub fn set(&mut self, name: &str, on: bool) -> bool {
+        match name {
+            "compact" => self.compact = on,
+            "mmap" => self.mmap = on,
+            "alias" => self.alias = on,
+            _ => return false,
+        }
+        true
+    }
+
+    /// Like [Tuning::parse]: "base" (= none), "all", "-name", "+name", comma separated.
+    pub fn parse(spec: &str) -> Option<Self> {
+        let mut t = Self::all();
+        for item in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            match item {
+                "base" => t = Self::none(),
+                "all" => t = Self::all(),
+                _ => {
+                    let (on, name) = match item.as_bytes()[0] {
+                        b'-' => (false, &item[1..]),
+                        b'+' => (true, &item[1..]),
+                        _ => (true, item),
+                    };
+                    if !t.set(name, on) {
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(t)
+    }
+
+    /// The switches from the environment (see [MemOptions]).
+    pub fn from_env() -> Self {
+        if std::env::var("RISC0_G16_METAL_G10").as_deref() == Ok("0") {
+            return Self::none();
+        }
+        let mut t = Self::all();
+        if let Ok(off) = std::env::var("RISC0_G16_METAL_G10_OFF") {
+            for name in off.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                if !t.set(name, false) {
+                    eprintln!("[groth16-metal] RISC0_G16_METAL_G10_OFF: unknown switch {name}");
+                }
+            }
+        }
+        t
+    }
+}
+
+/// The coefficients in the form [MemOptions::compact] selects.
+pub enum ProverCoeffs {
+    Full(Coeffs),
+    Compact(CompactCoeffs),
+}
+
+/// A borrowed [ProverCoeffs].
+#[derive(Clone, Copy)]
+pub enum CoeffsRef<'a> {
+    Full(&'a Coeffs),
+    Compact(&'a CompactCoeffs),
+}
+
+impl ProverCoeffs {
+    pub fn as_ref(&self) -> CoeffsRef<'_> {
+        match self {
+            Self::Full(c) => CoeffsRef::Full(c),
+            Self::Compact(c) => CoeffsRef::Compact(c),
+        }
+    }
+
+    /// (coefficients of A, of B, index entries of A, of B).
+    pub fn counts(&self) -> (usize, usize, usize, usize) {
+        match self {
+            Self::Full(c) => (c.count_a, c.count_b, c.ind_a, c.ind_b),
+            Self::Compact(c) => (c.count_a, c.count_b, c.ind_a, c.ind_b),
+        }
+    }
+
+    /// Payload bytes in GPU buffers.
+    pub fn resident_bytes(&self) -> u64 {
+        match self {
+            Self::Full(c) => c.resident_bytes(),
+            Self::Compact(c) => c.payload_bytes(),
+        }
+    }
+}
+
+/// A [SharedBuf] as an MSM point argument (at its offset: mapped sections start inside a page).
+fn pts<T: srs::Pod>(b: &SharedBuf<T>) -> MsmBuf<'_> {
+    MsmBuf::at(b.as_buf(), b.offset())
+}
+
+/// A [SharedBuf] (plus `extra` bytes) as a kernel argument.
+fn slice_of<T: srs::Pod>(b: &SharedBuf<T>, extra: u64) -> BufSlice<'_> {
+    BufSlice::at(b.as_buf(), b.offset() + extra)
 }
 
 /// What building a [MetalProver] cost.
@@ -151,6 +412,11 @@ pub struct BuildStats {
     pub allocated_after: u64,
     /// The footprint checked against the working-set budget before loading.
     pub planned_bytes: u64,
+    /// The memory switches the prover was built with (item G10).
+    pub mem: MemOptions,
+    /// Process physical footprint (`proc_pid_rusage`) before loading and once built.
+    pub footprint_before: u64,
+    pub footprint_after: u64,
 }
 
 /// What one proof cost.
@@ -295,14 +561,21 @@ fn dec<F: std::fmt::Display>(v: F) -> String {
 pub struct MetalProver {
     paths: [PathBuf; 3],
     srs: Srs,
-    coeffs: Coeffs,
+    coeffs: ProverCoeffs,
     fuzzed: FuzzedResultsArk,
     vk: VerifyingKeyArk,
     ntt: NttPlan,
-    /// The ChaCha fuzz, `2 * fuzz_blocks(wn)` Fr (the first `wn` are used).
-    fuzz: Buffer,
-    /// a, b, c over the domain (3 n Fr).
+    /// The ChaCha fuzz, `2 * fuzz_blocks(wn)` Fr (the first `wn` are used); `None` with
+    /// [MemOptions::alias] (regenerated per proof at the start of `abc`).
+    fuzz: Option<Buffer>,
+    /// a, b, c over the domain (3 n Fr), or a, b (2 n Fr) with c in the MSM scratch
+    /// ([MemOptions::alias]).
     abc: Buffer,
+    /// c lives in the MSM scratch's `sorted` buffer (else at `2 n` in `abc`).
+    c_in_scratch: bool,
+    /// Blocks of the ChaCha fuzz (`fuzz_blocks(wn)`).
+    fuzz_blocks: u64,
+    mem: MemOptions,
     /// The witness, then witness + fuzz (wn Fr; shared: the host copies the witness in).
     witness: Buffer,
     /// witness_into_poly's fault word.
@@ -337,10 +610,16 @@ enum Slot {
 }
 
 impl MetalProver {
-    /// Load the key files of `setup` and build everything a proof needs. Takes no GPU lock (see
-    /// `super` docs); fails cleanly, before loading, if the whole footprint would exceed the
-    /// working-set budget.
+    /// Load the key files of `setup` and build everything a proof needs, with the memory
+    /// switches from the environment ([MemOptions::from_env]). Takes no GPU lock (see `super`
+    /// docs); fails cleanly, before loading, if the whole footprint would exceed the working-set
+    /// budget.
     pub fn new(setup: &SetupParams) -> Result<Self> {
+        Self::new_with(setup, MemOptions::from_env())
+    }
+
+    /// [Self::new] with given memory switches.
+    pub fn new_with(setup: &SetupParams, mem: MemOptions) -> Result<Self> {
         let t0 = Instant::now();
         let kernels_built = KERNELS_BUILT.get().is_none();
         let k = kernels()?;
@@ -353,6 +632,8 @@ impl MetalProver {
                 Duration::ZERO
             },
             allocated_before: device.current_allocated_size(),
+            footprint_before: super::filemap::process_memory().phys_footprint,
+            mem,
             ..Default::default()
         };
         let srs_path = setup.srs_path.as_path();
@@ -372,20 +653,30 @@ impl MetalProver {
             wn > header.num_public && wn <= u32::MAX as usize && n <= u32::MAX as usize,
             "groth16-metal: witness length {wn} / domain {n} out of range"
         );
-        let coeffs_file = std::fs::metadata(coeffs_path)
-            .with_context(|| format!("stat(\"{}\")", coeffs_path.display()))?
-            .len();
+        let coeffs_bytes = planned_coeff_bytes(coeffs_path, mem.compact)?;
         let cap = wn.max(n) as u32;
-        let cfg = MsmConfig::default();
-        let fuzz_len = 2 * small::fuzz_blocks(wn as u64);
+        let cfg = msm_config_from_env();
+        let fuzz_blocks = small::fuzz_blocks(wn as u64);
+        let fuzz_len = 2 * fuzz_blocks;
         let wsum_bytes = wsum_bytes(cfg);
         let ntt_bytes = ((n as u64 / 2).max(1) + 4096 + 2 * (n as u64 >> 12).max(1)) * FR_BYTES;
-        let own = (3 * n as u64 + wn as u64 + fuzz_len) * FR_BYTES + wsum_bytes + 16;
+        let scratch_sizes = MsmScratch::sizes_for(cap, cfg);
+        // Item G10 aliasing: c in the scratch's `sorted` buffer (index 4 of the sizes) and the
+        // fuzz regenerated per proof at the start of a, b, when they fit.
+        let c_in_scratch = mem.alias && scratch_sizes[4] >= n as u64 * FR_BYTES;
+        let fuzz_late = mem.alias && fuzz_len <= 2 * n as u64;
+        let polys = if c_in_scratch { 2 } else { 3 };
+        // ... and the MSM piece buffer in a, b (free from MSM H's sort to the end of the proof).
+        let pieces_lent = mem.alias && scratch_sizes[5] <= polys * n as u64 * FR_BYTES;
+        let own = (polys * n as u64 + wn as u64 + if fuzz_late { 0 } else { fuzz_len }) * FR_BYTES
+            + wsum_bytes
+            + 16;
         stats.planned_bytes = header.points_bytes()
-            + coeffs_file
+            + coeffs_bytes
             + own
             + ntt_bytes
-            + MsmScratch::bytes_for(cap, cfg)
+            + scratch_sizes.iter().sum::<u64>()
+            - if pieces_lent { scratch_sizes[5] } else { 0 }
             + PLAN_SLACK;
         check_working_set(
             device,
@@ -394,7 +685,7 @@ impl MetalProver {
         )?;
 
         let t = Instant::now();
-        let srs = Srs::load(device, srs_path)?;
+        let srs = Srs::load_with(device, srs_path, mem.mmap)?;
         stats.srs_load = t.elapsed();
         ensure!(
             srs.a.len() == wn
@@ -406,11 +697,20 @@ impl MetalProver {
              length {wn} / domain {n}"
         );
         let t = Instant::now();
-        let coeffs = Coeffs::load(device, coeffs_path)?;
-        stats.coeffs_load = t.elapsed();
-        let t = Instant::now();
-        coeffs.validate(wn, n)?;
-        stats.coeffs_validate = t.elapsed();
+        let coeffs = if mem.compact {
+            // Validated inside (the original in full on a build, the compact form on a cache
+            // hit).
+            let c = CompactCoeffs::load(device, coeffs_path, wn, n, mem.mmap)?;
+            stats.coeffs_load = t.elapsed();
+            ProverCoeffs::Compact(c)
+        } else {
+            let c = Coeffs::load(device, coeffs_path)?;
+            stats.coeffs_load = t.elapsed();
+            let t = Instant::now();
+            c.validate(wn, n)?;
+            stats.coeffs_validate = t.elapsed();
+            ProverCoeffs::Full(c)
+        };
         let fuzzed = FuzzedResults::load(fres_path)?.to_ark()?;
         let vk = srs.header.vk.to_ark()?;
 
@@ -418,22 +718,36 @@ impl MetalProver {
         let alloc = |bytes: u64, private: bool, what: &str| -> Result<Buffer> {
             alloc_buffer(device, bytes, private, what)
         };
-        let fuzz = alloc(fuzz_len * FR_BYTES, true, "the fuzz")?;
-        let abc = alloc(3 * n as u64 * FR_BYTES, true, "a, b, c")?;
+        let fuzz = if fuzz_late {
+            None
+        } else {
+            Some(alloc(fuzz_len * FR_BYTES, true, "the fuzz")?)
+        };
+        let abc = alloc(polys * n as u64 * FR_BYTES, true, "a, b, c")?;
         let witness = alloc(wn as u64 * FR_BYTES, false, "the witness")?;
         let fault = alloc(16, false, "the fault word")?;
         let wsums = alloc(wsum_bytes, false, "the MSM window sums")?;
         check_working_set(device, "the NTT tables", ntt_bytes)?;
         let ntt = NttPlan::new(device, &k.queue, &k.library, lg)?;
-        let scratch = MsmScratch::new(device, cap, cfg)?;
-        let state = small::chacha_state(&[0; 32], &[0; 12]);
-        run_one(&k.queue, |enc| {
-            k.small
-                .chacha_fuzz(enc, BufSlice::new(&fuzz), &state, fuzz_len / 2)
-        })
-        .context("generating the fuzz")?;
+        let mut scratch = MsmScratch::new_with(device, cap, cfg, pieces_lent.then_some(&*abc))?;
+        ensure!(
+            scratch.pieces_lent() == pieces_lent,
+            "groth16-metal: MSM piece buffer layout"
+        );
+        // Every MSM scalar is a canonical Fr (< r < 2^254): the witness + fuzz (fr_add), h
+        // (from_mont) and the fuzz itself (< 2^253, fuzz.metal).
+        scratch.set_scalar_bits(254);
+        if let Some(fuzz) = &fuzz {
+            let state = fuzz_state();
+            run_one(&k.queue, |enc| {
+                k.small
+                    .chacha_fuzz(enc, BufSlice::new(fuzz), &state, fuzz_blocks)
+            })
+            .context("generating the fuzz")?;
+        }
         stats.gpu_setup = t.elapsed();
         stats.allocated_after = device.current_allocated_size();
+        stats.footprint_after = super::filemap::process_memory().phys_footprint;
         stats.total = t0.elapsed();
 
         let c_len = srs.c.len();
@@ -451,6 +765,9 @@ impl MetalProver {
             ntt,
             fuzz,
             abc,
+            c_in_scratch,
+            fuzz_blocks,
+            mem,
             witness,
             fault,
             wsums,
@@ -461,6 +778,16 @@ impl MetalProver {
             num_public,
             build_stats: stats,
         })
+    }
+
+    /// The memory switches this prover was built with.
+    pub fn mem_options(&self) -> MemOptions {
+        self.mem
+    }
+
+    /// The coefficients (full or compact).
+    pub fn coeffs(&self) -> &ProverCoeffs {
+        &self.coeffs
     }
 
     /// Whether this prover was built from `setup`'s files.
@@ -526,111 +853,135 @@ impl MetalProver {
         let upload_ms = ms(t);
 
         let t = Instant::now();
+        self.ntt.set_wide(opts.tune.wide_ntt);
         let mut run = Run::new(&k.queue, opts.profile);
         let small = &k.small;
         let msm = &k.msm;
         let nn = n as u64;
         let fr = |i: u64| i * FR_BYTES;
-        let (abc, w, fuzz, fault) = (&self.abc, &self.witness, &self.fuzz, &self.fault);
-        let coeffs = &self.coeffs;
-        let (count_a, ind_a) = (coeffs.count_a as u64, coeffs.ind_a as u64);
+        let (abc, w, fault) = (&self.abc, &self.witness, &self.fault);
+        // c: at 2 n in abc, or (item G10 alias) the MSM scratch's `sorted` buffer, which no sort
+        // of this proof has written yet (sort_h is the first, after the NTT stage).
+        let (c_buf, c_off): (&BufferRef, u64) = if self.c_in_scratch {
+            (self.scratch.sorted_buffer(), 0)
+        } else {
+            (abc, 2 * nn * FR_BYTES)
+        };
 
-        run.fill_new(abc, 3 * nn * FR_BYTES);
+        run.fill_new(abc, 2 * nn * FR_BYTES);
+        let coeffs = &self.coeffs;
         run.stage("witness_poly", 0, |enc| {
-            let cbuf = coeffs.coeffs.as_buf();
-            let ibuf = coeffs.indices.as_buf();
-            small.witness_into_poly(
-                enc,
-                BufSlice::fr_at(abc, 0),
-                nn,
-                BufSlice::new(cbuf),
-                count_a,
-                BufSlice::new(ibuf),
-                ind_a - 1,
-                BufSlice::new(w),
-                wn as u64,
-                BufSlice::new(fault),
-            );
-            small.witness_into_poly(
-                enc,
-                BufSlice::fr_at(abc, nn),
-                nn,
-                BufSlice::at(cbuf, count_a * small::COEFF_BYTES),
-                coeffs.count_b as u64,
-                BufSlice::at(ibuf, ind_a * 4),
-                coeffs.ind_b as u64 - 1,
-                BufSlice::new(w),
-                wn as u64,
-                BufSlice::new(fault),
-            );
+            encode_witness_poly(small, enc, coeffs.as_ref(), abc, nn, w, wn as u64, fault);
             small.fr_mul(
                 enc,
-                BufSlice::fr_at(abc, 2 * nn),
+                BufSlice::at(c_buf, c_off),
                 BufSlice::fr_at(abc, 0),
                 BufSlice::fr_at(abc, nn),
                 nn,
             );
         });
         let ntt = &self.ntt;
+        let fuzz_now = self.fuzz.as_ref();
         run.stage("ntt", 0, |enc| {
-            for p in 0..3 {
-                ntt.encode_to_coset(enc, abc, fr(p * nn));
-            }
+            ntt.encode_to_coset(enc, abc, 0);
+            ntt.encode_to_coset(enc, abc, fr(nn));
+            ntt.encode_to_coset(enc, c_buf, c_off);
             small.fr_mul_sub_from_mont(
                 enc,
                 BufSlice::fr_at(abc, 0),
                 BufSlice::fr_at(abc, nn),
-                BufSlice::fr_at(abc, 2 * nn),
+                BufSlice::at(c_buf, c_off),
                 nn,
             );
-            small.fr_add(enc, BufSlice::new(w), BufSlice::new(fuzz), wn as u64);
+            if let Some(fuzz) = fuzz_now {
+                small.fr_add(enc, BufSlice::new(w), BufSlice::new(fuzz), wn as u64);
+            }
         });
 
         let cfg = self.scratch.config();
         let scratch = &mut self.scratch;
+        scratch.set_tune(opts.tune.msm());
         let srs = &self.srs;
         let wsums = &self.wsums;
         let out = |slot: Slot| MsmBuf::at(wsums, slot_offset(cfg, slot));
         run.stage("sort_h", 1, |enc| {
             msm.encode_sort(enc, scratch, MsmBuf::new(abc), n as u32)
         });
-        run.stage("msm_h", 1, |enc| {
-            msm.encode_msm::<G1>(enc, scratch, MsmBuf::new(srs.h.as_buf()), 0, out(Slot::H))
-        });
+        let deep =
+            opts.profile && std::env::var("RISC0_G16_METAL_PROFILE_MSM").as_deref() == Ok("1");
+        let h_pts = pts(&srs.h);
+        msm_stage::<G1>(
+            &mut run,
+            msm,
+            scratch,
+            "msm_h",
+            1,
+            h_pts,
+            0,
+            out(Slot::H),
+            deep,
+        );
+        if fuzz_now.is_none() {
+            // Item G10 alias: sort_h has consumed h, so a, b are free: regenerate the fuzz there
+            // (same kernel and state as the build-time fuzz) and add it to the witness.
+            let blocks = self.fuzz_blocks;
+            run.stage("fuzz", 2, |enc| {
+                small.chacha_fuzz(enc, BufSlice::new(abc), &fuzz_state(), blocks);
+                small.fr_add(enc, BufSlice::new(w), BufSlice::new(abc), wn as u64);
+            });
+        }
         run.stage("sort_w", 2, |enc| {
             msm.encode_sort(enc, scratch, MsmBuf::new(w), wn as u32)
         });
-        run.stage("msm_a", 2, |enc| {
-            msm.encode_msm::<G1>(enc, scratch, MsmBuf::new(srs.a.as_buf()), 0, out(Slot::A))
-        });
-        run.stage("msm_b1", 2, |enc| {
-            msm.encode_msm::<G1>(
-                enc,
-                scratch,
-                MsmBuf::new(srs.b_g1.as_buf()),
-                0,
-                out(Slot::B1),
-            )
-        });
+        let a_pts = pts(&srs.a);
+        msm_stage::<G1>(
+            &mut run,
+            msm,
+            scratch,
+            "msm_a",
+            2,
+            a_pts,
+            0,
+            out(Slot::A),
+            deep,
+        );
+        let b1_pts = pts(&srs.b_g1);
+        msm_stage::<G1>(
+            &mut run,
+            msm,
+            scratch,
+            "msm_b1",
+            2,
+            b1_pts,
+            0,
+            out(Slot::B1),
+            deep,
+        );
         let first = (wn - self.c_len) as u32;
-        run.stage("msm_c", 2, |enc| {
-            msm.encode_msm::<G1>(
-                enc,
-                scratch,
-                MsmBuf::new(srs.c.as_buf()),
-                first,
-                out(Slot::C),
-            )
-        });
-        run.stage("msm_b2", 3, |enc| {
-            msm.encode_msm::<G2>(
-                enc,
-                scratch,
-                MsmBuf::new(srs.b_g2.as_buf()),
-                0,
-                out(Slot::B2),
-            )
-        });
+        let c_pts = pts(&srs.c);
+        msm_stage::<G1>(
+            &mut run,
+            msm,
+            scratch,
+            "msm_c",
+            2,
+            c_pts,
+            first,
+            out(Slot::C),
+            deep,
+        );
+        let b2_pts = pts(&srs.b_g2);
+        msm_stage::<G2>(
+            &mut run,
+            msm,
+            scratch,
+            "msm_b2",
+            3,
+            b2_pts,
+            0,
+            out(Slot::B2),
+            deep,
+        );
         let encode_ms = ms(t);
         let t = Instant::now();
         let gpu_ms = run.finish()?;
@@ -745,7 +1096,12 @@ impl MetalProver {
 
     fn window_sum<C: MsmCurve>(&self, slot: Slot) -> C::Projective {
         let cfg = self.scratch.config();
-        let words = cfg.nwins() as usize * 4 * C::COORD_WORDS;
+        // Every sort of a proof has the same layout (same switches, canonical scalars).
+        let (nwins, wbits) = self
+            .scratch
+            .sorted_layout()
+            .expect("window_sum before a sort");
+        let words = nwins as usize * 4 * C::COORD_WORDS;
         let off = slot_offset(cfg, slot) as usize;
         // Safety: the command buffers that wrote it completed; the slot lies inside the buffer
         // (wsum_bytes) and is 4-byte aligned.
@@ -755,7 +1111,7 @@ impl MetalProver {
                 words,
             )
         };
-        C::combine_windows(w, cfg.wbits)
+        C::combine_windows(w, wbits)
     }
 
     /// `MSM(P, f) + fuzzed` for P = A, B1, C (G1) and B2 (G2), f the fuzz (C from witness index
@@ -767,34 +1123,25 @@ impl MetalProver {
         let k = kernels()?;
         let msm = &k.msm;
         let cfg = self.scratch.config();
-        let (srs, wsums, scratch, fuzz) = (&self.srs, &self.wsums, &mut self.scratch, &self.fuzz);
+        let (srs, wsums, scratch) = (&self.srs, &self.wsums, &mut self.scratch);
         let out = |slot: Slot| MsmBuf::at(wsums, slot_offset(cfg, slot));
         let first = (self.wn - self.c_len) as u32;
         let wn = self.wn as u32;
+        // Without a persistent fuzz (item G10 alias) it is generated into a, b first, as a proof
+        // does.
+        let fuzz: &BufferRef = self.fuzz.as_deref().unwrap_or(&self.abc);
+        let blocks = self.fuzz_blocks;
+        let late = self.fuzz.is_none();
         run_one(&k.queue, |enc| {
+            if late {
+                k.small
+                    .chacha_fuzz(enc, BufSlice::new(fuzz), &fuzz_state(), blocks);
+            }
             msm.encode_sort(enc, scratch, MsmBuf::new(fuzz), wn);
-            msm.encode_msm::<G1>(enc, scratch, MsmBuf::new(srs.a.as_buf()), 0, out(Slot::A));
-            msm.encode_msm::<G1>(
-                enc,
-                scratch,
-                MsmBuf::new(srs.b_g1.as_buf()),
-                0,
-                out(Slot::B1),
-            );
-            msm.encode_msm::<G1>(
-                enc,
-                scratch,
-                MsmBuf::new(srs.c.as_buf()),
-                first,
-                out(Slot::C),
-            );
-            msm.encode_msm::<G2>(
-                enc,
-                scratch,
-                MsmBuf::new(srs.b_g2.as_buf()),
-                0,
-                out(Slot::B2),
-            );
+            msm.encode_msm::<G1>(enc, scratch, pts(&srs.a), 0, out(Slot::A));
+            msm.encode_msm::<G1>(enc, scratch, pts(&srs.b_g1), 0, out(Slot::B1));
+            msm.encode_msm::<G1>(enc, scratch, pts(&srs.c), first, out(Slot::C));
+            msm.encode_msm::<G2>(enc, scratch, pts(&srs.b_g2), 0, out(Slot::B2));
         })?;
         let f = &self.fuzzed;
         Ok((
@@ -808,6 +1155,108 @@ impl MetalProver {
     /// The verifying key parsed from the zkey.
     pub fn verifying_key(&self) -> &VerifyingKeyArk {
         &self.vk
+    }
+}
+
+/// The ChaCha state of the CUDA prover's fuzz (all-zero key and nonce).
+fn fuzz_state() -> [u32; 16] {
+    small::chacha_state(&[0; 32], &[0; 12])
+}
+
+/// Bytes the coefficients will take on the GPU, from the file header (before loading): the
+/// whole file, or the compact form's arrays (cs, rowc, indices, a table of at most 1 MiB, the
+/// rzup key's is 0.5 MiB, and page rounding).
+fn planned_coeff_bytes(path: &Path, compact: bool) -> Result<u64> {
+    let file = File::open(path).with_context(|| format!("open(\"{}\")", path.display()))?;
+    let size = file
+        .metadata()
+        .with_context(|| format!("stat(\"{}\")", path.display()))?
+        .len();
+    if !compact {
+        return Ok(size);
+    }
+    let mut hdr = [0u8; 32];
+    std::os::unix::fs::FileExt::read_exact_at(&file, &mut hdr, 0)
+        .with_context(|| format!("reading \"{}\"", path.display()))?;
+    let [ca, cb, ua, ub] = srs::limbs_le(&hdr);
+    Ok((ca.saturating_add(cb)).saturating_mul(8)
+        + (ua.saturating_add(ub)).saturating_mul(8)
+        + (1 << 20)
+        + 4 * 16384)
+}
+
+/// a and b (`abc` at 0 and n) from the witness and the coefficients (full or compact).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_witness_poly(
+    small: &SmallKernels,
+    enc: &ComputeCommandEncoderRef,
+    coeffs: CoeffsRef,
+    abc: &BufferRef,
+    nn: u64,
+    w: &BufferRef,
+    wn: u64,
+    fault: &BufferRef,
+) {
+    match coeffs {
+        CoeffsRef::Full(coeffs) => {
+            let (count_a, ind_a) = (coeffs.count_a as u64, coeffs.ind_a as u64);
+            let cbuf = coeffs.coeffs.as_buf();
+            let ibuf = coeffs.indices.as_buf();
+            small.witness_into_poly(
+                enc,
+                BufSlice::fr_at(abc, 0),
+                nn,
+                BufSlice::new(cbuf),
+                count_a,
+                BufSlice::new(ibuf),
+                ind_a - 1,
+                BufSlice::new(w),
+                wn,
+                BufSlice::new(fault),
+            );
+            small.witness_into_poly(
+                enc,
+                BufSlice::fr_at(abc, nn),
+                nn,
+                BufSlice::at(cbuf, count_a * small::COEFF_BYTES),
+                coeffs.count_b as u64,
+                BufSlice::at(ibuf, ind_a * 4),
+                coeffs.ind_b as u64 - 1,
+                BufSlice::new(w),
+                wn,
+                BufSlice::new(fault),
+            );
+        }
+        CoeffsRef::Compact(c) => {
+            let (count_a, ind_a) = (c.count_a as u64, c.ind_a as u64);
+            let ntab = c.ntab as u64;
+            for (out, cs_off, count, ind_off, rows) in [
+                (0, 0, count_a, 0, ind_a - 1),
+                (
+                    nn,
+                    count_a * 8,
+                    c.count_b as u64,
+                    ind_a * 4,
+                    c.ind_b as u64 - 1,
+                ),
+            ] {
+                small.witness_into_poly_compact(
+                    enc,
+                    BufSlice::fr_at(abc, out),
+                    nn,
+                    slice_of(&c.cs, cs_off),
+                    count,
+                    slice_of(&c.indices, ind_off),
+                    rows,
+                    BufSlice::new(w),
+                    wn,
+                    BufSlice::new(fault),
+                    slice_of(&c.table, 0),
+                    ntab,
+                    slice_of(&c.rowc, ind_off),
+                );
+            }
+        }
     }
 }
 
@@ -859,6 +1308,69 @@ fn random_fr() -> Result<Fr> {
         if !v.is_zero() {
             return Ok(v);
         }
+    }
+}
+
+/// The prover's MSM configuration: [MsmConfig::default] (c = 16, 256 MiB piece groups), or the
+/// measurement knobs of item G9's sweeps: `RISC0_G16_METAL_MSM_WBITS` (1..=16) and
+/// `RISC0_G16_METAL_MSM_PIECE_MIB` (the per-group piece-buffer cap). Results are the same for
+/// every value (the window layout is the scratch's); only speed and the scratch size change.
+fn msm_config_from_env() -> MsmConfig {
+    let mut cfg = MsmConfig::default();
+    let num = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    };
+    if let Some(w) = num("RISC0_G16_METAL_MSM_WBITS") {
+        if (1..=16).contains(&w) {
+            cfg.wbits = w as u32;
+        } else {
+            eprintln!("[groth16-metal] RISC0_G16_METAL_MSM_WBITS={w} out of 1..=16, ignored");
+        }
+    }
+    if let Some(m) = num("RISC0_G16_METAL_MSM_PIECE_MIB") {
+        cfg.max_piece_bytes = m.max(1) << 20;
+    }
+    cfg
+}
+
+/// One MSM as a [Run] stage; with `deep` (profiling), every dispatch of it is its own stage
+/// (`label.buckets0`, `label.segment_reduce0`, ..., `label.window_reduce`).
+#[allow(clippy::too_many_arguments)]
+fn msm_stage<C: MsmCurve>(
+    run: &mut Run,
+    msm: &MsmKernels,
+    scratch: &MsmScratch,
+    label: &str,
+    group: u32,
+    points: MsmBuf,
+    first: u32,
+    out: MsmBuf,
+    deep: bool,
+) {
+    if !deep {
+        run.stage(label, group, |enc| {
+            msm.encode_msm::<C>(enc, scratch, points, first, out)
+        });
+        return;
+    }
+    let (mut nb, mut ns) = (0, 0);
+    for stage in msm.msm_stages::<C>(scratch, points, first, out) {
+        let name = match stage {
+            MsmStage::Buckets(_) => {
+                nb += 1;
+                format!("{label}.buckets{}", nb - 1)
+            }
+            MsmStage::SegmentReduce(_) => {
+                ns += 1;
+                format!("{label}.segment_reduce{}", ns - 1)
+            }
+            MsmStage::WindowReduce(_) => format!("{label}.window_reduce"),
+        };
+        run.stage(&name, group, |enc| {
+            msm.encode_msm_stage::<C>(enc, scratch, points, out, stage)
+        });
     }
 }
 
@@ -987,6 +1499,12 @@ fn gpu_seconds(cb: &CommandBufferRef) -> f64 {
     let (start, end): (f64, f64) =
         unsafe { (msg_send![cb, GPUStartTime], msg_send![cb, GPUEndTime]) };
     end - start
+}
+
+/// The witness-polynomial encoder for other modules' tests.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    pub(crate) use super::{encode_witness_poly, CoeffsRef};
 }
 
 #[cfg(test)]

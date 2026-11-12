@@ -61,6 +61,7 @@ pub const SMALL_KERNEL_NAMES: &[&str] = &[
     "fr_mul_sub_from_mont",
     "fr_add",
     "witness_into_poly",
+    "witness_into_poly_compact",
     "chacha_fuzz",
     "fr_powers",
     "fr_scale",
@@ -187,6 +188,17 @@ struct WitnessPolyParams {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct WitnessPolyCompactParams {
+    rows: u32,
+    coeff_len: u32,
+    witness_len: u32,
+    out_len: u32,
+    table_len: u32,
+    _pad: [u32; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct ChachaFuzzParams {
     state: [u32; 16],
     blocks: u32,
@@ -228,6 +240,7 @@ pub struct SmallKernels {
     fr_mul_sub_from_mont: ComputePipelineState,
     fr_add: ComputePipelineState,
     witness_into_poly: ComputePipelineState,
+    witness_into_poly_compact: ComputePipelineState,
     chacha_fuzz: ComputePipelineState,
     fr_powers: ComputePipelineState,
     fr_scale: ComputePipelineState,
@@ -249,6 +262,7 @@ impl SmallKernels {
             fr_mul_sub_from_mont: pso("fr_mul_sub_from_mont")?,
             fr_add: pso("fr_add")?,
             witness_into_poly: pso("witness_into_poly")?,
+            witness_into_poly_compact: pso("witness_into_poly_compact")?,
             chacha_fuzz: pso("chacha_fuzz")?,
             fr_powers: pso("fr_powers")?,
             fr_scale: pso("fr_scale")?,
@@ -366,6 +380,51 @@ impl SmallKernels {
             enc,
             &self.witness_into_poly,
             &[out, coeffs, indices, witness, fault],
+            &p,
+            rows,
+        );
+    }
+
+    /// [Self::witness_into_poly] over the compact coefficients (item G10): coefficient `j` is
+    /// `cs[j] = (s, value index)` (two u32) into `table` (`table_len` Fr), and row `i` writes
+    /// `out[rowc[i]]`. Bit-identical to [Self::witness_into_poly] on the coefficients it was
+    /// derived from; same fault bits (a value index out of the table is `BAD_INDEX`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn witness_into_poly_compact(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        out: BufSlice,
+        out_len: u64,
+        cs: BufSlice,
+        coeff_len: u64,
+        indices: BufSlice,
+        rows: u64,
+        witness: BufSlice,
+        witness_len: u64,
+        fault: BufSlice,
+        table: BufSlice,
+        table_len: u64,
+        rowc: BufSlice,
+    ) {
+        out.check(out_len * FR_BYTES, "witness_into_poly_compact out");
+        cs.check(coeff_len * 8, "witness_into_poly_compact cs");
+        indices.check((rows + 1) * 4, "witness_into_poly_compact indices");
+        witness.check(witness_len * FR_BYTES, "witness_into_poly_compact witness");
+        fault.check(4, "witness_into_poly_compact fault");
+        table.check(table_len * FR_BYTES, "witness_into_poly_compact table");
+        rowc.check(rows * 4, "witness_into_poly_compact rowc");
+        let p = WitnessPolyCompactParams {
+            rows: count_u32(rows, "witness_into_poly_compact rows"),
+            coeff_len: count_u32(coeff_len, "witness_into_poly_compact cs"),
+            witness_len: count_u32(witness_len, "witness_into_poly_compact witness"),
+            out_len: count_u32(out_len, "witness_into_poly_compact out"),
+            table_len: count_u32(table_len, "witness_into_poly_compact table"),
+            _pad: [0; 3],
+        };
+        Self::dispatch(
+            enc,
+            &self.witness_into_poly_compact,
+            &[out, cs, indices, witness, fault, table, rowc],
             &p,
             rows,
         );

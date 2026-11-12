@@ -174,6 +174,10 @@ pub struct NttKernels {
     powers: ComputePipelineState,
     mul_powers: ComputePipelineState,
     scale: ComputePipelineState,
+    /// The `_w` (FrF, bn254_fast.h; item G9) pipelines of stage / fused / mul_powers.
+    stage_w: ComputePipelineState,
+    fused_w: ComputePipelineState,
+    mul_powers_w: ComputePipelineState,
     /// log2 of the largest fused block: [FUSED_LOG], less if the fused pipeline cannot run
     /// 2^(FUSED_LOG - 1) threads per threadgroup.
     fused_log: u32,
@@ -191,7 +195,11 @@ impl NttKernels {
                 .map_err(|e| anyhow!("pipeline {name}: {e}"))
         };
         let fused = pso("ntt_fused_stages")?;
-        let max_threads = fused.max_total_threads_per_threadgroup().max(1);
+        let fused_w = pso("ntt_fused_stages_w")?;
+        let max_threads = fused
+            .max_total_threads_per_threadgroup()
+            .min(fused_w.max_total_threads_per_threadgroup())
+            .max(1);
         let fused_log = FUSED_LOG.min(63 - max_threads.leading_zeros() + 1);
         Ok(Self {
             bit_reverse: pso("bit_reverse")?,
@@ -200,6 +208,9 @@ impl NttKernels {
             powers: pso("ntt_powers")?,
             mul_powers: pso("ntt_mul_powers")?,
             scale: pso("ntt_scale")?,
+            stage_w: pso("ntt_stage_w")?,
+            fused_w,
+            mul_powers_w: pso("ntt_mul_powers_w")?,
             fused_log,
         })
     }
@@ -245,6 +256,8 @@ pub struct NttPlan {
     lg_lo: u32,
     ninv: Fr,
     shift: Fr,
+    /// The `_w` pipelines (item G9; default on, [NttPlan::set_wide]).
+    wide: bool,
 }
 
 impl NttPlan {
@@ -328,6 +341,7 @@ impl NttPlan {
             lg_lo,
             ninv,
             shift,
+            wide: true,
         })
     }
 
@@ -405,6 +419,36 @@ impl NttPlan {
         self.encode_levels(enc, x, offset, 0);
     }
 
+    /// Use the `_w` pipelines (bn254_fast.h FrF: the 64-bit-accumulate Montgomery
+    /// multiplication; same results bit for bit) or the bn254.h ones (G5).
+    pub fn set_wide(&mut self, on: bool) {
+        self.wide = on;
+    }
+
+    fn stage_pso(&self) -> &ComputePipelineState {
+        if self.wide {
+            &self.kernels.stage_w
+        } else {
+            &self.kernels.stage
+        }
+    }
+
+    fn fused_pso(&self) -> &ComputePipelineState {
+        if self.wide {
+            &self.kernels.fused_w
+        } else {
+            &self.kernels.fused
+        }
+    }
+
+    fn mul_powers_pso(&self) -> &ComputePipelineState {
+        if self.wide {
+            &self.kernels.mul_powers_w
+        } else {
+            &self.kernels.mul_powers
+        }
+    }
+
     fn check(&self, x: &BufferRef, offset: u64) {
         assert!(
             offset.is_multiple_of(4),
@@ -446,12 +490,12 @@ impl NttPlan {
             bitrev: bitrev as u32,
             _pad: 0,
         };
-        enc.set_compute_pipeline_state(&self.kernels.mul_powers);
+        enc.set_compute_pipeline_state(self.mul_powers_pso());
         enc.set_buffer(buf::X, Some(x), offset);
         enc.set_buffer(buf::MUL_LO, Some(&self.coset_lo), 0);
         enc.set_buffer(buf::MUL_HI, Some(hi), 0);
         set_params(enc, buf::MUL_PARAMS, &p);
-        dispatch_1d(enc, &self.kernels.mul_powers, self.n);
+        dispatch_1d(enc, self.mul_powers_pso(), self.n);
     }
 
     /// The level passes in DIT (ascending) order.
@@ -501,11 +545,11 @@ impl NttPlan {
                         flags,
                         _pad: 0,
                     };
-                    enc.set_compute_pipeline_state(&self.kernels.stage);
+                    enc.set_compute_pipeline_state(self.stage_pso());
                     enc.set_buffer(buf::X, Some(x), offset);
                     enc.set_buffer(buf::TW, Some(&self.tw), 0);
                     set_params(enc, buf::STAGE_PARAMS, &p);
-                    dispatch_1d(enc, &self.kernels.stage, self.n / 2);
+                    dispatch_1d(enc, self.stage_pso(), self.n / 2);
                 }
                 Pass::Fused { q0, ns, cols } => {
                     let log_m = ns + cols;
@@ -515,7 +559,7 @@ impl NttPlan {
                         "ntt_fused_stages needs {tg_bytes} bytes of threadgroup memory"
                     );
                     let threads = 1u64 << (log_m - 1);
-                    assert!(threads <= self.kernels.fused.max_total_threads_per_threadgroup());
+                    assert!(threads <= self.fused_pso().max_total_threads_per_threadgroup());
                     let p = FusedParams {
                         lg: self.lg,
                         q0,
@@ -524,7 +568,7 @@ impl NttPlan {
                         flags,
                         _pad: [0; 3],
                     };
-                    enc.set_compute_pipeline_state(&self.kernels.fused);
+                    enc.set_compute_pipeline_state(self.fused_pso());
                     enc.set_buffer(buf::X, Some(x), offset);
                     enc.set_buffer(buf::TW, Some(&self.tw), 0);
                     set_params(enc, buf::STAGE_PARAMS, &p);
