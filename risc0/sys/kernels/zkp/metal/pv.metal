@@ -26,7 +26,8 @@
 // measured slower here (docs/metal-port/notes/Z3.md), so it is kept for A/B only.
 
 // Kernels and buffer bindings (Rust side: zkp/src/hal/metal/poseidon2.rs, same order):
-// Every name below also has an `_m32` instantiation with the same bindings.
+// Every name below also has an `_m32` instantiation with the same bindings; the pv_* kernels also
+// have a `_z9` one (Z9's reduction, the default; see sredc64h).
 //   pv_fold_k         (0 out: uint4[2n], 1 in: uint4[4n], 2 n)                       grid ceil(n/bs) x bs, bs = min(n, 128)
 //   pv_rows_k         (0 out: uint4[2 dim_x], 1 m: uint[dim_x * dim_y] column-major,
 //                      2 dim_x, 3 dim_y)                                              grid ceil(dim_x/bs) x bs, bs = min(dim_x, 128)
@@ -137,18 +138,22 @@ constant int PV_DHE[24] = {
 #define PV_C56 0x0dddddde
 
 // ============================== pv.cuh (thread per permutation) ==============================
+// Z9 / R17: every helper is always_inline, so no permutation state array is written after an
+// out-of-line call in the row loops (ir_scan.py tier B; R17.md). Measured: no speed change.
+#define PV_INLINE __attribute__((always_inline)) inline
+
 namespace pv {
 
-inline uint red1(uint r) { // [0, 2p) -> [0, p)
+PV_INLINE uint red1(uint r) { // [0, 2p) -> [0, p)
   return r >= PV_P ? r - PV_P : r;
 }
 
-inline uint addm(uint a, uint b) {
+PV_INLINE uint addm(uint a, uint b) {
   return red1(a + b);
 }
 
 // (-p, p) -> [0, p).
-inline uint canon(int r) {
+PV_INLINE uint canon(int r) {
   uint u = uint(r);
   return min(u, u + PV_P);
 }
@@ -162,47 +167,62 @@ struct I64 {
 // sredc(t) = (t - m*p) / 2^32, m = (int32)(t * p^-1 mod 2^32), p^-1 = 2^31 + 2^27 + 1.
 // t and m*p agree in the low word, so t - m*p = 2^32 * (hi(t) - hi(m*p)) with no borrow: the
 // 32-bit form below equals the HIP int64 expression whenever the latter is exact (pv.cuh bounds).
-inline int sredc32(I64 t) {
+PV_INLINE int sredc32(I64 t) {
   uint lo = t.lo;
   int m = int(lo + (lo << 27) + (lo << 31));
   return int(uint(t.hi) - uint(mulhi(m, int(PV_P))));
 }
 
 // sredc() for even t: m = lo * (2^27 + 1).
-inline int sredc_even32(I64 t) {
+PV_INLINE int sredc_even32(I64 t) {
   uint lo = t.lo;
   int m = int(lo + (lo << 27));
   return int(uint(t.hi) - uint(mulhi(m, int(PV_P))));
 }
 
 // The literal HIP code (int64): the default instantiations.
-inline int sredc64(long t) {
+PV_INLINE int sredc64(long t) {
   uint lo = uint(t);
   int m = int(lo + (lo << 27) + (lo << 31));
   return int(ulong(t + long(m) * -long(PV_P)) >> 32);
 }
 
-inline int sredc_even64(long t) {
+PV_INLINE int sredc_even64(long t) {
   uint lo = uint(t);
   int m = int(lo + (lo << 27));
   return int(ulong(t + long(m) * -long(PV_P)) >> 32);
 }
 
-template <bool W> inline int smul(int a, int b) {
-  if (W)
+// Z9 (`_z9` instantiations, the default): the product as one 32x32 -> 64 multiply (as the HIP
+// form), the reduction as hi(t) - mulhi(m, p) (as the m32 form; t and m*p agree in the low word,
+// see sredc32). Same value as sredc64. Measured 1.16-1.18x the HIP form's permutations/s on the
+// M5 Max: the 64-bit `t + m * -p` multiply-add is what costs (docs/metal-port/notes/Z9.md).
+PV_INLINE int sredc64h(long t) {
+  uint lo = uint(t);
+  int m = int(lo + (lo << 27) + (lo << 31));
+  return int(uint(ulong(t) >> 32) - uint(mulhi(m, int(PV_P))));
+}
+
+// V: 0 = `_m32` (32-bit words), 1 = pv.cuh's HIP int64 form, 2 = `_z9` (sredc64h in the full
+// rounds and the partial-round S-box; the partial-round linear layer keeps the HIP int64 form,
+// which measured faster there than the mulhi reduction).
+template <int V> PV_INLINE int smul(int a, int b) {
+  if (V == 2)
+    return sredc64h(long(a) * b);
+  if (V == 1)
     return sredc64(long(a) * b);
   return sredc32(I64{uint(a) * uint(b), mulhi(a, b)});
 }
 
 // y in [-p, p) -> y^7 in (-p, p).
-template <bool W> inline int ssbox(int y) {
-  int y2 = smul<W>(y, y);
-  int y3 = smul<W>(y2, y);
-  int y4 = smul<W>(y2, y2);
-  return smul<W>(y3, y4);
+template <int V> PV_INLINE int ssbox(int y) {
+  int y2 = smul<V>(y, y);
+  int y3 = smul<V>(y2, y);
+  int y4 = smul<V>(y2, y2);
+  return smul<V>(y3, y4);
 }
 
-inline void m4(thread uint& a, thread uint& b, thread uint& c, thread uint& d) {
+PV_INLINE void m4(thread uint& a, thread uint& b, thread uint& c, thread uint& d) {
   uint t0 = addm(a, b), t1 = addm(c, d);
   uint t2 = addm(addm(b, b), t1), t3 = addm(addm(d, d), t0);
   uint t1_2 = addm(t1, t1), t0_2 = addm(t0, t0);
@@ -214,7 +234,7 @@ inline void m4(thread uint& a, thread uint& b, thread uint& c, thread uint& d) {
 }
 
 // External (full-round) linear layer.
-inline void m_ext(thread uint* x) {
+PV_INLINE void m_ext(thread uint* x) {
   uint s[4] = {0, 0, 0, 0};
 #pragma unroll
   for (int g = 0; g < 6; g++) {
@@ -228,7 +248,7 @@ inline void m_ext(thread uint* x) {
     x[i] = addm(x[i], s[i & 3]);
 }
 
-template <bool W> inline void full_round(thread uint* x, int r) {
+template <int V> PV_INLINE void full_round(thread uint* x, int r) {
   // The round constants first: one batch of loads rather than one address per constant.
   uint rc[24];
 #pragma unroll
@@ -236,7 +256,7 @@ template <bool W> inline void full_round(thread uint* x, int r) {
     rc[i] = PV_RCF[r * 24 + i];
 #pragma unroll
   for (int i = 0; i < 24; i++)
-    x[i] = canon(ssbox<W>(int(x[i] + (rc[i] - PV_P))));
+    x[i] = canon(ssbox<V>(int(x[i] + (rc[i] - PV_P))));
   m_ext(x);
 }
 
@@ -244,14 +264,14 @@ template <bool W> inline void full_round(thread uint* x, int r) {
 // computed as sredc_even(E_i * e_i + a) with E_i == DH_i and a == S * 2^32 (mod p), both even.
 // S = sum_i e_i is kept as its wrapping low word lo and tb = sum (e_i >> 24) (pv.cuh ssum24; the
 // HIP v_perm/v_pk_add_u16 packing computes exactly this sum).
-template <bool W> inline void partial_rounds(thread uint* x) {
+template <int V> PV_INLINE void partial_rounds(thread uint* x) {
   int e[24];
 #pragma unroll
   for (int i = 0; i < 24; i++)
     e[i] = int(x[i]);
 #pragma unroll 1
   for (int r = 0; r < 21; r++) {
-    e[0] = ssbox<W>(int(canon(e[0]) + (PV_RCP[r] - PV_P)));
+    e[0] = ssbox<V>(int(canon(e[0]) + (PV_RCP[r] - PV_P)));
     uint lo = 0;
     int tb = 0;
 #pragma unroll
@@ -261,7 +281,7 @@ template <bool W> inline void partial_rounds(thread uint* x) {
     }
     // S = 2^24 * c + l with l = lo mod 2^24 and c = floor(S / 2^24): a = l * 2^32 + c * C56.
     int c = tb + int((lo - (uint(tb) << 24)) >> 24);
-    if (W) {
+    if (V != 0) {
       long a = long(ulong(lo & 0xffffffu) << 32) + long(c) * PV_C56;
 #pragma unroll
       for (int i = 0; i < 24; i++)
@@ -285,19 +305,19 @@ template <bool W> inline void partial_rounds(thread uint* x) {
     x[i] = canon(e[i]);
 }
 
-template <bool W> inline void permute(thread uint* x) {
+template <int V> PV_INLINE void permute(thread uint* x) {
   m_ext(x);
   // One loop over the 8 full rounds, so their body is emitted once (half the code size).
 #pragma unroll 1
   for (int r = 0; r < 8; r++) {
     if (r == 4)
-      partial_rounds<W>(x);
-    full_round<W>(x, r);
+      partial_rounds<V>(x);
+    full_round<V>(x, r);
   }
 }
 
 // The fold of digest pair t: in[4t .. 4t+3] (two digests) -> out[2t], out[2t + 1].
-template <bool W> inline void fold_one(device uint4* out, const device uint4* in, uint t) {
+template <int V> PV_INLINE void fold_one(device uint4* out, const device uint4* in, uint t) {
   uint x[24];
 #pragma unroll
   for (int q = 0; q < 4; q++) {
@@ -310,7 +330,7 @@ template <bool W> inline void fold_one(device uint4* out, const device uint4* in
 #pragma unroll
   for (int i = 16; i < 24; i++)
     x[i] = 0;
-  permute<W>(x);
+  permute<V>(x);
   out[2 * t] = uint4(x[0], x[1], x[2], x[3]);
   out[2 * t + 1] = uint4(x[4], x[5], x[6], x[7]);
 }
@@ -318,7 +338,7 @@ template <bool W> inline void fold_one(device uint4* out, const device uint4* in
 } // namespace pv
 
 // out[i] = hash of the two digests in[2i], in[2i + 1] (n outputs). pv.cuh fold_k.
-template <bool W>
+template <int V>
 [[max_total_threads_per_threadgroup(128)]]
 kernel void pv_fold(device uint4* out [[buffer(0)]],
                     const device uint4* in [[buffer(1)]],
@@ -326,17 +346,19 @@ kernel void pv_fold(device uint4* out [[buffer(0)]],
                     uint gid [[thread_position_in_grid]]) {
   if (gid >= n)
     return;
-  pv::fold_one<W>(out, in, gid);
+  pv::fold_one<V>(out, in, gid);
 }
 
 template [[host_name("pv_fold_k_m32")]] kernel void
-pv_fold<false>(device uint4*, const device uint4*, constant uint&, uint);
+pv_fold<0>(device uint4*, const device uint4*, constant uint&, uint);
 template [[host_name("pv_fold_k")]] kernel void
-pv_fold<true>(device uint4*, const device uint4*, constant uint&, uint);
+pv_fold<1>(device uint4*, const device uint4*, constant uint&, uint);
+template [[host_name("pv_fold_k_z9")]] kernel void
+pv_fold<2>(device uint4*, const device uint4*, constant uint&, uint);
 
 // The top layers of a fold tree in one threadgroup of n0 <= 128 threads: layers n0, n0/2, ..., 1
 // (digests: layer of size n at [n, 2n), its inputs at [2n, 4n)). pv.cuh fold_tail_k (HIP).
-template <bool W>
+template <int V>
 [[max_total_threads_per_threadgroup(128)]]
 kernel void pv_fold_tail(device uint4* nodes [[buffer(0)]],
                          constant uint& n0 [[buffer(1)]],
@@ -344,20 +366,22 @@ kernel void pv_fold_tail(device uint4* nodes [[buffer(0)]],
 #pragma unroll 1
   for (uint n = n0; n >= 1; n >>= 1) {
     if (t < n)
-      pv::fold_one<W>(nodes + 2 * n, nodes + 4 * n, t);
+      pv::fold_one<V>(nodes + 2 * n, nodes + 4 * n, t);
     threadgroup_barrier(mem_flags::mem_device);
   }
 }
 
 template [[host_name("pv_fold_tail_k_m32")]] kernel void
-pv_fold_tail<false>(device uint4*, constant uint&, uint);
+pv_fold_tail<0>(device uint4*, constant uint&, uint);
 template [[host_name("pv_fold_tail_k")]] kernel void
-pv_fold_tail<true>(device uint4*, constant uint&, uint);
+pv_fold_tail<1>(device uint4*, constant uint&, uint);
+template [[host_name("pv_fold_tail_k_z9")]] kernel void
+pv_fold_tail<2>(device uint4*, constant uint&, uint);
 
 // out[r] = hash of row r of the column-major dim_x x dim_y matrix m (16 elements per absorb).
 // pv.cuh rows_k, generic (non-RDNA) branch; the column pointer is advanced instead of computing
 // (i + j) * dim_x, so offsets beyond 2^32 elements need no 64-bit multiply.
-template <bool W>
+template <int V>
 [[max_total_threads_per_threadgroup(128)]]
 kernel void pv_rows(device uint4* out [[buffer(0)]],
                     const device uint* m [[buffer(1)]],
@@ -383,48 +407,50 @@ kernel void pv_rows(device uint4* out [[buffer(0)]],
         x[j] = 0u;
       }
     }
-    pv::permute<W>(x);
+    pv::permute<V>(x);
   } while (i < cols);
   out[2 * gid] = uint4(x[0], x[1], x[2], x[3]);
   out[2 * gid + 1] = uint4(x[4], x[5], x[6], x[7]);
 }
 
 template [[host_name("pv_rows_k_m32")]] kernel void
-pv_rows<false>(device uint4*, const device uint*, constant uint&, constant uint&, uint);
+pv_rows<0>(device uint4*, const device uint*, constant uint&, constant uint&, uint);
 template [[host_name("pv_rows_k")]] kernel void
-pv_rows<true>(device uint4*, const device uint*, constant uint&, constant uint&, uint);
+pv_rows<1>(device uint4*, const device uint*, constant uint&, constant uint&, uint);
+template [[host_name("pv_rows_k_z9")]] kernel void
+pv_rows<2>(device uint4*, const device uint*, constant uint&, constant uint&, uint);
 
 // =========================== pv_small.cuh (latency kernels, SIMD 32) ===========================
 namespace pvs {
 
-inline uint red1(uint r) { return min(r, r - PV_P); } // [0, 2^32) ok
-inline uint addm(uint a, uint b) { return red1(a + b); }
+PV_INLINE uint red1(uint r) { return min(r, r - PV_P); } // [0, 2^32) ok
+PV_INLINE uint addm(uint a, uint b) { return red1(a + b); }
 
 // pv.cuh mred, HIP C++ branch (W): the high word of t + m*p mod 2^64, m = lo(t) * M0.
-inline uint mred64(ulong t) {
+PV_INLINE uint mred64(ulong t) {
   uint m = uint(t) * PV_M0;
   return uint((t + ulong(m) * PV_P) >> 32);
 }
 // The same from 32-bit words (!W; CUDA's PTX carry chain): lo + lo(m*p) is 0 mod 2^32, so its
 // carry is (lo != 0).
-inline uint mred32(uint lo, uint hi) {
+PV_INLINE uint mred32(uint lo, uint hi) {
   uint m = lo * PV_M0;
   return hi + mulhi(m, PV_P) + (lo != 0u ? 1u : 0u);
 }
-template <bool W> inline uint mmul_lazy(uint a, uint b) {
+template <bool W> PV_INLINE uint mmul_lazy(uint a, uint b) {
   if (W)
     return mred64(ulong(a) * b);
   return mred32(a * b, mulhi(a, b));
 }
-template <bool W> inline uint mmul(uint a, uint b) { return red1(mmul_lazy<W>(a, b)); }
+template <bool W> PV_INLINE uint mmul(uint a, uint b) { return red1(mmul_lazy<W>(a, b)); }
 // x canonical -> x^7 canonical (bounds: pv.cuh)
-template <bool W> inline uint sbox(uint x) {
+template <bool W> PV_INLINE uint sbox(uint x) {
   uint x2 = mmul_lazy<W>(x, x);
   uint x3 = mmul<W>(x2, x);
   uint x4 = mmul_lazy<W>(x2, x2);
   return mmul<W>(x3, x4);
 }
-inline void m4(thread uint& a, thread uint& b, thread uint& c, thread uint& d) {
+PV_INLINE void m4(thread uint& a, thread uint& b, thread uint& c, thread uint& d) {
   uint t0 = addm(a, b), t1 = addm(c, d);
   uint t2 = addm(addm(b, b), t1), t3 = addm(addm(d, d), t0);
   uint t1_2 = addm(t1, t1), t0_2 = addm(t0, t0);
@@ -435,7 +461,7 @@ inline void m4(thread uint& a, thread uint& b, thread uint& c, thread uint& d) {
   d = t4;
 }
 // a * c (Montgomery), c constant with cm = c * M0 mod 2^32. a < 2p, c < p: canonical output.
-template <bool W> inline uint cmul(uint a, uint c, uint cm) {
+template <bool W> PV_INLINE uint cmul(uint a, uint c, uint cm) {
   uint m = a * cm;
   if (W)
     return red1(uint((ulong(a) * c + ulong(m) * PV_P) >> 32));
@@ -443,10 +469,10 @@ template <bool W> inline uint cmul(uint a, uint c, uint cm) {
   uint r = mulhi(a, c) + mulhi(m, PV_P) + (lo != 0u ? 1u : 0u);
   return red1(r);
 }
-inline uint shfl(uint v, uint src) {
+PV_INLINE uint shfl(uint v, uint src) {
   return simd_shuffle(v, ushort(src));
 }
-inline uint shx(uint v, uint m) {
+PV_INLINE uint shx(uint v, uint m) {
   return simd_shuffle_xor(v, ushort(m));
 }
 
@@ -454,7 +480,7 @@ namespace w {
 
 // External layer, lane-parallel: m4 inside each group of 4 lanes, then the column sums of the
 // 6 groups gathered with parallel shuffles (lanes j, j+4, ..., j+20 only).
-inline uint m_ext(uint x, uint lane) {
+PV_INLINE uint m_ext(uint x, uint lane) {
   const uint base = lane & ~3u, j = lane & 3u;
   uint a = shfl(x, base), b = shfl(x, base + 1), c = shfl(x, base + 2), d = shfl(x, base + 3);
   m4(a, b, c, d);
@@ -469,7 +495,7 @@ struct Lane {
   uint rc[8], pw[21], cr[21], crm[21], dh, dhm, e0, e0m;
 };
 
-inline void load(thread Lane& K, uint lane) {
+PV_INLINE void load(thread Lane& K, uint lane) {
 #pragma unroll
   for (int r = 0; r < 8; r++)
     K.rc[r] = PVS_RCF[r][lane];
@@ -486,7 +512,7 @@ inline void load(thread Lane& K, uint lane) {
 }
 
 // x = this lane's cell (0 for lanes >= 24); returns the permuted cell (0 for lanes >= 24).
-template <bool W> inline uint permute(uint x, uint lane, const thread Lane& K) {
+template <bool W> PV_INLINE uint permute(uint x, uint lane, const thread Lane& K) {
   const bool act = lane < 24;
   x = m_ext(x, lane);
 #pragma unroll
@@ -537,10 +563,10 @@ template <bool W> inline uint permute(uint x, uint lane, const thread Lane& K) {
 namespace q {
 
 // value of cell 4m + k from lane k of this lane's group
-inline uint grp(uint v, uint lane, uint k) {
+PV_INLINE uint grp(uint v, uint lane, uint k) {
   return shfl(v, (lane & ~3u) | k);
 }
-inline void m_ext(thread uint* y, uint lane) {
+PV_INLINE void m_ext(thread uint* y, uint lane) {
   const uint l = lane & 3u;
   uint s = 0;
 #pragma unroll
@@ -556,7 +582,7 @@ inline void m_ext(thread uint* y, uint lane) {
   for (int m = 0; m < 6; m++)
     y[m] = addm(y[m], s);
 }
-template <bool W> inline void full_round(thread uint* y, int r, uint lane) {
+template <bool W> PV_INLINE void full_round(thread uint* y, int r, uint lane) {
   const uint l = lane & 3u;
 #pragma unroll
   for (int m = 0; m < 6; m++)
@@ -565,7 +591,7 @@ template <bool W> inline void full_round(thread uint* y, int r, uint lane) {
 }
 // pv.cuh's (CUDA) partial rounds (cells lazily in [0, 2p)), the 24-term sum split over the 4
 // lanes. The 64-bit sum is kept as two words; each xor-shuffle adds both with a carry.
-template <bool W> inline void partial_rounds(thread uint* y, uint lane) {
+template <bool W> PV_INLINE void partial_rounds(thread uint* y, uint lane) {
   const uint l = lane & 3u;
 #pragma unroll 1
   for (int r = 0; r < 21; r++) {
@@ -606,7 +632,7 @@ template <bool W> inline void partial_rounds(thread uint* y, uint lane) {
   for (int m = 0; m < 6; m++)
     y[m] = red1(y[m]);
 }
-template <bool W> inline void permute(thread uint* y, uint lane) {
+template <bool W> PV_INLINE void permute(thread uint* y, uint lane) {
   m_ext(y, lane);
 #pragma unroll 1
   for (int r = 0; r < 4; r++)

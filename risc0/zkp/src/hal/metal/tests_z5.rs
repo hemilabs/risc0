@@ -268,8 +268,12 @@ fn mdiv_shapes() {
     assert_eq!(mdiv_shape(3 << 13, 8), None);
     assert_eq!(mdiv_shape(1 << 24, 8), None);
     assert_eq!(mdiv_shape(1 << 16, 4), None);
-    if std::env::var("RISC0_METAL_MDIV_E").is_err() {
-        assert_eq!(mdiv_default_e(1 << 19), 8);
+    if std::env::var("RISC0_METAL_MDIV_E").is_err()
+        && std::env::var("RISC0_METAL_MDIV_E16_MIN_PO2").is_err()
+    {
+        // Z9 moved the E = 16 switch from po2 20 to 17.
+        assert_eq!(mdiv_default_e(1 << 16), 8);
+        assert_eq!(mdiv_default_e(1 << 17), 16);
         assert_eq!(mdiv_default_e(1 << 20), 16);
         assert_eq!(mdiv_default_e(1 << 22), 16);
     }

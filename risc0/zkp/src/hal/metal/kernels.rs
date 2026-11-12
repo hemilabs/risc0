@@ -62,6 +62,7 @@ impl MetalKernels {
                 .new_compute_pipeline_state_with_function(&function)
                 .map_err(|e| anyhow!("{e}"))
                 .with_context(|| format!("compute pipeline for {name}"))?;
+            super::runtime::register_pso_name(&pso, name);
             pipelines.insert(name.to_string(), pso);
         }
         Ok(Self { library, pipelines })

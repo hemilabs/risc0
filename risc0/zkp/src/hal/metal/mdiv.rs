@@ -28,9 +28,14 @@
 //!   tiles below 32 (one 32-thread threadgroup per slice: the "single-threadgroup" scan for po2
 //!   11..=15) and takes `K = ntiles / 1024` tiles per thread above 1024 (the po2 22/23 "two-level"
 //!   scan). The arithmetic is exact field arithmetic, so the result does not depend on the shape.
-//! * E = 8 (CUDA's `MD_E`) below po2 20 and E = 16 from po2 20 up (measured faster there, see
-//!   `docs/metal-port/notes/Z5.md`); `RISC0_METAL_MDIV_E=8|16` forces one. So po2 22 runs at E = 16
+//! * E = 8 (CUDA's `MD_E`) below po2 17 and E = 16 from po2 17 up (Z9: E = 16 is 1.12-1.21x
+//!   faster at po2 17-19, Z5 measured it from po2 20; `RISC0_METAL_MDIV_E16_MIN_PO2` moves the
+//!   switch, 20 restores Z5's); `RISC0_METAL_MDIV_E=8|16` forces one. So po2 22 runs at E = 16
 //!   with 1024 tiles; at E = 8 it takes the K = 2 scan (tested, selectable).
+//! * Z9 CPU/GPU crossover: slices below `2^RISC0_METAL_MDIV_GPU_MIN_PO2` elements (default 16)
+//!   use the host loop on the unified-memory buffer, which measured faster there (po2 11: 5.8x,
+//!   13: 2.9x, 14: 1.7x, 15: ~1.0x; GPU 1.3x from po2 16; docs/metal-port/notes/Z9.md). `0`
+//!   restores the pre-Z9 behaviour (the GPU whenever a shape exists).
 //! * Anything else (po2 < 11, non-power-of-two lengths, `RISC0_METAL_MDIV=0`) uses the host
 //!   loop with the same rotate semantics, as CUDA falls back to the per-root sppark path.
 //!
@@ -120,13 +125,24 @@ pub(crate) fn mdiv_shape(n: usize, e: usize) -> Option<MdShape> {
     })
 }
 
-/// Slices of at least this many elements use E = 16 by default (measured: 20-30% less GPU time
-/// than E = 8 at po2 20, 21 and 22 on the M5 Max; see the Z5 note).
-pub(crate) const MD_E16_MIN_N: usize = 1 << 20;
+/// Slices of at least this many elements use E = 16 by default (Z5: 20-30% less GPU time than
+/// E = 8 at po2 20, 21 and 22; Z9: 12-21% at po2 17, 18 and 19, ambiguous at 16; M5 Max).
+pub(crate) const MD_E16_MIN_N: usize = 1 << 17;
+
+/// Slices below this many elements use the host loop (Z9 crossover, see the module docs).
+pub(crate) const MD_GPU_MIN_N: usize = 1 << 16;
+
+fn env_po2(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&p| p < usize::BITS as usize)
+}
 
 /// The E for slices of `n` elements: `RISC0_METAL_MDIV_E` if set to 8 or 16, else 16 from
-/// [MD_E16_MIN_N] up and 8 (CUDA's `MD_E`) below.
+/// [MD_E16_MIN_N] (or `2^RISC0_METAL_MDIV_E16_MIN_PO2`) up and 8 (CUDA's `MD_E`) below.
 pub(crate) fn mdiv_default_e(n: usize) -> usize {
+    let e16_min = env_po2("RISC0_METAL_MDIV_E16_MIN_PO2").map_or(MD_E16_MIN_N, |p| 1 << p);
     match std::env::var("RISC0_METAL_MDIV_E")
         .ok()
         .as_deref()
@@ -134,9 +150,15 @@ pub(crate) fn mdiv_default_e(n: usize) -> usize {
     {
         Some("16") => 16,
         Some("8") => 8,
-        _ if n >= MD_E16_MIN_N => 16,
+        _ if n >= e16_min => 16,
         _ => 8,
     }
+}
+
+/// Whether slices of `n` elements are large enough for the GPU path ([MD_GPU_MIN_N], or
+/// `2^RISC0_METAL_MDIV_GPU_MIN_PO2`; 0 = always).
+pub(crate) fn mdiv_gpu_size(n: usize) -> bool {
+    n >= env_po2("RISC0_METAL_MDIV_GPU_MIN_PO2").map_or(MD_GPU_MIN_N, |p| 1 << p)
 }
 
 /// Whether the GPU path is enabled (`RISC0_METAL_MDIV=0` forces the host loop, like
@@ -363,7 +385,7 @@ impl<MH: MetalHash> MetalHal<MH> {
         chunks: &[(usize, Vec<BabyBearExtElem>)],
         n: usize,
     ) -> Vec<BabyBearExtElem> {
-        let shape = if mdiv_enabled() {
+        let shape = if mdiv_enabled() && mdiv_gpu_size(n) {
             mdiv_shape(n, mdiv_default_e(n))
         } else {
             None
