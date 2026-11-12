@@ -280,6 +280,8 @@ fn zk_table(lg: usize) -> Vec<Fp> {
 pub(crate) struct NttState {
     tables: OnceLock<[BufferImpl<Fp>; 2]>,
     zk: Mutex<HashMap<usize, BufferImpl<Fp>>>,
+    /// Z9: per-HAL step-split overrides `(ct, lg) -> iterations per pass` (measurements, tests).
+    split: Mutex<HashMap<(bool, usize), Vec<usize>>>,
 }
 
 impl NttState {
@@ -287,6 +289,20 @@ impl NttState {
         Self {
             tables: OnceLock::new(),
             zk: Mutex::new(HashMap::new()),
+            split: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The passes of a forward (`ct`) or inverse NTT of `2^lg`: an override if set, else sppark's
+    /// split.
+    fn steps(&self, ct: bool, lg: usize) -> Vec<usize> {
+        if let Some(v) = self.split.lock().unwrap().get(&(ct, lg)) {
+            return v.clone();
+        }
+        if ct {
+            ct_steps(lg)
+        } else {
+            gs_steps(lg)
         }
     }
 }
@@ -471,7 +487,7 @@ impl<MH: MetalHash> MetalHal<MH> {
         lg: usize,
         skip: bool,
     ) {
-        let st = ct_steps(lg);
+        let st = self.ntt.steps(true, lg);
         let mut stage = 0;
         for (i, &iterations) in st.iter().enumerate() {
             let a = XArgs {
@@ -501,7 +517,7 @@ impl<MH: MetalHash> MetalHal<MH> {
         lg: usize,
         zk: Option<&BufferImpl<Fp>>,
     ) {
-        let st = gs_steps(lg);
+        let st = self.ntt.steps(false, lg);
         let n = st.len();
         let mut stage = lg;
         for (i, &iterations) in st.iter().enumerate() {
@@ -802,6 +818,26 @@ pub(crate) mod test_hooks {
 
     pub(crate) fn gs_steps(lg: usize) -> Vec<usize> {
         super::gs_steps(lg)
+    }
+
+    /// Override (Some) or reset (None) the pass split of `hal`'s forward (`ct`) or inverse NTTs
+    /// of `2^lg`. Every pass must have 1..=10 iterations and they must sum to `lg`.
+    pub(crate) fn set_split<MH: MetalHash>(
+        hal: &MetalHal<MH>,
+        ct: bool,
+        lg: usize,
+        split: Option<Vec<usize>>,
+    ) {
+        let mut m = hal.ntt.split.lock().unwrap();
+        match split {
+            Some(v) => {
+                assert!(v.iter().all(|&i| (1..=10).contains(&i)) && v.iter().sum::<usize>() == lg);
+                m.insert((ct, lg), v);
+            }
+            None => {
+                m.remove(&(ct, lg));
+            }
+        }
     }
 
     pub(crate) fn zk_table(lg: usize) -> Vec<Fp> {

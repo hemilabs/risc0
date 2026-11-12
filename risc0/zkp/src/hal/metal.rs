@@ -55,6 +55,8 @@ mod tests_z7;
 mod tests_z8b;
 #[cfg(test)]
 mod tests_r17;
+#[cfg(test)]
+mod tests_z9;
 
 use std::{
     fmt::Debug,
@@ -86,6 +88,7 @@ pub use self::{
         MAX_SET_BYTES, MAX_WORKING_SET_ENV,
     },
 };
+pub use self::runtime::{profile_report, profile_take, ProfileEntry, PROFILE_ENV};
 use super::{Buffer as _, Hal};
 use crate::{
     core::{
@@ -167,6 +170,10 @@ pub const KERNEL_NAMES: &[&str] = &[
     "mdiv_scan_512",
     "mdiv_scan_1024",
     "mdiv_final",
+    // pv.metal `_z9` instantiations (Z9)
+    "pv_fold_k_z9",
+    "pv_fold_tail_k_z9",
+    "pv_rows_k_z9",
 ];
 
 /// Whether the Metal backend may be used for `unit` (one of `zkp`, `rv32im`, `recursion`,

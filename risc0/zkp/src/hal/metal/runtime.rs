@@ -59,6 +59,125 @@ pub const MAX_SET_BYTES: usize = 4096;
 /// Buffers below this size are always pooled; larger ones only within the pool cap.
 const POOL_SMALL_BYTES: u64 = 64 << 10;
 
+/// Threads per threadgroup of `Grid::Threads` dispatches (capped by the PSO): 256, CUDA's
+/// elementwise block size (plan 2.5). `RISC0_METAL_THREADS_1D` overrides it (Z9 sweep); tests use
+/// [set_threads_1d].
+static THREADS_1D: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn threads_1d() -> u64 {
+    let v = THREADS_1D.load(Ordering::Relaxed);
+    if v != 0 {
+        return v;
+    }
+    let v = std::env::var("RISC0_METAL_THREADS_1D")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| (1..=1024).contains(&n))
+        .unwrap_or(256);
+    THREADS_1D.store(v, Ordering::Relaxed);
+    v
+}
+
+#[cfg(test)]
+pub(crate) fn set_threads_1d(n: u64) {
+    THREADS_1D.store(n, Ordering::Relaxed);
+}
+
+/// Z9 per-kernel GPU-time profiler (measurement tool, off by default). With
+/// `RISC0_METAL_PROFILE=1` every dispatch and blit is committed in a command buffer of its own and
+/// its `GPUEndTime - GPUStartTime` is added to a process-wide table keyed by kernel name (names
+/// come from [register_pso_name], called for every PSO [super::MetalKernels] builds). The table is
+/// printed to stderr when a runtime is dropped, and [profile_take] returns and clears it. One
+/// command buffer per dispatch serializes the GPU work, so wall time grows; the per-kernel GPU
+/// times stay comparable (they include a few microseconds of per-command-buffer overhead).
+pub const PROFILE_ENV: &str = "RISC0_METAL_PROFILE";
+
+fn profiling() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| env_flag(PROFILE_ENV))
+}
+
+static PSO_NAMES: Mutex<Option<HashMap<usize, &'static str>>> = Mutex::new(None);
+
+/// Record the kernel name of a PSO for the profiler (cheap; names are leaked once per PSO).
+pub(crate) fn register_pso_name(pso: &ComputePipelineStateRef, name: &str) {
+    if !profiling() {
+        return;
+    }
+    let mut names = PSO_NAMES.lock();
+    names.get_or_insert_with(HashMap::new).insert(
+        pso.as_ptr() as usize,
+        Box::leak(name.to_string().into_boxed_str()),
+    );
+}
+
+fn pso_name(key: usize) -> &'static str {
+    PSO_NAMES
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&key).copied())
+        .unwrap_or("(unnamed pso)")
+}
+
+/// Per-kernel profile entry: dispatch count, summed GPU seconds and the fastest dispatch (the
+/// least disturbed by other processes' GPU work; 0 until the first sample).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProfileEntry {
+    pub count: u64,
+    pub gpu_secs: f64,
+    pub min_secs: f64,
+}
+
+static PROFILE: Mutex<Option<HashMap<&'static str, ProfileEntry>>> = Mutex::new(None);
+
+#[allow(unexpected_cfgs)]
+fn record_profile(label: &'static str, cmd: &CommandBuffer) {
+    // SAFETY: plain Objective-C property reads on a live, completed command buffer.
+    let (start, end): (f64, f64) = unsafe {
+        let p = cmd.as_ptr() as *mut Object;
+        (msg_send![p, GPUStartTime], msg_send![p, GPUEndTime])
+    };
+    let mut prof = PROFILE.lock();
+    let e = prof
+        .get_or_insert_with(HashMap::new)
+        .entry(label)
+        .or_default();
+    let dt = (end - start).max(0.0);
+    e.min_secs = if e.count == 0 { dt } else { e.min_secs.min(dt) };
+    e.count += 1;
+    e.gpu_secs += dt;
+}
+
+/// Take (and clear) the per-kernel profile, sorted by GPU time, descending.
+pub fn profile_take() -> Vec<(&'static str, ProfileEntry)> {
+    let mut v: Vec<_> = PROFILE
+        .lock()
+        .take()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    v.sort_by(|a, b| b.1.gpu_secs.total_cmp(&a.1.gpu_secs));
+    v
+}
+
+/// Format [profile_take]'s result as a table.
+pub fn profile_report() -> String {
+    let v = profile_take();
+    let total: f64 = v.iter().map(|(_, e)| e.gpu_secs).sum();
+    let mut out = format!("[metal-profile] total GPU {:.3} ms\n", total * 1e3);
+    for (name, e) in v {
+        out += &format!(
+            "[metal-profile] {name:32} {:8} calls {:10.3} ms {:6.2}% {:9.1} us/call {:9.1} us min\n",
+            e.count,
+            e.gpu_secs * 1e3,
+            100.0 * e.gpu_secs / total.max(1e-12),
+            1e6 * e.gpu_secs / e.count.max(1) as f64,
+            1e6 * e.min_secs
+        );
+    }
+    out
+}
+
 /// Environment variable naming an artificial GPU working-set budget in bytes (plan 9.1), e.g.
 /// `4294967296`, `4G`, `4GiB`, `512M` (suffixes are binary: K = 1024). When set, it replaces
 /// `recommendedMaxWorkingSetSize` as the working-set limit (if smaller): `gpu_total_memory` and
@@ -251,12 +370,15 @@ struct OpenBatch {
     dispatches: usize,
     /// Buffers bound in this batch (object addresses); filled only in debug mode.
     used: HashSet<usize>,
+    /// Profiler label of the batch's only dispatch ([PROFILE_ENV]).
+    label: Option<&'static str>,
 }
 
 struct InFlight {
     seq: u64,
     cmd: CommandBuffer,
     used: HashSet<usize>,
+    label: Option<&'static str>,
     /// Test hook: report this batch as `Error` once it completes.
     #[cfg(test)]
     injected_error: bool,
@@ -584,6 +706,7 @@ impl Runtime {
                 bound: Bound::default(),
                 dispatches: 0,
                 used: HashSet::new(),
+                label: None,
             });
         }
         st.open.as_mut().unwrap()
@@ -598,6 +721,7 @@ impl Runtime {
                 seq: open.seq,
                 cmd: open.cmd,
                 used: open.used,
+                label: open.label,
                 #[cfg(test)]
                 injected_error: self.fail_next_batch.swap(false, Ordering::AcqRel),
             });
@@ -614,7 +738,11 @@ impl Runtime {
                 status = MTLCommandBufferStatus::Error;
             }
             match status {
-                MTLCommandBufferStatus::Completed => {}
+                MTLCommandBufferStatus::Completed => {
+                    if let Some(label) = front.label {
+                        record_profile(label, &front.cmd);
+                    }
+                }
                 MTLCommandBufferStatus::Error => {
                     #[allow(unused_mut)]
                     let mut msg = command_buffer_error(&front.cmd);
@@ -646,6 +774,14 @@ impl Runtime {
         &self,
         f: impl FnOnce(&ComputeCommandEncoderRef, &mut Bound, Option<&mut HashSet<usize>>) -> R,
     ) -> R {
+        self.with_compute_labeled(None, f)
+    }
+
+    fn with_compute_labeled<R>(
+        &self,
+        label: Option<&'static str>,
+        f: impl FnOnce(&ComputeCommandEncoderRef, &mut Bound, Option<&mut HashSet<usize>>) -> R,
+    ) -> R {
         let _lock = exclusive();
         let mut st = self.lock_state();
         let debug = self.debug();
@@ -661,7 +797,11 @@ impl Runtime {
         };
         let r = f(enc, &mut open.bound, debug.then_some(&mut open.used));
         open.dispatches += 1;
-        if open.dispatches >= self.batch_limit.load(Ordering::Relaxed) {
+        let prof = profiling();
+        if prof {
+            open.label = Some(label.unwrap_or("(with_encoder)"));
+        }
+        if prof || open.dispatches >= self.batch_limit.load(Ordering::Relaxed) {
             self.close(&mut st);
             self.poll(&mut st);
         }
@@ -679,7 +819,7 @@ impl Runtime {
     ) {
         let (threads_per_grid, threads_per_group, groups) = match grid {
             Grid::Threads(n) => {
-                let w = pso.max_total_threads_per_threadgroup().min(256);
+                let w = pso.max_total_threads_per_threadgroup().min(threads_1d());
                 (MTLSize::new(n, 1, 1), MTLSize::new(w, 1, 1), false)
             }
             Grid::Threads2D(x, y) => {
@@ -745,7 +885,8 @@ impl Runtime {
                 );
             }
         }
-        self.with_compute(|enc, bound, used| {
+        let label = profiling().then(|| pso_name(pso.as_ptr() as usize));
+        self.with_compute_labeled(label, |enc, bound, used| {
             if let Some(pre) = pre {
                 pre(enc);
                 // The callback may have changed any state.
@@ -832,7 +973,11 @@ impl Runtime {
             open.used.insert(buf.as_ptr() as usize);
         }
         open.dispatches += 1;
-        if open.dispatches >= self.batch_limit.load(Ordering::Relaxed) {
+        let prof = profiling();
+        if prof {
+            open.label = Some("(blit_fill)");
+        }
+        if prof || open.dispatches >= self.batch_limit.load(Ordering::Relaxed) {
             self.close(&mut st);
             self.poll(&mut st);
         }
@@ -1073,6 +1218,15 @@ impl Drop for Runtime {
         }
         for batch in st.in_flight.drain(..) {
             batch.cmd.wait_until_completed();
+            if let Some(label) = batch.label {
+                record_profile(label, &batch.cmd);
+            }
+        }
+        if profiling() {
+            let report = profile_report();
+            if report.lines().count() > 1 {
+                eprint!("{report}");
+            }
         }
     }
 }

@@ -21,8 +21,9 @@
 //! The classic `poseidon2.metal` kernels (the pre-port oracle) were retired in Z7.
 //!
 //! Environment (read once per HAL):
-//! * `RISC0_METAL_POSEIDON2` = `pv` (default; pv.cuh's HIP int64 arithmetic) | `m32` (the same
-//!   kernels with the products split into 32-bit words; A/B only).
+//! * `RISC0_METAL_POSEIDON2` = `z9` (default; Z9's reduction in the thread-per-hash kernels,
+//!   `sredc64h` in pv.metal, 1.16-1.18x) | `pv` (pv.cuh's HIP int64 arithmetic, the pre-Z9
+//!   default and Z9's revert knob) | `m32` (the products split into 32-bit words; A/B only).
 //! * `RISC0_METAL_PV_SMALL=0`: never use the `pvs` latency kernels.
 //! * `RISC0_METAL_PV_TAIL=0`: no single-dispatch fold-tree tail.
 //! * `RISC0_METAL_PVS_{W,Q}_MAX_{FOLD,ROWS}`: override a crossover (largest `n` for that kernel).
@@ -65,6 +66,9 @@ pub enum Poseidon2Kernels {
     /// `pv.metal` `_m32` instantiations: the same values from 32-bit mul/mulhi (A/B only;
     /// measured slower on the M5 Max).
     PvM32,
+    /// Z9: `pv.metal` `_z9` instantiations of the thread-per-hash kernels (32x32 -> 64 product,
+    /// mulhi reduction; the default); the `pvs` latency kernels use their `Pv` form.
+    PvZ9,
 }
 
 /// Kernel selection and crossovers. A size `n` (outputs of a fold, rows of `hash_rows`) uses
@@ -100,7 +104,7 @@ pub const DEFAULT_TAIL_MAX: u32 = 0;
 impl Default for Poseidon2Config {
     fn default() -> Self {
         Self {
-            kernels: Poseidon2Kernels::Pv,
+            kernels: Poseidon2Kernels::PvZ9,
             small: true,
             w_max_fold: DEFAULT_W_MAX_FOLD,
             q_max_fold: DEFAULT_Q_MAX_FOLD,
@@ -122,6 +126,7 @@ impl Poseidon2Config {
         };
         match var("RISC0_METAL_POSEIDON2").as_deref() {
             Some("m32") => cfg.kernels = Poseidon2Kernels::PvM32,
+            Some("z9") => cfg.kernels = Poseidon2Kernels::PvZ9,
             Some("pv") => cfg.kernels = Poseidon2Kernels::Pv,
             Some(other) => tracing::warn!("RISC0_METAL_POSEIDON2={other}: unknown, using default"),
             None => {}
@@ -162,13 +167,17 @@ pub(crate) enum PvKernel {
 }
 
 impl PvKernel {
-    fn name(self, op: &str, m32: bool) -> String {
+    fn name(self, op: &str, form: Poseidon2Kernels) -> String {
         let base = match self {
             PvKernel::Pv => "pv",
             PvKernel::PvsW => "pvs_w",
             PvKernel::PvsQ => "pvs_q",
         };
-        let suffix = if m32 { "_m32" } else { "" };
+        let suffix = match (form, self) {
+            (Poseidon2Kernels::PvM32, _) => "_m32",
+            (Poseidon2Kernels::PvZ9, PvKernel::Pv) => "_z9",
+            _ => "",
+        };
         format!("{base}_{op}_k{suffix}")
     }
 
@@ -227,10 +236,23 @@ impl MetalHashPoseidon2 {
 
     /// Encode `out[i] = H(in[2i], in[2i + 1])`, `i < n`, with `kernel`; `out`/`input` are digest
     /// offsets into `io`.
+    #[cfg(test)]
     pub(crate) fn encode_fold(
         hal: &MetalHal<Self>,
         kernel: PvKernel,
         m32: bool,
+        io: &BufferImpl<Digest>,
+        out: usize,
+        input: usize,
+        n: u32,
+    ) {
+        Self::encode_fold_form(hal, kernel, form_of(m32), io, out, input, n)
+    }
+
+    pub(crate) fn encode_fold_form(
+        hal: &MetalHal<Self>,
+        kernel: PvKernel,
+        form: Poseidon2Kernels,
         io: &BufferImpl<Digest>,
         out: usize,
         input: usize,
@@ -244,15 +266,29 @@ impl MetalHashPoseidon2 {
             io.as_arg_with_offset(input),
             KernelArg::Integer(n),
         ];
-        let name = kernel.name("fold", m32);
+        let name = kernel.name("fold", form);
         hal.dispatch(hal.pipeline(&name), args, groups(kernel, n), &[]);
     }
 
     /// Encode `hash_rows` over a column-major `rows x cols` matrix with `kernel`.
+    #[cfg(test)]
     pub(crate) fn encode_rows(
         hal: &MetalHal<Self>,
         kernel: PvKernel,
         m32: bool,
+        output: &BufferImpl<Digest>,
+        matrix: &BufferImpl<BabyBearElem>,
+        rows: u32,
+        cols: u32,
+    ) {
+        Self::encode_rows_form(hal, kernel, form_of(m32), output, matrix, rows, cols)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_rows_form(
+        hal: &MetalHal<Self>,
+        kernel: PvKernel,
+        form: Poseidon2Kernels,
         output: &BufferImpl<Digest>,
         matrix: &BufferImpl<BabyBearElem>,
         rows: u32,
@@ -267,22 +303,32 @@ impl MetalHashPoseidon2 {
             KernelArg::Integer(rows),
             KernelArg::Integer(cols),
         ];
-        let name = kernel.name("rows", m32);
+        let name = kernel.name("rows", form);
         hal.dispatch(hal.pipeline(&name), args, groups(kernel, rows), &[]);
     }
 
     /// Encode the fold-tree layers `n0, n0 / 2, ..., 1` (`n0 <= 128`) as one dispatch.
+    #[cfg(test)]
     pub(crate) fn encode_fold_tail(
         hal: &MetalHal<Self>,
         m32: bool,
         io: &BufferImpl<Digest>,
         n0: u32,
     ) {
+        Self::encode_fold_tail_form(hal, form_of(m32), io, n0)
+    }
+
+    pub(crate) fn encode_fold_tail_form(
+        hal: &MetalHal<Self>,
+        form: Poseidon2Kernels,
+        io: &BufferImpl<Digest>,
+        n0: u32,
+    ) {
         assert!((1..=PV_TAIL).contains(&n0) && n0.is_power_of_two());
-        let name = if m32 {
-            "pv_fold_tail_k_m32"
-        } else {
-            "pv_fold_tail_k"
+        let name = match form {
+            Poseidon2Kernels::PvM32 => "pv_fold_tail_k_m32",
+            Poseidon2Kernels::Pv => "pv_fold_tail_k",
+            Poseidon2Kernels::PvZ9 => "pv_fold_tail_k_z9",
         };
         let args = &[io.as_arg(), KernelArg::Integer(n0)];
         let grid = Grid::Groups {
@@ -295,8 +341,25 @@ impl MetalHashPoseidon2 {
     fn fold(&self, hal: &MetalHal<Self>, io: &BufferImpl<Digest>, n: usize) {
         let cfg = self.config();
         let n32 = u32::try_from(n).expect("hash_fold: too many outputs");
-        let m32 = cfg.kernels == Poseidon2Kernels::PvM32;
-        Self::encode_fold(hal, Self::fold_kernel(&cfg, n32), m32, io, n, 2 * n, n32);
+        Self::encode_fold_form(
+            hal,
+            Self::fold_kernel(&cfg, n32),
+            cfg.kernels,
+            io,
+            n,
+            2 * n,
+            n32,
+        );
+    }
+}
+
+/// `_m32` (true) or pv.cuh's HIP form (false), the forms the Z3 test entry points take.
+#[cfg(test)]
+fn form_of(m32: bool) -> Poseidon2Kernels {
+    if m32 {
+        Poseidon2Kernels::PvM32
+    } else {
+        Poseidon2Kernels::Pv
     }
 }
 
@@ -349,10 +412,10 @@ impl MetalHash for MetalHashPoseidon2 {
         let cfg = self.config();
         let rows = u32::try_from(row_size).expect("hash_rows: too many rows");
         let cols = u32::try_from(col_size).expect("hash_rows: too many columns");
-        Self::encode_rows(
+        Self::encode_rows_form(
             hal,
             Self::rows_kernel(&cfg, rows, cols),
-            cfg.kernels == Poseidon2Kernels::PvM32,
+            cfg.kernels,
             output,
             matrix,
             rows,
@@ -372,7 +435,7 @@ impl MetalHash for MetalHashPoseidon2 {
         for i in (0..layers).rev() {
             let n = 1usize << i;
             if n <= cfg.tail_max as usize {
-                Self::encode_fold_tail(hal, cfg.kernels == Poseidon2Kernels::PvM32, io, n as u32);
+                Self::encode_fold_tail_form(hal, cfg.kernels, io, n as u32);
                 break;
             }
             self.fold(hal, io, n);
