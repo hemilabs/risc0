@@ -157,7 +157,7 @@ pub(crate) fn write_skip_consts(out_dir: &Path) {
     for (i, b) in BUFS.iter().enumerate() {
         writeln!(s, "pub const EVAL_BUF_{b}: u64 = {i};").unwrap();
     }
-    writeln!(s, "pub const EVAL_PARAMS_SIZE: usize = 48;").unwrap();
+    writeln!(s, "pub const EVAL_PARAMS_SIZE: usize = 32;").unwrap();
     let rs = out_dir.join("keccak_metal_eval.rs");
     write_if_changed(&rs, &s);
     println!("cargo:rustc-env=KECCAK_METAL_EVAL_RS={}", rs.display());
@@ -455,7 +455,7 @@ impl Translation {
         )
         .unwrap();
         writeln!(s, "/// `sizeof(EvalParams)`.").unwrap();
-        writeln!(s, "pub const EVAL_PARAMS_SIZE: usize = 48;").unwrap();
+        writeln!(s, "pub const EVAL_PARAMS_SIZE: usize = 32;").unwrap();
         s
     }
 }

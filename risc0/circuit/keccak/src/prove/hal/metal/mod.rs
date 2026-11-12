@@ -137,10 +137,10 @@ static KECCAK_LIB: OnceLock<&'static [u8]> = OnceLock::new();
 /// their own binary archive (unit `keccakstrict`, so the keccak archive's cleanup never counts it).
 pub(crate) fn keccak_strict_kernels(device: &DeviceRef) -> &'static archive::ArchivedKernels {
     static ONCE: OnceLock<archive::ArchivedKernels> = OnceLock::new();
-    let lib = *KECCAK_LIB.get_or_init(|| {
-        keccak_kernels(device);
-        METAL_LIB
-    });
+    // keccak_kernels sets KECCAK_LIB in its own initializer, so call it outside any KECCAK_LIB
+    // initializer (a re-entrant OnceLock init deadlocks).
+    keccak_kernels(device);
+    let lib = KECCAK_LIB.get().copied().unwrap_or(METAL_LIB);
     ONCE.get_or_init(|| {
         scope!("load_keccak_strict_stages");
         archive::ArchivedKernels::new(

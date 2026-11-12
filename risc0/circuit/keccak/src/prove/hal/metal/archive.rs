@@ -27,8 +27,9 @@
 //! - **Key**: `<unit>-<sha256(digest(metallib) ‖ device name ‖ OS build ‖ kernel names)[..24]>`,
 //!   `digest` = [chunked_digest] (K7: sha256 of the per-MiB sha256s, hashed on all cores).
 //!   A new metallib, another GPU or an OS update (which can change the GPU compiler) therefore
-//!   never reads an old archive; old archives of the same unit are deleted when a new one is
-//!   written.
+//!   never reads an old archive. When a new one is written, the unit keeps its
+//!   `RISC0_METAL_ARCHIVE_KEEP` (default 4) most recently used other keys and deletes the rest,
+//!   and any key unused for 30 days ([prune_other_keys]; K7, K8 finding 4).
 //! - **Integrity**: the file is `<unit>-<key>-<digest(file)[..16]>.binarchive`, and its content
 //!   is checked against that name before Metal sees it. Metal does not survive every damaged
 //!   archive: a file with some bytes flipped loads, and then creating a PSO from it aborts the
@@ -297,6 +298,11 @@ pub(crate) fn chunked_digest(bytes: &[u8]) -> String {
     if std::env::var(ARCHIVE_HASH_ENV).is_ok_and(|v| v == "sha256") {
         return Sha256Impl::hash_bytes(bytes).to_string();
     }
+    parallel_digest(bytes)
+}
+
+/// [chunked_digest] without the [ARCHIVE_HASH_ENV] switch: always the parallel chunked form.
+fn parallel_digest(bytes: &[u8]) -> String {
     let chunks: Vec<&[u8]> = bytes.chunks(DIGEST_CHUNK).collect();
     let threads = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
@@ -1335,54 +1341,76 @@ mod tests {
         assert_eq!(super::chunked_digest(&[]).len(), 64);
     }
 
-    /// K7: the CPU cost of the archive hashes a warm start pays (K8 finding 5): the key over the
-    /// embedded metallib and the content checksum over the newest keccak archive in
-    /// `RISC0_METAL_ARCHIVE_DIR` / the cache dir. Best of 5.
+    /// K7: the CPU cost of the archive hashes a warm start pays (K8 finding 5), as an interleaved
+    /// A/B: plain sha256 (K8's form, `RISC0_METAL_ARCHIVE_HASH=sha256`) and the chunked parallel
+    /// digest, alternated `K7_PAIRS` times (default 11; A B A B ..., which goes first alternates)
+    /// over the embedded metallib (the key's input) and over the newest keccak archive in
+    /// `RISC0_METAL_ARCHIVE_DIR` / the cache dir (the checksum's input). Prints the medians,
+    /// min/max and the load average before and after. The rest of the key (sha256 of < 1 KB of
+    /// names) is the same in both forms.
     #[test]
     #[ignore]
     fn k7_archive_hash_cost() {
-        let best = |f: &dyn Fn()| {
-            (0..5)
-                .map(|_| {
-                    let t0 = std::time::Instant::now();
-                    f();
-                    t0.elapsed()
-                })
-                .min()
-                .unwrap()
+        use risc0_zkp::core::hash::sha::Sha256 as _;
+        let pairs: usize = std::env::var("K7_PAIRS").map_or(11, |v| v.parse().unwrap());
+        let loadavg = || {
+            std::process::Command::new("sysctl")
+                .args(["-n", "vm.loadavg"])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default()
         };
-        let names = crate::prove::hal::metal::kernel_names();
-        let key = best(&|| {
-            archive_key("Apple M5 Max", "26B131", METAL_LIB, &names);
-        });
-        println!(
-            "K7HASH key over {} MB metallib: {:?}",
-            METAL_LIB.len() >> 20,
-            key
-        );
+        let time = |f: &dyn Fn() -> String| {
+            let t0 = std::time::Instant::now();
+            std::hint::black_box(f());
+            t0.elapsed().as_secs_f64() * 1e3
+        };
+        let stats = |v: &mut Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            (v[v.len() / 2], v[0], v[v.len() - 1])
+        };
+        let ab = |what: &str, bytes: &[u8]| {
+            let plain = || super::Sha256Impl::hash_bytes(bytes).to_string();
+            let chunked = || super::parallel_digest(bytes);
+            // One untimed call of each (page-in, thread start-up).
+            plain();
+            chunked();
+            let before = loadavg();
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            for i in 0..pairs {
+                if i % 2 == 0 {
+                    a.push(time(&plain));
+                    b.push(time(&chunked));
+                } else {
+                    b.push(time(&chunked));
+                    a.push(time(&plain));
+                }
+            }
+            let ratios: Vec<f64> = b.iter().zip(&a).map(|(b, a)| b / a).collect();
+            let (am, amin, amax) = stats(&mut a);
+            let (bm, bmin, bmax) = stats(&mut b);
+            let (rm, _, _) = stats(&mut ratios.clone());
+            println!(
+                "K7HASH {what} ({} MB), {pairs} pairs: plain sha256 median {am:.1} ms \
+                 [{amin:.1}..{amax:.1}], chunked median {bm:.1} ms [{bmin:.1}..{bmax:.1}], \
+                 per-pair chunked/plain median {rm:.3}; load {before} -> {}",
+                bytes.len() >> 20,
+                loadavg()
+            );
+        };
+        ab("key input: embedded metallib", METAL_LIB);
         let dir = super::archive_dir().unwrap();
         let newest = std::fs::read_dir(&dir)
             .unwrap()
             .flatten()
             .filter(|e| e.file_name().to_string_lossy().starts_with("keccak-"))
             .max_by_key(|e| e.metadata().unwrap().modified().unwrap());
-        if let Some(e) = newest {
-            let content = std::fs::read(e.path()).unwrap();
-            let read = best(&|| {
-                std::fs::read(e.path()).unwrap();
-            });
-            let sum = best(&|| {
-                super::archive_checksum(&content);
-            });
-            let plain = best(&|| {
-                use risc0_zkp::core::hash::sha::Sha256 as _;
-                risc0_zkp::core::hash::sha::cpu::Impl::hash_bytes(&content);
-            });
-            println!(
-                "K7HASH checksum over {} MB archive: read {read:?}, chunked digest {sum:?}, \
-                 plain sha256 {plain:?}",
-                content.len() >> 20
-            );
+        match newest {
+            Some(e) => ab(
+                "checksum input: keccak archive",
+                &std::fs::read(e.path()).unwrap(),
+            ),
+            None => println!("K7HASH no keccak archive in {}", dir.display()),
         }
     }
 

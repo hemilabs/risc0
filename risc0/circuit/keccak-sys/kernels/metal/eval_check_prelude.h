@@ -55,7 +55,7 @@ using namespace metal;
 #define R0_KECCAK_EVAL_FN static inline
 #endif
 
-/// Per-dispatch parameters (set_bytes; 48 bytes, EVAL_PARAMS_SIZE on the Rust side).
+/// Per-dispatch parameters (set_bytes; 32 bytes, EVAL_PARAMS_SIZE on the Rust side).
 struct EvalParams {
   /// Threads in this dispatch (cycles of this chunk); must be <= stride.
   uint32_t count;
@@ -63,34 +63,22 @@ struct EvalParams {
   uint32_t first;
   /// Number of cycles (`size` in the constraint code); a power of two.
   uint32_t domain;
-  /// Scratch/carry capacity in threads (the chunk capacity the buffers were sized for,
-  /// <= EVAL_MAX_STRIDE).
+  /// Scratch/carry stride in words: the chunk capacity the buffers were sized for
+  /// (<= EVAL_MAX_STRIDE).
   uint32_t stride;
   /// The vanishing quotient by cycle mod 4, as raw (Montgomery) Fp words, which is how the Rust
   /// side stores them. Read by the last stage only.
   uint32_t quot[4];
-  /// Scratch/carry layout (K7, see ScratchRef): threads are grouped in tiles of `tile` threads
-  /// (`tile_shift` = log2(tile)); a tile's elements are contiguous. `tile_shift` = 31 and
-  /// `tile` = `stride` give K4's layout (`scratch[i * stride + t]`).
-  uint32_t tile_shift;
-  uint32_t tile;
-  /// Words of one tile's scratch (EVAL_SCRATCH_ELEMS * tile) and carry (EVAL_CARRY_WORDS * tile).
-  uint32_t scratch_block;
-  uint32_t carry_block;
 };
-static_assert(sizeof(EvalParams) == 48, "EvalParams must be 48 bytes (EVAL_PARAMS_SIZE)");
+static_assert(sizeof(EvalParams) == 32, "EvalParams must be 32 bytes (EVAL_PARAMS_SIZE)");
 
 namespace keccak_eval {
 
 /// One thread's slice of the scratch buffer, which holds poly_fp's `Fp xN[M]` (8237 elements,
-/// 33 KB a thread: far too large for thread memory). Threads are grouped in tiles of `tile`
-/// threads (EvalParams): element `i` of thread `t` is at
-/// `scratch[(t >> tile_shift) * scratch_block + i * tile + (t & (tile - 1))]` (`base` already
-/// points at the thread's first element, `stride` here is `tile`), so the threads of a SIMD group
-/// touching the same element touch consecutive words, and (K7) with a small tile a SIMD group's
-/// whole scratch is one contiguous block instead of 8237 words 4·chunk bytes apart (one page
-/// each). K4's layout is the special case tile = chunk stride (`tile_shift` = 31). 32-bit index
-/// math: the host keeps the buffer <= 2^32 words (EVAL_MAX_STRIDE).
+/// 33 KB a thread: far too large for thread memory). Element `i` of thread `t` is at
+/// `scratch[i * stride + t]` (`base` already points at `scratch + t`), so the threads of a SIMD
+/// group touching the same element touch consecutive words. 32-bit index math: the host keeps
+/// `EVAL_SCRATCH_ELEMS * stride <= 2^32` (EVAL_MAX_STRIDE; any power of two up to 2^18).
 struct ScratchRef {
   device Fp* base;
   uint32_t stride;
@@ -104,28 +92,20 @@ struct EvalCtx {
   ScratchRef scratch;
   /// This thread's carry: word `w` at `carry[w * stride]`.
   device uint32_t* carry;
-  /// Distance between a thread's consecutive scratch/carry words (the tile).
   uint32_t stride;
 };
 
 inline EvalCtx make_eval_ctx(const device FpExt* poly_mix,
                              device Fp* scratch,
                              device uint32_t* carry,
-                             constant EvalParams& p,
+                             uint32_t stride,
                              uint32_t t) {
-  // Tile of thread t and its lane in the tile (tile_shift 31: one tile, lane t).
-  uint32_t tile_idx = t >> p.tile_shift;
-  uint32_t lane = t & (p.tile - 1u);
-  if (p.tile_shift >= 31u) {
-    tile_idx = 0u;
-    lane = t;
-  }
   EvalCtx ectx;
   ectx.poly_mix = poly_mix;
-  ectx.scratch.base = scratch + tile_idx * p.scratch_block + lane;
-  ectx.scratch.stride = p.tile;
-  ectx.carry = carry + tile_idx * p.carry_block + lane;
-  ectx.stride = p.tile;
+  ectx.scratch.base = scratch + t;
+  ectx.scratch.stride = stride;
+  ectx.carry = carry + t;
+  ectx.stride = stride;
   return ectx;
 }
 
@@ -217,4 +197,4 @@ inline void write_check(device Fp* check, constant EvalParams& p, uint32_t cycle
     return;                                                                                        \
   }                                                                                                \
   uint32_t cycle = p.first + t;                                                                    \
-  keccak_eval::EvalCtx ectx = keccak_eval::make_eval_ctx(poly_mix, scratch, carry, p, t);
+  keccak_eval::EvalCtx ectx = keccak_eval::make_eval_ctx(poly_mix, scratch, carry, p.stride, t);

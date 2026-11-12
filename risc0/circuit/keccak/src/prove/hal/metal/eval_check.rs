@@ -40,10 +40,10 @@
 //! - `RISC0_KECCAK_METAL_EVAL_MACC=lazy|strict`: the stage kernels with the lazy
 //!   multiply-accumulate (default; ~44% less eval_check time at po2 17, bit-identical) or K4's
 //!   (`eval_strict_stage_<k>`, built on first use);
-//! - `RISC0_KECCAK_METAL_EVAL_CHUNK` (default now 16384, K4's 32768);
-//! - `RISC0_KECCAK_METAL_EVAL_TILE` (default 0 = K4's scratch layout; a power of two groups the
-//!   scratch of that many threads into one block — measured, no change, kept for other GPUs);
-//! - `RISC0_KECCAK_METAL_EVAL_TG` (default 0 = the HAL's threadgroup size; measured, no change).
+//! - `RISC0_KECCAK_METAL_EVAL_CHUNK` (default now 16384, K4's 32768).
+//!
+//! A tiled scratch layout and a runtime threadgroup size were measured and showed no change, so
+//! they are not kept (K7.md).
 //!
 //! The kernels index with 32-bit math, as CUDA: the launcher asserts
 //! `(EVAL_MAX_COLUMN + 1) * domain <= 2^32`, `stride <= EVAL_MAX_STRIDE` and `count <= stride`.
@@ -57,7 +57,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use metal::{Buffer as MtlBuffer, MTLSize};
+use metal::Buffer as MtlBuffer;
 use risc0_circuit_keccak_sys::metal_eval::{
     EVAL_BUF_ACCUM, EVAL_BUF_CARRY, EVAL_BUF_CHECK, EVAL_BUF_CTRL, EVAL_BUF_DATA, EVAL_BUF_MIX,
     EVAL_BUF_OUT, EVAL_BUF_PARAMS, EVAL_BUF_POLY_MIX, EVAL_BUF_SCRATCH, EVAL_CARRY_WORDS,
@@ -124,13 +124,6 @@ pub(super) fn fit_chunk(want: u32, allocated: u64, limit: u64) -> u32 {
     chunk
 }
 
-/// Default scratch/carry tile (threads whose scratch is one contiguous block, K7; see
-/// eval_check_prelude.h `ScratchRef`). 0 is K4's layout (`scratch[i * stride + t]`).
-pub const DEFAULT_EVAL_TILE: u32 = 0;
-
-/// Overrides [DEFAULT_EVAL_TILE]: 0 (K4's layout) or a power of two (threads a tile).
-pub const EVAL_TILE_ENV: &str = "RISC0_KECCAK_METAL_EVAL_TILE";
-
 /// Selects the stage kernels: `lazy` (default; K7's lazy multiply-accumulate, ~40% faster) or
 /// `strict` (K3/K4's kernels, `EVAL_STRICT_STAGE_NAMES`, built on first use). Bit-identical.
 pub const EVAL_MACC_ENV: &str = "RISC0_KECCAK_METAL_EVAL_MACC";
@@ -147,16 +140,8 @@ fn strict_from_env() -> bool {
     }
 }
 
-/// Default threadgroup size of the stage dispatches (K7); 0 is the HAL's default
-/// (`min(256, maxTotalThreadsPerThreadgroup)`).
-pub const DEFAULT_EVAL_TG: u32 = 0;
-
-/// Overrides [DEFAULT_EVAL_TG] (threads a threadgroup; 0 = the HAL's default).
-pub const EVAL_TG_ENV: &str = "RISC0_KECCAK_METAL_EVAL_TG";
-
-/// `EvalParams` of eval_check_prelude.h: count, first, domain, stride, quot[4] (raw words),
-/// tile_shift, tile, scratch_block, carry_block.
-type EvalParams = [u32; 12];
+/// `EvalParams` of eval_check_prelude.h: count, first, domain, stride, quot[4] (raw words).
+type EvalParams = [u32; 8];
 const _: () = assert!(std::mem::size_of::<EvalParams>() == EVAL_PARAMS_SIZE);
 
 /// The cached private buffers of the stage kernels.
@@ -174,35 +159,12 @@ pub(super) struct EvalCheckState {
     /// Keep the scratch cached after a call ([MetalCircuitHal::set_keep_eval_scratch]).
     keep: Cell<bool>,
     scratch: RefCell<Option<EvalScratch>>,
-    /// Scratch/carry tile ([DEFAULT_EVAL_TILE], [EVAL_TILE_ENV], [MetalCircuitHal::set_eval_tile]).
-    tile: Cell<u32>,
-    /// Threadgroup size of the stage dispatches ([DEFAULT_EVAL_TG], [EVAL_TG_ENV]).
-    tg: Cell<u32>,
     /// Run the strict stage kernels ([EVAL_MACC_ENV], [MetalCircuitHal::set_eval_strict]).
     strict: Cell<bool>,
     /// Measurements only (K7 `k7_eval_ab`): stage PSOs from another metallib, used in place of
     /// the process-wide ones, so variants can be interleaved in one process.
     #[cfg(test)]
     stage_override: RefCell<Option<Vec<(metal::ComputePipelineState, u32)>>>,
-}
-
-/// A `u32` knob from `env` (`ok` decides which values are valid), else `default`.
-fn env_u32(env: &str, default: u32, ok: impl Fn(u32) -> bool) -> u32 {
-    match std::env::var(env) {
-        Ok(text) => match text.trim().parse::<u32>() {
-            Ok(v) if ok(v) => v,
-            _ => {
-                tracing::error!("{env}={text:?} is not valid; using {default}");
-                default
-            }
-        },
-        Err(_) => default,
-    }
-}
-
-/// Valid tiles: 0 (K4's layout) or a power of two up to 2^16.
-fn valid_tile(tile: u32) -> bool {
-    tile == 0 || (tile.is_power_of_two() && tile <= 1 << 16)
 }
 
 impl EvalCheckState {
@@ -221,8 +183,6 @@ impl EvalCheckState {
             chunk: Cell::new(chunk.min(EVAL_MAX_STRIDE)),
             keep: Cell::new(false),
             scratch: RefCell::new(None),
-            tile: Cell::new(env_u32(EVAL_TILE_ENV, DEFAULT_EVAL_TILE, valid_tile)),
-            tg: Cell::new(env_u32(EVAL_TG_ENV, DEFAULT_EVAL_TG, |v| v <= 1024)),
             strict: Cell::new(strict_from_env()),
             #[cfg(test)]
             stage_override: RefCell::new(None),
@@ -261,27 +221,10 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
         self.eval.chunk.set(cycles);
     }
 
-    /// The scratch/carry tile for later calls: 0 (K4's layout) or a power of two (K7).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn set_eval_tile(&self, tile: u32) {
-        assert!(
-            valid_tile(tile),
-            "eval_check tile {tile}: 0 or a power of two <= 65536"
-        );
-        self.eval.tile.set(tile);
-    }
-
     /// Whether later calls run the strict stage kernels (K4's code) instead of the lazy ones.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn set_eval_strict(&self, strict: bool) {
         self.eval.strict.set(strict);
-    }
-
-    /// The threadgroup size of later stage dispatches (0 = the HAL's default).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn set_eval_tg(&self, threads: u32) {
-        assert!(threads <= 1024, "eval_check threadgroup {threads}");
-        self.eval.tg.set(threads);
     }
 
     /// Cycles per eval_check chunk.
@@ -449,29 +392,9 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
             .copy_from_slice::<ExtVal>("eval_poly_mix", &poly_mix_pows);
         let quot = vanishing_quotients(po2);
 
-        let tile = self.eval.tile.get();
         let want = self.eval.chunk.get().min(domain);
-        // A tiled layout needs a whole number of tiles (the chunk rounds up to one).
-        let want = if tile == 0 {
-            want
-        } else {
-            want.next_multiple_of(tile.min(want.next_power_of_two()))
-        };
         let (scratch, carry, stride, chunk) = self.eval_scratch(want);
         assert!(stride <= EVAL_MAX_STRIDE && chunk <= stride);
-        // The layout of this call: K4's (one tile of `stride` threads) or tiles of `tile` threads,
-        // which must divide the stride (it does unless the cached stride came from another tile).
-        let tile = if tile == 0 || stride % tile.min(stride) != 0 {
-            0
-        } else {
-            tile.min(stride)
-        };
-        let (tile_shift, tile_w) = if tile == 0 {
-            (31, stride)
-        } else {
-            (tile.trailing_zeros(), tile)
-        };
-        let tg = self.eval.tg.get();
         assert!(EVAL_SCRATCH_ELEMS as u64 * stride as u64 <= 1 << 32);
         assert!(EVAL_CARRY_WORDS as u64 * stride as u64 <= 1 << 32);
 
@@ -505,18 +428,7 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
             let count = chunk.min(domain - first);
             assert!(count <= stride);
             let params: EvalParams = [
-                count,
-                first,
-                domain,
-                stride,
-                quot[0],
-                quot[1],
-                quot[2],
-                quot[3],
-                tile_shift,
-                tile_w,
-                EVAL_SCRATCH_ELEMS * tile_w,
-                EVAL_CARRY_WORDS * tile_w,
+                count, first, domain, stride, quot[0], quot[1], quot[2], quot[3],
             ];
             let mut all = [const { KernelArg::Null }; 10];
             all[EVAL_BUF_CHECK as usize] = check.as_arg();
@@ -552,16 +464,8 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
                     }
                 });
                 let t0 = Instant::now();
-                let grid = if tg == 0 {
-                    Grid::Threads(count as u64)
-                } else {
-                    let threads = (tg as u64).min(pso.max_total_threads_per_threadgroup());
-                    Grid::Groups {
-                        groups: MTLSize::new((count as u64).div_ceil(threads), 1, 1),
-                        threads: MTLSize::new(threads, 1, 1),
-                    }
-                };
-                self.hal.dispatch(pso, &args, grid, &[]);
+                self.hal
+                    .dispatch(pso, &args, Grid::Threads(count as u64), &[]);
                 if let Some(p) = profile.as_mut() {
                     self.hal.sync();
                     p[stage] += t0.elapsed();
@@ -686,8 +590,7 @@ mod tests {
     }
 
     /// K7: the strict stage kernels (no lazy multiply-accumulate, `RISC0_KECCAK_METAL_EVAL_MACC=
-    /// strict`) and the lazy ones (default) give the CPU's check, and so each other's, bit for bit;
-    /// also with the tiled scratch layout and an explicit threadgroup size.
+    /// strict`) and the lazy ones (default) give the CPU's check, and so each other's, bit for bit.
     #[test]
     fn eval_check_strict_and_lazy_match_cpu() {
         let _gpu = super::super::tests::gpu_test_lock();
@@ -696,21 +599,10 @@ mod tests {
         for po2 in [8, 14] {
             let params = EvalCheckParams::new(po2);
             let expected = cpu_check(&params);
-            for (strict, tile, tg) in [
-                (true, 0, 0),
-                (false, 0, 0),
-                (false, 32, 128),
-                (true, 64, 64),
-            ] {
+            for strict in [true, false] {
                 circuit_hal.set_eval_strict(strict);
-                circuit_hal.set_eval_tile(tile);
-                circuit_hal.set_eval_tg(tg);
                 let actual = metal_check(&hal, &circuit_hal, &params, 3000);
-                assert_same(
-                    &format!("po2 {po2} strict {strict} tile {tile} tg {tg}"),
-                    &actual,
-                    &expected,
-                );
+                assert_same(&format!("po2 {po2} strict {strict}"), &actual, &expected);
             }
         }
     }
@@ -766,7 +658,7 @@ mod tests {
     }
 
     /// K7 interleaved A/B of runtime eval_check configurations at `K7_PO2` (default 17):
-    /// `K7_CONFIGS` = `label:chunk=N,tile=N,tg=N;...` (unset keys keep the defaults), `K7_REPS`
+    /// `K7_CONFIGS` = `label:chunk=N,strict=0|1,lib=N;...` (unset keys keep the defaults), `K7_REPS`
     /// rounds (default 7) of one call per config in turn (A B C A B C ...), each call as the prover
     /// makes it (scratch allocated and freed, one sync). Prints median/min/max per config and
     /// asserts every output equals the first config's (and the CPU's with `K7_CPU=1`).
@@ -777,7 +669,7 @@ mod tests {
         let po2: usize = std::env::var("K7_PO2").map_or(17, |v| v.parse().unwrap());
         let reps: usize = std::env::var("K7_REPS").map_or(7, |v| v.parse().unwrap());
         let configs: Vec<(String, Vec<(String, u32)>)> = std::env::var("K7_CONFIGS")
-            .unwrap_or_else(|_| "base:;tile32:tile=32".into())
+            .unwrap_or_else(|_| "lazy:;strict:strict=1".into())
             .split(';')
             .filter(|c| !c.trim().is_empty())
             .map(|c| {
@@ -861,14 +753,10 @@ mod tests {
         let apply = |kv: &[(String, u32)]| {
             *circuit_hal.eval.stage_override.borrow_mut() = None;
             circuit_hal.set_eval_chunk(DEFAULT_EVAL_CHUNK);
-            circuit_hal.set_eval_tile(super::DEFAULT_EVAL_TILE);
-            circuit_hal.set_eval_tg(super::DEFAULT_EVAL_TG);
             circuit_hal.set_eval_strict(false);
             for (k, v) in kv {
                 match k.as_str() {
                     "chunk" => circuit_hal.set_eval_chunk(*v),
-                    "tile" => circuit_hal.set_eval_tile(*v),
-                    "tg" => circuit_hal.set_eval_tg(*v),
                     "strict" => circuit_hal.set_eval_strict(*v != 0),
                     "lib" => {
                         *circuit_hal.eval.stage_override.borrow_mut() =
