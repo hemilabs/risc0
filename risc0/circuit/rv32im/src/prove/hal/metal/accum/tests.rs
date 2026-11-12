@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! R9 tests: the Metal accum path against the CPU circuit HAL.
+//! R9 tests: the Metal accum path against the CPU circuit HAL. R13: the GPU prefix scans.
 
-use std::{rc::Rc, sync::Arc, time::Instant};
+use std::{cell::Cell, rc::Rc, sync::Arc, time::Instant};
 
 use rand::Rng;
 use risc0_binfmt::{MemoryImage, Program};
@@ -194,14 +194,21 @@ fn riscv_test(name: &str) -> Program {
 }
 
 /// Accum variants of the Metal circuit HAL: the GPU path with a given perm window (`None`: no
-/// perm), or the CPU fallback (`RISC0_METAL_RV32IM_CPU_PHASES=accum`).
+/// perm) and GPU scans (R13), the same with R9's CPU scans (`RISC0_METAL_ACCUM_SCAN=cpu`), or
+/// the CPU fallback (`RISC0_METAL_RV32IM_CPU_PHASES=accum`).
 #[derive(Clone, Copy, Debug)]
 enum Variant {
     Gpu(Option<u32>),
+    GpuCpuScan(Option<u32>),
     CpuFallback,
 }
 
 struct WithVariant<'a>(&'a MetalCircuitHalPoseidon2, Variant);
+
+thread_local! {
+    /// Wall time (ms) of the last `WithVariant::step_accum` call, from an idle GPU queue.
+    static LAST_STEP_MS: Cell<f64> = const { Cell::new(0.0) };
+}
 
 impl CircuitAccumulator<MetalHalPoseidon2> for WithVariant<'_> {
     fn step_accum(
@@ -212,16 +219,27 @@ impl CircuitAccumulator<MetalHalPoseidon2> for WithVariant<'_> {
         global: &MetaBuffer<MetalHalPoseidon2>,
         mix: &MetaBuffer<MetalHalPoseidon2>,
     ) -> Result<()> {
-        match self.1 {
-            Variant::Gpu(win) => self
-                .0
-                .step_accum_metal(preflight, data, accum, global, mix, win),
+        // Start from an idle queue so the time is the step's own (scatter/mix upload excluded).
+        self.0.hal.sync();
+        marks::take();
+        let t = Instant::now();
+        let res = match self.1 {
+            Variant::Gpu(win) => {
+                self.0
+                    .step_accum_metal(preflight, data, accum, global, mix, win, ScanMode::Gpu)
+            }
+            Variant::GpuCpuScan(win) => {
+                self.0
+                    .step_accum_metal(preflight, data, accum, global, mix, win, ScanMode::Cpu)
+            }
             Variant::CpuFallback => self.0.step_accum_cpu(preflight, data, accum, global, mix),
-        }
+        };
+        LAST_STEP_MS.with(|c| c.set(t.elapsed().as_secs_f64() * 1e3));
+        res
     }
 
     fn step_accum_zeroizes(&self) -> bool {
-        matches!(self.1, Variant::Gpu(_))
+        !matches!(self.1, Variant::CpuFallback)
     }
 }
 
@@ -377,6 +395,7 @@ fn accum_matches_cpu() {
                 Variant::Gpu(Some(DEFAULT_SORT_WIN)),
                 Variant::Gpu(Some(11)),
                 Variant::Gpu(None),
+                Variant::GpuCpuScan(Some(DEFAULT_SORT_WIN)),
                 Variant::CpuFallback,
             ] {
                 let (metal, ms, _, _) = metal_accum(&hal, &circuit_hal, &r, variant);
@@ -594,7 +613,11 @@ fn r17_accum_segment_stress() {
             .map(|s| s.to_string_lossy().into_owned())
             .collect::<Vec<_>>()
             .join("/");
-        for variant in [Variant::Gpu(Some(DEFAULT_SORT_WIN)), Variant::Gpu(None)] {
+        for variant in [
+            Variant::Gpu(Some(DEFAULT_SORT_WIN)),
+            Variant::Gpu(None),
+            Variant::GpuCpuScan(Some(DEFAULT_SORT_WIN)),
+        ] {
             let (mut vs_first, mut vs_cpu) = (0, 0);
             let mut first: Option<Vec<Val>> = None;
             let mut detail = vec![];
@@ -638,4 +661,311 @@ fn r17_accum_segment_stress() {
         bad.is_empty(),
         "R17AUDIT accum nondeterministic or wrong: {bad:?}"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// R13: GPU prefix scans
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn scan_mode_env_values() {
+    assert_eq!(parse_scan_mode(None), ScanMode::Gpu);
+    assert_eq!(parse_scan_mode(Some("")), ScanMode::Gpu);
+    assert_eq!(parse_scan_mode(Some(" GPU ")), ScanMode::Gpu);
+    assert_eq!(parse_scan_mode(Some("cpu")), ScanMode::Cpu);
+    assert_eq!(parse_scan_mode(Some("Cpu")), ScanMode::Cpu);
+    assert_eq!(parse_scan_mode(Some("bogus")), ScanMode::Gpu);
+    assert!(check_fault(0).is_ok());
+    let e = format!(
+        "{:#}",
+        check_fault(FAULT_ACCUM_SCAN | FAULT_ASSERT).unwrap_err()
+    );
+    assert!(e.contains("canonical") && e.contains("assert"), "{e}");
+}
+
+/// Runs the GPU scan of columns `col0 .. col0 + ncols`, rows `[0, n)`, of a `rows x cols` buffer
+/// filled from `init`, and returns (buffer after, fault word).
+#[allow(clippy::too_many_arguments)]
+fn gpu_scan(
+    hal: &MetalHalPoseidon2,
+    circuit_hal: &MetalCircuitHalPoseidon2,
+    init: &[u32],
+    rows: usize,
+    col0: usize,
+    ncols: usize,
+    n: usize,
+    tg: Option<u64>,
+) -> (Vec<u32>, u32) {
+    let buf = hal.copy_from_slice("scan_test", init);
+    let fault = hal.alloc_buffer::<u32>("scan_fault", 1);
+    hal.blit_fill(fault.as_buf(), 0, 4, 0);
+    circuit_hal
+        .encode_fp_scan(&buf, rows, col0, ncols, n, &fault, tg)
+        .unwrap();
+    hal.sync();
+    (buf.to_vec(), fault.to_vec()[0])
+}
+
+/// The host reference: [fp_inclusive_scan] of rows `[0, n)` of each scanned column.
+fn cpu_scan(init: &[u32], rows: usize, col0: usize, ncols: usize, n: usize) -> Vec<u32> {
+    let mut want = init.to_vec();
+    for c in col0..col0 + ncols {
+        fp_inclusive_scan(&mut want[c * rows..c * rows + n]);
+    }
+    want
+}
+
+/// The GPU scan equals the host scan bit for bit (every cell of the buffer: scanned rows,
+/// rows >= n and other columns untouched) at sizes around the block and chunk boundaries,
+/// including 2^20 + 7 (more blocks than one fpScanBlockSums round at the default threadgroup), for
+/// several threadgroup sizes and value patterns (random, all P - 1, zeros, small).
+#[test]
+fn gpu_fp_scan_matches_cpu() {
+    let hal = Arc::new(MetalHalPoseidon2::new());
+    let circuit_hal = MetalCircuitHalPoseidon2::new(hal.clone()).unwrap();
+    circuit_hal.ctx().require(Phase::Accum).unwrap();
+    let default_tg = circuit_hal.fp_scan_tg(None).unwrap();
+    let width = circuit_hal
+        .ctx()
+        .pipeline("fpScanApply")
+        .thread_execution_width();
+    let mut tgs = vec![None, Some(width), Some(2 * width)];
+    let big = circuit_hal.fp_scan_tg(Some(1024)).unwrap();
+    if big != default_tg {
+        tgs.push(Some(big));
+    }
+    tracing::info!("scan tg default {default_tg}, width {width}, tgs {tgs:?}");
+    let mut rng = rand::rng();
+    let p = P;
+    let sizes = [
+        1usize,
+        2,
+        31,
+        255,
+        256,
+        257,
+        1023,
+        1024,
+        1025,
+        4097,
+        65_537,
+        (1 << 20) + 7,
+    ];
+    for &n in &sizes {
+        let rows = n.next_power_of_two().max(2);
+        let (cols, col0, ncols) = (6, 2, 4);
+        for pattern in 0..4 {
+            let init: Vec<u32> = (0..rows * cols)
+                .map(|_| match pattern {
+                    0 => rng.random_range(0..p),
+                    1 => p - 1,
+                    2 => 0,
+                    _ => rng.random_range(0..4),
+                })
+                .collect();
+            let want = cpu_scan(&init, rows, col0, ncols, n);
+            for &tg in &tgs {
+                // The big sizes only with the default and the narrowest threadgroup (time).
+                if n > 1 << 16 && pattern != 0 && tg.is_some() {
+                    continue;
+                }
+                let (got, fault) = gpu_scan(&hal, &circuit_hal, &init, rows, col0, ncols, n, tg);
+                assert_eq!(fault, 0, "n {n} pattern {pattern} tg {tg:?}: fault");
+                if let Some((row, col, a, b)) = first_diff(&want, &got, rows) {
+                    panic!(
+                        "n {n} pattern {pattern} tg {tg:?}: {} cells differ, first row {row} \
+                         col {col}: cpu {a:#x} gpu {b:#x}",
+                        count_diffs(&want, &got)
+                    );
+                }
+            }
+        }
+    }
+    // One column, and a column range that ends at the last column.
+    for (cols, col0, ncols, n) in [(3, 1, 1, 5000), (5, 1, 4, 3000), (1, 0, 1, 1 << 12)] {
+        let rows = 1 << 13;
+        let init: Vec<u32> = (0..rows * cols).map(|_| rng.random_range(0..p)).collect();
+        let want = cpu_scan(&init, rows, col0, ncols, n);
+        let (got, fault) = gpu_scan(&hal, &circuit_hal, &init, rows, col0, ncols, n, None);
+        assert_eq!(fault, 0);
+        assert!(got == want, "cols {cols} col0 {col0} ncols {ncols} n {n}");
+    }
+    // n = 0 encodes nothing.
+    let init = vec![7u32; 64];
+    let (got, fault) = gpu_scan(&hal, &circuit_hal, &init, 16, 0, 4, 0, None);
+    assert_eq!((got, fault), (init, 0));
+}
+
+/// A non-canonical (e.g. INVALID) scanned cell is reported through fault bit 0x100.
+#[test]
+fn gpu_fp_scan_faults_on_noncanonical() {
+    let hal = Arc::new(MetalHalPoseidon2::new());
+    let circuit_hal = MetalCircuitHalPoseidon2::new(hal.clone()).unwrap();
+    let rows = 1 << 12;
+    for (bad_row, bad) in [(0usize, 0xffff_ffffu32), (3000, P)] {
+        let mut init = vec![1u32; rows * 4];
+        init[2 * rows + bad_row] = bad;
+        let (_, fault) = gpu_scan(&hal, &circuit_hal, &init, rows, 0, 4, rows, None);
+        assert_eq!(fault, FAULT_ACCUM_SCAN, "row {bad_row} value {bad:#x}");
+        // Outside [0, n) it is not read.
+        let (_, fault) = gpu_scan(&hal, &circuit_hal, &init, rows, 0, 4, bad_row, None);
+        assert_eq!(fault, 0, "row {bad_row} beyond n");
+    }
+}
+
+/// Repeated GPU scans of the same input give the same words (and the host's): the R17-style
+/// determinism check for the scan kernels (`R13_SCAN_REPS`, default 20) at 2^20 rows x 4 columns.
+#[test]
+fn gpu_fp_scan_repeat() {
+    let reps: usize = std::env::var("R13_SCAN_REPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+    let hal = Arc::new(MetalHalPoseidon2::new());
+    let circuit_hal = MetalCircuitHalPoseidon2::new(hal.clone()).unwrap();
+    let mut rng = rand::rng();
+    let rows = 1 << 20;
+    let n = rows - 3;
+    let init: Vec<u32> = (0..rows * 4).map(|_| rng.random_range(0..P)).collect();
+    let want = cpu_scan(&init, rows, 0, 4, n);
+    let mut bad = 0;
+    for _ in 0..reps {
+        let (got, fault) = gpu_scan(&hal, &circuit_hal, &init, rows, 0, 4, n, None);
+        if fault != 0 || got != want {
+            bad += 1;
+        }
+    }
+    println!("R17AUDIT rv32im accum_scan 2^20x4: {bad}/{reps} reps differ from CPU");
+    assert_eq!(bad, 0);
+}
+
+fn stats(v: &[f64]) -> (f64, f64, f64) {
+    let mut s = v.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    (s[s.len() / 2], s[0], s[s.len() - 1])
+}
+
+/// R13 measurement (not an assertion): interleaved A/B of the accum step, A = R9's CPU scans
+/// (`ScanMode::Cpu`), B = GPU scans, `R13_AB_PAIRS` pairs (default 9) at `R13_AB_PO2` (default
+/// 20; comma list), full simple_loop segments. Prints per-arm medians/min/max of the step's wall
+/// time (from an idle queue) and of its internal marks, and checks every result against the
+/// CPU circuit HAL. Run alone: `--ignored --nocapture --test-threads=1`.
+#[test]
+#[ignore]
+fn accum_ab() {
+    let pairs: usize = std::env::var("R13_AB_PAIRS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(9);
+    let po2s: Vec<usize> = std::env::var("R13_AB_PO2")
+        .unwrap_or_else(|_| "20".into())
+        .split(',')
+        .map(|s| s.trim().parse().unwrap())
+        .collect();
+    let hal = Arc::new(MetalHalPoseidon2::new());
+    let circuit_hal = MetalCircuitHalPoseidon2::new(hal.clone()).unwrap();
+    eprintln!(
+        "working-set limit {} MB, scan tg {}",
+        hal.working_set_limit() >> 20,
+        circuit_hal.fp_scan_tg(None).unwrap()
+    );
+    let win = sort_win();
+    for po2 in po2s {
+        let seg = segment(testutil::kernel::simple_loop(1u32 << po2), po2);
+        let r = reference(&seg);
+        let rows = r.rows;
+        // A' repeats A: the A-vs-A spread is the noise floor of the A/B claim.
+        let arms = [
+            ("A cpu-scan", Variant::GpuCpuScan(win)),
+            ("B gpu-scan", Variant::Gpu(win)),
+            ("A' cpu-scan", Variant::GpuCpuScan(win)),
+        ];
+        // Warm-up (PSOs, pools).
+        for (_, v) in arms {
+            metal_accum(&hal, &circuit_hal, &r, v);
+        }
+        let mut step: [Vec<f64>; 3] = Default::default();
+        let mut phase: [Vec<f64>; 3] = Default::default();
+        let mut peak: [u64; 3] = [0; 3];
+        let mut segs: [std::collections::BTreeMap<String, Vec<f64>>; 3] = Default::default();
+        for pair in 0..pairs {
+            for (k, (name, v)) in arms.iter().enumerate() {
+                let (metal, ms, _before, pk) = metal_accum(&hal, &circuit_hal, &r, *v);
+                assert_accum_eq(&format!("po2 {po2} {name}"), rows, &r.accum, &metal);
+                let st = LAST_STEP_MS.with(Cell::get);
+                let m = marks::take();
+                step[k].push(st);
+                phase[k].push(ms);
+                peak[k] = peak[k].max(pk);
+                for w in m.windows(2) {
+                    let d = (w[1].1 - w[0].1).as_secs_f64() * 1e3;
+                    segs[k]
+                        .entry(format!("{}->{}", w[0].0, w[1].0))
+                        .or_default()
+                        .push(d);
+                }
+                eprintln!("po2 {po2} pair {pair} {name}: step {st:.2} ms, phase {ms:.2} ms");
+            }
+        }
+        for (k, (name, _)) in arms.iter().enumerate() {
+            let (sm, sl, sh) = stats(&step[k]);
+            let (pm, pl, ph) = stats(&phase[k]);
+            println!(
+                "R13AB po2 {po2} {name}: step median {sm:.2} ms [{sl:.2}, {sh:.2}], whole \
+                 accum phase median {pm:.2} ms [{pl:.2}, {ph:.2}], GPU peak {} MB ({pairs} runs)",
+                peak[k] >> 20
+            );
+            for (seg_name, v) in &segs[k] {
+                let (m, l, h) = stats(v);
+                println!("R13AB po2 {po2} {name}:   {seg_name} median {m:.2} ms [{l:.2}, {h:.2}]");
+            }
+        }
+        // Per-pair differences: B - A and A' - A (noise floor).
+        let d = |x: usize| -> Vec<f64> { (0..pairs).map(|i| step[x][i] - step[0][i]).collect() };
+        let (bm, bl, bh) = stats(&d(1));
+        let (am, al, ah) = stats(&d(2));
+        println!(
+            "R13AB po2 {po2}: per-pair step B-A median {bm:.2} ms [{bl:.2}, {bh:.2}]; A'-A median \
+             {am:.2} ms [{al:.2}, {ah:.2}]"
+        );
+        // The scans alone, the 4 accum columns' shape (rows x 4, n = rows), from an idle queue:
+        // the host scan vs the GPU scan (encode + wait) per threadgroup size.
+        let mut rng = rand::rng();
+        let init: Vec<u32> = (0..rows * 4).map(|_| rng.random_range(0..P)).collect();
+        let mut times: Vec<(String, Vec<f64>)> = vec![("cpu".into(), vec![])];
+        let width = circuit_hal
+            .ctx()
+            .pipeline("fpScanApply")
+            .thread_execution_width();
+        let tgs: Vec<u64> = [width, 64, 128, 256, 512, 1024]
+            .into_iter()
+            .filter(|&t| t % width == 0 && circuit_hal.fp_scan_tg(Some(t)).unwrap() == t)
+            .collect();
+        for &t in &tgs {
+            times.push((format!("gpu tg {t}"), vec![]));
+        }
+        let buf = hal.copy_from_slice("scan_ab", &init);
+        let fault = hal.alloc_buffer::<u32>("scan_ab_fault", 1);
+        for _ in 0..pairs {
+            let mut host = init.clone();
+            let t0 = Instant::now();
+            host.par_chunks_mut(rows).for_each(fp_inclusive_scan);
+            times[0].1.push(t0.elapsed().as_secs_f64() * 1e3);
+            for (k, &t) in tgs.iter().enumerate() {
+                buf.view_mut(|v: &mut [u32]| v.copy_from_slice(&init));
+                hal.sync();
+                let t0 = Instant::now();
+                circuit_hal
+                    .encode_fp_scan(&buf, rows, 0, 4, rows, &fault, Some(t))
+                    .unwrap();
+                hal.sync();
+                times[k + 1].1.push(t0.elapsed().as_secs_f64() * 1e3);
+                assert!(buf.to_vec() == host, "tg {t}");
+            }
+        }
+        for (name, v) in &times {
+            let (m, l, h) = stats(v);
+            println!("R13AB po2 {po2} scans alone {name}: median {m:.3} ms [{l:.3}, {h:.3}]");
+        }
+    }
 }

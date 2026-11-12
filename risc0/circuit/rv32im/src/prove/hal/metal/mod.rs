@@ -98,7 +98,17 @@ pub(crate) const EXPECTED_KERNELS: &[(Phase, &[&str])] = &[
         ],
     ),
     // R9 (accum_tu.metal from accum_tu_gen.py --metal, misc.metal).
-    (Phase::Accum, &["stepAccumA", "finalizeZeroizeAccum"]),
+    (
+        Phase::Accum,
+        &[
+            "stepAccumA",
+            "finalizeZeroizeAccum",
+            // R13 (misc.metal): accum::SCAN_KERNELS.
+            "fpScanReduce",
+            "fpScanBlockSums",
+            "fpScanApply",
+        ],
+    ),
     // R10 (baseline eval_check.metal).
     (Phase::EvalCheck, &["eval_check"]),
 ];
