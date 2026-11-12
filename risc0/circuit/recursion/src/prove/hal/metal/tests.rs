@@ -112,7 +112,7 @@ fn metallib_smoke() {
         unlisted.is_empty(),
         "in METAL_LIB but not listed: {unlisted:?}"
     );
-    for name in EVAL_MONOLITH.iter().chain(EVAL_SPLIT) {
+    for name in EvalKernels::ALL.iter().flat_map(|v| v.names()) {
         assert!(listed.contains(*name), "{name}");
     }
     let kernels = RecursionKernels::get(&device).unwrap();

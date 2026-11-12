@@ -75,9 +75,11 @@ use crate::prove::{
     RecursionReceipt,
 };
 
-/// Environment variable selecting the eval_check kernels: `split` (default since C11) or
-/// `monolith` (PLAN 2.0). C11 measured the split 31 % faster per lift/join/resolve proof at po2 18
-/// (interleaved A/B on captured zkvm proofs) and ~5x cheaper to build cold (7.5 s vs 36 s).
+/// Environment variable selecting the eval_check kernels: `lz` (the split in lazy Fp form, default
+/// since C12), `split` (the C11 default) or `monolith` (PLAN 2.0). C11 measured the split 31 %
+/// faster per lift/join/resolve proof at po2 18 (interleaved A/B on captured zkvm proofs) and ~5x
+/// cheaper to build cold (7.5 s vs 36 s); C12 measured the lazy Fp split 58.6 -> 47.8 ms per
+/// eval_check call at po2 18 (see `docs/metal-port/notes/C12.md`).
 pub(crate) const REC_KERNELS_ENV: &str = "RISC0_METAL_REC_KERNELS";
 
 /// The monolithic eval_check entry point (C3, `cuda2metal_eval.py`).
@@ -91,12 +93,23 @@ const EVAL_SPLIT: &[&str] = &[
     "ec_part_4",
     "ec_part_5",
 ];
+/// The lazy Fp form of the split, in dispatch order (C12, `cuda2metal_eval.py --split-lz`): the
+/// same parts and bindings as [EVAL_SPLIT], every part's Fp sums of products accumulated lazily.
+const EVAL_SPLIT_LZ: &[&str] = &[
+    "ec_lz_part_0",
+    "ec_lz_part_1",
+    "ec_lz_part_2",
+    "ec_lz_part_3",
+    "ec_lz_part_4",
+    "ec_lz_part_5",
+];
 
 /// Which eval_check kernels the recursion Metal HAL uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EvalKernels {
     Monolith,
     Split,
+    SplitLz,
 }
 
 impl EvalKernels {
@@ -104,20 +117,22 @@ impl EvalKernels {
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "monolith" | "mono" | "eval_check" => Some(Self::Monolith),
-            "" | "split" | "ec_part" => Some(Self::Split),
+            "split" | "ec_part" => Some(Self::Split),
+            "" | "lz" | "split-lz" | "split_lz" | "ec_lz_part" => Some(Self::SplitLz),
             _ => None,
         }
     }
 
-    /// The process-wide selection (read once): `RISC0_METAL_REC_KERNELS`, default split (C11).
+    /// The process-wide selection (read once): `RISC0_METAL_REC_KERNELS`, default the lazy Fp
+    /// split (C12; `split` reverts to the C11 default).
     pub(crate) fn selected() -> Self {
         static SEL: OnceLock<EvalKernels> = OnceLock::new();
         *SEL.get_or_init(|| match std::env::var(REC_KERNELS_ENV) {
             Ok(v) => Self::parse(&v).unwrap_or_else(|| {
-                tracing::warn!("{REC_KERNELS_ENV}={v:?} is not monolith|split; using split");
-                Self::Split
+                tracing::warn!("{REC_KERNELS_ENV}={v:?} is not lz|split|monolith; using lz");
+                Self::SplitLz
             }),
-            Err(_) => Self::Split,
+            Err(_) => Self::SplitLz,
         })
     }
 
@@ -126,13 +141,18 @@ impl EvalKernels {
         match self {
             Self::Monolith => EVAL_MONOLITH,
             Self::Split => EVAL_SPLIT,
+            Self::SplitLz => EVAL_SPLIT_LZ,
         }
     }
+
+    /// Every variant (tests).
+    #[allow(dead_code)]
+    pub(crate) const ALL: [EvalKernels; 3] = [Self::Monolith, Self::Split, Self::SplitLz];
 }
 
-/// Whether `name` is one of the eval_check entry points (either variant).
+/// Whether `name` is one of the eval_check entry points (any variant).
 fn is_eval_kernel(name: &str) -> bool {
-    EVAL_MONOLITH.contains(&name) || EVAL_SPLIT.contains(&name)
+    EvalKernels::ALL.iter().any(|v| v.names().contains(&name))
 }
 
 /// Environment variable (read once): threads that build the recursion PSOs. Default
@@ -252,7 +272,7 @@ pub(crate) struct RecursionKernels {
 
 impl RecursionKernels {
     fn load(device: &DeviceRef) -> Result<Self> {
-        for names in [EVAL_MONOLITH, EVAL_SPLIT] {
+        for names in [EVAL_MONOLITH, EVAL_SPLIT, EVAL_SPLIT_LZ] {
             for name in names {
                 if !METAL_KERNEL_NAMES.contains(name) {
                     bail!("risc0-circuit-recursion-sys METAL_KERNEL_NAMES does not list {name}");
@@ -818,12 +838,14 @@ mod c5_tests {
 
     #[test]
     fn eval_kernels_parse() {
-        assert_eq!(EvalKernels::parse(""), Some(EvalKernels::Split));
+        assert_eq!(EvalKernels::parse(""), Some(EvalKernels::SplitLz));
+        assert_eq!(EvalKernels::parse("lz"), Some(EvalKernels::SplitLz));
         assert_eq!(EvalKernels::parse("monolith"), Some(EvalKernels::Monolith));
         assert_eq!(EvalKernels::parse(" Split "), Some(EvalKernels::Split));
         assert_eq!(EvalKernels::parse("bogus"), None);
         assert_eq!(EvalKernels::Monolith.names(), &["eval_check"]);
         assert_eq!(EvalKernels::Split.names().len(), 6);
+        assert_eq!(EvalKernels::SplitLz.names().len(), 6);
     }
 
     #[test]
@@ -833,7 +855,9 @@ mod c5_tests {
         let b = MetalCircuitHal::new(hal).unwrap();
         assert!(std::ptr::eq(a.kernels(), b.kernels()));
         let names: Vec<&str> = a.kernels().base.names().collect();
-        assert_eq!(names.len(), METAL_KERNEL_NAMES.len() - 7);
+        let eval_names: usize = EvalKernels::ALL.iter().map(|v| v.names().len()).sum();
+        assert_eq!(eval_names, 13);
+        assert_eq!(names.len(), METAL_KERNEL_NAMES.len() - eval_names);
         for name in METAL_KERNEL_NAMES.iter().filter(|n| !is_eval_kernel(n)) {
             assert!(a.kernels().base.get(name).is_some(), "{name}");
         }

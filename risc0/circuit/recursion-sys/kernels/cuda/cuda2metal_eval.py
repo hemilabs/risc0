@@ -17,14 +17,15 @@
 "eval mode", errata 8.2).
 
 usage:
-  cuda2metal_eval.py -o OUTDIR [--split] [--check] [--no-pin] [--compile] [--metallib PATH]
-                     [--define NAME=VALUE ...]
-  cuda2metal_eval.py --check [--split]        # round trip + pins only, nothing written
-  cuda2metal_eval.py --list-kernels [--split] # the kernel entry names, one per line
+  cuda2metal_eval.py -o OUTDIR [--split [--split-lz]] [--check] [--no-pin] [--compile]
+                     [--metallib PATH] [--define NAME=VALUE ...]
+  cuda2metal_eval.py --check [--split [--split-lz]]        # round trip + pins only
+  cuda2metal_eval.py --list-kernels [--split [--split-lz]] # the kernel entry names
 
 Inputs (kernels/cuda, checked in) -> outputs (OUTDIR, never checked in):
   eval_check.cu        -> eval_check.metal        + kernel eval_check (monolith, always)
   eval_check_split.cu  -> eval_check_split.metal  + kernels ec_part_0 .. ec_part_5 (--split)
+                       -> eval_check_split_lz.metal + kernels ec_lz_part_0 .. 5 (--split-lz)
 
 Monolith: poly_fp (zirgen output, 12k lines) becomes a `static inline` function whose first
 parameter is `const device FpExt* poly_mix` (CUDA reads a `__constant__ FpExt poly_mix[158]`
@@ -41,7 +42,19 @@ the six instantiations are text-expanded into kernels `ec_part_0` .. `ec_part_5`
 block) that call `ec_part_body<P>`. The parts run in order on one serial encoder: part P > 0 adds
 the sum part P - 1 left in `check`, the last part scales by the quotient.
 
-Kernel bindings (both modes; RecEvalParams is defined in the generated prelude, 16 B):
+Split, lazy Fp (--split-lz, item C12): the translated split with every part's straight-line Fp
+arithmetic rewritten by ec_lazyfp.py's 'lz2' form (the HIP generator's lazy Fp sums of products:
+a sum/difference tree over products stays a raw 64-bit accumulator standing for x * 2^-32 mod P,
+folded only when one more term could overflow, and one REDC makes a canonical Fp only where one
+is needed). REDC is linear mod P and its output canonical, so for canonical inputs the result is
+bit-identical (the canonical-input assumption ec_lazyredc.py documents). The `rlf_*` helpers are
+Metal ports of ec_lazyfp.py's HIP ones (`Fp::asRaw`/`Fp::fromRaw` for sppark's raw `*a`/`Fp(r)`);
+the kernels are renamed `ec_lz_part_P` so both splits link into one metallib. C12 measured the
+six parts at po2 18 (domain 2^20) 58.6 -> 47.8 ms per call on the M5 Max (lz1 49.3 ms, a per-part
+mix of lz1/lz2/RecLz-only 47.7 ms: no better than all-lz2; the lazy-REDC split without the RecLz
+pass, i.e. plain Fp, 97 ms).
+
+Kernel bindings (all modes; RecEvalParams is defined in the generated prelude, 16 B):
   buffer(0) poly_mix  const device FpExt*  158 mix powers (CUDA __constant__ poly_mix)
   buffer(1) check     device Fp*           4 * domain (column-major, as CUDA)
   buffer(2) ctrl      const device Fp*
@@ -214,7 +227,76 @@ def split_kernels():
 KERNELS = {
     'eval_check': ['eval_check'],
     'eval_check_split': ['ec_part_%d' % p for p in range(NUM_PARTS)],
+    'eval_check_split_lz': ['ec_lz_part_%d' % p for p in range(NUM_PARTS)],
 }
+
+
+# ---- split, lazy Fp (--split-lz, C12) -------------------------------------------------------
+
+LZ_FORM = 'lz2'
+LZ_HELPERS = """\
+// ec_lazyfp.py's lazy Fp helpers (HIP originals; Metal: Fp::asRaw / Fp::fromRaw). An accumulator
+// x (uint64_t) stands for x * 2^-32 mod P. Canonical inputs assumed (see ec_lazyredc.py).
+static inline __attribute__((always_inline)) uint64_t rlf_mul(Fp a, Fp b) { return uint64_t(a.asRaw()) * uint64_t(b.asRaw()); }
+static inline __attribute__((always_inline)) uint64_t rlf_c(Fp a) { return uint64_t(a.asRaw()) << 32; }
+static inline __attribute__((always_inline)) uint64_t rlf_neg(Fp a) { return uint64_t(0x78000001u - a.asRaw()) << 32; }
+static inline __attribute__((always_inline)) uint64_t rlf_mneg(Fp a, Fp b) { return uint64_t(0x78000001u - a.asRaw()) * uint64_t(b.asRaw()); }
+// High word below 2P (fold1) or 3P (fold2) reduced below P.
+static inline __attribute__((always_inline)) uint64_t rlf_fold1(uint64_t x) {
+  uint32_t hi = uint32_t(x >> 32);
+  hi = min(hi, hi - 0x78000001u);
+  return (uint64_t(hi) << 32) | uint32_t(x);
+}
+static inline __attribute__((always_inline)) uint64_t rlf_fold2(uint64_t x) {
+  uint32_t hi = uint32_t(x >> 32);
+  hi = min(hi, hi - 0x78000001u);
+  hi = min(hi, hi - 0x78000001u);
+  return (uint64_t(hi) << 32) | uint32_t(x);
+}
+// REDC of x < P * 2^32: canonical x * 2^-32 mod P.
+static inline __attribute__((always_inline)) Fp rlf_fin(uint64_t x) {
+  uint32_t m = uint32_t(x) * 0x77ffffffu;
+  uint64_t u = x + uint64_t(m) * 0x78000001u;
+  uint32_t r = uint32_t(u >> 32);
+  return Fp::fromRaw(min(r, r - 0x78000001u));
+}
+"""
+LZ_HEAD = re.compile(r'^static inline __attribute__\(\(always_inline\)\) FpExt poly_fp_part(\d+)\('
+                     r'const device FpExt\* poly_mix, ', re.M)
+
+
+def lazy_fp(split_text):
+    """eval_check_split_lz.metal from the translated split (see the module doc). Returns
+    (text, counts)."""
+    import ec_lazyfp  # kernels/cuda (HIP variant generator), next to this script
+    counts = c.Counter()
+    ns = 'namespace %s {\n' % NS
+    if split_text.count(ns) != 1:
+        raise c.TranslateError('split-lz: expected one namespace open line')
+    text = split_text.replace(ns, ns + c.gen_block(LZ_HELPERS), 1)
+    out, pos, vc = [], 0, {}
+    for m in LZ_HEAD.finditer(text):
+        s = m.start()
+        e = text.index('\n}\n', s) + 3
+        out.append(text[pos:s])
+        out.append(ec_lazyfp.variant(text[s:e], LZ_FORM, vc))
+        counts.add('lz.parts')
+        pos = e
+    out.append(text[pos:])
+    text = ''.join(out)
+    for k, v in vc.items():
+        counts.add('lz.' + k, v)
+    text, n = re.subn(r'^kernel void ec_part_(\d+)\(', r'kernel void ec_lz_part_\1(', text,
+                      flags=re.M)
+    counts.add('lz.kernels', n)
+    text, n = re.subn(r'^// Translated from kernels/cuda/eval_check_split\.cu by ',
+                      '// Lazy Fp form (--split-lz, C12; ec_lazyfp.py %s on every part) of the split.\n'
+                      '// Translated from kernels/cuda/eval_check_split.cu by ' % LZ_FORM, text,
+                      flags=re.M)
+    counts.add('lz.header', n)
+    tallies('eval_check_split_lz', text, counts)
+    residual_scan('eval_check_split_lz', text)
+    return text, counts
 
 # Lines with no Metal meaning, kept as comments (reversible).
 DISABLE = [
@@ -305,6 +387,11 @@ PINNED = {
         'ptr_param': 55, 'check_param': 2, 'body_def': 1, 'gid': 1, 'ext_index': 4,
         'host.lines': 51, 'kernels': 6, 'tally.poly_mix_read': 172,
         'tally.data_read': 1371, 'tally.fp_mul': 4855,
+    },
+    'eval_check_split_lz': {
+        # ec_lazyfp.py 'lz2' on the six parts (C12): products made lazy / REDCs emitted.
+        'lz.parts': 6, 'lz.kernels': 6, 'lz.header': 1, 'lz.lz2_prod': 4855, 'lz.lz2_fin': 2557,
+        'tally.poly_mix_read': 172, 'tally.data_read': 1371, 'tally.fp_mul': 0,
     },
 }
 
@@ -498,6 +585,9 @@ def main(argv=None):
     ap.add_argument('-o', '--outdir')
     ap.add_argument('--split', action='store_true',
                     help='also translate eval_check_split.cu (kernels ec_part_0..5)')
+    ap.add_argument('--split-lz', action='store_true',
+                    help='with --split: also write eval_check_split_lz.metal (kernels '
+                    'ec_lz_part_0..5, lazy Fp form, C12)')
     ap.add_argument('--check', action='store_true',
                     help='round trip + pins + residuals; compare with OUTDIR files if present')
     ap.add_argument('--no-pin', action='store_true', help='report count mismatches only')
@@ -508,8 +598,11 @@ def main(argv=None):
     ap.add_argument('-q', '--quiet', action='store_true')
     a = ap.parse_args(argv)
 
+    if a.split_lz and not a.split:
+        ap.error('--split-lz needs --split')
     names = ['eval_check'] + (['eval_check_split'] if a.split else [])
     if a.list_kernels:
+        names += ['eval_check_split_lz'] if a.split_lz else []
         print('\n'.join(k for n in names for k in KERNELS[n]))
         return 0
     if not a.outdir and not a.check:
@@ -531,20 +624,27 @@ def main(argv=None):
                          min(len(back), len(base)))
                 raise c.TranslateError('%s: round trip differs from the CUDA source at %s'
                                        % (name, c.where(base, i)))
-        dst = os.path.join(a.outdir, name + '.metal') if a.outdir else None
-        status = c.write_or_check(dst, out, a.check) if dst else None
-        log('%s: %s%s%s' % (name, ', '.join('%s=%d' % kv for kv in counts.items()),
-                            ' round-trip=ok' if a.check else '',
-                            (' -> %s (%s)' % (dst, status)) if dst else ''))
-        if a.compile:
-            air = os.path.join(a.outdir, name + '.air')
-            dt, err = c.compile_metal(dst, air, defines=a.define)
-            warns = [l for l in err.splitlines() if 'warning:' in l]
-            log('  compiled %s in %.1f s, %d warning lines' % (os.path.basename(air), dt,
-                                                                  len(warns)))
-            for w in warns[:10]:
-                log('    ' + w)
-            airs.append(air)
+        outs = [(name, out, counts, a.check)]
+        if name == 'eval_check_split' and a.split_lz:
+            lz, lz_counts = lazy_fp(out)
+            mismatches += c.check_pins('eval_check_split_lz', lz_counts,
+                                       PINNED['eval_check_split_lz'], strict=not a.no_pin)
+            outs.append(('eval_check_split_lz', lz, lz_counts, False))
+        for oname, otext, ocounts, rt in outs:
+            dst = os.path.join(a.outdir, oname + '.metal') if a.outdir else None
+            status = c.write_or_check(dst, otext, a.check) if dst else None
+            log('%s: %s%s%s' % (oname, ', '.join('%s=%d' % kv for kv in ocounts.items()),
+                                ' round-trip=ok' if rt else '',
+                                (' -> %s (%s)' % (dst, status)) if dst else ''))
+            if a.compile:
+                air = os.path.join(a.outdir, oname + '.air')
+                dt, err = c.compile_metal(dst, air, defines=a.define)
+                warns = [l for l in err.splitlines() if 'warning:' in l]
+                log('  compiled %s in %.1f s, %d warning lines' % (os.path.basename(air), dt,
+                                                                      len(warns)))
+                for w in warns[:10]:
+                    log('    ' + w)
+                airs.append(air)
     if a.metallib:
         dt = c.link_metallib(airs, a.metallib)
         log('linked %s in %.1f s' % (a.metallib, dt))

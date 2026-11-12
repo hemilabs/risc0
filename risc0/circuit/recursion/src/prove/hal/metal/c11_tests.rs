@@ -115,7 +115,17 @@ fn load_captures() -> Vec<(String, capture::Capture)> {
 fn replay_preflight(c: &capture::Capture) -> Option<Preflight> {
     let p = c.preflight()?;
     if crate::prove::host_chains_backend() {
-        *p.host_chains.lock().unwrap() = crate::prove::witgen::host_chains(&c.program, &p);
+        let t = Instant::now();
+        let chains = crate::prove::witgen::host_chains(&c.program, &p);
+        if std::env::var_os("C12_CHAIN_STATS").is_some() {
+            eprintln!(
+                "C12CHAINS chains={} rows={} ms={:.2}",
+                chains.as_ref().map_or(0, |h| h.heads.len()),
+                chains.as_ref().map_or(0, |h| h.cycles.len()),
+                t.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        *p.host_chains.lock().unwrap() = chains;
     }
     Some(p)
 }
