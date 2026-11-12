@@ -603,3 +603,31 @@ pub(crate) fn recursion_prover(hashfn: &str) -> Result<Box<dyn RecursionProver>>
         _ => bail!("Unsupported hashfn: {hashfn}"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use risc0_core::field::baby_bear::BabyBear;
+    use risc0_zkp::{
+        core::hash::sha::Sha256HashSuite,
+        hal::{cpu::CpuHal, intel::IntelHalSha256},
+    };
+    use test_log::test;
+
+    use crate::prove::hal::cpu::CpuCircuitHal;
+
+    /// Differential bit-exact check of the Intel recursion eval_check kernel
+    /// against the CPU reference, mirroring `cuda.rs::tests::eval_check`. The
+    /// recursion Intel HAL previously had no unit test, so its eval_check
+    /// kernel was only covered end-to-end; this pins it directly.
+    #[test]
+    fn eval_check() {
+        const PO2: usize = 4;
+        let cpu_hal: CpuHal<BabyBear> = CpuHal::new(Sha256HashSuite::new_suite());
+        let cpu_eval = CpuCircuitHal;
+        let gpu_hal = Arc::new(IntelHalSha256::new());
+        let gpu_eval = super::IntelCircuitHalSha256::new(gpu_hal.clone());
+        crate::testutil::eval_check(&cpu_hal, cpu_eval, gpu_hal.as_ref(), gpu_eval, PO2);
+    }
+}
