@@ -388,6 +388,56 @@ mod tests {
         assert_eq!(check1, check2);
     }
 
+    // GPU-only eval_check timing. Gated behind RISC0_EVAL_CHECK_BENCH so it is a
+    // no-op in normal test runs. BENCH_PO2 (default 18) and BENCH_ITERS (default 20).
+    #[test]
+    fn eval_check_bench() {
+        if std::env::var_os("RISC0_EVAL_CHECK_BENCH").is_none() {
+            return;
+        }
+        let po2: usize = std::env::var("BENCH_PO2")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(18);
+        let iters: usize = std::env::var("BENCH_ITERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20);
+        let gpu_hal = Arc::new(HipHalSha256::new());
+        let gpu_eval = super::HipCircuitHal::new(gpu_hal.clone());
+        let params = EvalCheckParams::new(po2);
+        let check = gpu_hal.alloc_elem("check", ExtVal::EXT_SIZE * params.domain);
+        let code = gpu_hal.copy_from_elem("code", &params.code);
+        let data = gpu_hal.copy_from_elem("data", &params.data);
+        let accum = gpu_hal.copy_from_elem("accum", &params.accum);
+        let mix = gpu_hal.copy_from_elem("mix", &params.mix);
+        let out = gpu_hal.copy_from_elem("out", &params.out);
+        let run = || {
+            gpu_eval.eval_check(
+                &check,
+                &[&accum, &code, &data],
+                &[&mix, &out],
+                params.poly_mix,
+                params.po2,
+                params.steps,
+            );
+            gpu_eval.eval_check_dep();
+        };
+        for _ in 0..3 {
+            run();
+        }
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            run();
+        }
+        let dt = t.elapsed();
+        println!(
+            "EVAL_CHECK_BENCH kernel=combined po2={po2} domain={} iters={iters} per_call={:.3}ms",
+            params.domain,
+            dt.as_secs_f64() * 1000.0 / iters as f64
+        );
+    }
+
     fn eval_check_impl<H, C>(params: &EvalCheckParams, hal: &H, circuit_hal: &C) -> Vec<H::Elem>
     where
         H: Hal<Elem = Val, ExtElem = ExtVal>,
