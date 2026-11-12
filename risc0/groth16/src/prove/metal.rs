@@ -117,12 +117,15 @@ pub(crate) fn release_srs() -> Result<()> {
     risc0_groth16_sys::metal_release().context("failed to release the groth16 prover")
 }
 
-/// Discard the prover's caches. The Metal prover keeps no derived data on disk, so this frees
-/// the in-memory prover; the next [shrink_wrap] reloads it.
+/// Discard the prover's caches: the in-memory prover and the compact-coefficients disk cache
+/// (`coeffs_compact_metal_*.bin` in the Groth16 cache directory, item G10); the next
+/// [shrink_wrap] rebuilds both from the proving key.
 pub(crate) fn invalidate_caches() {
     if let Err(e) = release_srs() {
         tracing::warn!("{e:#}");
     }
+    let removed = risc0_groth16_sys::metal::compact::invalidate_cache();
+    tracing::debug!("groth16-metal: removed {removed} compact coefficient cache files");
 }
 
 /// Produce a Groth16 proof from an `identity_p254` seal.

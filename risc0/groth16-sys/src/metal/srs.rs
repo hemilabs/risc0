@@ -44,6 +44,8 @@ use metal::{
     Buffer, BufferRef, DeviceRef, MTLBuffer, MTLResourceOptions,
 };
 
+use super::filemap::FileMap;
+
 // ---------------------------------------------------------------------------------------------
 // Raw point types (the file and GPU layout)
 // ---------------------------------------------------------------------------------------------
@@ -240,12 +242,22 @@ unsafe impl Pod for G1AffineRaw {}
 unsafe impl Pod for G2AffineRaw {}
 
 /// A `StorageModeShared` Metal buffer of `len` elements of `T`, filled once by a loader and
-/// read-only afterwards (bind it as `const device T*`). Unlike zkp's `BufferImpl` it is not
-/// pooled or hazard-tracked: nothing on the GPU writes it, so host reads need no sync.
+/// read-only afterwards (bind it as `const device T*` at [SharedBuf::offset]). Unlike zkp's
+/// `BufferImpl` it is not pooled or hazard-tracked: nothing on the GPU writes it, so host reads
+/// need no sync.
+///
+/// Either an allocated buffer the loader copied the file bytes into (offset 0), or (item G10) a
+/// no-copy buffer over a read-only mapping of the file ([FileMap]; the elements start at the
+/// section's offset inside its first page, so only 4-byte alignment is guaranteed).
 pub struct SharedBuf<T: Pod> {
-    buffer: Buffer,
+    backing: Backing,
     len: usize,
     _t: PhantomData<T>,
+}
+
+enum Backing {
+    Owned(Buffer),
+    Mapped(FileMap),
 }
 
 impl<T: Pod> SharedBuf<T> {
@@ -262,7 +274,31 @@ impl<T: Pod> SharedBuf<T> {
         let buffer = new_shared_buffer(device, bytes.max(16))
             .ok_or_else(|| anyhow!("Metal allocation of {bytes} bytes for {what} failed"))?;
         Ok(Self {
-            buffer,
+            backing: Backing::Owned(buffer),
+            len,
+            _t: PhantomData,
+        })
+    }
+
+    /// `len` elements of `file` at byte `offset`, mapped without a copy ([FileMap::map]).
+    pub(crate) fn map(
+        device: &DeviceRef,
+        file: &File,
+        path: &Path,
+        offset: u64,
+        len: usize,
+        what: &str,
+    ) -> Result<Self> {
+        let bytes = len
+            .checked_mul(size_of::<T>())
+            .ok_or_else(|| anyhow!("{what}: {len} elements overflow"))? as u64;
+        ensure!(
+            offset.is_multiple_of(4),
+            "{what}: offset {offset} is not 4-byte aligned"
+        );
+        let map = FileMap::map(device, file, path, offset, bytes, what, true)?;
+        Ok(Self {
+            backing: Backing::Mapped(map),
             len,
             _t: PhantomData,
         })
@@ -281,26 +317,67 @@ impl<T: Pod> SharedBuf<T> {
         (self.len * size_of::<T>()) as u64
     }
 
-    /// The buffer to bind (as `const device T*`).
-    pub fn as_buf(&self) -> &BufferRef {
-        &self.buffer
+    /// Whether the elements are a no-copy mapping of the file.
+    pub fn is_mapped(&self) -> bool {
+        matches!(self.backing, Backing::Mapped(_))
     }
 
-    /// Host view of the contents (unified memory).
+    /// The buffer to bind (as `const device T*`, at [Self::offset]).
+    pub fn as_buf(&self) -> &BufferRef {
+        match &self.backing {
+            Backing::Owned(b) => b,
+            Backing::Mapped(m) => m.buffer(),
+        }
+    }
+
+    /// Byte offset of the first element in [Self::as_buf] (0 unless mapped).
+    pub fn offset(&self) -> u64 {
+        match &self.backing {
+            Backing::Owned(_) => 0,
+            Backing::Mapped(m) => m.inner_offset(),
+        }
+    }
+
+    /// The payload bytes (host view; unified memory).
+    pub fn bytes(&self) -> &[u8] {
+        match &self.backing {
+            // SAFETY: shared buffer of at least byte_len bytes, read-only by contract.
+            Backing::Owned(b) => unsafe {
+                std::slice::from_raw_parts(b.contents() as *const u8, self.byte_len() as usize)
+            },
+            Backing::Mapped(m) => m.bytes(),
+        }
+    }
+
+    /// Element `i` (any alignment).
+    pub fn get(&self, i: usize) -> T {
+        assert!(i < self.len, "index {i} out of {}", self.len);
+        // SAFETY: in bounds; T is Pod; read_unaligned has no alignment requirement.
+        unsafe { (self.bytes().as_ptr() as *const T).add(i).read_unaligned() }
+    }
+
+    /// Host view of the contents (unified memory). Panics for a mapping whose offset is not
+    /// aligned for `T` (use [Self::get] / [Self::bytes] there).
     pub fn as_slice(&self) -> &[T] {
-        // SAFETY: the buffer is StorageModeShared, at least len * size_of::<T>() bytes, aligned
-        // far beyond align_of::<T>() (page aligned), T is Pod (every bit pattern valid), and
-        // GPU work only reads it (contract of this type), so no write races this shared borrow.
-        unsafe { std::slice::from_raw_parts(self.buffer.contents() as *const T, self.len) }
+        let p = self.bytes().as_ptr();
+        assert!(
+            (p as usize).is_multiple_of(std::mem::align_of::<T>()),
+            "SharedBuf::as_slice on a mapping that is not aligned for the element type"
+        );
+        // SAFETY: at least len * size_of::<T>() bytes, aligned (checked), T is Pod (every bit
+        // pattern valid), and GPU work only reads it (contract of this type), so no write races
+        // this shared borrow.
+        unsafe { std::slice::from_raw_parts(p as *const T, self.len) }
     }
 
     pub(crate) fn as_bytes_mut(&mut self) -> &mut [u8] {
-        // SAFETY: as above; `&mut self` makes this the only view.
-        unsafe {
-            std::slice::from_raw_parts_mut(
-                self.buffer.contents() as *mut u8,
-                self.len * size_of::<T>(),
-            )
+        let n = self.len * size_of::<T>();
+        match &self.backing {
+            // SAFETY: as above; `&mut self` makes this the only view.
+            Backing::Owned(b) => unsafe {
+                std::slice::from_raw_parts_mut(b.contents() as *mut u8, n)
+            },
+            Backing::Mapped(_) => panic!("SharedBuf::as_bytes_mut on a read-only file mapping"),
         }
     }
 }
@@ -731,33 +808,54 @@ pub struct Srs {
 }
 
 impl Srs {
-    /// Load `stark_verify_final.zkey` (`SetupParams::srs_path`). Takes no lock and needs no
-    /// `MetalHal` (G1: `metal_preload` may run beside a STARK proof).
+    /// Load `stark_verify_final.zkey` (`SetupParams::srs_path`) into allocated buffers. Takes no
+    /// lock and needs no `MetalHal` (G1: `metal_preload` may run beside a STARK proof).
     pub fn load(device: &DeviceRef, path: &Path) -> Result<Self> {
+        Self::load_with(device, path, false)
+    }
+
+    /// [Self::load], or with `mapped` (item G10) the point sections as no-copy buffers over a
+    /// read-only mapping of the file ([SharedBuf::map]): nothing is copied, and the points are
+    /// the file's page cache instead of 2.3 GB of anonymous memory.
+    pub fn load_with(device: &DeviceRef, path: &Path, mapped: bool) -> Result<Self> {
         let start = Instant::now();
         let allocated_before = device.current_allocated_size();
         let file = File::open(path).with_context(|| format!("open(\"{}\")", path.display()))?;
         let header = read_header_from(&file, path)?;
 
-        fn load_section<T: Pod>(
+        let load_section = |sec: Section, what: &str| -> Result<SharedBuf<G1AffineRaw>> {
+            load_section_as(device, &file, path, sec, what, mapped)
+        };
+        fn load_section_as<T: Pod>(
             device: &DeviceRef,
             file: &File,
             path: &Path,
             sec: Section,
             what: &str,
+            mapped: bool,
         ) -> Result<SharedBuf<T>> {
             let len = sec.size as usize / size_of::<T>();
+            if mapped {
+                return SharedBuf::<T>::map(device, file, path, sec.offset, len, what);
+            }
             let mut buf = SharedBuf::<T>::alloc(device, what, len)?;
             read_exact_at_par(file, sec.offset, buf.as_bytes_mut())
                 .with_context(|| format!("reading {what} from \"{}\"", path.display()))?;
             Ok(buf)
         }
         let s = &header.sections;
-        let a = load_section(device, &file, path, s[section::POINTS_A], "SRS points A")?;
-        let b_g1 = load_section(device, &file, path, s[section::POINTS_B1], "SRS points B1")?;
-        let b_g2 = load_section(device, &file, path, s[section::POINTS_B2], "SRS points B2")?;
-        let c = load_section(device, &file, path, s[section::POINTS_C], "SRS points C")?;
-        let h = load_section(device, &file, path, s[section::POINTS_H], "SRS points H")?;
+        let a = load_section(s[section::POINTS_A], "SRS points A")?;
+        let b_g1 = load_section(s[section::POINTS_B1], "SRS points B1")?;
+        let b_g2 = load_section_as(
+            device,
+            &file,
+            path,
+            s[section::POINTS_B2],
+            "SRS points B2",
+            mapped,
+        )?;
+        let c = load_section(s[section::POINTS_C], "SRS points C")?;
+        let h = load_section(s[section::POINTS_H], "SRS points H")?;
         let stats = LoadStats {
             elapsed: start.elapsed(),
             bytes: header.points_bytes(),

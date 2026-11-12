@@ -495,10 +495,22 @@ pub struct MsmKernels {
     hist_count: ComputePipelineState,
     window_scan: ComputePipelineState,
     scatter: ComputePipelineState,
-    g1: CurvePsos,
-    g2: CurvePsos,
+    /// The G7/G8 point kernels (`RISC0_G16_METAL_G9_OFF=wide_mul`, the revert path): built on
+    /// first use (item G10), so the default path does not pay their cold pipeline compilation.
+    g1: std::sync::OnceLock<CurvePsos>,
+    g2: std::sync::OnceLock<CurvePsos>,
     g1w: CurvePsos,
     g2w: CurvePsos,
+    device: metal::Device,
+    lib: metal::Library,
+}
+
+fn curve_psos(device: &DeviceRef, lib: &LibraryRef, g: &str) -> Result<CurvePsos> {
+    Ok(CurvePsos {
+        buckets: pso(device, lib, &format!("msm_buckets_{g}"))?,
+        segment_reduce: pso(device, lib, &format!("msm_segment_reduce_{g}"))?,
+        window_reduce: pso(device, lib, &format!("msm_window_reduce_{g}"))?,
+    })
 }
 
 fn pso(device: &DeviceRef, lib: &LibraryRef, name: &str) -> Result<ComputePipelineState> {
@@ -512,29 +524,42 @@ fn pso(device: &DeviceRef, lib: &LibraryRef, name: &str) -> Result<ComputePipeli
 
 impl MsmKernels {
     pub fn new(device: &DeviceRef, lib: &LibraryRef) -> Result<Self> {
-        let curve = |g: &str| -> Result<CurvePsos> {
-            Ok(CurvePsos {
-                buckets: pso(device, lib, &format!("msm_buckets_{g}"))?,
-                segment_reduce: pso(device, lib, &format!("msm_segment_reduce_{g}"))?,
-                window_reduce: pso(device, lib, &format!("msm_window_reduce_{g}"))?,
-            })
-        };
-        Ok(Self {
+        let k = Self {
             clear: pso(device, lib, "msm_clear")?,
             hist_count: pso(device, lib, "msm_hist_count")?,
             window_scan: pso(device, lib, "msm_window_scan")?,
             scatter: pso(device, lib, "msm_scatter")?,
-            g1: curve("g1")?,
-            g2: curve("g2")?,
-            g1w: curve("g1w")?,
-            g2w: curve("g2w")?,
-        })
+            g1: Default::default(),
+            g2: Default::default(),
+            g1w: curve_psos(device, lib, "g1w")?,
+            g2w: curve_psos(device, lib, "g2w")?,
+            device: device.to_owned(),
+            lib: lib.to_owned(),
+        };
+        // `RISC0_G16_METAL_EAGER_PSOS=1`: build the revert-path pipelines now too (the G9
+        // behaviour; also what a warm-up that must cover every switch wants).
+        if std::env::var("RISC0_G16_METAL_EAGER_PSOS").as_deref() == Ok("1") {
+            k.lazy("g1")?;
+            k.lazy("g2")?;
+        }
+        Ok(k)
+    }
+
+    /// The lazily built pipelines of `g` ("g1" / "g2").
+    fn lazy(&self, g: &str) -> Result<&CurvePsos> {
+        let cell = if g == "g1" { &self.g1 } else { &self.g2 };
+        if let Some(c) = cell.get() {
+            return Ok(c);
+        }
+        let built = curve_psos(&self.device, &self.lib, g)?;
+        Ok(cell.get_or_init(|| built))
     }
 
     fn curve<C: MsmCurve>(&self, tune: MsmTune) -> &CurvePsos {
         match (C::NAME, tune.wide_mul) {
-            ("g1", false) => &self.g1,
-            ("g2", false) => &self.g2,
+            (g @ ("g1" | "g2"), false) => self
+                .lazy(g)
+                .unwrap_or_else(|e| panic!("building the {g} MSM pipelines: {e:#}")),
             ("g1", true) => &self.g1w,
             ("g2", true) => &self.g2w,
             (other, _) => unreachable!("unknown MSM curve {other}"),
@@ -676,9 +701,9 @@ impl MsmKernels {
         // Window groups that fit the pieces buffer.
         let group_bytes = p.max_pieces as u64 * C::XYZZ_BYTES;
         if p.max_pieces > 0 {
-            let per_group = ((sc.pieces.length() / group_bytes) as u32).clamp(1, p.nwins);
+            let per_group = ((sc.pieces_bytes / group_bytes) as u32).clamp(1, p.nwins);
             assert!(
-                per_group as u64 * group_bytes <= sc.pieces.length()
+                per_group as u64 * group_bytes <= sc.pieces_bytes
                     && per_group as u64 * p.max_pieces as u64 * 4 <= sc.piece_bucket.length(),
                 "MSM pieces scratch too small"
             );
@@ -820,6 +845,11 @@ pub struct MsmScratch {
     totals: Buffer,
     sorted: Buffer,
     pieces: Buffer,
+    /// Bytes of `pieces` the MSM uses (its configured size; `pieces` may be a larger buffer
+    /// lent by the prover, item G10).
+    pieces_bytes: u64,
+    /// `pieces` is the prover's buffer, not allocated here.
+    pieces_lent: bool,
     piece_bucket: Buffer,
     partial: Buffer,
     sorted_params: Option<MsmParams>,
@@ -862,6 +892,13 @@ impl MsmScratch {
         .map(|b| b.max(MAX_XYZZ_BYTES))
     }
 
+    /// The buffer sizes [MsmScratch::new] allocates, in allocation order: hist, offset,
+    /// piece_off, totals, sorted, pieces, piece_bucket, partial.
+    pub fn sizes_for(cap_n: u32, cfg: MsmConfig) -> [u64; 8] {
+        cfg.validate();
+        Self::sizes(cap_n, cfg)
+    }
+
     /// Bytes [MsmScratch::new] allocates for `cap_n` scalars (for budgeting before allocating).
     pub fn bytes_for(cap_n: u32, cfg: MsmConfig) -> u64 {
         cfg.validate();
@@ -874,9 +911,25 @@ impl MsmScratch {
     /// ([super::check_working_set]): fails, allocating nothing, if the whole scratch would take
     /// the device's `currentAllocatedSize` above it.
     pub fn new(device: &DeviceRef, cap_n: u32, cfg: MsmConfig) -> Result<Self> {
+        Self::new_with(device, cap_n, cfg, None)
+    }
+
+    /// [Self::new], with `pieces` (item G10) a buffer of the caller's to use as the piece buffer
+    /// instead of allocating one, if it holds at least the configured size (else one is
+    /// allocated). The caller guarantees nothing else uses its first [Self::sizes_for]`[5]`
+    /// bytes while an MSM on this scratch runs (the prover lends a, b once MSM H's sort
+    /// consumed h).
+    pub fn new_with(
+        device: &DeviceRef,
+        cap_n: u32,
+        cfg: MsmConfig,
+        pieces: Option<&BufferRef>,
+    ) -> Result<Self> {
         cfg.validate();
         let sizes = Self::sizes(cap_n, cfg);
-        super::check_working_set(device, "the MSM scratch", sizes.iter().sum())?;
+        let lent = pieces.filter(|b| b.length() >= sizes[5]);
+        let own: u64 = sizes.iter().sum::<u64>() - if lent.is_some() { sizes[5] } else { 0 };
+        super::check_working_set(device, "the MSM scratch", own)?;
         // Nil-checked (G8): a refused allocation is an error, not a null `Buffer`.
         // `RISC0_G16_METAL_SCRATCH_SHARED=1`: StorageModeShared instead (item G9's Shared vs
         // Private measurement; no difference found, Private stays the default).
@@ -884,7 +937,7 @@ impl MsmScratch {
         let alloc = |bytes: u64, what: &str| -> Result<Buffer> {
             super::new_buffer_checked(device, bytes, private, &format!("the MSM {what}"))
         };
-        let [hist, offset, piece_off, totals, sorted, pieces, piece_bucket, partial] = sizes;
+        let [hist, offset, piece_off, totals, sorted, pieces_size, piece_bucket, partial] = sizes;
         Ok(Self {
             cfg,
             cap_n,
@@ -895,7 +948,12 @@ impl MsmScratch {
             piece_off: alloc(piece_off, "piece_off")?,
             totals: alloc(totals, "totals")?,
             sorted: alloc(sorted, "sorted")?,
-            pieces: alloc(pieces, "pieces")?,
+            pieces: match lent {
+                Some(b) => b.to_owned(),
+                None => alloc(pieces_size, "pieces")?,
+            },
+            pieces_bytes: pieces_size,
+            pieces_lent: lent.is_some(),
             piece_bucket: alloc(piece_bucket, "piece_bucket")?,
             partial: alloc(partial, "partial")?,
             sorted_params: None,
@@ -903,6 +961,11 @@ impl MsmScratch {
             sorted_tune: MsmTune::default(),
             scalar_bits: 256,
         })
+    }
+
+    /// Whether the piece buffer is the caller's ([Self::new_with]).
+    pub fn pieces_lent(&self) -> bool {
+        self.pieces_lent
     }
 
     /// The kernel variants of the following sorts and the MSMs over them (item G9).
@@ -935,6 +998,12 @@ impl MsmScratch {
         self.cfg
     }
 
+    /// The `sorted` buffer (digits/indices of the last sort). Item G10: the prover borrows it
+    /// as the third polynomial (c) during the NTT phase, before any sort of the proof writes it.
+    pub(crate) fn sorted_buffer(&self) -> &BufferRef {
+        &self.sorted
+    }
+
     pub fn capacity(&self) -> u32 {
         self.cap_n
     }
@@ -944,21 +1013,27 @@ impl MsmScratch {
         self.cfg.nwins()
     }
 
-    /// Total bytes of the scratch buffers.
+    /// Total bytes of the scratch buffers this scratch allocated (a lent piece buffer is not
+    /// counted).
     pub fn bytes(&self) -> u64 {
+        let pieces = if self.pieces_lent {
+            0
+        } else {
+            self.pieces.length()
+        };
         [
             &self.hist,
             &self.offset,
             &self.piece_off,
             &self.totals,
             &self.sorted,
-            &self.pieces,
             &self.piece_bucket,
             &self.partial,
         ]
         .iter()
         .map(|b| b.length())
-        .sum()
+        .sum::<u64>()
+            + pieces
     }
 }
 

@@ -196,7 +196,7 @@ impl Coeffs {
     }
 }
 
-fn validate_part(
+pub(crate) fn validate_part(
     name: &str,
     m: u32,
     coeffs: &[Coeff],
@@ -350,7 +350,7 @@ impl FuzzedResults {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{os::unix::fs::FileExt, time::Instant};
 
     use ark_ec::{CurveGroup, PrimeGroup};
@@ -373,7 +373,7 @@ mod tests {
     }
 
     /// A small preprocessed file: rows of A then B, in the CUDA constructor's layout.
-    fn synthetic(
+    pub(crate) fn synthetic(
         rows_a: &[(u32, usize)],
         rows_b: &[(u32, usize)],
         witness: u32,

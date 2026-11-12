@@ -331,13 +331,13 @@ fn g9_bench() {
         .collect();
     let reps: usize = std::env::var("G9_REPS").map_or(7, |v| v.parse().unwrap());
     let profile = std::env::var("G9_PROFILE").as_deref() == Ok("1");
-    let c = &prover.coeffs;
+    let (ca, cb, ua, ub) = prover.coeffs().counts();
     eprintln!(
         "G9 coefficients: A {} in {} rows, B {} in {} rows; witness {}, domain {}",
-        c.count_a,
-        c.ind_a - 1,
-        c.count_b,
-        c.ind_b - 1,
+        ca,
+        ua - 1,
+        cb,
+        ub - 1,
         prover.witness_len(),
         prover.domain_size()
     );
@@ -412,6 +412,201 @@ fn g9_bench() {
         );
         for (k, v) in &stages[vi] {
             eprintln!("G9SUMMARY {name}   {k}: {}", stat(v));
+        }
+    }
+}
+
+fn random_witness(prover: &MetalProver, seed: u64) -> Vec<u8> {
+    use rand::{Rng as _, SeedableRng as _};
+    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+    let mut witness = vec![0u8; prover.witness_len() * 32];
+    for e in witness.chunks_exact_mut(32) {
+        rng.fill(&mut e[..31]);
+    }
+    witness
+}
+
+fn report_build(name: &str, p: &MetalProver) {
+    let st = &p.build_stats;
+    eprintln!(
+        "G10BUILD {name}: srs {:?} coeffs {:?} validate {:?} gpu setup {:?} total {:?}; planned \
+         {:.1} MiB, allocated {:.1} -> {:.1} MiB (+{:.1}), footprint {:.1} -> {:.1} MiB (+{:.1}), \
+         coefficients {:.1} MiB",
+        st.srs_load,
+        st.coeffs_load,
+        st.coeffs_validate,
+        st.gpu_setup,
+        st.total,
+        mib(st.planned_bytes),
+        mib(st.allocated_before),
+        mib(st.allocated_after),
+        mib(st.allocated_after.saturating_sub(st.allocated_before)),
+        mib(st.footprint_before),
+        mib(st.footprint_after),
+        mib(st.footprint_after.saturating_sub(st.footprint_before)),
+        mib(p.coeffs().resident_bytes()),
+    );
+}
+
+/// Item G10: every memory switch (built one prover at a time) gives the same pre-blinding values
+/// and, with fixed r and s, the same proof as the G9 layout; the alias layout's fuzz check holds.
+#[test]
+fn g10_mem_options_bit_exact() {
+    assert_eq!(MemOptions::parse("base"), Some(MemOptions::none()));
+    assert_eq!(MemOptions::parse("all"), Some(MemOptions::all()));
+    assert_eq!(MemOptions::parse("-bogus"), None);
+    for name in MemOptions::NAMES {
+        let mut t = MemOptions::all();
+        assert!(t.set(name, false));
+        assert_eq!(MemOptions::parse(&format!("-{name}")), Some(t));
+    }
+
+    let _lock = prover_test_lock();
+    let Some(dir) = component_dir() else {
+        return;
+    };
+    let setup = SetupParams::new(&dir).unwrap();
+    let mut variants = vec![("base".to_string(), MemOptions::none())];
+    variants.push(("all".into(), MemOptions::all()));
+    for name in MemOptions::NAMES {
+        variants.push((
+            format!("-{name}"),
+            MemOptions::parse(&format!("-{name}")).unwrap(),
+        ));
+        variants.push((
+            format!("base,+{name}"),
+            MemOptions::parse(&format!("base,+{name}")).unwrap(),
+        ));
+    }
+    let mut reference: Option<Proof> = None;
+    let mut witness = None;
+    for (name, mem) in variants {
+        let mut prover = match MetalProver::new_with(&setup, mem) {
+            Ok(p) => p,
+            Err(e) if super::super::working_set_budget().is_some() => {
+                let msg = format!("{e:#}");
+                assert!(msg.contains("working-set budget exceeded"), "{msg}");
+                eprintln!("G10 {name}: refused under the budget: {msg}");
+                continue;
+            }
+            Err(e) => panic!("{name}: {e:#}"),
+        };
+        report_build(&name, &prover);
+        assert_eq!(prover.mem_options(), mem);
+        let w = witness.get_or_insert_with(|| random_witness(&prover, 0x10));
+        let p = prover
+            .prove_with_blinding(w, &ProveOptions::default(), Fr::from(3u64), Fr::from(5u64))
+            .unwrap();
+        if name == "all" {
+            let (a, b1, c, b2) = prover.fuzz_check().unwrap();
+            assert!(
+                a.is_zero() && b1.is_zero() && c.is_zero() && b2.is_zero(),
+                "fuzz check"
+            );
+            // And a proof after the fuzz check (which regenerated the fuzz into a, b) is unchanged.
+            let p2 = prover
+                .prove_with_blinding(w, &ProveOptions::default(), Fr::from(3u64), Fr::from(5u64))
+                .unwrap();
+            assert_eq!(p2.pre_blinding, p.pre_blinding);
+        }
+        eprintln!(
+            "G10 {name}: gpu {:.1} ms, allocated after proof {:.1} MiB",
+            p.stats.gpu_total_ms(),
+            mib(p.stats.allocated)
+        );
+        match &reference {
+            None => reference = Some(p),
+            Some(r) => {
+                assert_eq!(p.pre_blinding, r.pre_blinding, "{name}");
+                assert_eq!((p.a, p.b, p.c), (r.a, r.b, r.c), "{name}");
+            }
+        }
+    }
+}
+
+/// G10: interleaved A/B of memory layouts on the real key (benchmark, ignored). `G10_VARIANTS`
+/// = [MemOptions::parse] specs separated by `;` (default "base;all"); every variant's prover is
+/// built once and kept (they coexist: ~10 GB for two), then `G10_REPS` rounds (default 7) prove
+/// with each in turn. `G10_PROFILE=1`: one command buffer per stage. Pre-blinding values must
+/// equal the first variant's.
+#[test]
+#[ignore]
+fn g10_bench() {
+    let _lock = prover_test_lock();
+    let Some(dir) = component_dir() else {
+        return;
+    };
+    let setup = SetupParams::new(&dir).unwrap();
+    let specs = std::env::var("G10_VARIANTS").unwrap_or_else(|_| "base;all".into());
+    let reps: usize = std::env::var("G10_REPS").map_or(7, |v| v.parse().unwrap());
+    let profile = std::env::var("G10_PROFILE").as_deref() == Ok("1");
+    let mut provers: Vec<(String, MetalProver)> = specs
+        .split(';')
+        .map(|s| {
+            let p = MetalProver::new_with(&setup, MemOptions::parse(s).expect("bad G10_VARIANTS"))
+                .unwrap();
+            report_build(s, &p);
+            (s.to_string(), p)
+        })
+        .collect();
+    let witness = random_witness(&provers[0].1, 9);
+    let opts = ProveOptions {
+        profile,
+        ..Default::default()
+    };
+    let mut reference = None;
+    for (_, p) in provers.iter_mut() {
+        let pre = p
+            .prove_with_blinding(&witness, &opts, Fr::from(3u64), Fr::from(5u64))
+            .unwrap()
+            .pre_blinding;
+        assert_eq!(reference.get_or_insert(pre.clone()), &pre);
+    }
+    let mut gpu = vec![Vec::new(); provers.len()];
+    let mut total = vec![Vec::new(); provers.len()];
+    let mut stages: Vec<std::collections::BTreeMap<String, Vec<f64>>> =
+        vec![Default::default(); provers.len()];
+    for rep in 0..reps {
+        for (vi, (name, p)) in provers.iter_mut().enumerate() {
+            let pr = p
+                .prove_with_blinding(&witness, &opts, Fr::from(3u64), Fr::from(5u64))
+                .unwrap();
+            assert_eq!(
+                Some(&pr.pre_blinding),
+                reference.as_ref(),
+                "{name} rep {rep}"
+            );
+            let st = &pr.stats;
+            gpu[vi].push(st.gpu_total_ms());
+            total[vi].push(st.total_ms);
+            for (k, v) in &st.gpu_ms {
+                stages[vi].entry(k.clone()).or_default().push(*v);
+            }
+            eprintln!(
+                "G10BENCH rep {rep} {name}: gpu {:.1} total {:.1} ms [{}]",
+                st.gpu_total_ms(),
+                st.total_ms,
+                st.gpu_ms
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v:.1}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+    }
+    fn stat(v: &[f64]) -> String {
+        let mut s = v.to_vec();
+        s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        format!("{:.1} [{:.1}..{:.1}]", s[s.len() / 2], s[0], s[s.len() - 1])
+    }
+    for (vi, (name, _)) in provers.iter().enumerate() {
+        eprintln!(
+            "G10SUMMARY {name}: gpu {} total {} ms",
+            stat(&gpu[vi]),
+            stat(&total[vi])
+        );
+        for (k, v) in &stages[vi] {
+            eprintln!("G10SUMMARY {name}   {k}: {}", stat(v));
         }
     }
 }

@@ -23,4 +23,8 @@ SYCL prover in `../intel` is the template.
   (same layout and values as `Fp`/`Fr`/`Fp2`) that the `_g1w`/`_g2w` MSM and `_w` NTT kernels
   instantiate. `g9_bench.metal` holds the micro-benchmarks of the variants (tests.rs
   `g9_fast_field_ops`), including the rejected ones (see docs/metal-port/notes/G9.md).
+- `witness_poly.metal`'s `witness_into_poly_compact` (item G10) reads the compact coefficients
+  (`(s, value index)` pairs into a table of distinct values, per-row output indices; built and
+  disk-cached by `src/metal/compact.rs`); same summation order as `witness_into_poly`, so
+  bit-identical.
 - With no `.metal` file present the metallib is an empty file and the name list is empty.

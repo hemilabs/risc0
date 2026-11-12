@@ -94,3 +94,64 @@ kernel void witness_into_poly(device Fr* out [[buffer(0)]],
     atomic_fetch_or_explicit(fault, bad, memory_order_relaxed);
   out[row] = sum;
 }
+
+// witness_into_poly over the compact coefficients (item G10; CUDA witness_into_poly_compact,
+// kernels/cuda/groth16_prover.cuh): coefficient j is (s, value index) = cs[j] into `table` (the
+// distinct values), and row i writes out[rowc[i]]. Same summation order as witness_into_poly,
+// so bit-identical. Same fault bits; additionally a value index >= table_len is fault 2.
+//
+// Buffer indices (mirrored by src/metal/small.rs):
+//   0 out Fr[out_len]   1 cs uint2[coeff_len]   2 indices uint[rows + 1]   3 witness Fr[witness_len]
+//   4 fault atomic_uint   5 table Fr[table_len]   6 rowc uint[rows]   7 constant WitnessPolyCompactParams
+struct WitnessPolyCompactParams {
+  uint32_t rows;
+  uint32_t coeff_len;
+  uint32_t witness_len;
+  uint32_t out_len;
+  uint32_t table_len;
+  uint32_t pad[3];
+};
+
+[[max_total_threads_per_threadgroup(256)]]
+kernel void witness_into_poly_compact(device Fr* out [[buffer(0)]],
+                                      const device uint2* cs [[buffer(1)]],
+                                      const device uint32_t* indices [[buffer(2)]],
+                                      const device Fr* witness [[buffer(3)]],
+                                      device atomic_uint* fault [[buffer(4)]],
+                                      const device Fr* table [[buffer(5)]],
+                                      const device uint32_t* rowc [[buffer(6)]],
+                                      constant WitnessPolyCompactParams& p [[buffer(7)]],
+                                      uint gid [[thread_position_in_grid]]) {
+  if (gid >= p.rows)
+    return;
+  uint32_t start = indices[gid];
+  uint32_t end = indices[gid + 1];
+  if (end < start || end > p.coeff_len) {
+    atomic_fetch_or_explicit(fault, 1u, memory_order_relaxed);
+    return;
+  }
+  if (end == start)
+    return;
+  uint32_t row = rowc[gid];
+  if (row >= p.out_len) {
+    atomic_fetch_or_explicit(fault, 2u, memory_order_relaxed);
+    return;
+  }
+  uint32_t bad = 0;
+  Fr sum = Fr::zero();
+  for (uint32_t j = start; j < end; j++) {
+    uint2 c = cs[j];
+    if (c.x >= p.witness_len || c.y >= p.table_len) {
+      atomic_fetch_or_explicit(fault, 2u, memory_order_relaxed);
+      return;
+    }
+    Fr v = table[c.y];
+    Fr w = witness[c.x];
+    if (!v.is_canonical() || !w.is_canonical())
+      bad = 4u;
+    sum += w * v;
+  }
+  if (bad)
+    atomic_fetch_or_explicit(fault, bad, memory_order_relaxed);
+  out[row] = sum;
+}

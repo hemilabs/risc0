@@ -97,6 +97,8 @@ impl Drop for EnvGuard {
 struct PeakSampler {
     stop: Arc<AtomicBool>,
     peak: Arc<AtomicU64>,
+    /// Peak of the process' physical footprint (G10).
+    footprint: Arc<AtomicU64>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -104,12 +106,17 @@ impl PeakSampler {
     fn start() -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let peak = Arc::new(AtomicU64::new(risc0_groth16_sys::metal::allocated_bytes()));
+        let footprint = Arc::new(AtomicU64::new(0));
         let handle = {
-            let (stop, peak) = (stop.clone(), peak.clone());
+            let (stop, peak, footprint) = (stop.clone(), peak.clone(), footprint.clone());
             std::thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
                     peak.fetch_max(
                         risc0_groth16_sys::metal::allocated_bytes(),
+                        Ordering::Relaxed,
+                    );
+                    footprint.fetch_max(
+                        risc0_groth16_sys::metal::filemap::process_memory().phys_footprint,
                         Ordering::Relaxed,
                     );
                     std::thread::sleep(Duration::from_millis(1));
@@ -119,16 +126,25 @@ impl PeakSampler {
         Self {
             stop,
             peak,
+            footprint,
             handle: Some(handle),
         }
     }
 
-    fn finish(mut self) -> u64 {
+    fn finish(self) -> u64 {
+        self.finish_both().0
+    }
+
+    /// (peak device allocation, peak process footprint).
+    fn finish_both(mut self) -> (u64, u64) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(h) = self.handle.take() {
             h.join().unwrap();
         }
-        self.peak.load(Ordering::Relaxed)
+        (
+            self.peak.load(Ordering::Relaxed),
+            self.footprint.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -381,12 +397,10 @@ fn wrap_after_stark_peak_is_not_stark_plus_key() {
         mib(peak),
         mib(key)
     );
+    // G10: the prover (3.9 GB with the default memory switches) is now smaller than the pools.
+    assert!(key > 1 << 30, "the prover is not cached ({key} bytes)");
     assert!(
-        key > STARK_POOL_BYTES,
-        "the prover is not cached ({key} bytes)"
-    );
-    assert!(
-        peak < before + key + STARK_POOL_BYTES / 2,
+        peak < before + key.max(STARK_POOL_BYTES) + key.min(STARK_POOL_BYTES) / 2,
         "the key was loaded beside the STARK pools: peak {:.1} MiB, before {:.1}, prover {:.1}, \
          pools {:.1}",
         mib(peak),
@@ -394,6 +408,68 @@ fn wrap_after_stark_peak_is_not_stark_plus_key() {
         mib(key),
         mib(STARK_POOL_BYTES)
     );
+    crate::prove::release_srs().unwrap();
+}
+
+/// Item G10: with the default memory switches the whole wrap (key load, witness, proof) fits a
+/// 4 GiB working-set budget (the minimum tier, PLAN 9.1); with the G9 layout
+/// (`RISC0_G16_METAL_G10=0`) the same budget refuses it cleanly before loading. Reports the peak
+/// device allocation and the process' peak physical footprint of a cold wrap and a cached one.
+#[test]
+fn wrap_under_4gib_budget() {
+    let _lock = gpu_test_lock();
+    if !available() {
+        return;
+    }
+    let budget = 4u64 << 30;
+    let _env = EnvGuard::set(
+        risc0_groth16_sys::metal::MAX_WORKING_SET_ENV,
+        Some(budget.to_string()),
+    );
+    {
+        let _g9 = EnvGuard::set("RISC0_G16_METAL_G10", Some("0".into()));
+        crate::prove::release_srs().unwrap();
+        let err = crate::prove::shrink_wrap(seal_words()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("working-set budget exceeded"),
+            "G9 layout under 4 GiB: {err:#}"
+        );
+    }
+    if risc0_groth16_sys::metal::prover::MemOptions::from_env()
+        != risc0_groth16_sys::metal::prover::MemOptions::all()
+    {
+        eprintln!("skipped: a G10 memory switch is off in the environment (revert run)");
+        return;
+    }
+    let (control_root, claim_digest, bn254_id) = fixture_meta();
+    crate::prove::release_srs().unwrap();
+    for what in ["cold key", "key cached"] {
+        let before = risc0_groth16_sys::metal::allocated_bytes();
+        let sampler = PeakSampler::start();
+        let t = Instant::now();
+        let seal = crate::prove::shrink_wrap(seal_words())
+            .unwrap_or_else(|e| panic!("the wrap failed under 4 GiB ({what}): {e:#}"));
+        let elapsed = t.elapsed();
+        let (peak, footprint) = sampler.finish_both();
+        Verifier::new(
+            &seal.to_vec(),
+            control_root,
+            claim_digest,
+            bn254_id,
+            &verifying_key(),
+        )
+        .unwrap()
+        .verify()
+        .unwrap();
+        eprintln!(
+            "G10 wrap under 4 GiB ({what}): {elapsed:?}; device allocation before {:.1} MiB, peak \
+             {:.1} MiB; process peak footprint {:.1} MiB",
+            mib(before),
+            mib(peak),
+            mib(footprint)
+        );
+        assert!(peak <= budget, "peak {peak} above the budget {budget}");
+    }
     crate::prove::release_srs().unwrap();
 }
 
