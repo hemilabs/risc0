@@ -21,9 +21,11 @@
 //!
 //! The circuit phases run on the GPU: `witgen` (C6; CPU WOM sort/scan between its two command
 //! buffers, Seq modes on the CPU), `accum` (C7, one batch) and `eval_check` (C8, monolith or
-//! split). NTT, Merkle hashing and FRI run through the zkp Metal HAL. `poseidon_254` uses the CPU
-//! prover until Z10. `RISC0_METAL_REC_SEAL_CHECK=1` re-proves every proof on the CPU with the same
-//! deterministic noise and requires identical seals (C9 validation knob).
+//! split). NTT, Merkle hashing and FRI run through the zkp Metal HAL, for every hash suite:
+//! `poseidon_254` (identity_p254) uses the zkp `MetalHashPoseidon254` since Z10
+//! (`RISC0_METAL_REC_P254=cpu` reverts it to the CPU prover). `RISC0_METAL_REC_SEAL_CHECK=1`
+//! re-proves every proof on the CPU with the same deterministic noise and requires identical
+//! seals (C9 validation knob).
 //!
 //! PSOs: the base kernels (C1's hand-written ones and C2's four step wrappers, ~7 s cold) are
 //! built once per process on first use; the eval_check PSOs (monolith ~20-60 s cold, split ~8 s,
@@ -37,6 +39,8 @@ mod eval_check;
 #[cfg(all(test, feature = "test"))]
 mod tests;
 mod witgen;
+#[cfg(all(test, feature = "test"))]
+mod z10_tests;
 
 use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -50,8 +54,8 @@ use risc0_zkp::{
     field::baby_bear::BabyBearExtElem,
     hal::{
         metal::{
-            BufferImpl, MetalHal, MetalHalPoseidon2, MetalHalSha256, MetalHash, MetalHashPoseidon2,
-            MetalHashSha256, MetalKernels,
+            BufferImpl, MetalHal, MetalHalPoseidon2, MetalHalPoseidon254, MetalHalSha256,
+            MetalHash, MetalHashPoseidon2, MetalHashPoseidon254, MetalHashSha256, MetalKernels,
         },
         Buffer as _,
     },
@@ -276,6 +280,7 @@ pub(crate) struct MetalCircuitHal<MH: MetalHash> {
 
 pub(crate) type MetalCircuitHalSha256 = MetalCircuitHal<MetalHashSha256>;
 pub(crate) type MetalCircuitHalPoseidon2 = MetalCircuitHal<MetalHashPoseidon2>;
+pub(crate) type MetalCircuitHalPoseidon254 = MetalCircuitHal<MetalHashPoseidon254>;
 
 impl<MH: MetalHash> MetalCircuitHal<MH> {
     pub fn new(hal: Arc<MetalHal<MH>>) -> Result<Self> {
@@ -509,9 +514,38 @@ impl RecursionProver for SealCheckProver {
     }
 }
 
+/// Environment variable (read once): `cpu` proves `poseidon_254` (identity_p254) with the CPU
+/// recursion prover, as before Z10; `metal` (default) with the Metal HAL and
+/// `MetalHashPoseidon254`.
+pub(crate) const REC_P254_ENV: &str = "RISC0_METAL_REC_P254";
+
+/// Parse a [REC_P254_ENV] value: `Some(true)` for Metal, `Some(false)` for the CPU, `None` for an
+/// unknown value.
+pub(crate) fn parse_rec_p254(v: &str) -> Option<bool> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "metal" | "gpu" | "" => Some(true),
+        "cpu" => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether `poseidon_254` proves on Metal ([REC_P254_ENV], read once; unknown values warn and
+/// keep Metal).
+pub(crate) fn p254_on_metal() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var(REC_P254_ENV) {
+        Err(_) => true,
+        Ok(v) => parse_rec_p254(&v).unwrap_or_else(|| {
+            tracing::warn!("{REC_P254_ENV}={v}: unknown (cpu | metal), using metal");
+            true
+        }),
+    })
+}
+
 pub(crate) fn recursion_prover(hashfn: &str) -> Result<Box<dyn RecursionProver>> {
     let metal = metal_recursion_prover(hashfn)?;
-    if seal_check_enabled() && hashfn != "poseidon_254" {
+    let cpu_p254 = hashfn == "poseidon_254" && !p254_on_metal();
+    if seal_check_enabled() && !cpu_p254 {
         tracing::warn!("{SEAL_CHECK_ENV}=1: every recursion proof is re-proved on the CPU");
         return Ok(Box::new(SealCheckProver {
             metal,
@@ -533,10 +567,19 @@ fn metal_recursion_prover(hashfn: &str) -> Result<Box<dyn RecursionProver>> {
             let circuit_hal = Arc::new(MetalCircuitHalSha256::new(hal.clone())?);
             Ok(Box::new(RecursionProverImpl::new(hal, circuit_hal)))
         }
-        // No Metal Poseidon254 hash until Z10 (PLAN 2.0): identity_p254 runs on the CPU prover.
+        // identity_p254 (Z10): the Metal HAL with MetalHashPoseidon254, or the CPU prover under
+        // RISC0_METAL_REC_P254=cpu (the pre-Z10 path).
+        "poseidon_254" if p254_on_metal() => metal_p254_prover(),
         "poseidon_254" => super::cpu::recursion_prover(hashfn),
         _ => bail!("Unsupported hashfn: {hashfn}"),
     }
+}
+
+/// The Metal `poseidon_254` recursion prover (whatever [REC_P254_ENV] says).
+pub(crate) fn metal_p254_prover() -> Result<Box<dyn RecursionProver>> {
+    let hal = Arc::new(MetalHalPoseidon254::new());
+    let circuit_hal = Arc::new(MetalCircuitHalPoseidon254::new(hal.clone())?);
+    Ok(Box::new(RecursionProverImpl::new(hal, circuit_hal)))
 }
 
 #[cfg(all(test, feature = "test"))]

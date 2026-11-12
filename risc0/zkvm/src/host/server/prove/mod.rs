@@ -221,6 +221,15 @@ pub trait ProverServer: private::Sealed {
         if let Err(e) = risc0_groth16::prove::prestart_prover() {
             tracing::warn!("groth16 prover prestart failed (non-fatal): {e}");
         }
+        // Metal (Z10): identity_p254 proves on the GPU with its own HAL (~1.4 GB pool at po2 18).
+        // Return this thread's segment / lift / join pools first, so that it does not sit beside
+        // them (the wrap's peak would be STARK pools + 1.4 GB). `shrink_wrap_with` below releases
+        // them anyway; the next session rebuilds them either way. `RISC0_METAL_WRAP_EARLY_RELEASE=0`
+        // keeps them until then (the pre-Z10 order).
+        #[cfg(feature = "metal")]
+        if std::env::var("RISC0_METAL_WRAP_EARLY_RELEASE").as_deref() != Ok("0") {
+            prover_impl::release_cached_provers();
+        }
         let ident_receipt = self.identity_p254(receipt).unwrap();
         let ident_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
