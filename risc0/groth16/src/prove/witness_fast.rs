@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A faster evaluator for circom-witnesscalc graphs over BN254 Fr (`cuda` shrink_wrap).
+//! A faster evaluator for circom-witnesscalc graphs over BN254 Fr (`cuda` and `metal`
+//! shrink_wrap).
 //!
 //! circom-witnesscalc does every multiplication as a 512-bit product and a long division,
 //! and every division by a constant with a fresh modular inverse. Here the graph is compiled
@@ -76,6 +77,7 @@ fn sub_p(r: &mut L) {
 
 /// CIOS Montgomery multiplication, no-carry variant (P < 2^254). Inputs and output < P.
 #[inline(always)]
+#[allow(clippy::needless_range_loop)]
 pub(crate) fn mont_mul(a: &L, b: &L) -> L {
     let mut t = [0u64; 4];
     for i in 0..4 {
@@ -149,8 +151,8 @@ pub(crate) enum Ins {
     Slow,
 }
 
-/// Node-indexed instructions (operands are node ids), for `witness_par` (CUDA only).
-#[cfg(feature = "cuda")]
+/// Node-indexed instructions (operands are node ids), for `witness_par` (CUDA and Metal).
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub(crate) struct NodeIns {
     pub(crate) ins: Vec<Ins>,
     pub(crate) kmul: Vec<L>,
@@ -158,7 +160,7 @@ pub(crate) struct NodeIns {
     pub(crate) r2: L,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub(crate) fn compile_node_ins(
     nodes: &Nodes<U254, VecNodes>,
     signals: &[usize],

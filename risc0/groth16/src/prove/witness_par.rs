@@ -56,11 +56,22 @@ fn find(p: &mut [u32], mut x: u32) -> u32 {
 /// ASAP levels per band.
 const BAND: u32 = 32;
 /// Evaluation threads (measured best on a 16-core host; more threads contend for memory).
+#[cfg(feature = "cuda")]
 const THREADS: usize = 12;
 
+#[cfg(feature = "cuda")]
 pub(crate) fn compile(nodes: &Nodes<U254, VecNodes>, signals: &[usize]) -> Option<ParProgram> {
+    compile_with(nodes, signals, THREADS)
+}
+
+/// [compile] with `nthr` evaluation threads (Metal sizes the pool from the host, PLAN 9.1).
+pub(crate) fn compile_with(
+    nodes: &Nodes<U254, VecNodes>,
+    signals: &[usize],
+    nthr: usize,
+) -> Option<ParProgram> {
     let band = BAND;
-    let nthr = THREADS;
+    let nthr = nthr.max(1);
     let ni = compile_node_ins(nodes, signals)?;
     let n = nodes.nodes.len();
     let mut level = vec![0u32; n];

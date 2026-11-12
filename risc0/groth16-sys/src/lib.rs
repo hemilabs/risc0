@@ -41,7 +41,8 @@ pub mod metal;
 
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub use metal::{
-    metal_preload, metal_prove, metal_prove_witness, metal_release, metal_supported, metal_warmup,
+    effective_working_set_limit, metal_planned_bytes, metal_preload, metal_prove,
+    metal_prove_in_place, metal_prove_witness, metal_release, metal_supported, metal_warmup,
     MetalUnavailable,
 };
 

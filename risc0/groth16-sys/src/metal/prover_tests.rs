@@ -610,3 +610,49 @@ fn g10_bench() {
         }
     }
 }
+
+/// Item G13: a witness written straight into the shared witness buffer proves exactly as the same
+/// witness passed as a slice (same blinding: equal proofs), and [planned_bytes] is the footprint
+/// the build checked against the budget.
+#[test]
+fn g13_in_place_witness_bit_exact() {
+    let _lock = prover_test_lock();
+    let Some(dir) = component_dir() else {
+        return;
+    };
+    let Some(mut prover) = build_or_refused(&dir) else {
+        return;
+    };
+    let setup = SetupParams::new(&dir).unwrap();
+    assert_eq!(
+        planned_bytes(&setup, MemOptions::from_env()).unwrap(),
+        prover.build_stats.planned_bytes
+    );
+    let opts = ProveOptions::default();
+    for seed in [13u64, 14] {
+        let witness = random_witness(&prover, seed);
+        let copied = prover
+            .prove_with_blinding(&witness, &opts, Fr::from(3u64), Fr::from(5u64))
+            .unwrap();
+        // Overwrite the buffer with something else first, then the witness, in place.
+        let buf = prover.witness_buffer();
+        assert_eq!(buf.len() * 32, witness.len());
+        buf.iter_mut().for_each(|e| *e = [7, 0, 0, 0]);
+        for (e, w) in prover
+            .witness_buffer()
+            .iter_mut()
+            .zip(witness.chunks_exact(32))
+        {
+            for (j, limb) in e.iter_mut().enumerate() {
+                *limb = u64::from_le_bytes(w[8 * j..8 * j + 8].try_into().unwrap());
+            }
+        }
+        let in_place = prover
+            .prove_from(None, &opts, Fr::from(3u64), Fr::from(5u64))
+            .unwrap();
+        assert_eq!(in_place.a, copied.a);
+        assert_eq!(in_place.b, copied.b);
+        assert_eq!(in_place.c, copied.c);
+        assert_eq!(in_place.public, copied.public);
+    }
+}

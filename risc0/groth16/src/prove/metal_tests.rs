@@ -411,6 +411,64 @@ fn wrap_after_stark_peak_is_not_stark_plus_key() {
     crate::prove::release_srs().unwrap();
 }
 
+/// Item G13 (c): with nothing else allocated, `prestart_prover` loads the key in the background
+/// (identity_p254 would run meanwhile) when the working-set limit has room for it and
+/// identity_p254's reserve, and the wrap then finds it cached; under a 4 GiB budget it does not
+/// load early (the wrap loads it after `pre_gpu`, and still fits). Each proof verifies.
+#[test]
+fn early_key_load_follows_the_budget() {
+    let _lock = gpu_test_lock();
+    if !available() {
+        return;
+    }
+    let (control_root, claim_digest, bn254_id) = fixture_meta();
+    let verify = |seal: &Seal| {
+        Verifier::new(
+            &seal.to_vec(),
+            control_root,
+            claim_digest,
+            bn254_id,
+            &verifying_key(),
+        )
+        .unwrap()
+        .verify()
+        .unwrap()
+    };
+    for (budget, early) in [
+        (None, true),
+        (Some(8u64 << 30), true),
+        (Some(4u64 << 30), false),
+    ] {
+        let _env = EnvGuard::set(
+            risc0_groth16_sys::metal::MAX_WORKING_SET_ENV,
+            budget.map(|b| b.to_string()),
+        );
+        let _knob = EnvGuard::set("RISC0_G16_METAL_EARLY_KEY", None);
+        crate::prove::release_srs().unwrap();
+        let before = risc0_groth16_sys::metal::allocated_bytes();
+        crate::prove::prestart_prover().unwrap();
+        // identity_p254 takes ~1.1 s; the early load ~0.2-0.5 s.
+        let t = Instant::now();
+        while !risc0_groth16_sys::metal::metal_is_loaded() && t.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let loaded = risc0_groth16_sys::metal::metal_is_loaded();
+        eprintln!(
+            "budget {budget:?}: before {:.1} MiB; loaded early: {loaded}; allocated {:.1} MiB",
+            mib(before),
+            mib(risc0_groth16_sys::metal::allocated_bytes())
+        );
+        if before > 1 << 30 {
+            eprintln!("skipped: {:.1} MiB already allocated", mib(before));
+            return;
+        }
+        assert_eq!(loaded, early, "budget {budget:?}");
+        let seal = crate::prove::shrink_wrap(seal_words()).unwrap_or_else(|e| panic!("{e:#}"));
+        verify(&seal);
+    }
+    crate::prove::release_srs().unwrap();
+}
+
 /// Item G10: with the default memory switches the whole wrap (key load, witness, proof) fits a
 /// 4 GiB working-set budget (the minimum tier, PLAN 9.1); with the G9 layout
 /// (`RISC0_G16_METAL_G10=0`) the same budget refuses it cleanly before loading. Reports the peak
@@ -500,4 +558,113 @@ fn unaligned_seal_wraps() {
             r.unwrap_or_else(|e| panic!("{e:#}"));
         }
     }
+}
+
+/// The full witness of the reference pipeline (seal_to_json -> circom-witnesscalc's own
+/// evaluator), as canonical little-endian bytes per element.
+fn reference_witness(seal: &[u8]) -> Vec<[u8; 32]> {
+    let input = super::super::to_json(seal).unwrap();
+    let graph = std::fs::read(super::super::fast::graph_path().unwrap()).unwrap();
+    let wtns = circom_witnesscalc::calc_witness(&input, &graph).unwrap();
+    let file = wtns_file::WtnsFile::<32>::read(&wtns[..]).unwrap();
+    file.witness
+        .0
+        .iter()
+        .map(|e| e.as_bytes().try_into().unwrap())
+        .collect()
+}
+
+/// A second seal for the witness comparisons: the fixture with some field elements changed
+/// (the graph evaluates any input; the result need not be a valid proof's witness).
+fn perturbed_seal() -> Vec<u32> {
+    use super::super::seal_format::{IopType, K_SEAL_ELEMS, K_SEAL_TYPES};
+    let words: &[u32] = bytemuck::cast_slice(seal_words());
+    let mut w = words.to_vec();
+    let mut pos = 0;
+    for (k, t) in K_SEAL_TYPES.iter().take(K_SEAL_ELEMS).enumerate() {
+        let x = 0x5a5a_1234u32.wrapping_mul(k as u32 + 1);
+        match t {
+            // A BabyBear element: stay below the modulus.
+            IopType::Fp => {
+                if k % 7 == 0 {
+                    w[pos] = (w[pos] ^ x) % 0x7800_0001;
+                }
+                pos += 1;
+            }
+            // A digest (< the BN254 modulus): change its lowest word only.
+            _ => {
+                if k % 5 == 0 {
+                    w[pos] ^= x;
+                }
+                pos += 8;
+            }
+        }
+    }
+    w
+}
+
+/// Item G13: the in-process witness (the memoized graph build, `fast::witness`) is bit-equal to
+/// the reference generator's, element by element, for the fixture and a perturbed seal.
+#[test]
+fn witness_bit_equal_to_reference() {
+    if component_dir().is_err() {
+        eprintln!("skipped: no risc0-groth16 component");
+        return;
+    }
+    let perturbed = perturbed_seal();
+    for seal in [seal_words(), bytemuck::cast_slice(&perturbed)] {
+        let reference = reference_witness(seal);
+        let ours = super::super::fast::witness(seal).unwrap();
+        assert_eq!(ours.len(), reference.len());
+        for (i, (a, b)) in ours.iter().zip(reference.iter()).enumerate() {
+            assert_eq!(a.as_bytes(), &b[..], "witness element {i}");
+        }
+    }
+}
+
+/// Item G13: the compiled evaluators (`par` with several thread counts, `fast`) give the same
+/// witness as the reference generator, element by element, for the fixture and a perturbed seal.
+#[test]
+fn witness_evaluators_bit_equal() {
+    use super::super::metal_witness::{witness_with, Kind};
+    if component_dir().is_err() {
+        eprintln!("skipped: no risc0-groth16 component");
+        return;
+    }
+    let perturbed = perturbed_seal();
+    for seal in [seal_words(), bytemuck::cast_slice(&perturbed)] {
+        let reference = reference_witness(seal);
+        for (kind, threads) in [
+            (Kind::Fast, 1),
+            (Kind::Par, 1),
+            (Kind::Par, 4),
+            (Kind::Par, 18),
+        ] {
+            let t = Instant::now();
+            let ours = witness_with(kind, threads, seal).unwrap();
+            eprintln!("{kind:?} x{threads}: compile + eval {:?}", t.elapsed());
+            assert_eq!(ours.len(), reference.len());
+            let bytes: &[u8] = bytemuck::cast_slice(&ours);
+            for (i, b) in reference.iter().enumerate() {
+                assert_eq!(
+                    &bytes[32 * i..32 * i + 32],
+                    &b[..],
+                    "{kind:?} x{threads}: element {i}"
+                );
+            }
+        }
+    }
+}
+
+/// G13 measurement helper (not a check): the time to build the witness graph in a fresh
+/// process. `cargo test ... graph_ready_time -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn graph_ready_time() {
+    let t = Instant::now();
+    super::super::fast::preload().unwrap();
+    eprintln!(
+        "G13 graph ready: {:.1} ms",
+        t.elapsed().as_secs_f64() * 1000.0
+    );
 }
