@@ -221,7 +221,7 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
                     fault.as_arg(),
                     KernelArg::Bytes(params),
                 ],
-                Grid::Threads(n as u64),
+                super::grid_1d(super::TgKind::Step, k.pipeline(name), n as u64),
                 &[],
             )
         };
@@ -316,6 +316,7 @@ impl<MH: MetalHash> CircuitAccumulator<MetalHal<MH>> for MetalCircuitHal<MH> {
             &fault,
         );
         self.check_fault(&fault, Phase::Accum)?;
+        self.prof_mark("accum");
 
         if let Some(snapshot) = snapshot {
             let t0 = std::time::Instant::now();

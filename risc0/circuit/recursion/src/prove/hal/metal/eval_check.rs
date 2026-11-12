@@ -18,10 +18,11 @@
 //! poly_mix powers go into a HAL-owned shared buffer (CUDA: `cudaMemcpyToSymbolAsync` into
 //! `__constant__ FpExt poly_mix[158]`), then the kernels C3 translated run over the evaluation
 //! domain on the open batch:
-//! - `monolith` (default): one `eval_check` dispatch (`eval_check.cu` + `ffi_supra.cu:43-68`);
-//! - `split` (`RISC0_METAL_REC_KERNELS=split`): `ec_part_0..5` back to back over the same bindings
-//!   on the serial encoder (`eval_check_split.cu` `launch_parts`; part P > 0 adds to the sum part
-//!   P-1 left in `check`, part 5 applies the quotient).
+//! - `split` (default since C11): `ec_part_0..5` back to back over the same bindings on the
+//!   serial encoder (`eval_check_split.cu` `launch_parts`; part P > 0 adds to the sum part P-1
+//!   left in `check`, part 5 applies the quotient);
+//! - `monolith` (`RISC0_METAL_REC_KERNELS=monolith`, the pre-C11 default): one `eval_check`
+//!   dispatch (`eval_check.cu` + `ffi_supra.cu:43-68`).
 //!
 //! Both are bit-identical to the CPU `poly_fp` (tests below). The batch is flushed, not waited
 //! for, so the prover's `post_eval_check` host work overlaps the GPU (CUDA: async on the stream).
@@ -46,13 +47,13 @@ use risc0_zkp::{
         map_pow, Elem as _, ExtElem as _, RootsOfUnity as _,
     },
     hal::{
-        metal::{as_bytes, BufferImpl, Grid, KernelArg, MetalHal, MetalHash, MetalKernels},
+        metal::{as_bytes, BufferImpl, KernelArg, MetalHal, MetalHash},
         AccumPreflight, Buffer as _, CircuitHal,
     },
     INV_RATE,
 };
 
-use super::{grow, host_slice, EvalKernels, MetalCircuitHal, Phase};
+use super::{grow, host_slice, EvalKernels, MetalCircuitHal, Phase, Pipelines};
 use crate::{
     CircuitImpl, GLOBAL_MIX, GLOBAL_OUT, REGISTER_GROUP_ACCUM, REGISTER_GROUP_CTRL,
     REGISTER_GROUP_DATA,
@@ -189,7 +190,7 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
     pub(crate) fn encode_eval_check(
         &self,
         variant: EvalKernels,
-        kernels: &MetalKernels,
+        kernels: &Pipelines,
         check: &BufferImpl<BabyBearElem>,
         groups: &[&BufferImpl<BabyBearElem>],
         globals: &[&BufferImpl<BabyBearElem>],
@@ -241,9 +242,11 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
             .map(|n| kernels.pipeline(n))
             .collect();
         for pso in psos {
-            // 1-D over the domain, threadgroups of min(256, PSO max) (`getSimpleConfig`).
-            self.hal
-                .dispatch(pso, &args, Grid::Threads(domain as u64), &[]);
+            // 1-D over the domain, threadgroups of min(256, PSO max) (`getSimpleConfig`) unless
+            // RISC0_METAL_REC_EVAL_TG says otherwise (C11 sweep; the domain is a power of two,
+            // so every width divides it).
+            let grid = super::grid_1d(super::TgKind::Eval, pso, domain as u64);
+            self.hal.dispatch(pso, &args, grid, &[]);
         }
     }
 
@@ -326,6 +329,10 @@ impl<MH: MetalHash> CircuitHal<MetalHal<MH>> for MetalCircuitHal<MH> {
         }
         // End of the phase (PLAN 2.6): commit without waiting; readers of `check` sync.
         self.hal.flush();
+        if super::profile::enabled() {
+            self.prof_mark("eval_check");
+            super::profile::report();
+        }
     }
 
     fn accumulate(
@@ -373,18 +380,19 @@ mod c8_tests {
     fn variant_kernels(
         c: &MetalCircuitHal<MetalHashPoseidon2>,
         variant: EvalKernels,
-    ) -> &'static MetalKernels {
+    ) -> &'static Pipelines {
         let (selected, kernels) = c.eval_kernels().unwrap();
         if selected == variant {
             return kernels;
         }
-        static OTHER: OnceLock<MetalKernels> = OnceLock::new();
+        static OTHER: OnceLock<Pipelines> = OnceLock::new();
         OTHER.get_or_init(|| {
             let t0 = Instant::now();
-            let k = MetalKernels::new(
+            let k = Pipelines::new(
                 &c.hal().device,
                 risc0_circuit_recursion_sys::METAL_LIB,
                 variant.names(),
+                4,
             )
             .unwrap();
             eprintln!(
