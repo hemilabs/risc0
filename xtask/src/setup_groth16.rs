@@ -36,7 +36,7 @@ impl SetupGroth16 {
         let work_dir = self.dir.canonicalize().unwrap();
         sh.change_dir(sh.create_dir(&work_dir).unwrap());
 
-        let setup_dir = work_dir.join("v0.1.0-risc0-groth16");
+        let setup_dir = work_dir.join("v0.2.0-risc0-groth16");
         sh.create_dir(&setup_dir).unwrap();
 
         let setup_params = SetupParams::new(&setup_dir).unwrap();

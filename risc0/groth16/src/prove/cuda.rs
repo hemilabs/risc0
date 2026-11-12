@@ -41,7 +41,7 @@ fn get_root_dir() -> Result<&'static Path> {
         if let Some(dir) = std::env::var_os("RISC0_GROTH16_DIR") {
             return dir.into();
         }
-        let version = Version::new(0, 1, 0);
+        let version = Version::new(0, 2, 0);
         Rzup::new()
             .and_then(|r| r.get_version_dir(&Component::Risc0Groth16, &version))
             .ok()
@@ -51,7 +51,7 @@ fn get_root_dir() -> Result<&'static Path> {
                 To install it, ensure that your `rzup` version is >= 0.5.0, \
                 and then run `rzup install risc0-groth16`. \
                 Where rzup does not run (Windows), copy the component's files to \
-                ~/.risc0/extensions/v0.1.0-risc0-groth16, or set RISC0_GROTH16_DIR \
+                ~/.risc0/extensions/v0.2.0-risc0-groth16, or set RISC0_GROTH16_DIR \
                 to a directory holding them.",
             )
     });

@@ -61,9 +61,9 @@ use crate::{ProofJson, Seal};
 
 use super::docker::IMAGE;
 
-/// SHA-256 of rzup risc0-groth16 v0.1.0 `stark_verify_graph.bin`; its witness
+/// SHA-256 of rzup risc0-groth16 v0.2.0 `stark_verify_graph.bin`; its witness
 /// was checked byte-identical to the pinned image's generator.
-const GRAPH_SHA256: &str = "51020d6fd9ded962";
+const GRAPH_SHA256: &str = "887aa345d6adc257";
 
 // ---------------------------------------------------------------------------
 // Witness graph -> straight-line Montgomery program
@@ -109,7 +109,7 @@ fn build_program() -> Result<Program> {
     let bytes = std::fs::read(graph_path()?).context("failed to read the witness graph")?;
     let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&bytes));
     if !digest.starts_with(GRAPH_SHA256) {
-        bail!("unexpected witness graph (sha256 {digest}); expected rzup risc0-groth16 0.1.0");
+        bail!("unexpected witness graph (sha256 {digest}); expected rzup risc0-groth16 0.2.0");
     }
     let (nodes_box, signals, input_mapping) = deserialize_witnesscalc_graph_from_bytes(&bytes)
         .map_err(|e| anyhow!("failed to parse the witness graph: {e:?}"))?;

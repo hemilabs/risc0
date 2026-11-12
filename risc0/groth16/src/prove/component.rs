@@ -27,7 +27,7 @@ pub(crate) fn component_dir() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("RISC0_GROTH16_DIR") {
         return Ok(dir.into());
     }
-    let version = Version::new(0, 1, 0);
+    let version = Version::new(0, 2, 0);
     if let Ok(dir) = Rzup::new().and_then(|r| r.get_version_dir(&Component::Risc0Groth16, &version))
     {
         return Ok(dir);
