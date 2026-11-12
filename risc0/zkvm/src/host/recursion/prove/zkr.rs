@@ -32,7 +32,7 @@ fn get_zkr(name: &str, hashfn: &str) -> Result<(Arc<Program>, Digest)> {
     };
 
     Ok((
-        risc0_circuit_recursion::prove::zkr::get_zkr(name, RECURSION_PO2)?,
+        risc0_circuit_recursion::prove::zkr::get_zkr(name, RECURSION_PO2)?.into(),
         control_ids
             .iter()
             .copied()
