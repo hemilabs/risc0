@@ -34,7 +34,8 @@
 //! the 4 vanishing quotients go into one shared buffer; then `ef_eval_split` (even threadgroups:
 //! main chain into `check`, odd: LogUp chain into the scratch partials) and `ef_combine`
 //! (`check = (check + partial) * quotient`) in one batch. [EVAL_KERNEL_ENV] selects the kernel
-//! (`evalfast`, the default, `evalfast_r12` or `baseline`); all are bit-exact with the CPU (tests).
+//! (`evalfast`, the default, `evalfast_r15e`, `evalfast_r12` or `baseline`); all are bit-exact
+//! with the CPU (tests).
 //!
 //! R15e (docs/metal-port/notes/R15e.md): evalfast reads its poly_mix table as `const device`
 //! memory instead of `constant` and computes the NBETA-folded rows from the pm rows instead of
@@ -42,6 +43,12 @@
 //! (`ef_eval_split_r12`, the same generated TU compiled with `-DEF_R12_FORM`) for A/B runs. The
 //! PSOs of the kernels that are not the default (`eval_check`, ~60 s cold, and
 //! `ef_eval_split_r12`) are built on first use ([lazy_pipeline]) instead of at library load.
+//!
+//! R18 (docs/metal-port/notes/R18.md): the kernel reads every table row as half of one 32-byte
+//! `ulong4` load of its aligned row pair instead of one 16-byte `uint4` load (same words), which
+//! more than halves the split-kernel time on the M5 Max. `evalfast_r15e` (`ef_eval_split_r15e`,
+//! the TU compiled with `-DEF_R15E_FORM`, lazy PSO) keeps the uint4 loads selectable. The table
+//! buffer must be 32-byte aligned (checked).
 //!
 //! The R7 CPU path (the `hal/cpu.rs` loop over `risc0_circuit_rv32im_cpu_poly_fp` on host views of
 //! the shared buffers) is kept as a debugging fallback, selected with
@@ -83,9 +90,11 @@ fn eval_on_cpu() -> bool {
 /// `[[max_total_threads_per_threadgroup]]` of the translated kernel.
 const EVAL_CHECK_THREADS: u64 = 256;
 
-/// Selects the GPU eval_check kernel: `evalfast` (default), `evalfast_r12` (evalfast with R12's
-/// poly_mix table forms, the A/B switch of R15e's table change) or `baseline` (R10's translation
-/// of CUDA eval_check_0..3.cu, the oracle). Read on every call; unknown values are an error.
+/// Selects the GPU eval_check kernel: `evalfast` (default), `evalfast_r15e` (evalfast with 16-byte
+/// table-row loads, the revert switch of R18's 32-byte row-pair loads), `evalfast_r12` (evalfast
+/// with R12's poly_mix table forms, the A/B switch of R15e's table change) or `baseline` (R10's
+/// translation of CUDA eval_check_0..3.cu, the oracle). Read on every call; unknown values are an
+/// error.
 pub(crate) const EVAL_KERNEL_ENV: &str = "RISC0_METAL_RV32IM_EVAL";
 
 /// The GPU eval_check kernels ([EVAL_KERNEL_ENV]).
@@ -95,6 +104,9 @@ pub(crate) enum EvalKernel {
     Evalfast,
     /// evalfast compiled with `-DEF_R12_FORM` (`constant` table, NBETA rows loaded).
     EvalfastR12,
+    /// evalfast compiled with `-DEF_R15E_FORM` (16-byte `uint4` table-row loads; R18's default
+    /// reads each row as half of a 32-byte row-pair load).
+    EvalfastR15e,
 }
 
 impl EvalKernel {
@@ -107,9 +119,11 @@ impl EvalKernel {
             "" => Ok(Self::DEFAULT),
             "evalfast" | "fast" | "ef" => Ok(Self::Evalfast),
             "evalfast_r12" | "evalfast-r12" | "r12" => Ok(Self::EvalfastR12),
+            "evalfast_r15e" | "evalfast-r15e" | "r15e" => Ok(Self::EvalfastR15e),
             "baseline" | "base" => Ok(Self::Baseline),
             _ => anyhow::bail!(
-                "{EVAL_KERNEL_ENV}={v:?}: expected `evalfast`, `evalfast_r12` or `baseline`"
+                "{EVAL_KERNEL_ENV}={v:?}: expected `evalfast`, `evalfast_r15e`, `evalfast_r12` or \
+                 `baseline`"
             ),
         }
     }
@@ -241,6 +255,9 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
             EvalKernel::EvalfastR12 => {
                 self.eval_check_evalfast_r12(check, groups, globals, poly_mix, po2, steps)
             }
+            EvalKernel::EvalfastR15e => {
+                self.eval_check_evalfast_r15e(check, groups, globals, poly_mix, po2, steps)
+            }
             EvalKernel::Baseline => {
                 self.eval_check_baseline(check, groups, globals, poly_mix, po2, steps)
             }
@@ -286,6 +303,27 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
         self.ctx.require(Phase::EvalCheck)?;
         let k = EfKernels {
             split: lazy_pipeline(self.ctx.library(), "ef_eval_split_r12")?,
+            combine: self.ctx.pipeline("ef_combine"),
+            threads: EF_THREADS,
+        };
+        self.eval_check_ef_with(&k, check, groups, globals, poly_mix, po2, steps, None)
+    }
+
+    /// [Self::eval_check_evalfast] in R15e's form (`ef_eval_split_r15e`: 16-byte table-row loads,
+    /// built on first use; same ABI and results).
+    pub(crate) fn eval_check_evalfast_r15e(
+        &self,
+        check: &BufferImpl<Val>,
+        groups: &[&BufferImpl<Val>],
+        globals: &[&BufferImpl<Val>],
+        poly_mix: ExtVal,
+        po2: usize,
+        steps: usize,
+    ) -> anyhow::Result<()> {
+        scope!("metal_eval_check_evalfast_r15e");
+        self.ctx.require(Phase::EvalCheck)?;
+        let k = EfKernels {
+            split: lazy_pipeline(self.ctx.library(), "ef_eval_split_r15e")?,
             combine: self.ctx.pipeline("ef_combine"),
             threads: EF_THREADS,
         };
@@ -379,6 +417,13 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
         // view_mut flushes and waits if a batch is open, so a previous eval_check that read this
         // buffer has finished before it is overwritten.
         tab_buf.view_mut(|dst| dst[..EF_TABLE_LEN].copy_from_slice(&tab));
+        // R18: the kernel reads the table as 32-byte row pairs (`ulong4`), so it must be bound
+        // at a 32-byte aligned address (pool buffers are page-aligned and bound at offset 0).
+        anyhow::ensure!(
+            tab_buf.as_device_ptr() % 32 == 0,
+            "eval_check: evalfast table at GPU address {:#x} is not 32-byte aligned",
+            tab_buf.as_device_ptr()
+        );
         pipeline_host_stat(0, th.elapsed());
 
         let rows = (domain as u64).div_ceil(threads);
@@ -707,6 +752,7 @@ mod ef_tests {
     enum Which {
         Evalfast,
         EvalfastR12,
+        EvalfastR15e,
         Baseline,
     }
 
@@ -742,6 +788,9 @@ mod ef_tests {
                 Which::EvalfastR12 => {
                     c.eval_check_evalfast_r12(&check, &groups, &globals, inp.poly_mix, po2, steps)
                 }
+                Which::EvalfastR15e => {
+                    c.eval_check_evalfast_r15e(&check, &groups, &globals, inp.poly_mix, po2, steps)
+                }
                 Which::Baseline => {
                     c.eval_check_baseline(&check, &groups, &globals, inp.poly_mix, po2, steps)
                 }
@@ -759,8 +808,8 @@ mod ef_tests {
         a.iter().zip(b).filter(|(x, y)| x != y).count()
     }
 
-    /// evalfast == evalfast_r12 == baseline == CPU, bit for bit over all `4 * domain` elements,
-    /// `reps` evalfast runs on the same buffers each equal.
+    /// evalfast == evalfast_r15e == evalfast_r12 == baseline == CPU, bit for bit over all
+    /// `4 * domain` elements, `reps` evalfast runs on the same buffers each equal.
     fn evalfast_matches(po2: usize, reps: usize) {
         let inp = Inputs::random(po2);
         let t = std::time::Instant::now();
@@ -771,6 +820,14 @@ mod ef_tests {
         let (fast, fast_t, fast_peak) = gpu_checks(&c, &inp, po2, Which::Evalfast, reps);
         let (base, base_t, base_peak) = gpu_checks(&c, &inp, po2, Which::Baseline, 1);
         let (r12, r12_t, _) = gpu_checks(&c, &inp, po2, Which::EvalfastR12, 1);
+        let (r15e, r15e_t, _) = gpu_checks(&c, &inp, po2, Which::EvalfastR15e, 1);
+        let n = mismatches(&cpu, &r15e[0]);
+        assert_eq!(
+            n,
+            0,
+            "po2 {po2}: evalfast_r15e vs CPU: {n} of {} differ",
+            cpu.len()
+        );
         let n = mismatches(&cpu, &r12[0]);
         assert_eq!(
             n,
@@ -795,8 +852,9 @@ mod ef_tests {
             cpu.len()
         );
         println!(
-            "R12 eval_check po2 {po2}: {} elements bit-exact (evalfast x{reps} == evalfast_r12 == \
-             baseline == CPU); evalfast {fast_t:?}, evalfast_r12 {r12_t:?}, baseline {base_t:?}, \
+            "R12 eval_check po2 {po2}: {} elements bit-exact (evalfast x{reps} == evalfast_r15e == \
+             evalfast_r12 == baseline == CPU); evalfast {fast_t:?}, evalfast_r15e {r15e_t:?}, \
+             evalfast_r12 {r12_t:?}, baseline {base_t:?}, \
              CPU HAL {cpu_time:?}; inputs {} B, peak \
              currentAllocatedSize evalfast {fast_peak} B / baseline {base_peak} B",
             cpu.len(),
@@ -1024,8 +1082,19 @@ mod ef_tests {
         let load0 = load_average();
         let mut times = vec![(Vec::new(), Vec::new()); vars.len()];
         let mut bad = vec![0usize; vars.len()];
-        for _ in 0..pairs {
-            for (i, (_, lib, threads, split)) in vars.iter().enumerate() {
+        // R18: odd rounds run the list in reverse (A B .. B A), so no variant always runs first.
+        let order: Vec<Vec<usize>> = (0..pairs)
+            .map(|r| {
+                let mut o: Vec<usize> = (0..vars.len()).collect();
+                if r % 2 == 1 {
+                    o.reverse();
+                }
+                o
+            })
+            .collect();
+        for o in &order {
+            for &i in o {
+                let (_, lib, threads, split) = &vars[i];
                 check.view_mut(|v| v.fill(Val::new_raw(0x7fff_ffff)));
                 let k = EfKernels {
                     split: lib.pipeline(split),
@@ -1050,6 +1119,21 @@ mod ef_tests {
                 check.view(|v| n = mismatches(&reference, v));
                 if n != 0 {
                     bad[i] += 1;
+                    // R18: `R15E_SHOW_MISMATCH=n` prints the first n differing elements.
+                    let show = env_usize("R15E_SHOW_MISMATCH", 0);
+                    if show > 0 {
+                        check.view(|v| {
+                            let diffs: Vec<String> = v
+                                .iter()
+                                .zip(&reference)
+                                .enumerate()
+                                .filter(|(_, (x, y))| x != y)
+                                .take(show)
+                                .map(|(j, (x, y))| format!("{j}: {x:?} (ref {y:?})"))
+                                .collect();
+                            println!("R15E {} mismatch: {n} elements; {diffs:?}", vars[i].0);
+                        });
+                    }
                 }
             }
         }
@@ -1058,6 +1142,15 @@ mod ef_tests {
             load_average()
         );
         for (i, (name, _, _, _)) in vars.iter().enumerate() {
+            // R18: per-round split delta against the first variant (the A arm), and in how many
+            // rounds this variant was faster.
+            let d: Vec<f64> = (0..pairs).map(|r| times[i].0[r] - times[0].0[r]).collect();
+            let (dm, dmin, dmax) = median_min_max(&d);
+            let faster = d.iter().filter(|&&x| x < 0.0).count();
+            println!(
+                "R15E {name:>12}: split minus A per round {dm:+8.1} ms [{dmin:+.1}, {dmax:+.1}], \
+                 faster in {faster}/{pairs}"
+            );
             let (s, smin, smax) = median_min_max(&times[i].0);
             let (cm, cmin, cmax) = median_min_max(&times[i].1);
             let tot: Vec<f64> = times[i]
@@ -1087,7 +1180,7 @@ mod ef_tests {
         let hal = Arc::new(MetalHalSha256::new());
         let c = MetalCircuitHal::new(hal).unwrap();
         let k = &c.ctx.kernels.kernels;
-        for name in ["eval_check", "ef_eval_split_r12"] {
+        for name in ["eval_check", "ef_eval_split_r12", "ef_eval_split_r15e"] {
             assert!(k.get(name).is_none(), "{name} built at load");
             assert!(
                 c.ctx.library().function_names().iter().any(|f| f == name),
@@ -1109,6 +1202,10 @@ mod ef_tests {
         assert_eq!(
             EvalKernel::parse("evalfast_r12").unwrap(),
             EvalKernel::EvalfastR12
+        );
+        assert_eq!(
+            EvalKernel::parse("evalfast_r15e").unwrap(),
+            EvalKernel::EvalfastR15e
         );
         assert_eq!(
             EvalKernel::parse(" Baseline ").unwrap(),
