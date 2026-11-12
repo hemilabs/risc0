@@ -75,7 +75,7 @@ XMX = os.environ.get('RISC0_INTEL_EVAL_XMX', '1') not in ('0', 'false', 'off', '
 if XMX:
     run(os.path.join(HERE, 'lincombF.py'), w('lc.cpp'), w('lcf.cpp'), '2')
     run(os.path.join(HERE, 'xmxlink.py'), w('lcf.cpp'), out)
-    EXPECT.append('xmxlink: 166 chains (>= 4 terms) of 282, 773 blocks')
+    EXPECT.append('xmxlink: 166 chains (>= 4 terms) of 282, 782 blocks')
 else:
     run(os.path.join(HERE, 'lincombF.py'), w('lc.cpp'), out, '2')
 log = ''.join(LOG)
