@@ -18,13 +18,16 @@
 //! poly_mix powers go into a HAL-owned shared buffer (CUDA: `cudaMemcpyToSymbolAsync` into
 //! `__constant__ FpExt poly_mix[158]`), then the kernels C3 translated run over the evaluation
 //! domain on the open batch:
-//! - `split` (default since C11): `ec_part_0..5` back to back over the same bindings on the
-//!   serial encoder (`eval_check_split.cu` `launch_parts`; part P > 0 adds to the sum part P-1
-//!   left in `check`, part 5 applies the quotient);
+//! - `lz` (default since C12): `ec_lz_part_0..5`, the split below with every part's Fp sums of
+//!   products accumulated lazily (`cuda2metal_eval.py --split-lz`, ec_lazyfp.py's `lz2` form);
+//!   the same bindings and dispatch order as the split;
+//! - `split` (`RISC0_METAL_REC_KERNELS=split`, the C11 default): `ec_part_0..5` back to back
+//!   over the same bindings on the serial encoder (`eval_check_split.cu` `launch_parts`; part
+//!   P > 0 adds to the sum part P-1 left in `check`, part 5 applies the quotient);
 //! - `monolith` (`RISC0_METAL_REC_KERNELS=monolith`, the pre-C11 default): one `eval_check`
 //!   dispatch (`eval_check.cu` + `ffi_supra.cu:43-68`).
 //!
-//! Both are bit-identical to the CPU `poly_fp` (tests below). The batch is flushed, not waited
+//! All three are bit-identical to the CPU `poly_fp` (tests below). The batch is flushed, not waited
 //! for, so the prover's `post_eval_check` host work overlaps the GPU (CUDA: async on the stream).
 //! eval_check has no asserts and every trace read is `& mask`-clamped, so there is no fault word;
 //! the host checks the buffer sizes the kernel relies on.
@@ -376,7 +379,7 @@ mod c8_tests {
     };
 
     /// The PSOs of `variant`, whichever variant `RISC0_METAL_REC_KERNELS` selected for the
-    /// process (the other one is built here once; cold ~10-60 s the first time on a machine).
+    /// process (the others are built here once each; cold ~10-60 s the first time on a machine).
     fn variant_kernels(
         c: &MetalCircuitHal<MetalHashPoseidon2>,
         variant: EvalKernels,
@@ -385,8 +388,8 @@ mod c8_tests {
         if selected == variant {
             return kernels;
         }
-        static OTHER: OnceLock<Pipelines> = OnceLock::new();
-        OTHER.get_or_init(|| {
+        static OTHER: [OnceLock<Pipelines>; 3] = [const { OnceLock::new() }; 3];
+        OTHER[variant as usize].get_or_init(|| {
             let t0 = Instant::now();
             let k = Pipelines::new(
                 &c.hal().device,
@@ -412,15 +415,18 @@ mod c8_tests {
         eval_check(&cpu_hal, CpuCircuitHal, gpu_hal.as_ref(), gpu_eval, 4);
     }
 
-    /// Monolith and split on the same random inputs, each bit-identical to the CPU eval_check.
+    /// Every variant (monolith, split, lazy Fp split) on the same random inputs, each bit-identical
+    /// to the CPU eval_check.
     /// Prints the warm wall time of encode + sync per variant (indicative GPU time) and the peak
     /// device allocation of the step.
     fn variants_match_cpu(po2: usize) {
         let _guard = crate::prove::hal::metal::global_state_test_lock();
         let hal = Arc::new(MetalHalPoseidon2::new());
         let c = MetalCircuitHal::new(hal.clone()).unwrap();
-        let mono = variant_kernels(&c, EvalKernels::Monolith);
-        let split = variant_kernels(&c, EvalKernels::Split);
+        let variants: Vec<(EvalKernels, &Pipelines)> = EvalKernels::ALL
+            .iter()
+            .map(|&v| (v, variant_kernels(&c, v)))
+            .collect();
 
         let p = EvalCheckParams::new(po2);
         let poly_mix_pows = map_pow(p.poly_mix, crate::info::POLY_MIX_POWERS);
@@ -451,7 +457,7 @@ mod c8_tests {
         let globals = [&mix, &out];
 
         let mut results = Vec::new();
-        for (variant, kernels) in [(EvalKernels::Monolith, mono), (EvalKernels::Split, split)] {
+        for (variant, kernels) in variants {
             let check = hal.alloc_elem("check", BabyBearExtElem::EXT_SIZE * p.domain);
             // Dirty the output so a missing write cannot pass.
             check.view_mut(|v| v.fill(BabyBearElem::new(12345)));

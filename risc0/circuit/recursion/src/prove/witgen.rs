@@ -182,8 +182,20 @@ fn pinned_ptr<T>(_p: Option<&()>, _i: usize) -> Option<*const T> {
     None
 }
 
-/// Chains at least this long run on the host.
+/// Chains at least this long run on the host (default; `RISC0_REC_HOST_CHAIN_MIN_LEN` overrides
+/// it, read once, for the C12 retune).
 const HOST_CHAIN_MIN_LEN: usize = 16;
+
+fn host_chain_min_len() -> usize {
+    static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("RISC0_REC_HOST_CHAIN_MIN_LEN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &usize| n >= 2)
+            .unwrap_or(HOST_CHAIN_MIN_LEN)
+    });
+    *N
+}
 
 thread_local! {
     /// Test / validation hook ([with_noise_seed]): when set, the ZK noise of the witness and
@@ -259,7 +271,7 @@ pub(crate) fn try_host_chains_range(
     complete: bool,
 ) -> Result<(Option<HostChains>, usize)> {
     use risc0_circuit_recursion_sys::risc0_circuit_recursion_cpu_chains;
-    let min_len = HOST_CHAIN_MIN_LEN;
+    let min_len = host_chain_min_len();
     let n = cycles.len();
     let mut chains: Vec<u32> = Vec::new();
     let mut heads: Vec<u32> = Vec::new();

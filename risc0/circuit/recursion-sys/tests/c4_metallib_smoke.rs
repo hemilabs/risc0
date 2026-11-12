@@ -214,7 +214,10 @@ fn c4_kernel_names_match_rec_kernels_and_translators() {
 
     let mut expected: Vec<String> = C1_NAMES.iter().map(|s| s.to_string()).collect();
     expected.extend(list_kernels("cuda2metal_steps.py", &[]));
-    expected.extend(list_kernels("cuda2metal_eval.py", &["--split"]));
+    expected.extend(list_kernels(
+        "cuda2metal_eval.py",
+        &["--split", "--split-lz"],
+    ));
     assert_eq!(
         listed, expected,
         "METAL_KERNEL_NAMES must be rec_kernels.metal's kernels followed by the translators' \
