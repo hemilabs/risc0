@@ -52,7 +52,7 @@
 #include "cuda_compat.h"
 #include "ef_fp.h"
 #include "ef_fpext.h"
-#include "fp.h"
+#include "rv32im_fp.h"
 // R17: a TU may substitute its own copy of fpext.h (witgen_tu.metal: witgen_fpext.h, the shared
 // header with its 4-element loops unrolled; kernels/cuda/witgen_tu_gen.py gen_fpext).
 #ifdef RV32IM_FPEXT_HEADER
@@ -65,6 +65,13 @@
 
 #pragma clang diagnostic ignored "-Wunused-parameter"
 #pragma clang diagnostic ignored "-Wunused-variable"
+
+// R17b: witgen_tu.metal defines RV32IM_WITGEN_EXT_INLINE as __attribute__((always_inline)) so
+// that no helper taking or returning an FpExt by value is an out-of-line call there (the R17
+// round-2 lost-store shape); other TUs keep the plain `inline`.
+#ifndef RV32IM_WITGEN_EXT_INLINE
+#define RV32IM_WITGEN_EXT_INLINE
+#endif
 
 namespace rv32im_metal {
 
@@ -198,7 +205,7 @@ inline Val inv_0(Val x) {
   return inv_chain(x);
 }
 
-inline ExtVal inv_0(ExtVal x) {
+RV32IM_WITGEN_EXT_INLINE inline ExtVal inv_0(ExtVal x) {
   return inv_ext_chain(x);
 }
 
@@ -248,7 +255,8 @@ inline void setGlobal(thread ExecContext& ctx, thread BufferObj* buf, size_t off
 // (docs/metal-port/notes/R17.md). Same loads and stores, in the same order.
 static_assert(EXT_SIZE == 4, "storeExt/loadExt are unrolled for 4 elements");
 
-inline void storeExt(thread ExecContext& ctx, BoundLayout<Reg> reg, ExtVal val) {
+RV32IM_WITGEN_EXT_INLINE inline void
+storeExt(thread ExecContext& ctx, BoundLayout<Reg> reg, ExtVal val) {
   reg.buf->store(ctx, reg.layout.col + 0, val.elems[0]);
   reg.buf->store(ctx, reg.layout.col + 1, val.elems[1]);
   reg.buf->store(ctx, reg.layout.col + 2, val.elems[2]);
@@ -259,7 +267,8 @@ inline Val load(thread ExecContext& ctx, BoundLayout<Reg> reg, size_t back) {
   return reg.buf->load(ctx, reg.layout.col, back);
 }
 
-inline ExtVal loadExt(thread ExecContext& ctx, BoundLayout<Reg> reg, size_t back) {
+RV32IM_WITGEN_EXT_INLINE inline ExtVal
+loadExt(thread ExecContext& ctx, BoundLayout<Reg> reg, size_t back) {
   Fp e0 = reg.buf->load(ctx, reg.layout.col + 0, back);
   Fp e1 = reg.buf->load(ctx, reg.layout.col + 1, back);
   Fp e2 = reg.buf->load(ctx, reg.layout.col + 2, back);

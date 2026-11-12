@@ -47,8 +47,31 @@
 
 #include <metal_stdlib>
 
+// R17b (docs/metal-port/notes/R17.md, "R17b hardening"): FpExt * FpExt is always_inline in this
+// TU. Declared before fpext.h so that the friend definition there inherits the attribute. At -O2
+// the compiler otherwise calls it out of line inside this file's FpExt loops (ir_scan.py tier A:
+// a default-constructed private FpExt / FpExt array written after the call and read after the
+// loop, the Apple GPU lost-store shape). Same arithmetic, bit-exact.
+#include "fp.h"
+struct FpExt;
+__attribute__((always_inline)) constexpr FpExt operator*(FpExt lhs, FpExt rhs);
 #include "fp.h"
 #include "fpext.h"
+
+// R17b: FpExt pow for this TU: fpext.h's pow, with `tot *= x; x *= x` spelled through the
+// always_inline FpExt * FpExt above (fpext.h's FpExt::operator*=(FpExt) stays an out-of-line
+// call at -O2 here, inside the caller's loops). Same square-and-multiply, bit-exact.
+static inline __attribute__((always_inline)) FpExt pow_r17b(FpExt x, size_t n) {
+  FpExt tot(1);
+  while (n != 0) {
+    if (n % 2 == 1) {
+      tot = tot * x;
+    }
+    n = n / 2;
+    x = x * x;
+  }
+  return tot;
+}
 
 using namespace metal;
 
@@ -174,7 +197,7 @@ mdiv_agg0(device FpExt* a [[buffer(0)]],
   for (int j = E - 2; j >= 0; j--) {
     p = a[b + j] + z * p;
   }
-  FpExt zE = pow(z, E);
+  FpExt zE = pow_r17b(z, E);
   FpExt nx;
   FpExt v = md_block_suffix_scan<MD_NTH>(p, zE, sh, &nx, threadIdx.x);
   if (threadIdx.x == 0) {
@@ -197,7 +220,7 @@ mdiv_scan(device FpExt* a [[buffer(0)]],
   const uint t = threadIdx.x;
   const uint K = J.k, ntiles = J.ntiles, T = J.t;
   FpExt z = md_ext(jb.z);
-  FpExt zT = pow(z, T);
+  FpExt zT = pow_r17b(z, T);
   FpExt v[MD_MAXK];
   for (uint k = 0; k < K; k++) {
     const uint u = t * K + k;
@@ -205,7 +228,7 @@ mdiv_scan(device FpExt* a [[buffer(0)]],
     if (jb.prev_rem != MD_NONE && u == ntiles - 1) {
       FpExt r = s[jb.prev_rem];
       a[jb.a + J.n - 1] = r;
-      v[k] = v[k] + r * pow(z, T - 1);
+      v[k] = v[k] + r * pow_r17b(z, T - 1);
     }
   }
   // Thread-local Horner over this thread's K tiles (K == 1: P = v[0]).
@@ -214,7 +237,7 @@ mdiv_scan(device FpExt* a [[buffer(0)]],
     p = v[k] + zT * p;
   }
   FpExt nx;
-  md_block_suffix_scan<NT>(p, pow(zT, K), sh, &nx, t);
+  md_block_suffix_scan<NT>(p, pow_r17b(zT, K), sh, &nx, t);
   // nx is the carry of this thread's top tile; walk down its tiles.
   FpExt c = nx;
   for (int k = K - 1; k >= 0; k--) {
@@ -251,7 +274,7 @@ mdiv_apply(device FpExt* a [[buffer(0)]],
   for (int j = E - 2; j >= 0; j--) {
     p = x[j] + z * p;
   }
-  FpExt zE = pow(z, E);
+  FpExt zE = pow_r17b(z, E);
   FpExt C = s[jb.carry + tile];
   if (threadIdx.x == MD_NTH - 1) {
     p = p + zE * C;
@@ -285,7 +308,7 @@ mdiv_apply(device FpExt* a [[buffer(0)]],
     for (int j = E - 2; j >= 0; j--) {
       q = o[j] + zn * q;
     }
-    FpExt znE = pow(zn, E);
+    FpExt znE = pow_r17b(zn, E);
     FpExt v = md_block_suffix_scan<MD_NTH>(q, znE, sh, &nx, threadIdx.x);
     if (threadIdx.x == 0) {
       s[jb.agg + tile] = v;

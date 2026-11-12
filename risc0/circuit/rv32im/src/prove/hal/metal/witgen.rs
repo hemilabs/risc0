@@ -44,12 +44,28 @@
 //! opt-in of R8-R16, is still accepted and changes nothing.
 //!
 //! From R8 to R16 the GPU path was opt-in: the generated kernel gave wrong witnesses on identical
-//! inputs from time to time (notes/R8.md, R11.md). R17 traced that to the Apple GPU losing a
-//! private-array store in the code shape of CUDA's `map()` lowering (a default-constructed array
-//! written in a loop that calls a noinline function). `witgen_tu_gen.py` now unrolls every
-//! map/reduce and refuses any loop in the call graph (docs/metal-port/notes/R17.md: mechanism,
-//! gate, and how to re-verify after a macOS or Metal toolchain update with
-//! `witgen_segment_file`, `RISC0_METAL_WITGEN_PERM=sorted` and a `--map-lowering loop` baseline).
+//! inputs from time to time (notes/R8.md, R11.md). R17 traced that to an Apple GPU defect: a
+//! thread-private aggregate element written late (after an out-of-line call) can read back its
+//! earlier value. `witgen_tu_gen.py` avoids every known trigger shape in the witgen TU
+//! (docs/metal-port/notes/R17.md has the mechanism and the gates):
+//! - R17 round 0: every map/reduce is unrolled into straight-line code and the call graph may not
+//!   contain a loop (CUDA's lowering writes a default-constructed array in a loop that calls a
+//!   noinline step function; `--scan-loops` checks the preprocessed TU);
+//! - rounds 1-2: the TU compiles its own `witgen_fpext.h` (no element loops, every FpExt function
+//!   always_inline: an out-of-line `operator*(FpExt lhs, Fp rhs) { lhs *= rhs; return lhs; }`
+//!   lost elems[3] of PoseidonState.zcheck at -O0/-Oz; `--scan-ir` checks the compiled IR);
+//! - R17b: its own `witgen_fp.h` (every Fp function always_inline), the FpExt helpers of
+//!   witgen.h / ef_fpext.h always_inline, no default-constructed aggregate (statement-expression
+//!   map lowering, mux results initialized in place), and internal linkage for everything but the
+//!   three kernels, so the metallib linker cannot bind a call to another TU's (or a stale .air's)
+//!   copy. `--scan-ir` also checks the linkage, `tools/metal_audit/ir_scan.py` finds no defect
+//!   shape at -O2/-O0/-Oz/compiler-decided inlining, and `--scan-metallib` checks that the linked
+//!   kernels contain only the TU's own functions (tests/metal_generators.rs).
+//!
+//! Re-verifying after a macOS or Metal toolchain update (R17.md, "Re-verifying"): run the
+//! rv32im-sys generator tests, `witgen_sorted_amplifier`, and `witgen_segment_file` with
+//! `RISC0_METAL_WITGEN_PERM=sorted` on the R17 segments, against same-session baselines that must
+//! still fail (`--map-lowering loop`, and the R17 round-1 copy via `--fpext-calls outline` at -O0).
 
 use std::sync::LazyLock;
 

@@ -39,6 +39,6 @@ run groth16   R17_AUDIT_REPS=10 R17_AUDIT_LG=20 $T -p risc0-groth16-sys -- r17_ 
 case " ${R17_AUDIT_ONLY:-ir} " in *" ir "*) ;; *) exit $fail ;; esac
 tools/metal_audit/emit_ir.sh . target/debug "$LOG/ir" -gline-tables-only 2>/dev/null &&
   python3 -I tools/metal_audit/ir_scan.py --json "$LOG/ir_scan.json" --tiers '' "$LOG/ir" > "$LOG/ir_scan.txt" &&
-  echo "== ir_scan: $LOG/ir_scan.txt" >&2 && awk 'NR==1 || $4+$5 > 0' "$LOG/ir_scan.txt" >&2
+  echo "== ir_scan: $LOG/ir_scan.txt" >&2 && awk 'NR==1 || $4+$5+$7 > 0' "$LOG/ir_scan.txt" >&2
 echo "== stress status: $([ $fail = 0 ] && echo all passed || echo FAILURES)" >&2
 exit $fail

@@ -12,6 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// R17b (docs/metal-port/notes/R17.md, "R17b hardening"): FpExt * FpExt is always_inline in this
+// TU. Declared before fpext.h so that the friend definition there inherits the attribute. At -O2
+// the compiler otherwise calls it out of line inside this file's FpExt loops (ir_scan.py tier A:
+// a default-constructed private FpExt / FpExt array written after the call and read after the
+// loop, the Apple GPU lost-store shape). Same arithmetic, bit-exact.
+#include "fp.h"
+struct FpExt;
+__attribute__((always_inline)) constexpr FpExt operator*(FpExt lhs, FpExt rhs);
 #include "fp.h"
 #include "fpext.h"
 
@@ -55,7 +63,7 @@ kernel void fri_fold(device Fp* out [[buffer(0)]],
                  in[2 * count * kFriFold + rev_idx],
                  in[3 * count * kFriFold + rev_idx]);
     tot += curMix * factor;
-    curMix *= mix;
+    curMix = curMix * mix;
   }
   for (size_t i = 0; i < 4; i++) {
     out[count * i + gid] = tot.elems[i];

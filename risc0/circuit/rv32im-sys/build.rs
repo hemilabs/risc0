@@ -2265,7 +2265,8 @@ fn build_metal_kernels() {
     // cuda2metal.py passes with pinned rewrite counts, map/reduce unrolled: R17, no loop in the
     // graph) + par_stepExecW, fwd_stepExec, rev_stepExec, and gen_dir/witgen_fpext.h (the shared
     // fpext.h with its 4-element loops unrolled, every function always_inline and the value
-    // constructors built in place, which witgen_tu.metal includes instead of it). The generator
+    // constructors built in place, which witgen_tu.metal includes instead of it) and
+    // gen_dir/witgen_fp.h (R17b: the shared fp.h, every function always_inline). The generator
     // rewrites the file only when it changed and fails when steps.cu or ffi.cu's extern section changed shape (pins) or
     // the graph would contain a loop (docs/metal-port/notes/R17.md).
     if !skip {
@@ -2287,6 +2288,13 @@ fn build_metal_kernels() {
             .find(|(name, _)| *name == "fpext.h")
             .expect("risc0-build-kernel stages fpext.h");
         write_if_changed(&fpext_src, fpext);
+        // R17b: gen_dir/witgen_fp.h (every function always_inline) from the staged fp.h.
+        let fp_src = out_dir.join("witgen_fp_src.h");
+        let (_, fp) = risc0_build_kernel::METAL_INCS
+            .iter()
+            .find(|(name, _)| *name == "fp.h")
+            .expect("risc0-build-kernel stages fp.h");
+        write_if_changed(&fp_src, fp);
         let gen_dir_str = gen_dir.to_str().unwrap();
         run_metal_generator(
             WITGEN_TU_GEN,
@@ -2296,6 +2304,8 @@ fn build_metal_kernels() {
                 gen_dir_str,
                 "--fpext-src",
                 fpext_src.to_str().unwrap(),
+                "--fp-src",
+                fp_src.to_str().unwrap(),
             ],
             "witgen_tu_gen.py --metal failed: see its message (re-pin PINNED_METAL / re-port \
              METAL_EXTERNS in kernels/cuda/witgen_tu_gen.py after a steps.cu or ffi.cu change)",

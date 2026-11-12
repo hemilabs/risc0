@@ -26,7 +26,7 @@
 /// every lookupDelta adds exactly 1.
 
 #include "cuda_compat.h"
-#include "fp.h"
+#include "rv32im_fp.h"
 
 namespace rv32im_metal {
 

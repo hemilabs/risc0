@@ -15,6 +15,7 @@
 
 # usage: accum_tu_gen.py [--check]
 #        accum_tu_gen.py --metal -o OUTDIR [--inline always|noinline] [--check] [--no-pin]
+#                        [--map-lowering unroll|loop]
 #
 # CUDA and ROCm builds run the rv32im accum step from accum_tu.cu instead of
 # steps.cu. This script, run after regenerating steps.cu and accum_batchinv.py:
@@ -46,6 +47,10 @@
 # --inline selects how the graph is compiled: `always` (default) marks every function
 # [[clang::always_inline]] (the CUDA __forceinline__ whole-program TU), `noinline` marks them
 # __attribute__((noinline)) (the fallback if always-inline compile or PSO time is too high).
+# Both modes unroll the graph's map() sites (R17: noinline mode; R17b: the default too) and
+# declare its mux results with their value (cuda2metal.py pass_mux_init), so no private
+# aggregate is default-constructed and written after a call (docs/metal-port/notes/R17.md);
+# `--map-lowering loop` emits CUDA's loops, only for a same-session baseline.
 # The per-pass rewrite counts are pinned (PINNED_METAL); --no-pin only reports them. The output
 # is written only when it changed (a fresh mtime would rerun the cargo build script); --check
 # fails instead of writing.
@@ -227,8 +232,10 @@ PINNED_METAL_COMMON = {
     'qual_rewrite': 58,
 }
 PINNED_METAL = {
-    'always': dict(PINNED_METAL_COMMON, **{'qual.forceinline': 58}),
-    'noinline': dict(PINNED_METAL_COMMON, **{'qual.noinline': 58, 'lambda.map.unroll': 6}),
+    'always': dict(PINNED_METAL_COMMON, **{'qual.forceinline': 58, 'lambda.map.unroll': 6,
+                                           'mux.init': 93}),
+    'noinline': dict(PINNED_METAL_COMMON, **{'qual.noinline': 58, 'lambda.map.unroll': 6,
+                                             'mux.init': 93}),
 }
 
 METAL_HEADER = '''\
@@ -354,8 +361,9 @@ def metal_pin_check():
     return bad
 
 
-def metal_tu(mode, tg=256):
-    """-> (accum_tu.metal text, counts)."""
+def metal_tu(mode, tg=256, map_lowering='unroll'):
+    """-> (accum_tu.metal text, counts). map_lowering='loop' (CUDA's shape) only for a
+    same-session baseline."""
     sys.path.insert(0, HERE)
     import cuda2metal as c2m
     qual_in, qual_mid, qual_out = INLINE_MODES[mode]
@@ -372,15 +380,20 @@ def metal_tu(mode, tg=256):
     typedefs = c2m.collect_array_typedefs(c2m.read(os.path.join(HERE, 'types.cuh.inc')))
     # R17: in the noinline fallback the map() loops would call the noinline back_* functions --
     # the Apple GPU lost-store shape (docs/metal-port/notes/R17.md) -- so they are unrolled there.
-    # The default always-inline mode keeps CUDA's loop lowering (byte-identical output).
-    text, counts = c2m.translate(src, typedefs,
-                                 map_lowering='unroll' if mode == 'noinline' else 'loop')
-    if mode == 'noinline':
+    # R17b: the default always-inline mode too. Its loops (24/16-element NondetReg arrays filled
+    # by back_Reg_A, which calls witgen.h's `load` out of line) are the ir_scan.py tier-A shape
+    # in stepAccumA; no failure was measured (R17 audit stress), the unrolled lowering is
+    # defence in depth (bit-exact, docs/metal-port/notes/R17.md "R17b hardening").
+    text, counts = c2m.translate(src, typedefs, map_lowering=map_lowering)
+    if map_lowering == 'unroll':
+        # R17b: mux results declared with their value, as in witgen_tu_gen.py.
+        text = c2m.pass_mux_init(text, counts, zero=c2m.zero_init_fn(c2m.read(
+            os.path.join(HERE, '..', 'metal', 'types.metal.inc'))))
         ns = text[text.index('namespace %s {' % c2m.METAL_NS):]
         loops = len(re.findall(r'\b(for|while|do)\s*[({]', c2m.mask(ns)))
         if loops:
-            raise c2m.TranslateError('%d loop(s) in the noinline accum call graph (R17 lost-store '
-                                     'shape): lower them without a loop first' % loops)
+            raise c2m.TranslateError('%d loop(s) in the accum call graph (R17 lost-store shape): '
+                                     'lower them without a loop first' % loops)
     n = text.count(qual_mid)
     text = text.replace(qual_mid, qual_out)
     counts.add('qual_rewrite', n)
@@ -403,16 +416,22 @@ def main_metal(argv):
     ap.add_argument('--tg', type=int, default=256, help='max_total_threads_per_threadgroup')
     ap.add_argument('--check', action='store_true')
     ap.add_argument('--no-pin', action='store_true')
+    ap.add_argument('--map-lowering', choices=('unroll', 'loop'), default='unroll',
+                    help='loop: CUDA\'s map() loops (R17b: only for a same-session baseline)')
     args = ap.parse_args(argv)
     sys.path.insert(0, HERE)
     import cuda2metal as c2m
     try:
-        text, counts = metal_tu(args.inline, args.tg)
+        text, counts = metal_tu(args.inline, args.tg, args.map_lowering)
     except (c2m.TranslateError, ValueError) as e:
         print('accum_tu_gen --metal: error: %s' % e, file=sys.stderr)
         return 1
     print('accum_tu_gen --metal (%s): %s' % (args.inline, c2m.fmt_counts(counts)))
-    bad = c2m.check_pins({'accum': counts}, {'accum': PINNED_METAL[args.inline]})
+    want = dict(PINNED_METAL[args.inline])
+    if args.map_lowering == 'loop':
+        want.pop('lambda.map.unroll')
+        want.pop('mux.init')
+    bad = c2m.check_pins({'accum': counts}, {'accum': want})
     if bad:
         print('accum_tu_gen --metal: rewrite counts differ from PINNED_METAL (steps.cu changed '
               'shape):', file=sys.stderr)

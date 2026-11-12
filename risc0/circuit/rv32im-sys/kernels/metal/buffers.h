@@ -28,7 +28,7 @@
 /// may neither reorder against other volatile accesses nor merge.
 
 #include "cuda_compat.h"
-#include "fp.h"
+#include "rv32im_fp.h"
 
 namespace rv32im_metal {
 

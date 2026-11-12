@@ -30,6 +30,11 @@
 /// GPUs, kept selectable for the R15 A/B per plan 2.4).
 
 #include "ef_fp.h"
+
+// R17b: always_inline in witgen_tu.metal (witgen.h, RV32IM_WITGEN_EXT_INLINE).
+#ifndef RV32IM_WITGEN_EXT_INLINE
+#define RV32IM_WITGEN_EXT_INLINE
+#endif
 // R17: a TU may substitute its own copy of fpext.h (witgen_tu.metal: witgen_fpext.h, the shared
 // header with its 4-element loops unrolled; kernels/cuda/witgen_tu_gen.py gen_fpext).
 #ifdef RV32IM_FPEXT_HEADER
@@ -62,7 +67,7 @@ inline Fp ef_redc4(uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1,
 }
 
 /// a * b in F_p[X]/(X^4 - 11), lazy reduction (CUDA ef_fpext.h EF_EXT_LAZY).
-inline FpExt ef_ext_mul(FpExt lhs, FpExt rhs) {
+RV32IM_WITGEN_EXT_INLINE inline FpExt ef_ext_mul(FpExt lhs, FpExt rhs) {
   const Fp nbeta = Fp(Fp::P - 11);
   const uint32_t a0 = lhs.elems[0].asRaw(), a1 = lhs.elems[1].asRaw();
   const uint32_t a2 = lhs.elems[2].asRaw(), a3 = lhs.elems[3].asRaw();
@@ -78,7 +83,7 @@ inline FpExt ef_ext_mul(FpExt lhs, FpExt rhs) {
 }
 
 /// FpExt inverse through `inv_chain` (same value as fpext.h's `inv`, including inv(0) = 0).
-inline FpExt inv_ext_chain(FpExt in) {
+RV32IM_WITGEN_EXT_INLINE inline FpExt inv_ext_chain(FpExt in) {
   thread const Fp* a = in.elems;
   const Fp beta(11), nbeta(Fp::P - 11);
   Fp b0 = a[0] * a[0] + beta * (a[1] * (a[3] + a[3]) - a[2] * a[2]);
