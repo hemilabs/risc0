@@ -362,3 +362,142 @@ fn segment_prover_uses_metal_hal() {
         );
     }
 }
+
+/// A fresh directory for one test's binary archive (removed at the start).
+fn archive_temp_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("risc0-r14-archive-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+/// R14: the rv32im PSOs through the zkp binary archive. A first load into an empty directory
+/// misses every kernel and writes the archive; a second load hits every kernel and writes
+/// nothing; both have a PSO for every requested kernel, with the same thread limits. Small,
+/// quick kernels only (the full set is `archive_cold_start`). Never sets [ARCHIVE_ENV], so it
+/// needs no process-wide test lock; if another process disabled the archive through it the test
+/// only checks the plain load.
+#[test]
+fn archive_roundtrip_small_set() {
+    let hal = MetalHalSha256::new();
+    let names = ["injectCycleCols", "finalizeZeroizeAccum", "ef_combine"];
+    let expected: &[(Phase, &[&str])] = &[];
+    let dir = archive_temp_dir("small");
+    let first = Rv32imKernels::load_from_in(
+        &hal,
+        METAL_LIB,
+        &names,
+        expected,
+        Some(dir.clone()),
+        "rv32im",
+    )
+    .unwrap();
+    let Some(r) = first.kernels.archive_report() else {
+        return;
+    };
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert_eq!(
+        (r.hits, r.misses, r.loaded, r.saved),
+        (0, names.len(), false, true),
+        "{r:?}"
+    );
+    let path = r.path.clone().unwrap();
+    assert!(path.starts_with(&dir) && path.exists(), "{path:?}");
+    let second = Rv32imKernels::load_from_in(
+        &hal,
+        METAL_LIB,
+        &names,
+        expected,
+        Some(dir.clone()),
+        "rv32im",
+    )
+    .unwrap();
+    let r = second.kernels.archive_report().unwrap();
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert_eq!(
+        (r.hits, r.misses, r.loaded, r.saved),
+        (names.len(), 0, true, false),
+        "{r:?}"
+    );
+    for name in names {
+        let (a, b) = (first.kernels.pipeline(name), second.kernels.pipeline(name));
+        assert_eq!(
+            a.max_total_threads_per_threadgroup(),
+            b.max_total_threads_per_threadgroup(),
+            "{name}"
+        );
+        assert_eq!(
+            a.thread_execution_width(),
+            b.thread_execution_width(),
+            "{name}"
+        );
+    }
+    // The unloaded kernels are still reachable through the library (lazy PSOs).
+    assert!(second
+        .kernels
+        .library()
+        .function_names()
+        .iter()
+        .any(|f| f == "eval_check"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// R14 measurement: cold and warm PSO creation of the full rv32im set ([METAL_KERNEL_NAMES] and
+/// [EXPECTED_KERNELS]): the plain loader, then the archive into an empty directory (misses), then
+/// the archive again (hits). Run with `MTL_SHADER_CACHE_SIZE=0` (OS shader cache off) to see
+/// cold times: `<bin> archive_cold_start --ignored --nocapture --test-threads 1`. It sets
+/// [ARCHIVE_ENV] for the plain load.
+#[test]
+#[ignore = "measurement: cold PSO builds take minutes; run alone"]
+fn archive_cold_start() {
+    let hal = MetalHalSha256::new();
+    let dir = archive_temp_dir("cold");
+    let order = std::env::var("R14_ARCHIVE_ORDER").unwrap_or_else(|_| "plain,miss,hit".into());
+    for step in order.split(',') {
+        let t = std::time::Instant::now();
+        let k = if step == "plain" {
+            std::env::set_var(ARCHIVE_ENV, "0");
+            let k = Rv32imKernels::load_from_in(
+                &hal,
+                METAL_LIB,
+                METAL_KERNEL_NAMES,
+                EXPECTED_KERNELS,
+                None,
+                "rv32im",
+            );
+            std::env::remove_var(ARCHIVE_ENV);
+            k
+        } else {
+            Rv32imKernels::load_from_in(
+                &hal,
+                METAL_LIB,
+                METAL_KERNEL_NAMES,
+                EXPECTED_KERNELS,
+                Some(dir.clone()),
+                "rv32im",
+            )
+        }
+        .unwrap();
+        eprintln!(
+            "[r14] archive {step}: {:.2} s, report {:?}",
+            t.elapsed().as_secs_f64(),
+            k.kernels.archive_report()
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// R14 (R8 open issue): a panic while the scratch lock is held (e.g. a working-set budget panic
+/// in `grow`) does not make every later phase of the circuit HAL panic on a poisoned Mutex.
+#[test]
+fn scratch_survives_a_poisoned_lock() {
+    let hal = Arc::new(MetalHalSha256::new());
+    let ctx = MetalRv32imCtx::new(hal).unwrap();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = ctx.scratch();
+        panic!("injected panic while holding the scratch lock");
+    }));
+    assert!(r.is_err());
+    let (u8t, u16t) = ctx.tables();
+    assert!(u8t.size() >= TABLE_U8_CELLS && u16t.size() >= TABLE_U16_CELLS);
+    let _ = ctx.upload_preflight(&PreflightTrace::default()).unwrap();
+}

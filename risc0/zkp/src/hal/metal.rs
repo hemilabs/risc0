@@ -29,6 +29,7 @@
 //!   allocated it: host reads sync, and pool returns wait for, only that HAL's batches. Binding a
 //!   buffer of HAL A into a dispatch on HAL B can give stale reads and early pool reuse.
 
+pub mod archive;
 mod buffer;
 mod eval;
 mod kernels;

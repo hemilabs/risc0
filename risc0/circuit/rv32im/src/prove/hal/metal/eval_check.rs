@@ -63,7 +63,8 @@ use risc0_zkp::{
 };
 
 use super::{
-    count, cpu_phase, grow, host_slice, phase_mark, MetalCircuitHal, Phase, CPU_PHASES_ENV,
+    count, cpu_phase, grow, host_slice, phase_mark, r14_stat, MetalCircuitHal, Phase,
+    CPU_PHASES_ENV,
 };
 use crate::{
     prove::{GLOBAL_MIX, GLOBAL_OUT},
@@ -341,8 +342,15 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
             combine.max_total_threads_per_threadgroup()
         );
 
+        // Wait for the GPU work before (the accum commit), so the host views below are current
+        // (view() would wait the same way); timed separately from the host-only work after it.
+        let tw = std::time::Instant::now();
+        self.hal.try_sync()?;
+        let th = std::time::Instant::now();
+        r14_stat(1, th - tw);
+
         // The table (CUDA ef_prep on one GPU thread): built on the CPU from the powers and the
-        // host views of out / mix (view() flushes and waits if a batch is open).
+        // host views of out / mix.
         let poly_mix_pows = map_pow(poly_mix, POLY_MIX_POWERS);
         assert_eq!(poly_mix_pows.len(), NUM_POLY_MIX_POWERS);
         let mut out_h = Vec::new();
@@ -371,6 +379,7 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
         // view_mut flushes and waits if a batch is open, so a previous eval_check that read this
         // buffer has finished before it is overwritten.
         tab_buf.view_mut(|dst| dst[..EF_TABLE_LEN].copy_from_slice(&tab));
+        r14_stat(0, th.elapsed());
 
         let rows = (domain as u64).div_ceil(threads);
         if times.is_some() {
@@ -415,6 +424,8 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
             &[],
         );
         // End of the phase: close the batch and surface a command-buffer error (PLAN 2.6, 2.9).
+        // (R14 measured committing without the wait, with and without a wait in
+        // eval_check_dep: no difference, notes/R14.md.)
         self.hal.try_sync()?;
         if let Some(t) = times {
             t[1] = t1.elapsed();
