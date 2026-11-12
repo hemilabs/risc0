@@ -40,6 +40,9 @@
 //                  2 sorted uint[nwins * n] 3 constant MsmParams
 //   sorted[w * n + pos] = i for each (i, w) with digit d != 0, pos taken from the cursor of
 //   bucket d. Grid: n threads. The order inside a bucket is not deterministic (the sum is).
+//
+// Booth digits (MsmParams::booth, item G9): bucket |d| of a signed digit (msm_digit_booth),
+// nbuckets = 2^(c-1) + 1, and sorted entries i | MSM_NEG for d < 0 (n < 2^31, host-checked).
 
 #include "msm_common.h"
 
@@ -63,7 +66,8 @@ kernel void msm_hist_count(const device uint32_t* scalars [[buffer(0)]],
     return;
   const device uint32_t* s = scalars + (size_t)gid * 8;
   for (uint32_t w = 0; w < p.nwins; w++) {
-    uint32_t d = msm_digit(s, w, p.wbits);
+    bool neg = false;
+    uint32_t d = p.booth ? msm_digit_booth(s, w, p.wbits, neg) : msm_digit(s, w, p.wbits);
     if (d)
       atomic_fetch_add_explicit(&hist[w * p.nbuckets + d], 1u, memory_order_relaxed);
   }
@@ -138,11 +142,12 @@ kernel void msm_scatter(const device uint32_t* scalars [[buffer(0)]],
     return;
   const device uint32_t* s = scalars + (size_t)gid * 8;
   for (uint32_t w = 0; w < p.nwins; w++) {
-    uint32_t d = msm_digit(s, w, p.wbits);
+    bool neg = false;
+    uint32_t d = p.booth ? msm_digit_booth(s, w, p.wbits, neg) : msm_digit(s, w, p.wbits);
     if (d) {
       uint32_t pos =
           atomic_fetch_add_explicit(&hist[w * p.nbuckets + d], 1u, memory_order_relaxed);
-      sorted[(size_t)w * p.n + pos] = gid;
+      sorted[(size_t)w * p.n + pos] = gid | (neg ? MSM_NEG : 0u);
     }
   }
 }

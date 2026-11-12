@@ -33,6 +33,13 @@
 //! `first` lets an MSM use the sorted scalars from index `first` on (C's points start at
 //! witness index `wn - c.len`, the Intel prover's `msm_sorted(..., first)`).
 //!
+//! Item G9 variants ([MsmTune], selected per sort with [MsmScratch::set_tune], default all on):
+//! `wide_mul` runs the point kernels over bn254_fast.h's `FpF`/`Fp2L` (`_g1w`/`_g2w`: 64-bit
+//! multiply-accumulate Montgomery products, ~1.6x faster bucket sums, same values bit for bit);
+//! `booth` sorts signed digits of c + 1 bits into 2^c + 1 buckets, so that scalars below 2^254
+//! ([MsmScratch::set_scalar_bits], the prover's canonical Fr) need 15 windows instead of 16 at
+//! c = 16. The window sums then have the sort's layout ([MsmScratch::sorted_layout]).
+//!
 //! Load balance: every bucket is cut into pieces of at most `piece` points; one thread sums one
 //! piece, and the segment reduction runs over pieces weighted by their bucket. A bucket holding a
 //! large share of the scalars (digit 1 of window 0 for a witness of bits) therefore costs no more
@@ -78,7 +85,50 @@ pub const MSM_KERNEL_NAMES: &[&str] = &[
     "msm_segment_reduce_g2",
     "msm_window_reduce_g1",
     "msm_window_reduce_g2",
+    "msm_buckets_g1w",
+    "msm_buckets_g2w",
+    "msm_segment_reduce_g1w",
+    "msm_segment_reduce_g2w",
+    "msm_window_reduce_g1w",
+    "msm_window_reduce_g2w",
 ];
+
+/// Kernel-variant switches of an MSM (item G9). [MsmScratch::set_tune] sets them before a sort;
+/// the MSMs over that sort use the same. The default is every optimization on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MsmTune {
+    /// The `_g1w`/`_g2w` point kernels (bn254_fast.h: 64-bit-accumulate Montgomery
+    /// multiplication) instead of `_g1`/`_g2` (bn254.h). Same results, bit for bit.
+    pub wide_mul: bool,
+    /// Signed (Booth) digits of c + 1 bits for the configured c ([MsmConfig::layout]):
+    /// 2^c + 1 buckets per window and, for scalars below 2^254 ([MsmScratch::set_scalar_bits]),
+    /// ceil(255 / (c + 1)) windows (15 instead of 16 at c = 16).
+    pub booth: bool,
+}
+
+impl Default for MsmTune {
+    fn default() -> Self {
+        Self::all()
+    }
+}
+
+impl MsmTune {
+    /// Every optimization on.
+    pub fn all() -> Self {
+        Self {
+            wide_mul: true,
+            booth: true,
+        }
+    }
+
+    /// The G6 kernels.
+    pub fn none() -> Self {
+        Self {
+            wide_mul: false,
+            booth: false,
+        }
+    }
+}
 
 /// Buffer indices of the MSM kernels (the tables at the top of the .metal files).
 pub mod buf {
@@ -146,7 +196,8 @@ pub struct MsmParams {
     pub npoints: u32,
     pub w0: u32,
     pub wcount: u32,
-    pub _pad: [u32; 4],
+    pub booth: u32,
+    pub _pad: [u32; 3],
 }
 const _: () = assert!(std::mem::size_of::<MsmParams>() == 64);
 
@@ -255,6 +306,43 @@ impl MsmConfig {
     /// Bound on the segments of one window for any MSM of at most `n` scalars (non-decreasing).
     pub fn max_segs(&self, n: u32) -> u32 {
         self.max_pieces(n).div_ceil(self.seg)
+    }
+
+    /// The sort layout (window width c, windows, buckets per window) of a sort with the digit
+    /// mode `booth`, for scalars below 2^`scalar_bits` (<= 256). Unsigned: c = wbits,
+    /// ceil(256 / c) windows (whatever `scalar_bits`, as G6), 2^c buckets. Booth (item G9):
+    /// c = wbits + 1, ceil((scalar_bits + 1) / c) windows (Booth needs s < 2^(W c - 1)),
+    /// 2^wbits + 1 buckets (|d| <= 2^wbits; bucket 0 unused). Neither exceeds
+    /// [Self::nwins] windows or [Self::nbuckets] + 1 buckets.
+    pub fn layout(&self, booth: bool, scalar_bits: u32) -> (u32, u32, u32) {
+        if booth {
+            let c = self.wbits + 1;
+            (c, (scalar_bits + 1).div_ceil(c), (1 << self.wbits) + 1)
+        } else {
+            (self.wbits, self.nwins(), self.nbuckets())
+        }
+    }
+
+    /// [Self::piece] for `nb` buckets per window.
+    pub fn piece_nb(n: u32, nb: u32) -> u32 {
+        ((2 * n as u64).div_ceil(nb as u64) as u32).max(16)
+    }
+
+    /// [Self::max_pieces] for `nb` buckets per window (same bound: for n <= 8 nb the piece is
+    /// 16; above, piece >= 2n / nb, so n / piece <= nb / 2). Non-decreasing in n and nb.
+    pub fn max_pieces_nb(n: u32, nb: u32) -> u32 {
+        let full = (n as u64).min(8 * nb as u64).div_ceil(16) as u32;
+        full + n.min(nb - 1)
+    }
+
+    /// [Self::max_segs] for `nb` buckets per window.
+    pub fn max_segs_nb(&self, n: u32, nb: u32) -> u32 {
+        Self::max_pieces_nb(n, nb).div_ceil(self.seg)
+    }
+
+    /// The largest bucket count of either digit mode ([Self::layout]): the scratch's sizing.
+    fn nbuckets_any(&self) -> u32 {
+        self.nbuckets() + 1
     }
 
     fn validate(&self) {
@@ -409,6 +497,8 @@ pub struct MsmKernels {
     scatter: ComputePipelineState,
     g1: CurvePsos,
     g2: CurvePsos,
+    g1w: CurvePsos,
+    g2w: CurvePsos,
 }
 
 fn pso(device: &DeviceRef, lib: &LibraryRef, name: &str) -> Result<ComputePipelineState> {
@@ -436,14 +526,18 @@ impl MsmKernels {
             scatter: pso(device, lib, "msm_scatter")?,
             g1: curve("g1")?,
             g2: curve("g2")?,
+            g1w: curve("g1w")?,
+            g2w: curve("g2w")?,
         })
     }
 
-    fn curve<C: MsmCurve>(&self) -> &CurvePsos {
-        match C::NAME {
-            "g1" => &self.g1,
-            "g2" => &self.g2,
-            other => unreachable!("unknown MSM curve {other}"),
+    fn curve<C: MsmCurve>(&self, tune: MsmTune) -> &CurvePsos {
+        match (C::NAME, tune.wide_mul) {
+            ("g1", false) => &self.g1,
+            ("g2", false) => &self.g2,
+            ("g1", true) => &self.g1w,
+            ("g2", true) => &self.g2w,
+            (other, _) => unreachable!("unknown MSM curve {other}"),
         }
     }
 
@@ -462,23 +556,33 @@ impl MsmKernels {
         );
         scalars.check(n as u64 * 32, "MSM scalars");
         let cfg = sc.cfg;
+        let booth = sc.tune.booth;
+        // Booth sorts keep the digit sign in the index's top bit.
+        assert!(
+            !booth || n < 1 << 31,
+            "MSM of {n} scalars too large for Booth digits"
+        );
+        let (wbits, nwins, nbuckets) = cfg.layout(booth, sc.scalar_bits);
         let p = MsmParams {
             n,
-            wbits: cfg.wbits,
-            nwins: cfg.nwins(),
-            nbuckets: cfg.nbuckets(),
-            piece: cfg.piece(n),
+            wbits,
+            nwins,
+            nbuckets,
+            piece: MsmConfig::piece_nb(n, nbuckets),
             // Strides of the piece and partial arrays: the scratch's, whatever n (the dispatch
             // grids use the bound at n, which is no larger).
             max_pieces: sc.max_pieces,
             seg: cfg.seg,
             max_segs: sc.max_segs,
+            booth: booth as u32,
             ..Default::default()
         };
         assert!(
-            n.div_ceil(p.piece) + n.min(p.nbuckets - 1) <= cfg.max_pieces(n)
-                && cfg.max_pieces(n) <= sc.max_pieces
-                && cfg.max_segs(n) <= sc.max_segs,
+            n.div_ceil(p.piece) + n.min(p.nbuckets - 1) <= MsmConfig::max_pieces_nb(n, nbuckets)
+                && MsmConfig::max_pieces_nb(n, nbuckets) <= sc.max_pieces
+                && cfg.max_segs_nb(n, nbuckets) <= sc.max_segs
+                && nwins <= cfg.nwins()
+                && nbuckets <= cfg.nbuckets_any(),
             "MSM piece bound of {n} scalars exceeds the scratch (sized for {})",
             sc.cap_n
         );
@@ -518,6 +622,7 @@ impl MsmKernels {
             dispatch_1d(enc, &self.scatter, n as u64);
         }
         sc.sorted_params = Some(p);
+        sc.sorted_tune = sc.tune;
     }
 
     /// The MSM over the scalars of the last [Self::encode_sort] on `sc`, by window:
@@ -605,7 +710,7 @@ impl MsmKernels {
         out: MsmBuf,
         stage: MsmStage,
     ) {
-        let ps = self.curve::<C>();
+        let ps = self.curve::<C>(sc.sorted_tune);
         match stage {
             MsmStage::Buckets(p) => {
                 enc.set_compute_pipeline_state(&ps.buckets);
@@ -625,7 +730,7 @@ impl MsmKernels {
                 enc.set_buffer(buf::buckets::PIECES, Some(&sc.pieces), 0);
                 enc.set_buffer(buf::buckets::PIECE_BUCKET, Some(&sc.piece_bucket), 0);
                 set_params(enc, buf::buckets::PARAMS, &p);
-                let grid = sc.cfg.max_pieces(p.n).min(p.max_pieces);
+                let grid = MsmConfig::max_pieces_nb(p.n, p.nbuckets).min(p.max_pieces);
                 dispatch_2d(enc, &ps.buckets, grid as u64, p.wcount as u64);
             }
             MsmStage::SegmentReduce(p) => {
@@ -635,7 +740,7 @@ impl MsmKernels {
                 enc.set_buffer(buf::segment_reduce::TOTALS, Some(&sc.totals), 0);
                 enc.set_buffer(buf::segment_reduce::PARTIAL, Some(&sc.partial), 0);
                 set_params(enc, buf::segment_reduce::PARAMS, &p);
-                let grid = sc.cfg.max_segs(p.n).min(p.max_segs);
+                let grid = sc.cfg.max_segs_nb(p.n, p.nbuckets).min(p.max_segs);
                 dispatch_2d(enc, &ps.segment_reduce, grid as u64, p.wcount as u64);
             }
             MsmStage::WindowReduce(p) => {
@@ -718,16 +823,24 @@ pub struct MsmScratch {
     piece_bucket: Buffer,
     partial: Buffer,
     sorted_params: Option<MsmParams>,
+    /// The switches of the next sort ([Self::set_tune]) and of the last one.
+    tune: MsmTune,
+    sorted_tune: MsmTune,
+    /// The sorts' scalars are below 2^scalar_bits (Booth window count; default 256).
+    scalar_bits: u32,
 }
 
 impl MsmScratch {
     /// The buffer sizes of a scratch for `cap_n` scalars, in allocation order: hist, offset,
     /// piece_off, totals, sorted, pieces, piece_bucket, partial.
     fn sizes(cap_n: u32, cfg: MsmConfig) -> [u64; 8] {
+        // Sized for either digit mode ([MsmConfig::layout]): nwins() windows, nbuckets() + 1
+        // buckets.
         let nwins = cfg.nwins() as u64;
-        let table = nwins * cfg.nbuckets() as u64 * 4;
-        let max_pieces = cfg.max_pieces(cap_n) as u64;
-        let max_segs = cfg.max_segs(cap_n) as u64;
+        let nb = cfg.nbuckets_any();
+        let table = nwins * nb as u64 * 4;
+        let max_pieces = MsmConfig::max_pieces_nb(cap_n, nb) as u64;
+        let max_segs = cfg.max_segs_nb(cap_n, nb) as u64;
         let group = max_pieces * MAX_XYZZ_BYTES;
         let groups = cfg
             .max_piece_bytes
@@ -765,15 +878,18 @@ impl MsmScratch {
         let sizes = Self::sizes(cap_n, cfg);
         super::check_working_set(device, "the MSM scratch", sizes.iter().sum())?;
         // Nil-checked (G8): a refused allocation is an error, not a null `Buffer`.
+        // `RISC0_G16_METAL_SCRATCH_SHARED=1`: StorageModeShared instead (item G9's Shared vs
+        // Private measurement; no difference found, Private stays the default).
+        let private = std::env::var("RISC0_G16_METAL_SCRATCH_SHARED").as_deref() != Ok("1");
         let alloc = |bytes: u64, what: &str| -> Result<Buffer> {
-            super::new_buffer_checked(device, bytes, true, &format!("the MSM {what}"))
+            super::new_buffer_checked(device, bytes, private, &format!("the MSM {what}"))
         };
         let [hist, offset, piece_off, totals, sorted, pieces, piece_bucket, partial] = sizes;
         Ok(Self {
             cfg,
             cap_n,
-            max_pieces: cfg.max_pieces(cap_n),
-            max_segs: cfg.max_segs(cap_n),
+            max_pieces: MsmConfig::max_pieces_nb(cap_n, cfg.nbuckets_any()),
+            max_segs: cfg.max_segs_nb(cap_n, cfg.nbuckets_any()),
             hist: alloc(hist, "hist")?,
             offset: alloc(offset, "offset")?,
             piece_off: alloc(piece_off, "piece_off")?,
@@ -783,7 +899,36 @@ impl MsmScratch {
             piece_bucket: alloc(piece_bucket, "piece_bucket")?,
             partial: alloc(partial, "partial")?,
             sorted_params: None,
+            tune: MsmTune::default(),
+            sorted_tune: MsmTune::default(),
+            scalar_bits: 256,
         })
+    }
+
+    /// The kernel variants of the following sorts and the MSMs over them (item G9).
+    pub fn set_tune(&mut self, tune: MsmTune) {
+        self.tune = tune;
+    }
+
+    pub fn tune(&self) -> MsmTune {
+        self.tune
+    }
+
+    /// Declare that the following sorts' scalars are below 2^bits (1..=256), e.g. 254 for
+    /// canonical Fr: Booth sorts then use fewer windows ([MsmConfig::layout]). Larger scalars
+    /// would give wrong MSMs (the caller guarantees the bound).
+    pub fn set_scalar_bits(&mut self, bits: u32) {
+        assert!(
+            (1..=256).contains(&bits),
+            "scalar bits {bits} out of 1..=256"
+        );
+        self.scalar_bits = bits;
+    }
+
+    /// (windows, window width) of the last sort: the layout of [MsmKernels::encode_msm]'s
+    /// window sums, for [MsmCurve::combine_windows].
+    pub fn sorted_layout(&self) -> Option<(u32, u32)> {
+        self.sorted_params.map(|p| (p.nwins, p.wbits))
     }
 
     pub fn config(&self) -> MsmConfig {
@@ -944,11 +1089,15 @@ impl MsmGpu {
         } else {
             self.run(|enc| self.kernels.encode_msm::<C>(enc, sc, points, first, ob))?
         };
-        // Safety: the command buffer completed; the buffer holds nw Xyzz.
+        let (snw, wbits) = sc.sorted_layout().expect("sorted");
+        // Safety: the command buffer completed; the buffer holds snw <= nw Xyzz.
         let w = unsafe {
-            std::slice::from_raw_parts(out.contents() as *const u32, nw * 4 * C::COORD_WORDS)
+            std::slice::from_raw_parts(
+                out.contents() as *const u32,
+                snw as usize * 4 * C::COORD_WORDS,
+            )
         };
-        Ok((C::combine_windows(w, sc.config().wbits), t))
+        Ok((C::combine_windows(w, wbits), t))
     }
 
     /// `sum_i scalars[i] * points[i]` (raw 256-bit scalars), allocating scratch for this call.

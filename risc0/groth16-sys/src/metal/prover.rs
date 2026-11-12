@@ -34,6 +34,12 @@
 //! [ProveOptions::profile] every stage gets its own command buffer (finer timings, a little
 //! slower). Pipelines (PSOs) are built once per process ([kernels]) and survive
 //! [crate::metal_release]; the NTT plan's pipelines are built with the plan (once per key load).
+//! `RISC0_G16_METAL_PROFILE_MSM=1` (with the profile) also splits each MSM into its dispatches.
+//!
+//! Item G9 optimizations ([Tuning], every one on by default, each with a revert switch:
+//! `RISC0_G16_METAL_G9=0` for the G7/G8 kernels, `RISC0_G16_METAL_G9_OFF=wide_mul,wide_ntt,booth`
+//! for single ones): the MSM and NTT kernels over bn254_fast.h's 64-bit-accumulate Montgomery
+//! multiplication, and Booth MSM digits (15 windows). All bit-exact (`g9_tuning_bit_exact`).
 //!
 //! Memory (rzup component: 5,635,930 witness elements, domain 2^23): key 2.34 GB of points +
 //! 1.44 GB of coefficients, then a, b, c (768 MiB), witness (172 MiB), fuzz (172 MiB), NTT tables
@@ -61,7 +67,7 @@ use metal::{
 use super::{
     check_working_set,
     coeffs::{Coeffs, FuzzedResults, FuzzedResultsArk},
-    msm::{MsmBuf, MsmConfig, MsmCurve, MsmKernels, MsmScratch, G1, G2},
+    msm::{MsmBuf, MsmConfig, MsmCurve, MsmKernels, MsmScratch, MsmStage, MsmTune, G1, G2},
     ntt::NttPlan,
     small::{self, BufSlice, SmallKernels},
     srs::{self, Srs, VerifyingKeyArk},
@@ -122,16 +128,122 @@ pub struct ProveOptions {
     pub profile: bool,
     /// Print the stage timings to stderr (`[groth16-metal]` lines).
     pub verbose: bool,
+    /// Optimization switches (item G9); the default is every optimization on.
+    pub tune: Tuning,
 }
 
 impl ProveOptions {
-    /// `RISC0_VERBOSE` set: verbose; `RISC0_G16_METAL_PROFILE=1`: profile (and verbose).
+    /// `RISC0_VERBOSE` set: verbose; `RISC0_G16_METAL_PROFILE=1`: profile (and verbose);
+    /// [Tuning::from_env] for the optimization switches.
     pub fn from_env() -> Self {
         let profile = std::env::var("RISC0_G16_METAL_PROFILE").as_deref() == Ok("1");
         Self {
             profile,
             verbose: profile || std::env::var_os("RISC0_VERBOSE").is_some(),
+            tune: Tuning::from_env(),
         }
+    }
+}
+
+/// The optimization switches of item G9, each with a revert knob so that a baseline can A/B
+/// them. `RISC0_G16_METAL_G9=0` turns every one off (the G7/G8 code paths);
+/// `RISC0_G16_METAL_G9_OFF=<name>,<name>` turns off single ones (names: [Tuning::NAMES]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tuning {
+    /// `wide_mul`: the MSM point kernels with the 64-bit-accumulate Montgomery multiplication
+    /// (bn254_fast.h).
+    pub wide_mul: bool,
+    /// `wide_ntt`: the NTT kernels (`ntt_*_w`) with the same multiplication.
+    pub wide_ntt: bool,
+    /// `booth`: signed MSM digits of 17 bits, 15 windows (the scalars are canonical Fr).
+    pub booth: bool,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Self::all()
+    }
+}
+
+impl Tuning {
+    /// Switch names for `RISC0_G16_METAL_G9_OFF`.
+    pub const NAMES: &'static [&'static str] = &["wide_mul", "wide_ntt", "booth"];
+
+    /// The MSM switches.
+    pub fn msm(&self) -> MsmTune {
+        MsmTune {
+            wide_mul: self.wide_mul,
+            booth: self.booth,
+        }
+    }
+
+    /// Every optimization on.
+    pub fn all() -> Self {
+        Self {
+            wide_mul: true,
+            wide_ntt: true,
+            booth: true,
+        }
+    }
+
+    /// Every optimization off: the G7/G8 prover.
+    pub fn none() -> Self {
+        Self {
+            wide_mul: false,
+            wide_ntt: false,
+            booth: false,
+        }
+    }
+
+    /// Turn the switch `name` on or off; false for an unknown name.
+    pub fn set(&mut self, name: &str, on: bool) -> bool {
+        match name {
+            "wide_mul" => self.wide_mul = on,
+            "wide_ntt" => self.wide_ntt = on,
+            "booth" => self.booth = on,
+            _ => return false,
+        }
+        true
+    }
+
+    /// `none()` for "base", `all()` for "all", else `all()` with "-name" items off and "+name"
+    /// items on (comma separated, applied in order to `all()`, or to `none()` after "base,").
+    pub fn parse(spec: &str) -> Option<Self> {
+        let mut t = Self::all();
+        for item in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            match item {
+                "base" => t = Self::none(),
+                "all" => t = Self::all(),
+                _ => {
+                    let (on, name) = match item.as_bytes()[0] {
+                        b'-' => (false, &item[1..]),
+                        b'+' => (true, &item[1..]),
+                        _ => (true, item),
+                    };
+                    if !t.set(name, on) {
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(t)
+    }
+
+    /// The switches from the environment (see [Tuning]); unknown names are ignored with a
+    /// warning on stderr.
+    pub fn from_env() -> Self {
+        if std::env::var("RISC0_G16_METAL_G9").as_deref() == Ok("0") {
+            return Self::none();
+        }
+        let mut t = Self::all();
+        if let Ok(off) = std::env::var("RISC0_G16_METAL_G9_OFF") {
+            for name in off.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                if !t.set(name, false) {
+                    eprintln!("[groth16-metal] RISC0_G16_METAL_G9_OFF: unknown switch {name}");
+                }
+            }
+        }
+        t
     }
 }
 
@@ -376,7 +488,7 @@ impl MetalProver {
             .with_context(|| format!("stat(\"{}\")", coeffs_path.display()))?
             .len();
         let cap = wn.max(n) as u32;
-        let cfg = MsmConfig::default();
+        let cfg = msm_config_from_env();
         let fuzz_len = 2 * small::fuzz_blocks(wn as u64);
         let wsum_bytes = wsum_bytes(cfg);
         let ntt_bytes = ((n as u64 / 2).max(1) + 4096 + 2 * (n as u64 >> 12).max(1)) * FR_BYTES;
@@ -425,7 +537,10 @@ impl MetalProver {
         let wsums = alloc(wsum_bytes, false, "the MSM window sums")?;
         check_working_set(device, "the NTT tables", ntt_bytes)?;
         let ntt = NttPlan::new(device, &k.queue, &k.library, lg)?;
-        let scratch = MsmScratch::new(device, cap, cfg)?;
+        let mut scratch = MsmScratch::new(device, cap, cfg)?;
+        // Every MSM scalar is a canonical Fr (< r < 2^254): the witness + fuzz (fr_add), h
+        // (from_mont) and the fuzz itself (< 2^253, fuzz.metal).
+        scratch.set_scalar_bits(254);
         let state = small::chacha_state(&[0; 32], &[0; 12]);
         run_one(&k.queue, |enc| {
             k.small
@@ -526,6 +641,7 @@ impl MetalProver {
         let upload_ms = ms(t);
 
         let t = Instant::now();
+        self.ntt.set_wide(opts.tune.wide_ntt);
         let mut run = Run::new(&k.queue, opts.profile);
         let small = &k.small;
         let msm = &k.msm;
@@ -588,49 +704,79 @@ impl MetalProver {
 
         let cfg = self.scratch.config();
         let scratch = &mut self.scratch;
+        scratch.set_tune(opts.tune.msm());
         let srs = &self.srs;
         let wsums = &self.wsums;
         let out = |slot: Slot| MsmBuf::at(wsums, slot_offset(cfg, slot));
         run.stage("sort_h", 1, |enc| {
             msm.encode_sort(enc, scratch, MsmBuf::new(abc), n as u32)
         });
-        run.stage("msm_h", 1, |enc| {
-            msm.encode_msm::<G1>(enc, scratch, MsmBuf::new(srs.h.as_buf()), 0, out(Slot::H))
-        });
+        let deep =
+            opts.profile && std::env::var("RISC0_G16_METAL_PROFILE_MSM").as_deref() == Ok("1");
+        let h_pts = MsmBuf::new(srs.h.as_buf());
+        msm_stage::<G1>(
+            &mut run,
+            msm,
+            scratch,
+            "msm_h",
+            1,
+            h_pts,
+            0,
+            out(Slot::H),
+            deep,
+        );
         run.stage("sort_w", 2, |enc| {
             msm.encode_sort(enc, scratch, MsmBuf::new(w), wn as u32)
         });
-        run.stage("msm_a", 2, |enc| {
-            msm.encode_msm::<G1>(enc, scratch, MsmBuf::new(srs.a.as_buf()), 0, out(Slot::A))
-        });
-        run.stage("msm_b1", 2, |enc| {
-            msm.encode_msm::<G1>(
-                enc,
-                scratch,
-                MsmBuf::new(srs.b_g1.as_buf()),
-                0,
-                out(Slot::B1),
-            )
-        });
+        let a_pts = MsmBuf::new(srs.a.as_buf());
+        msm_stage::<G1>(
+            &mut run,
+            msm,
+            scratch,
+            "msm_a",
+            2,
+            a_pts,
+            0,
+            out(Slot::A),
+            deep,
+        );
+        let b1_pts = MsmBuf::new(srs.b_g1.as_buf());
+        msm_stage::<G1>(
+            &mut run,
+            msm,
+            scratch,
+            "msm_b1",
+            2,
+            b1_pts,
+            0,
+            out(Slot::B1),
+            deep,
+        );
         let first = (wn - self.c_len) as u32;
-        run.stage("msm_c", 2, |enc| {
-            msm.encode_msm::<G1>(
-                enc,
-                scratch,
-                MsmBuf::new(srs.c.as_buf()),
-                first,
-                out(Slot::C),
-            )
-        });
-        run.stage("msm_b2", 3, |enc| {
-            msm.encode_msm::<G2>(
-                enc,
-                scratch,
-                MsmBuf::new(srs.b_g2.as_buf()),
-                0,
-                out(Slot::B2),
-            )
-        });
+        let c_pts = MsmBuf::new(srs.c.as_buf());
+        msm_stage::<G1>(
+            &mut run,
+            msm,
+            scratch,
+            "msm_c",
+            2,
+            c_pts,
+            first,
+            out(Slot::C),
+            deep,
+        );
+        let b2_pts = MsmBuf::new(srs.b_g2.as_buf());
+        msm_stage::<G2>(
+            &mut run,
+            msm,
+            scratch,
+            "msm_b2",
+            3,
+            b2_pts,
+            0,
+            out(Slot::B2),
+            deep,
+        );
         let encode_ms = ms(t);
         let t = Instant::now();
         let gpu_ms = run.finish()?;
@@ -745,7 +891,12 @@ impl MetalProver {
 
     fn window_sum<C: MsmCurve>(&self, slot: Slot) -> C::Projective {
         let cfg = self.scratch.config();
-        let words = cfg.nwins() as usize * 4 * C::COORD_WORDS;
+        // Every sort of a proof has the same layout (same switches, canonical scalars).
+        let (nwins, wbits) = self
+            .scratch
+            .sorted_layout()
+            .expect("window_sum before a sort");
+        let words = nwins as usize * 4 * C::COORD_WORDS;
         let off = slot_offset(cfg, slot) as usize;
         // Safety: the command buffers that wrote it completed; the slot lies inside the buffer
         // (wsum_bytes) and is 4-byte aligned.
@@ -755,7 +906,7 @@ impl MetalProver {
                 words,
             )
         };
-        C::combine_windows(w, cfg.wbits)
+        C::combine_windows(w, wbits)
     }
 
     /// `MSM(P, f) + fuzzed` for P = A, B1, C (G1) and B2 (G2), f the fuzz (C from witness index
@@ -859,6 +1010,69 @@ fn random_fr() -> Result<Fr> {
         if !v.is_zero() {
             return Ok(v);
         }
+    }
+}
+
+/// The prover's MSM configuration: [MsmConfig::default] (c = 16, 256 MiB piece groups), or the
+/// measurement knobs of item G9's sweeps: `RISC0_G16_METAL_MSM_WBITS` (1..=16) and
+/// `RISC0_G16_METAL_MSM_PIECE_MIB` (the per-group piece-buffer cap). Results are the same for
+/// every value (the window layout is the scratch's); only speed and the scratch size change.
+fn msm_config_from_env() -> MsmConfig {
+    let mut cfg = MsmConfig::default();
+    let num = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    };
+    if let Some(w) = num("RISC0_G16_METAL_MSM_WBITS") {
+        if (1..=16).contains(&w) {
+            cfg.wbits = w as u32;
+        } else {
+            eprintln!("[groth16-metal] RISC0_G16_METAL_MSM_WBITS={w} out of 1..=16, ignored");
+        }
+    }
+    if let Some(m) = num("RISC0_G16_METAL_MSM_PIECE_MIB") {
+        cfg.max_piece_bytes = m.max(1) << 20;
+    }
+    cfg
+}
+
+/// One MSM as a [Run] stage; with `deep` (profiling), every dispatch of it is its own stage
+/// (`label.buckets0`, `label.segment_reduce0`, ..., `label.window_reduce`).
+#[allow(clippy::too_many_arguments)]
+fn msm_stage<C: MsmCurve>(
+    run: &mut Run,
+    msm: &MsmKernels,
+    scratch: &MsmScratch,
+    label: &str,
+    group: u32,
+    points: MsmBuf,
+    first: u32,
+    out: MsmBuf,
+    deep: bool,
+) {
+    if !deep {
+        run.stage(label, group, |enc| {
+            msm.encode_msm::<C>(enc, scratch, points, first, out)
+        });
+        return;
+    }
+    let (mut nb, mut ns) = (0, 0);
+    for stage in msm.msm_stages::<C>(scratch, points, first, out) {
+        let name = match stage {
+            MsmStage::Buckets(_) => {
+                nb += 1;
+                format!("{label}.buckets{}", nb - 1)
+            }
+            MsmStage::SegmentReduce(_) => {
+                ns += 1;
+                format!("{label}.segment_reduce{}", ns - 1)
+            }
+            MsmStage::WindowReduce(_) => format!("{label}.window_reduce"),
+        };
+        run.stage(&name, group, |enc| {
+            msm.encode_msm_stage::<C>(enc, scratch, points, out, stage)
+        });
     }
 }
 

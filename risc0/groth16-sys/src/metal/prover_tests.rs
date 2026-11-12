@@ -243,3 +243,175 @@ fn run_survives_a_panicking_stage() {
     assert!(r.is_err());
     run_one(&k.queue, |_| {}).unwrap();
 }
+
+/// G9: every optimization switch is bit-exact. One witness proved with every switch off (the
+/// G7/G8 path), each single switch off, and all on: the pre-blinding MSM results (A', B1', B2',
+/// C', H) are equal. Also the switch parser.
+#[test]
+fn g9_tuning_bit_exact() {
+    use rand::{Rng as _, SeedableRng as _};
+
+    assert_eq!(Tuning::parse("base"), Some(Tuning::none()));
+    assert_eq!(Tuning::parse("all"), Some(Tuning::all()));
+    assert_eq!(Tuning::parse(""), Some(Tuning::all()));
+    assert_eq!(Tuning::parse("bogus"), None);
+    for name in Tuning::NAMES {
+        let mut t = Tuning::all();
+        assert!(t.set(name, false));
+        assert_ne!(t, Tuning::all(), "{name}");
+        assert_eq!(Tuning::parse(&format!("-{name}")), Some(t));
+        assert_eq!(
+            Tuning::parse(&format!("base,+{name},-{name}")),
+            Some(Tuning::none())
+        );
+    }
+
+    let _lock = prover_test_lock();
+    let Some(dir) = component_dir() else {
+        return;
+    };
+    let Some(mut prover) = build_or_refused(&dir) else {
+        return;
+    };
+    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(0x69);
+    let mut witness = vec![0u8; prover.witness_len() * 32];
+    for e in witness.chunks_exact_mut(32) {
+        rng.fill(&mut e[..31]);
+    }
+    let prove = |prover: &mut MetalProver, tune: Tuning| {
+        let opts = ProveOptions {
+            tune,
+            ..Default::default()
+        };
+        prover
+            .prove_with_blinding(&witness, &opts, Fr::from(3u64), Fr::from(5u64))
+            .unwrap()
+    };
+    let base = prove(&mut prover, Tuning::none());
+    let mut variants = vec![("all".to_string(), Tuning::all())];
+    for name in Tuning::NAMES {
+        variants.push((
+            format!("-{name}"),
+            Tuning::parse(&format!("-{name}")).unwrap(),
+        ));
+    }
+    for (name, tune) in variants {
+        let p = prove(&mut prover, tune);
+        assert_eq!(p.pre_blinding, base.pre_blinding, "{name}");
+        assert_eq!((p.a, p.b, p.c), (base.a, base.b, base.c), "{name}");
+        eprintln!("{name}: gpu {:.1} ms", p.stats.gpu_total_ms());
+    }
+}
+
+/// G9: interleaved A/B of [Tuning] variants on the real key (a benchmark, ignored).
+/// `G9_VARIANTS` = variants separated by `;` ([Tuning::parse]; default "base;all"), `G9_REPS`
+/// rounds (default 7) of A B ... in turn, `G9_PROFILE=1` one command buffer per stage. Every
+/// proof's pre-blinding values must equal the first variant's (bit-exact MSMs and H).
+#[test]
+#[ignore]
+fn g9_bench() {
+    use rand::{Rng as _, SeedableRng as _};
+
+    let _lock = prover_test_lock();
+    let Some(dir) = component_dir() else {
+        return;
+    };
+    let Some(mut prover) = build_or_refused(&dir) else {
+        return;
+    };
+    let specs = std::env::var("G9_VARIANTS").unwrap_or_else(|_| "base;all".into());
+    let variants: Vec<(String, Tuning)> = specs
+        .split(';')
+        .map(|s| {
+            (
+                s.to_string(),
+                Tuning::parse(s).expect("bad G9_VARIANTS item"),
+            )
+        })
+        .collect();
+    let reps: usize = std::env::var("G9_REPS").map_or(7, |v| v.parse().unwrap());
+    let profile = std::env::var("G9_PROFILE").as_deref() == Ok("1");
+    let c = &prover.coeffs;
+    eprintln!(
+        "G9 coefficients: A {} in {} rows, B {} in {} rows; witness {}, domain {}",
+        c.count_a,
+        c.ind_a - 1,
+        c.count_b,
+        c.ind_b - 1,
+        prover.witness_len(),
+        prover.domain_size()
+    );
+    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(9);
+    let mut witness = vec![0u8; prover.witness_len() * 32];
+    for e in witness.chunks_exact_mut(32) {
+        rng.fill(&mut e[..31]);
+    }
+    let opts = |tune| ProveOptions {
+        profile,
+        verbose: false,
+        tune,
+    };
+    // Warm-up (and the reference pre-blinding values) with the first variant.
+    let reference = prover
+        .prove_with_blinding(
+            &witness,
+            &opts(variants[0].1),
+            Fr::from(3u64),
+            Fr::from(5u64),
+        )
+        .unwrap()
+        .pre_blinding;
+    for (_, t) in &variants[1..] {
+        let p = prover
+            .prove_with_blinding(&witness, &opts(*t), Fr::from(3u64), Fr::from(5u64))
+            .unwrap();
+        if std::env::var_os("G9_NOCHECK").is_none() {
+            assert_eq!(p.pre_blinding, reference);
+        }
+    }
+    let mut gpu: Vec<Vec<f64>> = vec![Vec::new(); variants.len()];
+    let mut total: Vec<Vec<f64>> = vec![Vec::new(); variants.len()];
+    let mut stages: Vec<std::collections::BTreeMap<String, Vec<f64>>> =
+        vec![Default::default(); variants.len()];
+    for rep in 0..reps {
+        for (vi, (name, t)) in variants.iter().enumerate() {
+            let p = prover
+                .prove_with_blinding(&witness, &opts(*t), Fr::from(3u64), Fr::from(5u64))
+                .unwrap();
+            if std::env::var_os("G9_NOCHECK").is_none() {
+                assert_eq!(p.pre_blinding, reference, "variant {name} rep {rep}");
+            }
+            let st = &p.stats;
+            gpu[vi].push(st.gpu_total_ms());
+            total[vi].push(st.total_ms);
+            for (k, v) in &st.gpu_ms {
+                stages[vi].entry(k.clone()).or_default().push(*v);
+            }
+            eprintln!(
+                "G9BENCH rep {rep} {name}: gpu {:.1} total {:.1} ms [{}]",
+                st.gpu_total_ms(),
+                st.total_ms,
+                st.gpu_ms
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v:.1}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+    }
+    fn stat(v: &[f64]) -> String {
+        let mut s = v.to_vec();
+        s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        format!("{:.1} [{:.1}..{:.1}]", s[s.len() / 2], s[0], s[s.len() - 1])
+    }
+    for (vi, (name, _)) in variants.iter().enumerate() {
+        eprintln!(
+            "G9SUMMARY {name}: gpu {} total {} ms",
+            stat(&gpu[vi]),
+            stat(&total[vi])
+        );
+        for (k, v) in &stages[vi] {
+            eprintln!("G9SUMMARY {name}   {k}: {}", stat(v));
+        }
+    }
+}

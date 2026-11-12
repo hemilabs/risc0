@@ -38,6 +38,7 @@
 //                             7 piece_bucket uint[wcount * max_pieces] (out)
 //                             8 constant MsmParams
 //   Grid: (max_pieces, wcount) threads; thread (p, wl) handles piece p of window w0 + wl.
+//   With MsmParams::booth (item G9), a sorted entry with MSM_NEG adds the negated point.
 // msm_segment_reduce_{g1,g2}  0 pieces  1 piece_bucket  2 totals
 //                             3 partial Xyzz[nwins * max_segs] (out)  4 constant MsmParams
 //   Grid: (max_segs, wcount) threads; partial[w][s] = sum over the segment's pieces of
@@ -47,6 +48,7 @@
 //   Grid: nwins threadgroups of a power-of-two width; wsum[w] = sum of window w's partials.
 
 #include "bn254.h"
+#include "bn254_fast.h"
 #include "msm_common.h"
 
 using namespace metal;
@@ -103,12 +105,19 @@ kernel void msm_buckets(const device Affine<F>* points [[buffer(0)]],
 
   const device uint32_t* idx = sorted + (size_t)w * p.n;
   Xyzz<F> acc = Xyzz<F>::inf();
+  // Booth sorts flag negative digits in the index (MSM_NEG): add -P.
+  const uint32_t imask = p.booth ? ~MSM_NEG : ~0u;
   for (uint32_t k = start; k < end; k++) {
-    uint32_t i = idx[k];
+    uint32_t e = idx[k];
+    uint32_t i = e & imask;
     if (i >= p.first) {
       uint32_t j = i - p.first;
-      if (j < p.npoints) // guaranteed by the host; keeps a bad call in bounds
-        acc = acc.add_affine(points[j]);
+      if (j < p.npoints) { // guaranteed by the host; keeps a bad call in bounds
+        Affine<F> q = points[j];
+        if (e & ~imask)
+          q = q.neg();
+        acc = acc.add_affine(q);
+      }
     }
   }
   const size_t out = (size_t)wl * p.max_pieces + pc;
@@ -185,6 +194,9 @@ kernel void msm_window_reduce(const device Xyzz<F>* partial [[buffer(0)]],
 }
 
 // Explicit instantiations, written out (build.rs reads the host_name strings literally).
+// `_g1`/`_g2`: bn254.h's Fp / Fp2. `_g1w`/`_g2w` (item G9): bn254_fast.h's FpF / Fp2L, the same
+// values with the 64-bit-accumulate (no-carry CIOS) Montgomery multiplication and, for G2,
+// unreduced Karatsuba sums (same buffers and layouts).
 template [[host_name("msm_buckets_g1")]] kernel void
 msm_buckets<Fp>(const device Affine<Fp>*, const device uint32_t*, const device uint32_t*,
                  const device uint32_t*, const device uint32_t*, const device uint32_t*,
@@ -205,3 +217,23 @@ msm_segment_reduce<Fp2>(const device Xyzz<Fp2>*, const device uint32_t*, const d
 template [[host_name("msm_window_reduce_g2")]] kernel void
 msm_window_reduce<Fp2>(const device Xyzz<Fp2>*, const device uint32_t*, device Xyzz<Fp2>*,
                        constant MsmParams&, threadgroup Xyzz<Fp2>*, uint, uint, uint);
+template [[host_name("msm_buckets_g1w")]] kernel void
+msm_buckets<FpF>(const device Affine<FpF>*, const device uint32_t*, const device uint32_t*,
+                 const device uint32_t*, const device uint32_t*, const device uint32_t*,
+                 device Xyzz<FpF>*, device uint32_t*, constant MsmParams&, uint2);
+template [[host_name("msm_segment_reduce_g1w")]] kernel void
+msm_segment_reduce<FpF>(const device Xyzz<FpF>*, const device uint32_t*, const device uint32_t*,
+                        device Xyzz<FpF>*, constant MsmParams&, uint2);
+template [[host_name("msm_window_reduce_g1w")]] kernel void
+msm_window_reduce<FpF>(const device Xyzz<FpF>*, const device uint32_t*, device Xyzz<FpF>*,
+                       constant MsmParams&, threadgroup Xyzz<FpF>*, uint, uint, uint);
+template [[host_name("msm_buckets_g2w")]] kernel void
+msm_buckets<Fp2L>(const device Affine<Fp2L>*, const device uint32_t*, const device uint32_t*,
+                 const device uint32_t*, const device uint32_t*, const device uint32_t*,
+                 device Xyzz<Fp2L>*, device uint32_t*, constant MsmParams&, uint2);
+template [[host_name("msm_segment_reduce_g2w")]] kernel void
+msm_segment_reduce<Fp2L>(const device Xyzz<Fp2L>*, const device uint32_t*, const device uint32_t*,
+                        device Xyzz<Fp2L>*, constant MsmParams&, uint2);
+template [[host_name("msm_window_reduce_g2w")]] kernel void
+msm_window_reduce<Fp2L>(const device Xyzz<Fp2L>*, const device uint32_t*, device Xyzz<Fp2L>*,
+                       constant MsmParams&, threadgroup Xyzz<Fp2L>*, uint, uint, uint);

@@ -17,4 +17,10 @@ SYCL prover in `../intel` is the template.
   indices documented at the top of each file, `[[max_total_threads_per_threadgroup(N)]]` before
   `kernel void`, `Fp(0)` rather than `= 0`, threadgroup memory at most 32768 bytes (asserted on
   the host), BN254 arithmetic in 32-bit limbs.
+- `bn254_fast.h` (item G9) adds faster formulations next to `bn254.h` (whose functions and
+  semantics stay as they are for Z10): Montgomery multiplication with 32x32->64-bit
+  multiply-accumulates (`mul_wide`, gnark's no-carry `mul_nc`), the field types `FpF`/`FrF`/`Fp2L`
+  (same layout and values as `Fp`/`Fr`/`Fp2`) that the `_g1w`/`_g2w` MSM and `_w` NTT kernels
+  instantiate. `g9_bench.metal` holds the micro-benchmarks of the variants (tests.rs
+  `g9_fast_field_ops`), including the rejected ones (see docs/metal-port/notes/G9.md).
 - With no `.metal` file present the metallib is an empty file and the name list is empty.
