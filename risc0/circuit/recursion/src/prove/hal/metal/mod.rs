@@ -27,15 +27,24 @@
 //! re-proves every proof on the CPU with the same deterministic noise and requires identical
 //! seals (C9 validation knob).
 //!
-//! PSOs: the base kernels (C1's hand-written ones and C2's four step wrappers, ~7 s cold) are
-//! built once per process on first use; the eval_check PSOs (monolith ~20-60 s cold, split ~8 s,
-//! C3/C4 notes) are built lazily for the variant `RISC0_METAL_REC_KERNELS` selects, the first
-//! time a phase asks for them or by [warmup] on a background thread. Never per proof.
+//! PSOs: the base kernels (C1's hand-written ones and C2's four step wrappers) are built once per
+//! process on first use; the eval_check PSOs are built lazily for the variant
+//! `RISC0_METAL_REC_KERNELS` selects (split by default since C11), the first time a phase asks for
+//! them or by [warmup] on a background thread. Never per proof. Each set builds on parallel
+//! threads (C11, [Pipelines]): cold (no OS shader cache) base ~3 s and split ~2.2 s here, against
+//! 5-6 s and 7 s sequential and 36 s for the monolith.
+//!
+//! Measurement aids (C11, off by default): `RISC0_METAL_REC_PROFILE=1` ([profile]) and
+//! `RISC0_METAL_REC_CAPTURE=<dir>` ([capture]).
 
 mod accum;
 #[cfg(all(test, feature = "test"))]
 mod c10_tests;
+#[cfg(all(test, feature = "test"))]
+mod c11_tests;
+pub(crate) mod capture;
 mod eval_check;
+pub(crate) mod profile;
 #[cfg(all(test, feature = "test"))]
 mod tests;
 mod witgen;
@@ -54,8 +63,8 @@ use risc0_zkp::{
     field::baby_bear::BabyBearExtElem,
     hal::{
         metal::{
-            BufferImpl, MetalHal, MetalHalPoseidon2, MetalHalPoseidon254, MetalHalSha256,
-            MetalHash, MetalHashPoseidon2, MetalHashPoseidon254, MetalHashSha256, MetalKernels,
+            BufferImpl, Grid, MetalHal, MetalHalPoseidon2, MetalHalPoseidon254, MetalHalSha256,
+            MetalHash, MetalHashPoseidon2, MetalHashPoseidon254, MetalHashSha256,
         },
         Buffer as _,
     },
@@ -66,8 +75,9 @@ use crate::prove::{
     RecursionReceipt,
 };
 
-/// Environment variable selecting the eval_check kernels: `monolith` (default) or `split`
-/// (PLAN 2.0; decided by measurement in C11).
+/// Environment variable selecting the eval_check kernels: `split` (default since C11) or
+/// `monolith` (PLAN 2.0). C11 measured the split 31 % faster per lift/join/resolve proof at po2 18
+/// (interleaved A/B on captured zkvm proofs) and ~5x cheaper to build cold (7.5 s vs 36 s).
 pub(crate) const REC_KERNELS_ENV: &str = "RISC0_METAL_REC_KERNELS";
 
 /// The monolithic eval_check entry point (C3, `cuda2metal_eval.py`).
@@ -93,21 +103,21 @@ impl EvalKernels {
     /// Parse a `RISC0_METAL_REC_KERNELS` value; `None` for an unknown one.
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "" | "monolith" | "mono" | "eval_check" => Some(Self::Monolith),
-            "split" | "ec_part" => Some(Self::Split),
+            "monolith" | "mono" | "eval_check" => Some(Self::Monolith),
+            "" | "split" | "ec_part" => Some(Self::Split),
             _ => None,
         }
     }
 
-    /// The process-wide selection (read once): `RISC0_METAL_REC_KERNELS`, default monolith.
+    /// The process-wide selection (read once): `RISC0_METAL_REC_KERNELS`, default split (C11).
     pub(crate) fn selected() -> Self {
         static SEL: OnceLock<EvalKernels> = OnceLock::new();
         *SEL.get_or_init(|| match std::env::var(REC_KERNELS_ENV) {
             Ok(v) => Self::parse(&v).unwrap_or_else(|| {
-                tracing::warn!("{REC_KERNELS_ENV}={v:?} is not monolith|split; using monolith");
-                Self::Monolith
+                tracing::warn!("{REC_KERNELS_ENV}={v:?} is not monolith|split; using split");
+                Self::Split
             }),
-            Err(_) => Self::Monolith,
+            Err(_) => Self::Split,
         })
     }
 
@@ -125,12 +135,119 @@ fn is_eval_kernel(name: &str) -> bool {
     EVAL_MONOLITH.contains(&name) || EVAL_SPLIT.contains(&name)
 }
 
+/// Environment variable (read once): threads that build the recursion PSOs. Default
+/// `available_parallelism()`; `1` is the pre-C11 sequential build. C11 measured the cold build
+/// (OS shader cache off) of the base kernels 5.4-6.0 s -> 2.9 s and of the split eval_check
+/// 6.6-8.0 s -> 2.0-2.6 s on parallel threads (each PSO compiles on its own thread).
+pub(crate) const PSO_THREADS_ENV: &str = "RISC0_METAL_REC_PSO_THREADS";
+
+fn pso_threads() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var(PSO_THREADS_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()))
+    })
+}
+
+/// A set of PSOs from one metallib, built on up to [pso_threads] threads (C11). The same API as
+/// zkp's `MetalKernels` (which builds sequentially).
+pub(crate) struct Pipelines {
+    pipelines: std::collections::HashMap<String, ComputePipelineState>,
+}
+
+impl Pipelines {
+    /// Load `bytes` once and build a PSO for each of `names` on up to `threads` threads. Fails on
+    /// a missing name or a PSO the device rejects (the first error in `names` order).
+    pub(crate) fn new(
+        device: &DeviceRef,
+        bytes: &[u8],
+        names: &[&str],
+        threads: usize,
+    ) -> Result<Self> {
+        let library = device
+            .new_library_with_data(bytes)
+            .map_err(|e| anyhow!("loading metallib ({} bytes): {e}", bytes.len()))?;
+        let available = library.function_names();
+        let missing: Vec<&str> = names
+            .iter()
+            .copied()
+            .filter(|name| !available.iter().any(|a| a == name))
+            .collect();
+        if !missing.is_empty() {
+            bail!("metallib is missing kernel(s): {}", missing.join(", "));
+        }
+        let build = |name: &str| -> Result<ComputePipelineState> {
+            // Off the main thread: give each PSO its own autorelease pool (K5).
+            metal::objc::rc::autoreleasepool(|| {
+                let function = library
+                    .get_function(name, None)
+                    .map_err(|e| anyhow!("metallib function {name}: {e}"))?;
+                device
+                    .new_compute_pipeline_state_with_function(&function)
+                    .map_err(|e| anyhow!("compute pipeline for {name}: {e}"))
+            })
+        };
+        let threads = threads.clamp(1, names.len().max(1));
+        let built: Vec<Result<ComputePipelineState>> = if threads == 1 {
+            names.iter().map(|n| build(n)).collect()
+        } else {
+            let next = AtomicUsize::new(0);
+            let slots: Mutex<Vec<Option<Result<ComputePipelineState>>>> =
+                Mutex::new((0..names.len()).map(|_| None).collect());
+            std::thread::scope(|s| {
+                for _ in 0..threads {
+                    s.spawn(|| loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= names.len() {
+                            break;
+                        }
+                        let r = build(names[i]);
+                        slots.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(r);
+                    });
+                }
+            });
+            slots
+                .into_inner()
+                .unwrap_or_else(|e| e.into_inner())
+                .into_iter()
+                .map(|r| r.unwrap_or_else(|| Err(anyhow!("PSO build thread panicked"))))
+                .collect()
+        };
+        let mut pipelines = std::collections::HashMap::with_capacity(names.len());
+        for (name, pso) in names.iter().zip(built) {
+            pipelines.insert(name.to_string(), pso?);
+        }
+        Ok(Self { pipelines })
+    }
+
+    /// The PSO for `name`; panics (a programming error, plan 2.9) if it was not built.
+    pub(crate) fn pipeline(&self, name: &str) -> &ComputePipelineState {
+        self.get(name)
+            .unwrap_or_else(|| panic!("recursion Metal kernel {name} was not loaded"))
+    }
+
+    pub(crate) fn get(&self, name: &str) -> Option<&ComputePipelineState> {
+        self.pipelines.get(name)
+    }
+
+    pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
+        self.pipelines.keys().map(String::as_str)
+    }
+}
+
+/// The selected eval_check variant's PSOs (process-wide, independent of the base kernels so
+/// [warmup] can build both at once).
+static EVAL_KERNELS: OnceLock<std::result::Result<(EvalKernels, Pipelines), String>> =
+    OnceLock::new();
+
 /// The recursion metallib's PSOs: every [METAL_KERNEL_NAMES] entry except the eval_check ones
-/// eagerly, the selected eval_check variant lazily. One instance per process (one Metal device),
-/// like the zkp PSO cache.
+/// eagerly, the selected eval_check variant lazily ([EVAL_KERNELS]). One instance per process (one
+/// Metal device), like the zkp PSO cache.
 pub(crate) struct RecursionKernels {
-    base: MetalKernels,
-    eval: OnceLock<std::result::Result<(EvalKernels, MetalKernels), String>>,
+    base: Pipelines,
 }
 
 impl RecursionKernels {
@@ -148,16 +265,13 @@ impl RecursionKernels {
             .filter(|name| !is_eval_kernel(name))
             .collect();
         let t0 = std::time::Instant::now();
-        let base = MetalKernels::new(device, METAL_LIB, &base)?;
+        let base = Pipelines::new(device, METAL_LIB, &base, pso_threads())?;
         tracing::debug!(
             "recursion Metal: {} base PSOs in {:.2}s",
             base.names().count(),
             t0.elapsed().as_secs_f64()
         );
-        Ok(Self {
-            base,
-            eval: OnceLock::new(),
-        })
+        Ok(Self { base })
     }
 
     /// The process-wide instance, built on `device` on first use. Takes no GPU lock (PSO creation
@@ -178,22 +292,90 @@ impl RecursionKernels {
 
     /// The selected eval_check variant and its PSOs, built on first call (cold: tens of seconds
     /// for the monolith; warm the process with [warmup]).
-    pub(crate) fn eval(&self, device: &DeviceRef) -> Result<(EvalKernels, &MetalKernels)> {
-        let entry = self.eval.get_or_init(|| {
-            let variant = EvalKernels::selected();
-            let t0 = std::time::Instant::now();
-            let kernels = MetalKernels::new(device, METAL_LIB, variant.names())
-                .map_err(|e| format!("{e:#}"))?;
-            tracing::debug!(
-                "recursion Metal: eval_check {variant:?} PSOs in {:.2}s",
-                t0.elapsed().as_secs_f64()
-            );
-            Ok((variant, kernels))
-        });
-        match entry {
-            Ok((variant, kernels)) => Ok((*variant, kernels)),
-            Err(e) => Err(anyhow!("building the recursion eval_check PSOs: {e}")),
+    pub(crate) fn eval(&self, device: &DeviceRef) -> Result<(EvalKernels, &'static Pipelines)> {
+        eval_kernels(device)
+    }
+}
+
+/// The selected eval_check variant and its PSOs, built on first call (see
+/// [RecursionKernels::eval]).
+pub(crate) fn eval_kernels(device: &DeviceRef) -> Result<(EvalKernels, &'static Pipelines)> {
+    let entry = EVAL_KERNELS.get_or_init(|| {
+        let variant = EvalKernels::selected();
+        let t0 = std::time::Instant::now();
+        let kernels = Pipelines::new(device, METAL_LIB, variant.names(), pso_threads())
+            .map_err(|e| format!("{e:#}"))?;
+        tracing::debug!(
+            "recursion Metal: eval_check {variant:?} PSOs in {:.2}s",
+            t0.elapsed().as_secs_f64()
+        );
+        Ok((variant, kernels))
+    });
+    match entry {
+        Ok((variant, kernels)) => Ok((*variant, kernels)),
+        Err(e) => Err(anyhow!("building the recursion eval_check PSOs: {e}")),
+    }
+}
+
+/// Which launch-width knob a dispatch follows (C11 threadgroup sweep).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TgKind {
+    /// The eval_check dispatches: `RISC0_METAL_REC_EVAL_TG`.
+    Eval = 0,
+    /// The four step kernels (exec, verify WOM, compute/verify accum): `RISC0_METAL_REC_STEP_TG`.
+    Step = 1,
+}
+
+const TG_ENVS: [&str; 2] = ["RISC0_METAL_REC_EVAL_TG", "RISC0_METAL_REC_STEP_TG"];
+
+thread_local! {
+    /// Test override of the knobs (sweeps in one process).
+    static TG_OVERRIDE: std::cell::Cell<[Option<u64>; 2]> = const { std::cell::Cell::new([None; 2]) };
+}
+
+/// Run `f` with the threadgroup width of `kind` forced to `tg` (0 = default) on this thread.
+#[allow(dead_code)]
+pub(crate) fn with_tg<R>(kind: TgKind, tg: u64, f: impl FnOnce() -> R) -> R {
+    let old = TG_OVERRIDE.with(|c| c.get());
+    let mut v = old;
+    v[kind as usize] = Some(tg);
+    TG_OVERRIDE.with(|c| c.set(v));
+    struct Restore([Option<u64>; 2]);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TG_OVERRIDE.with(|c| c.set(self.0));
         }
+    }
+    let _restore = Restore(old);
+    f()
+}
+
+/// The 1-D grid of `n` threads for a dispatch of `kind`: the default `Grid::Threads` (threadgroups
+/// of min(256, PSO max)) unless the knob or a test override names a width; that width is clamped
+/// to the PSO's `maxTotalThreadsPerThreadgroup` and rounded down to whole SIMD groups (no core
+/// count involved). Every kernel bounded this way checks `gid` against its thread count.
+pub(crate) fn grid_1d(kind: TgKind, pso: &ComputePipelineState, n: u64) -> Grid {
+    static ENV: OnceLock<[u64; 2]> = OnceLock::new();
+    let env = ENV.get_or_init(|| {
+        std::array::from_fn(|i| {
+            std::env::var(TG_ENVS[i])
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0)
+        })
+    });
+    let tg = TG_OVERRIDE
+        .with(|c| c.get()[kind as usize])
+        .unwrap_or(env[kind as usize]);
+    if tg == 0 {
+        return Grid::Threads(n);
+    }
+    let simd = pso.thread_execution_width().max(1);
+    let tg = tg.min(pso.max_total_threads_per_threadgroup());
+    let tg = (tg / simd * simd).max(simd);
+    Grid::Groups {
+        groups: metal::MTLSize::new(n.div_ceil(tg), 1, 1),
+        threads: metal::MTLSize::new(tg, 1, 1),
     }
 }
 
@@ -304,7 +486,7 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
 
     /// The selected eval_check variant and its PSOs (built on first use).
     #[allow(dead_code)]
-    pub(crate) fn eval_kernels(&self) -> Result<(EvalKernels, &'static MetalKernels)> {
+    pub(crate) fn eval_kernels(&self) -> Result<(EvalKernels, &'static Pipelines)> {
         self.kernels.eval(&self.hal.device)
     }
 
@@ -332,9 +514,28 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
     }
 
     /// Count a call of `phase` and record the device allocation (PLAN 9.1 peak per phase).
+    /// Under [PROFILE_ENV], also close the profile interval of the GPU work queued before it.
     pub(crate) fn enter(&self, phase: Phase) {
         PHASE_CALLS[phase as usize].fetch_add(1, Ordering::Relaxed);
+        if profile::enabled() {
+            match phase {
+                Phase::Witgen => {
+                    let _ = self.sync();
+                    profile::start();
+                }
+                Phase::Accum => self.prof_mark("pre_accum"),
+                Phase::EvalCheck => self.prof_mark("pre_eval"),
+            }
+        }
         self.record(phase);
+    }
+
+    /// Under [PROFILE_ENV]: sync, then record the wall time since the previous mark as `label`.
+    pub(crate) fn prof_mark(&self, label: &'static str) {
+        if profile::enabled() {
+            let _ = self.sync();
+            profile::mark(label);
+        }
     }
 
     /// Record the device's current allocation as a candidate peak of `phase`.
@@ -390,8 +591,15 @@ pub(crate) unsafe fn host_slice<T: Clone>(buf: &BufferImpl<T>) -> &[T] {
 pub(crate) fn warmup() -> Result<()> {
     let device = metal::Device::system_default().ok_or_else(|| anyhow!("no Metal device"))?;
     let t0 = std::time::Instant::now();
-    let kernels = RecursionKernels::get(&device)?;
-    kernels.eval(&device)?;
+    // Base and eval_check PSOs at once (each set also builds on parallel threads, C11).
+    std::thread::scope(|s| {
+        let eval = s.spawn(|| eval_kernels(&device).map(|_| ()));
+        let base = RecursionKernels::get(&device).map(|_| ());
+        base.and(
+            eval.join()
+                .unwrap_or_else(|_| Err(anyhow!("eval PSO thread panicked"))),
+        )
+    })?;
     drop(MetalHalPoseidon2::new());
     tracing::debug!("recursion Metal warmup: {:.2}s", t0.elapsed().as_secs_f64());
     Ok(())
@@ -544,6 +752,14 @@ pub(crate) fn p254_on_metal() -> bool {
 
 pub(crate) fn recursion_prover(hashfn: &str) -> Result<Box<dyn RecursionProver>> {
     let metal = metal_recursion_prover(hashfn)?;
+    let metal = match std::env::var_os(capture::CAPTURE_ENV) {
+        Some(dir) if !dir.is_empty() => Box::new(capture::CaptureProver {
+            inner: metal,
+            dir: dir.into(),
+            hashfn: hashfn.to_string(),
+        }),
+        _ => metal,
+    };
     let cpu_p254 = hashfn == "poseidon_254" && !p254_on_metal();
     if seal_check_enabled() && !cpu_p254 {
         tracing::warn!("{SEAL_CHECK_ENV}=1: every recursion proof is re-proved on the CPU");
@@ -602,7 +818,7 @@ mod c5_tests {
 
     #[test]
     fn eval_kernels_parse() {
-        assert_eq!(EvalKernels::parse(""), Some(EvalKernels::Monolith));
+        assert_eq!(EvalKernels::parse(""), Some(EvalKernels::Split));
         assert_eq!(EvalKernels::parse("monolith"), Some(EvalKernels::Monolith));
         assert_eq!(EvalKernels::parse(" Split "), Some(EvalKernels::Split));
         assert_eq!(EvalKernels::parse("bogus"), None);

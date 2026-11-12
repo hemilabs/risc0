@@ -163,6 +163,64 @@ static WITGEN_CHECK: LazyLock<bool> =
 /// Witgens compared by `RISC0_METAL_REC_WITGEN_CHECK`.
 pub(crate) static WITGEN_CHECKED: AtomicUsize = AtomicUsize::new(0);
 
+/// `RISC0_METAL_REC_ROW_PASSES` (read once): `1` turns on the witness-buffer row passes (C11
+/// sub-track; see `has_row_passes`). Off by default: C11's interleaved A/B found no change.
+pub(crate) const ROW_PASSES_ENV: &str = "RISC0_METAL_REC_ROW_PASSES";
+
+thread_local! {
+    /// Test override of [ROW_PASSES_ENV].
+    static ROW_PASSES_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+fn row_passes_enabled() -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var(ROW_PASSES_ENV).as_deref() == Ok("1"));
+    ROW_PASSES_OVERRIDE.with(|c| c.get()).unwrap_or(*ON)
+}
+
+/// Run `f` with the row passes forced on or off on this thread (tests).
+#[allow(dead_code)]
+pub(crate) fn with_row_passes<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let old = ROW_PASSES_OVERRIDE.with(|c| c.replace(Some(on)));
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ROW_PASSES_OVERRIDE.with(|c| c.set(self.0));
+        }
+    }
+    let _r = Restore(old);
+    f()
+}
+
+/// `RecRowParams` (recursion-sys/kernels/metal/context.h), bound with `set_bytes`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct RecRowParams {
+    pub log_rows: u32,
+    pub live: u32,
+    pub cols: u32,
+    pub zk: u32,
+    pub value: u32,
+    pub _pad: [u32; 3],
+}
+const _: () = assert!(std::mem::size_of::<RecRowParams>() == 32);
+
+/// (log2 rows, columns) of a column-major buffer of `rows` (a power of two, >= 4) rows per column
+/// (as hip.rs; the kernels work on row quads).
+fn row_shape(buf: &BufferImpl<BabyBearElem>, rows: usize) -> Result<(u32, u32)> {
+    ensure!(
+        rows.is_power_of_two() && rows >= 4 && buf.size().is_multiple_of(rows),
+        "row passes: {} elements in rows of {rows}",
+        buf.size()
+    );
+    let cols = buf.size() / rows;
+    ensure!(
+        cols <= u32::MAX as usize && buf.size() / 4 <= u32::MAX as usize,
+        "row passes: buffer too large"
+    );
+    Ok((rows.trailing_zeros(), cols as u32))
+}
+
 /// The canonical value of a raw (Montgomery) word, as CUDA's `Fp::asUInt32()` and the CPU
 /// `WomArgumentRow::operator<` (canonical `addr`, `Fp::operator<` on the value) compare them.
 #[inline]
@@ -587,7 +645,11 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
         self.hal.dispatch(
             k.pipeline("parStepExec"),
             &exec_args,
-            Grid::Threads(num_cycles as u64),
+            super::grid_1d(
+                super::TgKind::Step,
+                k.pipeline("parStepExec"),
+                num_cycles as u64,
+            ),
             &[],
         );
         self.check_fault(&fault, Phase::Witgen)?;
@@ -638,12 +700,21 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
         self.hal.dispatch(
             k.pipeline("parStepVerifyWom"),
             &verify_args,
-            Grid::Threads(num_cycles as u64),
+            super::grid_1d(
+                super::TgKind::Step,
+                k.pipeline("parStepVerifyWom"),
+                num_cycles as u64,
+            ),
             &[],
         );
         self.check_fault(&fault, Phase::Witgen)?;
         self.record(Phase::Witgen);
         let t_all = t0.elapsed();
+        super::profile::record("witgen.fill", ms(t_fill));
+        super::profile::record("witgen.host", ms(t_host - t_fill));
+        super::profile::record("witgen.exec", ms(t_exec - t_host));
+        super::profile::record("witgen.sort", ms(t_sort - t_exec));
+        super::profile::record("witgen.verify", ms(t_all - t_sort));
         tracing::debug!(
             "metal witgen: {num_cycles} cycles of {steps}, chains={}: fill {:.2}ms, host {:.2}ms, \
              exec {:.2}ms, sort+scan {:.2}ms, inject+verify {:.2}ms, total {:.2}ms",
@@ -754,12 +825,83 @@ impl<MH: MetalHash> CircuitWitnessGenerator<MetalHal<MH>> for MetalCircuitHal<MH
                 check_against_cpu(total_cycles, preflight, ctrl, data, global, data0, global0)
             }
             StepMode::Parallel => {
-                self.witgen_parallel(total_cycles, preflight, host_chains, ctrl, data, global)
+                self.witgen_parallel(total_cycles, preflight, host_chains, ctrl, data, global)?;
+                self.prof_mark("witgen");
+                Ok(())
             }
             StepMode::SeqForward | StepMode::SeqReverse => {
                 self.witgen_cpu(mode, total_cycles, preflight, ctrl, data, global)
             }
         }
+    }
+
+    /// C11 row passes (CUDA/HIP `recInitRows`/`recFillTail`/`recZeroizeRows`, C1's kernels):
+    /// on under [ROW_PASSES_ENV]. The generic path fills all of `data` with INVALID and zeroizes
+    /// all of it; the row passes write zero (not INVALID) past the live rows and zeroize only
+    /// the live rows. Validated by `RISC0_HIP_REC_ZCHECK=1` (prove/witgen.rs) and `c11_tests`.
+    fn has_row_passes(&self) -> bool {
+        row_passes_enabled()
+    }
+
+    fn init_rows(&self, buf: &BufferImpl<BabyBearElem>, rows: usize, live: usize) -> Result<()> {
+        let (log_rows, cols) = row_shape(buf, rows)?;
+        let p = RecRowParams {
+            log_rows,
+            live: live.min(rows) as u32,
+            cols,
+            ..Default::default()
+        };
+        let quads = (buf.size() / 4) as u64;
+        self.hal.dispatch(
+            self.kernels().pipeline("recInitRows"),
+            &[buf.as_arg(), KernelArg::Bytes(bytemuck::bytes_of(&p))],
+            Grid::Threads(quads),
+            &[],
+        );
+        Ok(())
+    }
+
+    fn fill_tail(
+        &self,
+        buf: &BufferImpl<BabyBearElem>,
+        rows: usize,
+        zk: usize,
+        value: BabyBearElem,
+    ) -> Result<()> {
+        let (log_rows, cols) = row_shape(buf, rows)?;
+        ensure!(zk <= rows, "fill_tail: {zk} rows of {rows}");
+        let p = RecRowParams {
+            log_rows,
+            cols,
+            zk: zk as u32,
+            value: value.as_u32_montgomery(),
+            ..Default::default()
+        };
+        self.hal.dispatch(
+            self.kernels().pipeline("recFillTail"),
+            &[buf.as_arg(), KernelArg::Bytes(bytemuck::bytes_of(&p))],
+            Grid::Threads(zk as u64 * cols as u64),
+            &[],
+        );
+        Ok(())
+    }
+
+    fn zeroize_rows(&self, buf: &BufferImpl<BabyBearElem>, rows: usize, live: usize) -> Result<()> {
+        let (log_rows, cols) = row_shape(buf, rows)?;
+        let live = live.min(rows) as u32;
+        let p = RecRowParams {
+            log_rows,
+            live,
+            cols,
+            ..Default::default()
+        };
+        self.hal.dispatch(
+            self.kernels().pipeline("recZeroizeRows"),
+            &[buf.as_arg(), KernelArg::Bytes(bytemuck::bytes_of(&p))],
+            Grid::Threads2D(live.div_ceil(4) as u64, cols as u64),
+            &[],
+        );
+        Ok(())
     }
 
     /// Errata 8.4: a host-generated witness is copied into the shared `data` / `global` buffers
