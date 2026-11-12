@@ -14,6 +14,58 @@ Usage: python3 gen_multipass.py <mono_amalg.cpp> <pass1_output.cpp> <pass2_outpu
 import re
 import sys
 
+# --- v3.1.0 rebase: multipass deferred -------------------------------------
+# Every constant below (the v10->v9 split boundary, CROSS_X33_INDICES,
+# BOUNDARY_BYVAL_EXTS, CROSS_X34_INDICES, the v9 arg mapping, and PM=458 in the
+# kernel wrappers) is pinned to the PRE-3.1.0 circuit DAG. risc0 v3.1.0
+# regenerated the rv32im circuit: the split function's arg2 is no longer the
+# x34 FpExt array (so pass1 no longer compiles), the cross-boundary live-set
+# differs, and poly_mix is now 484 wide, not 458. A wrong derivation would not
+# fail to build loudly -- it would emit a silently-incorrect kernel.
+#
+# Multipass is an opt-in, off-by-default perf experiment (RISC0_MULTIPASS),
+# set nowhere in production; the shipping Intel path is the mono
+# RISC0_INTEL_EVAL_FAST kernel. Until the cross-boundary live-set is re-derived
+# for the v3.1.0 circuit, emit stub pass1/pass2 entry points that fail loudly
+# at runtime instead of generating wrong code. Flip to True (and re-derive the
+# constants below) to re-enable. Kept parallel to the deferred ROCm gfx12 WMMA
+# perf path. See risc0-v3.1.0-rebase notes.
+MULTIPASS_SUPPORTED = False
+
+
+def gen_stub(pass_num):
+    """A pass1/pass2 translation unit that defines only the extern "C" entry
+    point and returns a clear error, so the crate still links and the mono
+    path is unaffected, but setting RISC0_MULTIPASS fails loudly rather than
+    proving with a mis-derived kernel."""
+    msg = (
+        "multipass eval_check is unavailable: its cross-boundary derivation in "
+        "gen_multipass.py has not been re-done for the risc0 v3.1.0 circuit. "
+        "Unset RISC0_MULTIPASS to use the production mono RISC0_INTEL_EVAL_FAST "
+        "kernel."
+    )
+    if pass_num == 1:
+        sig = (
+            'extern "C" const char* risc0_circuit_rv32im_intel_eval_check_pass1(\n'
+            '    void*, void*, void*, const void*, const void*, const void*, '
+            'const void*,\n    const void*, uint32_t)'
+        )
+    else:
+        sig = (
+            'extern "C" const char* risc0_circuit_rv32im_intel_eval_check_pass2(\n'
+            '    void*, void*, const void*, const void*, const void*, const void*, '
+            'const void*,\n    const void*, const void*, uint32_t, uint32_t, uint32_t)'
+        )
+    return (
+        "// Stub: multipass eval_check deferred for the v3.1.0 circuit\n"
+        "// (gen_multipass.py MULTIPASS_SUPPORTED=False).\n"
+        "#include <cstdint>\n#include <cstring>\n\n"
+        f"{sig} {{\n"
+        f'    return strdup("{msg}");\n'
+        "}\n"
+    )
+
+
 # Cross-boundary x33 indices (197 indices, computed from amalgamation analysis)
 CROSS_X33_INDICES = [
     123, 127, 130, 133, 135, 179, 184, 198, 207, 221, 247, 278, 279, 280, 282, 292,
@@ -389,6 +441,19 @@ def main():
     mono_path = sys.argv[1]
     pass1_path = sys.argv[2]
     pass2_path = sys.argv[3]
+
+    if not MULTIPASS_SUPPORTED:
+        with open(pass1_path, 'w') as f:
+            f.write(gen_stub(1))
+        with open(pass2_path, 'w') as f:
+            f.write(gen_stub(2))
+        print(
+            "  gen_multipass: MULTIPASS_SUPPORTED=False -- wrote stub pass1/pass2; "
+            "multipass deferred for the v3.1.0 circuit, mono RISC0_INTEL_EVAL_FAST "
+            "is the production path",
+            file=sys.stderr,
+        )
+        return
 
     with open(mono_path) as f:
         content = f.read()
