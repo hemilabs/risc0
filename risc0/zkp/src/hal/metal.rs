@@ -35,6 +35,7 @@ mod kernels;
 mod mdiv;
 mod ntt;
 mod poseidon2;
+mod poseidon254;
 mod runtime;
 mod small;
 #[cfg(test)]
@@ -55,6 +56,8 @@ mod tests_z7;
 mod tests_z8b;
 #[cfg(test)]
 mod tests_r17;
+#[cfg(test)]
+mod tests_z10;
 
 use std::{
     fmt::Debug,
@@ -81,6 +84,7 @@ pub use self::{
     buffer::BufferImpl,
     kernels::MetalKernels,
     poseidon2::{MetalHashPoseidon2, Poseidon2Config, Poseidon2Kernels},
+    poseidon254::{MetalHashPoseidon254, Poseidon254Config, Poseidon254Kernels},
     runtime::{
         as_bytes, BudgetScope, Grid, KernelArg, BUDGET_SCOPE_ENV, DEFAULT_BATCH_DISPATCHES,
         MAX_SET_BYTES, MAX_WORKING_SET_ENV,
@@ -167,6 +171,13 @@ pub const KERNEL_NAMES: &[&str] = &[
     "mdiv_scan_512",
     "mdiv_scan_1024",
     "mdiv_final",
+    // poseidon254.metal (Z10)
+    "p254_fold_ref",
+    "p254_fold_w64",
+    "p254_fold_w64c",
+    "p254_rows_ref",
+    "p254_rows_w64",
+    "p254_rows_w64c",
 ];
 
 /// Whether the Metal backend may be used for `unit` (one of `zkp`, `rv32im`, `recursion`,
@@ -356,6 +367,7 @@ impl<MH: MetalHash> Debug for MetalHal<MH> {
 
 pub type MetalHalSha256 = MetalHal<MetalHashSha256>;
 pub type MetalHalPoseidon2 = MetalHal<MetalHashPoseidon2>;
+pub type MetalHalPoseidon254 = MetalHal<MetalHashPoseidon254>;
 
 impl<MH: MetalHash> Default for MetalHal<MH> {
     fn default() -> Self {

@@ -405,6 +405,7 @@ fn build_metal_kernels() {
             "pv.metal",
             "eval.metal",
             "mdiv.metal",
+            "poseidon254.metal",
         ],
     )];
 
@@ -417,6 +418,7 @@ fn build_metal_kernels() {
             .files(src_paths)
             .include(inc_path)
             .dep(inc_path.join("sha256.h"))
+            .dep(inc_path.join("bn254.h"))
             .compile(&out);
     }
 }
