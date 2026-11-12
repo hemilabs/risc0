@@ -101,7 +101,17 @@ pub(crate) const EXPECTED_KERNELS: &[(Phase, &[&str])] = &[
         ],
     ),
     // R9 (accum_tu.metal from accum_tu_gen.py --metal, misc.metal).
-    (Phase::Accum, &["stepAccumA", "finalizeZeroizeAccum"]),
+    (
+        Phase::Accum,
+        &[
+            "stepAccumA",
+            "finalizeZeroizeAccum",
+            // R13 (misc.metal): accum::SCAN_KERNELS.
+            "fpScanReduce",
+            "fpScanBlockSums",
+            "fpScanApply",
+        ],
+    ),
     // R12 evalfast (eval_check_ef.metal). The R10 baseline `eval_check` and R15e's
     // `ef_eval_split_r12` are built lazily by the eval_check host when selected (R15e).
     (Phase::EvalCheck, &["ef_eval_split", "ef_combine"]),

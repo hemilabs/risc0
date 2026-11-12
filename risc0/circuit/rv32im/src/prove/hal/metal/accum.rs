@@ -21,14 +21,21 @@
 //!    here with one counting sort per window. Same output with or without it: each cycle runs once
 //!    and writes only its own row. `RISC0_METAL_ACCUM_SORT=0` runs without a perm (the kernel's
 //!    `hasPerm = 0` path); `4..=24` picks the window (default [DEFAULT_SORT_WIN]).
-//! 2. **GPU batch**: zero the fault word (blit fill), `stepAccumA` (accum_tu.metal, R4) over
-//!    `lastCycle` threads; wait.
-//! 3. **CPU scans**: inclusive Fp prefix sums of the last 4 accum columns over `lastCycle` rows
-//!    (CUDA: 4 `cub::DeviceScan::InclusiveScan`; CPU: `std::inclusive_scan`). Fp addition is exact
-//!    and associative, so the sums equal both. A GPU scan is item R13.
-//! 4. **GPU batch**: `finalizeZeroizeAccum` (misc.metal, R1) over all rows: the machine columns get
+//! 2. **GPU**: zero the fault word (blit fill), `stepAccumA` (accum_tu.metal, R4) over
+//!    `lastCycle` threads.
+//! 3. **GPU scans** (R13): inclusive Fp prefix sums of the last 4 accum columns over `lastCycle`
+//!    rows (CUDA: 4 `cub::DeviceScan::InclusiveScan`; CPU: `std::inclusive_scan`) with misc.metal's
+//!    `fpScanReduce`, `fpScanBlockSums`, `fpScanApply` (reduce-then-scan, the 4 columns in each
+//!    dispatch). Fp addition of canonical words is exact and associative, so the sums equal both,
+//!    bit for bit; a non-canonical input sets fault bit 0x100 instead.
+//! 4. **GPU**: `finalizeZeroizeAccum` (misc.metal, R1) over all rows: the machine columns get
 //!    the previous row's running sums, every INVALID cell becomes 0. So
 //!    [CircuitAccumulator::step_accum_zeroizes] is true, as on CUDA.
+//!
+//! Steps 2-4 are encoded back to back and waited for once, at the end of the phase; the fault
+//! word is read after that wait. `RISC0_METAL_ACCUM_SCAN=cpu` keeps R9's sequence instead: wait
+//! after step 2 (and check the fault word), scan on the CPU ([fp_inclusive_scan]), then encode
+//! step 4 and wait.
 //!
 //! `RISC0_METAL_RV32IM_CPU_PHASES` (comma list of `witgen,accum,eval`) naming `accum` keeps the
 //! R7 path instead: the CPU accum kernel over host views of the Metal buffers (the prover then
@@ -40,6 +47,7 @@
 use std::sync::OnceLock;
 
 use anyhow::{bail, ensure, Result};
+use metal::MTLSize;
 use rayon::prelude::*;
 use risc0_circuit_rv32im_sys::{
     risc0_circuit_rv32im_cpu_accum, RawAccumBuffers, RawBuffer, RawPreflightCycle,
@@ -99,6 +107,43 @@ pub(crate) fn fp_inclusive_scan(col: &mut [u32]) {
     }
 }
 
+/// Where step 3 (the 4 prefix scans) runs: `gpu` (default, R13) or `cpu` (R9's host scans with
+/// a wait before them).
+pub(crate) const ACCUM_SCAN_ENV: &str = "RISC0_METAL_ACCUM_SCAN";
+
+/// Step 3's implementation (module docs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScanMode {
+    /// misc.metal's scan kernels, in the same batch as stepAccumA and finalizeZeroizeAccum.
+    Gpu,
+    /// R9: wait for stepAccumA, scan on the host, then finalize.
+    Cpu,
+}
+
+/// Parse an `RISC0_METAL_ACCUM_SCAN` value (unset or unknown: [ScanMode::Gpu]).
+pub(crate) fn parse_scan_mode(v: Option<&str>) -> ScanMode {
+    match v.map(str::trim) {
+        None | Some("") => ScanMode::Gpu,
+        Some(s) if s.eq_ignore_ascii_case("gpu") => ScanMode::Gpu,
+        Some(s) if s.eq_ignore_ascii_case("cpu") => ScanMode::Cpu,
+        Some(s) => {
+            tracing::error!("{ACCUM_SCAN_ENV}={s:?}: expected `gpu` or `cpu`; using gpu");
+            ScanMode::Gpu
+        }
+    }
+}
+
+fn scan_mode() -> ScanMode {
+    static MODE: OnceLock<ScanMode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        let mode = parse_scan_mode(std::env::var(ACCUM_SCAN_ENV).ok().as_deref());
+        if mode == ScanMode::Cpu {
+            tracing::info!("rv32im Metal accum: CPU prefix scans ({ACCUM_SCAN_ENV})");
+        }
+        mode
+    })
+}
+
 /// `RISC0_METAL_RV32IM_CPU_PHASES` names `accum` (read once per process).
 fn accum_on_cpu() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -127,6 +172,28 @@ pub(crate) fn parse_sort_win(v: Option<&str>) -> Option<u32> {
     }
 }
 
+/// `stepAccumA`'s threadgroup size (R15w): `RISC0_METAL_ACCUM_TG`; unset or 0 keeps the runtime's
+/// default (`min(256, PSO maximum)`). Otherwise capped by the PSO maximum and rounded down to the
+/// SIMD width (witgen.rs `witgen_tg`). Tests override it per thread (`tests::ACCUM_TG`).
+pub(crate) const ACCUM_TG_ENV: &str = "RISC0_METAL_ACCUM_TG";
+
+fn accum_tg() -> u64 {
+    #[cfg(test)]
+    if let Some(t) = tests::ACCUM_TG.with(std::cell::Cell::get) {
+        return t;
+    }
+    static TG: OnceLock<u64> = OnceLock::new();
+    *TG.get_or_init(
+        || match std::env::var(ACCUM_TG_ENV).ok().as_deref().map(str::trim) {
+            None | Some("") => 0,
+            Some(s) => s.parse().unwrap_or_else(|_| {
+                tracing::error!("{ACCUM_TG_ENV}={s:?} is not a number; using the default");
+                0
+            }),
+        },
+    )
+}
+
 fn sort_win() -> Option<u32> {
     static WIN: OnceLock<Option<u32>> = OnceLock::new();
     *WIN.get_or_init(|| parse_sort_win(std::env::var(ACCUM_SORT_ENV).ok().as_deref()))
@@ -136,31 +203,68 @@ fn sort_win() -> Option<u32> {
 /// within a major: the permutation of CUDA's stable radix sort over `majorKeys`' keys
 /// `(i >> win) << 8 | major`. One counting sort per window (windows in parallel).
 pub(crate) fn build_perm(cycles: &[RawPreflightCycle], win: u32, perm: &mut [u32]) {
+    build_perm_by(cycles, win, perm, |c| c.major)
+}
+
+/// [build_perm] with any 8-bit key: the cycles grouped by `key` within 2^win-row windows, rows
+/// ascending within a key (a stable counting sort per window). Witgen's major-grouped launch
+/// order uses it too (witgen.rs, R15w; HIP `wmsSort`'s permutations).
+pub(crate) fn build_perm_by(
+    cycles: &[RawPreflightCycle],
+    win: u32,
+    perm: &mut [u32],
+    key: impl Fn(&RawPreflightCycle) -> u8 + Sync,
+) {
     let n = cycles.len();
     assert!(perm.len() >= n);
     let w = 1usize << win.min(31);
     perm[..n]
         .par_chunks_mut(w)
         .enumerate()
-        .for_each(|(wi, out)| {
-            let base = wi * w;
-            let rows = &cycles[base..base + out.len()];
-            let mut next = [0u32; 256];
-            for c in rows {
-                next[c.major as usize] += 1;
-            }
-            let mut sum = 0;
-            for slot in next.iter_mut() {
-                let c = *slot;
-                *slot = sum;
-                sum += c;
-            }
-            for (i, c) in rows.iter().enumerate() {
-                let slot = &mut next[c.major as usize];
-                out[*slot as usize] = (base + i) as u32;
-                *slot += 1;
-            }
-        });
+        .for_each(|(wi, out)| perm_window(cycles, wi * w, out, &key));
+}
+
+/// [build_perm_by] on the calling thread only (no rayon): witgen builds its launch order on a
+/// thread of its own, overlapping the GPU setup, where rayon joins would wait on a busy pool
+/// (R15w fix round 1).
+pub(crate) fn build_perm_by_seq(
+    cycles: &[RawPreflightCycle],
+    win: u32,
+    perm: &mut [u32],
+    key: impl Fn(&RawPreflightCycle) -> u8,
+) {
+    let n = cycles.len();
+    assert!(perm.len() >= n);
+    let w = 1usize << win.min(31);
+    for (wi, out) in perm[..n].chunks_mut(w).enumerate() {
+        perm_window(cycles, wi * w, out, &key);
+    }
+}
+
+/// One window of [build_perm_by]: `out` gets the rows `base..base + out.len()` grouped by `key`
+/// (a stable counting sort).
+fn perm_window(
+    cycles: &[RawPreflightCycle],
+    base: usize,
+    out: &mut [u32],
+    key: &impl Fn(&RawPreflightCycle) -> u8,
+) {
+    let rows = &cycles[base..base + out.len()];
+    let mut next = [0u32; 256];
+    for c in rows {
+        next[key(c) as usize] += 1;
+    }
+    let mut sum = 0;
+    for slot in next.iter_mut() {
+        let c = *slot;
+        *slot = sum;
+        sum += c;
+    }
+    for (i, c) in rows.iter().enumerate() {
+        let slot = &mut next[key(c) as usize];
+        out[*slot as usize] = (base + i) as u32;
+        *slot += 1;
+    }
 }
 
 /// stepAccumA's `AccumParams` (accum_tu.metal, 48 bytes, static_assert'ed there).
@@ -198,17 +302,87 @@ const _: () = assert!(std::mem::size_of::<FinalizeAccumParams>() == 16);
 unsafe impl bytemuck::Zeroable for FinalizeAccumParams {}
 unsafe impl bytemuck::Pod for FinalizeAccumParams {}
 
-/// stepAccumA fault bits (rv32im-sys kernels/metal/cuda_compat.h `RV32IM_FAULT_*`; R17 gave
-/// `RV32IM_FAULT_ACCUM_PERM` its own bit, 0x40, distinct from witgen's cycle-index 0x20).
+/// The scan kernels' `FpScanParams` (misc.metal, 16 bytes).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct FpScanParams {
+    n: u32,
+    rows: u32,
+    col0: u32,
+    blocks: u32,
+}
+const _: () = assert!(std::mem::size_of::<FpScanParams>() == 16);
+// SAFETY: as above.
+unsafe impl bytemuck::Zeroable for FpScanParams {}
+unsafe impl bytemuck::Pod for FpScanParams {}
+
+/// misc.metal `FP_SCAN_PER_THREAD`: rows per thread of a scan block.
+const FP_SCAN_PER_THREAD: u32 = 4;
+
+/// Default scan threadgroup size (capped by the PSOs, rounded to the SIMD width).
+const FP_SCAN_TG: u64 = 256;
+
+/// Simdgroups per scan threadgroup the host allows (threadgroup memory index 1 holds one word
+/// each; the kernels scan them within one simdgroup, so also at most the SIMD width).
+const FP_SCAN_MAX_SIMDGROUPS: u64 = 32;
+
+/// The scan kernels (misc.metal), in dispatch order.
+pub(crate) const SCAN_KERNELS: [&str; 3] = ["fpScanReduce", "fpScanBlockSums", "fpScanApply"];
+
+/// Accum fault bits (rv32im-sys kernels/metal/cuda_compat.h `RV32IM_FAULT_*`; R17 gave
+/// `RV32IM_FAULT_ACCUM_PERM` its own bit, 0x40, distinct from witgen's cycle-index 0x20;
+/// `RV32IM_FAULT_ACCUM_SCAN` is defined in misc.metal next to fpScanReduce).
 const FAULT_ASSERT: u32 = 0x10;
 const FAULT_ACCUM_PERM: u32 = 0x40;
+const FAULT_ACCUM_SCAN: u32 = 0x100;
+
+/// An error naming the bits of a nonzero accum fault word.
+fn check_fault(bits: u32) -> Result<()> {
+    if bits == 0 {
+        return Ok(());
+    }
+    let mut what = Vec::new();
+    if bits & FAULT_ASSERT != 0 {
+        what.push("a circuit assert failed");
+    }
+    if bits & FAULT_ACCUM_PERM != 0 {
+        what.push("a perm entry was out of range");
+    }
+    if bits & FAULT_ACCUM_SCAN != 0 {
+        what.push("a scanned cell was not a canonical Fp word");
+    }
+    bail!(
+        "rv32im Metal accum: kernels reported fault bits {bits:#x} ({})",
+        what.join(", ")
+    )
+}
+
+/// Test-only phase timestamps (R13 profile; `accum/tests.rs` `accum_ab`). No-op otherwise.
+#[cfg(test)]
+pub(crate) mod marks {
+    use std::{cell::RefCell, time::Instant};
+    thread_local! {
+        pub(crate) static MARKS: RefCell<Vec<(&'static str, Instant)>> =
+            const { RefCell::new(Vec::new()) };
+    }
+    pub(crate) fn take() -> Vec<(&'static str, Instant)> {
+        MARKS.with(|m| std::mem::take(&mut *m.borrow_mut()))
+    }
+}
+#[inline(always)]
+fn test_mark(_label: &'static str) {
+    #[cfg(test)]
+    marks::MARKS.with(|m| m.borrow_mut().push((_label, std::time::Instant::now())));
+}
 
 fn u32_of(what: &str, v: usize) -> Result<u32> {
     u32::try_from(v).map_err(|_| anyhow::anyhow!("rv32im Metal accum: {what} = {v} exceeds u32"))
 }
 
 impl<MH: MetalHash> MetalCircuitHal<MH> {
-    /// The Metal accum path (module docs); `win`: the perm's sort window, `None` for no perm.
+    /// The Metal accum path (module docs); `win`: the perm's sort window, `None` for no perm;
+    /// `scan`: where step 3 runs.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn step_accum_metal(
         &self,
         preflight: &PreflightTrace,
@@ -217,6 +391,7 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
         global: &MetaBuffer<MetalHal<MH>>,
         mix: &MetaBuffer<MetalHal<MH>>,
         win: Option<u32>,
+        scan: ScanMode,
     ) -> Result<()> {
         scope!("metal_accumulate");
         self.ctx.require(Phase::Accum)?;
@@ -261,9 +436,12 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
             );
             u32_of(what, m.rows * m.cols)?;
         }
-        if n > 0 {
-            self.accum_steps(preflight, data, accum, global, mix, win)?;
-        }
+        // The fault word still to be read after the final wait (GPU scans).
+        let pending_fault = if n > 0 {
+            self.accum_steps(preflight, data, accum, global, mix, win, scan)?
+        } else {
+            None
+        };
 
         // 4. finalizeZeroizeAccum over every row (with n = 0 it only zeroizes).
         let fin = FinalizeAccumParams {
@@ -280,6 +458,10 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
         );
         // End of the phase (PLAN 2.6): close the batch; errors are attributed to accum.
         scope!("accum_finalize_wait", hal.try_sync())?;
+        test_mark("waited");
+        if let Some(fault) = pending_fault {
+            check_fault(fault.to_vec()[0])?;
+        }
         tracing::debug!(
             "accumulate: done, GPU allocated {} MB",
             hal.allocated_size() >> 20
@@ -287,7 +469,9 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
         Ok(())
     }
 
-    /// Steps 1-3 (module docs) for `n > 0` cycles.
+    /// Steps 1-3 (module docs) for `n > 0` cycles. Returns the fault word when it is still to be
+    /// checked after the phase's final wait (GPU scans); with CPU scans it was checked here.
+    #[allow(clippy::too_many_arguments)]
     fn accum_steps(
         &self,
         preflight: &PreflightTrace,
@@ -296,7 +480,9 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
         global: &MetaBuffer<MetalHal<MH>>,
         mix: &MetaBuffer<MetalHal<MH>>,
         win: Option<u32>,
-    ) -> Result<()> {
+        scan: ScanMode,
+    ) -> Result<Option<BufferImpl<u32>>> {
+        test_mark("start");
         let hal = self.hal.as_ref();
         let n = preflight.cycles.len();
         // 1. perm. The scratch perm may still be bound by in-flight work of a previous call.
@@ -310,7 +496,9 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
                 };
                 // SAFETY: synced; nothing that uses `buf` is encoded until this returns.
                 let host = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr(), n) };
+                test_mark("perm_synced");
                 scope!("accum_perm", build_perm(&preflight.cycles, win, host));
+                test_mark("perm_built");
                 Some(buf)
             }
             None => None,
@@ -332,8 +520,16 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
             mix_cols: mix.cols as u32,
             _pad: [0; 2],
         };
+        let pso = self.ctx.pipeline("stepAccumA");
+        let grid = match super::witgen::witgen_tg(pso, accum_tg()) {
+            None => Grid::Threads(n as u64),
+            Some(t) => Grid::Groups {
+                groups: MTLSize::new((n as u64).div_ceil(t), 1, 1),
+                threads: MTLSize::new(t, 1, 1),
+            },
+        };
         hal.dispatch(
-            self.ctx.pipeline("stepAccumA"),
+            pso,
             &[
                 data.buf.as_arg(),
                 accum.buf.as_arg(),
@@ -345,24 +541,18 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
                 fault.as_arg(),
                 KernelArg::Bytes(as_bytes(&[params])),
             ],
-            Grid::Threads(n as u64),
+            grid,
             &[],
         );
-        scope!("accum_step_wait", hal.try_sync())?;
-        let bits = fault.to_vec()[0];
-        if bits != 0 {
-            let mut what = Vec::new();
-            if bits & FAULT_ASSERT != 0 {
-                what.push("a circuit assert failed");
-            }
-            if bits & FAULT_ACCUM_PERM != 0 {
-                what.push("a perm entry was out of range");
-            }
-            bail!(
-                "rv32im Metal accum: stepAccumA reported fault bits {bits:#x} ({})",
-                what.join(", ")
-            );
+        if scan == ScanMode::Gpu {
+            // 3. GPU scans of the last 4 columns over the first n rows, same batch.
+            self.encode_fp_scan(&accum.buf, accum.rows, accum.cols - 4, 4, n, &fault, None)?;
+            test_mark("encoded");
+            return Ok(Some(fault));
         }
+        scope!("accum_step_wait", hal.try_sync())?;
+        test_mark("step_waited");
+        check_fault(fault.to_vec()[0])?;
 
         // 3. CPU scans of the last 4 columns over the first n rows.
         {
@@ -377,7 +567,118 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
                 .par_chunks_mut(rows)
                 .for_each(|col| fp_inclusive_scan(&mut col[..n]));
         }
+        test_mark("scanned");
 
+        Ok(None)
+    }
+
+    /// The scan threadgroup size: `want` (default [FP_SCAN_TG]) capped by every scan PSO's
+    /// maximum and rounded down to a multiple of the SIMD width, so the block size of
+    /// fpScanReduce and fpScanApply agree and each SIMD group is full. Also checks that the
+    /// simdgroup sums fit one simdgroup (kernel assumption).
+    pub(crate) fn fp_scan_tg(&self, want: Option<u64>) -> Result<u64> {
+        let mut max = want.unwrap_or(FP_SCAN_TG);
+        let mut width = 1;
+        for name in SCAN_KERNELS {
+            let pso = self.ctx.pipeline(name);
+            max = max.min(pso.max_total_threads_per_threadgroup());
+            width = width.max(pso.thread_execution_width());
+        }
+        let tg = max / width * width;
+        ensure!(
+            tg >= width && tg / width <= width.min(FP_SCAN_MAX_SIMDGROUPS),
+            "rv32im Metal accum scan: no usable threadgroup size (max {max}, SIMD width {width})"
+        );
+        Ok(tg)
+    }
+
+    /// Encode (no wait) the in-place inclusive Fp prefix scan of rows `[0, n)` of columns
+    /// `col0 .. col0 + ncols` of the column-major `rows`-row buffer `buf` (misc.metal's three
+    /// scan kernels). A non-canonical input ORs [FAULT_ACCUM_SCAN] into `fault`. `tg`: the
+    /// threadgroup size (tests; default [Self::fp_scan_tg]).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_fp_scan<T: Clone>(
+        &self,
+        buf: &BufferImpl<T>,
+        rows: usize,
+        col0: usize,
+        ncols: usize,
+        n: usize,
+        fault: &BufferImpl<u32>,
+        tg: Option<u64>,
+    ) -> Result<()> {
+        ensure!(
+            n <= rows && (col0 + ncols) * rows <= buf.size(),
+            "rv32im Metal scan: {n} rows of columns {col0}..{} exceed the buffer ({} x {rows})",
+            col0 + ncols,
+            buf.size() / rows.max(1)
+        );
+        u32_of("scanned cells", (col0 + ncols) * rows)?;
+        if n == 0 || ncols == 0 {
+            return Ok(());
+        }
+        let hal = self.hal.as_ref();
+        // A caller-supplied size must already be one fp_scan_tg accepts unchanged (a multiple of
+        // the SIMD width, within every PSO's maximum and the wsum sizing).
+        let tg = match tg {
+            Some(t) => {
+                let ok = self.fp_scan_tg(Some(t))?;
+                ensure!(
+                    ok == t,
+                    "rv32im Metal accum scan: threadgroup size {t} unusable (nearest {ok})"
+                );
+                t
+            }
+            None => self.fp_scan_tg(None)?,
+        };
+        let block = tg as usize * FP_SCAN_PER_THREAD as usize;
+        let blocks = n.div_ceil(block);
+        let params = FpScanParams {
+            n: n as u32,
+            rows: rows as u32,
+            col0: col0 as u32,
+            blocks: blocks as u32,
+        };
+        let sums = hal.alloc_buffer::<u32>("accum_scan_sums", blocks * ncols);
+        let size = |x: usize, y: usize| MTLSize::new(x as u64, y as u64, 1);
+        // One word per simdgroup; fp_scan_tg guarantees at most FP_SCAN_MAX_SIMDGROUPS.
+        let wsum_bytes = 4 * FP_SCAN_MAX_SIMDGROUPS;
+        let threads = size(tg as usize, 1);
+        let p = [params];
+        let pbytes = as_bytes(&p);
+        let [reduce, block_sums, apply] = SCAN_KERNELS;
+        hal.dispatch(
+            self.ctx.pipeline(reduce),
+            &[
+                buf.as_arg(),
+                sums.as_arg(),
+                fault.as_arg(),
+                KernelArg::Bytes(pbytes),
+            ],
+            Grid::Groups {
+                groups: size(blocks, ncols),
+                threads,
+            },
+            &[0, wsum_bytes],
+        );
+        hal.dispatch(
+            self.ctx.pipeline(block_sums),
+            &[sums.as_arg(), KernelArg::Bytes(pbytes)],
+            Grid::Groups {
+                groups: size(1, ncols),
+                threads,
+            },
+            &[0, wsum_bytes],
+        );
+        hal.dispatch(
+            self.ctx.pipeline(apply),
+            &[buf.as_arg(), sums.as_arg(), KernelArg::Bytes(pbytes)],
+            Grid::Groups {
+                groups: size(blocks, ncols),
+                threads,
+            },
+            &[block as u64 * 4, wsum_bytes],
+        );
         Ok(())
     }
 
@@ -433,7 +734,7 @@ impl<MH: MetalHash> CircuitAccumulator<MetalHal<MH>> for MetalCircuitHal<MH> {
         let res = if accum_on_cpu() {
             self.step_accum_cpu(preflight, data, accum, global, mix)
         } else {
-            self.step_accum_metal(preflight, data, accum, global, mix, sort_win())
+            self.step_accum_metal(preflight, data, accum, global, mix, sort_win(), scan_mode())
         };
         phase_mark(&self.hal, "accum end");
         res
