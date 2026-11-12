@@ -551,8 +551,17 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
             return Ok(());
         }
         let hal = self.hal.as_ref();
+        // A caller-supplied size must already be one fp_scan_tg accepts unchanged (a multiple of
+        // the SIMD width, within every PSO's maximum and the wsum sizing).
         let tg = match tg {
-            Some(t) => t,
+            Some(t) => {
+                let ok = self.fp_scan_tg(Some(t))?;
+                ensure!(
+                    ok == t,
+                    "rv32im Metal accum scan: threadgroup size {t} unusable (nearest {ok})"
+                );
+                t
+            }
             None => self.fp_scan_tg(None)?,
         };
         let block = tg as usize * FP_SCAN_PER_THREAD as usize;

@@ -30,7 +30,10 @@ use risc0_binfmt::{MemoryImage, Program};
 use risc0_zkp::{
     core::hash::poseidon2::Poseidon2HashSuite,
     field::Elem as _,
-    hal::{cpu::CpuHal, metal::MetalHalPoseidon2},
+    hal::{
+        cpu::CpuHal,
+        metal::{BudgetScope, MetalHalPoseidon2},
+    },
 };
 use test_log::test;
 
@@ -644,9 +647,12 @@ fn witgen_snapshot_over_budget_is_an_error() {
         checked: false,
     };
     h.hal.try_sync().unwrap();
-    // Room for the preflight copy and the tables, not for a second data buffer (13.8 MB).
+    // Room for the preflight copy and the tables, not for a second data buffer (13.8 MB). The
+    // budget counts only this HAL's bytes (Z8b `BudgetScope::Hal`), so tests allocating and
+    // freeing concurrently in the parallel harness cannot move it (R13 fix round 1).
+    h.hal.set_budget_scope(BudgetScope::Hal);
     h.hal
-        .set_working_set_limit(Some(h.hal.allocated_size() + (2 << 20)));
+        .set_working_set_limit(Some(h.hal.owned_allocated_size() + (2 << 20)));
     let res = h.circuit.metal_witgen(
         StepMode::Parallel,
         &trace,
@@ -657,8 +663,7 @@ fn witgen_snapshot_over_budget_is_an_error() {
     );
     h.hal.set_working_set_limit(None);
     let err = format!("{:#}", res.expect_err("the snapshot cannot fit"));
-    // Which allocation hits the budget first depends on what other tests hold on the device
-    // (the budget counts the whole process).
+    // Which allocation hits the budget first may vary; any of witgen's allocations reports it.
     assert!(
         err.contains("rv32im Metal witgen: allocating") && err.contains("budget"),
         "{err}"
