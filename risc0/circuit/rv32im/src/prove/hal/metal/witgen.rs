@@ -30,13 +30,24 @@
 //!    so no single dispatch runs long enough for the GPU watchdog.
 //! 3. `sync()` (phase end, PLAN 2.6), then the fault word: any `RV32IM_FAULT_*` bit → `Err`.
 //!
-//! `pre_data` (PLAN 4.2: a real buffer by default until single-buffer bit-exactness is proven):
-//! the prover passes `data` itself unless `RISC0_USE_PRE_DATA` is set. Then a copy of `data`
-//! taken after `injectCycleCols` is bound at index 1, so `par_stepExecW`'s back-row loads read the
-//! scattered rows and never a row a neighbouring thread is writing.
-//! `RISC0_METAL_WITGEN_SINGLE_BUFFER=1` binds `data` itself instead (CUDA's default
-//! `pre_data == data`, saving `rows * 211 * 4` bytes). A separate `pre_data` from the prover
+//! `pre_data`: the prover passes `data` itself unless `RISC0_USE_PRE_DATA` is set. Since R15w the
+//! default binds `data` itself (single-buffer mode, CUDA's default `pre_data == data`), saving
+//! `rows * 211 * 4` bytes (885 MB at po2 20). That is bit-exact because every row a cycle reads
+//! back holds its injected value, which its own cycle writes again unchanged, so a back load reads
+//! the same word before or after its writer ran (HIP's ffi.cu argues the same; notes/R15w.md has
+//! the argument and the gate: 600 calls on 5 segments, sorted and production launch orders, 0
+//! bad, with a same-session baseline that fails). `RISC0_METAL_WITGEN_SINGLE_BUFFER=0` restores
+//! R8's snapshot: a copy of `data` taken after `injectCycleCols`, bound at index 1, so back loads
+//! never read a row a neighbouring thread is writing. A separate `pre_data` from the prover
 //! (`RISC0_USE_PRE_DATA`) already holds the scattered rows and cycle columns and is bound as is.
+//!
+//! Launch order and threadgroup size (R15w, [WitgenTune]): the first parallel launch (cycles
+//! before the table split) runs its cycles grouped by major within 2^14-row windows
+//! (`RISC0_METAL_WITGEN_SORT`, 0 = cycle order), HIP's order: a SIMD group then mostly runs one
+//! arm of step_Top's mux. The permutation is built on the host from the pristine preflight cycles
+//! (accum's counting sort, the same order HIP's `wmsSort` builds on the GPU) and bound as the
+//! kernel's `perm`. `RISC0_METAL_WITGEN_TG` overrides the threadgroup size (default: the
+//! runtime's `min(256, PSO maximum)`).
 //!
 //! **The GPU path is the default** (again since R17). `RISC0_METAL_RV32IM_CPU_PHASES` containing
 //! `witgen` is the kill switch: witgen then runs the CPU kernel over host views of the shared
@@ -187,12 +198,118 @@ pub(crate) fn cpu_witgen() -> bool {
     *CPU_WITGEN
 }
 
-/// `RISC0_METAL_WITGEN_SINGLE_BUFFER=1`: bind `data` as `pre_data` (CUDA's default).
-fn single_buffer() -> bool {
-    matches!(
-        std::env::var("RISC0_METAL_WITGEN_SINGLE_BUFFER").as_deref(),
-        Ok("1")
-    )
+/// Parallel-witgen tuning (R15w, notes/R15w.md): the env knobs below, read once per process
+/// ([tune]); tests override them per thread (`tests::with_tune`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WitgenTune {
+    /// `par_stepExecW` threadgroup size (`RISC0_METAL_WITGEN_TG`); 0: the runtime's default
+    /// (`min(256, PSO maximum)`, `Grid::Threads`). Otherwise capped by the PSO maximum and rounded
+    /// down to a multiple of the SIMD width.
+    pub tg: u64,
+    /// The first launch (cycles before the table split) runs its cycles grouped by major within
+    /// 2^sort_win-row windows (`RISC0_METAL_WITGEN_SORT`, HIP `RISC0_HIP_WITGEN_SORT`); 0: cycle
+    /// order.
+    pub sort_win: u32,
+    /// Group by (min(major, 31), minor & 7) instead of the major (`RISC0_METAL_WITGEN_SORT_MINOR=1`,
+    /// HIP `RISC0_HIP_WITGEN_MINOR`).
+    pub minor: bool,
+    /// Bind `data` itself as `pre_data` when the prover passes `data` (CUDA's default; no
+    /// snapshot): `RISC0_METAL_WITGEN_SINGLE_BUFFER=1`, `0` takes the R8 snapshot.
+    pub single: bool,
+}
+
+/// Defaults of [WitgenTune] (notes/R15w.md has the measurements behind each): the runtime's
+/// threadgroup size (no other size measured faster), the first launch grouped by major in 2^14-row
+/// windows (HIP's gfx11 default; kernels ~5 ms faster per po2 20 segment, 165 of 229 pairs), no
+/// minor key (no gain measured), and single-buffer mode (no `rows * 211 * 4`-byte snapshot: −885 MB
+/// at po2 20, ~7 ms less per call; bit-exact over 600 gate calls on 5 segments).
+/// `RISC0_METAL_WITGEN_SORT=0 RISC0_METAL_WITGEN_SINGLE_BUFFER=0` restores the R8-R17 behaviour.
+pub(crate) const DEFAULT_TUNE: WitgenTune = WitgenTune {
+    tg: 0,
+    sort_win: 14,
+    minor: false,
+    single: true,
+};
+
+/// Parse one knob: unset/empty -> `default`; unparsable -> `default` with an error log.
+fn knob<T: std::str::FromStr + Copy>(name: &str, v: Option<&str>, default: T) -> T {
+    match v.map(str::trim) {
+        None | Some("") => default,
+        Some(s) => s.parse().unwrap_or_else(|_| {
+            tracing::error!("{name}={s:?} is not a valid value; using the default");
+            default
+        }),
+    }
+}
+
+/// [WitgenTune] from the environment lookup `get` (`std::env::var` in production).
+pub(crate) fn parse_tune(get: impl Fn(&str) -> Option<String>) -> WitgenTune {
+    let flag = |name: &str, default: bool| -> bool {
+        match get(name).as_deref().map(str::trim) {
+            None | Some("") => default,
+            Some("1") => true,
+            Some("0") => false,
+            Some(s) => {
+                tracing::error!("{name}={s:?}: expected 0 or 1; using the default");
+                default
+            }
+        }
+    };
+    WitgenTune {
+        tg: knob(
+            "RISC0_METAL_WITGEN_TG",
+            get("RISC0_METAL_WITGEN_TG").as_deref(),
+            DEFAULT_TUNE.tg,
+        ),
+        sort_win: knob(
+            "RISC0_METAL_WITGEN_SORT",
+            get("RISC0_METAL_WITGEN_SORT").as_deref(),
+            DEFAULT_TUNE.sort_win,
+        )
+        .min(24),
+        minor: flag("RISC0_METAL_WITGEN_SORT_MINOR", DEFAULT_TUNE.minor),
+        single: flag("RISC0_METAL_WITGEN_SINGLE_BUFFER", DEFAULT_TUNE.single),
+    }
+}
+
+/// The process's [WitgenTune] (tests: the thread's override, if any).
+fn tune() -> WitgenTune {
+    static TUNE: LazyLock<WitgenTune> = LazyLock::new(|| {
+        let t = parse_tune(|k| std::env::var(k).ok());
+        if t != DEFAULT_TUNE {
+            tracing::info!("rv32im Metal witgen tuning: {t:?}");
+        }
+        t
+    });
+    test_tune().unwrap_or(*TUNE)
+}
+
+/// `par_stepExecW`'s threadgroup size for `want` (0: none, the runtime picks), as [WitgenTune::tg].
+pub(crate) fn witgen_tg(pso: &metal::ComputePipelineStateRef, want: u64) -> Option<u64> {
+    if want == 0 {
+        return None;
+    }
+    let width = pso.thread_execution_width().max(1);
+    let max = pso.max_total_threads_per_threadgroup();
+    Some((want.min(max) / width * width).max(width.min(max)))
+}
+
+/// The major-grouped order of `[0, n)` (cycles before the table split), as HIP's `wmsSort` makes
+/// it for par_stepExec: rows grouped by key within 2^win-row windows, ascending within a key.
+pub(crate) fn witgen_sort_perm(
+    cycles: &[risc0_circuit_rv32im_sys::RawPreflightCycle],
+    win: u32,
+    minor: bool,
+) -> Vec<u32> {
+    let mut perm = vec![0u32; cycles.len()];
+    if minor {
+        super::accum::build_perm_by(cycles, win, &mut perm, |c| {
+            (c.major.min(31) << 3) | (c.minor & 7)
+        });
+    } else {
+        super::accum::build_perm(cycles, win, &mut perm);
+    }
+    perm
 }
 
 /// Whether the Metal witgen writes the five per-cycle columns itself, so preflight can leave them
@@ -211,12 +328,15 @@ static SYNC_STEPS: LazyLock<bool> = LazyLock::new(|| {
     )
 });
 
-/// What parallel witgen binds as `pre_data` (tests force a choice per call).
+/// What parallel witgen binds as `pre_data` when the prover passes `data` itself (tests force a
+/// choice per call).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PreData {
-    /// The default: a snapshot of `data` when the prover passes `data` itself as `pre_data`.
+    /// [WitgenTune::single] decides (the production path).
     Auto,
-    /// Bind `data` itself (single-buffer mode).
+    /// A snapshot of `data` taken after `injectCycleCols` (R8).
+    Snapshot,
+    /// Bind `data` itself (single-buffer mode, CUDA's default).
     Single,
 }
 
@@ -243,12 +363,7 @@ impl<MH: MetalHash> CircuitWitnessGenerator<MetalHal<MH>> for MetalCircuitHal<MH
         let res = if *CPU_WITGEN {
             self.cpu_witgen(mode, preflight, global, data)
         } else {
-            let pre = if single_buffer() {
-                PreData::Single
-            } else {
-                PreData::Auto
-            };
-            self.metal_witgen(mode, preflight, global, data, pre_data, pre)
+            self.metal_witgen(mode, preflight, global, data, pre_data, PreData::Auto)
         };
         phase_mark(&self.hal, "witgen end");
         res
@@ -313,6 +428,12 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
         }
 
         let hal = &self.hal;
+        let tune = tune();
+        let pre = match pre {
+            PreData::Auto if tune.single => PreData::Single,
+            PreData::Auto => PreData::Snapshot,
+            p => p,
+        };
         let (pf, layout) = no_panic("the preflight copy", || ctx.upload_preflight(preflight))??;
         let (table_u8, table_u16) = no_panic("the lookup tables", || ctx.tables())?;
         let fault: BufferImpl<u32> =
@@ -369,7 +490,7 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
         }
 
         // 3. pre_data (parallel mode only; the sequential kernels ignore binding 1).
-        let snapshot = if mode == StepMode::Parallel && aliased && pre == PreData::Auto {
+        let snapshot = if mode == StepMode::Parallel && aliased && pre == PreData::Snapshot {
             // The HAL panics when an allocation exceeds the working-set budget
             // (RISC0_METAL_MAX_WORKING_SET_BYTES); report that as this phase's error.
             let size = data.buf.size();
@@ -377,6 +498,7 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
                 hal.alloc_elem("witgen_pre_data", size)
             })
             .map_err(|e| e.context("RISC0_METAL_WITGEN_SINGLE_BUFFER=1 runs without it"))?;
+            timing_mark("snapshot");
             hal.eltwise_copy_elem(&snap, &data.buf);
             if *SYNC_STEPS {
                 hal.try_sync()?;
@@ -433,18 +555,54 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
             StepMode::Parallel => {
                 // CUDA: par_stepExec over [0, split), then [split, lastCycle).
                 let pso = ctx.pipeline("par_stepExecW");
+                let tg = witgen_tg(pso, tune.tg);
+                let grid = |n: u32| match tg {
+                    None => Grid::Threads(n as u64),
+                    Some(t) => Grid::Groups {
+                        groups: metal::MTLSize::new((n as u64).div_ceil(t), 1, 1),
+                        threads: metal::MTLSize::new(t, 1, 1),
+                    },
+                };
+                // HIP: the first launch's cycles grouped by major (R15w; [WitgenTune::sort_win]),
+                // built on the host from the pristine preflight cycles before anything is encoded.
+                // Same witness: each cycle still runs once and writes only its own row; the rows
+                // it reads back hold their injected values (pre_data), or, single-buffer, the
+                // same values their own cycles write again (notes/R15w.md).
+                let mut sorted = (tune.sort_win > 0 && split > 1).then(|| {
+                    scope!("witgen_sort");
+                    witgen_sort_perm(
+                        &preflight.cycles[..split as usize],
+                        tune.sort_win,
+                        tune.minor,
+                    )
+                });
+                if timing_on() {
+                    hal.try_sync()?;
+                }
+                timing_mark("encode");
                 for (start, count) in [(0, split), (split, last_cycle - split)] {
                     // Tests only: a launch order other than start + i (`test_perm`).
-                    if let Some(p) = test_perm(preflight, start, count) {
+                    let order = test_perm(preflight, start, count).or_else(|| {
+                        if start == 0 {
+                            sorted.take()
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(p) = order {
                         let params = WitgenParams {
                             start,
                             count: p.len() as u32,
                             use_perm: 1,
                             ..base
                         };
-                        let pb = hal.copy_from_u32("witgen_perm", &p);
-                        encode(pso, &params, arg(bind(&pb)), Grid::Threads(p.len() as u64))?;
+                        let pb =
+                            no_panic("the launch order", || hal.copy_from_u32("witgen_perm", &p))?;
+                        encode(pso, &params, arg(bind(&pb)), grid(p.len() as u32))?;
                         perm_bufs.push(pb);
+                        continue;
+                    }
+                    if count == 0 {
                         continue;
                     }
                     let params = WitgenParams {
@@ -454,7 +612,7 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
                         ..base
                     };
                     // perm (binding 10) is not read with use_perm = 0: bind the fault word.
-                    encode(pso, &params, arg(bind(&fault)), Grid::Threads(count as u64))?;
+                    encode(pso, &params, arg(bind(&fault)), grid(count))?;
                 }
             }
             StepMode::SeqForward | StepMode::SeqReverse => {
@@ -485,6 +643,7 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
 
         // Phase end: wait, then the fault word.
         hal.try_sync()?;
+        timing_mark("done");
         drop(perm_bufs);
         drop(snapshot);
         // SAFETY: synced above; nothing using `fault` is encoded.
@@ -564,6 +723,38 @@ fn test_perm(preflight: &PreflightTrace, start: u32, count: u32) -> Option<Vec<u
 #[cfg(not(test))]
 fn test_perm(_: &PreflightTrace, _: u32, _: u32) -> Option<Vec<u32>> {
     None
+}
+
+#[cfg(test)]
+fn test_tune() -> Option<WitgenTune> {
+    tests::thread_tune()
+}
+
+#[cfg(not(test))]
+fn test_tune() -> Option<WitgenTune> {
+    None
+}
+
+/// Tests only (`tests::timing`): a timestamp per step of the call. With timing on, the GPU is
+/// also waited for before the kernels are encoded, so "encode" -> "done" is their own time.
+#[cfg(test)]
+fn timing_mark(label: &'static str) {
+    tests::timing_mark(label)
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn timing_mark(_: &'static str) {}
+
+#[cfg(test)]
+fn timing_on() -> bool {
+    tests::timing_on()
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn timing_on() -> bool {
+    false
 }
 
 #[cfg(test)]

@@ -172,6 +172,28 @@ pub(crate) fn parse_sort_win(v: Option<&str>) -> Option<u32> {
     }
 }
 
+/// `stepAccumA`'s threadgroup size (R15w): `RISC0_METAL_ACCUM_TG`; unset or 0 keeps the runtime's
+/// default (`min(256, PSO maximum)`). Otherwise capped by the PSO maximum and rounded down to the
+/// SIMD width (witgen.rs `witgen_tg`). Tests override it per thread (`tests::ACCUM_TG`).
+pub(crate) const ACCUM_TG_ENV: &str = "RISC0_METAL_ACCUM_TG";
+
+fn accum_tg() -> u64 {
+    #[cfg(test)]
+    if let Some(t) = tests::ACCUM_TG.with(std::cell::Cell::get) {
+        return t;
+    }
+    static TG: OnceLock<u64> = OnceLock::new();
+    *TG.get_or_init(
+        || match std::env::var(ACCUM_TG_ENV).ok().as_deref().map(str::trim) {
+            None | Some("") => 0,
+            Some(s) => s.parse().unwrap_or_else(|_| {
+                tracing::error!("{ACCUM_TG_ENV}={s:?} is not a number; using the default");
+                0
+            }),
+        },
+    )
+}
+
 fn sort_win() -> Option<u32> {
     static WIN: OnceLock<Option<u32>> = OnceLock::new();
     *WIN.get_or_init(|| parse_sort_win(std::env::var(ACCUM_SORT_ENV).ok().as_deref()))
@@ -181,6 +203,18 @@ fn sort_win() -> Option<u32> {
 /// within a major: the permutation of CUDA's stable radix sort over `majorKeys`' keys
 /// `(i >> win) << 8 | major`. One counting sort per window (windows in parallel).
 pub(crate) fn build_perm(cycles: &[RawPreflightCycle], win: u32, perm: &mut [u32]) {
+    build_perm_by(cycles, win, perm, |c| c.major)
+}
+
+/// [build_perm] with any 8-bit key: the cycles grouped by `key` within 2^win-row windows, rows
+/// ascending within a key (a stable counting sort per window). Witgen's major-grouped launch
+/// order uses it too (witgen.rs, R15w; HIP `wmsSort`'s permutations).
+pub(crate) fn build_perm_by(
+    cycles: &[RawPreflightCycle],
+    win: u32,
+    perm: &mut [u32],
+    key: impl Fn(&RawPreflightCycle) -> u8 + Sync,
+) {
     let n = cycles.len();
     assert!(perm.len() >= n);
     let w = 1usize << win.min(31);
@@ -192,7 +226,7 @@ pub(crate) fn build_perm(cycles: &[RawPreflightCycle], win: u32, perm: &mut [u32
             let rows = &cycles[base..base + out.len()];
             let mut next = [0u32; 256];
             for c in rows {
-                next[c.major as usize] += 1;
+                next[key(c) as usize] += 1;
             }
             let mut sum = 0;
             for slot in next.iter_mut() {
@@ -201,7 +235,7 @@ pub(crate) fn build_perm(cycles: &[RawPreflightCycle], win: u32, perm: &mut [u32
                 sum += c;
             }
             for (i, c) in rows.iter().enumerate() {
-                let slot = &mut next[c.major as usize];
+                let slot = &mut next[key(c) as usize];
                 out[*slot as usize] = (base + i) as u32;
                 *slot += 1;
             }
@@ -461,8 +495,16 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
             mix_cols: mix.cols as u32,
             _pad: [0; 2],
         };
+        let pso = self.ctx.pipeline("stepAccumA");
+        let grid = match super::witgen::witgen_tg(pso, accum_tg()) {
+            None => Grid::Threads(n as u64),
+            Some(t) => Grid::Groups {
+                groups: MTLSize::new((n as u64).div_ceil(t), 1, 1),
+                threads: MTLSize::new(t, 1, 1),
+            },
+        };
         hal.dispatch(
-            self.ctx.pipeline("stepAccumA"),
+            pso,
             &[
                 data.buf.as_arg(),
                 accum.buf.as_arg(),
@@ -474,7 +516,7 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
                 fault.as_arg(),
                 KernelArg::Bytes(as_bytes(&[params])),
             ],
-            Grid::Threads(n as u64),
+            grid,
             &[],
         );
         if scan == ScanMode::Gpu {

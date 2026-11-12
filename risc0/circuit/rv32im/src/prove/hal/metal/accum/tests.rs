@@ -206,6 +206,8 @@ enum Variant {
 struct WithVariant<'a>(&'a MetalCircuitHalPoseidon2, Variant);
 
 thread_local! {
+    /// accum.rs `accum_tg`: this thread's `stepAccumA` threadgroup size override (R15w).
+    pub(super) static ACCUM_TG: Cell<Option<u64>> = const { Cell::new(None) };
     /// Wall time (ms) of the last `WithVariant::step_accum` call, from an idle GPU queue.
     static LAST_STEP_MS: Cell<f64> = const { Cell::new(0.0) };
 }
@@ -966,6 +968,103 @@ fn accum_ab() {
         for (name, v) in &times {
             let (m, l, h) = stats(v);
             println!("R13AB po2 {po2} scans alone {name}: median {m:.3} ms [{l:.3}, {h:.3}]");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// R15w: stepAccumA threadgroup size
+// ---------------------------------------------------------------------------------------------
+
+/// Every `stepAccumA` threadgroup size the PSO allows (multiples of the SIMD width, powers of
+/// two) gives the CPU's accum, with and without the perm.
+#[test]
+fn accum_tg_matches_cpu() {
+    let hal = Arc::new(MetalHalPoseidon2::new());
+    let circuit_hal = MetalCircuitHalPoseidon2::new(hal.clone()).unwrap();
+    let pso = circuit_hal.ctx().pipeline("stepAccumA");
+    let (w, max) = (
+        pso.thread_execution_width(),
+        pso.max_total_threads_per_threadgroup(),
+    );
+    let seg = segment(riscv_test("mul"), 16);
+    let r = reference(&seg);
+    let mut tg = w;
+    while tg <= max {
+        for win in [Some(DEFAULT_SORT_WIN), None] {
+            ACCUM_TG.with(|c| c.set(Some(tg)));
+            let (metal, ..) = metal_accum(&hal, &circuit_hal, &r, Variant::Gpu(win));
+            ACCUM_TG.with(|c| c.set(None));
+            assert_accum_eq(&format!("tg {tg} win {win:?}"), r.rows, &r.accum, &metal);
+        }
+        tg *= 2;
+    }
+}
+
+/// R15w measurement (not an assertion of speed): interleaved A/B of `stepAccumA` threadgroup
+/// sizes (`R15W_ACCUM_TGS`, comma list, `0` = the default; the first is A, repeat it for A'),
+/// `R15W_PAIRS` rounds (default 9), on `R15W_SEGMENTS` (postcard files) or a po2 20 simple_loop.
+/// Each result is checked against the CPU. Run alone: `--ignored --nocapture --test-threads=1`.
+#[test]
+#[ignore]
+fn r15w_accum_ab() {
+    let pairs: usize = std::env::var("R15W_PAIRS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(9);
+    let tgs: Vec<u64> = std::env::var("R15W_ACCUM_TGS")
+        .unwrap_or_else(|_| "0,128,64,0".into())
+        .split(',')
+        .map(|s| s.trim().parse().unwrap())
+        .collect();
+    let hal = Arc::new(MetalHalPoseidon2::new());
+    let circuit_hal = MetalCircuitHalPoseidon2::new(hal.clone()).unwrap();
+    let segs: Vec<(String, crate::execute::segment::Segment)> = match std::env::var("R15W_SEGMENTS")
+    {
+        Ok(paths) => paths
+            .split(',')
+            .filter(|p| !p.is_empty())
+            .map(|path| {
+                let bytes = std::fs::read(path).unwrap();
+                let ((_i, seg), _) =
+                    postcard::take_from_bytes::<(u32, crate::execute::segment::Segment)>(&bytes)
+                        .unwrap();
+                (path.rsplit('/').take(2).collect::<Vec<_>>().join("<"), seg)
+            })
+            .collect(),
+        Err(_) => vec![(
+            "simple_loop".into(),
+            segment(testutil::kernel::simple_loop(1u32 << 20), 20),
+        )],
+    };
+    let win = sort_win();
+    for (name, seg) in segs {
+        let r = reference(&seg);
+        let run = |tg: u64| {
+            ACCUM_TG.with(|c| c.set(Some(tg)));
+            let (metal, _ms, _b, _p) = metal_accum(&hal, &circuit_hal, &r, Variant::Gpu(win));
+            ACCUM_TG.with(|c| c.set(None));
+            assert_accum_eq(&format!("{name} tg {tg}"), r.rows, &r.accum, &metal);
+            LAST_STEP_MS.with(Cell::get)
+        };
+        for &tg in &tgs {
+            run(tg);
+        }
+        let mut t: Vec<Vec<f64>> = vec![vec![]; tgs.len()];
+        for _ in 0..pairs {
+            for (i, &tg) in tgs.iter().enumerate() {
+                t[i].push(run(tg));
+            }
+        }
+        for (i, tg) in tgs.iter().enumerate() {
+            let (m, l, h) = stats(&t[i]);
+            let d: Vec<f64> = (0..pairs).map(|p| t[i][p] - t[0][p]).collect();
+            let (dm, dl, dh) = stats(&d);
+            println!(
+                "R15WACC {name} po2 {} tg {tg}: step median {m:.2} ms [{l:.2}, {h:.2}], minus A per \
+                 pair median {dm:.2} [{dl:.2}, {dh:.2}] ({pairs} runs)",
+                seg.po2
+            );
         }
     }
 }

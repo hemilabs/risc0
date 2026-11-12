@@ -100,6 +100,38 @@ fn launch_order() -> LaunchOrder {
     })
 }
 
+thread_local! {
+    /// witgen.rs `test_tune`: this thread's [WitgenTune] override.
+    static TUNE: std::cell::Cell<Option<WitgenTune>> = const { std::cell::Cell::new(None) };
+    /// witgen.rs `timing_mark` / `timing_on`.
+    static TIMING: std::cell::RefCell<Option<Vec<(&'static str, Instant)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn thread_tune() -> Option<WitgenTune> {
+    TUNE.with(|t| t.get())
+}
+
+/// Runs `f` with [WitgenTune] `t` for the witgen calls on this thread.
+fn with_tune<R>(t: WitgenTune, f: impl FnOnce() -> R) -> R {
+    let old = TUNE.with(|c| c.replace(Some(t)));
+    let r = f();
+    TUNE.with(|c| c.set(old));
+    r
+}
+
+pub(super) fn timing_on() -> bool {
+    TIMING.with(|t| t.borrow().is_some())
+}
+
+pub(super) fn timing_mark(label: &'static str) {
+    TIMING.with(|t| {
+        if let Some(v) = t.borrow_mut().as_mut() {
+            v.push((label, Instant::now()));
+        }
+    })
+}
+
 /// witgen.rs `test_perm`.
 pub(super) fn launch_perm(preflight: &PreflightTrace, start: u32, count: u32) -> Option<Vec<u32>> {
     let mut cycles: Vec<u32> = (start..start + count).collect();
@@ -622,8 +654,10 @@ fn witgen_diff_count_fault() {
     assert!(format!("{err:#}").contains("getDiffCount"), "{err:#}");
 }
 
-/// Under a working-set budget too small for the `pre_data` snapshot, witgen returns an error
-/// (the HAL's allocation panic is converted) instead of unwinding through the prover.
+/// Under a working-set budget too small for the `pre_data` snapshot (`RISC0_METAL_WITGEN_SINGLE_BUFFER=0`),
+/// witgen returns an error (the HAL's allocation panic is converted) instead of unwinding through
+/// the prover. [witgen_single_buffer_fits_without_snapshot] is the same budget in single-buffer
+/// mode.
 #[test]
 fn witgen_snapshot_over_budget_is_an_error() {
     let h = Harness::new();
@@ -659,7 +693,7 @@ fn witgen_snapshot_over_budget_is_an_error() {
         &global,
         &data,
         &data,
-        PreData::Auto,
+        PreData::Snapshot,
     );
     h.hal.set_working_set_limit(None);
     let err = format!("{:#}", res.expect_err("the snapshot cannot fit"));
@@ -670,8 +704,8 @@ fn witgen_snapshot_over_budget_is_an_error() {
     );
 }
 
-/// Single-buffer mode (CUDA's default `pre_data == data`) against the CPU: recorded for R15, not
-/// the default (R17: 0 of 60 bad calls on two po2 20 segments, notes/R17.md).
+/// Single-buffer mode (CUDA's default `pre_data == data`, the default since R15w) against the
+/// CPU, whatever the tuning env says (notes/R15w.md has the gate).
 #[test]
 fn witgen_single_buffer_matches_cpu() {
     let h = Harness::new();
@@ -803,8 +837,10 @@ fn witgen_segment_file() {
     let mut failures = 0;
     for mode_name in modes.split(',') {
         let (mode, pre) = match mode_name.trim() {
-            "par" => (StepMode::Parallel, PreData::Auto),
+            // `par` keeps its R8/R17 meaning (the snapshot); `auto` is the production default.
+            "par" => (StepMode::Parallel, PreData::Snapshot),
             "single" => (StepMode::Parallel, PreData::Single),
+            "auto" => (StepMode::Parallel, PreData::Auto),
             "fwd" => (StepMode::SeqForward, PreData::Auto),
             "rev" => (StepMode::SeqReverse, PreData::Auto),
             other => panic!("unknown mode {other}"),
@@ -892,5 +928,350 @@ fn witgen_segment_file() {
     assert_eq!(
         failures, 0,
         "Metal witgen calls that failed or differ from the CPU"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// R15w: tuning knobs (threadgroup size, major-sorted first launch, single buffer)
+// ---------------------------------------------------------------------------------------------
+
+/// [parse_tune]: defaults, valid values, and garbage falling back to the default.
+#[test]
+fn witgen_tune_env_values() {
+    let env = |pairs: &'static [(&'static str, &'static str)]| {
+        move |k: &str| {
+            pairs
+                .iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.to_string())
+        }
+    };
+    assert_eq!(parse_tune(env(&[])), DEFAULT_TUNE);
+    let t = parse_tune(env(&[
+        ("RISC0_METAL_WITGEN_TG", "128"),
+        ("RISC0_METAL_WITGEN_SORT", "12"),
+        ("RISC0_METAL_WITGEN_SORT_MINOR", "1"),
+        ("RISC0_METAL_WITGEN_SINGLE_BUFFER", "0"),
+    ]));
+    assert_eq!(
+        t,
+        WitgenTune {
+            tg: 128,
+            sort_win: 12,
+            minor: true,
+            single: false
+        }
+    );
+    let t = parse_tune(env(&[
+        ("RISC0_METAL_WITGEN_TG", "x"),
+        ("RISC0_METAL_WITGEN_SORT", "99"),
+        ("RISC0_METAL_WITGEN_SINGLE_BUFFER", "yes"),
+    ]));
+    assert_eq!(t.tg, DEFAULT_TUNE.tg);
+    assert_eq!(t.sort_win, 24);
+    assert_eq!(t.single, DEFAULT_TUNE.single);
+}
+
+/// [witgen_tg]: capped by the PSO maximum, a multiple of the SIMD width, never 0.
+#[test]
+fn witgen_tg_rounding() {
+    let h = Harness::new();
+    let pso = h.circuit.ctx.pipeline("par_stepExecW");
+    let (w, max) = (
+        pso.thread_execution_width(),
+        pso.max_total_threads_per_threadgroup(),
+    );
+    assert_eq!(witgen_tg(pso, 0), None);
+    assert_eq!(witgen_tg(pso, 1), Some(w));
+    assert_eq!(witgen_tg(pso, w + 1), Some(w));
+    assert_eq!(witgen_tg(pso, 1 << 20), Some(max / w * w));
+}
+
+/// Every [WitgenTune] knob combination is bit-exact against the CPU witgen: threadgroup sizes,
+/// the major-sorted first launch (windows, minor keys) and single-buffer mode, on the riscv-tests
+/// programs and a po2 18 shift/mul/div loop.
+#[test]
+fn witgen_tune_matches_cpu() {
+    let h = Harness::new();
+    let mut pfs: Vec<(String, PreflightResults)> = vec![];
+    for (name, program) in riscv_programs().into_iter().step_by(5) {
+        for pf in preflights(program, DEFAULT_SEGMENT_LIMIT_PO2) {
+            pfs.push((name.clone(), pf));
+        }
+    }
+    pfs.push((
+        "shift_loop".into(),
+        preflights(shift_loop(1 << 15), 18).remove(0),
+    ));
+    let tunes = [
+        WitgenTune {
+            tg: 64,
+            ..DEFAULT_TUNE
+        },
+        WitgenTune {
+            tg: 32,
+            sort_win: 14,
+            single: true,
+            ..DEFAULT_TUNE
+        },
+        WitgenTune {
+            sort_win: 4,
+            minor: true,
+            single: false,
+            ..DEFAULT_TUNE
+        },
+        WitgenTune {
+            sort_win: 12,
+            single: true,
+            ..DEFAULT_TUNE
+        },
+        WitgenTune {
+            single: !DEFAULT_TUNE.single,
+            ..DEFAULT_TUNE
+        },
+        // R17's behaviour (cycle order, snapshot) and cycle order in single-buffer mode.
+        WitgenTune {
+            sort_win: 0,
+            single: false,
+            ..DEFAULT_TUNE
+        },
+        WitgenTune {
+            sort_win: 0,
+            single: true,
+            ..DEFAULT_TUNE
+        },
+    ];
+    let mut bad = 0;
+    for (name, pf) in &pfs {
+        let rows = 1usize << pf.po2();
+        let (cpu_data, cpu_global) = h.cpu(pf);
+        for t in tunes {
+            let (data, global, _) = with_tune(t, || h.metal(pf, StepMode::Parallel));
+            let l = format!("{name} po2={} {t:?}", pf.po2());
+            bad += first_diff(&format!("{l} data"), &cpu_data, &data, rows)
+                + first_diff(&format!("{l} global"), &cpu_global, &global, 1);
+        }
+    }
+    assert_eq!(bad, 0, "a tuned Metal witgen differs from the CPU witgen");
+}
+
+/// Parse an R15w variant: `base` or a comma list of `tg=N`, `sort=W`, `minor=0|1`, `single=0|1`
+/// over [DEFAULT_TUNE].
+fn parse_variant(v: &str) -> WitgenTune {
+    let mut t = DEFAULT_TUNE;
+    for kv in v
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "base")
+    {
+        let (k, x) = kv
+            .split_once('=')
+            .unwrap_or_else(|| panic!("variant item {kv}"));
+        let n: u64 = x.parse().unwrap_or_else(|_| panic!("variant item {kv}"));
+        match k {
+            "tg" => t.tg = n,
+            "sort" => t.sort_win = n as u32,
+            "minor" => t.minor = n != 0,
+            "single" => t.single = n != 0,
+            _ => panic!("unknown variant key {k}"),
+        }
+    }
+    t
+}
+
+fn stats(v: &[f64]) -> (f64, f64, f64) {
+    let mut s = v.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    (s[s.len() / 2], s[0], s[s.len() - 1])
+}
+
+/// One timed Metal witgen call (production path, `PreData::Auto`, this thread's tune): the
+/// kernels' time (idle queue -> encode -> wait), the whole `metal_witgen` call, the peak GPU
+/// allocation during the call, and whether data/global equal the CPU's.
+fn timed_witgen(
+    h: &Harness,
+    pf: &PreflightResults,
+    cpu: &(Vec<Val>, Vec<Val>),
+) -> (f64, f64, u64, bool) {
+    struct Timed<'a>(&'a Harness, std::cell::Cell<(f64, f64, u64)>);
+    impl CircuitWitnessGenerator<MetalHalPoseidon2> for Timed<'_> {
+        fn writes_cycle_cols(&self) -> bool {
+            true
+        }
+        fn takes_zeroed_data(&self) -> bool {
+            true
+        }
+        fn generate_witness(
+            &self,
+            mode: StepMode,
+            preflight: &PreflightTrace,
+            global: &MetaBuffer<MetalHalPoseidon2>,
+            data: &MetaBuffer<MetalHalPoseidon2>,
+            pre_data: &MetaBuffer<MetalHalPoseidon2>,
+        ) -> anyhow::Result<()> {
+            let hal = &self.0.hal;
+            hal.try_sync()?;
+            hal.reset_peak_allocated_size();
+            TIMING.with(|t| *t.borrow_mut() = Some(vec![]));
+            let t0 = Instant::now();
+            let res =
+                self.0
+                    .circuit
+                    .metal_witgen(mode, preflight, global, data, pre_data, PreData::Auto);
+            let ms = t0.elapsed().as_secs_f64() * 1e3;
+            let marks = TIMING.with(|t| t.borrow_mut().take()).unwrap_or_default();
+            let at = |l: &str| marks.iter().find(|(n, _)| *n == l).map(|(_, t)| *t);
+            let k = match (at("encode"), at("done")) {
+                (Some(a), Some(b)) => (b - a).as_secs_f64() * 1e3,
+                _ => f64::NAN,
+            };
+            self.1.set((k, ms, hal.peak_allocated_size()));
+            res
+        }
+    }
+    let t = Timed(h, Default::default());
+    let w = WitnessGenerator::new(h.hal.as_ref(), &t, pf.clone(), StepMode::Parallel);
+    let ok = match w {
+        Ok(w) => {
+            let rows = 1usize << pf.po2();
+            first_diff("ab data", &cpu.0, &w.data.as_ref().unwrap().to_vec(), rows)
+                + first_diff("ab global", &cpu.1, &w.global.to_vec(), 1)
+                == 0
+        }
+        Err(e) => {
+            eprintln!("[r15w] witgen error: {e:#}");
+            false
+        }
+    };
+    let (k, ms, peak) = t.1.get();
+    (k, ms, peak, ok)
+}
+
+/// R15w measurement (not an assertion of speed): interleaved A/B of parallel witgen variants.
+/// `R15W_SEGMENTS`: comma list of dumped segments (postcard, as [witgen_segment_file]; unset:
+/// a po2 20 [shift_loop] trace); `R15W_VARIANTS`: `;`-separated variants ([parse_variant]),
+/// the first is A (repeat it to get an A' noise floor); `R15W_PAIRS` rounds (default 7).
+/// Every call is compared with the CPU witgen and must match. Run alone:
+/// `--ignored --nocapture --test-threads=1`.
+#[test]
+#[ignore]
+fn r15w_witgen_ab() {
+    let pairs: usize = env_or("R15W_PAIRS", 7);
+    let variants: Vec<(String, WitgenTune)> = std::env::var("R15W_VARIANTS")
+        .unwrap_or_else(|_| "base;sort=14;base".into())
+        .split(';')
+        .map(|v| (v.trim().to_string(), parse_variant(v)))
+        .collect();
+    let h = Harness::new();
+    let mut segs: Vec<(String, PreflightResults)> = vec![];
+    match std::env::var("R15W_SEGMENTS") {
+        Ok(paths) => {
+            for path in paths.split(',').filter(|p| !p.is_empty()) {
+                let bytes = std::fs::read(path).unwrap();
+                let ((_i, segment), _) =
+                    postcard::take_from_bytes::<(u32, crate::execute::segment::Segment)>(&bytes)
+                        .unwrap();
+                let pf = PreflightResults::new(&segment, ExtVal::random(&mut rand::rng())).unwrap();
+                let name = std::path::Path::new(path)
+                    .iter()
+                    .rev()
+                    .take(2)
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("<");
+                segs.push((name, pf));
+            }
+        }
+        Err(_) => segs.push((
+            "shift_loop".into(),
+            preflights(shift_loop(1 << 17), 20).remove(0),
+        )),
+    }
+    let mut bad = 0;
+    for (name, pf) in &segs {
+        let cpu = h.cpu(pf);
+        eprintln!("[r15w] {name}: po2 {}", pf.po2());
+        for (_, t) in &variants {
+            with_tune(*t, || timed_witgen(&h, pf, &cpu));
+        }
+        let n = variants.len();
+        let mut k: Vec<Vec<f64>> = vec![vec![]; n];
+        let mut ph: Vec<Vec<f64>> = vec![vec![]; n];
+        let mut peak = vec![0u64; n];
+        for pair in 0..pairs {
+            for (i, (vn, t)) in variants.iter().enumerate() {
+                let (km, ms, pk, ok) = with_tune(*t, || timed_witgen(&h, pf, &cpu));
+                bad += !ok as usize;
+                k[i].push(km);
+                ph[i].push(ms);
+                peak[i] = peak[i].max(pk);
+                eprintln!("[r15w] {name} pair {pair} [{vn}]: kernels {km:.2} ms, call {ms:.2} ms, ok {ok}");
+            }
+        }
+        for (i, (vn, _)) in variants.iter().enumerate() {
+            let (km, kl, kh) = stats(&k[i]);
+            let (pm, pl, phh) = stats(&ph[i]);
+            let q1 = |v: &[f64]| {
+                let mut s = v.to_vec();
+                s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                s[s.len() / 4]
+            };
+            let (kq, pq) = (q1(&k[i]), q1(&ph[i]));
+            let d: Vec<f64> = (0..pairs).map(|p| k[i][p] - k[0][p]).collect();
+            let (dm, dl, dh) = stats(&d);
+            println!(
+                "R15WAB {name} [{vn}]: kernels median {km:.2} ms (q1 {kq:.2}) [{kl:.2}, {kh:.2}], \
+                 call median {pm:.2} ms (q1 {pq:.2}) [{pl:.2}, {phh:.2}], minus A per pair median \
+                 {dm:.2} [{dl:.2}, {dh:.2}], GPU peak {} MB ({pairs} runs)",
+                peak[i] >> 20
+            );
+        }
+    }
+    assert_eq!(bad, 0, "R15w A/B calls differing from the CPU witgen");
+}
+
+/// The budget of [witgen_snapshot_over_budget_is_an_error] (room for the preflight copy and the
+/// tables, not for a second data buffer) is enough in single-buffer mode (R15w): witgen gets as
+/// far as the kernels, which fault on the deliberately invalid trace (fault 0x4), not as far as a
+/// budget error.
+#[test]
+fn witgen_single_buffer_fits_without_snapshot() {
+    let h = Harness::new();
+    let rows = 1 << 14;
+    let trace = PreflightTrace {
+        cycles: vec![cycle(0); rows],
+        ..Default::default()
+    };
+    let global = MetaBuffer {
+        buf: h.hal.alloc_elem_init("global", REGCOUNT_GLOBAL, Val::ZERO),
+        rows: 1,
+        cols: REGCOUNT_GLOBAL,
+        checked: false,
+    };
+    let data = MetaBuffer {
+        buf: h
+            .hal
+            .alloc_elem_init("data", rows * REGCOUNT_DATA, Val::ZERO),
+        rows,
+        cols: REGCOUNT_DATA,
+        checked: false,
+    };
+    h.hal.try_sync().unwrap();
+    h.hal.set_budget_scope(BudgetScope::Hal);
+    h.hal
+        .set_working_set_limit(Some(h.hal.owned_allocated_size() + (2 << 20)));
+    let res = h.circuit.metal_witgen(
+        StepMode::Parallel,
+        &trace,
+        &global,
+        &data,
+        &data,
+        PreData::Single,
+    );
+    h.hal.set_working_set_limit(None);
+    let err = format!("{:#}", res.expect_err("the trace is invalid"));
+    assert!(
+        err.contains("kernel fault") && !err.contains("budget"),
+        "{err}"
     );
 }
