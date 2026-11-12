@@ -41,6 +41,12 @@
 //! for single ones): the MSM and NTT kernels over bn254_fast.h's 64-bit-accumulate Montgomery
 //! multiplication, and Booth MSM digits (15 windows). All bit-exact (`g9_tuning_bit_exact`).
 //!
+//! Item G12 adds two MSM switches to [Tuning] (revert: `RISC0_G16_METAL_G12=0`, or
+//! `RISC0_G16_METAL_G12_OFF=lenperm,lent_groups`): `lenperm`, the bucket threads take the pieces
+//! of a window longest first (balanced SIMD lanes; -184 ms per proof), and `lent_groups`, the
+//! window groups are sized by the lent a, b buffer, so MSM B2 is one group (-19 ms). Same
+//! results, bit for bit.
+//!
 //! Memory (rzup component: 5,635,930 witness elements, domain 2^23; device allocation 3890 MiB
 //! with the item G10 [MemOptions], 5624 MiB without): key points 2232 MiB (mapped from the zkey
 //! without a copy: file-backed pages, outside the process' physical footprint), coefficients
@@ -219,6 +225,14 @@ pub struct Tuning {
     pub wide_ntt: bool,
     /// `booth`: signed MSM digits of 17 bits, 15 windows (the scalars are canonical Fr).
     pub booth: bool,
+    /// `lenperm` (item G12): MSM bucket threads take the pieces longest first
+    /// ([MsmTune::lenperm]). Revert: `RISC0_G16_METAL_G12=0` or `RISC0_G16_METAL_G12_OFF=lenperm`
+    /// (the switch names are also accepted in `RISC0_G16_METAL_G9_OFF`).
+    pub lenperm: bool,
+    /// `lent_groups` (item G12): MSM window groups sized by the lent pieces buffer (a, b) rather
+    /// than the 256 MiB cap ([MsmTune::lent_groups]; MSM B2 in one group). Revert:
+    /// `RISC0_G16_METAL_G12_OFF=lent_groups`.
+    pub lent_groups: bool,
 }
 
 impl Default for Tuning {
@@ -229,13 +243,16 @@ impl Default for Tuning {
 
 impl Tuning {
     /// Switch names for `RISC0_G16_METAL_G9_OFF`.
-    pub const NAMES: &'static [&'static str] = &["wide_mul", "wide_ntt", "booth"];
+    pub const NAMES: &'static [&'static str] =
+        &["wide_mul", "wide_ntt", "booth", "lenperm", "lent_groups"];
 
     /// The MSM switches.
     pub fn msm(&self) -> MsmTune {
         MsmTune {
             wide_mul: self.wide_mul,
             booth: self.booth,
+            lenperm: self.lenperm,
+            lent_groups: self.lent_groups,
         }
     }
 
@@ -245,6 +262,8 @@ impl Tuning {
             wide_mul: true,
             wide_ntt: true,
             booth: true,
+            lenperm: true,
+            lent_groups: true,
         }
     }
 
@@ -254,6 +273,8 @@ impl Tuning {
             wide_mul: false,
             wide_ntt: false,
             booth: false,
+            lenperm: false,
+            lent_groups: false,
         }
     }
 
@@ -263,6 +284,8 @@ impl Tuning {
             "wide_mul" => self.wide_mul = on,
             "wide_ntt" => self.wide_ntt = on,
             "booth" => self.booth = on,
+            "lenperm" => self.lenperm = on,
+            "lent_groups" => self.lent_groups = on,
             _ => return false,
         }
         true
@@ -298,12 +321,19 @@ impl Tuning {
             return Self::none();
         }
         let mut t = Self::all();
-        if let Ok(off) = std::env::var("RISC0_G16_METAL_G9_OFF") {
-            for name in off.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-                if !t.set(name, false) {
-                    eprintln!("[groth16-metal] RISC0_G16_METAL_G9_OFF: unknown switch {name}");
+        for var in ["RISC0_G16_METAL_G9_OFF", "RISC0_G16_METAL_G12_OFF"] {
+            if let Ok(off) = std::env::var(var) {
+                for name in off.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    if !t.set(name, false) {
+                        eprintln!("[groth16-metal] {var}: unknown switch {name}");
+                    }
                 }
             }
+        }
+        // Item G12's switches, all off.
+        if std::env::var("RISC0_G16_METAL_G12").as_deref() == Ok("0") {
+            t.lenperm = false;
+            t.lent_groups = false;
         }
         t
     }
@@ -1369,7 +1399,8 @@ fn random_fr() -> Result<Fr> {
 
 /// The prover's MSM configuration: [MsmConfig::default] (c = 16, 256 MiB piece groups), or the
 /// measurement knobs of item G9's sweeps: `RISC0_G16_METAL_MSM_WBITS` (1..=16) and
-/// `RISC0_G16_METAL_MSM_PIECE_MIB` (the per-group piece-buffer cap). Results are the same for
+/// `RISC0_G16_METAL_MSM_PIECE_MIB` (the per-group piece-buffer cap), and item G12's
+/// `RISC0_G16_METAL_MSM_SEG` (pieces per segment_reduce thread, default 64). Results are the same for
 /// every value (the window layout is the scratch's); only speed and the scratch size change.
 fn msm_config_from_env() -> MsmConfig {
     let mut cfg = MsmConfig::default();
@@ -1387,6 +1418,14 @@ fn msm_config_from_env() -> MsmConfig {
     }
     if let Some(m) = num("RISC0_G16_METAL_MSM_PIECE_MIB") {
         cfg.max_piece_bytes = m.max(1) << 20;
+    }
+    // Item G12's sweep: pieces per msm_segment_reduce thread.
+    if let Some(sg) = num("RISC0_G16_METAL_MSM_SEG") {
+        if (1..=4096).contains(&sg) {
+            cfg.seg = sg as u32;
+        } else {
+            eprintln!("[groth16-metal] RISC0_G16_METAL_MSM_SEG={sg} out of 1..=4096, ignored");
+        }
     }
     cfg
 }

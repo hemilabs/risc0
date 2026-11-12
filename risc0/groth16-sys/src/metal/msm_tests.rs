@@ -590,9 +590,377 @@ fn r17_msm_repeat() {
     let lg: u32 = std::env::var("R17_AUDIT_LG").map_or(20, |v| v.parse().unwrap());
     check_size(&g, 1 << lg, 17, MsmConfig::default(), reps);
     println!("R17AUDIT groth16 msm G1+G2 2^{lg}: {reps}/{reps} reps equal ark (0 differ)");
+    // G10's open issue (a G2 wbits = 1 result seen wrong once under load): that config, too.
+    let tiny = MsmConfig {
+        wbits: 1,
+        seg: 3,
+        ..Default::default()
+    };
+    check_size(&g, 1000, 200 + 2, tiny, reps);
+    println!(
+        "R17AUDIT groth16 msm G1+G2 n 1000 wbits 1 seg 3: {reps}/{reps} reps equal ark (0 differ)"
+    );
 }
 
-/// G9: every [MsmTune] combination, with scalars declared below 2^256 and below 2^254 (the
+/// G12 investigation (ignored): the G10 note's one-off wrong G2 result (n = 1000, wbits = 1,
+/// seg = 3) as a repeat test per [MsmTune] variant. `G12_TINY_REPS` (default 50) sorts + MSMs
+/// per variant, `G12_TINY_VARIANTS` (default "base,wide,booth,lenperm"; all = G12 default).
+/// Prints the number of wrong G1 / G2 results per variant (no assertion).
+#[test]
+#[ignore]
+fn g12_tiny_g2_repeat() {
+    let Some(g) = gpu() else { return };
+    let reps: usize = std::env::var("G12_TINY_REPS").map_or(50, |v| v.parse().unwrap());
+    let variants = std::env::var("G12_TINY_VARIANTS").unwrap_or_else(|_| "g6,g9,all".into());
+    let n = std::env::var("G12_TINY_N").map_or(1000usize, |v| v.parse().unwrap());
+    let seed = std::env::var("G12_TINY_SEED").map_or(202u64, |v| v.parse().unwrap());
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let p1 = points::<G1Projective>(n, &mut rng);
+    let p2 = points::<G2Projective>(n, &mut rng);
+    let s = scalars(n, &mut rng);
+    let want1: G1Projective = ark_msm(&p1, &s);
+    let want2: G2Projective = ark_msm(&p2, &s);
+    let b1 = g.buffer(&words::<G1>(&p1));
+    let b2 = g.buffer(&words::<G2>(&p2));
+    let sw: Vec<u32> = s.iter().flat_map(scalar_words).collect();
+    let bs = g.buffer(&sw);
+    let cfg = MsmConfig {
+        wbits: std::env::var("G12_TINY_WBITS").map_or(1, |v| v.parse().unwrap()),
+        seg: std::env::var("G12_TINY_SEG").map_or(3, |v| v.parse().unwrap()),
+        ..Default::default()
+    };
+    let mut sc = MsmScratch::new(&g.device, n as u32, cfg).unwrap();
+    for v in variants.split(',') {
+        let tune = match v {
+            "g6" => MsmTune::none(),
+            "g9" => MsmTune {
+                lenperm: false,
+                lent_groups: false,
+                ..MsmTune::all()
+            },
+            "g9nobooth" => MsmTune {
+                booth: false,
+                lenperm: false,
+                lent_groups: false,
+                ..MsmTune::all()
+            },
+            "nobooth" => MsmTune {
+                booth: false,
+                ..MsmTune::all()
+            },
+            "all" => MsmTune::all(),
+            other => panic!("unknown variant {other}"),
+        };
+        sc.set_tune(tune);
+        let (mut bad1, mut bad2) = (0, 0);
+        // Per rep, the G2 window sums as affine points (the Xyzz words depend on the
+        // nondeterministic order inside a bucket); at the end the reps whose result is wrong are
+        // listed with the windows that differ from the majority value.
+        let mut all_w: Vec<Vec<G2Affine>> = Vec::new();
+        #[allow(clippy::type_complexity)]
+        let mut stage_rows: Vec<(Vec<(G2Affine, u32)>, Vec<G2Affine>)> = Vec::new();
+        let mut wrong_reps = Vec::new();
+        for rep in 0..reps {
+            g.sort(&mut sc, MsmBuf::new(&bs), n as u32).unwrap();
+            let got1 = if std::env::var("G12_TINY_MODE").as_deref() == Ok("skipg1") {
+                want1
+            } else {
+                g.msm_sorted::<G1>(&sc, MsmBuf::new(&b1), 0).unwrap().0
+            };
+            let nw = sc.windows() as usize;
+            let out = g.device.new_buffer(
+                nw as u64 * G2::XYZZ_BYTES,
+                MTLResourceOptions::StorageModeShared,
+            );
+            // G12_TINY_MODE: "one" (default) one command buffer per MSM; "split" one per
+            // dispatch; "skipg1" no G1 MSM before the G2 one.
+            let mode = std::env::var("G12_TINY_MODE").unwrap_or_else(|_| "one".into());
+            if mode == "split" {
+                for st in g
+                    .kernels
+                    .msm_stages::<G2>(&sc, MsmBuf::new(&b2), 0, MsmBuf::new(&out))
+                {
+                    g.run(|enc| {
+                        g.kernels.encode_msm_stage::<G2>(
+                            enc,
+                            &sc,
+                            MsmBuf::new(&b2),
+                            MsmBuf::new(&out),
+                            st,
+                        )
+                    })
+                    .unwrap();
+                }
+            } else {
+                g.run(|enc| {
+                    g.kernels
+                        .encode_msm::<G2>(enc, &sc, MsmBuf::new(&b2), 0, MsmBuf::new(&out))
+                })
+                .unwrap();
+            }
+            let (snw, wbits) = sc.sorted_layout().unwrap();
+            let per = 4 * G2::COORD_WORDS;
+            // Safety: completed; shared buffer of at least snw * per words.
+            let w: Vec<u32> = unsafe {
+                std::slice::from_raw_parts(out.contents() as *const u32, snw as usize * per)
+            }
+            .to_vec();
+            let got2 = G2::combine_windows(&w, wbits);
+            bad1 += (got1.into_affine() != want1.into_affine()) as usize;
+            let wrong2 = got2.into_affine() != want2.into_affine();
+            bad2 += wrong2 as usize;
+            if wrong2 {
+                wrong_reps.push(rep);
+            }
+            all_w.push(
+                (0..snw as usize)
+                    .map(|k| G2::xyzz_to_projective(&w[k * per..(k + 1) * per]).into_affine())
+                    .collect(),
+            );
+            // With RISC0_G16_METAL_SCRATCH_SHARED=1 (and one window group): the pieces and the
+            // segment partials of every window, as affine points.
+            if std::env::var("RISC0_G16_METAL_SCRATCH_SHARED").as_deref() == Ok("1") {
+                let (pieces, pb, partial, mp, ms) = sc.debug_buffers();
+                let read = |b: &BufferRef, words: usize| -> Vec<u32> {
+                    // Safety: shared scratch, the command buffer completed.
+                    unsafe { std::slice::from_raw_parts(b.contents() as *const u32, words) }
+                        .to_vec()
+                };
+                let pw = read(pieces, snw as usize * mp as usize * per);
+                let pbw = read(pb, snw as usize * mp as usize);
+                let qw = read(partial, snw as usize * ms as usize * per);
+                let at = |v: &[u32], i: usize| {
+                    G2::xyzz_to_projective(&v[i * per..(i + 1) * per]).into_affine()
+                };
+                let mut row = Vec::new();
+                for k in 0..snw as usize {
+                    for j in 0..2usize.min(mp as usize) {
+                        row.push((at(&pw, k * mp as usize + j), pbw[k * mp as usize + j]));
+                    }
+                }
+                let parts: Vec<G2Affine> = (0..snw as usize)
+                    .map(|k| at(&qw, k * ms as usize))
+                    .collect();
+                stage_rows.push((row, parts));
+            }
+        }
+        let nwin = all_w[0].len();
+        let majority: Vec<G2Affine> = (0..nwin)
+            .map(|k| {
+                let mut best = (all_w[0][k], 0);
+                for cand in all_w.iter().map(|r| r[k]) {
+                    let c = all_w.iter().filter(|r| r[k] == cand).count();
+                    if c > best.1 {
+                        best = (cand, c);
+                    }
+                }
+                best.0
+            })
+            .collect();
+        let mut bad_windows = 0;
+        for (rep, wins) in all_w.iter().enumerate() {
+            let dw: Vec<usize> = (0..nwin).filter(|&k| wins[k] != majority[k]).collect();
+            bad_windows += dw.len();
+            if !dw.is_empty() && bad_windows <= 40 {
+                println!(
+                    "G12TINY {v} rep {rep}: windows {dw:?} differ from the majority (result wrong: {})",
+                    wrong_reps.contains(&rep)
+                );
+            }
+        }
+        if !stage_rows.is_empty() {
+            // Pieces (first two of each window) and first segment partials in the minority.
+            let np = stage_rows[0].0.len();
+            let nq = stage_rows[0].1.len();
+            for rep in 0..reps {
+                let dp: Vec<usize> = (0..np)
+                    .filter(|&i| {
+                        let c = stage_rows
+                            .iter()
+                            .filter(|r| r.0[i] == stage_rows[rep].0[i])
+                            .count();
+                        c * 2 < reps
+                    })
+                    .collect();
+                let dq: Vec<usize> = (0..nq)
+                    .filter(|&i| {
+                        let c = stage_rows
+                            .iter()
+                            .filter(|r| r.1[i] == stage_rows[rep].1[i])
+                            .count();
+                        c * 2 < reps
+                    })
+                    .collect();
+                if !dp.is_empty() || !dq.is_empty() {
+                    println!(
+                        "G12TINY {v} rep {rep}: minority pieces {:?} (window, slot, bucket), \
+                         minority partials (windows) {dq:?}",
+                        dp.iter()
+                            .map(|&i| (i / 2, i % 2, stage_rows[rep].0[i].1))
+                            .collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+        let diff_reps = (0..reps)
+            .filter(|&r| (0..nwin).any(|k| all_w[r][k] != majority[k]))
+            .count();
+        let bad_host = wrong_reps
+            .iter()
+            .filter(|&&r| (0..nwin).all(|k| all_w[r][k] == majority[k]))
+            .count();
+        println!(
+            "G12TINY {v} {cfg:?} n {n}: G1 {bad1}/{reps} wrong, G2 {bad2}/{reps} wrong; \
+             G2 window sums differ from the majority in {diff_reps} reps ({bad_windows} windows), \
+             majority sums but wrong in {bad_host}"
+        );
+    }
+}
+
+/// R17 audit / item G12: msm_window_reduce (G2) alone, re-run `R17_AUDIT_REPS` (default 300)
+/// times on one MSM's segment partials (n 1000, wbits 1, seg 3: 129 windows), each result
+/// normalized and compared with the majority; fails on any minority window. With the point
+/// additions out of line (before G12) this found 58 of 18000 re-runs wrong while a prover ran
+/// concurrently (G12 note); run it under such a load to exercise it.
+#[test]
+#[ignore]
+fn r17_msm_window_reduce_repeat() {
+    let Some(g) = gpu() else { return };
+    let reps: usize = std::env::var("R17_AUDIT_REPS")
+        .ok()
+        .or_else(|| std::env::var("G12_WR_REPS").ok())
+        .map_or(300, |v| v.parse().unwrap());
+    let n = std::env::var("G12_TINY_N").map_or(1000usize, |v| v.parse().unwrap());
+    let mut rng = ChaCha8Rng::seed_from_u64(202);
+    let _p1 = points::<G1Projective>(n, &mut rng);
+    let p2 = points::<G2Projective>(n, &mut rng);
+    let s = scalars(n, &mut rng);
+    let b2 = g.buffer(&words::<G2>(&p2));
+    let sw: Vec<u32> = s.iter().flat_map(scalar_words).collect();
+    let bs = g.buffer(&sw);
+    let cfg = MsmConfig {
+        wbits: std::env::var("G12_TINY_WBITS").map_or(1, |v| v.parse().unwrap()),
+        seg: std::env::var("G12_TINY_SEG").map_or(3, |v| v.parse().unwrap()),
+        ..Default::default()
+    };
+    let mut sc = MsmScratch::new(&g.device, n as u32, cfg).unwrap();
+    g.sort(&mut sc, MsmBuf::new(&bs), n as u32).unwrap();
+    let nw = sc.windows() as usize;
+    let out = g.device.new_buffer(
+        nw as u64 * G2::XYZZ_BYTES,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let ob = MsmBuf::new(&out);
+    let stages = g.kernels.msm_stages::<G2>(&sc, MsmBuf::new(&b2), 0, ob);
+    g.run(|enc| {
+        for st in &stages {
+            g.kernels
+                .encode_msm_stage::<G2>(enc, &sc, MsmBuf::new(&b2), ob, *st)
+        }
+    })
+    .unwrap();
+    let wr = *stages.last().unwrap();
+    let (snw, _) = sc.sorted_layout().unwrap();
+    let per = 4 * G2::COORD_WORDS;
+    let mut runs: Vec<Vec<G2Affine>> = Vec::new();
+    for _ in 0..reps {
+        g.run(|enc| {
+            g.kernels
+                .encode_msm_stage::<G2>(enc, &sc, MsmBuf::new(&b2), ob, wr)
+        })
+        .unwrap();
+        // Safety: completed; shared.
+        let w =
+            unsafe { std::slice::from_raw_parts(out.contents() as *const u32, snw as usize * per) };
+        runs.push(
+            (0..snw as usize)
+                .map(|k| G2::xyzz_to_projective(&w[k * per..(k + 1) * per]).into_affine())
+                .collect(),
+        );
+    }
+    let mut bad = 0;
+    let mut bad_runs = 0;
+    for r in 0..reps {
+        let d: Vec<usize> = (0..snw as usize)
+            .filter(|&k| runs.iter().filter(|x| x[k] == runs[r][k]).count() * 2 < reps)
+            .collect();
+        bad += d.len();
+        bad_runs += !d.is_empty() as usize;
+        if !d.is_empty() && bad_runs <= 10 {
+            println!("G12WR run {r}: windows {d:?} in the minority");
+        }
+    }
+    println!(
+        "G12WR {cfg:?} n {n}: {bad_runs}/{reps} window_reduce runs with a minority window \
+         ({bad} windows of {snw} x {reps})"
+    );
+    println!(
+        "R17AUDIT groth16 msm_window_reduce G2 129 windows: {bad_runs}/{reps} reps differ from the \
+         majority"
+    );
+    assert_eq!(bad_runs, 0, "msm_window_reduce is not deterministic");
+}
+
+/// G12: `lent_groups` groups the windows by a lent piece buffer's whole length. With a 1-byte
+/// cap (one window per group) and a lent buffer that holds every window, the MSM runs as one
+/// group with the switch and as one group per window without; both equal ark, for G1 and G2,
+/// with and without the length order.
+#[test]
+fn msm_lent_groups() {
+    let Some(g) = gpu() else { return };
+    let mut rng = ChaCha8Rng::seed_from_u64(0x612);
+    let n = 2000usize;
+    let p1 = points::<G1Projective>(n, &mut rng);
+    let p2 = points::<G2Projective>(n, &mut rng);
+    let s = scalars(n, &mut rng);
+    let want1: G1Projective = ark_msm(&p1, &s);
+    let want2: G2Projective = ark_msm(&p2, &s);
+    let b1 = g.buffer(&words::<G1>(&p1));
+    let b2 = g.buffer(&words::<G2>(&p2));
+    let sw: Vec<u32> = s.iter().flat_map(scalar_words).collect();
+    let bs = g.buffer(&sw);
+    let cfg = MsmConfig {
+        wbits: 8,
+        max_piece_bytes: 1,
+        ..Default::default()
+    };
+    let one_group = MsmScratch::sizes_for(n as u32, cfg)[5] * cfg.nwins() as u64;
+    let lent = g
+        .device
+        .new_buffer(one_group, MTLResourceOptions::StorageModePrivate);
+    let mut sc = MsmScratch::new_with(&g.device, n as u32, cfg, Some(&lent)).unwrap();
+    assert!(sc.pieces_lent());
+    for (lent_groups, lenperm) in [(false, false), (true, false), (false, true), (true, true)] {
+        sc.set_tune(MsmTune {
+            lent_groups,
+            lenperm,
+            ..MsmTune::all()
+        });
+        g.sort(&mut sc, MsmBuf::new(&bs), n as u32).unwrap();
+        let out = g
+            .device
+            .new_buffer(1 << 16, MTLResourceOptions::StorageModeShared);
+        let groups = g
+            .kernels
+            .msm_stages::<G2>(&sc, MsmBuf::new(&b2), 0, MsmBuf::new(&out))
+            .iter()
+            .filter(|st| matches!(st, MsmStage::Buckets(_)))
+            .count();
+        let nw = sc.sorted_layout().unwrap().0 as usize;
+        assert_eq!(
+            groups,
+            if lent_groups { 1 } else { nw },
+            "lent_groups {lent_groups}"
+        );
+        let what = format!("lent_groups {lent_groups} lenperm {lenperm}");
+        let (got1, _) = g.msm_sorted::<G1>(&sc, MsmBuf::new(&b1), 0).unwrap();
+        assert_eq!(got1.into_affine(), want1.into_affine(), "G1 {what}");
+        let (got2, _) = g.msm_sorted::<G2>(&sc, MsmBuf::new(&b2), 0).unwrap();
+        assert_eq!(got2.into_affine(), want2.into_affine(), "G2 {what}");
+    }
+}
+
+/// G9 (G12: with `lenperm`): every [MsmTune] combination, with scalars declared below 2^256 and below 2^254 (the
 /// prover's canonical Fr, fewer Booth windows), against ark, on one scratch re-sorted for each.
 /// Scalars include Booth edge patterns: windows of all ones, digits of exactly +-2^16 at c = 17,
 /// every window's top bit set, and 2^253 - 1.
@@ -639,10 +1007,24 @@ fn msm_tune_variants() {
         let mut sc = MsmScratch::new(&g.device, n as u32, cfg).unwrap();
         for bits in [256, 254] {
             sc.set_scalar_bits(bits);
-            for (wide_mul, booth) in [(false, false), (true, false), (false, true), (true, true)] {
-                sc.set_tune(MsmTune { wide_mul, booth });
+            for (wide_mul, booth, lenperm) in [
+                (false, false, false),
+                (true, false, false),
+                (false, true, false),
+                (true, true, false),
+                (true, false, true),
+                (true, true, true),
+                (false, true, true),
+            ] {
+                sc.set_tune(MsmTune {
+                    wide_mul,
+                    booth,
+                    lenperm,
+                    lent_groups: lenperm,
+                });
                 g.sort(&mut sc, MsmBuf::new(&bs), n as u32).unwrap();
-                let what = format!("{cfg:?} bits {bits} wide {wide_mul} booth {booth}");
+                let what =
+                    format!("{cfg:?} bits {bits} wide {wide_mul} booth {booth} lenperm {lenperm}");
                 let (nw, _) = sc.sorted_layout().unwrap();
                 let expect_nw = if booth {
                     (bits + 1).div_ceil(cfg.wbits + 1)

@@ -33,7 +33,8 @@ struct MsmParams {
   uint32_t w0;         // first window of this window group (buckets / segment_reduce)
   uint32_t wcount;     // windows in this group
   uint32_t booth;      // 1: signed (Booth) digits, msm_digit_booth (item G9)
-  uint32_t _pad[3];
+  uint32_t lenperm;    // 1: bucket threads take the pieces in length order (item G12)
+  uint32_t _pad[2];
 };
 
 // Sorted entries of a Booth sort carry the digit's sign in the top bit of the scalar index.
@@ -77,3 +78,6 @@ inline uint32_t msm_digit_booth(const device uint32_t* s, uint32_t w, uint32_t c
   // d = mag - top 2^c: for top, |d| = 2^c - mag (0 when mag = 2^c, i.e. all ones: d = 0).
   return top ? (1u << c) - mag : mag;
 }
+
+// Item G12 length order: piece lengths fall in MSM_LEN_BINS bins (min(length, bins - 1)).
+constant uint32_t MSM_LEN_BINS = 1024;

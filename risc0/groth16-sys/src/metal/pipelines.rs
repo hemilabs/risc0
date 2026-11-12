@@ -65,6 +65,12 @@ pub const MSM_PSOS: &[&str] = &[
     "msm_buckets_g2w",
     "msm_segment_reduce_g2w",
     "msm_window_reduce_g2w",
+    "msm_len_clear",
+    "msm_len_count",
+    "msm_len_scan",
+    "msm_len_scatter",
+    "msm_buckets_perm_g1w",
+    "msm_buckets_perm_g2w",
 ];
 
 /// The NTT PSOs ([super::ntt::NttKernels]; all of them, the 3 non-`_w` ones size the fused block).

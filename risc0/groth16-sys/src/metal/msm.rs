@@ -91,6 +91,12 @@ pub const MSM_KERNEL_NAMES: &[&str] = &[
     "msm_segment_reduce_g2w",
     "msm_window_reduce_g1w",
     "msm_window_reduce_g2w",
+    "msm_len_clear",
+    "msm_len_count",
+    "msm_len_scan",
+    "msm_len_scatter",
+    "msm_buckets_perm_g1w",
+    "msm_buckets_perm_g2w",
 ];
 
 /// Kernel-variant switches of an MSM (item G9). [MsmScratch::set_tune] sets them before a sort;
@@ -104,6 +110,17 @@ pub struct MsmTune {
     /// 2^c + 1 buckets per window and, for scalars below 2^254 ([MsmScratch::set_scalar_bits]),
     /// ceil(255 / (c + 1)) windows (15 instead of 16 at c = 16).
     pub booth: bool,
+    /// Item G12: the bucket threads take the (bucket-cut) pieces longest first
+    /// (`msm_len_*` after the sort, `msm_buckets_perm_*`), so that the lanes of a SIMD group sum
+    /// pieces of about the same length. Only with `wide_mul` (the perm kernels exist for the
+    /// `_g1w`/`_g2w` field types); ignored otherwise. Same results.
+    pub lenperm: bool,
+    /// Item G12: when the pieces buffer is lent ([MsmScratch::new_with]), group the windows by
+    /// the lent buffer's whole length instead of the configured cap
+    /// ([MsmConfig::max_piece_bytes]): the prover lends a, b (512 MiB at the rzup key), where
+    /// all 15 G2 windows fit, so MSM B2 runs as one window group instead of two. No memory of
+    /// its own. Same results.
+    pub lent_groups: bool,
 }
 
 impl Default for MsmTune {
@@ -118,6 +135,8 @@ impl MsmTune {
         Self {
             wide_mul: true,
             booth: true,
+            lenperm: true,
+            lent_groups: true,
         }
     }
 
@@ -126,7 +145,14 @@ impl MsmTune {
         Self {
             wide_mul: false,
             booth: false,
+            lenperm: false,
+            lent_groups: false,
         }
+    }
+
+    /// Whether the length order is in effect ([Self::lenperm] needs [Self::wide_mul]).
+    pub fn uses_lenperm(&self) -> bool {
+        self.lenperm && self.wide_mul
     }
 }
 
@@ -164,6 +190,8 @@ pub mod buf {
         pub const PIECES: u64 = 6;
         pub const PIECE_BUCKET: u64 = 7;
         pub const PARAMS: u64 = 8;
+        /// msm_buckets_perm only (item G12).
+        pub const PERM: u64 = 9;
     }
     pub mod segment_reduce {
         pub const PIECES: u64 = 0;
@@ -197,9 +225,14 @@ pub struct MsmParams {
     pub w0: u32,
     pub wcount: u32,
     pub booth: u32,
-    pub _pad: [u32; 3],
+    /// Item G12: length order ([MsmTune::lenperm]).
+    pub lenperm: u32,
+    pub _pad: [u32; 2],
 }
 const _: () = assert!(std::mem::size_of::<MsmParams>() == 64);
+
+/// `MSM_LEN_BINS` of msm_common.h (item G12 length order).
+const LEN_BINS: u64 = 1024;
 
 /// Threadgroup memory limit per threadgroup (plan 2.1; larger allocations fail silently).
 const MAX_TG_BYTES: u64 = 32768;
@@ -485,6 +518,8 @@ pub fn scalar_words(s: &Fr) -> [u32; 8] {
 
 struct CurvePsos {
     buckets: ComputePipelineState,
+    /// `msm_buckets_perm_*` (item G12; the `_g1w`/`_g2w` sets only).
+    buckets_perm: Option<ComputePipelineState>,
     segment_reduce: ComputePipelineState,
     window_reduce: ComputePipelineState,
 }
@@ -495,6 +530,11 @@ pub struct MsmKernels {
     hist_count: ComputePipelineState,
     window_scan: ComputePipelineState,
     scatter: ComputePipelineState,
+    /// `msm_len_{clear,count,scan,scatter}` (item G12).
+    len_clear: ComputePipelineState,
+    len_count: ComputePipelineState,
+    len_scan: ComputePipelineState,
+    len_scatter: ComputePipelineState,
     /// The G7/G8 point kernels (`RISC0_G16_METAL_G9_OFF=wide_mul`, the revert path): built on
     /// first use (item G10), so the default path does not pay their cold pipeline compilation.
     g1: std::sync::OnceLock<CurvePsos>,
@@ -508,6 +548,7 @@ pub struct MsmKernels {
 fn curve_psos(device: &DeviceRef, lib: &LibraryRef, g: &str) -> Result<CurvePsos> {
     Ok(CurvePsos {
         buckets: pso(device, lib, &format!("msm_buckets_{g}"))?,
+        buckets_perm: None,
         segment_reduce: pso(device, lib, &format!("msm_segment_reduce_{g}"))?,
         window_reduce: pso(device, lib, &format!("msm_window_reduce_{g}"))?,
     })
@@ -541,6 +582,7 @@ impl MsmKernels {
         let curve = |g: &str| -> Result<CurvePsos> {
             Ok(CurvePsos {
                 buckets: src.pso(&format!("msm_buckets_{g}"))?,
+                buckets_perm: Some(src.pso(&format!("msm_buckets_perm_{g}"))?),
                 segment_reduce: src.pso(&format!("msm_segment_reduce_{g}"))?,
                 window_reduce: src.pso(&format!("msm_window_reduce_{g}"))?,
             })
@@ -550,6 +592,10 @@ impl MsmKernels {
             hist_count: src.pso("msm_hist_count")?,
             window_scan: src.pso("msm_window_scan")?,
             scatter: src.pso("msm_scatter")?,
+            len_clear: src.pso("msm_len_clear")?,
+            len_count: src.pso("msm_len_count")?,
+            len_scan: src.pso("msm_len_scan")?,
+            len_scatter: src.pso("msm_len_scatter")?,
             g1: Default::default(),
             g2: Default::default(),
             g1w: curve("g1w")?,
@@ -603,6 +649,7 @@ impl MsmKernels {
         scalars.check(n as u64 * 32, "MSM scalars");
         let cfg = sc.cfg;
         let booth = sc.tune.booth;
+        let lenperm = sc.tune.uses_lenperm();
         // Booth sorts keep the digit sign in the index's top bit.
         assert!(
             !booth || n < 1 << 31,
@@ -621,6 +668,7 @@ impl MsmKernels {
             seg: cfg.seg,
             max_segs: sc.max_segs,
             booth: booth as u32,
+            lenperm: lenperm as u32,
             ..Default::default()
         };
         assert!(
@@ -666,6 +714,33 @@ impl MsmKernels {
             enc.set_buffer(buf::scatter::SORTED, Some(&sc.sorted), 0);
             set_params(enc, buf::scatter::PARAMS, &p);
             dispatch_1d(enc, &self.scatter, n as u64);
+        }
+        if lenperm {
+            // Item G12: the pieces of each window in length order (msm_sort.metal).
+            enc.set_compute_pipeline_state(&self.len_clear);
+            enc.set_buffer(0, Some(&sc.lhist), 0);
+            set_params(enc, 1, &p);
+            dispatch_1d(enc, &self.len_clear, p.nwins as u64 * LEN_BINS);
+            if n > 0 {
+                enc.set_compute_pipeline_state(&self.len_count);
+                enc.set_buffer(0, Some(&sc.offset), 0);
+                enc.set_buffer(1, Some(&sc.hist), 0);
+                enc.set_buffer(2, Some(&sc.lhist), 0);
+                set_params(enc, 3, &p);
+                dispatch_2d(enc, &self.len_count, p.nbuckets as u64, p.nwins as u64);
+                enc.set_compute_pipeline_state(&self.len_scan);
+                enc.set_buffer(0, Some(&sc.lhist), 0);
+                set_params(enc, 1, &p);
+                dispatch_1d(enc, &self.len_scan, p.nwins as u64);
+                enc.set_compute_pipeline_state(&self.len_scatter);
+                enc.set_buffer(0, Some(&sc.offset), 0);
+                enc.set_buffer(1, Some(&sc.hist), 0);
+                enc.set_buffer(2, Some(&sc.piece_off), 0);
+                enc.set_buffer(3, Some(&sc.lhist), 0);
+                enc.set_buffer(4, Some(&sc.perm), 0);
+                set_params(enc, 5, &p);
+                dispatch_2d(enc, &self.len_scatter, p.nbuckets as u64, p.nwins as u64);
+            }
         }
         sc.sorted_params = Some(p);
         sc.sorted_tune = sc.tune;
@@ -719,12 +794,17 @@ impl MsmKernels {
         };
         let mut stages = Vec::new();
 
-        // Window groups that fit the pieces buffer.
+        // Window groups that fit the pieces buffer (item G12 `lent_groups`: all of a lent one).
         let group_bytes = p.max_pieces as u64 * C::XYZZ_BYTES;
+        let pieces_bytes = if sc.sorted_tune.lent_groups && sc.pieces_lent {
+            sc.pieces.length().max(sc.pieces_bytes)
+        } else {
+            sc.pieces_bytes
+        };
         if p.max_pieces > 0 {
-            let per_group = ((sc.pieces_bytes / group_bytes) as u32).clamp(1, p.nwins);
+            let per_group = ((pieces_bytes / group_bytes) as u32).clamp(1, p.nwins);
             assert!(
-                per_group as u64 * group_bytes <= sc.pieces_bytes
+                per_group as u64 * group_bytes <= pieces_bytes
                     && per_group as u64 * p.max_pieces as u64 * 4 <= sc.piece_bucket.length(),
                 "MSM pieces scratch too small"
             );
@@ -759,7 +839,16 @@ impl MsmKernels {
         let ps = self.curve::<C>(sc.sorted_tune);
         match stage {
             MsmStage::Buckets(p) => {
-                enc.set_compute_pipeline_state(&ps.buckets);
+                // Item G12: thread t sums piece perm[w][t] (length order) or piece t.
+                let pso = if p.lenperm != 0 {
+                    enc.set_buffer(buf::buckets::PERM, Some(&sc.perm), 0);
+                    ps.buckets_perm
+                        .as_ref()
+                        .expect("length order without the perm bucket kernel")
+                } else {
+                    &ps.buckets
+                };
+                enc.set_compute_pipeline_state(pso);
                 if p.npoints > 0 {
                     enc.set_buffer(buf::buckets::POINTS, Some(points.buf), points.offset);
                 } else {
@@ -777,7 +866,7 @@ impl MsmKernels {
                 enc.set_buffer(buf::buckets::PIECE_BUCKET, Some(&sc.piece_bucket), 0);
                 set_params(enc, buf::buckets::PARAMS, &p);
                 let grid = MsmConfig::max_pieces_nb(p.n, p.nbuckets).min(p.max_pieces);
-                dispatch_2d(enc, &ps.buckets, grid as u64, p.wcount as u64);
+                dispatch_2d(enc, pso, grid as u64, p.wcount as u64);
             }
             MsmStage::SegmentReduce(p) => {
                 enc.set_compute_pipeline_state(&ps.segment_reduce);
@@ -873,6 +962,9 @@ pub struct MsmScratch {
     pieces_lent: bool,
     piece_bucket: Buffer,
     partial: Buffer,
+    /// Item G12 length order: perm uint[nwins * max_pieces], lhist uint[nwins * LEN_BINS].
+    perm: Buffer,
+    lhist: Buffer,
     sorted_params: Option<MsmParams>,
     /// The switches of the next sort ([Self::set_tune]) and of the last one.
     tune: MsmTune,
@@ -883,8 +975,8 @@ pub struct MsmScratch {
 
 impl MsmScratch {
     /// The buffer sizes of a scratch for `cap_n` scalars, in allocation order: hist, offset,
-    /// piece_off, totals, sorted, pieces, piece_bucket, partial.
-    fn sizes(cap_n: u32, cfg: MsmConfig) -> [u64; 8] {
+    /// piece_off, totals, sorted, pieces, piece_bucket, partial, perm, lhist.
+    fn sizes(cap_n: u32, cfg: MsmConfig) -> [u64; 10] {
         // Sized for either digit mode ([MsmConfig::layout]): nwins() windows, nbuckets() + 1
         // buckets.
         let nwins = cfg.nwins() as u64;
@@ -909,13 +1001,15 @@ impl MsmScratch {
             // Sized for every window: G1 groups hold twice the windows of G2 groups.
             nwins * max_pieces * 4,
             nwins * max_segs * MAX_XYZZ_BYTES,
+            nwins * max_pieces * 4,
+            nwins * LEN_BINS * 4,
         ]
         .map(|b| b.max(MAX_XYZZ_BYTES))
     }
 
     /// The buffer sizes [MsmScratch::new] allocates, in allocation order: hist, offset,
-    /// piece_off, totals, sorted, pieces, piece_bucket, partial.
-    pub fn sizes_for(cap_n: u32, cfg: MsmConfig) -> [u64; 8] {
+    /// piece_off, totals, sorted, pieces, piece_bucket, partial, perm, lhist.
+    pub fn sizes_for(cap_n: u32, cfg: MsmConfig) -> [u64; 10] {
         cfg.validate();
         Self::sizes(cap_n, cfg)
     }
@@ -938,8 +1032,8 @@ impl MsmScratch {
     /// [Self::new], with `pieces` (item G10) a buffer of the caller's to use as the piece buffer
     /// instead of allocating one, if it holds at least the configured size (else one is
     /// allocated). The caller guarantees nothing else uses its first [Self::sizes_for]`[5]`
-    /// bytes while an MSM on this scratch runs (the prover lends a, b once MSM H's sort
-    /// consumed h).
+    /// bytes (with [MsmTune::lent_groups], item G12: the whole buffer) while an MSM on this
+    /// scratch runs (the prover lends a, b, which are free once MSM H's sort consumed h).
     pub fn new_with(
         device: &DeviceRef,
         cap_n: u32,
@@ -958,7 +1052,8 @@ impl MsmScratch {
         let alloc = |bytes: u64, what: &str| -> Result<Buffer> {
             super::new_buffer_checked(device, bytes, private, &format!("the MSM {what}"))
         };
-        let [hist, offset, piece_off, totals, sorted, pieces_size, piece_bucket, partial] = sizes;
+        let [hist, offset, piece_off, totals, sorted, pieces_size, piece_bucket, partial, perm, lhist] =
+            sizes;
         Ok(Self {
             cfg,
             cap_n,
@@ -977,11 +1072,25 @@ impl MsmScratch {
             pieces_lent: lent.is_some(),
             piece_bucket: alloc(piece_bucket, "piece_bucket")?,
             partial: alloc(partial, "partial")?,
+            perm: alloc(perm, "perm")?,
+            lhist: alloc(lhist, "lhist")?,
             sorted_params: None,
             tune: MsmTune::default(),
             sorted_tune: MsmTune::default(),
             scalar_bits: 256,
         })
+    }
+
+    /// Test access: (pieces, piece_bucket, partial, max_pieces, max_segs).
+    #[cfg(test)]
+    pub(crate) fn debug_buffers(&self) -> (&BufferRef, &BufferRef, &BufferRef, u32, u32) {
+        (
+            &self.pieces,
+            &self.piece_bucket,
+            &self.partial,
+            self.max_pieces,
+            self.max_segs,
+        )
     }
 
     /// Whether the piece buffer is the caller's ([Self::new_with]).
@@ -1050,6 +1159,8 @@ impl MsmScratch {
             &self.sorted,
             &self.piece_bucket,
             &self.partial,
+            &self.perm,
+            &self.lhist,
         ]
         .iter()
         .map(|b| b.length())
@@ -1111,7 +1222,7 @@ impl MsmGpu {
         b
     }
 
-    fn run(&self, f: impl FnOnce(&ComputeCommandEncoderRef)) -> Result<f64> {
+    pub(crate) fn run(&self, f: impl FnOnce(&ComputeCommandEncoderRef)) -> Result<f64> {
         let cb = self.queue.new_command_buffer();
         let enc = cb.new_compute_command_encoder();
         f(enc);
