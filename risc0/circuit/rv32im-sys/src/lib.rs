@@ -40,11 +40,13 @@ pub const METAL_KERNEL_NAMES: &[&str] = &[
     "par_stepExecW",
     "fwd_stepExec",
     "rev_stepExec",
-    // $OUT_DIR/metal/eval_check.metal (cuda2metal.py eval; baseline eval_check, R6)
-    "eval_check",
     // $OUT_DIR/metal/eval_check_ef.metal (kernels/cuda/evalfast/regen.py --metal; evalfast, R12)
     "ef_eval_split",
     "ef_combine",
+    // Not listed (R15e), so their PSOs are built on first use only: "eval_check" ($OUT_DIR/metal/
+    // eval_check.metal, cuda2metal.py eval; the R6 baseline, ~60 s cold) and "ef_eval_split_r12"
+    // ($OUT_DIR/metal/eval_check_ef_r12.metal, evalfast in R12's table form); see the rv32im
+    // Metal eval_check host (RISC0_METAL_RV32IM_EVAL).
 ];
 
 /// Host half of the Metal evalfast eval_check (R12): the poly_mix table sizes, the product

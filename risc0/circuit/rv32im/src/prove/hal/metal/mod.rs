@@ -42,7 +42,7 @@ use std::{
     collections::HashSet,
     mem::size_of,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, MutexGuard, OnceLock,
     },
 };
@@ -53,7 +53,10 @@ use risc0_circuit_rv32im_sys::{
     RawMemoryTransaction, RawPreflightCycle, METAL_KERNEL_NAMES, METAL_LIB,
 };
 use risc0_zkp::hal::{
-    metal::{BufferImpl, MetalHal, MetalHalPoseidon2, MetalHash, MetalHashPoseidon2, MetalKernels},
+    metal::{
+        archive::{self, ArchiveReport, ArchivedKernels},
+        BufferImpl, MetalHal, MetalHalPoseidon2, MetalHash, MetalHashPoseidon2, MetalKernels,
+    },
     Buffer as _,
 };
 
@@ -99,8 +102,9 @@ pub(crate) const EXPECTED_KERNELS: &[(Phase, &[&str])] = &[
     ),
     // R9 (accum_tu.metal from accum_tu_gen.py --metal, misc.metal).
     (Phase::Accum, &["stepAccumA", "finalizeZeroizeAccum"]),
-    // R10 (baseline eval_check.metal).
-    (Phase::EvalCheck, &["eval_check"]),
+    // R12 evalfast (eval_check_ef.metal). The R10 baseline `eval_check` and R15e's
+    // `ef_eval_split_r12` are built lazily by the eval_check host when selected (R15e).
+    (Phase::EvalCheck, &["ef_eval_split", "ef_combine"]),
 ];
 
 /// Debug knob: path of a metallib to load instead of `risc0_circuit_rv32im_sys::METAL_LIB`.
@@ -109,21 +113,103 @@ pub(crate) const EXPECTED_KERNELS: &[(Phase, &[&str])] = &[
 #[cfg(any(test, debug_assertions))]
 pub(crate) const METALLIB_OVERRIDE_ENV: &str = "RISC0_METAL_RV32IM_METALLIB";
 
+/// R14: `RISC0_METAL_RV32IM_ARCHIVE=0` builds the rv32im PSOs with `MetalKernels::new` (one at
+/// a time, no binary archive: the pre-R14 loader). By default they are built through the zkp
+/// HAL's binary archive (`risc0_zkp::hal::metal::archive`, unit [ARCHIVE_UNIT], hoisted from
+/// keccak's K5 code), concurrently, so a cold process compiles each kernel once and later
+/// processes load the stored GPU binaries even when the OS shader cache misses.
+/// `RISC0_METAL_ARCHIVE=0` (all units) keeps the concurrent build but drops the archive.
+pub(crate) const ARCHIVE_ENV: &str = "RISC0_METAL_RV32IM_ARCHIVE";
+
+/// The binary-archive unit name of the embedded rv32im metallib (a metallib loaded through
+/// `RISC0_METAL_RV32IM_METALLIB` uses `rv32im_override`, so it never replaces this archive).
+pub(crate) const ARCHIVE_UNIT: &str = "rv32im";
+
+fn use_archive() -> bool {
+    !std::env::var(ARCHIVE_ENV).is_ok_and(|v| v.trim() == "0")
+}
+
+/// The loaded rv32im metallib and its PSOs.
+pub(crate) enum LoadedKernels {
+    /// Through the binary archive (or, if it is disabled or fails, concurrently without it).
+    Archived(ArchivedKernels),
+    /// `MetalKernels::new` ([ARCHIVE_ENV] = 0).
+    Plain(MetalKernels),
+}
+
+impl LoadedKernels {
+    pub(crate) fn get(&self, name: &str) -> Option<&ComputePipelineState> {
+        match self {
+            Self::Archived(k) => k.get(name),
+            Self::Plain(k) => k.get(name),
+        }
+    }
+
+    /// The PSO for `name`; panics (a programming error, PLAN 2.9) if it was not built at load.
+    pub(crate) fn pipeline(&self, name: &str) -> &ComputePipelineState {
+        self.get(name)
+            .unwrap_or_else(|| panic!("Metal kernel {name} was not loaded"))
+    }
+
+    pub(crate) fn library(&self) -> &metal::LibraryRef {
+        match self {
+            Self::Archived(k) => k.library(),
+            Self::Plain(k) => &k.library,
+        }
+    }
+
+    /// The archive's account of the load (None for the plain loader).
+    #[allow(dead_code)]
+    pub(crate) fn archive_report(&self) -> Option<&ArchiveReport> {
+        match self {
+            Self::Archived(k) => Some(&k.report),
+            Self::Plain(_) => None,
+        }
+    }
+}
+
 /// The rv32im metallib with a PSO for every [METAL_KERNEL_NAMES] entry and every
 /// [EXPECTED_KERNELS] entry the library contains. Built once per process (one Metal device),
 /// like the zkp PSO cache.
 pub(crate) struct Rv32imKernels {
-    kernels: MetalKernels,
+    kernels: LoadedKernels,
     /// Expected kernels the library does not have, by phase.
     missing: Vec<(Phase, &'static str)>,
 }
 
 impl Rv32imKernels {
+    /// [Self::load_from_in] without a binary archive (tests with their own kernel lists, which
+    /// must not replace the process's archive of the real set).
+    #[cfg(test)]
     fn load_from<MH: MetalHash>(
         hal: &MetalHal<MH>,
         bytes: &[u8],
         listed: &[&str],
         expected: &[(Phase, &[&'static str])],
+    ) -> Result<Self> {
+        Self::load_from_in(
+            hal,
+            bytes,
+            listed,
+            expected,
+            use_archive(),
+            None,
+            ARCHIVE_UNIT,
+        )
+    }
+
+    /// Load `bytes`. With `archived` (production: [use_archive], i.e. [ARCHIVE_ENV] unset or not
+    /// `0`) the PSOs are built concurrently through the binary archive in `archive_dir` (None: no
+    /// archive) under `unit`; without it, by the plain pre-R14 loader. The loader choice is a
+    /// parameter so tests never have to set [ARCHIVE_ENV] (process-wide state, PLAN 8.7).
+    fn load_from_in<MH: MetalHash>(
+        hal: &MetalHal<MH>,
+        bytes: &[u8],
+        listed: &[&str],
+        expected: &[(Phase, &[&'static str])],
+        archived: bool,
+        archive_dir: Option<std::path::PathBuf>,
+        unit: &str,
     ) -> Result<Self> {
         // First load without PSOs to see which entry points the library has.
         let available: HashSet<String> = hal
@@ -143,8 +229,36 @@ impl Rv32imKernels {
                 }
             }
         }
-        // Names listed by rv32im-sys must be present (MetalKernels::new fails fast otherwise).
-        let kernels = hal.try_load_library(bytes, &wanted)?;
+        // Names listed by rv32im-sys must be present (both loaders fail fast otherwise).
+        let t = std::time::Instant::now();
+        let kernels = if archived {
+            let k = ArchivedKernels::new_in(archive_dir, &hal.device, unit, bytes, &wanted)?;
+            let r = &k.report;
+            tracing::info!(
+                "rv32im Metal: {} PSOs in {:.2} s (binary archive {}: {} hits, {} misses{})",
+                wanted.len(),
+                r.elapsed.as_secs_f64(),
+                r.path
+                    .as_deref()
+                    .map_or("off".into(), |p| p.display().to_string()),
+                r.hits,
+                r.misses,
+                if r.errors.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {} errors, first: {}", r.errors.len(), r.errors[0])
+                }
+            );
+            LoadedKernels::Archived(k)
+        } else {
+            let k = hal.try_load_library(bytes, &wanted)?;
+            tracing::info!(
+                "rv32im Metal: {} PSOs in {:.2} s ({ARCHIVE_ENV}=0: no binary archive)",
+                wanted.len(),
+                t.elapsed().as_secs_f64()
+            );
+            LoadedKernels::Plain(k)
+        };
         Ok(Self { kernels, missing })
     }
 
@@ -166,13 +280,21 @@ impl Rv32imKernels {
                     std::fs::read(&path)
                         .map_err(|e| format!("reading {path:?} ({METALLIB_OVERRIDE_ENV}): {e}"))
                 });
-                let bytes: &[u8] = match &override_lib {
-                    None => METAL_LIB,
-                    Some(Ok(bytes)) => bytes,
+                let (bytes, unit): (&[u8], &str) = match &override_lib {
+                    None => (METAL_LIB, ARCHIVE_UNIT),
+                    Some(Ok(bytes)) => (bytes, "rv32im_override"),
                     Some(Err(e)) => return Err(e.clone()),
                 };
-                Self::load_from(hal, bytes, METAL_KERNEL_NAMES, EXPECTED_KERNELS)
-                    .map_err(|e| format!("{e:#}"))
+                Self::load_from_in(
+                    hal,
+                    bytes,
+                    METAL_KERNEL_NAMES,
+                    EXPECTED_KERNELS,
+                    use_archive(),
+                    archive::archive_dir(),
+                    unit,
+                )
+                .map_err(|e| format!("{e:#}"))
             })
             .as_ref()
             .map_err(|e| anyhow!("loading the rv32im metallib: {e}"))
@@ -272,6 +394,8 @@ pub struct MetalRv32imCtx<MH: MetalHash> {
     hal: Arc<MetalHal<MH>>,
     kernels: &'static Rv32imKernels,
     /// A Mutex rather than a RefCell (PLAN 2.6) so the circuit HAL is Send + Sync like the HAL.
+    /// Locked poison-tolerantly (R14, R8 open issue): a budget panic inside `grow` leaves the
+    /// previous buffers in place, so later phases can still use the scratch.
     scratch: Mutex<ScratchBuffers>,
 }
 
@@ -287,7 +411,7 @@ impl<MH: MetalHash> MetalRv32imCtx<MH> {
     /// The loaded rv32im metallib.
     #[allow(dead_code)]
     pub fn library(&self) -> &metal::LibraryRef {
-        &self.kernels.kernels.library
+        self.kernels.kernels.library()
     }
 
     /// Fails, naming the missing kernels, if `phase` cannot run on Metal with this metallib.
@@ -306,7 +430,10 @@ impl<MH: MetalHash> MetalRv32imCtx<MH> {
     /// phase zero-fills them.
     #[allow(dead_code)]
     pub(crate) fn tables(&self) -> (BufferImpl<u32>, BufferImpl<u32>) {
-        let mut s = self.scratch.lock().unwrap();
+        let mut s = self
+            .scratch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let u8 = grow(&self.hal, &mut s.table_u8, "table_u8", TABLE_U8_CELLS);
         let u16 = grow(&self.hal, &mut s.table_u16, "table_u16", TABLE_U16_CELLS);
         (u8, u16)
@@ -326,7 +453,11 @@ impl<MH: MetalHash> MetalRv32imCtx<MH> {
             trace.bigint_bytes.len(),
         );
         self.hal.try_sync()?;
-        let mut s = self.scratch.lock().unwrap();
+        let t = std::time::Instant::now();
+        let mut s = self
+            .scratch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let buf = grow(&self.hal, &mut s.pf, "preflight", layout.bytes);
         s.pf_layout = layout;
         buf.view_mut(|dst| {
@@ -348,13 +479,16 @@ impl<MH: MetalHash> MetalRv32imCtx<MH> {
             copy(layout.txns_offset, txns);
             copy(layout.bigint_offset, &trace.bigint_bytes);
         });
+        r14_stat(3, t.elapsed());
         Ok((buf, layout))
     }
 
     /// Scratch buffers, for phases that need more than the helpers above.
     #[allow(dead_code)]
     pub(crate) fn scratch(&self) -> MutexGuard<'_, ScratchBuffers> {
-        self.scratch.lock().unwrap()
+        self.scratch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -429,6 +563,22 @@ pub(crate) fn phase_mark<MH: MetalHash>(hal: &MetalHal<MH>, label: &'static str)
         .push(mark);
 }
 
+/// R14 host-side timers, in ns, summed since the last reset (the
+/// pipeline bench resets and reads them): `[0]` host-only work between the wait for the previous
+/// GPU work and the evalfast dispatch (poly_mix table, its copy: the GPU has nothing queued
+/// then), `[1]` that wait, `[2]` unused, `[3]` the preflight copy of `upload_preflight`
+/// (host-only: the GPU is idle until the segment's first dispatch).
+pub(crate) static R14_STATS: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+pub(crate) fn r14_stat(i: usize, d: std::time::Duration) {
+    R14_STATS[i].fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
+}
+
 pub struct MetalCircuitHal<MH: MetalHash> {
     hal: Arc<MetalHal<MH>>, // retain a reference: buffers may only be used through their own HAL
     ctx: MetalRv32imCtx<MH>,
@@ -496,3 +646,6 @@ mod tests;
 #[cfg(test)]
 #[path = "integration_tests.rs"]
 mod integration_tests;
+
+#[cfg(test)]
+mod pipeline_bench;
