@@ -221,25 +221,50 @@ pub(crate) fn build_perm_by(
     perm[..n]
         .par_chunks_mut(w)
         .enumerate()
-        .for_each(|(wi, out)| {
-            let base = wi * w;
-            let rows = &cycles[base..base + out.len()];
-            let mut next = [0u32; 256];
-            for c in rows {
-                next[key(c) as usize] += 1;
-            }
-            let mut sum = 0;
-            for slot in next.iter_mut() {
-                let c = *slot;
-                *slot = sum;
-                sum += c;
-            }
-            for (i, c) in rows.iter().enumerate() {
-                let slot = &mut next[key(c) as usize];
-                out[*slot as usize] = (base + i) as u32;
-                *slot += 1;
-            }
-        });
+        .for_each(|(wi, out)| perm_window(cycles, wi * w, out, &key));
+}
+
+/// [build_perm_by] on the calling thread only (no rayon): witgen builds its launch order on a
+/// thread of its own, overlapping the GPU setup, where rayon joins would wait on a busy pool
+/// (R15w fix round 1).
+pub(crate) fn build_perm_by_seq(
+    cycles: &[RawPreflightCycle],
+    win: u32,
+    perm: &mut [u32],
+    key: impl Fn(&RawPreflightCycle) -> u8,
+) {
+    let n = cycles.len();
+    assert!(perm.len() >= n);
+    let w = 1usize << win.min(31);
+    for (wi, out) in perm[..n].chunks_mut(w).enumerate() {
+        perm_window(cycles, wi * w, out, &key);
+    }
+}
+
+/// One window of [build_perm_by]: `out` gets the rows `base..base + out.len()` grouped by `key`
+/// (a stable counting sort).
+fn perm_window(
+    cycles: &[RawPreflightCycle],
+    base: usize,
+    out: &mut [u32],
+    key: &impl Fn(&RawPreflightCycle) -> u8,
+) {
+    let rows = &cycles[base..base + out.len()];
+    let mut next = [0u32; 256];
+    for c in rows {
+        next[key(c) as usize] += 1;
+    }
+    let mut sum = 0;
+    for slot in next.iter_mut() {
+        let c = *slot;
+        *slot = sum;
+        sum += c;
+    }
+    for (i, c) in rows.iter().enumerate() {
+        let slot = &mut next[key(c) as usize];
+        out[*slot as usize] = (base + i) as u32;
+        *slot += 1;
+    }
 }
 
 /// stepAccumA's `AccumParams` (accum_tu.metal, 48 bytes, static_assert'ed there).

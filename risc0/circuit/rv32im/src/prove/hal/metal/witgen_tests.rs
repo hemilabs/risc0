@@ -952,6 +952,7 @@ fn witgen_tune_env_values() {
         ("RISC0_METAL_WITGEN_SORT", "12"),
         ("RISC0_METAL_WITGEN_SORT_MINOR", "1"),
         ("RISC0_METAL_WITGEN_SINGLE_BUFFER", "0"),
+        ("RISC0_METAL_WITGEN_SORT_OVERLAP", "0"),
     ]));
     assert_eq!(
         t,
@@ -959,7 +960,8 @@ fn witgen_tune_env_values() {
             tg: 128,
             sort_win: 12,
             minor: true,
-            single: false
+            single: false,
+            sort_overlap: false,
         }
     );
     let t = parse_tune(env(&[
@@ -970,6 +972,34 @@ fn witgen_tune_env_values() {
     assert_eq!(t.tg, DEFAULT_TUNE.tg);
     assert_eq!(t.sort_win, 24);
     assert_eq!(t.single, DEFAULT_TUNE.single);
+}
+
+/// The overlapped (sequential) and inline (rayon) launch-order sorts give the same permutation,
+/// for both keys and several windows, including a partial last window.
+#[test]
+fn witgen_sort_seq_matches_par() {
+    let mut x = 0x2545_f491_4f6c_dd1du64;
+    let cycles: Vec<_> = (0..(3 << 12) + 77)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let mut c = cycle(0);
+            c.major = (x % 40) as u8;
+            c.minor = (x >> 8) as u8;
+            c
+        })
+        .collect();
+    for win in [0, 3, 11, 12, 14] {
+        for minor in [false, true] {
+            let par = witgen_sort_perm(&cycles, win, minor, true);
+            let seq = witgen_sort_perm(&cycles, win, minor, false);
+            assert_eq!(par, seq, "win {win} minor {minor}");
+            let mut sorted = seq.clone();
+            sorted.sort_unstable();
+            assert!(sorted.iter().enumerate().all(|(i, &v)| v as usize == i));
+        }
+    }
 }
 
 /// [witgen_tg]: capped by the PSO maximum, a multiple of the SIMD width, never 0.
@@ -1025,6 +1055,17 @@ fn witgen_tune_matches_cpu() {
             single: true,
             ..DEFAULT_TUNE
         },
+        // The first round's sort path (rayon, on the calling thread), both keys.
+        WitgenTune {
+            sort_overlap: false,
+            ..DEFAULT_TUNE
+        },
+        WitgenTune {
+            sort_win: 11,
+            minor: true,
+            sort_overlap: false,
+            ..DEFAULT_TUNE
+        },
         WitgenTune {
             single: !DEFAULT_TUNE.single,
             ..DEFAULT_TUNE
@@ -1055,8 +1096,10 @@ fn witgen_tune_matches_cpu() {
     assert_eq!(bad, 0, "a tuned Metal witgen differs from the CPU witgen");
 }
 
-/// Parse an R15w variant: `base` or a comma list of `tg=N`, `sort=W`, `minor=0|1`, `single=0|1`
-/// over [DEFAULT_TUNE].
+/// Parse an R15w variant: a comma list of `tg=N`, `sort=W`, `minor=0|1`, `single=0|1`,
+/// `overlap=0|1` applied over [DEFAULT_TUNE]. `base` alone is DEFAULT_TUNE (the current defaults,
+/// not the pre-R15w behaviour); `r13` is `sort=0,single=0` (the R13/R17 path), the A of every
+/// R15w call A/B.
 fn parse_variant(v: &str) -> WitgenTune {
     let mut t = DEFAULT_TUNE;
     for kv in v
@@ -1064,6 +1107,11 @@ fn parse_variant(v: &str) -> WitgenTune {
         .map(str::trim)
         .filter(|s| !s.is_empty() && *s != "base")
     {
+        if kv == "r13" {
+            t.sort_win = 0;
+            t.single = false;
+            continue;
+        }
         let (k, x) = kv
             .split_once('=')
             .unwrap_or_else(|| panic!("variant item {kv}"));
@@ -1073,6 +1121,7 @@ fn parse_variant(v: &str) -> WitgenTune {
             "sort" => t.sort_win = n as u32,
             "minor" => t.minor = n != 0,
             "single" => t.single = n != 0,
+            "overlap" => t.sort_overlap = n != 0,
             _ => panic!("unknown variant key {k}"),
         }
     }
@@ -1158,7 +1207,7 @@ fn timed_witgen(
 fn r15w_witgen_ab() {
     let pairs: usize = env_or("R15W_PAIRS", 7);
     let variants: Vec<(String, WitgenTune)> = std::env::var("R15W_VARIANTS")
-        .unwrap_or_else(|_| "base;sort=14;base".into())
+        .unwrap_or_else(|_| "r13;base;r13".into())
         .split(';')
         .map(|v| (v.trim().to_string(), parse_variant(v)))
         .collect();
