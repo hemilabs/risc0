@@ -590,6 +590,59 @@ pub(crate) mod tests {
         }
     }
 
+    /// K9: the automatic eval_check chunk of a po2 16 proof follows the working-set budget. With
+    /// room (the device's default limit) it is 32768; under a budget set to that proof's peak
+    /// minus half the extra scratch, 32768 no longer fits and the proof runs with 16384 (no
+    /// further halving) and stays under the budget. Every seal verifies.
+    #[test]
+    fn auto_eval_chunk_follows_budget() {
+        let _gpu = gpu_test_lock();
+        const PO2: usize = 16;
+        let inputs = test_inputs(PO2);
+        let large = super::eval_check::LARGE_EVAL_CHUNK;
+        let base = super::eval_check::DEFAULT_EVAL_CHUNK;
+        let extra =
+            super::eval_check::scratch_bytes(large) - super::eval_check::scratch_bytes(base);
+        let run = |budget: Option<u64>| {
+            let hal = Rc::new(MetalHalPoseidon2::new());
+            hal.set_working_set_limit(budget);
+            let circuit_hal = Rc::new(MetalCircuitHalPoseidon2::new(hal.clone()));
+            circuit_hal.set_eval_chunk_auto();
+            assert_eq!(circuit_hal.eval_chunk(), None);
+            let prover = KeccakProverImpl {
+                hal: hal.clone(),
+                circuit_hal: circuit_hal.clone(),
+            };
+            hal.sync();
+            risc0_zkp::hal::Hal::trim_device_memory(hal.as_ref());
+            hal.reset_peak_allocated_size();
+            let seal = prover.prove(&inputs, PO2).unwrap();
+            let peak = hal.peak_allocated_size();
+            prover.verify(&seal).expect("Verification failed");
+            (circuit_hal.last_eval_chunk(), peak, hal.working_set_limit())
+        };
+        let (chunk, peak, limit) = run(None);
+        println!(
+            "po2 {PO2} default limit {} MiB: chunk {chunk}, peak {} MiB",
+            limit >> 20,
+            peak >> 20
+        );
+        if peak > limit {
+            println!("the device's limit is below a po2 {PO2} proof's peak; skipped");
+            return;
+        }
+        assert_eq!(chunk, large);
+        let budget = peak - extra / 2;
+        let (chunk, peak2, _) = run(Some(budget));
+        println!(
+            "po2 {PO2} budget {} MiB: chunk {chunk}, peak {} MiB",
+            budget >> 20,
+            peak2 >> 20
+        );
+        assert_eq!(chunk, base);
+        assert!(peak2 <= budget);
+    }
+
     /// K7: wall time per phase of Metal keccak proofs at `K7_PO2S` (default 17,18; `K7_PROVE_REPS`
     /// proofs each, default 3, after one warm-up proof), and of the CPU prover (`K7_CPU=1`, one
     /// proof). Phases as [Phase] (setup = preflight + data alloc/fill before scatter; finalize =
