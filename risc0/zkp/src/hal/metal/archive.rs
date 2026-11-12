@@ -34,7 +34,8 @@
 //!   never reads an old archive. When a new one is written, the unit keeps its
 //!   `RISC0_METAL_ARCHIVE_KEEP` (default 4) most recently used other keys and deletes the rest,
 //!   and any key unused for 30 days ([prune_other_keys]; K7, K8 finding 4). Units must not be
-//!   prefixes of each other followed by `-` (`keccak`, `rv32im`, `recursion` are not).
+//!   prefixes of each other followed by `-` (`keccak`, `rv32im`, `recursion`, `groth16` are not;
+//!   `groth16` is `risc0-groth16-sys`'s, item G11).
 //! - **Integrity**: the file is `<unit>-<key>-<digest(file)[..16]>.binarchive`, and its content
 //!   is checked against that name before Metal sees it. Metal does not survive every damaged
 //!   archive: a file with some bytes flipped loads, and then creating a PSO from it aborts the

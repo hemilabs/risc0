@@ -7177,6 +7177,7 @@ dependencies = [
  "rand_chacha 0.3.1",
  "risc0-build-kernel",
  "risc0-sys",
+ "risc0-zkp",
  "sppark",
  "test-log",
  "tracing",

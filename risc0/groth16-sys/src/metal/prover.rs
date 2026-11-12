@@ -74,7 +74,8 @@ use super::{
     coeffs::{Coeffs, FuzzedResults, FuzzedResultsArk},
     compact::CompactCoeffs,
     msm::{MsmBuf, MsmConfig, MsmCurve, MsmKernels, MsmScratch, MsmStage, MsmTune, G1, G2},
-    ntt::NttPlan,
+    ntt::{NttKernels, NttPlan, NttSchedule},
+    pipelines,
     small::{self, BufSlice, SmallKernels},
     srs::{self, SharedBuf, Srs, VerifyingKeyArk},
 };
@@ -87,15 +88,37 @@ const PLAN_SLACK: u64 = 32 << 20;
 
 /// The process-wide GPU objects: device, queue, the groth16 library and the pipelines of the
 /// small kernels and the MSM (built once; cold creation of the MSM pipelines takes up to minutes
-/// the first time a metallib is seen, the OS shader cache makes later processes fast).
+/// the first time a metallib is seen, the OS shader cache makes later processes fast). By default
+/// they come through the binary archive ([super::pipelines], item G11).
 pub struct Kernels {
     pub device: Device,
     pub queue: CommandQueue,
     pub library: Library,
     pub small: SmallKernels,
     pub msm: MsmKernels,
+    /// The NTT pipelines every plan shares (G11, archive on); `None` with
+    /// `RISC0_G16_METAL_ARCHIVE=0`, where each plan builds its own (the pre-G11 behaviour).
+    pub ntt: Option<NttKernels>,
+    /// What the archive did (`None` with `RISC0_G16_METAL_ARCHIVE=0`).
+    pub archive: Option<risc0_zkp::hal::metal::archive::ArchiveReport>,
     /// Wall time of building the library and pipelines.
     pub build_time: Duration,
+}
+
+impl Kernels {
+    /// An NTT plan for 2^lg with the default schedule, from the shared pipelines if there are.
+    pub fn ntt_plan(&self, lg: u32) -> Result<NttPlan> {
+        match &self.ntt {
+            Some(k) => NttPlan::with_kernels(
+                &self.device,
+                &self.queue,
+                k.clone(),
+                lg,
+                NttSchedule::default(),
+            ),
+            None => NttPlan::new(&self.device, &self.queue, &self.library, lg),
+        }
+    }
 }
 
 /// The process-wide [Kernels], built on first use.
@@ -111,18 +134,51 @@ fn build_kernels() -> Result<Kernels> {
     super::metal_supported()?;
     let t0 = Instant::now();
     let device = Device::system_default().ok_or_else(|| anyhow!("no Metal device"))?;
-    let library = device
-        .new_library_with_data(crate::METAL_LIB)
-        .map_err(|e| anyhow!("loading the groth16 metallib: {e}"))?;
-    let small = SmallKernels::new(&device, &library)?;
-    let msm = MsmKernels::new(&device, &library)?;
+    if !pipelines::use_archive() {
+        // `RISC0_G16_METAL_ARCHIVE=0`: the pre-G11 loader (serial plain builds; NTT per plan).
+        let library = device
+            .new_library_with_data(crate::METAL_LIB)
+            .map_err(|e| anyhow!("loading the groth16 metallib: {e}"))?;
+        let small = SmallKernels::new(&device, &library)?;
+        let msm = MsmKernels::new(&device, &library)?;
+        let queue = device.new_command_queue();
+        return Ok(Kernels {
+            device,
+            queue,
+            library,
+            small,
+            msm,
+            ntt: None,
+            archive: None,
+            build_time: t0.elapsed(),
+        });
+    }
+    let archived = pipelines::build_archived(
+        &device,
+        risc0_zkp::hal::metal::archive::archive_dir(),
+        crate::METAL_LIB,
+    )
+    .context("loading the groth16 metallib")?;
+    let library = archived.library().to_owned();
+    let src = pipelines::PsoSource::archived(&device, &archived);
+    let small = SmallKernels::from_source(&src)?;
+    let msm = MsmKernels::from_source(&device, &library, &src)?;
+    let ntt = NttKernels::from_source(&src)?;
     let queue = device.new_command_queue();
+    if std::env::var_os("RISC0_VERBOSE").is_some() {
+        eprintln!(
+            "[groth16-metal] pipelines: {}",
+            pipelines::describe(&archived.report)
+        );
+    }
     Ok(Kernels {
         device,
         queue,
         library,
         small,
         msm,
+        ntt: Some(ntt),
+        archive: Some(archived.report.clone()),
         build_time: t0.elapsed(),
     })
 }
@@ -728,7 +784,7 @@ impl MetalProver {
         let fault = alloc(16, false, "the fault word")?;
         let wsums = alloc(wsum_bytes, false, "the MSM window sums")?;
         check_working_set(device, "the NTT tables", ntt_bytes)?;
-        let ntt = NttPlan::new(device, &k.queue, &k.library, lg)?;
+        let ntt = k.ntt_plan(lg)?;
         let mut scratch = MsmScratch::new_with(device, cap, cfg, pieces_lent.then_some(&*abc))?;
         ensure!(
             scratch.pieces_lent() == pieces_lent,

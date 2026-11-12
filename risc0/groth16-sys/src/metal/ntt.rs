@@ -166,7 +166,8 @@ pub fn fr_from_words(w: &[u32]) -> Fr {
     Fr::new_unchecked(BigInt::new(l))
 }
 
-/// The pipelines of `bit_rev.metal` and `ntt.metal`.
+/// The pipelines of `bit_rev.metal` and `ntt.metal` (cheap to clone: retained references).
+#[derive(Clone)]
 pub struct NttKernels {
     bit_reverse: ComputePipelineState,
     stage: ComputePipelineState,
@@ -186,14 +187,12 @@ pub struct NttKernels {
 impl NttKernels {
     /// Build the pipelines from the groth16 metallib (`crate::METAL_LIB`) loaded as `lib`.
     pub fn new(device: &DeviceRef, lib: &LibraryRef) -> Result<Self> {
-        let pso = |name: &str| -> Result<ComputePipelineState> {
-            let f = lib
-                .get_function(name, None)
-                .map_err(|e| anyhow!("groth16 metallib has no {name}: {e}"))?;
-            device
-                .new_compute_pipeline_state_with_function(&f)
-                .map_err(|e| anyhow!("pipeline {name}: {e}"))
-        };
+        Self::from_source(&super::pipelines::PsoSource::plain(device, lib))
+    }
+
+    /// Take the PSOs from `src` (item G11: the binary archive, or a plain build).
+    pub fn from_source(src: &super::pipelines::PsoSource) -> Result<Self> {
+        let pso = |name: &str| src.pso(name);
         let fused = pso("ntt_fused_stages")?;
         let fused_w = pso("ntt_fused_stages_w")?;
         let max_threads = fused
@@ -280,6 +279,18 @@ impl NttPlan {
         lg: u32,
         schedule: NttSchedule,
     ) -> Result<Self> {
+        Self::with_kernels(device, queue, NttKernels::new(device, lib)?, lg, schedule)
+    }
+
+    /// A plan using already built `kernels` (item G11: the process-wide archived PSOs, so a plan
+    /// compiles nothing).
+    pub fn with_kernels(
+        device: &DeviceRef,
+        queue: &CommandQueueRef,
+        kernels: NttKernels,
+        lg: u32,
+        schedule: NttSchedule,
+    ) -> Result<Self> {
         ensure!(
             lg <= MAX_LG,
             "groth16-metal: NTT domain 2^{lg} too large (max 2^{MAX_LG})"
@@ -290,7 +301,6 @@ impl NttPlan {
                 "groth16-metal: NTT fused cols {cols} >= {FUSED_LOG}"
             );
         }
-        let kernels = NttKernels::new(device, lib)?;
         let n = 1u64 << lg;
         let lg_lo = lg.min(LG_LO);
         let w = Fr::get_root_of_unity(n).ok_or_else(|| anyhow!("no 2^{lg}-th root of unity"))?;

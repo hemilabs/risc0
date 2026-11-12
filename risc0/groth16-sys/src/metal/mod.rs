@@ -57,6 +57,7 @@ pub mod compact;
 pub mod filemap;
 pub mod msm;
 pub mod ntt;
+pub mod pipelines;
 pub mod prover;
 pub mod small;
 pub mod srs;
@@ -343,7 +344,9 @@ pub fn metal_release() -> Result<()> {
 /// Build the groth16 pipelines now (process-wide, kept across [metal_release]) without loading a
 /// key; returns how long the build took. Cold pipeline creation of this library took minutes on
 /// the dev machine the first time (docs/metal-port/notes/G7.md), so a long-lived worker should
-/// call this at start, outside any job deadline. Takes no GPU lock.
+/// call this at start, outside any job deadline. Takes no GPU lock. The pipelines come through
+/// the binary archive ([pipelines], item G11): ~0.02 s when it holds them, whatever the state of
+/// the OS shader cache; ~25-30 s cold on the M5 Max the first time a metallib is seen.
 pub fn metal_warmup() -> Result<std::time::Duration> {
     Ok(prover::kernels()?.build_time)
 }

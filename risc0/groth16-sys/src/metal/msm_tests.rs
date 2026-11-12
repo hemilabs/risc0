@@ -662,3 +662,105 @@ fn msm_tune_variants() {
         }
     }
 }
+
+/// G11: PSOs loaded from the binary archive run as fast as plainly built ones and give the same
+/// results. One process, both kernel sets on one device, interleaved A B / B A pairs (A = plain
+/// `MsmKernels::new`, B = `MsmKernels::from_source` on archive hits), sort + G1 + G2 MSM of
+/// 2^`G11_MSM_LOG` (default 20) terms per arm, `G11_PAIRS` (default 9) pairs; every MSM is checked
+/// against arkworks. Prints the medians and the per-pair B - A deltas (GPU ms).
+#[test]
+#[ignore]
+fn g11_archived_msm_same_speed() {
+    use crate::metal::pipelines::{archived_psos, build_archived, PsoSource};
+    let _lock = super::super::test_lock::exclusive();
+    let Some(device) = metal::Device::system_default() else {
+        return;
+    };
+    let env = |k: &str, d: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    let n = 1usize << env("G11_MSM_LOG", 20);
+    let pairs = env("G11_PAIRS", 9);
+
+    let lib = device.new_library_with_data(crate::METAL_LIB).unwrap();
+    let plain = MsmGpu {
+        device: device.clone(),
+        queue: device.new_command_queue(),
+        kernels: MsmKernels::new(&device, &lib).unwrap(),
+    };
+    let dir = std::env::temp_dir().join(format!("g11-msm-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    build_archived(&device, Some(dir.clone()), crate::METAL_LIB).unwrap();
+    let ak = build_archived(&device, Some(dir.clone()), crate::METAL_LIB).unwrap();
+    assert_eq!(
+        ak.report.hits,
+        archived_psos().len(),
+        "second load not all hits"
+    );
+    let src = PsoSource::archived(&device, &ak);
+    let archived = MsmGpu {
+        device: device.clone(),
+        queue: device.new_command_queue(),
+        kernels: MsmKernels::from_source(&device, ak.library(), &src).unwrap(),
+    };
+    assert_eq!(src.outside(), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let mut rng = ChaCha8Rng::seed_from_u64(11);
+    let p1 = points::<G1Projective>(n, &mut rng);
+    let p2 = points::<G2Projective>(n, &mut rng);
+    let s = scalars(n, &mut rng);
+    let want1: G1Projective = ark_msm(&p1, &s);
+    let want2: G2Projective = ark_msm(&p2, &s);
+    let b1 = plain.buffer(&words::<G1>(&p1));
+    let b2 = plain.buffer(&words::<G2>(&p2));
+    let bs = plain.buffer(&s.iter().flat_map(scalar_words).collect::<Vec<_>>());
+    let mut scratch = [
+        MsmScratch::new(&device, n as u32, MsmConfig::default()).unwrap(),
+        MsmScratch::new(&device, n as u32, MsmConfig::default()).unwrap(),
+    ];
+    let gpus = [&plain, &archived];
+    // [arm][pair] = (sort + G1 + G2, G2) GPU ms
+    let mut t = [vec![], vec![]];
+    for pair in 0..=pairs {
+        let order = if pair % 2 == 0 { [0, 1] } else { [1, 0] };
+        for arm in order {
+            let g = gpus[arm];
+            let sc = &mut scratch[arm];
+            let ts = g.sort(sc, MsmBuf::at(&bs, 0), n as u32).unwrap();
+            let (got1, t1) = g.msm_sorted::<G1>(sc, MsmBuf::at(&b1, 0), 0).unwrap();
+            let (got2, t2) = g.msm_sorted::<G2>(sc, MsmBuf::at(&b2, 0), 0).unwrap();
+            assert_eq!(got1.into_affine(), want1.into_affine(), "G1 arm {arm}");
+            assert_eq!(got2.into_affine(), want2.into_affine(), "G2 arm {arm}");
+            if pair > 0 {
+                // pair 0 is a warm-up
+                t[arm].push(((ts + t1 + t2) * 1e3, t2 * 1e3));
+            }
+        }
+    }
+    let med = |mut v: Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        (v[v.len() / 2], v[0], v[v.len() - 1])
+    };
+    for (what, f) in [
+        ("total", (|x: &(f64, f64)| x.0) as fn(&(f64, f64)) -> f64),
+        ("G2", |x: &(f64, f64)| x.1),
+    ] {
+        let a: Vec<f64> = t[0].iter().map(f).collect();
+        let b: Vec<f64> = t[1].iter().map(f).collect();
+        let d: Vec<f64> = a.iter().zip(&b).map(|(a, b)| b - a).collect();
+        let slower = d.iter().filter(|&&x| x > 0.0).count();
+        println!(
+            "G11 msm n=2^{} {what}: plain {:.2?} ms, archived {:.2?} ms, archived - plain per pair \
+             {:.2?} ms (median, min, max), archived slower {slower}/{}",
+            n.trailing_zeros(),
+            med(a),
+            med(b),
+            med(d.clone()),
+            d.len()
+        );
+    }
+}
