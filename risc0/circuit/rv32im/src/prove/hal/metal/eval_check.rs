@@ -699,6 +699,17 @@ mod ef_tests {
         (0..n).map(|_| Val::random(&mut rng)).collect()
     }
 
+    /// R19: value distributions of [Inputs::seeded].
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Dist {
+        /// Uniform canonical values.
+        Uniform,
+        /// Uniform in `[P / 2, P)`.
+        High,
+        /// Edge values: mostly `P - 1` / `P - 2`, some 0, 1 and uniform values.
+        Extreme,
+    }
+
     struct Inputs {
         code: Vec<Val>,
         data: Vec<Val>,
@@ -718,6 +729,43 @@ mod ef_tests {
                 mix: random_vals(CircuitImpl::MIX_SIZE),
                 out: random_vals(CircuitImpl::OUTPUT_SIZE),
                 poly_mix: ExtVal::random(&mut rand::rng()),
+            }
+        }
+
+        /// R19: inputs from a seeded generator (reproducible mismatches). [Dist] picks the
+        /// value distribution of the trace, mix and out values.
+        fn seeded(po2: usize, seed: u64, dist: Dist) -> Self {
+            use rand::{rngs::StdRng, Rng, SeedableRng};
+            const P: u32 = risc0_core::field::baby_bear::P;
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut vals = |n: usize| -> Vec<Val> {
+                (0..n)
+                    .map(|_| match dist {
+                        Dist::Uniform => Val::random(&mut rng),
+                        Dist::High => Val::new(rng.random_range(P / 2..P)),
+                        Dist::Extreme => match rng.random_range(0..8u32) {
+                            0..=3 => Val::new(P - 1),
+                            4 => Val::new(P - 2),
+                            5 => Val::ZERO,
+                            6 => Val::ONE,
+                            _ => Val::random(&mut rng),
+                        },
+                    })
+                    .collect()
+            };
+            let domain = (1 << po2) * INV_RATE;
+            let code = vals(TAPSET.group_size(REGISTER_GROUP_CODE) * domain);
+            let data = vals(TAPSET.group_size(REGISTER_GROUP_DATA) * domain);
+            let accum = vals(TAPSET.group_size(REGISTER_GROUP_ACCUM) * domain);
+            let mix = vals(CircuitImpl::MIX_SIZE);
+            let out = vals(CircuitImpl::OUTPUT_SIZE);
+            Self {
+                code,
+                data,
+                accum,
+                mix,
+                out,
+                poly_mix: ExtVal::random(&mut rng),
             }
         }
 
@@ -811,16 +859,19 @@ mod ef_tests {
     /// evalfast == evalfast_r15e == evalfast_r12 == baseline == CPU, bit for bit over all
     /// `4 * domain` elements, `reps` evalfast runs on the same buffers each equal.
     fn evalfast_matches(po2: usize, reps: usize) {
-        let inp = Inputs::random(po2);
+        evalfast_matches_on(&Inputs::random(po2), po2, reps, "uniform");
+    }
+
+    fn evalfast_matches_on(inp: &Inputs, po2: usize, reps: usize, kind: &str) {
         let t = std::time::Instant::now();
-        let cpu = cpu_check(&inp, po2);
+        let cpu = cpu_check(inp, po2);
         let cpu_time = t.elapsed();
         let hal = Arc::new(MetalHalSha256::new());
         let c = MetalCircuitHal::new(hal.clone()).unwrap();
-        let (fast, fast_t, fast_peak) = gpu_checks(&c, &inp, po2, Which::Evalfast, reps);
-        let (base, base_t, base_peak) = gpu_checks(&c, &inp, po2, Which::Baseline, 1);
-        let (r12, r12_t, _) = gpu_checks(&c, &inp, po2, Which::EvalfastR12, 1);
-        let (r15e, r15e_t, _) = gpu_checks(&c, &inp, po2, Which::EvalfastR15e, 1);
+        let (fast, fast_t, fast_peak) = gpu_checks(&c, inp, po2, Which::Evalfast, reps);
+        let (base, base_t, base_peak) = gpu_checks(&c, inp, po2, Which::Baseline, 1);
+        let (r12, r12_t, _) = gpu_checks(&c, inp, po2, Which::EvalfastR12, 1);
+        let (r15e, r15e_t, _) = gpu_checks(&c, inp, po2, Which::EvalfastR15e, 1);
         let n = mismatches(&cpu, &r15e[0]);
         assert_eq!(
             n,
@@ -852,7 +903,8 @@ mod ef_tests {
             cpu.len()
         );
         println!(
-            "R12 eval_check po2 {po2}: {} elements bit-exact (evalfast x{reps} == evalfast_r15e == \
+            "R12 eval_check po2 {po2} ({kind} inputs): {} elements bit-exact (evalfast x{reps} == \
+             evalfast_r15e == \
              evalfast_r12 == baseline == CPU); evalfast {fast_t:?}, evalfast_r15e {r15e_t:?}, \
              evalfast_r12 {r12_t:?}, baseline {base_t:?}, \
              CPU HAL {cpu_time:?}; inputs {} B, peak \
@@ -877,11 +929,51 @@ mod ef_tests {
         evalfast_matches(16, 3);
     }
 
+    /// R19: edge-value inputs ([Dist::Extreme]: mostly `P - 1` / `P - 2`, some 0 and 1) at two
+    /// seeds; every element must match the CPU. It does not replace
+    /// `evalfast_seeds_match_baseline`: R19's over-bound dual-accumulator transform passed these
+    /// inputs (notes/R19.md).
+    #[test]
+    fn evalfast_matches_cpu_extreme_po2_12() {
+        for seed in [19, 1919] {
+            evalfast_matches_on(&Inputs::seeded(12, seed, Dist::Extreme), 12, 2, "extreme");
+        }
+    }
+
     /// po2 20: ~5.3 GB of inputs and a ~1 min CPU reference (run explicitly; R12 note).
     #[test]
     #[ignore]
     fn evalfast_matches_cpu_po2_20() {
         evalfast_matches(20, 2);
+    }
+
+    /// R19: evalfast against the baseline kernel on `R19_EF_SEEDS` (default 8) seeded uniform
+    /// inputs at po2 `R19_EF_PO2` (default 18). A lazy-reduction bound broken by a generator
+    /// change shows up on only some rows of some inputs (R19's dual-accumulator transform: wrong
+    /// on 4 of 6 seeds at po2 18, 1 of 5 at po2 16, 1 of 16 at po2 10), so run this after any
+    /// change to the evalfast generator or its helpers.
+    #[test]
+    #[ignore]
+    fn evalfast_seeds_match_baseline() {
+        let po2 = env_usize("R19_EF_PO2", 18);
+        let seeds = env_usize("R19_EF_SEEDS", 8) as u64;
+        let hal = Arc::new(MetalHalSha256::new());
+        let c = MetalCircuitHal::new(hal.clone()).unwrap();
+        let mut bad = Vec::new();
+        for seed in 1..=seeds {
+            let inp = Inputs::seeded(po2, seed, Dist::Uniform);
+            let (base, _, _) = gpu_checks(&c, &inp, po2, Which::Baseline, 1);
+            let (fast, fast_t, _) = gpu_checks(&c, &inp, po2, Which::Evalfast, 1);
+            let n = mismatches(&base[0], &fast[0]);
+            println!("R19 evalfast seed {seed} po2 {po2}: {n} elements differ; {fast_t:?}");
+            if n > 0 {
+                bad.push((seed, n));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "evalfast differs from the baseline: (seed, elements) {bad:?}"
+        );
     }
 
     /// Repeated evalfast runs on one random po2 `R12_EF_PO2` (default 18) input against the
@@ -1060,7 +1152,22 @@ mod ef_tests {
             );
             vars.push((name.to_string(), lib, threads, split));
         }
-        let inp = Inputs::random(po2);
+        // R19: `R15E_INPUT=seeded|high|extreme` draws the inputs from a seeded generator
+        // (`R15E_SEED`, default 19) with that distribution ([Dist]) instead of `rand::rng()`.
+        let dist = match std::env::var("R15E_INPUT").as_deref() {
+            Ok("seeded") => Some(Dist::Uniform),
+            Ok("high") => Some(Dist::High),
+            Ok("extreme") => Some(Dist::Extreme),
+            _ => None,
+        };
+        let inp = match dist {
+            Some(dist) => {
+                let seed = env_usize("R15E_SEED", 19) as u64;
+                println!("R15E inputs: {dist:?}, seed {seed}");
+                Inputs::seeded(po2, seed, dist)
+            }
+            None => Inputs::random(po2),
+        };
         let steps = 1 << po2;
         let domain = steps * INV_RATE;
         let [code, data, accum, mix, out] = [&inp.code, &inp.data, &inp.accum, &inp.mix, &inp.out]
