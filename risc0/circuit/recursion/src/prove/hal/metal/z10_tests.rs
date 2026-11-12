@@ -38,7 +38,10 @@ fn test_input() -> VecDeque<u32> {
 }
 
 fn env_usize(k: &str, d: usize) -> usize {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 
 /// The Merkle shapes (rows, cols) a recursion proof at `po2` hashes: the three register groups,
@@ -64,7 +67,9 @@ pub(crate) fn p254_shapes(po2: usize) -> Vec<(&'static str, usize, usize)> {
 fn random_elems(n: usize, seed: u64) -> Vec<BabyBearElem> {
     use rand::{Rng as _, SeedableRng as _};
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-    (0..n).map(|_| BabyBearElem::new(rng.random::<u32>() % 0x7800_0001)).collect()
+    (0..n)
+        .map(|_| BabyBearElem::new(rng.random::<u32>() % 0x7800_0001))
+        .collect()
 }
 
 /// Profile (Z10 step 1): where an identity_p254-shaped proof (po2 18) spends its time on the CPU
@@ -151,7 +156,10 @@ fn p254_seal_matches_cpu(po2: usize) {
     assert_eq!(SEAL_CHECKS_OK.load(Ordering::Relaxed), ok + 1);
     let after = phase_calls();
     for i in 0..3 {
-        assert!(after[i] > calls[i], "phase {i} not served by the Metal circuit HAL");
+        assert!(
+            after[i] > calls[i],
+            "phase {i} not served by the Metal circuit HAL"
+        );
     }
     // A second seeded Metal proof is identical (determinism).
     let a = with_noise_seed(11, || metal.prove(&program, test_input(), None)).unwrap();
@@ -190,9 +198,15 @@ fn factory_p254_uses_metal() {
     let globals = CircuitImpl::OUTPUT_SIZE;
     assert_eq!(r.seal[..globals], c.seal[..globals]);
     if p254_on_metal() {
-        assert!(after[0] > calls[0], "poseidon_254 did not use the Metal circuit HAL");
+        assert!(
+            after[0] > calls[0],
+            "poseidon_254 did not use the Metal circuit HAL"
+        );
     } else {
-        assert_eq!(after[0], calls[0], "RISC0_METAL_REC_P254=cpu but the Metal HAL ran");
+        assert_eq!(
+            after[0], calls[0],
+            "RISC0_METAL_REC_P254=cpu but the Metal HAL ran"
+        );
     }
 }
 

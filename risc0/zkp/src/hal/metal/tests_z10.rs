@@ -98,9 +98,7 @@ fn cpu_rows(cpu: &Cpu, matrix: &[BabyBearElem], rows: usize) -> Vec<Digest> {
 fn cpu_row(matrix: &[BabyBearElem], rows: usize, row: usize) -> Digest {
     let cols = matrix.len() / rows;
     let v: Vec<BabyBearElem> = (0..cols).map(|c| matrix[c * rows + row]).collect();
-    *Poseidon254HashSuite::new_suite()
-        .hashfn
-        .hash_elem_slice(&v)
+    *Poseidon254HashSuite::new_suite().hashfn.hash_elem_slice(&v)
 }
 
 fn cpu_fold(cpu: &Cpu, io: &[Digest], n: usize) -> Vec<Digest> {
@@ -200,7 +198,9 @@ fn rows_matches_cpu() {
     let hal = MetalHalPoseidon254::new();
     let mut seed = 0;
     for &rows in &[1usize, 5, 33, 256, 1001] {
-        for &cols in &[1usize, 2, 7, 8, 9, 12, 15, 16, 17, 23, 24, 31, 32, 33, 64, 128, 129] {
+        for &cols in &[
+            1usize, 2, 7, 8, 9, 12, 15, 16, 17, 23, 24, 31, 32, 33, 64, 128, 129,
+        ] {
             seed += 1;
             let m = elems(&mut rng(seed), rows * cols);
             let want = cpu_rows(&cpu, &m, rows);
@@ -390,7 +390,10 @@ fn bench_kernels() {
     ];
     let mut totals = vec![vec![0.0; reps]; variants.len()];
     for (name, rows, cols) in shapes {
-        let m = hal.copy_from_elem("m", &elems(&mut rng(rows as u64 + cols as u64), rows * cols));
+        let m = hal.copy_from_elem(
+            "m",
+            &elems(&mut rng(rows as u64 + cols as u64), rows * cols),
+        );
         let nodes = hal.alloc_digest("nodes", 2 * rows);
         let layers = rows.trailing_zeros() as usize;
         let mut tr = vec![vec![]; variants.len()];
@@ -402,6 +405,8 @@ fn bench_kernels() {
             hal.hash_fold_tree(&nodes, layers);
             hal.sync();
         }
+        // Interleaved: rep-major, variant-minor.
+        #[allow(clippy::needless_range_loop)]
         for rep in 0..reps {
             for (vi, c) in variants.iter().enumerate() {
                 hal.hash().set_config(*c);
@@ -450,7 +455,10 @@ fn minmax(v: &[f64]) -> (f64, f64) {
 #[ignore]
 fn pso_report() {
     let hal = MetalHalPoseidon254::new();
-    for name in super::KERNEL_NAMES.iter().filter(|n| n.starts_with("p254_")) {
+    for name in super::KERNEL_NAMES
+        .iter()
+        .filter(|n| n.starts_with("p254_"))
+    {
         let p = hal.pipeline(name);
         println!(
             "Z10PSO {name}: max threads/tg {}, execution width {}, static tg mem {}",
@@ -584,5 +592,8 @@ fn r17_p254_stress() {
             }
         }
     }
-    assert!(bad.is_empty(), "R17AUDIT poseidon254 nondeterministic or wrong: {bad:?}");
+    assert!(
+        bad.is_empty(),
+        "R17AUDIT poseidon254 nondeterministic or wrong: {bad:?}"
+    );
 }

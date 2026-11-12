@@ -302,4 +302,3 @@ impl MetalHash for MetalHashPoseidon254 {
         &self.suite
     }
 }
-
