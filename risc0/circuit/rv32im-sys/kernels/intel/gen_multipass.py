@@ -351,7 +351,7 @@ extern "C" const char* risc0_circuit_rv32im_intel_eval_check_pass1(
         auto* out = static_cast<Fp*>(const_cast<void*>(d_out));
         auto* mix = static_cast<Fp*>(const_cast<void*>(d_mix));
         auto* poly_mix = static_cast<FpExt*>(const_cast<void*>(d_poly_mix));
-        constexpr uint32_t WG = 256, PM = 458;
+        constexpr uint32_t WG = 256, PM = 484;  // v3.1.0: poly_mix is 484 wide (see MULTIPASS_SUPPORTED)
         uint32_t gs = ((domain + WG - 1) / WG) * WG;
         q->submit([&](sycl::handler& h) {
             sycl::local_accessor<FpExt, 1> slm(sycl::range<1>(PM), h);
@@ -402,7 +402,7 @@ extern "C" const char* risc0_circuit_rv32im_intel_eval_check_pass2(
         auto* poly_mix = static_cast<FpExt*>(const_cast<void*>(d_poly_mix));
         Fp rou_val;
         std::memcpy(&rou_val, &rou_raw, sizeof(uint32_t));
-        constexpr uint32_t WG = 256, PM = 458;
+        constexpr uint32_t WG = 256, PM = 484;  // v3.1.0: poly_mix is 484 wide (see MULTIPASS_SUPPORTED)
         uint32_t gs = ((domain + WG - 1) / WG) * WG;
         q->submit([&](sycl::handler& h) {
             sycl::local_accessor<FpExt, 1> slm(sycl::range<1>(PM), h);

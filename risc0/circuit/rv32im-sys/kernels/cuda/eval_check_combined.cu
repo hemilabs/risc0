@@ -54,9 +54,9 @@ __global__ void eval_check_diag(Fp* check,
   check[12] = out[0];
   // check[13] = domain as Fp
   check[13] = Fp(domain);
-  // check[14..15] = poly_mix[457] components (last)
-  check[14] = poly_mix[457][0];
-  check[15] = poly_mix[457][1];
+  // check[14..15] = poly_mix[483] components (last)
+  check[14] = poly_mix[483][0];
+  check[15] = poly_mix[483][1];
 }
 
 __launch_bounds__(EVAL_CHECK_THREADS, 1)
