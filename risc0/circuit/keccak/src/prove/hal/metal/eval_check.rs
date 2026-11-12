@@ -36,6 +36,15 @@
 //! - the polynomial mix powers (`map_pow(poly_mix, POLY_MIX_POWERS)`, as `hal/cuda.rs`) are a bound
 //!   `const device FpExt*` buffer (34.8 KB, above `set_bytes`' 4 KB).
 //!
+//! K7 (docs/metal-port/notes/K7.md) knobs, each with the previous behaviour one setting away:
+//! - `RISC0_KECCAK_METAL_EVAL_MACC=lazy|strict`: the stage kernels with the lazy
+//!   multiply-accumulate (default; ~44% less eval_check time at po2 17, bit-identical) or K4's
+//!   (`eval_strict_stage_<k>`, built on first use);
+//! - `RISC0_KECCAK_METAL_EVAL_CHUNK` (default now 16384, K4's 32768).
+//!
+//! A tiled scratch layout and a runtime threadgroup size were measured and showed no change, so
+//! they are not kept (K7.md).
+//!
 //! The kernels index with 32-bit math, as CUDA: the launcher asserts
 //! `(EVAL_MAX_COLUMN + 1) * domain <= 2^32`, `stride <= EVAL_MAX_STRIDE` and `count <= stride`.
 //! Bindings: `kernels/metal/eval_check_prelude.h` (mirrored by `EVAL_BUF_*`). Each stage binds only
@@ -54,6 +63,7 @@ use risc0_circuit_keccak_sys::metal_eval::{
     EVAL_BUF_OUT, EVAL_BUF_PARAMS, EVAL_BUF_POLY_MIX, EVAL_BUF_SCRATCH, EVAL_CARRY_WORDS,
     EVAL_INV_RATE, EVAL_MAX_COLUMN, EVAL_MAX_STRIDE, EVAL_NUM_POLY_MIX_POWS, EVAL_PARAMS_SIZE,
     EVAL_SCRATCH_ELEMS, EVAL_STAGES, EVAL_STAGE_BINDINGS, EVAL_STAGE_NAMES,
+    EVAL_STRICT_STAGE_NAMES,
 };
 use risc0_core::field::RootsOfUnity as _;
 use risc0_zkp::{
@@ -77,12 +87,16 @@ use crate::{
     },
 };
 
-/// Default cycles per chunk (the scratch/carry stride): 32768 cycles take 1.08 GB of scratch.
+/// Default cycles per chunk (the scratch/carry stride): 16384 cycles take 541 MB of scratch.
 /// Why chunk at all: the scratch is ~33 KB per cycle, so a whole po2 18 domain (2^20 cycles)
-/// would need ~34 GB; a fixed chunk keeps it constant from po2 13 up. Why 32768: one dispatch
-/// of 32768 threads fills any Apple GPU, and 16 chunks × 58 stages at po2 17 keep the encode
-/// overhead small (K4 note). K7 re-tunes it for base-chip budgets.
-pub const DEFAULT_EVAL_CHUNK: u32 = 32768;
+/// would need ~34 GB; a fixed chunk keeps it constant from po2 12 up. Why 16384 (K7; K4 had
+/// 32768): interleaved A/B on the M5 Max (40 cores) found 16384 as fast as 32768 and 65536 at
+/// po2 17 (lazy kernels: medians 671 vs 706-719 ms, minima 647 vs 617-621 ms, within the A/A
+/// spread) and faster at po2 14 (102 vs 132 ms: half the scratch to allocate and free per call),
+/// with half the peak memory; 8192 was 30% slower (too few threads per dispatch to hide latency
+/// on 40 cores). 16384 threads still fill a 10-core GPU many times over.
+/// `RISC0_KECCAK_METAL_EVAL_CHUNK=32768` restores K4's value.
+pub const DEFAULT_EVAL_CHUNK: u32 = 16384;
 
 /// Overrides [DEFAULT_EVAL_CHUNK] (cycles per chunk; for the K7 sweep).
 pub const EVAL_CHUNK_ENV: &str = "RISC0_KECCAK_METAL_EVAL_CHUNK";
@@ -110,6 +124,22 @@ pub(super) fn fit_chunk(want: u32, allocated: u64, limit: u64) -> u32 {
     chunk
 }
 
+/// Selects the stage kernels: `lazy` (default; K7's lazy multiply-accumulate, ~40% faster) or
+/// `strict` (K3/K4's kernels, `EVAL_STRICT_STAGE_NAMES`, built on first use). Bit-identical.
+pub const EVAL_MACC_ENV: &str = "RISC0_KECCAK_METAL_EVAL_MACC";
+
+/// Whether [EVAL_MACC_ENV] selects the strict kernels.
+fn strict_from_env() -> bool {
+    match std::env::var(EVAL_MACC_ENV).as_deref() {
+        Ok("strict") => true,
+        Ok("lazy") | Ok("") | Err(_) => false,
+        Ok(v) => {
+            tracing::error!("{EVAL_MACC_ENV}={v:?} is not lazy or strict; using lazy");
+            false
+        }
+    }
+}
+
 /// `EvalParams` of eval_check_prelude.h: count, first, domain, stride, quot[4] (raw words).
 type EvalParams = [u32; 8];
 const _: () = assert!(std::mem::size_of::<EvalParams>() == EVAL_PARAMS_SIZE);
@@ -129,6 +159,12 @@ pub(super) struct EvalCheckState {
     /// Keep the scratch cached after a call ([MetalCircuitHal::set_keep_eval_scratch]).
     keep: Cell<bool>,
     scratch: RefCell<Option<EvalScratch>>,
+    /// Run the strict stage kernels ([EVAL_MACC_ENV], [MetalCircuitHal::set_eval_strict]).
+    strict: Cell<bool>,
+    /// Measurements only (K7 `k7_eval_ab`): stage PSOs from another metallib, used in place of
+    /// the process-wide ones, so variants can be interleaved in one process.
+    #[cfg(test)]
+    stage_override: RefCell<Option<Vec<(metal::ComputePipelineState, u32)>>>,
 }
 
 impl EvalCheckState {
@@ -147,6 +183,9 @@ impl EvalCheckState {
             chunk: Cell::new(chunk.min(EVAL_MAX_STRIDE)),
             keep: Cell::new(false),
             scratch: RefCell::new(None),
+            strict: Cell::new(strict_from_env()),
+            #[cfg(test)]
+            stage_override: RefCell::new(None),
         }
     }
 }
@@ -182,6 +221,12 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
         self.eval.chunk.set(cycles);
     }
 
+    /// Whether later calls run the strict stage kernels (K4's code) instead of the lazy ones.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn set_eval_strict(&self, strict: bool) {
+        self.eval.strict.set(strict);
+    }
+
     /// Cycles per eval_check chunk.
     // Tuning/memory knobs for tests, K7 and the miner; not called by the prover itself.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -189,7 +234,7 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
         self.eval.chunk.get()
     }
 
-    /// Whether eval_check keeps its scratch and carry (about 1 GB at the default chunk) cached for
+    /// Whether eval_check keeps its scratch and carry (about 0.5 GB at the default chunk) cached for
     /// the next call instead of freeing them on return (the default). Only for callers that run
     /// many eval_checks of one size on one HAL with memory to spare: the cached scratch counts
     /// against the working-set budget of everything that runs between the calls.
@@ -202,7 +247,7 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
         }
     }
 
-    /// Free the cached eval_check scratch and carry (about 1 GB at the default chunk); the next
+    /// Free the cached eval_check scratch and carry (about 0.5 GB at the default chunk); the next
     /// eval_check allocates them again.
     // Tuning/memory knobs for tests, K7 and the miner; not called by the prover itself.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -347,17 +392,35 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
             .copy_from_slice::<ExtVal>("eval_poly_mix", &poly_mix_pows);
         let quot = vanishing_quotients(po2);
 
-        let (scratch, carry, stride, chunk) = self.eval_scratch(self.eval.chunk.get().min(domain));
+        let want = self.eval.chunk.get().min(domain);
+        let (scratch, carry, stride, chunk) = self.eval_scratch(want);
         assert!(stride <= EVAL_MAX_STRIDE && chunk <= stride);
         assert!(EVAL_SCRATCH_ELEMS as u64 * stride as u64 <= 1 << 32);
         assert!(EVAL_CARRY_WORDS as u64 * stride as u64 <= 1 << 32);
 
-        let pipelines: Vec<_> = EVAL_STAGE_NAMES
-            .iter()
-            .map(|name| self.pipeline(name))
-            .collect();
+        #[cfg(test)]
+        let overridden = self.eval.stage_override.borrow().clone();
+        #[cfg(not(test))]
+        let overridden: Option<Vec<(metal::ComputePipelineState, u32)>> = None;
+        // (PSO, bindings mask) of each stage, in order.
+        let pipelines: Vec<(&metal::ComputePipelineStateRef, u32)> = match &overridden {
+            Some(v) => v.iter().map(|(p, m)| (&**p, *m)).collect(),
+            None if self.eval.strict.get() => {
+                let strict = super::keccak_strict_kernels(&self.hal.device);
+                EVAL_STRICT_STAGE_NAMES
+                    .iter()
+                    .zip(EVAL_STAGE_BINDINGS)
+                    .map(|(name, mask)| (&**strict.pipeline(name), mask))
+                    .collect()
+            }
+            None => EVAL_STAGE_NAMES
+                .iter()
+                .zip(EVAL_STAGE_BINDINGS)
+                .map(|(name, mask)| (&**self.pipeline(name), mask))
+                .collect(),
+        };
         if let Some(p) = profile.as_mut() {
-            p.resize(EVAL_STAGES, Duration::ZERO);
+            p.resize(pipelines.len(), Duration::ZERO);
             self.hal.sync();
         }
         let mut first = 0u32;
@@ -384,9 +447,8 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
                 offset: 0,
             };
             all[EVAL_BUF_PARAMS as usize] = KernelArg::Bytes(as_bytes(&params[..]));
-            for (stage, pso) in pipelines.iter().enumerate() {
+            for (stage, &(pso, mask)) in pipelines.iter().enumerate() {
                 // Only the stage's own bindings; the others stay nil (unread).
-                let mask = EVAL_STAGE_BINDINGS[stage];
                 let args: [KernelArg; 10] = std::array::from_fn(|i| {
                     if mask & (1 << i) == 0 {
                         return KernelArg::Null;
@@ -502,8 +564,8 @@ mod tests {
         }
     }
 
-    /// Bit-exact against the CPU HAL at `po2s`, at the default chunk (one chunk up to po2 13,
-    /// 2^(po2 - 13) chunks above).
+    /// Bit-exact against the CPU HAL at `po2s`, at the default chunk (one chunk up to po2 12,
+    /// 2^(po2 - 12) chunks above).
     fn matches_cpu(po2s: &[usize]) {
         let _gpu = super::super::tests::gpu_test_lock();
         let hal = Rc::new(MetalHalSha256::new());
@@ -527,7 +589,25 @@ mod tests {
         matches_cpu(&[4, 8, 14]);
     }
 
-    /// PO2 17 (domain 2^19: 16 chunks of 32768 at the default chunk); ~10 GB of host memory.
+    /// K7: the strict stage kernels (no lazy multiply-accumulate, `RISC0_KECCAK_METAL_EVAL_MACC=
+    /// strict`) and the lazy ones (default) give the CPU's check, and so each other's, bit for bit.
+    #[test]
+    fn eval_check_strict_and_lazy_match_cpu() {
+        let _gpu = super::super::tests::gpu_test_lock();
+        let hal = Rc::new(MetalHalSha256::new());
+        let circuit_hal = MetalCircuitHal::new(hal.clone());
+        for po2 in [8, 14] {
+            let params = EvalCheckParams::new(po2);
+            let expected = cpu_check(&params);
+            for strict in [true, false] {
+                circuit_hal.set_eval_strict(strict);
+                let actual = metal_check(&hal, &circuit_hal, &params, 3000);
+                assert_same(&format!("po2 {po2} strict {strict}"), &actual, &expected);
+            }
+        }
+    }
+
+    /// PO2 17 (domain 2^19: 32 chunks of 16384 at the default chunk); ~10 GB of host memory.
     #[test]
     #[ignore]
     fn eval_check_matches_cpu_po2_17() {
@@ -575,6 +655,183 @@ mod tests {
             t0.elapsed().as_secs_f64() / reps as f64
         );
         assert_eq!(vs_first + vs_cpu, 0);
+    }
+
+    /// K7 interleaved A/B of runtime eval_check configurations at `K7_PO2` (default 17):
+    /// `K7_CONFIGS` = `label:chunk=N,strict=0|1,lib=N;...` (unset keys keep the defaults), `K7_REPS`
+    /// rounds (default 7) of one call per config in turn (A B C A B C ...), each call as the prover
+    /// makes it (scratch allocated and freed, one sync). Prints median/min/max per config and
+    /// asserts every output equals the first config's (and the CPU's with `K7_CPU=1`).
+    #[test]
+    #[ignore]
+    fn k7_eval_ab() {
+        let _gpu = super::super::tests::gpu_test_lock();
+        let po2: usize = std::env::var("K7_PO2").map_or(17, |v| v.parse().unwrap());
+        let reps: usize = std::env::var("K7_REPS").map_or(7, |v| v.parse().unwrap());
+        let configs: Vec<(String, Vec<(String, u32)>)> = std::env::var("K7_CONFIGS")
+            .unwrap_or_else(|_| "lazy:;strict:strict=1".into())
+            .split(';')
+            .filter(|c| !c.trim().is_empty())
+            .map(|c| {
+                let (label, kv) = c.split_once(':').unwrap_or((c, ""));
+                let kv = kv
+                    .split(',')
+                    .filter(|x| !x.is_empty())
+                    .map(|x| {
+                        let (k, v) = x.split_once('=').unwrap();
+                        (k.trim().to_string(), v.trim().parse().unwrap())
+                    })
+                    .collect();
+                (label.trim().to_string(), kv)
+            })
+            .collect();
+        let hal = Rc::new(MetalHalSha256::new());
+        let circuit_hal = MetalCircuitHal::new(hal.clone());
+        let params = EvalCheckParams::new(po2);
+        let check = hal.alloc_elem("check", 4 * params.domain);
+        let code = hal.copy_from_elem("code", &params.code);
+        let data = hal.copy_from_elem("data", &params.data);
+        let accum = hal.copy_from_elem("accum", &params.accum);
+        let mix = hal.copy_from_elem("mix", &params.mix);
+        let out = hal.copy_from_elem("out", &params.out);
+        hal.sync();
+        // K7_LIBS: comma list of `metallib[@keccak_metal_eval.rs]` (`lib=i` picks one; `lib`
+        // unset = embedded). The optional constants file of the variant's build gives its stage
+        // count and bindings (a build with another RISC0_KECCAK_METAL_EVAL_STAGES); without it
+        // the variant has this build's stages.
+        let libs: Vec<Vec<(metal::ComputePipelineState, u32)>> = std::env::var("K7_LIBS")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|p| !p.is_empty())
+            .enumerate()
+            .map(|(i, spec)| {
+                let (path, consts) = spec.split_once('@').unwrap_or((spec, ""));
+                let masks: Vec<u32> = if consts.is_empty() {
+                    risc0_circuit_keccak_sys::metal_eval::EVAL_STAGE_BINDINGS.to_vec()
+                } else {
+                    let text = std::fs::read_to_string(consts).unwrap();
+                    let line = text
+                        .lines()
+                        .find(|l| l.starts_with("pub const EVAL_STAGE_BINDINGS"))
+                        .unwrap();
+                    let list = &line[line.rfind('[').unwrap() + 1..line.rfind(']').unwrap()];
+                    list.split(',')
+                        .map(|x| {
+                            u32::from_str_radix(x.trim().trim_start_matches("0x"), 16).unwrap()
+                        })
+                        .collect()
+                };
+                let names: Vec<String> = (0..masks.len())
+                    .map(|k| format!("eval_stage_{k}"))
+                    .collect();
+                let names: Vec<&str> = names.iter().map(|n| n.as_str()).collect();
+                let bytes = std::fs::read(path).unwrap();
+                // The variant's own archive, next to it (never the shared cache dir).
+                let dir = std::path::Path::new(path).parent().map(|d| d.join("arch"));
+                let k = super::super::archive::ArchivedKernels::new_in(
+                    dir,
+                    &hal.device,
+                    "keccak",
+                    &bytes,
+                    &names,
+                )
+                .unwrap();
+                println!(
+                    "K7 lib{i} {path}: {} stages, {} hits {} misses {:.1} s",
+                    names.len(),
+                    k.report.hits,
+                    k.report.misses,
+                    k.report.elapsed.as_secs_f64()
+                );
+                names
+                    .iter()
+                    .zip(masks)
+                    .map(|(n, m)| (k.pipeline(n).clone(), m))
+                    .collect()
+            })
+            .collect();
+        let apply = |kv: &[(String, u32)]| {
+            *circuit_hal.eval.stage_override.borrow_mut() = None;
+            circuit_hal.set_eval_chunk(DEFAULT_EVAL_CHUNK);
+            circuit_hal.set_eval_strict(false);
+            for (k, v) in kv {
+                match k.as_str() {
+                    "chunk" => circuit_hal.set_eval_chunk(*v),
+                    "strict" => circuit_hal.set_eval_strict(*v != 0),
+                    "lib" => {
+                        *circuit_hal.eval.stage_override.borrow_mut() =
+                            Some(libs[*v as usize].clone())
+                    }
+                    _ => panic!("unknown K7 key {k}"),
+                }
+            }
+        };
+        // K7_QUIET=N: before each timed call, wait (up to 120 s) until the GPU's "Device
+        // Utilization %" (ioreg; other processes share the GPU) is <= N, sampled 0.3 s apart.
+        let quiet: Option<u32> = std::env::var("K7_QUIET").ok().map(|v| v.parse().unwrap());
+        let wait_quiet = || {
+            if let Some(q) = quiet {
+                let t0 = Instant::now();
+                while t0.elapsed() < Duration::from_secs(120) {
+                    std::thread::sleep(Duration::from_millis(300));
+                    if super::super::tests::gpu_utilization().is_some_and(|u| u <= q) {
+                        break;
+                    }
+                }
+            }
+        };
+        let run = || {
+            let t0 = Instant::now();
+            circuit_hal.eval_check_metal(
+                &check,
+                &[&accum, &code, &data],
+                &[&mix, &out],
+                params.poly_mix,
+                params.po2,
+                params.steps,
+                None,
+            );
+            t0.elapsed()
+        };
+        let expected = std::env::var("K7_CPU")
+            .is_ok_and(|v| v == "1")
+            .then(|| cpu_check(&params));
+        let mut reference: Option<Vec<Val>> = None;
+        // Warm-up: one call per config, checked.
+        for (label, kv) in &configs {
+            apply(kv);
+            run();
+            let got = check.to_vec();
+            if let Some(e) = &expected {
+                assert_same(&format!("{label} vs CPU"), &got, e);
+            }
+            match &reference {
+                None => reference = Some(got),
+                Some(r) => assert_same(&format!("{label} vs {}", configs[0].0), &got, r),
+            }
+        }
+        let mut times = vec![Vec::new(); configs.len()];
+        for _ in 0..reps {
+            for (i, (_, kv)) in configs.iter().enumerate() {
+                apply(kv);
+                wait_quiet();
+                times[i].push(run().as_secs_f64() * 1e3);
+            }
+        }
+        for (i, (label, _)) in configs.iter().enumerate() {
+            let mut t = times[i].clone();
+            t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            println!(
+                "K7AB po2 {po2} {EVAL_STAGES} stages {label}: median {:.1} ms min {:.1} max {:.1} (n {}) {:?}",
+                t[t.len() / 2],
+                t[0],
+                t[t.len() - 1],
+                t.len(),
+                times[i].iter().map(|x| x.round() as u64).collect::<Vec<_>>()
+            );
+        }
+        // The last round's output is still bit-exact.
+        assert_same("last call", &check.to_vec(), reference.as_ref().unwrap());
     }
 
     /// Many chunks, a partial last chunk, and a cached stride larger than the chunk.
@@ -642,7 +899,7 @@ mod tests {
         println!("stage bindings: {EVAL_STAGE_BINDINGS:03x?}");
     }
 
-    /// Under a working-set budget that does not fit the default chunk's 1.08 GB of scratch, the
+    /// Under a working-set budget that does not fit the default chunk's 541 MB of scratch, the
     /// launcher shrinks the chunk and stays bit-exact.
     #[test]
     fn eval_check_shrinks_chunk_under_budget() {

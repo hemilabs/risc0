@@ -117,13 +117,18 @@ mod tests {
                 "{name}"
             );
         }
-        // Another kernel set has another key: a new archive, and the old one (same unit) goes.
+        // Another kernel set has another key: a new archive; the old one (same unit, another
+        // key) stays, within the keep count (K7: no eviction ping-pong between two binaries).
         let third =
             ArchivedKernels::new_in(Some(dir.clone()), &device, "keccak", METAL_LIB, &names[..1])
                 .unwrap();
         assert_ne!(third.report.path.as_ref(), Some(&path));
         assert!(third.report.saved);
-        assert!(!path.exists(), "stale archive kept");
+        if super::keep_archives() > 1 {
+            assert!(path.exists(), "another key's archive was evicted");
+        } else {
+            assert!(!path.exists(), "stale archive kept");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -530,6 +535,137 @@ mod tests {
             .err()
             .unwrap();
         assert!(err.to_string().contains("no_such_kernel"), "{err}");
+    }
+
+    /// Other keys' archives: the `keep - 1` most recently used stay, older ones and any unused
+    /// for 30 days go; the stem's own files are never touched.
+    #[test]
+    fn prune_keeps_recent_keys() {
+        use std::time::{Duration, SystemTime};
+        let dir = temp_dir("prune");
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = SystemTime::now();
+        let file = |name: &str, age_s: u64| {
+            let p = dir.join(name);
+            std::fs::write(&p, b"x").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&p)
+                .unwrap()
+                .set_modified(now - Duration::from_secs(age_s))
+                .unwrap();
+            p
+        };
+        let own = file("keccak-k0-0000000000000000.binarchive", 90 * 86400);
+        let a = file("keccak-k1-0000000000000000.binarchive", 10);
+        let b = file("keccak-k2-0000000000000000.binarchive", 20);
+        let c = file("keccak-k3-0000000000000000.binarchive", 30);
+        let d = file("keccak-k4-0000000000000000.binarchive", 40);
+        let old = file("keccak-k5-0000000000000000.binarchive", 31 * 86400);
+        let foreign = file("rv32im-k6-0000000000000000.binarchive", 50 * 86400);
+        super::prune_other_keys(&dir, "keccak", "keccak-k0", 4, now);
+        assert!(own.exists() && a.exists() && b.exists() && c.exists());
+        assert!(!d.exists() && !old.exists());
+        assert!(foreign.exists());
+        super::prune_other_keys(&dir, "keccak", "keccak-k0", 1, now);
+        assert!(own.exists() && !a.exists() && !b.exists() && !c.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The chunked digest changes with any byte, and with the length.
+    #[test]
+    fn chunked_digest_sensitivity() {
+        let mut bytes: Vec<u8> = (0..(3 * super::DIGEST_CHUNK + 17))
+            .map(|i| (i * 7) as u8)
+            .collect();
+        let d0 = super::chunked_digest(&bytes);
+        assert_eq!(d0, super::chunked_digest(&bytes));
+        for at in [
+            0,
+            super::DIGEST_CHUNK - 1,
+            super::DIGEST_CHUNK,
+            bytes.len() - 1,
+        ] {
+            bytes[at] ^= 1;
+            assert_ne!(super::chunked_digest(&bytes), d0, "flip at {at}");
+            bytes[at] ^= 1;
+        }
+        bytes.push(0);
+        assert_ne!(super::chunked_digest(&bytes), d0);
+        assert_eq!(super::chunked_digest(&[]).len(), 64);
+    }
+
+    /// K7: the CPU cost of the archive hashes a warm start pays (K8 finding 5), as an interleaved
+    /// A/B: plain sha256 (K8's form, `RISC0_METAL_ARCHIVE_HASH=sha256`) and the chunked parallel
+    /// digest, alternated `K7_PAIRS` times (default 11; A B A B ..., which goes first alternates)
+    /// over the embedded metallib (the key's input) and over the newest keccak archive in
+    /// `RISC0_METAL_ARCHIVE_DIR` / the cache dir (the checksum's input). Prints the medians,
+    /// min/max and the load average before and after. The rest of the key (sha256 of < 1 KB of
+    /// names) is the same in both forms.
+    #[test]
+    #[ignore]
+    fn k7_archive_hash_cost() {
+        use risc0_zkp::core::hash::sha::Sha256 as _;
+        let pairs: usize = std::env::var("K7_PAIRS").map_or(11, |v| v.parse().unwrap());
+        let loadavg = || {
+            std::process::Command::new("sysctl")
+                .args(["-n", "vm.loadavg"])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default()
+        };
+        let time = |f: &dyn Fn() -> String| {
+            let t0 = std::time::Instant::now();
+            std::hint::black_box(f());
+            t0.elapsed().as_secs_f64() * 1e3
+        };
+        let stats = |v: &mut Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            (v[v.len() / 2], v[0], v[v.len() - 1])
+        };
+        let ab = |what: &str, bytes: &[u8]| {
+            let plain = || risc0_zkp::core::hash::sha::cpu::Impl::hash_bytes(bytes).to_string();
+            let chunked = || super::parallel_digest(bytes);
+            // One untimed call of each (page-in, thread start-up).
+            plain();
+            chunked();
+            let before = loadavg();
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            for i in 0..pairs {
+                if i % 2 == 0 {
+                    a.push(time(&plain));
+                    b.push(time(&chunked));
+                } else {
+                    b.push(time(&chunked));
+                    a.push(time(&plain));
+                }
+            }
+            let ratios: Vec<f64> = b.iter().zip(&a).map(|(b, a)| b / a).collect();
+            let (am, amin, amax) = stats(&mut a);
+            let (bm, bmin, bmax) = stats(&mut b);
+            let (rm, _, _) = stats(&mut ratios.clone());
+            println!(
+                "K7HASH {what} ({} MB), {pairs} pairs: plain sha256 median {am:.1} ms \
+                 [{amin:.1}..{amax:.1}], chunked median {bm:.1} ms [{bmin:.1}..{bmax:.1}], \
+                 per-pair chunked/plain median {rm:.3}; load {before} -> {}",
+                bytes.len() >> 20,
+                loadavg()
+            );
+        };
+        ab("key input: embedded metallib", METAL_LIB);
+        let dir = super::archive_dir().unwrap();
+        let newest = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("keccak-"))
+            .max_by_key(|e| e.metadata().unwrap().modified().unwrap());
+        match newest {
+            Some(e) => ab(
+                "checksum input: keccak archive",
+                &std::fs::read(e.path()).unwrap(),
+            ),
+            None => println!("K7HASH no keccak archive in {}", dir.display()),
+        }
     }
 
     /// The key covers the metallib, the device, the OS build and the kernel names.

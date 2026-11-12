@@ -98,15 +98,21 @@ pub(crate) fn metal_eval_sources(kernel_dir: &Path, gen_dir: &Path) -> Vec<PathB
 
     std::fs::create_dir_all(gen_dir).unwrap();
     // Drop stage files of an earlier build with more stages.
-    let keep: BTreeSet<String> = tr.files.iter().map(|(n, _)| n.clone()).collect();
+    let keep: BTreeSet<String> = tr
+        .files
+        .iter()
+        .chain(&tr.strict_files)
+        .map(|(n, _)| n.clone())
+        .collect();
     for entry in std::fs::read_dir(gen_dir).unwrap() {
         let name = entry.unwrap().file_name().to_string_lossy().into_owned();
-        if name.starts_with("eval_stage_") && name.ends_with(".metal") && !keep.contains(&name) {
+        let stage = name.starts_with("eval_stage_") || name.starts_with("eval_strict_stage_");
+        if stage && name.ends_with(".metal") && !keep.contains(&name) {
             std::fs::remove_file(gen_dir.join(&name)).unwrap();
         }
     }
     let mut paths = Vec::new();
-    for (name, text) in &tr.files {
+    for (name, text) in tr.files.iter().chain(&tr.strict_files) {
         let path = gen_dir.join(name);
         write_if_changed(&path, text);
         paths.push(path);
@@ -133,6 +139,7 @@ pub(crate) fn write_skip_consts(out_dir: &Path) {
         "// Written by keccak-sys/build_metal_eval.rs under RISC0_SKIP_BUILD_KERNELS: no stages.\n\
          pub const EVAL_STAGES: usize = 0;\n\
          pub const EVAL_STAGE_NAMES: [&str; 0] = [];\n\
+         pub const EVAL_STRICT_STAGE_NAMES: [&str; 0] = [];\n\
          pub const EVAL_STAGE_BINDINGS: [u32; 0] = [];\n",
     );
     for name in [
@@ -288,8 +295,13 @@ fn mentions(line: &str, ident: &str) -> bool {
 #[derive(Clone, Debug)]
 #[allow(dead_code)] // `counts` is read by the k3 tests.
 pub(crate) struct Translation {
-    /// `(file name, MSL)`, one per stage, in stage order.
+    /// `(file name, MSL)`, one per stage, in stage order (kernels `eval_stage_<k>`, with the K7
+    /// lazy multiply-accumulate).
     pub files: Vec<(String, String)>,
+    /// The same stages without the lazy rewrite (K3/K4's code; kernels
+    /// `eval_strict_stage_<k>`, files `eval_strict_stage_<k>.metal`): the runtime switch back
+    /// (`RISC0_KECCAK_METAL_EVAL_MACC=strict`), built only when selected.
+    pub strict_files: Vec<(String, String)>,
     pub stages: Vec<Stage>,
     pub requested_stages: usize,
     /// Functions in the chain (58 today).
@@ -325,6 +337,13 @@ pub(crate) struct RewriteCounts {
     pub constants: usize,
     /// Lines of constraint code (function bodies).
     pub body_lines: usize,
+    /// K7 lazy multiply-accumulate (see [lazy_plan]): `FpExt xB = xA + poly_mix[N] * xC;` lines
+    /// rewritten into 64-bit per-limb accumulators,
+    pub lazy_macs: usize,
+    /// the chains they form (each ends in one Montgomery reduction per limb),
+    pub lazy_chains: usize,
+    /// and the folds that keep the accumulators below 2^64.
+    pub lazy_folds: usize,
 }
 
 impl Translation {
@@ -353,6 +372,22 @@ impl Translation {
             "pub const EVAL_STAGE_NAMES: [&str; {}] = [{}];",
             self.stages.len(),
             names.join(", ")
+        )
+        .unwrap();
+        let strict: Vec<String> = (0..self.stages.len())
+            .map(|k| format!("\"eval_strict_stage_{k}\""))
+            .collect();
+        writeln!(
+            s,
+            "/// The same stages without the K7 lazy multiply-accumulate (runtime switch\n\
+             /// `RISC0_KECCAK_METAL_EVAL_MACC=strict`; not in METAL_KERNEL_NAMES: built on demand)."
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "pub const EVAL_STRICT_STAGE_NAMES: [&str; {}] = [{}];",
+            self.stages.len(),
+            strict.join(", ")
         )
         .unwrap();
         writeln!(
@@ -854,8 +889,16 @@ fn check_body(f: &mut Function, max_column: &mut u32) -> usize {
 
 /// Emit `f` as MSL; `cut` replaces its tail call by carry stores (the callee starts the next
 /// stage).
-fn emit_function(f: &Function, cut: Option<&Function>, counts: &mut RewriteCounts) -> String {
+fn emit_function(
+    f: &Function,
+    cut: Option<&Function>,
+    lazy: bool,
+    counts: &mut RewriteCounts,
+) -> String {
     let mut s = String::new();
+    let plan = lazy.then(|| lazy_plan(f));
+    // Upper bound (exclusive) of each lazy accumulator's 64-bit value.
+    let mut bound: HashMap<String, u128> = HashMap::new();
     let params: Vec<String> = f
         .params
         .iter()
@@ -918,6 +961,52 @@ fn emit_function(f: &Function, cut: Option<&Function>, counts: &mut RewriteCount
             writeln!(s, "  ScratchRef {var} = ectx.scratch;").unwrap();
             continue;
         }
+        if let Some((b, a, n, c)) = plan.as_ref().and_then(|_| parse_mac(line)) {
+            let lazy_vars = plan.as_ref().unwrap();
+            counts.lazy_macs += 1;
+            writeln!(s, "  FpExt pm_{b} = ectx.poly_mix[{n}];").unwrap();
+            let (prev, mut bd) = match bound.get(a) {
+                Some(&bd) if lazy_vars.contains(a) => (a.to_string(), bd),
+                _ => {
+                    counts.lazy_chains += 1;
+                    let start = format!("s_{b}");
+                    for j in 0..4 {
+                        writeln!(
+                            s,
+                            "  uint64_t {start}_l{j} = keccak_eval::lazy_start({a}.elems[{j}]);"
+                        )
+                        .unwrap();
+                    }
+                    (start, LAZY_START_BOUND)
+                }
+            };
+            let fold = bd + LAZY_PROD_BOUND > 1u128 << 64;
+            if fold {
+                counts.lazy_folds += 1;
+                bd = LAZY_FOLDED_BOUND;
+            }
+            for j in 0..4 {
+                let acc = if fold {
+                    format!("keccak_eval::lazy_fold({prev}_l{j})")
+                } else {
+                    format!("{prev}_l{j}")
+                };
+                writeln!(
+                    s,
+                    "  uint64_t {b}_l{j} = {acc} + keccak_eval::lazy_prod(pm_{b}.elems[{j}], {c});"
+                )
+                .unwrap();
+            }
+            bound.insert(b.to_string(), bd + LAZY_PROD_BOUND);
+            if !lazy_vars.contains(b) {
+                writeln!(
+                    s,
+                    "  FpExt {b} = keccak_eval::lazy_ext({b}_l0, {b}_l1, {b}_l2, {b}_l3);"
+                )
+                .unwrap();
+            }
+            continue;
+        }
         let out = line.replace("poly_mix[", "ectx.poly_mix[");
         s.push_str("  ");
         s.push_str(&out);
@@ -925,6 +1014,67 @@ fn emit_function(f: &Function, cut: Option<&Function>, counts: &mut RewriteCount
     }
     s.push_str("}\n");
     s
+}
+
+/// BabyBear's modulus.
+const LAZY_P: u128 = 15 * (1 << 27) + 1;
+/// Exclusive bound of one product of two raw (Montgomery, < P) words.
+const LAZY_PROD_BOUND: u128 = (LAZY_P - 1) * (LAZY_P - 1) + 1;
+/// Exclusive bound of a chain's start, `raw << 32` (raw < P).
+const LAZY_START_BOUND: u128 = (LAZY_P - 1) * (1 << 32) + 1;
+/// Exclusive bound after `lazy_fold` (the high word reduced mod P).
+const LAZY_FOLDED_BOUND: u128 = LAZY_P * (1 << 32);
+
+/// `FpExt xB = xA + poly_mix[N] * xC;` (the multiply-accumulate shape) as `(xB, xA, N, xC)`.
+fn parse_mac(line: &str) -> Option<(&str, &str, &str, &str)> {
+    let rest = line.strip_prefix("FpExt ")?;
+    let (b, rhs) = rest.split_once(" = ")?;
+    let (a, rhs) = rhs.split_once(" + poly_mix[")?;
+    let (n, c) = rhs.split_once("] * ")?;
+    let c = c.strip_suffix(';')?;
+    (is_ident(b) && is_ident(a) && is_digits(n) && is_ident(c)).then_some((b, a, n, c))
+}
+
+/// K7 lazy multiply-accumulate. `FpExt xB = xA + poly_mix[N] * xC;` is 4 Montgomery products
+/// and 4 modular additions. Chains of them (xA used only as the accumulator of the next one)
+/// are emitted as 4 `uint64_t` accumulators per step instead: the chain starts from
+/// `raw(xA) << 32` (= xA·R² in Montgomery terms, R = 2^32), each step adds the 64-bit product
+/// `raw(poly_mix[N].elems[j]) * raw(xC)` (= p·c·R²), the high word is reduced mod P whenever the
+/// next product could overflow 2^64 (`lazy_fold`, no multiply), and the chain's last value is
+/// Montgomery-reduced once per limb (`lazy_ext`). The result is the same field element, in
+/// canonical form, so the output is bit-identical; it saves about half of the multiplies of
+/// these lines (13.4k of the ~70k Montgomery products a cycle; eval_check is ALU-bound, K7 note).
+/// Returns the chain members whose value never has to exist as an `FpExt`: defined by a
+/// multiply-accumulate and used exactly once, as the accumulator of another one.
+fn lazy_plan(f: &Function) -> BTreeSet<String> {
+    let mut uses: HashMap<&str, usize> = HashMap::new();
+    let mut acc_uses: HashMap<&str, usize> = HashMap::new();
+    let mut defined = BTreeSet::new();
+    for line in &f.body {
+        let mut words = line
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|w| is_ident(w) && (w.starts_with('x') || w.starts_with("arg")))
+            .peekable();
+        // The declared variable of `Fp xN ...`, `FpExt xN ...`, `auto xN = ...` is no use.
+        if ["Fp ", "FpExt ", "auto "]
+            .iter()
+            .any(|p| line.starts_with(p))
+        {
+            words.next();
+        }
+        for w in words {
+            *uses.entry(w).or_default() += 1;
+        }
+        if let Some((b, a, _, _)) = parse_mac(line) {
+            *acc_uses.entry(a).or_default() += 1;
+            defined.insert(b);
+        }
+    }
+    acc_uses
+        .into_iter()
+        .filter(|(v, n)| *n == 1 && uses.get(v) == Some(&1) && defined.contains(v))
+        .map(|(v, _)| v.to_string())
+        .collect()
 }
 
 /// Translate the CUDA eval_check (`header` = eval_check.cuh, `sources` = the eval_check_<n>.cu
@@ -1081,6 +1231,7 @@ pub(crate) fn translate(header: &str, sources: &[(String, String)], stages: usiz
     bounds.push(chain.len());
 
     let mut files = Vec::new();
+    let mut strict_files = Vec::new();
     let mut out_stages = Vec::new();
     let mut carry_words = 1;
     for k in 0..s {
@@ -1097,70 +1248,81 @@ pub(crate) fn translate(header: &str, sources: &[(String, String)], stages: usiz
         let lines: usize = members.iter().map(|&i| functions[i].body.len()).sum();
         let fn_names: Vec<String> = members.iter().map(|&i| functions[i].name.clone()).collect();
 
-        let mut body = String::new();
-        // Callees first, so no forward declarations are needed.
-        for (j, &fi) in members.iter().enumerate().rev() {
-            let f = &functions[fi];
-            let cut = (j + 1 == members.len() && !last).then(|| &functions[chain[bounds[k + 1]]]);
-            body.push('\n');
-            body.push_str(&emit_function(f, cut, &mut counts));
-        }
-        // The header's constants this stage uses (an unused one would warn).
-        let consts: String = header
-            .constants
-            .iter()
-            .filter(|(n, _)| body.contains(n.as_str()))
-            .map(|(n, v)| format!("constant constexpr uint32_t {n} = {v};\n"))
-            .collect();
-
-        let mut text = String::new();
-        writeln!(
-            text,
-            "// Generated by keccak-sys/build_metal_eval.rs from kernels/cuda/eval_check.cuh and\n\
-             // eval_check_<n>.cu. Do not edit.\n\
-             // Stage {k} of {s}: {} ({lines} lines of constraint code).\n\
-             #include \"eval_check_prelude.h\"\n\n\
-             namespace keccak_eval {{\n\n{consts}",
-            fn_names.join(" -> ")
-        )
-        .unwrap();
-        text.push_str(&body);
-        text.push_str("\n} // namespace keccak_eval\n\n");
-
-        // The kernel.
-        let args: Vec<String> = if k == 0 {
-            INPUTS.iter().map(|s| s.to_string()).collect()
-        } else {
-            let mut slot = 0;
-            head.params
+        // The stage's file, lazy (default kernels) or strict (the K3/K4 code, runtime switch).
+        let stage_text = |lazy: bool, kname: &str, counts: &mut RewriteCounts| -> String {
+            let mut body = String::new();
+            // Callees first, so no forward declarations are needed.
+            for (j, &fi) in members.iter().enumerate().rev() {
+                let f = &functions[fi];
+                let cut =
+                    (j + 1 == members.len() && !last).then(|| &functions[chain[bounds[k + 1]]]);
+                body.push('\n');
+                body.push_str(&emit_function(f, cut, lazy, counts));
+            }
+            // The header's constants this stage uses (an unused one would warn).
+            let consts: String = header
+                .constants
                 .iter()
-                .map(|p| match p.kind {
-                    Kind::Scratch => "ectx.scratch".to_string(),
-                    Kind::Input => roots[&(members[0], p.name.clone())].clone(),
-                    Kind::Ext => {
-                        let a = format!("keccak_eval::carry_load(ectx, {slot})");
-                        slot += 1;
-                        a
-                    }
-                })
-                .collect()
+                .filter(|(n, _)| body.contains(n.as_str()))
+                .map(|(n, v)| format!("constant constexpr uint32_t {n} = {v};\n"))
+                .collect();
+
+            let mut text = String::new();
+            writeln!(
+                text,
+                "// Generated by keccak-sys/build_metal_eval.rs from kernels/cuda/eval_check.cuh and\n\
+                 // eval_check_<n>.cu. Do not edit.\n\
+                 // Stage {k} of {s}{}: {} ({lines} lines of constraint code).\n\
+                 #include \"eval_check_prelude.h\"\n\n\
+                 namespace keccak_eval {{\n\n{consts}",
+                if lazy { "" } else { " (strict: no lazy multiply-accumulate)" },
+                fn_names.join(" -> ")
+            )
+            .unwrap();
+            text.push_str(&body);
+            text.push_str("\n} // namespace keccak_eval\n\n");
+
+            // The kernel.
+            let args: Vec<String> = if k == 0 {
+                INPUTS.iter().map(|s| s.to_string()).collect()
+            } else {
+                let mut slot = 0;
+                head.params
+                    .iter()
+                    .map(|p| match p.kind {
+                        Kind::Scratch => "ectx.scratch".to_string(),
+                        Kind::Input => roots[&(members[0], p.name.clone())].clone(),
+                        Kind::Ext => {
+                            let a = format!("keccak_eval::carry_load(ectx, {slot})");
+                            slot += 1;
+                            a
+                        }
+                    })
+                    .collect()
+            };
+            writeln!(
+                text,
+                "R0_KECCAK_EVAL_KERNEL_ATTRS\n\
+                 kernel void {kname}(R0_KECCAK_EVAL_KERNEL_PARAMS) {{\n\
+                 \x20 R0_KECCAK_EVAL_KERNEL_PROLOGUE\n\
+                 \x20 FpExt tot = keccak_eval::{}(cycle, p.domain, ectx, {});",
+                head.name,
+                args.join(", ")
+            )
+            .unwrap();
+            if last {
+                text.push_str("  keccak_eval::write_check(check, p, cycle, tot);\n");
+            } else {
+                text.push_str("  (void)tot;\n");
+            }
+            text.push_str("}\n");
+            text
         };
-        writeln!(
-            text,
-            "R0_KECCAK_EVAL_KERNEL_ATTRS\n\
-             kernel void {name}(R0_KECCAK_EVAL_KERNEL_PARAMS) {{\n\
-             \x20 R0_KECCAK_EVAL_KERNEL_PROLOGUE\n\
-             \x20 FpExt tot = keccak_eval::{}(cycle, p.domain, ectx, {});",
-            head.name,
-            args.join(", ")
-        )
-        .unwrap();
-        if last {
-            text.push_str("  keccak_eval::write_check(check, p, cycle, tot);\n");
-        } else {
-            text.push_str("  (void)tot;\n");
-        }
-        text.push_str("}\n");
+        // The strict copy's rewrites are not counted again.
+        let strict_name = format!("eval_strict_stage_{k}");
+        let strict = stage_text(false, &strict_name, &mut RewriteCounts::default());
+        strict_files.push((format!("{strict_name}.metal"), strict));
+        let text = stage_text(true, &name, &mut counts);
         files.push((format!("{name}.metal"), text));
 
         // The bindings this stage may touch. Inputs: a member's `const Fp*` parameter mentioned
@@ -1202,6 +1364,7 @@ pub(crate) fn translate(header: &str, sources: &[(String, String)], stages: usiz
 
     Translation {
         files,
+        strict_files,
         stages: out_stages,
         requested_stages: stages,
         chain_len: chain.len(),

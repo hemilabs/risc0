@@ -28,12 +28,14 @@
 //! - **Location**: `RISC0_METAL_ARCHIVE_DIR`, else the risc0 cache directory
 //!   (`~/Library/Caches/com.risczero.RISC-Zero.risc0`, the directory `risc0-build-kernel` caches
 //!   compiler outputs in) `/metal-archives`.
-//! - **Key**: `<unit>-<sha256(metallib ‖ device name ‖ OS build ‖ kernel names)[..24]>`.
+//! - **Key**: `<unit>-<sha256(digest(metallib) ‖ device name ‖ OS build ‖ kernel names)[..24]>`,
+//!   `digest` = [chunked_digest] (K7: sha256 of the per-MiB sha256s, hashed on all cores).
 //!   A new metallib, another GPU or an OS update (which can change the GPU compiler) therefore
-//!   never reads an old archive; old archives of the same unit are deleted when a new one is
-//!   written. Units must not be prefixes of each other followed by `-` (`keccak`, `rv32im`,
-//!   `recursion` are not).
-//! - **Integrity**: the file is `<unit>-<key>-<sha256(file)[..16]>.binarchive`, and its content
+//!   never reads an old archive. When a new one is written, the unit keeps its
+//!   `RISC0_METAL_ARCHIVE_KEEP` (default 4) most recently used other keys and deletes the rest,
+//!   and any key unused for 30 days ([prune_other_keys]; K7, K8 finding 4). Units must not be
+//!   prefixes of each other followed by `-` (`keccak`, `rv32im`, `recursion` are not).
+//! - **Integrity**: the file is `<unit>-<key>-<digest(file)[..16]>.binarchive`, and its content
 //!   is checked against that name before Metal sees it. Metal does not survive every damaged
 //!   archive: a file with some bytes flipped loads, and then creating a PSO from it aborts the
 //!   process with an uncaught C++ `std::length_error` (K8 review; Rust cannot catch it), which a
@@ -292,11 +294,63 @@ pub fn os_build() -> Option<String> {
     })
 }
 
+/// Chunk size of [chunked_digest].
+#[doc(hidden)]
+pub const DIGEST_CHUNK: usize = 1 << 20;
+
+/// Environment switch back to K8's single-stream sha256 for the key and checksum (K7 revert knob):
+/// `RISC0_METAL_ARCHIVE_HASH=sha256`. Archives written under one setting have another file name
+/// (key) and checksum than under the other, so switching costs one cold build.
+pub const ARCHIVE_HASH_ENV: &str = "RISC0_METAL_ARCHIVE_HASH";
+
+/// The hex digest the archive key and checksum are built from (K7): sha256 over the sha256s of
+/// the 1 MiB chunks of `bytes`, the chunks hashed on all cores (K8 finding 5: hashing the
+/// 16 MB metallib and the ~50 MB archive in one stream took ~130 ms of every warm start).
+/// Any changed byte changes its chunk's digest and so the result, like a plain sha256 (a Merkle
+/// list of one level). With [ARCHIVE_HASH_ENV]=sha256: plain sha256 of `bytes`.
+#[doc(hidden)]
+pub fn chunked_digest(bytes: &[u8]) -> String {
+    if std::env::var(ARCHIVE_HASH_ENV).is_ok_and(|v| v == "sha256") {
+        return Sha256Impl::hash_bytes(bytes).to_string();
+    }
+    parallel_digest(bytes)
+}
+
+/// [chunked_digest] without the [ARCHIVE_HASH_ENV] switch: always the parallel chunked form.
+#[doc(hidden)]
+pub fn parallel_digest(bytes: &[u8]) -> String {
+    let chunks: Vec<&[u8]> = bytes.chunks(DIGEST_CHUNK).collect();
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .clamp(1, chunks.len().max(1));
+    let per = chunks.len().div_ceil(threads).max(1);
+    let mut list = Vec::with_capacity(8 + chunks.len() * 32);
+    list.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = chunks
+            .chunks(per)
+            .map(|group| {
+                scope.spawn(move || {
+                    group
+                        .iter()
+                        .map(|c| Sha256Impl::hash_bytes(c).as_bytes().to_vec())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        for w in workers {
+            for d in w.join().expect("archive digest worker") {
+                list.extend_from_slice(&d);
+            }
+        }
+    });
+    Sha256Impl::hash_bytes(&list).to_string()
+}
+
 /// The archive key: metallib, device, OS build and the kernel names.
 #[doc(hidden)]
 pub fn archive_key(device_name: &str, os: &str, bytes: &[u8], names: &[&str]) -> String {
-    let mut input = Vec::with_capacity(bytes.len() + 4096);
-    input.extend_from_slice(bytes);
+    let mut input = chunked_digest(bytes).into_bytes();
     for part in [device_name, os].into_iter().chain(names.iter().copied()) {
         input.push(0);
         input.extend_from_slice(part.as_bytes());
@@ -342,10 +396,10 @@ pub fn archive_base_for(
 /// Hex digits of the content checksum in an archive's file name.
 const CHECKSUM_LEN: usize = 16;
 
-/// The first [CHECKSUM_LEN] hex digits of the sha256 of an archive's bytes.
+/// The first [CHECKSUM_LEN] hex digits of the [chunked_digest] of an archive's bytes.
 #[doc(hidden)]
 pub fn archive_checksum(content: &[u8]) -> String {
-    Sha256Impl::hash_bytes(content).to_string()[..CHECKSUM_LEN].to_string()
+    chunked_digest(content)[..CHECKSUM_LEN].to_string()
 }
 
 /// The file name of an archive with base `base` ([archive_base]) and content `content`.
@@ -461,6 +515,11 @@ pub fn open_archive_with(
         match device.new_binary_archive_with_descriptor(&desc) {
             Ok(archive) => {
                 report.loaded = true;
+                // Mark it used (K7): the stale cleanup of other keys evicts the least recently
+                // used archives first.
+                if let Ok(f) = std::fs::File::open(&path) {
+                    let _ = f.set_modified(SystemTime::now());
+                }
                 report.path = Some(path);
                 return Some(archive);
             }
@@ -613,7 +672,7 @@ fn build_all<'a>(
 }
 
 /// Write `archive` as the archive file of `base` (temporary file, checksum, rename to
-/// [archive_file]), then delete the unit's other (stale) archives in the directory. A file of the
+/// [archive_file]), then delete older saves of the same key and prune the unit's other keys ([prune_other_keys]). A file of the
 /// same key written at or after `opened` (when this process looked for one) is another process's
 /// concurrent save and is kept: deleting it would make the processes overwrite each other's
 /// archives in turn. The next [verified_archive_file] keeps one of the two. Returns the file
@@ -655,11 +714,8 @@ pub fn save_archive(
                     .metadata()
                     .and_then(|m| m.modified())
                     .is_ok_and(|t| t >= opened);
-            if name != keep
-                && !concurrent_save
-                && s.starts_with(&format!("{unit}-"))
-                && s.ends_with(ARCHIVE_EXT)
-            {
+            // Same key, another file: an older save of this archive (only one survives).
+            if name != keep && !concurrent_save && checksum_in_name(&stem, &s).is_some() {
                 let _ = std::fs::remove_file(entry.path());
             }
             // The temporary file of a process that died between serialize and rename (~50 MB);
@@ -678,5 +734,62 @@ pub fn save_archive(
             }
         }
     }
+    prune_other_keys(dir, unit, &stem, keep_archives(), SystemTime::now());
     Ok(path)
+}
+
+/// How many archives of a unit (keys: metallib, device, OS build) the cache dir keeps
+/// (`RISC0_METAL_ARCHIVE_KEEP`, default [DEFAULT_ARCHIVE_KEEP]; 1 = K5/K8's rule, only the newest).
+pub const ARCHIVE_KEEP_ENV: &str = "RISC0_METAL_ARCHIVE_KEEP";
+
+/// Default of [ARCHIVE_KEEP_ENV]. K8 finding 4: deleting every other key made two binaries with
+/// different metallibs on one machine (risc0 versions, worktrees, a worker and a test build)
+/// evict each other, so each switch paid a cold build (~25 s on an M5 Max, minutes on base
+/// chips). Four keys of ~35-60 MB each bound the directory to a few hundred MB per unit.
+pub const DEFAULT_ARCHIVE_KEEP: usize = 4;
+
+/// Archives of other keys unused for this long are deleted regardless of the count (an OS
+/// update or a new risc0 version leaves the old ones behind for good).
+pub const ARCHIVE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 3600);
+
+/// The [ARCHIVE_KEEP_ENV] setting.
+#[doc(hidden)]
+pub fn keep_archives() -> usize {
+    std::env::var(ARCHIVE_KEEP_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(DEFAULT_ARCHIVE_KEEP)
+}
+
+/// Deletes the unit's archives of keys other than `stem`'s beyond the `keep - 1` most recently
+/// used ones (modification time: written or loaded, see [open_archive_with]), and any of them
+/// unused for [ARCHIVE_MAX_AGE] (relative to `now`). Never touches `stem`'s own files.
+#[doc(hidden)]
+pub fn prune_other_keys(dir: &Path, unit: &str, stem: &str, keep: usize, now: SystemTime) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut others: Vec<(SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let ours = name.starts_with(&format!("{unit}-")) && name.ends_with(ARCHIVE_EXT);
+            if !ours || name.starts_with(&format!("{stem}-")) {
+                return None;
+            }
+            let modified = e.metadata().and_then(|m| m.modified()).ok()?;
+            Some((modified, e.path()))
+        })
+        .collect();
+    // Newest first.
+    others.sort_by_key(|o| std::cmp::Reverse(o.0));
+    for (i, (modified, path)) in others.iter().enumerate() {
+        let old = now
+            .duration_since(*modified)
+            .is_ok_and(|age| age > ARCHIVE_MAX_AGE);
+        if i + 1 >= keep || old {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }

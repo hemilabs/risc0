@@ -129,6 +129,48 @@ inline FpExt carry_load(EvalCtx ectx, uint32_t slot) {
   return v;
 }
 
+// K7 lazy multiply-accumulate (build_metal_eval.rs `lazy_plan`): a chain of
+// `acc = acc + poly_mix[N] * x` keeps, per FpExt limb, a 64-bit sum T of raw (Montgomery) products,
+// T == value * 2^32 (mod P) in raw terms, and Montgomery-reduces it once at the chain's end. The
+// translator bounds T statically and folds it before it could overflow. Every helper is
+// always_inline and straight-line on scalars (R17: no out-of-line call, no aggregate written
+// element by element after a call).
+
+/// Start of a chain from a reduced value: raw << 32 (< P * 2^32).
+__attribute__((always_inline)) inline uint64_t lazy_start(Fp a) {
+  return uint64_t(a.asRaw()) << 32;
+}
+
+/// The 64-bit product of two raw words (< (P - 1)^2).
+__attribute__((always_inline)) inline uint64_t lazy_prod(Fp a, Fp b) {
+  return uint64_t(a.asRaw()) * uint64_t(b.asRaw());
+}
+
+/// T -> T' < P * 2^32 with T' == T (mod P): the high word reduced mod P (< 2^32 < 3P).
+__attribute__((always_inline)) inline uint64_t lazy_fold(uint64_t t) {
+  uint32_t h = uint32_t(t >> 32);
+  h = h >= Fp::P ? h - Fp::P : h;
+  h = h >= Fp::P ? h - Fp::P : h;
+  return (uint64_t(h) << 32) | (t & 0xffffffffull);
+}
+
+/// Montgomery reduction of any 64-bit T: the canonical Fp whose raw word is T / 2^32 mod P (as
+/// fp.h's `mul` reduces its product).
+__attribute__((always_inline)) inline Fp lazy_redc(uint64_t t) {
+  uint64_t o64 = lazy_fold(t);
+  uint32_t low = -uint32_t(o64);
+  uint32_t red = Fp::M * low;
+  o64 += uint64_t(red) * uint64_t(Fp::P);
+  uint32_t ret = uint32_t(o64 >> 32);
+  return Fp::fromRaw(ret >= Fp::P ? ret - Fp::P : ret);
+}
+
+/// The FpExt a chain ends in.
+__attribute__((always_inline)) inline FpExt lazy_ext(uint64_t t0, uint64_t t1, uint64_t t2,
+                                                     uint64_t t3) {
+  return FpExt(lazy_redc(t0), lazy_redc(t1), lazy_redc(t2), lazy_redc(t3));
+}
+
 /// The last stage: check = tot * quot(cycle), as kernels/intel/kernels.h `launch_eval_stage`.
 inline void write_check(device Fp* check, constant EvalParams& p, uint32_t cycle, FpExt tot) {
   Fp quot = Fp::fromRaw(p.quot[cycle & 3]);
