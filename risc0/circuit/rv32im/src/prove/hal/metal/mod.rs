@@ -99,8 +99,9 @@ pub(crate) const EXPECTED_KERNELS: &[(Phase, &[&str])] = &[
     ),
     // R9 (accum_tu.metal from accum_tu_gen.py --metal, misc.metal).
     (Phase::Accum, &["stepAccumA", "finalizeZeroizeAccum"]),
-    // R10 (baseline eval_check.metal).
-    (Phase::EvalCheck, &["eval_check"]),
+    // R12 evalfast (eval_check_ef.metal). The R10 baseline `eval_check` and R15e's
+    // `ef_eval_split_r12` are built lazily by the eval_check host when selected (R15e).
+    (Phase::EvalCheck, &["ef_eval_split", "ef_combine"]),
 ];
 
 /// Debug knob: path of a metallib to load instead of `risc0_circuit_rv32im_sys::METAL_LIB`.
