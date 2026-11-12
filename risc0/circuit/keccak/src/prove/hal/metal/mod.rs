@@ -104,7 +104,17 @@ pub(crate) fn keccak_kernels(device: &DeviceRef) -> &'static KeccakKernels {
     static ONCE: OnceLock<KeccakKernels> = OnceLock::new();
     let k = ONCE.get_or_init(|| {
         scope!("load_keccak_metallib");
-        let kernels = archive::ArchivedKernels::new(device, "keccak", METAL_LIB, &kernel_names())
+        // Measurements only (K7): `K7_METALLIB` replaces the embedded metallib in test builds, so
+        // compiler/translation variants can be timed against the same Rust code.
+        #[cfg(test)]
+        let lib: &[u8] = match std::env::var("K7_METALLIB") {
+            Ok(path) => Vec::leak(std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"))),
+            Err(_) => METAL_LIB,
+        };
+        #[cfg(not(test))]
+        let lib: &[u8] = METAL_LIB;
+        let _ = KECCAK_LIB.set(lib);
+        let kernels = archive::ArchivedKernels::new(device, "keccak", lib, &kernel_names())
             .unwrap_or_else(|e| panic!("keccak metallib: {e:#}"));
         KeccakKernels {
             registry_id: device.registry_id(),
@@ -117,6 +127,30 @@ pub(crate) fn keccak_kernels(device: &DeviceRef) -> &'static KeccakKernels {
         "keccak PSOs were built for another Metal device"
     );
     k
+}
+
+/// The metallib the process-wide keccak PSOs came from ([keccak_kernels]).
+static KECCAK_LIB: OnceLock<&'static [u8]> = OnceLock::new();
+
+/// The strict eval_check stages (`EVAL_STRICT_STAGE_NAMES`: K3/K4's code without the K7 lazy
+/// multiply-accumulate), built on first use only (`RISC0_KECCAK_METAL_EVAL_MACC=strict`), through
+/// their own binary archive (unit `keccakstrict`, so the keccak archive's cleanup never counts it).
+pub(crate) fn keccak_strict_kernels(device: &DeviceRef) -> &'static archive::ArchivedKernels {
+    static ONCE: OnceLock<archive::ArchivedKernels> = OnceLock::new();
+    let lib = *KECCAK_LIB.get_or_init(|| {
+        keccak_kernels(device);
+        METAL_LIB
+    });
+    ONCE.get_or_init(|| {
+        scope!("load_keccak_strict_stages");
+        archive::ArchivedKernels::new(
+            device,
+            "keccakstrict",
+            lib,
+            &risc0_circuit_keccak_sys::metal_eval::EVAL_STRICT_STAGE_NAMES,
+        )
+        .unwrap_or_else(|e| panic!("keccak metallib (strict stages): {e:#}"))
+    })
 }
 
 /// Build every keccak PSO now (through the binary archive), e.g. on a background thread at
@@ -244,6 +278,8 @@ pub(crate) mod tests {
         pub(super) static METAL_EVAL_CHECKS: Cell<usize> = const { Cell::new(0) };
         /// Phases the Metal circuit HAL entered on this thread ([mark_phase]), by [Phase].
         static PHASE_ENTRIES: [Cell<usize>; PHASES] = const { [const { Cell::new(0) }; PHASES] };
+        /// (phase, when) of every [mark_phase] on this thread (K7 phase breakdown).
+        static PHASE_TIMES: std::cell::RefCell<Vec<(usize, Instant)>> = const { std::cell::RefCell::new(Vec::new()) };
     }
 
     /// The phases of a Metal keccak proof, as the circuit HAL sees them.
@@ -286,6 +322,7 @@ pub(crate) mod tests {
     /// memory measurement runs, closes the previous phase and opens `phase` with a sample.
     pub(crate) fn mark_phase(device: &metal::DeviceRef, phase: Phase) {
         PHASE_ENTRIES.with(|e| e[phase as usize].set(e[phase as usize].get() + 1));
+        PHASE_TIMES.with(|t| t.borrow_mut().push((phase as usize, Instant::now())));
         if SAMPLING.load(Ordering::Relaxed) {
             let bytes = device.current_allocated_size();
             record(PHASE.load(Ordering::Relaxed), bytes);
@@ -305,6 +342,23 @@ pub(crate) mod tests {
     pub(crate) fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
         // A failed test poisons the lock; the next test still runs.
         GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The GPU's "Device Utilization %" from `ioreg` (all processes; K7 measurements wait for
+    /// a quiet GPU with it), or None if it cannot be read.
+    pub(crate) fn gpu_utilization() -> Option<u32> {
+        let out = std::process::Command::new("ioreg")
+            .args(["-r", "-d", "1", "-c", "IOAccelerator"])
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let key = "\"Device Utilization %\"=";
+        let at = text.find(key)? + key.len();
+        let digits: String = text[at..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        digits.parse().ok()
     }
 
     fn phase_entries() -> [usize; PHASES] {
@@ -533,6 +587,61 @@ pub(crate) mod tests {
                 mib(budget),
                 mib(hal.allocated_size()),
             );
+        }
+    }
+
+    /// K7: wall time per phase of Metal keccak proofs at `K7_PO2S` (default 17,18; `K7_PROVE_REPS`
+    /// proofs each, default 3, after one warm-up proof), and of the CPU prover (`K7_CPU=1`, one
+    /// proof). Phases as [Phase] (setup = preflight + data alloc/fill before scatter; finalize =
+    /// from the end of eval_check to the seal). Every seal verifies.
+    #[test]
+    #[ignore]
+    fn k7_phase_breakdown() {
+        let _gpu = gpu_test_lock();
+        let po2s: Vec<usize> = std::env::var("K7_PO2S")
+            .unwrap_or_else(|_| "17,18".into())
+            .split(',')
+            .map(|s| s.trim().parse().unwrap())
+            .collect();
+        let reps: usize = std::env::var("K7_PROVE_REPS").map_or(3, |v| v.parse().unwrap());
+        let ms = |d: Duration| d.as_secs_f64() * 1e3;
+        for po2 in po2s {
+            let inputs = test_inputs(po2);
+            let hal = Rc::new(MetalHalPoseidon2::new());
+            let circuit_hal = Rc::new(MetalCircuitHalPoseidon2::new(hal.clone()));
+            let prover = KeccakProverImpl { hal, circuit_hal };
+            for rep in 0..=reps {
+                PHASE_TIMES.with(|t| t.borrow_mut().clear());
+                let t0 = Instant::now();
+                let seal = prover.prove(&inputs, po2).unwrap();
+                let end = Instant::now();
+                prover.verify(&seal).expect("Verification failed");
+                let marks = PHASE_TIMES.with(|t| t.borrow().clone());
+                let mut per = [Duration::ZERO; PHASES];
+                let mut prev = (Phase::Setup as usize, t0);
+                for &(ph, at) in marks.iter().chain([(usize::MAX, end)].iter()) {
+                    per[prev.0] += at - prev.1;
+                    prev = (ph, at);
+                }
+                let parts: Vec<String> = PHASE_NAMES
+                    .iter()
+                    .zip(per)
+                    .map(|(n, d)| format!("{n} {:.1}", ms(d)))
+                    .collect();
+                println!(
+                    "K7PHASE po2 {po2} metal rep {rep}{}: total {:.1} ms: {}",
+                    if rep == 0 { " (warm-up)" } else { "" },
+                    ms(end - t0),
+                    parts.join(", ")
+                );
+            }
+            if std::env::var("K7_CPU").is_ok_and(|v| v == "1") {
+                let cpu = crate::prove::hal::cpu::keccak_prover().unwrap();
+                let t0 = Instant::now();
+                let seal = cpu.prove(&inputs, po2).unwrap();
+                println!("K7PHASE po2 {po2} cpu: total {:.1} ms", ms(t0.elapsed()));
+                cpu.verify(&seal).expect("Verification failed");
+            }
         }
     }
 

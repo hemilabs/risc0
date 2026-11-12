@@ -111,8 +111,28 @@ fn pinned_counts() {
             cuts: 57,
             constants: 2,
             body_lines: 90630,
+            lazy_macs: 13435,
+            lazy_chains: 93,
+            lazy_folds: 6644,
         }
     );
+    // K7: every stage also has a strict copy (no lazy multiply-accumulate) with its own kernel.
+    assert_eq!(tr.strict_files.len(), tr.files.len());
+    for (k, ((lf, lt), (sf, st))) in tr.files.iter().zip(&tr.strict_files).enumerate() {
+        assert_eq!(lf, &format!("eval_stage_{k}.metal"));
+        assert_eq!(sf, &format!("eval_strict_stage_{k}.metal"));
+        assert!(st.contains(&format!("kernel void eval_strict_stage_{k}(")));
+        assert!(
+            !st.contains("lazy_"),
+            "stage {k}: strict copy has lazy code"
+        );
+        assert_eq!(
+            lt.matches("lazy_ext(").count() > 0,
+            st.contains("ectx.poly_mix["),
+            "{k}"
+        );
+    }
+    assert!(tr.rust_consts().contains("\"eval_strict_stage_57\"]"));
     assert_eq!(tr.scratch_elems, 8237);
     assert_eq!(tr.max_column, 1095);
     assert_eq!(
