@@ -250,6 +250,7 @@ fn c11_seal_matches_cpu_sha256_po2_16() {
 #[test]
 #[ignore]
 fn c11_pso_times() {
+    let _guard = global_state_test_lock();
     let device = metal::Device::system_default().unwrap();
     let base: Vec<&str> = METAL_KERNEL_NAMES
         .iter()
@@ -403,6 +404,7 @@ fn c11_row_passes_match_generic() {
         field::{baby_bear::BabyBearElem, Elem as _},
         hal::Hal as _,
     };
+    let _guard = global_state_test_lock();
     let hal = Arc::new(MetalHalPoseidon2::new());
     let c = MetalCircuitHal::new(hal.clone()).unwrap();
     let rows = 1usize << 10;

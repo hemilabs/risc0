@@ -137,8 +137,8 @@ fn is_eval_kernel(name: &str) -> bool {
 
 /// Environment variable (read once): threads that build the recursion PSOs. Default
 /// `available_parallelism()`; `1` is the pre-C11 sequential build. C11 measured the cold build
-/// (OS shader cache off) of the base kernels 5.4-6.0 s -> 2.9 s and of the split eval_check
-/// 6.6-8.0 s -> 2.0-2.6 s on parallel threads (each PSO compiles on its own thread).
+/// (OS shader cache off, 8 interleaved pairs, medians) of the base kernels 6.15 s -> 3.38 s and of
+/// the split eval_check 7.33 s -> 2.00 s on parallel threads (each PSO compiles on its own thread).
 pub(crate) const PSO_THREADS_ENV: &str = "RISC0_METAL_REC_PSO_THREADS";
 
 fn pso_threads() -> usize {
