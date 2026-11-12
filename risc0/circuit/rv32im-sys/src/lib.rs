@@ -35,6 +35,9 @@ pub const METAL_KERNEL_NAMES: &[&str] = &[
     "finalizeZeroizeAccum",
     "seq_fwd_probe",
     "seq_rev_probe",
+    "fpScanReduce", // R13 accum Fp prefix scans
+    "fpScanBlockSums",
+    "fpScanApply",
     "stepAccumA", // $OUT_DIR/metal/accum_tu.metal (kernels/cuda/accum_tu_gen.py --metal)
     // $OUT_DIR/metal/witgen_tu.metal (kernels/cuda/witgen_tu_gen.py --metal)
     "par_stepExecW",

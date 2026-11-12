@@ -40,7 +40,7 @@ use risc0_binfmt::MemoryImage;
 use risc0_core::field::Elem as _;
 use test_log::test;
 
-use super::R14_STATS;
+use super::PIPELINE_HOST_STATS;
 use crate::{
     execute::{
         segment::Segment,
@@ -227,11 +227,11 @@ fn pipeline_bench() {
     for round in 0..=pairs {
         for (vi, (name, kvs)) in variants.iter().enumerate() {
             let old = apply(kvs);
-            for s in R14_STATS.iter() {
+            for s in PIPELINE_HOST_STATS.iter() {
                 s.store(0, Ordering::Relaxed);
             }
             let (secs, begins, seals) = run_pass(prover.as_ref(), &segs);
-            let st: Vec<u64> = R14_STATS
+            let st: Vec<u64> = PIPELINE_HOST_STATS
                 .iter()
                 .map(|s| s.load(Ordering::Relaxed))
                 .collect();

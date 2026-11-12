@@ -489,7 +489,7 @@ impl<MH: MetalHash> MetalRv32imCtx<MH> {
             copy(layout.txns_offset, txns);
             copy(layout.bigint_offset, &trace.bigint_bytes);
         });
-        r14_stat(3, t.elapsed());
+        pipeline_host_stat(3, t.elapsed());
         Ok((buf, layout))
     }
 
@@ -578,15 +578,15 @@ pub(crate) fn phase_mark<MH: MetalHash>(hal: &MetalHal<MH>, label: &'static str)
 /// GPU work and the evalfast dispatch (poly_mix table, its copy: the GPU has nothing queued
 /// then), `[1]` that wait, `[2]` unused, `[3]` the preflight copy of `upload_preflight`
 /// (host-only: the GPU is idle until the segment's first dispatch).
-pub(crate) static R14_STATS: [AtomicU64; 4] = [
+pub(crate) static PIPELINE_HOST_STATS: [AtomicU64; 4] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
 ];
 
-pub(crate) fn r14_stat(i: usize, d: std::time::Duration) {
-    R14_STATS[i].fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
+pub(crate) fn pipeline_host_stat(i: usize, d: std::time::Duration) {
+    PIPELINE_HOST_STATS[i].fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
 }
 
 pub struct MetalCircuitHal<MH: MetalHash> {

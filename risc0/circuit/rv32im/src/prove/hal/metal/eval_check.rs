@@ -63,7 +63,7 @@ use risc0_zkp::{
 };
 
 use super::{
-    count, cpu_phase, grow, host_slice, phase_mark, r14_stat, MetalCircuitHal, Phase,
+    count, cpu_phase, grow, host_slice, phase_mark, pipeline_host_stat, MetalCircuitHal, Phase,
     CPU_PHASES_ENV,
 };
 use crate::{
@@ -347,7 +347,7 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
         let tw = std::time::Instant::now();
         self.hal.try_sync()?;
         let th = std::time::Instant::now();
-        r14_stat(1, th - tw);
+        pipeline_host_stat(1, th - tw);
 
         // The table (CUDA ef_prep on one GPU thread): built on the CPU from the powers and the
         // host views of out / mix.
@@ -379,7 +379,7 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
         // view_mut flushes and waits if a batch is open, so a previous eval_check that read this
         // buffer has finished before it is overwritten.
         tab_buf.view_mut(|dst| dst[..EF_TABLE_LEN].copy_from_slice(&tab));
-        r14_stat(0, th.elapsed());
+        pipeline_host_stat(0, th.elapsed());
 
         let rows = (domain as u64).div_ceil(threads);
         if times.is_some() {

@@ -43,8 +43,8 @@ use crate::{
 /// The rv32im Metal tests' shared lock (PLAN 8.7), poison-tolerant like keccak's
 /// `gpu_test_lock`. Taken for their whole run by the tests that change or depend on
 /// process-wide state: `pipeline_bench` (environment variables between rounds, the
-/// [R14_STATS] counters), the binary-archive tests (archive files, timings), so two of them never
-/// overlap under the default parallel harness, e.g. with `--include-ignored`.
+/// [PIPELINE_HOST_STATS] counters), the binary-archive tests (archive files, timings), so two of
+/// them never overlap under the default parallel harness, e.g. with `--include-ignored`.
 pub(crate) fn metal_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock()
