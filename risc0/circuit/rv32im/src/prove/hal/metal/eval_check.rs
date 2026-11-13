@@ -79,8 +79,8 @@ use risc0_zkp::{
 };
 
 use super::{
-    count, cpu_phase, grow, host_slice, phase_mark, pipeline_host_stat, MetalCircuitHal, Phase,
-    CPU_PHASES_ENV,
+    count, cpu_phase, eval_regime, grow, host_slice, phase_mark, pipeline_host_stat,
+    MetalCircuitHal, Phase, CPU_PHASES_ENV,
 };
 use crate::{
     prove::{GLOBAL_MIX, GLOBAL_OUT},
@@ -238,6 +238,17 @@ fn build_fc(
         FC_KERNEL,
         &[(0, domain)],
     )?;
+    // R22: refuse a specialization the back end compiled into the slow regime (eval_regime.rs).
+    if eval_regime::settings().0 != eval_regime::GuardMode::Off {
+        let info = r
+            .path
+            .as_deref()
+            .and_then(|p| eval_regime::archive_info(p, FC_KERNEL));
+        let regime = eval_regime::Regime::of(info, eval_regime::settings().1);
+        if !eval_regime::fc_acceptable(kernels, domain, regime) {
+            anyhow::bail!("refused by the eval regime guard (slow compiler regime)");
+        }
+    }
     tracing::info!(
         "rv32im Metal: {FC_KERNEL} for domain {domain} in {:.2} s (binary archive {}: {} hits, \
          {} misses{})",
@@ -532,16 +543,22 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
             Ok(d) => fc_pipeline(self.ctx.kernels(), d, FcMode::current()?),
             Err(_) => None,
         };
+        // R22: the regime guard's fallback replaces the plain PSO if that one is slow.
+        let fallback = eval_regime::fallback_split();
         tracing::debug!(
             "eval_check (Metal evalfast): {}",
             if fc.is_some() {
                 "ef_eval_split_fc specialized for the domain"
+            } else if fallback.is_some() {
+                "the eval regime guard's fallback (ef_eval_split_r15e)"
             } else {
                 "plain ef_eval_split"
             }
         );
         let k = EfKernels {
-            split: fc.unwrap_or_else(|| self.ctx.pipeline("ef_eval_split")),
+            split: fc
+                .or(fallback)
+                .unwrap_or_else(|| self.ctx.pipeline("ef_eval_split")),
             combine: self.ctx.pipeline("ef_combine"),
             threads: EF_THREADS,
         };
@@ -1761,6 +1778,121 @@ mod ef_tests {
             .unwrap();
             assert_eq!(mismatches(&cpu, &check.to_vec()), 0);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R22: the regime guard reads the OS driver's compile of each candidate split kernel from a
+    /// binary archive (eval_regime.rs). Fails when the default kernels (plain, and specialized for
+    /// po2 20) are not in the fast regime, i.e. after a toolchain / OS / generator change that
+    /// costs ~2.4x eval_check time; also checks that the field still separates the regimes
+    /// (R15e's form is slow today) and that the fallback PSO built through an archive is
+    /// CPU-exact.
+    #[test]
+    fn eval_regime_guard_kernels() {
+        use risc0_zkp::hal::metal::archive;
+
+        use super::eval_regime::{archive_info, Regime, FALLBACK_KERNEL, PLAIN_KERNEL, STACK_MAX};
+        let dir = std::env::temp_dir().join(format!("risc0-r22-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hal = Arc::new(MetalHalSha256::new());
+        let c = MetalCircuitHal::new(hal.clone()).unwrap();
+        let lib = c.ctx.library();
+        let bytes = risc0_circuit_rv32im_sys::METAL_LIB;
+        let domain = 4u32 << 20;
+        /// (kernel, function constants, expected in the fast regime)
+        type Case<'a> = (&'a str, &'a [(usize, u32)], bool);
+        let cases: [Case; 3] = [
+            (PLAIN_KERNEL, &[], true),
+            (FC_KERNEL, &[(0, domain)], true),
+            (FALLBACK_KERNEL, &[], false),
+        ];
+        let built: Vec<_> = std::thread::scope(|s| {
+            let hs: Vec<_> = cases
+                .iter()
+                .map(|&(name, fc, _)| {
+                    let (dir, hal, c) = (dir.clone(), &hal, &c);
+                    s.spawn(move || {
+                        let t = std::time::Instant::now();
+                        // The plain kernel's archive is the process library's own (production
+                        // path; compiling it into a fresh archive takes ~20 s).
+                        if name == PLAIN_KERNEL {
+                            let own = c
+                                .ctx
+                                .kernels()
+                                .kernels
+                                .archive_report()
+                                .and_then(|r| r.path.as_deref())
+                                .and_then(|p| archive_info(p, name));
+                            if own.is_some() {
+                                println!("R22 {name} (process archive): {own:?}");
+                                return (None, own);
+                            }
+                        }
+                        let (pso, r) = metal::objc::rc::autoreleasepool(|| {
+                            archive::specialized_pipeline(
+                                Some(dir),
+                                &hal.device,
+                                lib,
+                                bytes,
+                                &format!("rv32im_r22test_{name}"),
+                                name,
+                                fc,
+                            )
+                        })
+                        .unwrap();
+                        let path = r.path.clone().expect("archive written");
+                        let info = archive_info(&path, name);
+                        println!("R22 {name} {fc:?}: {info:?} ({:?})", t.elapsed());
+                        (Some(pso), info)
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for ((name, _, fast), (_, info)) in cases.iter().zip(&built) {
+            let regime = Regime::of(*info, STACK_MAX);
+            if *fast {
+                assert!(
+                    matches!(regime, Regime::Fast(_)),
+                    "{name}: {regime:?}: the default eval kernel is no longer in the fast \
+                     compiler regime (native stack <= {STACK_MAX} B); eval_check will be ~2.4x \
+                     slower. See docs/metal-port/notes/R22.md"
+                );
+            } else {
+                assert!(
+                    matches!(regime, Regime::Slow(_)),
+                    "{name}: {regime:?}: R15e's form is no longer slow: the stack field may no \
+                     longer separate the regimes (recalibrate, notes/R22.md)"
+                );
+            }
+        }
+        // The archive-built fallback PSO computes the same check as the CPU.
+        let po2 = 10;
+        let inp = Inputs::random(po2);
+        let cpu = cpu_check(&inp, po2);
+        let steps = 1 << po2;
+        let [code, data, accum, mix, out] = [&inp.code, &inp.data, &inp.accum, &inp.mix, &inp.out]
+            .map(|b| hal.copy_from_elem("in", b));
+        let check = hal.alloc_elem("check", ExtVal::EXT_SIZE * steps * INV_RATE);
+        check.view_mut(|v| v.fill(Val::new_raw(0x7fff_ffff)));
+        let k = EfKernels {
+            split: built[2].0.as_ref().unwrap(),
+            combine: c.ctx.pipeline("ef_combine"),
+            threads: EF_THREADS,
+        };
+        c.eval_check_ef_with(
+            &k,
+            &check,
+            &[&accum, &code, &data],
+            &[&mix, &out],
+            inp.poly_mix,
+            po2,
+            steps,
+            None,
+        )
+        .unwrap();
+        assert_eq!(mismatches(&cpu, &check.to_vec()), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

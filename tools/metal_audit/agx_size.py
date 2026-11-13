@@ -13,10 +13,20 @@ it is a separate copy of it, so treat the sizes as the toolchain's, not the OS d
 Usage:
   agx_size.py [--arch applegpu_g17s] [--macos 27.0] [--jobs N] [--keep DIR] LIB.metallib FN [FN...]
   agx_size.py ... LIB.metallib --all       (every kernel listed by `metal-nm` / the lib's names)
+  agx_size.py ... --fc 0=4194304 LIB FN     (R22: FN specialized with uint function constants)
   agx_size.py --parse OBJ.agx ...           (metadata of objects kept with --keep)
+  agx_size.py --archive FILE.binarchive ... (R22: the pipelines of runtime MTLBinaryArchive
+                                             files, i.e. what the OS driver compiled)
+  agx_size.py ... --guard-stack BYTES ...   (R22: exit 2 if a function's stack exceeds BYTES)
 Output: one line per function, tab separated: lib, function, text_bytes, metadata, seconds.
 Metadata (see META_FIELDS; empirically identified, treat as tentative): stack = per-thread private
 stack bytes including callees, frame = the kernel's own frame, regs? / uregs? = unconfirmed.
+
+R22 regime guard: R21 found that ef_eval_split's time follows this stack field in two clusters
+(fast 18-21 KB, ~160 ms at po2 18; slow 32-40 KB, ~400 ms). `--guard-stack 24576` fails when a
+toolchain / generator change moves the kernel into the slow cluster. rv32im-sys/build.rs runs it
+on every metallib build (RISC0_METAL_EF_STACK_GUARD); the rv32im runtime reads the same field
+from the binary archive the OS driver wrote (eval_regime.rs).
 """
 import argparse, concurrent.futures as cf, json, os, shutil, struct, subprocess, sys, tempfile, time
 
@@ -53,6 +63,82 @@ def sections(blob):
                 s += 80
         off += cmdsize
     return out
+
+
+FAT_MAGICS = (0xCAFEBABE, 0xCBFEBABE)  # 0xCBFEBABE: MTLBinaryArchive files (big-endian fat header)
+CPU_APPLEGPU = 0x01000013  # the native slice of an archive (0x01000017: the AIR metallib slice)
+
+
+def fat_slices(blob):
+    """[(cputype, bytes)] of a fat image (a plain image is one slice with cputype None)."""
+    magic = struct.unpack_from(">I", blob, 0)[0]
+    if magic not in FAT_MAGICS:
+        return [(None, blob)]
+    n = struct.unpack_from(">I", blob, 4)[0]
+    out = []
+    for i in range(n):
+        cpu, _sub, off, size, _align = struct.unpack_from(">iiIII", blob, 8 + 20 * i)
+        out.append((cpu, blob[off:off + size]))
+    return out
+
+
+def ld_names(inner):
+    """The length-prefixed strings of a native object's __GPU_LD_MD section (the pipeline's
+    function name and its stage, e.g. ["ef_eval_split", "compute"])."""
+    try:
+        ld = [s for s in sections(inner) if s[0] == "__GPU_LD_MD"]
+    except Exception:  # noqa: BLE001
+        return []
+    if not ld:
+        return []
+    d = inner[ld[0][2]:ld[0][2] + ld[0][3]]
+    out = []
+    for o in range(0, len(d) - 4, 4):
+        n = struct.unpack_from("<I", d, o)[0]
+        if 0 < n < 256 and o + 4 + n < len(d) and d[o + 4 + n] == 0:
+            w = d[o + 4:o + 4 + n]
+            if all(0x21 <= c < 0x7F for c in w):
+                out.append(w.decode())
+    return out
+
+
+def archive_objects(blob):
+    """[(function name or None, native object bytes)] of every pipeline in a binary archive (or
+    a metal-tt output): the nested applegpu objects of the native slice's __compute section."""
+    out = []
+    for cpu, sl in fat_slices(blob):
+        if cpu not in (None, CPU_APPLEGPU):
+            continue
+        try:
+            comp = [s for s in sections(sl) if s[1] == "__compute"]
+        except ValueError:
+            continue
+        for _seg, _sect, off, size in comp:
+            d = sl[off:off + size]
+            starts = []
+            o = d.find(struct.pack("<I", MH_MAGIC_64))
+            while o >= 0:
+                starts.append(o)
+                o = d.find(struct.pack("<I", MH_MAGIC_64), o + 4)
+            # Keep the starts that parse as an object (a magic inside code is not one).
+            objs = []
+            for i, st in enumerate(starts):
+                end = starts[i + 1] if i + 1 < len(starts) else len(d)
+                try:
+                    sections(d[st:end])
+                    objs.append(st)
+                except Exception:  # noqa: BLE001
+                    pass
+            for i, st in enumerate(objs):
+                end = objs[i + 1] if i + 1 < len(objs) else len(d)
+                inner = d[st:end]
+                names = [n for n in ld_names(inner) if n not in ("compute", "vertex", "fragment")]
+                out.append((names[0] if names else None, inner))
+    return out
+
+
+def text_bytes(inner):
+    return sum(s[3] for s in sections(inner) if s[1] == "__text")
 
 
 def _fb_table_fields(d, t):
@@ -92,13 +178,31 @@ def native_meta(inner):
         return {}
 
 
-def size_one(tt, lib, fn, arch, macos, keep, timeout=None):
+def pipeline_script(lib, fn, fc=()):
+    """The metal-tt pipeline script of one compute pipeline of `fn` (specialized with the uint
+    function constants `fc`, [(index, value)], if any)."""
+    libs = {"paths": [{"label": "lib", "path": os.path.abspath(lib)}]}
+    ref = f"alias:lib#{fn}"
+    if fc:
+        libs["specialized_functions"] = [{
+            "label": "spec",
+            "function": ref,
+            "specialized_name": fn,
+            "constant_values": [{
+                "id_type": "FunctionConstantIndex",
+                "id": {"data": i},
+                "value_type": "ConstantUInt",
+                "value": {"data": v},
+            } for i, v in fc],
+        }]
+        ref = f"alias:spec#{fn}"
+    return {"libraries": libs, "pipelines": {"compute_pipelines": [{"compute_function": ref}]}}
+
+
+def size_one(tt, lib, fn, arch, macos, keep, timeout=None, fc=()):
     work = tempfile.mkdtemp(prefix="agxsz-")
     try:
-        script = {
-            "libraries": {"paths": [{"label": "lib", "path": os.path.abspath(lib)}]},
-            "pipelines": {"compute_pipelines": [{"compute_function": f"alias:lib#{fn}"}]},
-        }
+        script = pipeline_script(lib, fn, fc)
         js = os.path.join(work, "p.mtlp-json")
         with open(js, "w") as f:
             json.dump(script, f)
@@ -114,14 +218,14 @@ def size_one(tt, lib, fn, arch, macos, keep, timeout=None):
         except subprocess.TimeoutExpired:
             os.killpg(pr.pid, 9)
             pr.communicate()
-            return (lib, fn, None, [f"timeout after {timeout} s"], time.time() - t0)
+            return (lib, fn, None, [f"timeout after {timeout} s"], time.time() - t0, {})
         dt = time.time() - t0
         if r.returncode != 0 or not os.path.exists(outp):
-            return (lib, fn, None, (r.stderr or r.stdout).strip().splitlines()[-1:], dt)
+            return (lib, fn, None, (r.stderr or r.stdout).strip().splitlines()[-1:], dt, {})
         blob = open(outp, "rb").read()
         comp = [s for s in sections(blob) if s[1] == "__compute"]
         if len(comp) != 1:
-            return (lib, fn, None, [f"expected one __compute section, got {len(comp)}"], dt)
+            return (lib, fn, None, [f"expected one __compute section, got {len(comp)}"], dt, {})
         _, _, off, size = comp[0]
         inner = blob[off:off + size]
         secs = sections(inner)
@@ -129,10 +233,11 @@ def size_one(tt, lib, fn, arch, macos, keep, timeout=None):
         other = [f"{k}={v}" for k, v in native_meta(inner).items()]
         if keep:
             os.makedirs(keep, exist_ok=True)
-            base = os.path.join(keep, f"{os.path.basename(lib)}.{fn}")
+            tag = "".join(f".fc{i}={v}" for i, v in fc)
+            base = os.path.join(keep, f"{os.path.basename(lib)}.{fn}{tag}")
             shutil.copy(outp, base + ".archive")
             open(base + ".agx", "wb").write(inner)
-        return (lib, fn, text, other, dt)
+        return (lib, fn, text, other, dt, native_meta(inner))
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -148,6 +253,27 @@ def kernels_of(lib):
     return sorted(set(names))
 
 
+def parse_fn(spec, fc):
+    """`FN` or `FN@I=V[,I=V...]` -> (FN, [(I, V)]); the global --fc applies to plain names."""
+    if "@" not in spec:
+        return spec, list(fc)
+    fn, rest = spec.split("@", 1)
+    return fn, [tuple(int(x, 0) for x in kv.split("=", 1)) for kv in rest.split(",") if kv]
+
+
+def guard_verdict(fn, meta, limit):
+    """None if `fn` passes the stack guard, else the message (R22). An absent stack field is a
+    zero stack (FlatBuffers omits default values, e.g. ef_combine); no metadata at all is
+    unknown."""
+    if not meta:
+        return f"{fn}: native stack size unknown (metadata layout not understood)"
+    st = meta.get("stack", 0)
+    if st > limit:
+        return (f"{fn}: native per-thread stack {st} B > {limit} B: the slow compiler regime "
+                f"(R21: ~2.4x eval_check time); see docs/metal-port/notes/R22.md")
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--arch", default="applegpu_g17s")
@@ -156,32 +282,79 @@ def main():
     ap.add_argument("--keep", default=None, help="keep the archives and native objects here")
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--timeout", type=float, default=None, help="seconds per function")
+    ap.add_argument("--fc", action="append", default=[], metavar="I=V",
+                    help="uint function constant for every plain FN (FN@I=V sets it per FN)")
+    ap.add_argument("--guard-stack", type=int, default=None, metavar="BYTES",
+                    help="exit 2 if a function's native stack exceeds BYTES (3: unknown)")
+    ap.add_argument("--only", action="append", default=[], help="--archive: only these names")
     ap.add_argument("lib")
     ap.add_argument("fns", nargs="*")
     ap.add_argument("--parse", action="store_true", help="arguments are kept .agx objects")
+    ap.add_argument("--archive", action="store_true",
+                    help="arguments are binary archives (runtime MTLBinaryArchive files)")
     a = ap.parse_args()
+    fails = []
     if a.parse:
         for p in [a.lib] + a.fns:
             inner = open(p, "rb").read()
-            text = sum(s[3] for s in sections(inner) if s[1] == "__text")
-            meta = " ".join(f"{k}={v}" for k, v in native_meta(inner).items())
-            print(f"{p}\t{text}\t{meta}")
-        return
-    fns = kernels_of(a.lib) if a.all else a.fns
-    if not fns:
-        sys.exit("agx_size: no functions given")
-    tt = toolchain_bin("metal-tt")
-    rc = 0
-    with cf.ThreadPoolExecutor(max_workers=max(1, a.jobs)) as ex:
-        futs = [ex.submit(size_one, tt, a.lib, fn, a.arch, a.macos, a.keep, a.timeout)
-                for fn in fns]
-        for f in cf.as_completed(futs):
-            lib, fn, text, other, dt = f.result()
-            if text is None:
-                rc = 1
-            print(f"{lib}\t{fn}\t{text if text is not None else 'ERR'}\t{' '.join(other)}\t{dt:.1f}s",
-                  flush=True)
-    sys.exit(rc)
+            meta = native_meta(inner)
+            print(f"{p}\t{text_bytes(inner)}\t{' '.join(f'{k}={v}' for k, v in meta.items())}")
+            if a.guard_stack is not None:
+                v = guard_verdict(p, meta, a.guard_stack)
+                if v:
+                    fails.append(v)
+    elif a.archive:
+        for p in [a.lib] + a.fns:
+            for name, inner in archive_objects(open(p, "rb").read()):
+                if a.only and name not in a.only:
+                    continue
+                meta = native_meta(inner)
+                print(f"{p}\t{name}\t{text_bytes(inner)}\t"
+                      f"{' '.join(f'{k}={v}' for k, v in meta.items())}", flush=True)
+                if a.guard_stack is not None:
+                    v = guard_verdict(name, meta, a.guard_stack)
+                    if v:
+                        fails.append(v)
+    else:
+        fc = [tuple(int(x, 0) for x in kv.split("=", 1)) for kv in a.fc]
+        if a.lib.endswith(".air"):
+            # One .air linked on its own: metal-tt cannot specialize a function of a metallib
+            # linked from several .air modules ("cannot find private metadata"), but can one of
+            # a single-module library.
+            tmp_air = tempfile.mkdtemp(prefix="agxsz-air-")
+            import atexit
+            atexit.register(shutil.rmtree, tmp_air, True)
+            linked = os.path.join(tmp_air, "lib.metallib")
+            r = subprocess.run([toolchain_bin("metallib"), a.lib, "-o", linked],
+                               capture_output=True, text=True)
+            if r.returncode != 0:
+                sys.exit(f"agx_size: metallib {a.lib} failed: {r.stderr.strip()}")
+            a.lib = linked
+        fns = [parse_fn(f, fc) for f in (kernels_of(a.lib) if a.all else a.fns)]
+        if not fns:
+            sys.exit("agx_size: no functions given")
+        tt = toolchain_bin("metal-tt")
+        rc = 0
+        with cf.ThreadPoolExecutor(max_workers=max(1, a.jobs)) as ex:
+            futs = [ex.submit(size_one, tt, a.lib, fn, a.arch, a.macos, a.keep, a.timeout, spec)
+                    for fn, spec in fns]
+            for f in cf.as_completed(futs):
+                lib, fn, text, other, dt, meta = f.result()
+                if text is None:
+                    rc = 1
+                print(f"{lib}\t{fn}\t{text if text is not None else 'ERR'}\t{' '.join(other)}"
+                      f"\t{dt:.1f}s", flush=True)
+                if a.guard_stack is not None:
+                    v = guard_verdict(fn, meta, a.guard_stack) if text is not None else \
+                        f"{fn}: not translated ({' '.join(other)})"
+                    if v:
+                        fails.append(v)
+        if rc and not fails:
+            sys.exit(rc)
+    for v in fails:
+        print(f"agx_size: REGIME GUARD: {v}", file=sys.stderr, flush=True)
+    if fails:
+        sys.exit(3 if all("unknown" in v or "not translated" in v for v in fails) else 2)
 
 
 if __name__ == "__main__":

@@ -33,6 +33,7 @@
 
 mod accum;
 mod eval_check;
+mod eval_regime;
 mod witgen;
 
 // R8: preflight leaves the per-cycle columns to the Metal witgen (witgen::DEFER_CYCLE_COLS).
@@ -333,7 +334,11 @@ impl Rv32imKernels {
             })
             .as_ref()
             .map_err(|e| anyhow!("loading the rv32im metallib: {e}"))
-            .inspect(|k| eval_check::fc_prewarm(k))
+            .inspect(|k| {
+                eval_check::fc_prewarm(k);
+                // R22: the eval compiler-regime guard (eval_regime.rs).
+                eval_regime::start(k);
+            })
     }
 
     /// Fails, naming the missing kernels, if `phase` cannot run on Metal with this metallib.
