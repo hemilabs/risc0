@@ -480,6 +480,137 @@ fn msm_edges() {
     assert!(g.msm::<G2>(&inf2, &s).unwrap().is_zero());
 }
 
+/// Item G14: scalars with the real witness's shape (the prover's MSMs A, B1, B2, C now take
+/// the witness without the fuzz): 44 % zero, 29 % one, 3 % r - 1, small values, a few repeated
+/// full-width values, the rest random.
+fn witness_like_scalars(n: usize, rng: &mut ChaCha8Rng) -> Vec<Fr> {
+    let heavy: Vec<Fr> = (0..8).map(|_| Fr::rand(rng)).collect();
+    (0..n)
+        .map(|_| match rng.gen_range(0..100) {
+            0..=43 => Fr::zero(),
+            44..=72 => Fr::one(),
+            73..=75 => -Fr::one(),
+            76..=79 => Fr::from(rng.gen_range(2..1u64 << 40)),
+            80..=81 => heavy[rng.gen_range(0..heavy.len())],
+            _ => Fr::rand(rng),
+        })
+        .collect()
+}
+
+/// [check_size]'s checks for given scalars: `reps` sorts + G1 and G2 MSMs (and a C-style
+/// `first`) on a scratch of `cfg` with `tune` and `scalar_bits`, each equal to ark.
+#[allow(clippy::too_many_arguments)]
+fn check_scalars(
+    g: &MsmGpu,
+    what: &str,
+    p1: &[G1Affine],
+    p2: &[G2Affine],
+    s: &[Fr],
+    cfg: MsmConfig,
+    tunes: &[MsmTune],
+    reps: usize,
+) {
+    let n = s.len();
+    let want1: G1Projective = ark_msm(&p1[..n], s);
+    let want2: G2Projective = ark_msm(&p2[..n], s);
+    let first = n / 3;
+    let want_c: G1Projective = ark_msm(&p1[..n - first], &s[first..]);
+    let b1 = g.buffer(&words::<G1>(&p1[..n]));
+    let b2 = g.buffer(&words::<G2>(&p2[..n]));
+    let sw: Vec<u32> = s.iter().flat_map(scalar_words).collect();
+    let bs = g.buffer(&sw);
+    let mut sc = MsmScratch::new(&g.device, n as u32, cfg).unwrap();
+    for bits in [254, 256] {
+        sc.set_scalar_bits(bits);
+        for tune in tunes {
+            sc.set_tune(*tune);
+            for rep in 0..reps {
+                let ctx = format!("{what} n {n} bits {bits} {tune:?} {cfg:?} rep {rep}");
+                g.sort(&mut sc, MsmBuf::new(&bs), n as u32).unwrap();
+                let (got1, _) = g.msm_sorted::<G1>(&sc, MsmBuf::new(&b1), 0).unwrap();
+                assert_eq!(got1.into_affine(), want1.into_affine(), "G1 {ctx}");
+                let (got2, _) = g.msm_sorted::<G2>(&sc, MsmBuf::new(&b2), 0).unwrap();
+                assert_eq!(got2.into_affine(), want2.into_affine(), "G2 {ctx}");
+                let (got, _) = g
+                    .msm_sorted::<G1>(&sc, MsmBuf::new(&b1), first as u32)
+                    .unwrap();
+                assert_eq!(got.into_affine(), want_c.into_affine(), "G1 first {ctx}");
+            }
+        }
+    }
+}
+
+/// Item G14: witness-shaped scalars (mostly 0 and 1; one bucket of window 0 holds ~30 % of the
+/// entries, cut into many pieces) and the extreme all-ones / all r - 1 inputs at sizes where the
+/// piece is longer than the minimum, every MSM variant, against ark.
+#[test]
+fn g14_witness_like_scalars() {
+    let Some(g) = gpu() else { return };
+    let mut rng = ChaCha8Rng::seed_from_u64(0x14);
+    let n = 1 << 18;
+    let p1 = points::<G1Projective>(n, &mut rng);
+    let p2 = points::<G2Projective>(n, &mut rng);
+    let tunes = [
+        MsmTune::all(),
+        MsmTune {
+            lenperm: false,
+            lent_groups: false,
+            ..MsmTune::all()
+        },
+        MsmTune::none(),
+    ];
+    let s = witness_like_scalars(n, &mut rng);
+    check_scalars(
+        &g,
+        "witness-like",
+        &p1,
+        &p2,
+        &s,
+        MsmConfig::default(),
+        &tunes,
+        1,
+    );
+    let small = MsmConfig {
+        wbits: 11,
+        seg: 5,
+        ..Default::default()
+    };
+    check_scalars(&g, "witness-like", &p1, &p2, &s, small, &tunes[..1], 1);
+    // 2^18 entries in one bucket of window 0 (piece 16 at c = 16: 16384 pieces of one bucket),
+    // and r - 1 (one bucket per window).
+    check_scalars(
+        &g,
+        "all ones",
+        &p1,
+        &p2,
+        &vec![Fr::one(); n],
+        small,
+        &tunes[..1],
+        1,
+    );
+    let n2 = n / 2;
+    check_scalars(
+        &g,
+        "all ones",
+        &p1,
+        &p2,
+        &vec![Fr::one(); n2],
+        MsmConfig::default(),
+        &tunes,
+        1,
+    );
+    check_scalars(
+        &g,
+        "all r - 1",
+        &p1,
+        &p2,
+        &vec![-Fr::one(); n2],
+        MsmConfig::default(),
+        &tunes,
+        1,
+    );
+}
+
 /// Raw 256-bit scalars >= r (the kernels take any integer): the result is (s mod r) * P.
 #[test]
 fn msm_raw_scalars_above_r() {
@@ -599,6 +730,28 @@ fn r17_msm_repeat() {
     check_size(&g, 1000, 200 + 2, tiny, reps);
     println!(
         "R17AUDIT groth16 msm G1+G2 n 1000 wbits 1 seg 3: {reps}/{reps} reps equal ark (0 differ)"
+    );
+    // Item G14: the witness MSMs are no longer fuzzed, so their inputs are mostly 0 and 1 (one
+    // heavy bucket in window 0, many pieces of one bucket in the segment reduction).
+    let n = 1usize << lg;
+    let mut rng = ChaCha8Rng::seed_from_u64(0x17);
+    let p1 = points::<G1Projective>(n, &mut rng);
+    let p2 = points::<G2Projective>(n, &mut rng);
+    let s = witness_like_scalars(n, &mut rng);
+    let cfg = MsmConfig::default();
+    check_scalars(
+        &g,
+        "r17 witness-like",
+        &p1,
+        &p2,
+        &s,
+        cfg,
+        &[MsmTune::all()],
+        reps,
+    );
+    println!(
+        "R17AUDIT groth16 msm G1+G2 witness-like 2^{lg}: {reps}/{reps} reps x 2 scalar widths \
+         equal ark (0 differ)"
     );
 }
 
