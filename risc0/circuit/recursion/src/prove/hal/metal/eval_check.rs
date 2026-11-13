@@ -300,6 +300,54 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
     }
 }
 
+/// Test hook (C13): run this thread's eval_check calls with another variant than the process
+/// selected, for in-process interleaved A/B of two kernel forms on whole proofs.
+#[cfg(all(test, feature = "test"))]
+pub(crate) mod test_override {
+    use std::{cell::Cell, sync::OnceLock};
+
+    use super::*;
+
+    thread_local! {
+        static VARIANT: Cell<Option<EvalKernels>> = const { Cell::new(None) };
+    }
+
+    /// Run `f` with this thread's eval_check variant forced to `v`.
+    pub(crate) fn with_variant<R>(v: EvalKernels, f: impl FnOnce() -> R) -> R {
+        let old = VARIANT.with(|c| c.replace(Some(v)));
+        struct Restore(Option<EvalKernels>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                VARIANT.with(|c| c.set(self.0));
+            }
+        }
+        let _restore = Restore(old);
+        f()
+    }
+
+    pub(super) fn eval_kernels<MH: MetalHash>(
+        c: &MetalCircuitHal<MH>,
+        selected: EvalKernels,
+        kernels: &'static Pipelines,
+    ) -> (EvalKernels, &'static Pipelines) {
+        let Some(v) = VARIANT.with(|c| c.get()).filter(|&v| v != selected) else {
+            return (selected, kernels);
+        };
+        static OTHER: [OnceLock<Pipelines>; EvalKernels::ALL.len()] =
+            [const { OnceLock::new() }; EvalKernels::ALL.len()];
+        let k = OTHER[v as usize].get_or_init(|| {
+            Pipelines::new(
+                &c.hal().device,
+                risc0_circuit_recursion_sys::METAL_LIB,
+                v.names(),
+                4,
+            )
+            .unwrap()
+        });
+        (v, k)
+    }
+}
+
 impl<MH: MetalHash> CircuitHal<MetalHal<MH>> for MetalCircuitHal<MH> {
     fn eval_check(
         &self,
@@ -317,6 +365,8 @@ impl<MH: MetalHash> CircuitHal<MetalHal<MH>> for MetalCircuitHal<MH> {
         let (variant, kernels) = self
             .eval_kernels()
             .unwrap_or_else(|e| panic!("recursion Metal eval_check: {e:#}"));
+        #[cfg(all(test, feature = "test"))]
+        let (variant, kernels) = test_override::eval_kernels(self, variant, kernels);
         self.encode_eval_check(
             variant,
             kernels,
@@ -388,7 +438,8 @@ mod c8_tests {
         if selected == variant {
             return kernels;
         }
-        static OTHER: [OnceLock<Pipelines>; 3] = [const { OnceLock::new() }; 3];
+        static OTHER: [OnceLock<Pipelines>; EvalKernels::ALL.len()] =
+            [const { OnceLock::new() }; EvalKernels::ALL.len()];
         OTHER[variant as usize].get_or_init(|| {
             let t0 = Instant::now();
             let k = Pipelines::new(
@@ -415,8 +466,8 @@ mod c8_tests {
         eval_check(&cpu_hal, CpuCircuitHal, gpu_hal.as_ref(), gpu_eval, 4);
     }
 
-    /// Every variant (monolith, split, lazy Fp split) on the same random inputs, each bit-identical
-    /// to the CPU eval_check.
+    /// Every variant (monolith, split, lazy Fp split with uint4 and with four-load mix reads) on
+    /// the same random inputs, each bit-identical to the CPU eval_check.
     /// Prints the warm wall time of encode + sync per variant (indicative GPU time) and the peak
     /// device allocation of the step.
     fn variants_match_cpu(po2: usize) {

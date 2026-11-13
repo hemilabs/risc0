@@ -82,6 +82,50 @@ impl<H: Hal> MerkleTreeProver<H> {
 }
 
 impl<H: Hal> MerkleTreeProver<H> {
+    /// Host copy of the whole tree (every node, the root and the top layer `commit` writes), for
+    /// [Self::from_host] (C13: committed ctrl groups kept across HALs).
+    pub(crate) fn to_host(&self) -> (MerkleTreeParams, Vec<Digest>, Digest, Vec<Digest>) {
+        let nodes = self.nodes.to_vec();
+        let top = self.params.top_size;
+        let top_nodes = nodes[top..2 * top].to_vec();
+        (self.params, nodes, self.root, top_nodes)
+    }
+
+    /// Host bytes [Self::to_host] copies (every node plus the top layer).
+    pub(crate) fn host_bytes(&self) -> usize {
+        (self.params.row_size * 2 + self.params.top_size) * core::mem::size_of::<Digest>()
+    }
+
+    /// The tree [Self::to_host] copied, on `hal`, over `matrix` (its leaves' values, which the
+    /// caller rebuilt): no hashing, one upload of the nodes.
+    pub(crate) fn from_host(
+        hal: &H,
+        matrix: &H::Buffer<H::Elem>,
+        params: MerkleTreeParams,
+        nodes: &[Digest],
+        root: Digest,
+        top_nodes: &[Digest],
+    ) -> Self {
+        assert_eq!(matrix.size(), params.row_size * params.col_size);
+        assert_eq!(nodes.len(), params.row_size * 2);
+        let nodes = hal.copy_from_digest("nodes", nodes);
+        let sample_buf = if !hal.has_unified_memory() && params.col_size > 0 {
+            Some(hal.alloc_elem("sample_reuse", params.col_size))
+        } else {
+            None
+        };
+        MerkleTreeProver {
+            params,
+            matrix: Some(matrix.clone()),
+            nodes,
+            root,
+            sample_buf,
+            cached_top_nodes: Arc::new(Mutex::new(Some(top_nodes.to_vec()))),
+        }
+    }
+}
+
+impl<H: Hal> MerkleTreeProver<H> {
     /// Generate a merkle tree from a matrix of values.
     ///
     /// The proofs will prove a single 'column' of values in the tree at a

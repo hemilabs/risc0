@@ -228,6 +228,7 @@ KERNELS = {
     'eval_check': ['eval_check'],
     'eval_check_split': ['ec_part_%d' % p for p in range(NUM_PARTS)],
     'eval_check_split_lz': ['ec_lz_part_%d' % p for p in range(NUM_PARTS)],
+    'eval_check_split_lz_u32': ['ec_lz32_part_%d' % p for p in range(NUM_PARTS)],
 }
 
 
@@ -261,6 +262,45 @@ static inline __attribute__((always_inline)) Fp rlf_fin(uint64_t x) {
   return Fp::fromRaw(min(r, r - 0x78000001u));
 }
 """
+# C13: the mix-power read of every RecLz accumulation step (rec_lz_add) as one 16-byte uint4
+# load (the 158 powers sit in a HAL-owned buffer at offset 0, FpExt = 4 words, so every power is
+# 16-byte aligned) instead of four 4-byte loads. Measured -6.5 % per eval_check call (po2 18);
+# a 32-byte ulong4 pair load (K1's form) was +40 %. The four-load form stays in the metallib as
+# eval_check_split_lz_u32.metal (kernels ec_lz32_part_0..5, RISC0_METAL_REC_LZ_UINT4=0).
+LZ_ADD_U32 = """\
+  const device uint32_t* m = reinterpret_cast<const device uint32_t*>(&poly_mix[k]);
+  uint32_t cv = rec_raw(c);
+  for (int i = 0; i < 4; i++)
+    r.a[i] += uint64_t(m[i]) * cv;
+"""
+LZ_ADD_UINT4 = """\
+  // C13: one 16-byte load of the mix power (see cuda2metal_eval.py LZ_ADD_UINT4).
+  uint4 m = *(reinterpret_cast<const device uint4*>(poly_mix) + k);
+  uint32_t cv = rec_raw(c);
+  r.a[0] += uint64_t(m.x) * cv;
+  r.a[1] += uint64_t(m.y) * cv;
+  r.a[2] += uint64_t(m.z) * cv;
+  r.a[3] += uint64_t(m.w) * cv;
+"""
+
+
+def lz_u32(lz_text):
+    """eval_check_split_lz_u32.metal: the C12 lazy Fp split (four 4-byte mix loads per
+    rec_lz_add), kernels renamed ec_lz32_part_N. Returns (text, counts)."""
+    counts = c.Counter()
+    text, n = re.subn(r'^kernel void ec_lz_part_(\d+)\(', r'kernel void ec_lz32_part_\1(',
+                      lz_text, flags=re.M)
+    counts.add('lz32.kernels', n)
+    text, n = re.subn(r'^// Lazy Fp form \(--split-lz, C12;',
+                      '// Four-load rec_lz_add (C12 form; C13 revert, RISC0_METAL_REC_LZ_UINT4=0).\n'
+                      '// Lazy Fp form (--split-lz, C12;', text, flags=re.M)
+    counts.add('lz32.header', n)
+    counts.add('lz32.u32_add', text.count(LZ_ADD_U32))
+    tallies('eval_check_split_lz_u32', text, counts)
+    residual_scan('eval_check_split_lz_u32', text)
+    return text, counts
+
+
 LZ_HEAD = re.compile(r'^static inline __attribute__\(\(always_inline\)\) FpExt poly_fp_part(\d+)\('
                      r'const device FpExt\* poly_mix, ', re.M)
 
@@ -294,6 +334,8 @@ def lazy_fp(split_text):
                       '// Translated from kernels/cuda/eval_check_split.cu by ' % LZ_FORM, text,
                       flags=re.M)
     counts.add('lz.header', n)
+    counts.add('lz.uint4_add', text.count(LZ_ADD_U32))
+    text = text.replace(LZ_ADD_U32, LZ_ADD_UINT4)
     tallies('eval_check_split_lz', text, counts)
     residual_scan('eval_check_split_lz', text)
     return text, counts
@@ -391,6 +433,12 @@ PINNED = {
     'eval_check_split_lz': {
         # ec_lazyfp.py 'lz2' on the six parts (C12): products made lazy / REDCs emitted.
         'lz.parts': 6, 'lz.kernels': 6, 'lz.header': 1, 'lz.lz2_prod': 4855, 'lz.lz2_fin': 2557,
+        'lz.uint4_add': 1,  # C13: rec_lz_add's mix read as one uint4 load (no &poly_mix[k])
+        'tally.poly_mix_read': 171, 'tally.data_read': 1371, 'tally.fp_mul': 0,
+    },
+    'eval_check_split_lz_u32': {
+        # The C12 form of eval_check_split_lz (C13's revert, RISC0_METAL_REC_LZ_UINT4=0).
+        'lz32.kernels': 6, 'lz32.header': 1, 'lz32.u32_add': 1,
         'tally.poly_mix_read': 172, 'tally.data_read': 1371, 'tally.fp_mul': 0,
     },
 }
@@ -587,7 +635,8 @@ def main(argv=None):
                     help='also translate eval_check_split.cu (kernels ec_part_0..5)')
     ap.add_argument('--split-lz', action='store_true',
                     help='with --split: also write eval_check_split_lz.metal (kernels '
-                    'ec_lz_part_0..5, lazy Fp form, C12)')
+                    'ec_lz_part_0..5, lazy Fp form, C12; uint4 mix loads, C13) and '
+                    'eval_check_split_lz_u32.metal (ec_lz32_part_0..5, four-load form)')
     ap.add_argument('--check', action='store_true',
                     help='round trip + pins + residuals; compare with OUTDIR files if present')
     ap.add_argument('--no-pin', action='store_true', help='report count mismatches only')
@@ -602,7 +651,7 @@ def main(argv=None):
         ap.error('--split-lz needs --split')
     names = ['eval_check'] + (['eval_check_split'] if a.split else [])
     if a.list_kernels:
-        names += ['eval_check_split_lz'] if a.split_lz else []
+        names += ['eval_check_split_lz', 'eval_check_split_lz_u32'] if a.split_lz else []
         print('\n'.join(k for n in names for k in KERNELS[n]))
         return 0
     if not a.outdir and not a.check:
@@ -630,6 +679,10 @@ def main(argv=None):
             mismatches += c.check_pins('eval_check_split_lz', lz_counts,
                                        PINNED['eval_check_split_lz'], strict=not a.no_pin)
             outs.append(('eval_check_split_lz', lz, lz_counts, False))
+            lz32, lz32_counts = lz_u32(lz.replace(LZ_ADD_UINT4, LZ_ADD_U32))
+            mismatches += c.check_pins('eval_check_split_lz_u32', lz32_counts,
+                                       PINNED['eval_check_split_lz_u32'], strict=not a.no_pin)
+            outs.append(('eval_check_split_lz_u32', lz32, lz32_counts, False))
         for oname, otext, ocounts, rt in outs:
             dst = os.path.join(a.outdir, oname + '.metal') if a.outdir else None
             status = c.write_or_check(dst, otext, a.check) if dst else None

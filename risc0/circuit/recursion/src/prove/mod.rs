@@ -16,6 +16,7 @@
 //!
 //! This module contains the recursion [Prover].
 
+mod ctrl_persist;
 mod hal;
 mod p2fast;
 #[cfg(any(feature = "cuda", feature = "rocm"))]
@@ -519,6 +520,17 @@ where
     cached_ctrl_program: RefCell<HashMap<CtrlKey, Arc<Program>>>,
 }
 
+/// Where a proof's committed ctrl group came from ([RecursionProverImpl::commit_ctrl]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CtrlSource {
+    /// This prover's device cache.
+    Cached,
+    /// Rebuilt from the host copy of an earlier prover (C13).
+    Restored,
+    /// Committed.
+    Committed,
+}
+
 /// Programs whose ctrl the device caches keep at once; more clears them (each holds a
 /// ~24 MB device buffer and its committed group).
 const CTRL_DEVICE_CACHE_CAP: usize = 8;
@@ -595,14 +607,10 @@ where
             .borrow_mut()
             .entry(ctrl_key)
             .or_insert_with(|| ctrl.clone());
-        let mut cache = self.cached_ctrl_group.borrow_mut();
-        if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(ctrl_key) {
+        if !self.cached_ctrl_group.borrow().contains_key(&ctrl_key) {
             let mut prover = risc0_zkp::prove::Prover::new(self.hal.as_ref(), TAPSET);
             prover.set_po2(program.po2);
-            prover.commit_group(REGISTER_GROUP_CTRL, &ctrl);
-            if let Some(group) = prover.get_group(REGISTER_GROUP_CTRL).cloned() {
-                e.insert(group);
-            }
+            self.commit_ctrl(&mut prover, ctrl_key, &ctrl, Some(program));
         }
         tracing::debug!(
             "recursion prewarm: po2={} rows={} {:.1}ms",
@@ -691,21 +699,9 @@ where
                 // Cache ctrl PolyGroup to skip iNTT/expand/merkle on repeated proofs
                 // with the same program (`ctrl_key`, whose entries `claim_ctrl_caches`
                 // checked belong to exactly this program).
+                // C13: or rebuilt from the host copy a previous prover of this process kept.
                 let t0 = std::time::Instant::now();
-                let ctrl_cached;
-                {
-                    let mut cache = self.cached_ctrl_group.borrow_mut();
-                    if let Some(cached) = cache.get(&ctrl_key) {
-                        prover.commit_cached_group(REGISTER_GROUP_CTRL, cached.clone());
-                        ctrl_cached = true;
-                    } else {
-                        prover.commit_group(REGISTER_GROUP_CTRL, &witgen.ctrl);
-                        if let Some(group) = prover.get_group(REGISTER_GROUP_CTRL).cloned() {
-                            cache.insert(ctrl_key, group);
-                        }
-                        ctrl_cached = false;
-                    }
-                }
+                let ctrl_cached = self.commit_ctrl(&mut prover, ctrl_key, &witgen.ctrl, shared);
                 let ctrl_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
                 let t0 = std::time::Instant::now();
@@ -725,7 +721,7 @@ where
                 let accum_commit_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
                 if *VERBOSE {
-                    eprintln!("[recursion_prove] preflight={preflight_ms:.1}ms(cached={preflight_was_cached}) witgen={witgen_ms:.1}ms ctrl={ctrl_ms:.1}ms(cached={ctrl_cached}) data_commit={data_commit_ms:.1}ms accum={accum_ms:.1}ms accum_commit={accum_commit_ms:.1}ms");
+                    eprintln!("[recursion_prove] preflight={preflight_ms:.1}ms(cached={preflight_was_cached}) witgen={witgen_ms:.1}ms ctrl={ctrl_ms:.1}ms({ctrl_cached:?}) data_commit={data_commit_ms:.1}ms accum={accum_ms:.1}ms accum_commit={accum_commit_ms:.1}ms");
                 }
 
                 mix
@@ -799,12 +795,63 @@ where
             self.cached_ctrl_group.borrow_mut().clear();
             self.cached_ctrl_program.borrow_mut().clear();
         }
-        codes.insert(key, Arc::new(program.code.clone()));
+        let code = ctrl_persist::code_for(key, program, shared)
+            .unwrap_or_else(|| Arc::new(program.code.clone()));
+        codes.insert(key, code);
         if let Some(arc) = shared {
             self.cached_ctrl_program
                 .borrow_mut()
                 .insert(key, arc.clone());
         }
+    }
+
+    /// Commit `key`'s ctrl group to `prover`: the device-cached group, else (C13) the group
+    /// rebuilt from the host copy a previous prover of this process kept, else a fresh commit
+    /// of `ctrl` (cached on the device, and kept on the host when [ctrl_persist] has room).
+    /// Returns where the group came from. `claim_ctrl_caches(key, ..)` must have run.
+    fn commit_ctrl(
+        &self,
+        prover: &mut risc0_zkp::prove::Prover<'_, H>,
+        key: CtrlKey,
+        ctrl: &H::Buffer<H::Elem>,
+        shared: Option<&Arc<Program>>,
+    ) -> CtrlSource {
+        let mut cache = self.cached_ctrl_group.borrow_mut();
+        if let Some(cached) = cache.get(&key) {
+            prover.commit_cached_group(REGISTER_GROUP_CTRL, cached.clone());
+            return CtrlSource::Cached;
+        }
+        let persist = ctrl_persist::enabled()
+            && self.hal.has_unified_memory()
+            && self.hal.gpu_total_memory() != usize::MAX;
+        let code = self.cached_ctrl_code.borrow().get(&key).cloned();
+        let hashfn = self.hal.get_hash_suite().name.clone();
+        if let (true, Some(code)) = (persist, code.as_ref()) {
+            if let Some(host) = ctrl_persist::lookup(&hashfn, key, code) {
+                let t0 = std::time::Instant::now();
+                let group = PolyGroup::from_host(self.hal.as_ref(), &host);
+                // Wait for the rebuild's expand NTT (the time a commit would also have waited).
+                let _ = group.evaluated.as_ref().map(|e| e.get_at(0));
+                ctrl_persist::record_restore(&hashfn, key, t0.elapsed().as_secs_f64() * 1e3);
+                prover.commit_cached_group(REGISTER_GROUP_CTRL, group.clone());
+                cache.insert(key, group);
+                return CtrlSource::Restored;
+            }
+        }
+        let t0 = std::time::Instant::now();
+        prover.commit_group(REGISTER_GROUP_CTRL, ctrl);
+        let commit_ms = t0.elapsed().as_secs_f64() * 1e3;
+        if let Some(group) = prover.get_group(REGISTER_GROUP_CTRL).cloned() {
+            if let (true, Some(code)) = (persist && ctrl_persist::wants(&hashfn), code) {
+                let cap = ctrl_persist::cap_bytes(self.hal.gpu_total_memory());
+                let bytes = group.host_bytes() + code.len() * std::mem::size_of::<BabyBearElem>();
+                if ctrl_persist::would_keep(&hashfn, key, bytes, cap) {
+                    ctrl_persist::store(&hashfn, key, code, shared, &group, commit_ms, cap);
+                }
+            }
+            cache.insert(key, group);
+        }
+        CtrlSource::Committed
     }
 
     fn preflight(&self, program: &Program, input: VecDeque<u32>) -> Result<Preflight> {

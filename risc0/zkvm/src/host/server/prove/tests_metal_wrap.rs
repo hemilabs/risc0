@@ -28,7 +28,9 @@
 //! on its own:
 //! `cargo test -p risc0-zkvm --features metal --lib -- tests_metal_wrap --ignored --nocapture`.
 //! Knobs: `RISC0_G8_BUDGET` (bytes, default 8589934592; `none` for no budget), `RISC0_G8_PO2`
-//! (default 18), `RISC0_G8_CYCLES` (default 2^19).
+//! (default 18), `RISC0_G8_CYCLES` (default 2^19), `RISC0_G8_JOBS` (default 1: STARK + wrap
+//! jobs in one process, as a worker runs them; from the second job on, identity_p254 rebuilds
+//! its ctrl group from the host copy C13 keeps instead of committing it).
 
 use std::{
     sync::{
@@ -128,6 +130,7 @@ fn metal_wrap_after_stark() {
     };
     let po2 = env_u64("RISC0_G8_PO2", 18) as u32;
     let cycles = env_u64("RISC0_G8_CYCLES", 1 << 19);
+    let jobs = env_u64("RISC0_G8_JOBS", 1);
     match budget {
         Some(b) => std::env::set_var("RISC0_METAL_MAX_WORKING_SET_BYTES", b.to_string()),
         None => std::env::remove_var("RISC0_METAL_MAX_WORKING_SET_BYTES"),
@@ -138,7 +141,12 @@ fn metal_wrap_after_stark() {
     let sampler = Sampler::start();
     let base = sampler.current();
     sampler.phase();
+    for job in 0..jobs {
+        wrap_job(&sampler, base, budget, po2, cycles, job);
+    }
+}
 
+fn wrap_job(sampler: &Sampler, base: u64, budget: Option<u64>, po2: u32, cycles: u64, job: u64) {
     // STARK: segments + lift/join, pools stay cached on this thread.
     let env = ExecutorEnv::builder()
         .write(&MultiTestSpec::BusyLoop { cycles })
@@ -176,7 +184,7 @@ fn metal_wrap_after_stark() {
     let released = sampler.current();
 
     eprintln!(
-        "[G8] budget={} po2={po2} cycles={cycles} base={:.1} MiB | STARK: {stark_s:.2}s peak \
+        "[G8] job={job} budget={} po2={po2} cycles={cycles} base={:.1} MiB | STARK: {stark_s:.2}s peak \
          {:.1} MiB, held before the wrap {:.1} MiB | wrap (identity_p254 + shrink_wrap): \
          {wrap_s:.2}s peak {:.1} MiB, after {:.1} MiB | after release_hal_buffers + release_srs \
          {:.1} MiB",

@@ -1,0 +1,347 @@
+// Copyright 2026 RISC Zero, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Committed ctrl groups kept on the host across provers (item C13, Metal).
+//!
+//! A recursion prover caches each program's committed ctrl group (`cached_ctrl_group`), but a
+//! long-lived worker drops its provers, and with them their HALs, between jobs
+//! (`release_hal_buffers`, and on Metal the release before identity_p254). The next job then
+//! recommitted every program's ctrl: for identity_p254 that is 23 columns x 2^20 rows of
+//! Poseidon254 (~180 ms of the ~1.1 s proof), for a poseidon2 lift/join ~12 ms.
+//!
+//! This module keeps a host copy of such a group (coefficients and the whole Merkle tree, no
+//! evaluated domain: [PolyGroupHost]) process-wide, keyed by hash suite and program, and the new
+//! prover rebuilds the group from it ([PolyGroup::from_host]: uploads, one expand NTT, no hashing,
+//! ~6.5 ms on an M5 Max). The copies are host memory, so they add nothing to the Metal working
+//! set; the device buffers of a rebuilt group are the ones a commit would have allocated.
+//!
+//! What is kept (`RISC0_METAL_REC_CTRL_PERSIST`, read once):
+//! - default (`1`): the Poseidon254 groups only, i.e. identity_p254's ctrl (~103 MB of host
+//!   memory, code copy included). A poseidon2 ctrl rebuilds in about the time it commits in
+//!   (~6.5 vs ~12 ms, a saving no A/B resolves) for ~100 MB each, so those are not kept;
+//! - `all`: every hash suite's groups (as many as fit, see below);
+//! - `0`: nothing (the pre-C13 behavior).
+//!
+//! The copies may hold at most [cap_bytes] (a 32nd of the GPU working-set budget: 128 MiB at a
+//! 4 GiB budget, enough for identity_p254's group; `RISC0_METAL_REC_CTRL_PERSIST_BYTES`
+//! overrides). When they do not all fit, the order is deterministic ([Priority]): Poseidon254
+//! groups are kept first, then larger groups, then by key; the lowest go first. Measured commit
+//! times are only logged (on a shared GPU they are too noisy to rank by).
+//!
+//! Why a 32nd: it is a budget-relative bound on host memory (not Metal working set) that holds
+//! identity_p254's ~98 MiB group from a 4 GiB budget up, and stays a small share of host RAM on
+//! the minimum 16 GB Mac (128 MiB at 4 GiB, 256 MiB at 8 GiB).
+
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, MutexGuard, OnceLock, Weak},
+};
+
+use risc0_zkp::{
+    field::baby_bear::BabyBearElem,
+    prove::poly_group::{PolyGroup, PolyGroupHost},
+};
+
+use super::{CtrlKey, Program};
+
+/// Environment variable (read once): `0` disables the persisted ctrl groups.
+pub(crate) const PERSIST_ENV: &str = "RISC0_METAL_REC_CTRL_PERSIST";
+/// Environment variable (read once): the host bytes the persisted groups may hold (default: a
+/// 32nd of the GPU working-set budget). `0` keeps nothing.
+pub(crate) const PERSIST_BYTES_ENV: &str = "RISC0_METAL_REC_CTRL_PERSIST_BYTES";
+
+/// What [PERSIST_ENV] keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Mode {
+    /// Nothing (the pre-C13 behavior).
+    Off,
+    /// The Poseidon254 groups (identity_p254's ctrl): the default.
+    P254,
+    /// Every hash suite's groups.
+    All,
+}
+
+/// `None` for an unparsable value.
+pub(crate) fn parse_persist(v: &str) -> Option<Mode> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "" | "1" | "on" | "true" | "p254" => Some(Mode::P254),
+        "all" => Some(Mode::All),
+        "0" | "off" | "false" => Some(Mode::Off),
+        _ => None,
+    }
+}
+
+/// Test hook (in-process A/B): 0 = follow [PERSIST_ENV], else 1 + the forced [Mode] index.
+#[cfg(test)]
+pub(crate) static TEST_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Force a [Mode] in this process (tests); `None` follows [PERSIST_ENV] again.
+#[cfg(test)]
+pub(crate) fn set_test_mode(m: Option<Mode>) {
+    let v = match m {
+        None => 0,
+        Some(Mode::Off) => 1,
+        Some(Mode::P254) => 2,
+        Some(Mode::All) => 3,
+    };
+    TEST_MODE.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The process-wide [Mode] (Metal builds; [Mode::Off] elsewhere).
+pub(crate) fn mode() -> Mode {
+    #[cfg(test)]
+    match TEST_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return Mode::Off,
+        2 => return Mode::P254,
+        3 => return Mode::All,
+        _ => {}
+    }
+    static MODE: OnceLock<Mode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        if !cfg!(feature = "metal") {
+            return Mode::Off;
+        }
+        match std::env::var(PERSIST_ENV) {
+            Ok(v) => parse_persist(&v).unwrap_or_else(|| {
+                tracing::error!("{PERSIST_ENV}={v:?} is not 0/1/all; keeping p254 ctrl groups");
+                Mode::P254
+            }),
+            Err(_) => Mode::P254,
+        }
+    })
+}
+
+/// Whether persisted groups are looked up at all.
+pub(crate) fn enabled() -> bool {
+    mode() != Mode::Off
+}
+
+/// Whether `mode` keeps the groups of hash suite `hashfn` (a `HashSuite::name`).
+pub(crate) fn mode_wants(mode: Mode, hashfn: &str) -> bool {
+    match mode {
+        Mode::Off => false,
+        Mode::P254 => hashfn == p254_suite_name(),
+        Mode::All => true,
+    }
+}
+
+/// Whether this process keeps the groups of hash suite `hashfn`.
+pub(crate) fn wants(hashfn: &str) -> bool {
+    mode_wants(mode(), hashfn)
+}
+
+fn p254_suite_name() -> &'static str {
+    static NAME: OnceLock<String> = OnceLock::new();
+    NAME.get_or_init(|| {
+        risc0_zkp::core::hash::poseidon_254::Poseidon254HashSuite::new_suite()
+            .name
+            .clone()
+    })
+}
+
+/// The host bytes the persisted groups may hold, for a GPU working-set budget of `budget` bytes.
+pub(crate) fn cap_bytes(budget: usize) -> usize {
+    static CAP: OnceLock<Option<usize>> = OnceLock::new();
+    let over = *CAP.get_or_init(|| {
+        std::env::var(PERSIST_BYTES_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+    });
+    over.unwrap_or(budget / 32)
+}
+
+struct Entry {
+    code: Arc<Vec<BabyBearElem>>,
+    /// The shared program last matched to `code` (pointer equality skips the compare).
+    program: Weak<Program>,
+    group: Arc<PolyGroupHost<BabyBearElem>>,
+    /// Wall time of the commit a rebuild replaces (logged only: on a shared GPU it is too noisy
+    /// to rank by).
+    commit_ms: f64,
+    bytes: usize,
+}
+
+type Key = (String, CtrlKey);
+
+/// Keep / eviction order, highest kept first. Deterministic (no measured times): Poseidon254
+/// groups first (their commit is the expensive one: ~180 ms against ~12 ms for poseidon2),
+/// then larger groups (larger programs take longer to commit), then the key for a total order.
+type Priority = (u8, usize, Key);
+
+fn priority(hashfn: &str, key: CtrlKey, bytes: usize) -> Priority {
+    let suite = u8::from(hashfn == p254_suite_name());
+    (suite, bytes, (hashfn.to_string(), key))
+}
+
+#[derive(Default)]
+struct State {
+    entries: HashMap<Key, Entry>,
+    restores: usize,
+    snapshots: usize,
+}
+
+fn state() -> MutexGuard<'static, State> {
+    static S: OnceLock<Mutex<State>> = OnceLock::new();
+    S.get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+fn total_bytes(s: &State) -> usize {
+    s.entries.values().map(|e| e.bytes).sum()
+}
+
+/// The code of `program` as a persisted group under `key` (any hash suite) holds it, so a new
+/// prover's code cache shares it instead of copying the program's code again. `None` if no
+/// entry is for exactly this code.
+pub(crate) fn code_for(
+    key: CtrlKey,
+    program: &Program,
+    shared: Option<&Arc<Program>>,
+) -> Option<Arc<Vec<BabyBearElem>>> {
+    if !enabled() {
+        return None;
+    }
+    let mut s = state();
+    let mut code: Option<Arc<Vec<BabyBearElem>>> = None;
+    for ((_, k), e) in s.entries.iter_mut() {
+        if *k != key {
+            continue;
+        }
+        if let Some(c) = &code {
+            if Arc::ptr_eq(c, &e.code) {
+                continue;
+            }
+        }
+        let same_program = shared.is_some_and(|a| {
+            e.program
+                .upgrade()
+                .is_some_and(|seen| Arc::ptr_eq(a, &seen))
+        });
+        if same_program || super::same_code(&e.code, &program.code) {
+            if let Some(a) = shared {
+                e.program = Arc::downgrade(a);
+            }
+            code = Some(e.code.clone());
+        }
+    }
+    code
+}
+
+/// The persisted group of `hashfn`'s prover for `key`, if it was built from `code` (the same
+/// `Arc` that [code_for] handed out: the caller's code cache already holds exactly this
+/// program's code).
+pub(crate) fn lookup(
+    hashfn: &str,
+    key: CtrlKey,
+    code: &Arc<Vec<BabyBearElem>>,
+) -> Option<Arc<PolyGroupHost<BabyBearElem>>> {
+    if !enabled() {
+        return None;
+    }
+    let s = state();
+    let e = s.entries.get(&(hashfn.to_string(), key))?;
+    Arc::ptr_eq(&e.code, code).then(|| e.group.clone())
+}
+
+/// Count a rebuild of `hashfn`/`key` that took `ms` (logged; tests and the bench count them).
+pub(crate) fn record_restore(hashfn: &str, key: CtrlKey, ms: f64) {
+    let mut s = state();
+    s.restores += 1;
+    if let Some(e) = s.entries.get(&(hashfn.to_string(), key)) {
+        tracing::debug!(
+            "C13 ctrl persist: {hashfn} rebuild {ms:.1} ms (commit was {:.1} ms)",
+            e.commit_ms
+        );
+    }
+}
+
+/// Whether a group of `bytes` would be kept under `cap`: not kept yet, and it fits together
+/// with the kept entries of higher [Priority] (lower ones would be evicted). (The caller checks
+/// [wants] first.)
+pub(crate) fn would_keep(hashfn: &str, key: CtrlKey, bytes: usize, cap: usize) -> bool {
+    if bytes > cap {
+        return false;
+    }
+    let s = state();
+    if s.entries.contains_key(&(hashfn.to_string(), key)) {
+        return false;
+    }
+    let mine = priority(hashfn, key, bytes);
+    let above: usize = s
+        .entries
+        .iter()
+        .filter(|(k, e)| priority(&k.0, k.1, e.bytes) > mine)
+        .map(|(_, e)| e.bytes)
+        .sum();
+    above + bytes <= cap
+}
+
+/// Keep `group` (just committed by `hashfn`'s prover in `commit_ms`) for `key` / `code`, then
+/// evict the lowest [Priority] until the copies fit `cap`.
+pub(crate) fn store<H>(
+    hashfn: &str,
+    key: CtrlKey,
+    code: Arc<Vec<BabyBearElem>>,
+    shared: Option<&Arc<Program>>,
+    group: &PolyGroup<H>,
+    commit_ms: f64,
+    cap: usize,
+) where
+    H: risc0_zkp::hal::Hal<Elem = BabyBearElem>,
+{
+    let host = group.to_host();
+    let bytes = host.bytes() + code.len() * std::mem::size_of::<BabyBearElem>();
+    let mut s = state();
+    s.snapshots += 1;
+    s.entries.insert(
+        (hashfn.to_string(), key),
+        Entry {
+            code,
+            program: shared.map(Arc::downgrade).unwrap_or_default(),
+            group: Arc::new(host),
+            commit_ms,
+            bytes,
+        },
+    );
+    while total_bytes(&s) > cap {
+        let Some(victim) = s
+            .entries
+            .iter()
+            .min_by_key(|(k, e)| priority(&k.0, k.1, e.bytes))
+            .map(|(k, _)| k.clone())
+        else {
+            break;
+        };
+        s.entries.remove(&victim);
+    }
+    tracing::debug!(
+        "C13 ctrl persist: kept {hashfn} group ({bytes} B, commit {commit_ms:.1} ms); {} groups, {} B",
+        s.entries.len(),
+        total_bytes(&s)
+    );
+}
+
+/// Host bytes, number of groups, rebuilds and snapshots so far (tests and the bench).
+#[cfg(test)]
+pub(crate) fn stats() -> (usize, usize, usize, usize) {
+    let s = state();
+    (total_bytes(&s), s.entries.len(), s.restores, s.snapshots)
+}
+
+/// Drop every persisted group (tests).
+#[cfg(test)]
+pub(crate) fn clear() {
+    state().entries.clear();
+}

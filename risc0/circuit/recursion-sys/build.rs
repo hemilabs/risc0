@@ -1018,7 +1018,8 @@ fn build_metal_kernels() {
         &'static [&'static str],
     );
     // The eval translator always runs with `--split --split-lz`: the monolith (`eval_check`), the
-    // split (`ec_part_0..5`) and its lazy Fp form (`ec_lz_part_0..5`, C12) all go into the
+    // split (`ec_part_0..5`), its lazy Fp form (`ec_lz_part_0..5`, C12; uint4 mix loads, C13) and
+    // that form's four-load revert (`ec_lz32_part_0..5`, C13) all go into the
     // metallib so the HAL can choose at run time (`RISC0_METAL_REC_KERNELS`, PLAN 2.0); a PSO
     // costs nothing until it is created.
     const TRANSLATORS: &[Translator] = &[
@@ -1045,6 +1046,7 @@ fn build_metal_kernels() {
                 "eval_check.metal",
                 "eval_check_split.metal",
                 "eval_check_split_lz.metal",
+                "eval_check_split_lz_u32.metal",
             ],
             &[
                 "kernels/cuda/eval_check.cu",

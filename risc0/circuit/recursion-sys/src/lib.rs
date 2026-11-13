@@ -64,6 +64,14 @@ pub const METAL_KERNEL_NAMES: &[&str] = &[
     "ec_lz_part_3",
     "ec_lz_part_4",
     "ec_lz_part_5",
+    // $OUT_DIR/metal/eval_check_split_lz_u32.metal (C13 `--split-lz`; the C12 four-load form of
+    // the lazy split, RISC0_METAL_REC_LZ_UINT4=0)
+    "ec_lz32_part_0",
+    "ec_lz32_part_1",
+    "ec_lz32_part_2",
+    "ec_lz32_part_3",
+    "ec_lz32_part_4",
+    "ec_lz32_part_5",
 ];
 
 use risc0_core::field::baby_bear::{BabyBearElem, BabyBearExtElem};
