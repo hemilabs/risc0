@@ -217,6 +217,47 @@ fn pso_threads() -> usize {
     })
 }
 
+/// Z16: `RISC0_METAL_ARCHIVE_REC=0` builds the recursion PSOs without the binary archive (the
+/// pre-Z16 C11 loader); `RISC0_METAL_ARCHIVE=0` turns off every unit's archive.
+pub(crate) const REC_ARCHIVE_ENV: &str = "RISC0_METAL_ARCHIVE_REC";
+
+fn use_rec_archive() -> bool {
+    !std::env::var(REC_ARCHIVE_ENV).is_ok_and(|v| v.trim() == "0")
+}
+
+/// Z16: the binary-archive unit of the recursion PSOs of `names`: `recursion` for the base set,
+/// `recursion_<variant>` for the eval_check variants, None (no archive) for any other set (tests
+/// building single kernels, which must not clutter the user's cache). One unit per set, so the
+/// sets of one metallib never prune each other's archives (the archive keeps a few keys per
+/// unit), and no unit is another's prefix followed by `-` (archive.rs naming rule).
+pub(crate) fn set_unit(names: &[&str]) -> Option<String> {
+    if names == base_names().as_slice() {
+        return Some("recursion".into());
+    }
+    EvalKernels::ALL
+        .iter()
+        .find(|v| v.names() == names)
+        .map(|v| format!("recursion_{}", format!("{v:?}").to_ascii_lowercase()))
+}
+
+/// Z16: the archive unit [Pipelines::new] uses for `names` from `bytes`: [set_unit] for the
+/// embedded [METAL_LIB], None for any other metallib. Compared by content, not address:
+/// `METAL_LIB` is a `const`, so two uses of it need not share one address (a pointer check
+/// missed the eval_check set: 1.7-4 s of every cold start). The length check rejects another
+/// metallib at once; equal bytes cost one memcmp of a few MB.
+pub(crate) fn archive_unit(bytes: &[u8], names: &[&str]) -> Option<String> {
+    (bytes == METAL_LIB).then(|| set_unit(names)).flatten()
+}
+
+/// The base (non-eval_check) kernels, in [METAL_KERNEL_NAMES] order.
+fn base_names() -> Vec<&'static str> {
+    METAL_KERNEL_NAMES
+        .iter()
+        .copied()
+        .filter(|name| !is_eval_kernel(name))
+        .collect()
+}
+
 /// A set of PSOs from one metallib, built on up to [pso_threads] threads (C11). The same API as
 /// zkp's `MetalKernels` (which builds sequentially).
 pub(crate) struct Pipelines {
@@ -226,12 +267,78 @@ pub(crate) struct Pipelines {
 impl Pipelines {
     /// Load `bytes` once and build a PSO for each of `names` on up to `threads` threads. Fails on
     /// a missing name or a PSO the device rejects (the first error in `names` order).
+    ///
+    /// Z16: the embedded [METAL_LIB] goes through the shared binary archive ([Self::new_in_unit])
+    /// under a unit named after the kernel set ([set_unit]); other metallibs (test variants) are
+    /// built without one.
     pub(crate) fn new(
         device: &DeviceRef,
         bytes: &[u8],
         names: &[&str],
         threads: usize,
     ) -> Result<Self> {
+        let unit = archive_unit(bytes, names);
+        Self::new_in_unit(device, bytes, names, threads, unit.as_deref())
+    }
+
+    /// [Self::new], through the binary archive of `unit` (`risc0_zkp::hal::metal::archive`, the
+    /// K5/R14 code the keccak, rv32im and groth16 units use) when `unit` is Some and neither
+    /// [REC_ARCHIVE_ENV] nor `RISC0_METAL_ARCHIVE` is `0`: a cold OS shader cache then loads the
+    /// stored GPU binaries instead of compiling (Z16: ~3.4 s of the 9.6 s cold start). Archive
+    /// errors fall back to the plain build (never fatal).
+    pub(crate) fn new_in_unit(
+        device: &DeviceRef,
+        bytes: &[u8],
+        names: &[&str],
+        threads: usize,
+        unit: Option<&str>,
+    ) -> Result<Self> {
+        if let Some(unit) = unit.filter(|_| use_rec_archive()) {
+            let dir = risc0_zkp::hal::metal::archive::archive_dir();
+            return Self::archived_in(dir, device, bytes, names, threads, unit).map(|(p, _)| p);
+        }
+        Self::plain(device, bytes, names, threads)
+    }
+
+    /// [Self::new_in_unit]'s archived build, with the archive in `dir` (None: concurrent, no
+    /// archive); also returns the archive report (tests).
+    pub(crate) fn archived_in(
+        dir: Option<std::path::PathBuf>,
+        device: &DeviceRef,
+        bytes: &[u8],
+        names: &[&str],
+        threads: usize,
+        unit: &str,
+    ) -> Result<(Self, risc0_zkp::hal::metal::archive::ArchiveReport)> {
+        let k = risc0_zkp::hal::metal::archive::ArchivedKernels::new_in_threads(
+            dir,
+            device,
+            unit,
+            bytes,
+            names,
+            Some(threads.max(1)),
+        )?;
+        let (_library, pipelines, r) = k.into_parts();
+        tracing::debug!(
+            "recursion Metal: {} PSOs ({unit}) in {:.2} s (binary archive {}: {} hits, {} misses{})",
+            names.len(),
+            r.elapsed.as_secs_f64(),
+            r.path
+                .as_deref()
+                .map_or("off".into(), |p| p.display().to_string()),
+            r.hits,
+            r.misses,
+            if r.errors.is_empty() {
+                String::new()
+            } else {
+                format!(", {} errors, first: {}", r.errors.len(), r.errors[0])
+            }
+        );
+        Ok((Self { pipelines }, r))
+    }
+
+    /// The pre-Z16 C11 build: no archive, on up to `threads` threads.
+    fn plain(device: &DeviceRef, bytes: &[u8], names: &[&str], threads: usize) -> Result<Self> {
         let library = device
             .new_library_with_data(bytes)
             .map_err(|e| anyhow!("loading metallib ({} bytes): {e}", bytes.len()))?;
@@ -324,11 +431,7 @@ impl RecursionKernels {
                 }
             }
         }
-        let base: Vec<&str> = METAL_KERNEL_NAMES
-            .iter()
-            .copied()
-            .filter(|name| !is_eval_kernel(name))
-            .collect();
+        let base = base_names();
         let t0 = std::time::Instant::now();
         let base = Pipelines::new(device, METAL_LIB, &base, pso_threads())?;
         tracing::debug!(
@@ -1058,5 +1161,113 @@ mod c5_tests {
         }
         eprintln!("C5 warmup ({variant:?}): {cold:.2}s; eval PSOs afterwards {warm:.4}s");
         assert!(warm < 1.0);
+    }
+
+    /// Z16 cold-start probe: one process builds the recursion (base and selected eval_check) and
+    /// zkp PSOs (`warmup`, what a worker does at start) and prints the wall time.
+    /// `.. --ignored --exact prove::hal::metal::c5_tests::z16_probe_warmup`
+    #[test]
+    #[ignore]
+    fn z16_probe_warmup() {
+        let t = std::time::Instant::now();
+        warmup().unwrap();
+        println!(
+            "Z16PROBE recursion+zkp warmup {:.3} s",
+            t.elapsed().as_secs_f64()
+        );
+    }
+
+    /// Z16: the base set and every eval_check variant have their own archive unit; other sets
+    /// (tests building single kernels) get none.
+    #[test]
+    fn z16_archive_units() {
+        assert_eq!(set_unit(&base_names()).as_deref(), Some("recursion"));
+        let mut units: Vec<String> = EvalKernels::ALL
+            .iter()
+            .map(|v| set_unit(v.names()).unwrap())
+            .collect();
+        assert_eq!(
+            units,
+            [
+                "recursion_monolith",
+                "recursion_split",
+                "recursion_splitlz",
+                "recursion_splitlzu32"
+            ]
+        );
+        units.push("recursion".into());
+        // archive.rs naming rule: no unit is another's prefix followed by `-`.
+        for a in &units {
+            for b in &units {
+                assert!(a == b || !b.starts_with(&format!("{a}-")), "{a} {b}");
+            }
+        }
+        assert_eq!(set_unit(&[base_names()[0]]), None);
+        // What `Pipelines::new` sees from the two process-wide loaders (through a copy of the
+        // slice, as another use of the `const` may be), and from another metallib.
+        let copy = METAL_LIB.to_vec();
+        assert_eq!(
+            archive_unit(&copy, &base_names()).as_deref(),
+            Some("recursion")
+        );
+        let sel = EvalKernels::selected();
+        assert!(archive_unit(&copy, sel.names()).is_some(), "{sel:?}");
+        let mut other = copy.clone();
+        let last = other.len() - 1;
+        other[last] ^= 1;
+        assert_eq!(archive_unit(&other, &base_names()), None);
+    }
+
+    /// Z16: the base PSOs through a fresh archive (all misses, saved), then again (all hits);
+    /// both sets and the plain C11 build have the same kernels. The recursion suite itself runs
+    /// on the archived process-wide set (the default), which is the bit-exactness evidence.
+    #[test]
+    fn z16_base_archive_roundtrip() {
+        let device = metal::Device::system_default().unwrap();
+        let dir = std::env::temp_dir().join(format!("risc0-z16-rec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let names = base_names();
+        let (a, r1) = Pipelines::archived_in(
+            Some(dir.clone()),
+            &device,
+            METAL_LIB,
+            &names,
+            4,
+            "recursion",
+        )
+        .unwrap();
+        if risc0_zkp::hal::metal::archive::os_build().is_none() {
+            return;
+        }
+        assert!(r1.errors.is_empty(), "{:?}", r1.errors);
+        assert_eq!(r1.misses, names.len());
+        assert!(r1.saved);
+        let (b, r2) = Pipelines::archived_in(
+            Some(dir.clone()),
+            &device,
+            METAL_LIB,
+            &names,
+            4,
+            "recursion",
+        )
+        .unwrap();
+        assert!(r2.loaded && !r2.saved, "{r2:?}");
+        assert_eq!(r2.hits, names.len());
+        let c = Pipelines::plain(&device, METAL_LIB, &names, 4).unwrap();
+        for p in [&a, &b, &c] {
+            let mut got: Vec<&str> = p.names().collect();
+            got.sort();
+            let mut want = names.clone();
+            want.sort();
+            assert_eq!(got, want);
+        }
+        let files: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert!(files[0].starts_with("recursion-"), "{files:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -119,6 +119,20 @@ pub fn metal_warmup() {
     }
 }
 
+/// Z16: build or load the Metal eval_check PSO specialized for segment po2 `po2` (R20) now, so the
+/// first segments of that size already use it; a worker calls this at startup with its segment
+/// po2. `wait = false` returns at once (the work runs on a background thread) and reports whether
+/// the PSO was already ready; `wait = true` blocks until it is ready (true) or failed. No-op
+/// (false) when Metal is disabled for rv32im, `RISC0_METAL_RV32IM_EVAL_FC=0`, or `po2` is not a
+/// segment po2.
+#[cfg(feature = "metal")]
+pub fn metal_prewarm_segment_po2(po2: usize, wait: bool) -> bool {
+    if !risc0_zkp::hal::metal::enabled("rv32im") {
+        return false;
+    }
+    self::hal::metal::prewarm_segment_po2(po2, wait)
+}
+
 /// Trigger HIP module loading so the first kernel launch doesn't stall.
 /// This is a no-op on non-ROCm builds. Mirrors cuda_warmup() but adds
 /// hipInit/hipSetDevice for HIP runtime initialization.

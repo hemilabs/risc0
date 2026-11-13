@@ -338,6 +338,75 @@ pub(crate) fn fc_prewarm(kernels: &'static super::Rv32imKernels) {
     });
 }
 
+/// Z16 (R20 open issue 3): build or load the [FC_KERNEL] PSO specialized for the domain of
+/// segment po2 `po2` now, ahead of the first segment of that size, so a short job does not run on
+/// the plain PSO while the generic [fc_prewarm] (most recently used domains first) or the first
+/// segment's own background build is still going. A worker calls it at startup with its
+/// configured segment po2. It loads the rv32im (and zkp) PSOs first if they are not loaded yet.
+///
+/// - `wait = false`: returns at once; the loading and the build run on a background thread
+///   (with a cold OS shader cache even an archive hit takes ~6.6 s for this kernel: the
+///   specialization of the function itself, Z16 note). Returns whether the PSO was already ready.
+/// - `wait = true`: blocks until the PSO is ready or its build failed; returns whether it is
+///   ready. Do not call it with `wait` from a thread that holds `risc0_zkp::hal::metal::exclusive`
+///   while another thread proves.
+///
+/// Returns false without doing anything when [EVAL_FC_ENV] is `0`, `po2` is outside
+/// `MIN_CYCLES_PO2..=MAX_CYCLES_PO2`, or the metallib cannot be loaded (logged).
+pub(crate) fn prewarm_segment_po2(po2: usize, wait: bool) -> bool {
+    let mode = match FcMode::current() {
+        Ok(FcMode::Off) => return false,
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("rv32im Metal: segment po2 {po2} prewarm skipped: {e:#}");
+            return false;
+        }
+    };
+    if !(risc0_zkp::MIN_CYCLES_PO2..=risc0_zkp::MAX_CYCLES_PO2).contains(&po2) {
+        return false;
+    }
+    let domain = ((1usize << po2) * INV_RATE) as u32;
+    let run = move |m: FcMode| -> bool {
+        let hal = risc0_zkp::hal::metal::MetalHalPoseidon2::new();
+        match super::Rv32imKernels::get(&hal) {
+            Ok(kernels) => fc_pipeline(kernels, domain, m).is_some(),
+            Err(e) => {
+                tracing::warn!("rv32im Metal: segment po2 {po2} prewarm: {e:#}");
+                false
+            }
+        }
+    };
+    if wait {
+        return run(FcMode::Wait);
+    }
+    let ready = fc_ready(domain);
+    if !ready {
+        // Background unless the process asked for `wait` builds everywhere.
+        let m = if mode == FcMode::Wait {
+            FcMode::Wait
+        } else {
+            FcMode::Background
+        };
+        if let Err(e) = std::thread::Builder::new()
+            .name(format!("rv32im-fc-po2-{po2}"))
+            .spawn(move || {
+                run(m);
+            })
+        {
+            tracing::warn!("rv32im Metal: cannot start the segment po2 {po2} prewarm: {e}");
+        }
+    }
+    ready
+}
+
+/// Whether the specialized PSO of `domain` is built and ready (no side effects).
+pub(crate) fn fc_ready(domain: u32) -> bool {
+    matches!(
+        fc_states().0.lock().unwrap().get(&domain),
+        Some(FcState::Ready(_))
+    )
+}
+
 /// The [FC_KERNEL] PSO specialized for `domain` if it is ready. Otherwise (first call for this
 /// domain) starts its build: on a background thread for [FcMode::Background] (None until it is
 /// ready), or waits for it for [FcMode::Wait]. None for [FcMode::Off], after a failed build, or
@@ -1762,6 +1831,54 @@ mod ef_tests {
             assert_eq!(mismatches(&cpu, &check.to_vec()), 0);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Z16: the segment-po2 prewarm ignores po2s that are not segment po2s (no build, nothing
+    /// ready) and reports an unknown domain as not ready.
+    #[test]
+    fn z16_prewarm_po2_out_of_range() {
+        for po2 in [0, 4, 12, 25, 40] {
+            assert!(!prewarm_segment_po2(po2, false), "{po2}");
+            assert!(!prewarm_segment_po2(po2, true), "{po2}");
+        }
+        assert!(!fc_ready(12345));
+    }
+
+    /// Z16: `prewarm_segment_po2(po2, true)` leaves the specialized PSO of that po2 ready, and a
+    /// later call (either mode) reports it ready at once. Ignored: it builds through the user's
+    /// archive cache (a cold specialization compiles for 20-30 s).
+    /// `cargo test --release -p risc0-circuit-rv32im --features metal --lib -- --ignored z16_prewarm_po2_ready`
+    #[test]
+    #[ignore]
+    fn z16_prewarm_po2_ready() {
+        if FcMode::current().unwrap() == FcMode::Off {
+            return;
+        }
+        let po2 = std::env::var("Z16_PO2")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20usize);
+        let t = std::time::Instant::now();
+        assert!(prewarm_segment_po2(po2, true));
+        eprintln!("Z16 prewarm po2 {po2}: {:.3} s", t.elapsed().as_secs_f64());
+        assert!(fc_ready(((1usize << po2) * INV_RATE) as u32));
+        assert!(prewarm_segment_po2(po2, false));
+        assert!(prewarm_segment_po2(po2, true));
+    }
+
+    /// Z16 cold-start probe: one process builds the zkp and rv32im PSOs (`warmup`, what a worker
+    /// does at start) and prints the wall time. Run it as its own process per sample, e.g. with
+    /// `MTL_SHADER_CACHE_SIZE=0` for a cold OS shader cache.
+    /// `.. --ignored --exact prove::hal::metal::eval_check::ef_tests::z16_probe_warmup`
+    #[test]
+    #[ignore]
+    fn z16_probe_warmup() {
+        let t = std::time::Instant::now();
+        super::super::warmup().unwrap();
+        println!(
+            "Z16PROBE rv32im+zkp warmup {:.3} s",
+            t.elapsed().as_secs_f64()
+        );
     }
 
     #[test]

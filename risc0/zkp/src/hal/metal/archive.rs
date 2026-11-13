@@ -66,6 +66,16 @@
 //! (`MTLFunctionConstantValues`), in an archive of its own whose key includes the constant
 //! values (rv32im's per-domain `ef_eval_split_fc`).
 //!
+//! Z16 adds an optional read-only **offline (AOT) archive** per unit: `RISC0_METAL_AOT_DIR` names a
+//! directory of archives made ahead of time by `metal-tt` (`tools/metal_aot/build_archive.py`)
+//! for one GPU architecture each, named
+//! `<unit>-<chunked_digest(metallib)[..24]>-<MTLDevice.architecture.name>-<checksum>.binarchive`.
+//! The one matching this metallib and this GPU is checked against its checksum, loaded, and tried
+//! first for every PSO (`FailOnBinaryArchiveMiss`); a miss continues as above (the runtime
+//! archive, then a compile). So a first install on a GPU the shipped set covers compiles
+//! nothing, and any other GPU, OS or metallib just misses (a wrong archive is never fatal: Metal
+//! reports a miss, Z16 note). The directory is never written. Unset: no change.
+//!
 //! The functions marked `#[doc(hidden)]` are test seams (keccak's archive tests use them).
 
 use std::{
@@ -91,6 +101,8 @@ use metal::{
 pub const ARCHIVE_ENV: &str = "RISC0_METAL_ARCHIVE";
 /// Overrides the archive directory.
 pub const ARCHIVE_DIR_ENV: &str = "RISC0_METAL_ARCHIVE_DIR";
+/// Z16: directory of read-only offline (`metal-tt`) archives (module docs). Unset: none.
+pub const AOT_DIR_ENV: &str = "RISC0_METAL_AOT_DIR";
 const ARCHIVE_EXT: &str = "binarchive";
 
 /// What happened to the archive while the PSOs were built.
@@ -100,8 +112,12 @@ pub struct ArchiveReport {
     pub path: Option<PathBuf>,
     /// An existing archive file was loaded.
     pub loaded: bool,
-    /// PSOs loaded from the archive (no GPU compile).
+    /// PSOs loaded from the archive (no GPU compile), including [Self::aot_hits].
     pub hits: usize,
+    /// Z16: of [Self::hits], PSOs loaded from the offline archive ([AOT_DIR_ENV]).
+    pub aot_hits: usize,
+    /// Z16: the offline archive file that was loaded, if any.
+    pub aot_path: Option<PathBuf>,
     /// PSOs not in the archive: compiled into it (or, on an archive error, built the plain way).
     /// Either compiles, unless the OS shader cache has the function.
     pub misses: usize,
@@ -141,6 +157,18 @@ impl ArchivedKernels {
         self.pipelines.get(name)
     }
 
+    /// The library, the PSOs by kernel name and the archive report (Z16: the zkp and recursion
+    /// loaders keep their own containers).
+    pub fn into_parts(
+        self,
+    ) -> (
+        Library,
+        HashMap<String, ComputePipelineState>,
+        ArchiveReport,
+    ) {
+        (self.library, self.pipelines, self.report)
+    }
+
     /// Load `bytes` as a metallib and build a PSO for each of `names` (through the archive of
     /// `unit`, see the module docs). Fails on a missing kernel or a PSO the device rejects; never
     /// because of the archive.
@@ -155,6 +183,34 @@ impl ArchivedKernels {
         unit: &str,
         bytes: &[u8],
         names: &[&str],
+    ) -> Result<Self> {
+        Self::new_in_threads(dir, device, unit, bytes, names, None)
+    }
+
+    /// [Self::new_in] on at most `threads` PSO-building threads (None: `available_parallelism`;
+    /// Z16: recursion's `RISC0_METAL_REC_PSO_THREADS`).
+    pub fn new_in_threads(
+        dir: Option<PathBuf>,
+        device: &DeviceRef,
+        unit: &str,
+        bytes: &[u8],
+        names: &[&str],
+        threads: Option<usize>,
+    ) -> Result<Self> {
+        Self::new_in_aot(dir, aot_dir(), device, unit, bytes, names, threads)
+    }
+
+    /// [Self::new_in_threads] with the offline archive directory given (None: no offline
+    /// archive) instead of read from [AOT_DIR_ENV] (tests never set process-wide environment).
+    #[doc(hidden)]
+    pub fn new_in_aot(
+        dir: Option<PathBuf>,
+        aot_dir: Option<PathBuf>,
+        device: &DeviceRef,
+        unit: &str,
+        bytes: &[u8],
+        names: &[&str],
+        threads: Option<usize>,
     ) -> Result<Self> {
         let t0 = Instant::now();
         // A relative directory (e.g. `RISC0_METAL_ARCHIVE_DIR=rel`) would become a `file://rel/..`
@@ -190,14 +246,29 @@ impl ArchivedKernels {
         let archive = base
             .as_deref()
             .and_then(|base| open_archive(device, base, &mut report));
+        let aot = aot_dir.and_then(|d| open_aot_archive(&d, device, unit, bytes, &mut report));
 
         let add_nanos = AtomicU64::new(0);
-        let built = build_all(device, &library, names, archive.as_deref(), &add_nanos)?;
+        let built = build_all(
+            device,
+            &library,
+            names,
+            Archives {
+                aot: aot.as_deref(),
+                runtime: archive.as_deref(),
+            },
+            &add_nanos,
+            threads,
+        )?;
         let mut pipelines = HashMap::with_capacity(names.len());
         let mut added = 0;
         for (name, pso, source) in built {
             match source {
                 Source::Hit => report.hits += 1,
+                Source::AotHit => {
+                    report.hits += 1;
+                    report.aot_hits += 1;
+                }
                 Source::Added => {
                     report.misses += 1;
                     added += 1;
@@ -211,6 +282,7 @@ impl ArchivedKernels {
                     }
                 }
             }
+            super::runtime::register_pso_name(&pso, name);
             pipelines.insert(name.to_string(), pso);
         }
         report.add_time = Duration::from_nanos(add_nanos.load(Ordering::Relaxed));
@@ -273,6 +345,100 @@ pub fn archive_dir() -> Option<PathBuf> {
             .join("Library/Caches/com.risczero.RISC-Zero.risc0")
             .join("metal-archives"),
     )
+}
+
+/// Z16: the offline archive directory ([AOT_DIR_ENV]); None when unset/empty or when the
+/// archive is disabled ([ARCHIVE_ENV] = 0).
+pub fn aot_dir() -> Option<PathBuf> {
+    if std::env::var(ARCHIVE_ENV).is_ok_and(|v| v.trim() == "0") {
+        return None;
+    }
+    std::env::var_os(AOT_DIR_ENV)
+        .filter(|d| !d.is_empty())
+        .map(|d| {
+            let d = PathBuf::from(d);
+            std::path::absolute(&d).unwrap_or(d)
+        })
+}
+
+/// Z16: `MTLDevice.architecture.name` (e.g. `applegpu_g17s`, the `metal-tt -arch` name); None if
+/// the OS does not have it (macOS < 14).
+#[allow(unexpected_cfgs)]
+pub fn gpu_architecture(device: &DeviceRef) -> Option<String> {
+    unsafe {
+        let responds: bool = msg_send![device, respondsToSelector: sel!(architecture)];
+        if !responds {
+            return None;
+        }
+        let arch: *mut Object = msg_send![device, architecture];
+        if arch.is_null() {
+            return None;
+        }
+        let name: *mut Object = msg_send![arch, name];
+        if name.is_null() {
+            return None;
+        }
+        let c: *const std::ffi::c_char = msg_send![name, UTF8String];
+        (!c.is_null()).then(|| std::ffi::CStr::from_ptr(c).to_string_lossy().into_owned())
+    }
+}
+
+/// Z16: `<unit>-<chunked_digest(bytes)[..24]>-<arch>`, the stem of the offline archive of a
+/// metallib for one GPU architecture (`<stem>-<checksum>.binarchive`, as [archive_file]).
+#[doc(hidden)]
+pub fn aot_stem(unit: &str, bytes: &[u8], arch: &str) -> String {
+    format!("{unit}-{}-{arch}", &chunked_digest(bytes)[..24])
+}
+
+/// Z16: load the offline archive of `unit`/`bytes` for this GPU from `dir`, if there is one whose
+/// content matches the checksum in its name (a damaged archive can abort the process inside
+/// Metal, K8; the module docs). Never fatal and never writes `dir`: a missing, mismatched or
+/// unloadable file is reported (debug/warn) and skipped.
+fn open_aot_archive(
+    dir: &Path,
+    device: &DeviceRef,
+    unit: &str,
+    bytes: &[u8],
+    report: &mut ArchiveReport,
+) -> Option<BinaryArchive> {
+    let arch = gpu_architecture(device)?;
+    let stem = aot_stem(unit, bytes, &arch);
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(sum) = name.to_str().and_then(|n| checksum_in_name(&stem, n)) else {
+            continue;
+        };
+        let path = entry.path();
+        let ok = std::fs::read(&path).is_ok_and(|c| archive_checksum(&c) == sum);
+        if !ok {
+            let msg = format!(
+                "offline archive {}: checksum mismatch; skipped",
+                path.display()
+            );
+            tracing::warn!("{unit}: Metal binary archive: {msg}");
+            report.errors.push(msg);
+            continue;
+        }
+        let desc = BinaryArchiveDescriptor::new();
+        desc.set_url(&file_url(&path));
+        match device.new_binary_archive_with_descriptor(&desc) {
+            Ok(a) => {
+                report.aot_path = Some(path);
+                return Some(a);
+            }
+            Err(e) => {
+                let msg = format!("offline archive {}: {e}; skipped", path.display());
+                tracing::warn!("{unit}: Metal binary archive: {msg}");
+                report.errors.push(msg);
+            }
+        }
+    }
+    tracing::debug!(
+        "{unit}: no offline archive {stem}-*.{ARCHIVE_EXT} in {}",
+        dir.display()
+    );
+    None
 }
 
 /// The OS build (`ProductBuildVersion`, e.g. `25A354`): a new build can bring a new GPU compiler,
@@ -595,6 +761,8 @@ pub fn new_pso_with_options(
 enum Source {
     /// Loaded from the archive as it was.
     Hit,
+    /// Z16: loaded from the offline archive ([AOT_DIR_ENV]).
+    AotHit,
     /// Compiled into the archive (`addComputePipelineFunctions`), then loaded from it.
     Added,
     /// Built without the archive: there is none (`None`), or the archive failed (the error).
@@ -603,6 +771,14 @@ enum Source {
 
 type Built<'a> = (&'a str, ComputePipelineState, Source);
 
+/// The archives a PSO may come from: the read-only offline one (Z16, tried first) and the
+/// runtime one (hit, else compiled into it).
+#[derive(Clone, Copy)]
+struct Archives<'a> {
+    aot: Option<&'a BinaryArchiveRef>,
+    runtime: Option<&'a BinaryArchiveRef>,
+}
+
 /// One PSO of `function` (`name` for messages): an archive hit if possible; else the function
 /// is compiled into the archive and the PSO loaded from there; else (archive error, or no
 /// archive) a plain build. [build_all]'s per-kernel step.
@@ -610,11 +786,21 @@ fn build_function(
     device: &DeviceRef,
     function: &metal::FunctionRef,
     name: &str,
-    archive: Option<&BinaryArchiveRef>,
+    archives: Archives,
     add_nanos: &AtomicU64,
 ) -> Result<(ComputePipelineState, Source)> {
     let desc = ComputePipelineDescriptor::new();
     desc.set_compute_function(Some(function));
+    if let Some(aot) = archives.aot {
+        desc.set_binary_archives(&[aot]);
+        if let Ok(pso) =
+            new_pso_with_options(device, &desc, MTLPipelineOption::FailOnBinaryArchiveMiss)
+        {
+            return Ok((pso, Source::AotHit));
+        }
+        desc.set_binary_archives(&[]);
+    }
+    let archive = archives.runtime;
     let mut archive_err = None;
     if let Some(archive) = archive {
         desc.set_binary_archives(&[archive]);
@@ -746,13 +932,17 @@ pub fn specialized_pipeline(
         .as_deref()
         .and_then(|base| open_archive(device, base, &mut report));
     let add_nanos = AtomicU64::new(0);
+    let archives = Archives {
+        aot: None,
+        runtime: archive.as_deref(),
+    };
     let (pso, source) = metal::objc::rc::autoreleasepool(|| {
-        build_function(device, &function, &key_name, archive.as_deref(), &add_nanos)
+        build_function(device, &function, &key_name, archives, &add_nanos)
     })?;
     report.add_time = Duration::from_nanos(add_nanos.load(Ordering::Relaxed));
     let mut added = false;
     match source {
-        Source::Hit => report.hits += 1,
+        Source::Hit | Source::AotHit => report.hits += 1,
         Source::Added => {
             report.misses += 1;
             added = true;
@@ -795,19 +985,20 @@ fn build_all<'a>(
     device: &DeviceRef,
     library: &Library,
     names: &[&'a str],
-    archive: Option<&BinaryArchiveRef>,
+    archives: Archives,
     add_nanos: &AtomicU64,
+    threads: Option<usize>,
 ) -> Result<Vec<Built<'a>>> {
     let build_one = |name: &'a str| -> Result<Built<'a>> {
         let function = library
             .get_function(name, None)
             .map_err(|e| anyhow!("metallib function {name}: {e}"))?;
-        let (pso, source) = build_function(device, &function, name, archive, add_nanos)?;
+        let (pso, source) = build_function(device, &function, name, archives, add_nanos)?;
         Ok((name, pso, source))
     };
 
-    let threads = std::thread::available_parallelism()
-        .map_or(4, |n| n.get())
+    let threads = threads
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()))
         .min(names.len())
         .max(1);
     let next = AtomicUsize::new(0);
