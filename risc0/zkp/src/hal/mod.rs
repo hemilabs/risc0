@@ -191,6 +191,40 @@ pub trait Hal {
         unimplemented!()
     }
 
+    /// Z14: true if [Self::hash_rows_bit_reverse] over a `rows`-row matrix bit-reverses `cols`
+    /// columns of `2^lg` inside the hash kernel (no separate pass). Committing code then leaves the
+    /// coefficients bit-reversed until the Merkle hash ([Self::commit_coeffs_lde_bit_reversed]).
+    fn fuses_bit_reverse_into_hash(&self, _rows: usize, _cols: usize, _lg: usize) -> bool {
+        false
+    }
+
+    /// Z14: [Self::hash_rows] of `matrix` into `output` and [Self::batch_bit_reverse] of the
+    /// `count` columns of `coeffs` (a buffer the hash does not read), in either order.
+    fn hash_rows_bit_reverse(
+        &self,
+        output: &Self::Buffer<Digest>,
+        matrix: &Self::Buffer<Self::Elem>,
+        coeffs: &Self::Buffer<Self::Elem>,
+        count: usize,
+    ) {
+        self.hash_rows(output, matrix);
+        self.batch_bit_reverse(coeffs, count);
+    }
+
+    /// Z14: [Self::commit_coeffs_lde], but `coeffs` is left bit-reversed (as the inverse NTT
+    /// produces it); the caller bit-reverses it, e.g. with [Self::hash_rows_bit_reverse]. Only
+    /// worth calling where [Self::fuses_bit_reverse_into_hash] holds.
+    fn commit_coeffs_lde_bit_reversed(
+        &self,
+        coeffs: &Self::Buffer<Self::Elem>,
+        evaluated: &Self::Buffer<Self::Elem>,
+        witness: &Self::Buffer<Self::Elem>,
+        count: usize,
+    ) {
+        self.commit_coeffs_lde(coeffs, evaluated, witness, count);
+        self.batch_bit_reverse(coeffs, count);
+    }
+
     /// `dst = interpolate_zk_shift(src)`, leaving `src` unchanged.
     fn batch_interpolate_ntt_zk_shift_from(
         &self,

@@ -27,13 +27,16 @@
 //! * `RISC0_METAL_PV_SMALL=0`: never use the `pvs` latency kernels.
 //! * `RISC0_METAL_PV_TAIL=0`: no single-dispatch fold-tree tail.
 //! * `RISC0_METAL_PVS_{W,Q}_MAX_{FOLD,ROWS}`: override a crossover (largest `n` for that kernel).
+//! * `RISC0_METAL_COMMIT_FUSE=0`: no Z14 fusion: a commit's coefficient bit reversal runs as its
+//!   own `bit_rev_z_batched_64` pass instead of inside the Merkle row hash (`pv_rows_side_k_z9`),
+//!   and `prefill_elem` sets nothing aside (`RISC0_METAL_PREFILL=0` turns off only the latter).
 
 use std::sync::Mutex;
 
 use metal::MTLSize;
 use risc0_core::field::baby_bear::{BabyBear, BabyBearElem};
 
-use super::{BufferImpl, Grid, KernelArg, MetalHal, MetalHash};
+use super::{as_bytes, BufferImpl, Grid, KernelArg, MetalHal, MetalHash};
 use crate::{
     core::{
         digest::Digest,
@@ -86,6 +89,9 @@ pub struct Poseidon2Config {
     /// `hash_fold_tree` folds every layer of at most this many outputs in one `pv_fold_tail_k`
     /// dispatch (0: off; at most 128).
     pub tail_max: u32,
+    /// Z14: fold a commit's coefficient bit reversal and `prefill_elem` fills into the row hash
+    /// (`pv_rows_side_k_z9`).
+    pub commit_fuse: bool,
 }
 
 /// Measured crossovers (M5 Max, `tests_z3::bench_{fold,rows}_kernels`, notes/Z3.md): `pvs_w` is
@@ -111,6 +117,7 @@ impl Default for Poseidon2Config {
             w_max_rows: DEFAULT_W_MAX_ROWS,
             q_max_rows: DEFAULT_Q_MAX_ROWS,
             tail_max: DEFAULT_TAIL_MAX,
+            commit_fuse: true,
         }
     }
 }
@@ -136,6 +143,9 @@ impl Poseidon2Config {
         }
         if var("RISC0_METAL_PV_TAIL").as_deref() == Some("0") {
             cfg.tail_max = 0;
+        }
+        if var("RISC0_METAL_COMMIT_FUSE").as_deref() == Some("0") {
+            cfg.commit_fuse = false;
         }
         let num = |name: &str, dst: &mut u32| {
             if let Some(v) = var(name) {
@@ -410,6 +420,14 @@ impl MetalHash for MetalHashPoseidon2 {
         let col_size = matrix.size() / row_size;
         assert_eq!(matrix.size(), col_size * row_size);
         let cfg = self.config();
+        // Z14: fills set aside by `prefill_elem` ride on the first row hash that can carry them.
+        if Self::fuse_shape(&cfg, row_size, col_size) {
+            let fills = hal.rt.prefill_unfilled(2);
+            if !fills.is_empty() {
+                Self::encode_rows_side(hal, output, matrix, None, &fills, PV_SIDE_TG_BYTES);
+                return;
+            }
+        }
         let rows = u32::try_from(row_size).expect("hash_rows: too many rows");
         let cols = u32::try_from(col_size).expect("hash_rows: too many columns");
         Self::encode_rows_form(
@@ -444,5 +462,137 @@ impl MetalHash for MetalHashPoseidon2 {
 
     fn get_hash_suite(&self) -> &HashSuite<BabyBear> {
         &self.suite
+    }
+
+    fn carries_fills(&self) -> bool {
+        let cfg = self.config();
+        cfg.commit_fuse && cfg.kernels == Poseidon2Kernels::PvZ9
+    }
+
+    fn fuses_bit_reverse(&self, rows: usize, cols: usize, lg: usize) -> bool {
+        Self::fuse_shape(&self.config(), rows, cols) && (10..32).contains(&lg)
+    }
+
+    fn hash_rows_bit_reverse(
+        &self,
+        hal: &MetalHal<Self>,
+        output: &BufferImpl<Digest>,
+        matrix: &BufferImpl<BabyBearElem>,
+        coeffs: &BufferImpl<BabyBearElem>,
+        count: usize,
+    ) -> bool {
+        let rows = output.size();
+        if rows == 0 || count == 0 {
+            return false;
+        }
+        let cols = matrix.size() / rows;
+        assert_eq!(matrix.size(), cols * rows);
+        let n = coeffs.size() / count;
+        assert_eq!(coeffs.size(), n * count);
+        if !n.is_power_of_two() || !self.fuses_bit_reverse(rows, cols, n.trailing_zeros() as usize)
+        {
+            return false;
+        }
+        let fills = hal.rt.prefill_unfilled(2);
+        Self::encode_rows_side(
+            hal,
+            output,
+            matrix,
+            Some((coeffs, n.trailing_zeros() as usize, count)),
+            &fills,
+            PV_SIDE_TG_BYTES,
+        );
+        true
+    }
+}
+
+/// Mirrored by `PvSideParams` in pv.metal.
+#[derive(Clone, Copy, Debug, Default, bytemuck::NoUninit)]
+#[repr(C)]
+struct PvSideParams {
+    lg: u32,
+    cols: u32,
+    stride: u32,
+    _pad: u32,
+    fill_n0: u32,
+    fill_v0: u32,
+    fill_n1: u32,
+    fill_v1: u32,
+}
+
+/// `pv_rows_side`'s threadgroup memory: two 32 x 32 tiles with rows padded to 33 words.
+pub(crate) const PV_SIDE_TG_BYTES: u64 = 2 * 32 * 33 * 4;
+
+impl MetalHashPoseidon2 {
+    /// Z14: `pv_rows_side_k_z9` covers this row-hash shape: the default (Z9) thread-per-hash row
+    /// kernel in whole 128-thread groups (bit reversals need columns of at least 2^10, one 32 x
+    /// 32 tile pair).
+    fn fuse_shape(cfg: &Poseidon2Config, rows: usize, cols: usize) -> bool {
+        cfg.commit_fuse
+            && cfg.kernels == Poseidon2Kernels::PvZ9
+            && cols > 0
+            && rows.is_multiple_of(PV_BLOCK as usize)
+            && u32::try_from(rows).is_ok()
+            && u32::try_from(cols).is_ok()
+            && Self::rows_kernel(cfg, rows as u32, cols as u32) == PvKernel::Pv
+    }
+
+    /// Encode `pv_rows_side_k_z9`: `hash_rows(output, matrix)`, plus the in-place bit reversal of
+    /// `bit_reverse` = (coeffs, lg, count: columns of 2^lg) and up to two `fills` (buffer, bytes,
+    /// word; bytes a multiple of 16).
+    pub(crate) fn encode_rows_side(
+        hal: &MetalHal<Self>,
+        output: &BufferImpl<Digest>,
+        matrix: &BufferImpl<BabyBearElem>,
+        bit_reverse: Option<(&BufferImpl<BabyBearElem>, usize, usize)>,
+        fills: &[(metal::Buffer, u64, u32)],
+        tg_bytes: u64,
+    ) {
+        assert!(fills.len() <= 2);
+        let rows = output.size();
+        let cols = matrix.size() / rows;
+        let mut params = PvSideParams::default();
+        if let Some((_, lg, count)) = bit_reverse {
+            assert!((10..32).contains(&lg));
+            params.lg = lg as u32;
+            params.cols = u32::try_from(count).expect("bit reversal: too many columns");
+            params.stride = 1u32 << lg;
+        }
+        let fill_n = |k: usize| {
+            fills.get(k).map_or(0, |f| {
+                assert_eq!(f.1 % 16, 0);
+                u32::try_from(f.1 / 16).expect("fill: too large")
+            })
+        };
+        params.fill_n0 = fill_n(0);
+        params.fill_n1 = fill_n(1);
+        params.fill_v0 = fills.first().map_or(0, |f| f.2);
+        params.fill_v1 = fills.get(1).map_or(0, |f| f.2);
+        let params = [params];
+        // Metal API validation requires every argument the kernel declares to be bound, even when
+        // a zero count (`cols` / `fill_n*`) keeps the kernel from touching it, so an absent io or
+        // fill gets `matrix` as a dummy (never read or written through that binding).
+        let fill_arg = |k: usize| {
+            fills.get(k).map_or(matrix.as_arg(), |f| KernelArg::Buffer {
+                buffer: &f.0,
+                offset: 0,
+            })
+        };
+        let args = &[
+            output.as_arg(),
+            matrix.as_arg(),
+            KernelArg::Integer(rows as u32),
+            KernelArg::Integer(cols as u32),
+            bit_reverse.map_or(matrix.as_arg(), |b| b.0.as_arg()),
+            KernelArg::Bytes(as_bytes(&params)),
+            fill_arg(0),
+            fill_arg(1),
+        ];
+        hal.dispatch(
+            hal.pipeline("pv_rows_side_k_z9"),
+            args,
+            groups(PvKernel::Pv, rows as u32),
+            &[tg_bytes],
+        );
     }
 }

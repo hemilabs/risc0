@@ -404,6 +404,18 @@ struct Pool {
     /// private buffers (never subtracted; their drop is not observable). The [BudgetScope::Hal]
     /// budget is checked against it.
     owned_bytes: u64,
+    /// Z14: pooled buffers set aside for `Hal::prefill_elem` (counted in `cached_bytes`; a drain
+    /// releases them like the rest of the pool).
+    prefilled: Vec<Prefilled>,
+}
+
+/// Z14: a pooled buffer of `len` bytes to be handed out by `alloc_elem_init(.., word)`; `filled`
+/// once a fill of `word` has been encoded (in a hash kernel).
+struct Prefilled {
+    len: u64,
+    word: u32,
+    buf: MtlBuffer,
+    filled: bool,
 }
 
 impl Pool {
@@ -431,6 +443,7 @@ impl Pool {
         // buffer retains every resource it binds until it completes.
         self.ready.clear();
         self.pending.clear();
+        self.prefilled.clear();
         self.cached_bytes = 0;
         self.owned_bytes = self.owned_bytes.saturating_sub(bytes);
         bytes
@@ -1198,6 +1211,80 @@ impl Runtime {
     /// released. Budget and allocation failures use [drain_all_pools] instead.
     pub(crate) fn drain_pool(&self) -> u64 {
         self.pool.lock().drain()
+    }
+
+    /// Z14 (`Hal::prefill_elem`): set aside a pooled buffer of `len` bytes for a later
+    /// `alloc_elem_init` with `word`: one that is ready, else one still pending (its GPU users
+    /// were encoded earlier, and the fill and every later use are ordered after them by the
+    /// queue's hazard tracking). Never a new allocation. False if one is already set aside for
+    /// (`len`, `word`), none is pooled, or the set-aside bytes would exceed `max_bytes`.
+    pub(crate) fn prefill_reserve(&self, len: u64, word: u32, max_bytes: u64) -> bool {
+        let completed = self.completed_seq.load(Ordering::Acquire);
+        let mut pool = self.pool.lock();
+        pool.reclaim(completed);
+        let held: u64 = pool.prefilled.iter().map(|p| p.len).sum();
+        if held + len > max_bytes
+            || pool
+                .prefilled
+                .iter()
+                .any(|p| p.len == len && p.word == word)
+        {
+            return false;
+        }
+        let buf = match pool.ready.get_mut(&len).and_then(Vec::pop) {
+            Some(buf) => buf,
+            None => match pool.pending.iter().position(|p| p.1 == len) {
+                Some(i) => pool.pending.swap_remove(i).2,
+                None => return false,
+            },
+        };
+        // Still pool memory: `cached_bytes` keeps counting it.
+        pool.prefilled.push(Prefilled {
+            len,
+            word,
+            buf,
+            filled: false,
+        });
+        true
+    }
+
+    /// Z14: the set-aside buffers whose fill is not encoded yet, at most `max`, now marked filled:
+    /// the caller encodes their fills (len / 16 uint4s of `word`) in its next dispatch.
+    ///
+    /// Assumes one thread drives the HAL (true for every caller today: rv32im witgen/finalize and
+    /// the recursion HALs): a `prefill_take` on another thread between this call and the caller's
+    /// encode would see `filled` for a fill that is not in the command stream yet.
+    pub(crate) fn prefill_unfilled(&self, max: usize) -> Vec<(MtlBuffer, u64, u32)> {
+        let mut pool = self.pool.lock();
+        pool.prefilled
+            .iter_mut()
+            .filter(|p| !p.filled)
+            .take(max)
+            .map(|p| {
+                p.filled = true;
+                (p.buf.clone(), p.len, p.word)
+            })
+            .collect()
+    }
+
+    /// Z14: take the buffer set aside for (`len`, `word`), with whether its fill is encoded.
+    pub(crate) fn prefill_take(&self, len: u64, word: u32) -> Option<(MtlBuffer, bool)> {
+        let mut pool = self.pool.lock();
+        let i = pool
+            .prefilled
+            .iter()
+            .position(|p| p.len == len && p.word == word)?;
+        let p = pool.prefilled.swap_remove(i);
+        pool.cached_bytes -= len;
+        Some((p.buf, p.filled))
+    }
+
+    /// Z14 test hook: (set-aside buffers, of which fill-encoded).
+    #[cfg(test)]
+    pub(crate) fn prefill_stats(&self) -> (usize, usize) {
+        let pool = self.pool.lock();
+        let filled = pool.prefilled.iter().filter(|p| p.filled).count();
+        (pool.prefilled.len(), filled)
     }
 
     #[cfg(test)]

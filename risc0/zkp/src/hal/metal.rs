@@ -64,6 +64,8 @@ mod tests_z9;
 mod tests_z10;
 #[cfg(test)]
 mod tests_z13;
+#[cfg(test)]
+mod tests_z14;
 
 use std::{
     fmt::Debug,
@@ -182,6 +184,8 @@ pub const KERNEL_NAMES: &[&str] = &[
     "pv_fold_k_z9",
     "pv_fold_tail_k_z9",
     "pv_rows_k_z9",
+    // pv.metal: the row hash with a commit's side work (bit reversal, fills) folded in (Z14)
+    "pv_rows_side_k_z9",
     // poseidon254.metal (Z10)
     "p254_fold_ref",
     "p254_fold_w64",
@@ -190,6 +194,12 @@ pub const KERNEL_NAMES: &[&str] = &[
     "p254_rows_w64",
     "p254_rows_w64c",
 ];
+
+/// `RISC0_METAL_PREFILL=0` turns [MetalHal]'s `Hal::prefill_elem` off (Z14).
+fn prefill_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RISC0_METAL_PREFILL").map_or(true, |v| v.trim() != "0"))
+}
 
 /// Whether the Metal backend may be used for `unit` (one of `zkp`, `rv32im`, `recursion`,
 /// `keccak`, `groth16`): false if `RISC0_METAL=0`, or if the comma-separated list in
@@ -323,6 +333,31 @@ pub trait MetalHash: Sized {
 
     /// Return the HashSuite
     fn get_hash_suite(&self) -> &HashSuite<BabyBear>;
+
+    /// Z14: whether this hash's row kernel encodes the fills of `Hal::prefill_elem` buffers
+    /// (else `prefill_elem` sets nothing aside).
+    fn carries_fills(&self) -> bool {
+        false
+    }
+
+    /// Z14: whether [Self::hash_rows_bit_reverse] fuses for a `rows`-row matrix and `cols`
+    /// columns of `2^lg` coefficients.
+    fn fuses_bit_reverse(&self, _rows: usize, _cols: usize, _lg: usize) -> bool {
+        false
+    }
+
+    /// Z14: encode `hash_rows` with the in-place bit reversal of the `count` columns of `coeffs`
+    /// folded into the hash kernel; false (nothing encoded) when it does not fuse that shape.
+    fn hash_rows_bit_reverse(
+        &self,
+        _hal: &MetalHal<Self>,
+        _output: &BufferImpl<Digest>,
+        _matrix: &BufferImpl<BabyBearElem>,
+        _coeffs: &BufferImpl<BabyBearElem>,
+        _count: usize,
+    ) -> bool {
+        false
+    }
 }
 
 pub struct MetalHashSha256 {
@@ -617,7 +652,36 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
         size: usize,
         value: Self::Elem,
     ) -> Self::Buffer<Self::Elem> {
+        // Z14: a buffer `prefill_elem` set aside (its fill encoded in a row hash, or encoded now).
+        let word = value.as_u32_montgomery();
+        let bytes = (size * std::mem::size_of::<Self::Elem>()) as u64;
+        if let Some((buf, filled)) = self.rt.prefill_take(bytes, word) {
+            let raw = buffer::RawBuffer::from_pooled(&self.rt, name, buf, bytes);
+            let out = BufferImpl::from_raw(raw, size);
+            if !filled {
+                self.fill_u32(&out, word);
+            }
+            return out;
+        }
         self.small_alloc_elem_init(name, size, value)
+    }
+
+    /// Z14: set aside a pooled buffer of `size` elements (one just freed, never a new
+    /// allocation) for an upcoming `alloc_elem_init(.., size, value)`; its fill rides on the next
+    /// commit row hash (`pv_rows_side_k_z9`) instead of a blit. Off with
+    /// `RISC0_METAL_PREFILL=0`, with a hash that does not carry fills, and beyond an eighth of
+    /// the working-set limit in set-aside bytes (a pool drain releases them).
+    fn prefill_elem(&self, size: usize, value: Self::Elem) {
+        let bytes = (size * std::mem::size_of::<Self::Elem>()) as u64;
+        if !prefill_enabled()
+            || !self.hash().carries_fills()
+            || bytes == 0
+            || !bytes.is_multiple_of(16)
+        {
+            return;
+        }
+        let max = self.rt.working_set_limit() / 8;
+        self.rt.prefill_reserve(bytes, value.as_u32_montgomery(), max);
     }
 
     fn alloc_extelem_zeroed(&self, name: &'static str, size: usize) -> Self::Buffer<Self::ExtElem> {
@@ -813,6 +877,37 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
     fn hash_rows(&self, output: &Self::Buffer<Digest>, matrix: &Self::Buffer<Self::Elem>) {
         self.hash().hash_rows(self, output, matrix);
         self.flush();
+    }
+
+    fn fuses_bit_reverse_into_hash(&self, rows: usize, cols: usize, lg: usize) -> bool {
+        self.hash().fuses_bit_reverse(rows, cols, lg)
+    }
+
+    fn hash_rows_bit_reverse(
+        &self,
+        output: &Self::Buffer<Digest>,
+        matrix: &Self::Buffer<Self::Elem>,
+        coeffs: &Self::Buffer<Self::Elem>,
+        count: usize,
+    ) {
+        if !self
+            .hash()
+            .hash_rows_bit_reverse(self, output, matrix, coeffs, count)
+        {
+            self.hash().hash_rows(self, output, matrix);
+            self.ntt_batch_bit_reverse(coeffs, count);
+        }
+        self.flush();
+    }
+
+    fn commit_coeffs_lde_bit_reversed(
+        &self,
+        coeffs: &Self::Buffer<Self::Elem>,
+        evaluated: &Self::Buffer<Self::Elem>,
+        witness: &Self::Buffer<Self::Elem>,
+        count: usize,
+    ) {
+        self.ntt_commit_coeffs_lde_impl(coeffs, evaluated, witness, count, false);
     }
 
     fn zk_shift(&self, io: &Self::Buffer<Self::Elem>, poly_count: usize) {

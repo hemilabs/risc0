@@ -131,16 +131,34 @@ impl<'a, H: Hal> Prover<'a, H> {
             let evaluated = self
                 .hal
                 .alloc_elem("evaluated", group_size * self.cycles * INV_RATE);
-            self.hal
-                .commit_coeffs_lde(&coeffs, &evaluated, witness, group_size);
-            PolyGroup::new_with_evaluated(
-                self.hal,
-                coeffs,
-                evaluated,
+            // Z14: leave the coefficients bit-reversed when the Merkle row hash can reverse them.
+            if self.hal.fuses_bit_reverse_into_hash(
+                self.cycles * INV_RATE,
                 group_size,
-                self.cycles,
-                witness.name(),
-            )
+                log2_ceil(self.cycles),
+            ) {
+                self.hal
+                    .commit_coeffs_lde_bit_reversed(&coeffs, &evaluated, witness, group_size);
+                PolyGroup::new_with_evaluated_bit_reversed(
+                    self.hal,
+                    coeffs,
+                    evaluated,
+                    group_size,
+                    self.cycles,
+                    witness.name(),
+                )
+            } else {
+                self.hal
+                    .commit_coeffs_lde(&coeffs, &evaluated, witness, group_size);
+                PolyGroup::new_with_evaluated(
+                    self.hal,
+                    coeffs,
+                    evaluated,
+                    group_size,
+                    self.cycles,
+                    witness.name(),
+                )
+            }
         } else {
             let coeffs = make_coeffs(self.hal, witness, group_size);
             PolyGroup::new(self.hal, coeffs, group_size, self.cycles, witness.name())

@@ -595,6 +595,7 @@ impl<MH: MetalHash> MetalHal<MH> {
         lg_blowup: usize,
         cols: usize,
         chunk: usize,
+        natural: bool,
     ) {
         let zk = self.ntt_zk_table(lg);
         let chunk = if chunk == 0 {
@@ -618,7 +619,9 @@ impl<MH: MetalHash> MetalHal<MH> {
                 lg + lg_blowup,
                 false,
             );
-            self.bitrev_batched((coeffs, c0 * n), lg, k);
+            if natural {
+                self.bitrev_batched((coeffs, c0 * n), lg, k);
+            }
             c0 += chunk;
         }
     }
@@ -740,6 +743,19 @@ impl<MH: MetalHash> MetalHal<MH> {
         witness: &BufferImpl<Fp>,
         count: usize,
     ) {
+        self.ntt_commit_coeffs_lde_impl(coeffs, evaluated, witness, count, true);
+    }
+
+    /// `ntt_commit_coeffs_lde`; `natural`: bit-reverse the coefficients to natural order (else
+    /// they stay in the inverse NTT's bit-reversed order: Z14's `commit_coeffs_lde_bit_reversed`).
+    pub(crate) fn ntt_commit_coeffs_lde_impl(
+        &self,
+        coeffs: &BufferImpl<Fp>,
+        evaluated: &BufferImpl<Fp>,
+        witness: &BufferImpl<Fp>,
+        count: usize,
+        natural: bool,
+    ) {
         scope!("commit_coeffs_lde");
         let row_size = witness.size() / count;
         assert_eq!(row_size * count, witness.size());
@@ -753,7 +769,7 @@ impl<MH: MetalHash> MetalHal<MH> {
             (10..=23).contains(&lg),
             "commit_coeffs_lde: lg_domain_size {lg} out of range"
         );
-        self.nttx_commit(coeffs, evaluated, witness, lg, lg_blowup, count, 0);
+        self.nttx_commit(coeffs, evaluated, witness, lg, lg_blowup, count, 0, natural);
         self.flush();
     }
 
@@ -884,7 +900,7 @@ pub(crate) mod test_hooks {
         chunk: usize,
     ) {
         let lg_blowup = log2_ceil(crate::INV_RATE);
-        hal.nttx_commit(coeffs, evaluated, witness, lg, lg_blowup, cols, chunk);
+        hal.nttx_commit(coeffs, evaluated, witness, lg, lg_blowup, cols, chunk, true);
         hal.flush();
     }
 

@@ -320,7 +320,7 @@ impl<H: Hal> PolyGroup<H> {
         size: usize,
         name: &'static str,
     ) -> Self {
-        Self::new_impl(hal, coeffs, None, count, size, name)
+        Self::new_impl(hal, coeffs, None, false, count, size, name)
     }
 
     /// Build from coefficients (natural order) and their already-computed LDE, as
@@ -333,13 +333,30 @@ impl<H: Hal> PolyGroup<H> {
         size: usize,
         name: &'static str,
     ) -> Self {
-        Self::new_impl(hal, coeffs, Some(evaluated), count, size, name)
+        Self::new_impl(hal, coeffs, Some(evaluated), false, count, size, name)
     }
 
+    /// [Self::new_with_evaluated] for coefficients still in bit-reversed order, as
+    /// [`Hal::commit_coeffs_lde_bit_reversed`] leaves them (Z14): the Merkle hash bit-reverses
+    /// them.
+    pub fn new_with_evaluated_bit_reversed(
+        hal: &H,
+        coeffs: H::Buffer<H::Elem>,
+        evaluated: H::Buffer<H::Elem>,
+        count: usize,
+        size: usize,
+        name: &'static str,
+    ) -> Self {
+        Self::new_impl(hal, coeffs, Some(evaluated), true, count, size, name)
+    }
+
+    /// `coeffs_bit_reversed`: `coeffs` (with `pre_evaluated`) is still bit-reversed. Without
+    /// `pre_evaluated` it always is (the expand NTT reads that order).
     fn new_impl(
         hal: &H,
         coeffs: H::Buffer<H::Elem>,
         pre_evaluated: Option<H::Buffer<H::Elem>>,
+        coeffs_bit_reversed: bool,
         count: usize,
         size: usize,
         name: &'static str,
@@ -348,19 +365,31 @@ impl<H: Hal> PolyGroup<H> {
         assert_eq!(coeffs.size(), count * size);
         let domain = size * INV_RATE;
         let t0 = std::time::Instant::now();
-        let evaluated = match pre_evaluated {
+        // See the coeffs spill below.
+        let spill_enabled = size >= (1 << 22) && !unified_memory_gpu(hal);
+        let coeffs_bytes = coeffs.size() * std::mem::size_of::<H::Elem>();
+        let spill_threshold: usize = 512 << 20;
+        let spill = spill_enabled && coeffs_bytes >= spill_threshold;
+        // Z14: bit-reverse the coefficients inside the Merkle row hash when the HAL fuses the two
+        // (not when they go to the host before it).
+        let defer_bit_reverse =
+            !spill && hal.fuses_bit_reverse_into_hash(domain, count, log2_ceil(size));
+        let (evaluated, bit_reverse_pending) = match pre_evaluated {
             Some(e) => {
                 assert_eq!(e.size(), count * domain);
-                e
+                (e, coeffs_bit_reversed)
             }
             None => {
                 let evaluated = hal.alloc_elem("evaluated", count * domain);
                 hal.batch_expand_into_evaluate_ntt(&evaluated, &coeffs, count, log2_ceil(INV_RATE));
-                hal.batch_bit_reverse(&coeffs, count);
-                evaluated
+                (evaluated, true)
             }
         };
         let t_ntt = t0.elapsed();
+        let merkle_bit_reverse = bit_reverse_pending && defer_bit_reverse;
+        if bit_reverse_pending && !merkle_bit_reverse {
+            hal.batch_bit_reverse(&coeffs, count);
+        }
         let t_bitrev = t0.elapsed();
 
         // Spill coeffs to host BEFORE merkle alloc if large enough. At po2=22
@@ -375,10 +404,7 @@ impl<H: Hal> PolyGroup<H> {
         // Unified-memory GPU HALs (Metal) skip it: the "host" copy would sit in the same physical
         // memory as the device buffer and save nothing (same test as prover.rs's
         // `unified_memory_gpu`, which gates the evaluated spill).
-        let spill_enabled = size >= (1 << 22) && !unified_memory_gpu(hal);
-        let coeffs_bytes = coeffs.size() * std::mem::size_of::<H::Elem>();
-        let spill_threshold: usize = 512 << 20;
-        let (coeffs_dev, coeffs_host) = if spill_enabled && coeffs_bytes >= spill_threshold {
+        let (coeffs_dev, coeffs_host) = if spill {
             let host: Vec<H::Elem> = coeffs.to_vec();
             // Mark the underlying device buffer to bypass the reuse pool on
             // drop — we want the VRAM returned to the driver immediately so
@@ -394,7 +420,17 @@ impl<H: Hal> PolyGroup<H> {
             (Some(coeffs), None)
         };
 
-        let merkle = MerkleTreeProver::new(hal, &evaluated, domain, count, QUERIES);
+        let merkle = MerkleTreeProver::new_bit_reverse(
+            hal,
+            &evaluated,
+            domain,
+            count,
+            QUERIES,
+            coeffs_dev
+                .as_ref()
+                .filter(|_| merkle_bit_reverse)
+                .map(|c| (c, count)),
+        );
         let t_merkle = t0.elapsed();
         if std::env::var_os("RISC0_VERBOSE").is_some() {
             eprintln!(

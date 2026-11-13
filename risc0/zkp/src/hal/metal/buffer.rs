@@ -41,6 +41,23 @@ pub(crate) struct RawBuffer {
 }
 
 impl RawBuffer {
+    /// Z14: wrap a buffer of `bytes` this runtime's pool handed out (`Runtime::prefill_take`).
+    pub(crate) fn from_pooled(
+        rt: &Arc<Runtime>,
+        name: &'static str,
+        buf: MtlBuffer,
+        bytes: u64,
+    ) -> Self {
+        tracker().lock().unwrap().alloc(bytes as usize);
+        Self {
+            name,
+            buf: ManuallyDrop::new(buf),
+            bytes,
+            bypass_pool: AtomicBool::new(false),
+            rt: rt.clone(),
+        }
+    }
+
     pub(crate) fn new(rt: &Arc<Runtime>, name: &'static str, bytes: usize) -> Self {
         // Metal returns nil for a zero-length buffer; keep every allocation addressable.
         let bytes = (bytes as u64).max(16);
@@ -106,6 +123,17 @@ impl<T> BufferImpl<T> {
     pub(crate) fn new(rt: &Arc<Runtime>, name: &'static str, size: usize) -> Self {
         Self {
             raw: Arc::new(RawBuffer::new(rt, name, size * mem::size_of::<T>())),
+            offset: 0,
+            size,
+            marker: PhantomData,
+        }
+    }
+
+    /// Z14: a buffer of `size` elements over `raw` (`Runtime::prefill_take`'s buffer).
+    pub(crate) fn from_raw(raw: RawBuffer, size: usize) -> Self {
+        assert!((size * mem::size_of::<T>()) as u64 <= raw.bytes);
+        Self {
+            raw: Arc::new(raw),
             offset: 0,
             size,
             marker: PhantomData,
