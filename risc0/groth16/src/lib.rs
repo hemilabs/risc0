@@ -62,7 +62,7 @@
 //! component can be done with the following commands:
 //!
 //! ```bash
-//! export VERSION=0.1.0
+//! export VERSION=0.2.0
 //! cargo xtask-groth16 -- ~/groth16-tmp
 //! cargo run --bin rzup -- \
 //!     publish create-artifact \
