@@ -329,6 +329,41 @@ where
     }
 }
 
+/// The forward butterflies of a level of fewer than 32 points (n < 5), for the 16-wide NTT.
+#[cfg(all(feature = "prove", target_arch = "x86_64"))]
+pub(crate) fn fwd_butterfly_small<B, T>(io: &mut [T], n: usize, expand_bits: usize)
+where
+    B: Elem + RootsOfUnity,
+    T: Copy + Mul<B, Output = T> + Add<Output = T> + Sub<Output = T>,
+{
+    match n {
+        0 => fwd_butterfly_0::<B, T>(io, expand_bits),
+        1 => fwd_butterfly_1::<B, T>(io, expand_bits),
+        2 => fwd_butterfly_2::<B, T>(io, expand_bits),
+        3 => fwd_butterfly_3::<B, T>(io, expand_bits),
+        4 => fwd_butterfly_4::<B, T>(io, expand_bits),
+        _ => unreachable!(),
+    }
+}
+
+/// The inverse butterflies of a level of fewer than 32 points (n < 5), without the
+/// normalization, for the 16-wide NTT.
+#[cfg(all(feature = "prove", target_arch = "x86_64"))]
+pub(crate) fn rev_butterfly_small<B, T>(io: &mut [T], n: usize)
+where
+    B: Elem + RootsOfUnity,
+    T: Copy + Mul<B, Output = T> + Add<Output = T> + Sub<Output = T>,
+{
+    match n {
+        0 => rev_butterfly_0::<B, T>(io),
+        1 => rev_butterfly_1::<B, T>(io),
+        2 => rev_butterfly_2::<B, T>(io),
+        3 => rev_butterfly_3::<B, T>(io),
+        4 => rev_butterfly_4::<B, T>(io),
+        _ => unreachable!(),
+    }
+}
+
 /// Expand the `input` into `output` to support polynomial evaluation on
 /// `input.len() * (1 << expand_bits)` points.
 pub fn expand<T>(output: &mut [T], input: &[T], expand_bits: usize)

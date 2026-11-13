@@ -21,6 +21,8 @@ extern crate alloc;
 pub mod digest;
 pub mod hash;
 pub mod ntt;
+#[cfg(all(feature = "prove", target_arch = "x86_64"))]
+pub mod x16;
 pub mod poly;
 
 use rand_core::RngCore;

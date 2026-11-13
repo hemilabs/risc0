@@ -43,6 +43,41 @@ use crate::{
 
 type CpuHal = risc0_zkp::hal::cpu::CpuHal<CircuitField>;
 
+/// Cycles per call of the 16-wide constraint polynomial.
+const POLY_FP_LANES: usize = 16;
+
+type PolyFpX16 = unsafe extern "C" fn(
+    usize,
+    usize,
+    *const ExtVal,
+    *const *const Val,
+    *mut ExtVal,
+) -> *const std::os::raw::c_char;
+
+/// The 16-wide constraint polynomial for this CPU (AVX-512, else AVX2), if the build has it.
+/// `RISC0_CPU_EVAL_SCALAR` set forces the scalar one.
+fn poly_fp_x16() -> Option<PolyFpX16> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use risc0_circuit_rv32im_sys::{
+            risc0_circuit_rv32im_cpu_poly_fp_x16_available,
+            risc0_circuit_rv32im_cpu_poly_fp_x16_avx2, risc0_circuit_rv32im_cpu_poly_fp_x16_avx512,
+        };
+        if std::env::var_os("RISC0_CPU_EVAL_SCALAR").is_some()
+            || !unsafe { risc0_circuit_rv32im_cpu_poly_fp_x16_available() }
+        {
+            return None;
+        }
+        if std::arch::is_x86_feature_detected!("avx512f") {
+            return Some(risc0_circuit_rv32im_cpu_poly_fp_x16_avx512);
+        }
+        if std::arch::is_x86_feature_detected!("avx2") {
+            return Some(risc0_circuit_rv32im_cpu_poly_fp_x16_avx2);
+        }
+    }
+    None
+}
+
 #[derive(Default)]
 pub struct CpuCircuitHal;
 
@@ -183,33 +218,68 @@ impl CircuitHal<CpuHal> for CpuCircuitHal {
         let check = unsafe { std::slice::from_raw_parts(check.as_ptr(), check.len()) };
         let poly_mix_pows = poly_mix_pows.as_slice();
 
-        let args: &[&[Val]] = &[accum, data, out, mix];
+        let args: [*const Val; 4] = [accum.as_ptr(), data.as_ptr(), out.as_ptr(), mix.as_ptr()];
+        // Shared across threads as addresses: raw pointers are not Send.
+        let args_addr = args.as_ptr() as usize;
+        let check_addr = check.as_ptr() as usize;
+        let check_len = check.len();
 
-        (0..domain).into_par_iter().for_each(|cycle| {
-            let args: Vec<*const Val> = args.iter().map(|x| (*x).as_ptr()).collect();
-            let mut tot = ExtVal::ZERO;
-            unsafe {
-                risc0_circuit_rv32im_cpu_poly_fp(
-                    cycle,
-                    domain,
-                    poly_mix_pows.as_ptr(),
-                    args.as_ptr(),
-                    &mut tot,
-                )
-            };
-            let x = Val::ROU_FWD[po2 + EXP_PO2].pow(cycle);
+        // The result at `cycle` is the polynomial divided by (3x)^(2^po2) - 1 for x = w^cycle, w of
+        // order 2^(po2 + EXP_PO2). w^(2^po2) has order 4, so that depends only on cycle mod 4.
+        let inv_zerofier: [Val; 4] = std::array::from_fn(|k| {
+            let x = Val::ROU_FWD[po2 + EXP_PO2].pow(k);
             // TODO: what is this magic number 3?
-            let y = (Val::new(3) * x).pow(1 << po2);
-            let ret = tot * (y - Val::new(1)).inv();
-
+            ((Val::new(3) * x).pow(1 << po2) - Val::new(1)).inv()
+        });
+        let write = |cycle: usize, tot: ExtVal| {
+            let ret = tot * inv_zerofier[cycle % 4];
             // SAFETY: This conversion is to make the check slice mutable, which should be
             // safe because each thread access will not overlap with each other.
             let check =
-                unsafe { std::slice::from_raw_parts_mut(check.as_ptr() as *mut Val, check.len()) };
+                unsafe { std::slice::from_raw_parts_mut(check_addr as *mut Val, check_len) };
             for i in 0..ExtVal::EXT_SIZE {
                 check[i * domain + cycle] = ret.elems()[i];
             }
-        });
+        };
+
+        match poly_fp_x16() {
+            Some(poly_fp_x16) if domain % POLY_FP_LANES == 0 => {
+                (0..domain / POLY_FP_LANES)
+                    .into_par_iter()
+                    .for_each(|block| {
+                        let cycle = block * POLY_FP_LANES;
+                        let mut tots = [ExtVal::ZERO; POLY_FP_LANES];
+                        ffi_wrap(|| unsafe {
+                            poly_fp_x16(
+                                cycle,
+                                domain,
+                                poly_mix_pows.as_ptr(),
+                                args_addr as *const *const Val,
+                                tots.as_mut_ptr(),
+                            )
+                        })
+                        .expect("eval_check");
+                        for (lane, tot) in tots.into_iter().enumerate() {
+                            write(cycle + lane, tot);
+                        }
+                    });
+            }
+            _ => {
+                (0..domain).into_par_iter().for_each(|cycle| {
+                    let mut tot = ExtVal::ZERO;
+                    unsafe {
+                        risc0_circuit_rv32im_cpu_poly_fp(
+                            cycle,
+                            domain,
+                            poly_mix_pows.as_ptr(),
+                            args_addr as *const *const Val,
+                            &mut tot,
+                        )
+                    };
+                    write(cycle, tot);
+                });
+            }
+        }
     }
 
     fn accumulate(

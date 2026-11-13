@@ -314,6 +314,7 @@ fn main() {
     // The CPU and GPU kernels share nothing, so build them concurrently.
     std::thread::scope(|scope| {
         scope.spawn(build_cpu_kernels);
+        scope.spawn(build_cpu_simd_kernels);
 
         if env::var("CARGO_FEATURE_CUDA").is_ok() {
             build_cuda_kernels();
@@ -344,6 +345,17 @@ fn build_cpu_kernels() {
         .files_on_own_threads(big)
         .include(env::var("DEP_RISC0_SYS_CXX_ROOT").unwrap())
         .compile("risc0_recursion_cpu");
+}
+
+/// The 16-wide constraint polynomial for the CPU prover (`risc0_build_kernel::simd_poly`).
+fn build_cpu_simd_kernels() {
+    risc0_build_kernel::simd_poly::build_x16_poly(
+        &[PathBuf::from("kernels/cxx/poly_fp.cpp")],
+        "recursion",
+        "risc0_circuit_recursion_cpu_poly_fp",
+        "risc0_recursion_cpu_x16",
+        &[PathBuf::from(env::var("DEP_RISC0_SYS_CXX_ROOT").unwrap())],
+    );
 }
 
 fn build_cuda_kernels() {

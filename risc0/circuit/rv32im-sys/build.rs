@@ -250,6 +250,7 @@ fn main() {
     // the GPU kernels share nothing, so build them concurrently instead of one after the other.
     std::thread::scope(|scope| {
         scope.spawn(build_cpu_kernels);
+        scope.spawn(build_cpu_simd_kernels);
 
         if cuda {
             build_cuda_kernels();
@@ -283,6 +284,17 @@ fn build_cpu_kernels() {
         .deps(glob_paths("kernels/cxx/*.h.inc"))
         .include(env::var("DEP_RISC0_SYS_CXX_ROOT").unwrap())
         .compile("risc0_rv32im_cpu");
+}
+
+/// The 16-wide constraint polynomial for the CPU prover (`risc0_build_kernel::simd_poly`).
+fn build_cpu_simd_kernels() {
+    risc0_build_kernel::simd_poly::build_x16_poly(
+        &glob_paths("kernels/cxx/rust_poly_fp_*.cpp"),
+        "rv32im_v2",
+        "risc0_circuit_rv32im_cpu_poly_fp",
+        "risc0_rv32im_cpu_x16",
+        &[PathBuf::from(env::var("DEP_RISC0_SYS_CXX_ROOT").unwrap())],
+    );
 }
 
 fn build_cuda_kernels() {

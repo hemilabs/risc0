@@ -105,6 +105,31 @@ extern "C" {
         args_ptr: *const *const BabyBearElem,
         result: *mut BabyBearExtElem,
     ) -> *const std::os::raw::c_char;
+
+    /// Whether this build has the 16-wide polynomial (`build_cpu_simd_kernels`).
+    pub fn risc0_circuit_rv32im_cpu_poly_fp_x16_available() -> bool;
+}
+
+/// The constraint polynomial at the 16 cycles from `cycle` (a multiple of 16) into
+/// `result[0..16]`. Only when `risc0_circuit_rv32im_cpu_poly_fp_x16_available()`, and each only on
+/// a CPU with its instruction set.
+#[cfg(target_arch = "x86_64")]
+extern "C" {
+    pub fn risc0_circuit_rv32im_cpu_poly_fp_x16_avx512(
+        cycle: usize,
+        steps: usize,
+        poly_mixs: *const BabyBearExtElem,
+        args_ptr: *const *const BabyBearElem,
+        result: *mut BabyBearExtElem,
+    ) -> *const std::os::raw::c_char;
+
+    pub fn risc0_circuit_rv32im_cpu_poly_fp_x16_avx2(
+        cycle: usize,
+        steps: usize,
+        poly_mixs: *const BabyBearExtElem,
+        args_ptr: *const *const BabyBearElem,
+        result: *mut BabyBearExtElem,
+    ) -> *const std::os::raw::c_char;
 }
 
 #[cfg(any(feature = "cuda", feature = "rocm"))]

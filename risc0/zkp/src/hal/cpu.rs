@@ -42,6 +42,34 @@ impl<F: Field> CpuHal<F> {
     pub fn new(suite: HashSuite<F>) -> Self {
         Self { suite }
     }
+
+    /// Whether the field is Baby Bear and the CPU has the 16-wide arithmetic (`core::x16`).
+    #[cfg(target_arch = "x86_64")]
+    fn baby_bear_x16() -> bool {
+        core::any::type_name::<F::Elem>()
+            == core::any::type_name::<risc0_core::field::baby_bear::BabyBearElem>()
+            && crate::core::x16::available()
+    }
+
+    /// Whether Merkle hashing can use the 16-wide Poseidon2.
+    #[cfg(target_arch = "x86_64")]
+    fn poseidon2_x16(&self) -> bool {
+        self.suite.name == "poseidon2" && Self::baby_bear_x16()
+    }
+
+    /// `row` as Baby Bear elements, when the 16-wide arithmetic applies to it.
+    #[cfg(target_arch = "x86_64")]
+    fn baby_bear_row(
+        row: &mut [F::Elem],
+    ) -> Option<&mut [risc0_core::field::baby_bear::BabyBearElem]> {
+        // SAFETY: F::Elem is BabyBearElem (`baby_bear_x16`).
+        Self::baby_bear_x16().then(|| unsafe {
+            std::slice::from_raw_parts_mut(
+                row.as_mut_ptr() as *mut risc0_core::field::baby_bear::BabyBearElem,
+                row.len(),
+            )
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -334,6 +362,11 @@ impl<F: Field> Hal for CpuHal<F> {
                 .as_slice_mut()
                 .par_chunks_exact_mut(row_size)
                 .for_each(|row| {
+                    #[cfg(target_arch = "x86_64")]
+                    if let Some(row) = Self::baby_bear_row(row) {
+                        crate::core::x16::evaluate_ntt(row, expand_bits);
+                        return;
+                    }
                     evaluate_ntt::<Self::Elem, Self::Elem>(row, expand_bits);
                 });
         }
@@ -345,6 +378,11 @@ impl<F: Field> Hal for CpuHal<F> {
         io.as_slice_mut()
             .par_chunks_exact_mut(row_size)
             .for_each(|row| {
+                #[cfg(target_arch = "x86_64")]
+                if let Some(row) = Self::baby_bear_row(row) {
+                    crate::core::x16::interpolate_ntt(row);
+                    return;
+                }
                 interpolate_ntt::<Self::Elem, Self::Elem>(row);
             });
     }
@@ -558,6 +596,29 @@ impl<F: Field> Hal for CpuHal<F> {
         assert_eq!(matrix.size(), col_size * row_size);
         let mut output = output.as_slice_mut();
         let matrix = &*matrix.as_slice();
+        #[cfg(target_arch = "x86_64")]
+        if row_size % 16 == 0 && self.poseidon2_x16() {
+            use crate::core::x16;
+            // SAFETY: F::Elem is BabyBearElem (`poseidon2_x16`).
+            let matrix = unsafe {
+                std::slice::from_raw_parts(
+                    matrix.as_ptr() as *const risc0_core::field::baby_bear::BabyBearElem,
+                    matrix.len(),
+                )
+            };
+            output
+                .par_chunks_mut(x16::LANES)
+                .enumerate()
+                .for_each(|(block, out)| {
+                    out.copy_from_slice(&x16::hash_rows(
+                        matrix,
+                        row_size,
+                        col_size,
+                        block * x16::LANES,
+                    ));
+                });
+            return;
+        }
         let hashfn = self.suite.hashfn.as_ref();
         output.par_iter_mut().enumerate().for_each(|(idx, output)| {
             let column: Vec<Self::Elem> =
@@ -572,6 +633,21 @@ impl<F: Field> Hal for CpuHal<F> {
         let io = io.as_slice_sync();
         let output = io.slice(output_size, output_size);
         let input = io.slice(input_size, input_size);
+        #[cfg(target_arch = "x86_64")]
+        if output_size % 16 == 0 && self.poseidon2_x16() {
+            use crate::core::x16;
+            (0..output_size / x16::LANES)
+                .into_par_iter()
+                .for_each(|block| {
+                    let first = block * x16::LANES;
+                    let pairs: [Digest; 2 * x16::LANES] =
+                        std::array::from_fn(|i| input.get(2 * first + i));
+                    for (lane, d) in x16::hash_pairs(&pairs).into_iter().enumerate() {
+                        output.set(first + lane, d);
+                    }
+                });
+            return;
+        }
         let hashfn = self.suite.hashfn.as_ref();
         (0..output.size()).into_par_iter().for_each(|idx| {
             let in1 = input.get(2 * idx);
