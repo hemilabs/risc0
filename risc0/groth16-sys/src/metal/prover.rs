@@ -47,6 +47,14 @@
 //! window groups are sized by the lent a, b buffer, so MSM B2 is one group (-19 ms). Same
 //! results, bit for bit.
 //!
+//! Item G14 adds `nofuzz` to [Tuning] (revert: `RISC0_G16_METAL_FUZZ=1` or
+//! `RISC0_G16_METAL_G14=0`): the witness MSMs A, B1, B2, C take the witness itself, not witness +
+//! the ChaCha fuzz, and the fuzz correction is not added. The fuzz is a public constant (all-zero
+//! key and nonce, `-MSM(P, f)` shipped in `fuzzed_msm_results.bin`), a load-balancing device of
+//! sppark's MSM with no privacy role; the zero-knowledge blinding is r, s. The real witness is
+//! 44 % zeros and 29 % ones, so the MSMs make 22.4M bucket additions instead of 84.5M
+//! (-540 ms of GPU time per proof). Same results, bit for bit.
+//!
 //! Memory (rzup component: 5,635,930 witness elements, domain 2^23; device allocation 3890 MiB
 //! with the item G10 [MemOptions], 5624 MiB without): key points 2232 MiB (mapped from the zkey
 //! without a copy: file-backed pages, outside the process' physical footprint), coefficients
@@ -233,6 +241,15 @@ pub struct Tuning {
     /// than the 256 MiB cap ([MsmTune::lent_groups]; MSM B2 in one group). Revert:
     /// `RISC0_G16_METAL_G12_OFF=lent_groups`.
     pub lent_groups: bool,
+    /// `nofuzz` (item G14): the witness MSMs A, B1, B2, C take the witness itself instead of
+    /// witness + the ChaCha fuzz, and the precomputed `-MSM(P, f)` is not added back. The fuzz
+    /// is public and the same for every proof (all-zero ChaCha key and nonce; the correction
+    /// ships in `fuzzed_msm_results.bin`), so it hides nothing; its only role was to spread the
+    /// digits over sppark's buckets, which this MSM's bucket pieces already do. Without it the
+    /// 0 and 1 witness values (most of the witness) have no or one Booth digit. Same results,
+    /// bit for bit. Revert: `RISC0_G16_METAL_FUZZ=1` or `RISC0_G16_METAL_G14=0` (or
+    /// `RISC0_G16_METAL_G9_OFF=nofuzz`).
+    pub nofuzz: bool,
 }
 
 impl Default for Tuning {
@@ -243,8 +260,14 @@ impl Default for Tuning {
 
 impl Tuning {
     /// Switch names for `RISC0_G16_METAL_G9_OFF`.
-    pub const NAMES: &'static [&'static str] =
-        &["wide_mul", "wide_ntt", "booth", "lenperm", "lent_groups"];
+    pub const NAMES: &'static [&'static str] = &[
+        "wide_mul",
+        "wide_ntt",
+        "booth",
+        "lenperm",
+        "lent_groups",
+        "nofuzz",
+    ];
 
     /// The MSM switches.
     pub fn msm(&self) -> MsmTune {
@@ -264,6 +287,7 @@ impl Tuning {
             booth: true,
             lenperm: true,
             lent_groups: true,
+            nofuzz: true,
         }
     }
 
@@ -275,6 +299,7 @@ impl Tuning {
             booth: false,
             lenperm: false,
             lent_groups: false,
+            nofuzz: false,
         }
     }
 
@@ -286,6 +311,7 @@ impl Tuning {
             "booth" => self.booth = on,
             "lenperm" => self.lenperm = on,
             "lent_groups" => self.lent_groups = on,
+            "nofuzz" => self.nofuzz = on,
             _ => return false,
         }
         true
@@ -334,6 +360,16 @@ impl Tuning {
         if std::env::var("RISC0_G16_METAL_G12").as_deref() == Ok("0") {
             t.lenperm = false;
             t.lent_groups = false;
+        }
+        // Item G14: `RISC0_G16_METAL_FUZZ=1` (or `RISC0_G16_METAL_G14=0`) fuzzes the witness
+        // MSMs again; `RISC0_G16_METAL_FUZZ=0` forces the switch on.
+        match std::env::var("RISC0_G16_METAL_FUZZ").as_deref() {
+            Ok("1") => t.nofuzz = false,
+            Ok("0") => t.nofuzz = true,
+            _ => {}
+        }
+        if std::env::var("RISC0_G16_METAL_G14").as_deref() == Ok("0") {
+            t.nofuzz = false;
         }
         t
     }
@@ -989,7 +1025,10 @@ impl MetalProver {
             );
         });
         let ntt = &self.ntt;
-        let fuzz_now = self.fuzz.as_ref();
+        // Item G14 `nofuzz`: the witness MSMs take the witness itself (no fuzz stage, no
+        // correction).
+        let fuzzed = !opts.tune.nofuzz;
+        let fuzz_now = self.fuzz.as_ref().filter(|_| fuzzed);
         run.stage("ntt", 0, |enc| {
             ntt.encode_to_coset(enc, abc, 0);
             ntt.encode_to_coset(enc, abc, fr(nn));
@@ -1029,7 +1068,7 @@ impl MetalProver {
             out(Slot::H),
             deep,
         );
-        if fuzz_now.is_none() {
+        if fuzzed && fuzz_now.is_none() {
             // Item G10 alias: sort_h has consumed h, so a, b are free: regenerate the fuzz there
             // (same kernel and state as the build-time fuzz) and add it to the witness.
             let blocks = self.fuzz_blocks;
@@ -1109,7 +1148,17 @@ impl MetalProver {
         let msm_b1 = self.window_sum::<G1>(Slot::B1);
         let msm_c = self.window_sum::<G1>(Slot::C);
         let msm_b2 = self.window_sum::<G2>(Slot::B2);
-        let pre = self.remove_fuzz(h, msm_a, msm_b1, msm_b2, msm_c);
+        let pre = if fuzzed {
+            self.remove_fuzz(h, msm_a, msm_b1, msm_b2, msm_c)
+        } else {
+            PreBlindingProjective {
+                a: msm_a,
+                b1: msm_b1,
+                b2: msm_b2,
+                c: msm_c,
+                h,
+            }
+        };
         let (a, b, c) = self.finish_proof(&pre, r, s);
         let host_ms = ms(t);
         let pre_blinding = PreBlinding {
@@ -1121,7 +1170,8 @@ impl MetalProver {
         };
         if opts.verbose {
             eprintln!(
-                "[groth16-metal] pre-blinding MSM results (fuzz removed):\n{}",
+                "[groth16-metal] pre-blinding MSM results ({}):\n{}",
+                if fuzzed { "fuzz removed" } else { "no fuzz" },
                 pre_blinding.dump()
             );
         }

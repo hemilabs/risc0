@@ -305,7 +305,8 @@ fn g9_tuning_bit_exact() {
 
 /// G9: interleaved A/B of [Tuning] variants on the real key (a benchmark, ignored).
 /// `G9_VARIANTS` = variants separated by `;` ([Tuning::parse]; default "base;all"), `G9_REPS`
-/// rounds (default 7) of A B ... in turn, `G9_PROFILE=1` one command buffer per stage. Every
+/// rounds (default 7) of A B ... in turn, `G9_PROFILE=1` one command buffer per stage,
+/// `G9_WITNESS=<file>` a real witness instead of random values. Every
 /// proof's pre-blinding values must equal the first variant's (bit-exact MSMs and H).
 #[test]
 #[ignore]
@@ -341,11 +342,24 @@ fn g9_bench() {
         prover.witness_len(),
         prover.domain_size()
     );
-    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(9);
-    let mut witness = vec![0u8; prover.witness_len() * 32];
-    for e in witness.chunks_exact_mut(32) {
-        rng.fill(&mut e[..31]);
-    }
+    // `G9_WITNESS=<file>`: a real witness (witness_len canonical 32-byte elements, e.g. dumped
+    // from a wrap) instead of random 248-bit values. Item G14: the real witness is mostly 0 and
+    // 1, which is what `nofuzz` exploits.
+    let witness = match std::env::var("G9_WITNESS") {
+        Ok(path) => {
+            let w = std::fs::read(&path).expect("G9_WITNESS");
+            assert_eq!(w.len(), prover.witness_len() * 32, "G9_WITNESS size");
+            w
+        }
+        Err(_) => {
+            let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(9);
+            let mut witness = vec![0u8; prover.witness_len() * 32];
+            for e in witness.chunks_exact_mut(32) {
+                rng.fill(&mut e[..31]);
+            }
+            witness
+        }
+    };
     let opts = |tune| ProveOptions {
         profile,
         verbose: false,
@@ -520,6 +534,96 @@ fn g10_mem_options_bit_exact() {
                 assert_eq!(p.pre_blinding, r.pre_blinding, "{name}");
                 assert_eq!((p.a, p.b, p.c), (r.a, r.b, r.c), "{name}");
             }
+        }
+    }
+}
+
+/// A witness with the shape of the real shrink_wrap witness (item G14): 44 % zeros, 29 % ones,
+/// some r - 1 (Booth: the same digit in every window), small values and a few repeated
+/// full-width values (heavy buckets in every window), the rest random. Canonical Fr.
+fn witness_like(prover: &MetalProver, seed: u64) -> Vec<u8> {
+    use ark_ff::{BigInteger as _, UniformRand as _};
+    use rand::{Rng as _, SeedableRng as _};
+    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+    let heavy: Vec<Fr> = (0..8).map(|_| Fr::rand(&mut rng)).collect();
+    let mut witness = vec![0u8; prover.witness_len() * 32];
+    for e in witness.chunks_exact_mut(32) {
+        let v = match rng.gen_range(0..100) {
+            0..=43 => Fr::zero(),
+            44..=72 => Fr::from(1u64),
+            73..=75 => -Fr::from(1u64),
+            76..=79 => Fr::from(rng.gen_range(2..1u64 << 40)),
+            80..=81 => heavy[rng.gen_range(0..heavy.len())],
+            _ => Fr::rand(&mut rng),
+        };
+        e.copy_from_slice(&v.into_bigint().to_bytes_le());
+    }
+    witness
+}
+
+/// G14: `nofuzz` (the witness MSMs without the ChaCha fuzz and its correction) gives the same
+/// pre-blinding values and proof as the fuzzed path, for a witness-like and a random witness,
+/// in the G10 layout (fuzz regenerated per proof into a, b) and, when the budget allows, the G9
+/// layout (persistent fuzz buffer). `fuzz_check` still holds after a `nofuzz` proof, and a
+/// fuzzed proof after it is unchanged.
+#[test]
+fn g14_nofuzz_bit_exact() {
+    let fuzzed = Tuning {
+        nofuzz: false,
+        ..Tuning::all()
+    };
+    assert_eq!(Tuning::parse("-nofuzz"), Some(fuzzed));
+    assert!(Tuning::all().nofuzz && !Tuning::none().nofuzz);
+
+    let _lock = prover_test_lock();
+    let Some(dir) = component_dir() else {
+        return;
+    };
+    let setup = SetupParams::new(&dir).unwrap();
+    for mem in [MemOptions::all(), MemOptions::none()] {
+        let mut prover = match MetalProver::new_with(&setup, mem) {
+            Ok(p) => p,
+            Err(e) if super::super::working_set_budget().is_some() => {
+                let msg = format!("{e:#}");
+                assert!(msg.contains("working-set budget exceeded"), "{msg}");
+                eprintln!("G14 {mem:?}: refused under the budget: {msg}");
+                continue;
+            }
+            Err(e) => panic!("{mem:?}: {e:#}"),
+        };
+        for (what, w) in [
+            ("witness-like", witness_like(&prover, 0x14)),
+            ("random", random_witness(&prover, 0x15)),
+        ] {
+            let prove = |prover: &mut MetalProver, tune: Tuning| {
+                let opts = ProveOptions {
+                    tune,
+                    ..Default::default()
+                };
+                prover
+                    .prove_with_blinding(&w, &opts, Fr::from(3u64), Fr::from(5u64))
+                    .unwrap()
+            };
+            let f = prove(&mut prover, fuzzed);
+            let nf = prove(&mut prover, Tuning::all());
+            assert_eq!(nf.pre_blinding, f.pre_blinding, "{what} {mem:?}");
+            assert_eq!((nf.a, nf.b, nf.c), (f.a, f.b, f.c), "{what} {mem:?}");
+            assert!(!nf.stats.gpu_ms.iter().any(|(k, _)| k == "fuzz"));
+            let (a, b1, c, b2) = prover.fuzz_check().unwrap();
+            assert!(
+                a.is_zero() && b1.is_zero() && c.is_zero() && b2.is_zero(),
+                "fuzz check {mem:?}"
+            );
+            let f2 = prove(&mut prover, fuzzed);
+            assert_eq!(
+                f2.pre_blinding, f.pre_blinding,
+                "{what} {mem:?} after fuzz_check"
+            );
+            eprintln!(
+                "G14 {what} {mem:?}: gpu fuzzed {:.1} ms, nofuzz {:.1} ms",
+                f.stats.gpu_total_ms(),
+                nf.stats.gpu_total_ms()
+            );
         }
     }
 }
