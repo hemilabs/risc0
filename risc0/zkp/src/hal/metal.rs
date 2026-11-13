@@ -37,6 +37,7 @@ mod mdiv;
 mod ntt;
 mod poseidon2;
 mod poseidon254;
+mod query;
 mod runtime;
 mod small;
 #[cfg(test)]
@@ -846,6 +847,31 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
 
     fn has_unified_memory(&self) -> bool {
         self.device.has_unified_memory()
+    }
+
+    fn batch_get_digest_at(&self, buf: &Self::Buffer<Digest>, indices: &[usize]) -> Vec<Digest> {
+        query::batch_get_digest_at(buf, indices)
+    }
+
+    fn gather_multi(
+        &self,
+        jobs: &[super::GatherJob<'_, Self>],
+    ) -> Option<Vec<(Vec<Self::Elem>, Vec<Digest>)>> {
+        if !query::query_par_enabled() {
+            return None;
+        }
+        let jobs: Vec<query::HostGather<'_, BabyBearElem>> = jobs
+            .iter()
+            .map(|j| query::HostGather {
+                matrix: j.matrix,
+                col_size: j.col_size,
+                row_size: j.row_size,
+                rows: j.rows,
+                nodes: j.nodes,
+                node_indices: j.node_indices,
+            })
+            .collect();
+        Some(query::gather_multi(&jobs))
     }
 
     fn trim_device_memory(&self) {

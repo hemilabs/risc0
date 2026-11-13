@@ -233,30 +233,45 @@ impl<H: Hal> MerkleTreeProver<H> {
         (all, counts)
     }
 
-    /// [Self::batch_prove] for several trees (each with its own indices), with the GPU gathers
-    /// of all of them in one host round trip where the HAL supports it (`Hal::gather_multi`).
+    /// [Self::batch_prove] for several trees (each with its own indices), with the gathers of
+    /// all of them in one host round trip where the HAL supports it (`Hal::gather_multi`).
     #[allow(clippy::type_complexity)]
     pub fn batch_prove_many(
         hal: &H,
         jobs: &[(&Self, &[usize])],
     ) -> Vec<Vec<(Vec<H::Elem>, Vec<Digest>)>> {
-        let fallback = || -> Vec<Vec<(Vec<H::Elem>, Vec<Digest>)>> {
-            jobs.iter()
-                .map(|(tree, indices)| tree.batch_prove(hal, indices))
-                .collect()
-        };
-        if hal.has_unified_memory()
-            || jobs.iter().any(|(t, _)| t.matrix.is_none() || t.params.col_size == 0)
+        if let Some(out) = Self::try_gather_multi(hal, jobs) {
+            return out;
+        }
+        jobs.iter()
+            .map(|(tree, indices)| tree.batch_prove(hal, indices))
+            .collect()
+    }
+
+    /// The query openings of `jobs` through `Hal::gather_multi`, or `None` where the HAL has no
+    /// such path (then the caller uses the per-tree [Self::batch_prove]). Unified-memory HALs
+    /// other than Metal return `None` from `gather_multi`, so they keep the per-tree path; Metal
+    /// reads the openings on the host in parallel (`RISC0_METAL_QUERY_PAR=0` reverts it).
+    #[allow(clippy::type_complexity)]
+    fn try_gather_multi(
+        hal: &H,
+        jobs: &[(&Self, &[usize])],
+    ) -> Option<Vec<Vec<(Vec<H::Elem>, Vec<Digest>)>>> {
+        if jobs
+            .iter()
+            .any(|(t, _)| t.matrix.is_none() || t.params.col_size == 0)
         {
-            return fallback();
+            return None;
         }
         for (tree, indices) in jobs {
             for &idx in indices.iter() {
                 assert!(idx < tree.params.row_size);
             }
         }
-        let paths: Vec<(Vec<usize>, Vec<usize>)> =
-            jobs.iter().map(|(t, indices)| t.sibling_indices(indices)).collect();
+        let paths: Vec<(Vec<usize>, Vec<usize>)> = jobs
+            .iter()
+            .map(|(t, indices)| t.sibling_indices(indices))
+            .collect();
         let gjobs: Vec<crate::hal::GatherJob<'_, H>> = jobs
             .iter()
             .zip(&paths)
@@ -269,25 +284,25 @@ impl<H: Hal> MerkleTreeProver<H> {
                 node_indices: nodes,
             })
             .collect();
-        let Some(gathered) = hal.gather_multi(&gjobs) else {
-            return fallback();
-        };
-        gathered
-            .into_iter()
-            .zip(jobs.iter().zip(&paths))
-            .map(|((cols, digests), ((t, indices), (_, counts)))| {
-                let col_size = t.params.col_size;
-                let mut off = 0;
-                (0..indices.len())
-                    .map(|q| {
-                        let c = cols[q * col_size..(q + 1) * col_size].to_vec();
-                        let d = digests[off..off + counts[q]].to_vec();
-                        off += counts[q];
-                        (c, d)
-                    })
-                    .collect()
-            })
-            .collect()
+        let gathered = hal.gather_multi(&gjobs)?;
+        Some(
+            gathered
+                .into_iter()
+                .zip(jobs.iter().zip(&paths))
+                .map(|((cols, digests), ((t, indices), (_, counts)))| {
+                    let col_size = t.params.col_size;
+                    let mut off = 0;
+                    (0..indices.len())
+                        .map(|q| {
+                            let c = cols[q * col_size..(q + 1) * col_size].to_vec();
+                            let d = digests[off..off + counts[q]].to_vec();
+                            off += counts[q];
+                            (c, d)
+                        })
+                        .collect()
+                })
+                .collect(),
+        )
     }
 
     /// Batch-prove multiple indices at once, returning data without writing to IOP.
@@ -303,6 +318,12 @@ impl<H: Hal> MerkleTreeProver<H> {
             .as_ref()
             .expect("matrix released; call set_matrix() first");
         let col_size = self.params.col_size;
+        // Unified memory: a HAL with a parallel host gather (Metal) reads all of it at once.
+        if hal.has_unified_memory() {
+            if let Some(mut out) = Self::try_gather_multi(hal, &[(self, indices)]) {
+                return out.pop().unwrap();
+            }
+        }
 
         // Collect column data for all queries
         let mut all_col_data: Vec<Vec<H::Elem>> = Vec::with_capacity(n);
@@ -616,6 +637,207 @@ mod tests {
             // bad_query out of range) Do this multiple times as the
             // manipulation location is random
             possibly_bad_verify_all(rows, cols, queries, queries + 1, true);
+        }
+    }
+
+    /// Z11: on Metal the query openings go through `Hal::gather_multi` /
+    /// `batch_get_digest_at` (parallel host reads). They must equal the CPU HAL's exactly, and
+    /// so must the reverted path (`RISC0_METAL_QUERY_PAR=0`).
+    #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+    mod metal_z11 {
+        use rand::{rngs::SmallRng, Rng, SeedableRng};
+        use risc0_core::field::{baby_bear::BabyBearElem, Elem};
+
+        use super::super::MerkleTreeProver;
+        use crate::{
+            core::hash::poseidon2::Poseidon2HashSuite,
+            hal::{
+                cpu::CpuHal,
+                metal::{gpu_test_lock, MetalHalPoseidon2},
+                Hal,
+            },
+            prove::write_iop::WriteIOP,
+        };
+
+        type Opening = (Vec<BabyBearElem>, Vec<crate::core::digest::Digest>);
+        type Cpu = CpuHal<risc0_core::field::baby_bear::BabyBear>;
+
+        /// (rows, cols, queries): the po2-20 tree widths at a small row count, a single column,
+        /// tiny trees whose paths end at the top layer, and a FRI-round-like shape.
+        const SHAPES: &[(usize, usize, usize)] = &[
+            (1 << 12, 211, 50),
+            (1 << 12, 103, 50),
+            (1 << 12, 16, 50),
+            (1 << 10, 1, 50),
+            (1 << 8, 64, 50),
+            (4, 3, 2),
+            (1, 5, 1),
+            (1 << 6, 7, 64),
+        ];
+
+        fn matrix(rng: &mut SmallRng, n: usize) -> Vec<BabyBearElem> {
+            (0..n).map(|_| BabyBearElem::random(&mut *rng)).collect()
+        }
+
+        /// Query rows with the edges and a duplicate.
+        fn rows(rng: &mut SmallRng, row_size: usize, n: usize) -> Vec<usize> {
+            let mut out: Vec<usize> = (0..n).map(|_| rng.random_range(0..row_size)).collect();
+            out[0] = 0;
+            if n > 2 {
+                out[1] = row_size - 1;
+                out[2] = out[n - 1];
+            }
+            out
+        }
+
+        struct Trees {
+            cpu: Vec<MerkleTreeProver<Cpu>>,
+            metal: Vec<MerkleTreeProver<MetalHalPoseidon2>>,
+            rows: Vec<Vec<usize>>,
+        }
+
+        fn build(cpu: &Cpu, metal: &MetalHalPoseidon2, seed: u64) -> Trees {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let mut t = Trees {
+                cpu: Vec::new(),
+                metal: Vec::new(),
+                rows: Vec::new(),
+            };
+            for &(rows, cols, queries) in SHAPES {
+                let data = matrix(&mut rng, rows * cols);
+                let cm = cpu.copy_from_elem("matrix", &data);
+                let mm = metal.copy_from_elem("matrix", &data);
+                t.cpu
+                    .push(MerkleTreeProver::new(cpu, &cm, rows, cols, queries));
+                t.metal
+                    .push(MerkleTreeProver::new(metal, &mm, rows, cols, queries));
+                t.rows.push(self::rows(&mut rng, rows, queries));
+            }
+            t
+        }
+
+        fn many<H>(hal: &H, trees: &[MerkleTreeProver<H>], rows: &[Vec<usize>]) -> Vec<Vec<Opening>>
+        where
+            H: Hal<Elem = BabyBearElem>,
+        {
+            let jobs: Vec<(&MerkleTreeProver<H>, &[usize])> = trees
+                .iter()
+                .zip(rows)
+                .map(|(t, r)| (t, r.as_slice()))
+                .collect();
+            MerkleTreeProver::batch_prove_many(hal, &jobs)
+        }
+
+        fn single<H>(
+            hal: &H,
+            trees: &[MerkleTreeProver<H>],
+            rows: &[Vec<usize>],
+        ) -> Vec<Vec<Opening>>
+        where
+            H: Hal<Elem = BabyBearElem>,
+        {
+            trees
+                .iter()
+                .zip(rows)
+                .map(|(t, r)| t.batch_prove(hal, r))
+                .collect()
+        }
+
+        /// The IOP words of `prove` for every query of every tree.
+        fn proofs<H>(hal: &H, trees: &[MerkleTreeProver<H>], rows: &[Vec<usize>]) -> Vec<u32>
+        where
+            H: Hal<Elem = BabyBearElem, Field = risc0_core::field::baby_bear::BabyBear>,
+        {
+            let suite = Poseidon2HashSuite::new_suite();
+            let mut iop = WriteIOP::new(suite.rng.as_ref());
+            for (t, r) in trees.iter().zip(rows) {
+                for &row in r {
+                    t.prove(hal, &mut iop, row);
+                }
+            }
+            iop.proof
+        }
+
+        fn check(cpu: &Cpu, metal: &MetalHalPoseidon2, t: &Trees, what: &str) {
+            let want_many = many(cpu, &t.cpu, &t.rows);
+            assert_eq!(
+                many(metal, &t.metal, &t.rows),
+                want_many,
+                "{what}: batch_prove_many"
+            );
+            assert_eq!(single(cpu, &t.cpu, &t.rows), want_many, "cpu batch_prove");
+            assert_eq!(
+                single(metal, &t.metal, &t.rows),
+                want_many,
+                "{what}: batch_prove"
+            );
+            assert_eq!(
+                proofs(metal, &t.metal, &t.rows),
+                proofs(cpu, &t.cpu, &t.rows),
+                "{what}: prove"
+            );
+        }
+
+        #[test]
+        fn query_openings_match_cpu() {
+            // Not for the GPU: keeps `query_openings_match_cpu_knob_off`'s env change out.
+            let _lock = gpu_test_lock();
+            let cpu = CpuHal::new(Poseidon2HashSuite::new_suite());
+            let metal = MetalHalPoseidon2::new();
+            for seed in 0..3 {
+                let t = build(&cpu, &metal, 0x5a11 + seed);
+                check(&cpu, &metal, &t, "query_par");
+            }
+        }
+
+        /// `RISC0_METAL_QUERY_PAR=0` (the revert knob) gives the same openings. Takes the GPU test
+        /// lock: it changes process-wide state (plan 8.7).
+        #[test]
+        fn query_openings_match_cpu_knob_off() {
+            let _lock = gpu_test_lock();
+            let cpu = CpuHal::new(Poseidon2HashSuite::new_suite());
+            let metal = MetalHalPoseidon2::new();
+            let t = build(&cpu, &metal, 0x5a21);
+            std::env::set_var("RISC0_METAL_QUERY_PAR", "0");
+            let off = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                check(&cpu, &metal, &t, "knob off")
+            }));
+            std::env::remove_var("RISC0_METAL_QUERY_PAR");
+            if let Err(e) = off {
+                std::panic::resume_unwind(e);
+            }
+            check(&cpu, &metal, &t, "knob back on");
+        }
+
+        /// The digest gather around its serial / parallel switch and chunk boundaries, on a
+        /// slice of a buffer (offset views), against `get_at`.
+        #[test]
+        fn batch_get_digest_at_matches_get_at() {
+            use crate::hal::Buffer;
+            let metal = MetalHalPoseidon2::new();
+            let mut rng = SmallRng::seed_from_u64(0x5a31);
+            let n = 1000;
+            let words: Vec<u32> = (0..n * 8).map(|_| rng.random()).collect();
+            let digests: Vec<crate::core::digest::Digest> = words
+                .chunks(8)
+                .map(|w| crate::core::digest::Digest::new(w.try_into().unwrap()))
+                .collect();
+            let buf = metal.copy_from_digest("digests", &digests);
+            let view = buf.slice(7, n - 9);
+            for len in [0, 1, 31, 32, 63, 64, 65, 97, 500, 2048] {
+                let idx: Vec<usize> = (0..len).map(|_| rng.random_range(0..view.size())).collect();
+                let want: Vec<_> = idx.iter().map(|&i| digests[7 + i]).collect();
+                assert_eq!(metal.batch_get_digest_at(&view, &idx), want, "len {len}");
+            }
+        }
+
+        #[test]
+        #[should_panic]
+        fn batch_get_digest_at_out_of_range_panics() {
+            let metal = MetalHalPoseidon2::new();
+            let buf = metal.copy_from_digest("digests", &[crate::core::digest::Digest::ZERO; 100]);
+            let idx: Vec<usize> = (0..99).chain([100]).collect();
+            metal.batch_get_digest_at(&buf, &idx);
         }
     }
 }
