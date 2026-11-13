@@ -27,8 +27,10 @@
 // msm_clear        0 hist uint[nwins * nbuckets]               1 constant MsmParams
 //   hist = 0. Grid: nwins * nbuckets threads.
 // msm_hist_count   0 scalars uint[n * 8]   1 hist atomic_uint[nwins * nbuckets]
-//                  2 constant MsmParams
+//                  2 constant MsmParams   3 tr uint[8 * n] (out; written only with MsmParams::tr)
 //   hist[w][d] += 1 for every scalar and window with digit d != 0. Grid: n threads.
+//   Item G15: with MsmParams::tr, also tr[k * n + i] = word k of scalar i (the transposed copy
+//   msm_scatter then reads: per window only the one or two words that hold its digit).
 // msm_window_scan  0 hist uint[nwins * nbuckets] (counts in; bucket starts out)
 //                  1 offset uint[nwins * nbuckets] (bucket starts)
 //                  2 piece_off uint[nwins * nbuckets] (first piece of each bucket)
@@ -40,6 +42,9 @@
 //                  2 sorted uint[nwins * n] 3 constant MsmParams
 //   sorted[w * n + pos] = i for each (i, w) with digit d != 0, pos taken from the cursor of
 //   bucket d. Grid: n threads. The order inside a bucket is not deterministic (the sum is).
+//   Item G15: windows [w0, w0 + wcount) only when wcount != 0 (the host then dispatches one
+//   window group after another, so that the scattered stores of a dispatch stay in one window's
+//   n entries); with MsmParams::tr, buffer 0 is msm_hist_count's transposed copy.
 //
 // Length order (item G12; MsmParams::lenperm), after msm_scatter, over the bucket-cut pieces:
 // msm_len_clear    0 lhist uint[nwins * MSM_LEN_BINS]  1 constant MsmParams
@@ -77,10 +82,16 @@ kernel void msm_clear(device uint32_t* hist [[buffer(0)]],
 kernel void msm_hist_count(const device uint32_t* scalars [[buffer(0)]],
                            device atomic_uint* hist [[buffer(1)]],
                            constant MsmParams& p [[buffer(2)]],
+                           device uint32_t* tr [[buffer(3)]],
                            uint gid [[thread_position_in_grid]]) {
   if (gid >= p.n)
     return;
   const device uint32_t* s = scalars + (size_t)gid * 8;
+  if (p.tr) {
+    // Item G15: the transposed copy for msm_scatter (word k of every scalar contiguous).
+    for (uint32_t k = 0; k < 8; k++)
+      tr[(size_t)k * p.n + gid] = s[k];
+  }
   for (uint32_t w = 0; w < p.nwins; w++) {
     bool neg = false;
     uint32_t d = p.booth ? msm_digit_booth(s, w, p.wbits, neg) : msm_digit(s, w, p.wbits);
@@ -156,10 +167,15 @@ kernel void msm_scatter(const device uint32_t* scalars [[buffer(0)]],
                         uint gid [[thread_position_in_grid]]) {
   if (gid >= p.n)
     return;
-  const device uint32_t* s = scalars + (size_t)gid * 8;
-  for (uint32_t w = 0; w < p.nwins; w++) {
+  // Item G15: `scalars` transposed (p.tr; see msm_hist_count), and windows [w0, w0 + wcount)
+  // only (wcount = 0: all), one dispatch per window group.
+  const uint32_t stride = p.tr ? p.n : 1u;
+  const device uint32_t* s = p.tr ? scalars + gid : scalars + (size_t)gid * 8;
+  const uint32_t wend = p.wcount ? min(p.w0 + p.wcount, p.nwins) : p.nwins;
+  for (uint32_t w = p.w0; w < wend; w++) {
     bool neg = false;
-    uint32_t d = p.booth ? msm_digit_booth(s, w, p.wbits, neg) : msm_digit(s, w, p.wbits);
+    uint32_t d = p.booth ? msm_digit_booth(s, w, p.wbits, neg, stride)
+                         : msm_digit(s, w, p.wbits, stride);
     if (d) {
       uint32_t pos =
           atomic_fetch_add_explicit(&hist[w * p.nbuckets + d], 1u, memory_order_relaxed);

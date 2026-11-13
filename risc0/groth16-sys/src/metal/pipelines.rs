@@ -48,6 +48,7 @@ pub const SMALL_PSOS: &[&str] = &[
     "fr_add",
     "witness_into_poly",
     "witness_into_poly_compact",
+    "witness_into_poly_compact_nc",
     "chacha_fuzz",
     "fr_powers",
     "fr_scale",

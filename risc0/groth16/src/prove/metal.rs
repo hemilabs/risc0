@@ -435,24 +435,40 @@ fn gpu_prove(
 
     let mut pre_gpu_ms = 0.0;
     let mut loaded_ms = 0.0;
-    let (witness, witness_ms, loaded) = std::thread::scope(|sc| {
-        let h = sc.spawn(|| {
-            let w = HostWitness::compute(identity_p254_seal_bytes);
-            (w, ms(t0))
-        });
+    // Item G15 (opt-in `par_transient`): the witness is computed before the key load rather than
+    // beside it, so that its value array (580 MB while in use) never coexists with the key's
+    // allocations. (When the key was loaded early, the in-place path above is taken instead, and
+    // the array is resident at the wrap's peak: the same peak as `par`; see notes/G15.md.)
+    let (witness, witness_ms, loaded) = if super::metal_witness::is_par_transient() {
         if let Some(f) = pre_gpu.take() {
             f();
         }
         pre_gpu_ms = ms(t0);
-        // The proving key (first use, or after release_srs), now that pre_gpu has freed the
-        // STARK pools; overlaps the witness.
+        let w = HostWitness::compute(identity_p254_seal_bytes);
+        let w_ms = ms(t0);
         let loaded = preload(&dir);
         loaded_ms = ms(t0);
-        let (w, w_ms) = h
-            .join()
-            .unwrap_or_else(|_| (Err(anyhow!("groth16 witness thread panicked")), ms(t0)));
         (w, w_ms, loaded)
-    });
+    } else {
+        std::thread::scope(|sc| {
+            let h = sc.spawn(|| {
+                let w = HostWitness::compute(identity_p254_seal_bytes);
+                (w, ms(t0))
+            });
+            if let Some(f) = pre_gpu.take() {
+                f();
+            }
+            pre_gpu_ms = ms(t0);
+            // The proving key (first use, or after release_srs), now that pre_gpu has freed the
+            // STARK pools; overlaps the witness.
+            let loaded = preload(&dir);
+            loaded_ms = ms(t0);
+            let (w, w_ms) = h
+                .join()
+                .unwrap_or_else(|_| (Err(anyhow!("groth16 witness thread panicked")), ms(t0)));
+            (w, w_ms, loaded)
+        })
+    };
     let witness = witness.context("failed to calculate the groth16 witness")?;
     loaded?;
 

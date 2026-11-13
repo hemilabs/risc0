@@ -19,13 +19,20 @@
 //! - `par`: the parallel dataflow evaluator, ~10x faster than `fast.rs`, but it keeps an 18.1M
 //!   x 32 B (580 MB) value array resident for the life of the process. Only where there is room
 //!   for it (see [PAR_MIN_LIMIT_BYTES]).
+//! - `par_transient` (item G15, opt-in only): `par` whose value array is handed back to the
+//!   kernel between wraps (reusable pages, reclaimed under memory pressure; see
+//!   [super::witness_par]). Its witness takes ~40-100 ms instead of `fast`'s ~165-280 ms on the
+//!   critical path at an 8 GiB budget, but it is NOT the default: measured at 8 GiB, its program
+//!   raises the STARK-phase process peak by ~0.2-0.4 GB over `fast`, and when the key was loaded
+//!   early the witness is computed in place with the array resident at the wrap's peak (+0.74 GB,
+//!   equal to `par`). See notes/G15.md.
 //! - `fast`: the single-threaded slot evaluator: no per-node array (~30K recycled slots), so it
-//!   also removes `fast.rs`' 580 MB calloc per wrap. The default below that limit.
+//!   also removes `fast.rs`' 580 MB calloc per wrap. The default below [PAR_MIN_LIMIT_BYTES].
 //! - `ref`: [super::fast] (the pre-G13 evaluator; also the fallback if the graph does not
 //!   qualify for the compiled evaluators).
 //!
-//! `RISC0_G16_METAL_WITNESS=par|fast|ref` overrides the choice. All three produce the same
-//! witness (`metal_tests::witness_evaluators_bit_equal`).
+//! `RISC0_G16_METAL_WITNESS=par|par_transient|fast|ref` overrides the choice. All produce the
+//! same witness (`metal_tests::witness_evaluators_bit_equal`).
 
 use std::sync::OnceLock;
 
@@ -49,6 +56,7 @@ pub(crate) const PAR_MIN_LIMIT_BYTES: u64 = 20 << 30;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {
     Par,
+    ParTransient,
     Fast,
     Ref,
 }
@@ -56,6 +64,7 @@ pub(crate) enum Kind {
 fn parse_kind(v: Option<&str>, limit: Option<u64>) -> Kind {
     match v {
         Some("par") => Kind::Par,
+        Some("par_transient") => Kind::ParTransient,
         Some("fast") => Kind::Fast,
         Some("ref") => Kind::Ref,
         _ => match limit {
@@ -130,7 +139,10 @@ fn build(kind: Kind) -> Result<Graph> {
     let (input_offset, input_len) = super::fast::seal_input(&input_mapping)?;
     let t1 = std::time::Instant::now();
     let eval = match kind {
-        Kind::Par => witness_par::compile_with(vn, &signals, par_threads()).map(Eval::Par),
+        Kind::Par => witness_par::compile_with(vn, &signals, par_threads(), true).map(Eval::Par),
+        Kind::ParTransient => {
+            witness_par::compile_with(vn, &signals, par_threads(), false).map(Eval::Par)
+        }
         Kind::Fast => witness_fast::compile(vn, &signals).map(Eval::Fast),
         Kind::Ref => None,
     }
@@ -180,6 +192,12 @@ pub(crate) fn preload() -> Result<()> {
         Some(_) => Ok(()),
         None => super::fast::preload(),
     }
+}
+
+/// Whether this process uses the `par_transient` evaluator (decided without waiting for the
+/// graph build, so that the build still overlaps `pre_gpu`'s start in [super::metal]).
+pub(crate) fn is_par_transient() -> bool {
+    kind() == Kind::ParTransient
 }
 
 /// Whether the compiled `par` evaluator is in use (and built).
@@ -240,7 +258,10 @@ pub(crate) fn witness_with(kind: Kind, threads: usize, seal_bytes: &[u8]) -> Res
         .ok_or_else(|| anyhow!("unexpected witness graph node type"))?;
     let (input_offset, input_len) = super::fast::seal_input(&input_mapping)?;
     let eval = match kind {
-        Kind::Par => witness_par::compile_with(vn, &signals, threads).map(Eval::Par),
+        Kind::Par => witness_par::compile_with(vn, &signals, threads, true).map(Eval::Par),
+        Kind::ParTransient => {
+            witness_par::compile_with(vn, &signals, threads, false).map(Eval::Par)
+        }
         Kind::Fast => witness_fast::compile(vn, &signals).map(Eval::Fast),
         Kind::Ref => None,
     }
@@ -258,10 +279,68 @@ pub(crate) fn witness_with(kind: Kind, threads: usize, seal_bytes: &[u8]) -> Res
     inputs[g.input_offset..].copy_from_slice(&seal);
     let mut out = vec![[0u64; 4]; g.n_signals];
     match &g.eval {
-        Eval::Par(p) => witness_par::eval(p, g.nodes(), &inputs, &mut out),
+        Eval::Par(p) => {
+            assert_eq!(witness_par::is_resident(p), kind == Kind::Par);
+            witness_par::eval(p, g.nodes(), &inputs, &mut out);
+            if kind == Kind::ParTransient {
+                // Again over the handed-back array (its pages reclaimed or not).
+                let mut again = vec![[0u64; 4]; g.n_signals];
+                witness_par::eval(p, g.nodes(), &inputs, &mut again);
+                assert!(again == out, "par_transient: second witness differs");
+            }
+        }
         Eval::Fast(p) => witness_fast::eval(p, g.nodes(), &inputs, &mut out),
     }
     Ok(out)
+}
+
+/// Tests: footprint and evaluation times of a freshly compiled `kind` program (not `ref`).
+#[cfg(test)]
+pub(crate) fn footprint_probe(kind: Kind, seal_bytes: &[u8], evals: usize) -> Result<()> {
+    use risc0_groth16_sys::metal::filemap::process_memory;
+    let mib = |b: u64| b as f64 / (1u64 << 20) as f64;
+    let (nodes, signals, input_mapping, _) = super::fast::read_graph(true)?;
+    let vn = nodes
+        .as_any()
+        .downcast_ref::<Nodes<U254, VecNodes>>()
+        .ok_or_else(|| anyhow!("unexpected witness graph node type"))?;
+    let (input_offset, input_len) = super::fast::seal_input(&input_mapping)?;
+    let f0 = process_memory().phys_footprint;
+    let t = std::time::Instant::now();
+    let eval = match kind {
+        Kind::Par => witness_par::compile_with(vn, &signals, par_threads(), true).map(Eval::Par),
+        Kind::ParTransient => {
+            witness_par::compile_with(vn, &signals, par_threads(), false).map(Eval::Par)
+        }
+        Kind::Fast => witness_fast::compile(vn, &signals).map(Eval::Fast),
+        Kind::Ref => None,
+    }
+    .ok_or_else(|| anyhow!("{kind:?} does not compile"))?;
+    let f1 = process_memory().phys_footprint;
+    eprintln!(
+        "G15PAR {kind:?}: compile {:.1} ms, footprint +{:.1} MiB",
+        t.elapsed().as_secs_f64() * 1e3,
+        mib(f1.saturating_sub(f0))
+    );
+    let seal = super::fast::seal_inputs(seal_bytes)?;
+    let mut inputs = vec![U254::ZERO; input_offset + input_len];
+    inputs[0] = U254::from(1u64);
+    inputs[input_offset..].copy_from_slice(&seal);
+    let mut out = vec![[0u64; 4]; signals.len()];
+    for i in 0..evals {
+        let t = std::time::Instant::now();
+        match &eval {
+            Eval::Par(p) => witness_par::eval(p, vn, &inputs, &mut out),
+            Eval::Fast(p) => witness_fast::eval(p, vn, &inputs, &mut out),
+        }
+        let f = process_memory().phys_footprint;
+        eprintln!(
+            "G15PAR {kind:?}: eval {i} {:.1} ms, footprint after +{:.1} MiB",
+            t.elapsed().as_secs_f64() * 1e3,
+            mib(f.saturating_sub(f0))
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -274,8 +353,13 @@ mod tests {
         assert_eq!(parse_kind(Some("fast"), Some(64 << 30)), Kind::Fast);
         assert_eq!(parse_kind(Some("ref"), None), Kind::Ref);
         assert_eq!(parse_kind(None, Some(PAR_MIN_LIMIT_BYTES)), Kind::Par);
+        // Item G15: `par_transient` is opt-in only; below the limit the default stays `fast`.
         assert_eq!(parse_kind(None, Some(8 << 30)), Kind::Fast);
         assert_eq!(parse_kind(Some("auto"), Some(4 << 30)), Kind::Fast);
         assert_eq!(parse_kind(None, None), Kind::Fast);
+        assert_eq!(
+            parse_kind(Some("par_transient"), Some(64 << 30)),
+            Kind::ParTransient
+        );
     }
 }

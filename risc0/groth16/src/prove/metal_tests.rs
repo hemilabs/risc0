@@ -639,6 +639,7 @@ fn witness_evaluators_bit_equal() {
             (Kind::Par, 1),
             (Kind::Par, 4),
             (Kind::Par, 18),
+            (Kind::ParTransient, 4),
         ] {
             let t = Instant::now();
             let ours = witness_with(kind, threads, seal).unwrap();
@@ -654,6 +655,24 @@ fn witness_evaluators_bit_equal() {
             }
         }
     }
+}
+
+/// Item G15 measurement helper (not a check): footprint and evaluation times of one evaluator
+/// (`G15_WITNESS_KIND=par|fast`, default `par_transient`). `cargo test ... g15_par_footprint -- --ignored --nocapture
+/// --test-threads 1`.
+#[test]
+#[ignore]
+fn g15_par_footprint() {
+    if component_dir().is_err() {
+        return;
+    }
+    use super::super::metal_witness::{footprint_probe, Kind};
+    let kind = match std::env::var("G15_WITNESS_KIND").as_deref() {
+        Ok("par") => Kind::Par,
+        Ok("fast") => Kind::Fast,
+        _ => Kind::ParTransient,
+    };
+    footprint_probe(kind, seal_words(), 5).unwrap();
 }
 
 /// G13 measurement helper (not a check): the time to build the witness graph in a fresh

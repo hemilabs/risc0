@@ -55,8 +55,29 @@ use super::{
 };
 
 const MAGIC: [u8; 8] = *b"R0G16MCP";
-/// Bump when the layout or meaning of the cache file changes.
-const VERSION: u32 = 1;
+/// Bump when the layout or meaning of the cache file changes. Version 2 (item G15) is version 1
+/// with the rows of each list in length order ([len_order]); version 1 stays the natural order
+/// (the revert knob), so both caches can exist side by side.
+const VERSION_NATURAL: u32 = 1;
+const VERSION_LEN_ORDER: u32 = 2;
+
+/// Item G15: the rows of each list (A, B) longest first (stable, so rows of one length keep their
+/// order), so that the 32 lanes of a SIMD group of `witness_into_poly_compact` sum rows of the
+/// same length (in the natural order 8-11 % of the lanes' steps do work: most rows have 1-2
+/// coefficients, a few up to 499). Every row still sums its coefficients in their order into
+/// its own output, so `a` and `b` are bit-identical. `RISC0_G16_METAL_COEFF_ORDER=natural`
+/// reverts (cache version 1).
+pub fn len_order() -> bool {
+    std::env::var("RISC0_G16_METAL_COEFF_ORDER").as_deref() != Ok("natural")
+}
+
+fn version() -> u32 {
+    if len_order() {
+        VERSION_LEN_ORDER
+    } else {
+        VERSION_NATURAL
+    }
+}
 /// The backend tag in the key and the file name.
 const TAG: &[u8] = b"metal-compact";
 /// Section alignment of the cache file (the Apple silicon page size; a multiple of 4 KiB pages).
@@ -162,7 +183,7 @@ impl Header {
     fn to_bytes(self) -> [u8; HEADER_WORDS * 8] {
         let mut w = [0u64; HEADER_WORDS];
         w[0] = u64::from_le_bytes(MAGIC);
-        w[1] = VERSION as u64 | (32u64 << 32);
+        w[1] = version() as u64 | (32u64 << 32);
         w[2..9].copy_from_slice(&[
             self.key, self.ca, self.cb, self.ua, self.ub, self.ntab, self.sum,
         ]);
@@ -180,7 +201,7 @@ impl Header {
             .chunks_exact(8)
             .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
             .collect();
-        if w[0] != u64::from_le_bytes(MAGIC) || w[1] != VERSION as u64 | (32u64 << 32) {
+        if w[0] != u64::from_le_bytes(MAGIC) || w[1] != version() as u64 | (32u64 << 32) {
             return None;
         }
         Some(Self {
@@ -557,8 +578,9 @@ impl CompactCoeffs {
 
     /// What `witness_into_poly_compact` relies on: each index list starts at 0, increases
     /// strictly and ends at its coefficient count; each row's output index is below
-    /// `domain_size` and increases strictly from row to row; every `s` is below `witness_len` and
-    /// every value index below the table length; every table value is a canonical Fr.
+    /// `domain_size` and no two rows of a list share one (version 1 has them increasing; item
+    /// G15's length order does not); every `s` is below `witness_len` and every value index
+    /// below the table length; every table value is a canonical Fr.
     pub fn validate(&self, witness_len: usize, domain_size: usize) -> Result<()> {
         let ind = Self::words(&self.indices);
         let rowc = Self::words(&self.rowc);
@@ -579,11 +601,19 @@ impl CompactCoeffs {
                 bail!("compact coefficients {name}: row {r} is empty or indices decrease");
             }
             let rc = &rowc[base..base + rows];
-            if let Some(r) =
-                (0..rows).find(|&r| rc[r] as usize >= domain_size || (r > 0 && rc[r] <= rc[r - 1]))
-            {
+            let mut seen = vec![0u64; domain_size.div_ceil(64)];
+            if let Some(r) = (0..rows).find(|&r| {
+                let o = rc[r] as usize;
+                if o >= domain_size {
+                    return true;
+                }
+                let (word, bit) = (o / 64, 1u64 << (o % 64));
+                let dup = seen[word] & bit != 0;
+                seen[word] |= bit;
+                dup
+            }) {
                 bail!(
-                    "compact coefficients {name}: row {r} output {} out of range or not increasing",
+                    "compact coefficients {name}: row {r} output {} out of range or repeated",
                     rc[r]
                 );
             }
@@ -645,7 +675,7 @@ fn u32s(b: &[u8]) -> Vec<u32> {
 fn source_key(file: &File, meta: &std::fs::Metadata) -> Result<u64> {
     let size = meta.len();
     let mut h = fnv1a(FNV_BASIS, TAG);
-    h = fnv1a(h, &VERSION.to_le_bytes());
+    h = fnv1a(h, &version().to_le_bytes());
     h = fnv1a(h, &32u32.to_le_bytes());
     h = fnv1a(h, &48u32.to_le_bytes());
     let mut block = vec![0u8; 4096];
@@ -709,12 +739,49 @@ fn build(
     for r in 0..ub - 1 {
         rowc[ua + r] = co[ca + indices[ua + r] as usize].c;
     }
-    Ok(Built {
+    let built = Built {
         cs,
         table,
         rowc,
         indices,
+    };
+    Ok(if len_order() {
+        length_ordered(built, [ca, cb, ua, ub])
+    } else {
+        built
     })
+}
+
+/// Item G15: `b` with the rows of each list in [len_order] (longest first, stable). The
+/// coefficients of a row move with it, in their order; the trailing entry of each list's
+/// `rowc` (unused) stays 0.
+fn length_ordered(b: Built, counts: [usize; 4]) -> Built {
+    let [ca, cb, ua, ub] = counts;
+    let mut cs = Vec::with_capacity(b.cs.len());
+    let mut rowc = vec![0u32; ua + ub];
+    let mut indices = Vec::with_capacity(ua + ub);
+    for (base, cbase, count, u) in [(0usize, 0usize, ca, ua), (ua, ca, cb, ub)] {
+        let ix = &b.indices[base..base + u];
+        let rows = u - 1;
+        let mut order: Vec<u32> = (0..rows as u32).collect();
+        // Stable: equal lengths keep their (natural) order.
+        order.sort_by_key(|&r| std::cmp::Reverse(ix[r as usize + 1] - ix[r as usize]));
+        let start = cs.len();
+        indices.push(0);
+        for (k, &r) in order.iter().enumerate() {
+            let (lo, hi) = (ix[r as usize] as usize, ix[r as usize + 1] as usize);
+            cs.extend_from_slice(&b.cs[2 * (cbase + lo)..2 * (cbase + hi)]);
+            indices.push(((cs.len() - start) / 2) as u32);
+            rowc[base + k] = b.rowc[base + r as usize];
+        }
+        debug_assert_eq!(*indices.last().unwrap() as usize, count);
+    }
+    Built {
+        cs,
+        table: b.table,
+        rowc,
+        indices,
+    }
 }
 
 /// Write the cache file (temporary name, then renamed over `cp`).
@@ -820,6 +887,7 @@ mod tests {
             &w,
             wn as u64,
             &f0,
+            false,
         );
         encode_witness_poly(
             &k.small,
@@ -830,6 +898,7 @@ mod tests {
             &w,
             wn as u64,
             &f1,
+            true,
         );
         enc.end_encoding();
         cb.commit();
@@ -884,6 +953,27 @@ mod tests {
             assert!(a.iter().any(|&x| x != 0));
             assert_eq!(a, b, "compact != full");
         }
+        // Item G15: the rows of each list are in length order (longest first), or natural.
+        for c in [&c1, &c2, &c3, &c4] {
+            let ind = CompactCoeffs::words(&c.indices);
+            for (base, u) in [(0, c.ind_a), (c.ind_a, c.ind_b)] {
+                let len: Vec<u32> = (0..u - 1)
+                    .map(|r| ind[base + r + 1] - ind[base + r])
+                    .collect();
+                if len_order() {
+                    assert!(len.windows(2).all(|w| w[0] >= w[1]), "{len:?}");
+                } else {
+                    let rc = CompactCoeffs::words(&c.rowc);
+                    assert!(rc[base..base + u - 1].windows(2).all(|w| w[0] < w[1]));
+                }
+            }
+        }
+        // Two rows of a list writing one output are refused.
+        let mut c3 = c3;
+        let r0 = CompactCoeffs::words(&c3.rowc)[0];
+        c3.rowc.as_bytes_mut()[4..8].copy_from_slice(&r0.to_le_bytes());
+        let e = c3.validate(wn, n).unwrap_err();
+        assert!(format!("{e:#}").contains("repeated"), "{e:#}");
         // The compact form is validated against the sizes.
         assert!(CompactCoeffs::load_in(&dev, &src, wn, 15, true, Some(&dir)).is_err());
         let max_s = full.coeffs.as_slice().iter().map(|c| c.s).max().unwrap() as usize;
@@ -977,7 +1067,9 @@ mod tests {
             }
             let cb = k.queue.new_command_buffer();
             let enc = cb.new_compute_command_encoder();
-            encode_witness_poly(&k.small, enc, c, &out, n as u64, &w, wn as u64, &fault);
+            encode_witness_poly(
+                &k.small, enc, c, &out, n as u64, &w, wn as u64, &fault, true,
+            );
             enc.end_encoding();
             cb.commit();
             cb.wait_until_completed();
