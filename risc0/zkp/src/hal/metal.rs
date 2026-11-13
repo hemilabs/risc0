@@ -209,6 +209,21 @@ pub fn device_name() -> Option<String> {
     Device::system_default().map(|device| device.name().to_string())
 }
 
+/// The working-set limit and the device's `currentAllocatedSize` in bytes, without making a HAL
+/// (item Z12): `RISC0_METAL_MAX_WORKING_SET_BYTES` when set and smaller, else
+/// `recommendedMaxWorkingSetSize` (what [MetalHal::working_set_limit] reports for a HAL whose
+/// budget was not overridden), and every Metal allocation of this process on the device. `None`
+/// without a Metal device.
+pub fn device_memory() -> Option<(u64, u64)> {
+    let device = Device::system_default()?;
+    let recommended = device.recommended_max_working_set_size();
+    let limit = match runtime::env_working_set_limit() {
+        Some(budget) => budget.min(recommended),
+        None => recommended,
+    };
+    Some((limit, device.current_allocated_size()))
+}
+
 /// The process-wide GPU lock (the GPU becomes unstable as the number of concurrent provers grows).
 ///
 /// Taken per call: around every encode, commit and wait of every `MetalHal`, and by code that

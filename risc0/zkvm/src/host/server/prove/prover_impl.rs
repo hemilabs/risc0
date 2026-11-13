@@ -72,6 +72,90 @@ pub(crate) fn release_cached_provers() {
     risc0_circuit_recursion::prove::release_cached_provers();
 }
 
+/// Revert knob for item Z12 (docs/metal-port/notes/Z12.md): `0` keeps the segment prover cached
+/// through recursion (the pre-Z12 behaviour), `1` always releases it, unset (or anything else)
+/// decides from the working-set budget (see `release_segment_prover_before_recursion`).
+#[cfg(feature = "metal")]
+pub(crate) const RELEASE_SEG_BEFORE_REC_ENV: &str = "RISC0_METAL_RELEASE_SEG_BEFORE_REC";
+
+/// What lift/join adds to the device's allocation when recursion starts with no segment prover
+/// cached: Z12 measured a recursion-phase peak of 1700-1720 MiB (BusyLoop and the worker's
+/// memory-merkle, segment po2 17-19, 4 and 8 GiB budgets; the lift/join programs are po2 <= 18
+/// whatever the segment po2 is), rounded up.
+#[cfg(feature = "metal")]
+const REC_PEAK_BYTES: u64 = 2 << 30;
+
+#[cfg(all(feature = "metal", test))]
+thread_local! {
+    /// Test hook: overrides [RELEASE_SEG_BEFORE_REC_ENV] on this thread (the process environment
+    /// is shared with the tests running in parallel).
+    pub(crate) static RELEASE_SEG_MODE: std::cell::RefCell<Option<&'static str>> =
+        const { std::cell::RefCell::new(None) };
+    /// Test hook: releases made by `release_segment_prover_before_recursion` on this thread.
+    pub(crate) static SEG_RELEASES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The Z12 decision: `Some(reason)` to release the segment prover before recursion. `mode` is
+/// [RELEASE_SEG_BEFORE_REC_ENV]'s value; `memory` is `(working-set limit, device allocation now)`.
+#[cfg(feature = "metal")]
+pub(crate) fn seg_release_reason(mode: &str, memory: Option<(u64, u64)>) -> Option<String> {
+    match mode.trim() {
+        "0" => None,
+        "1" => Some("forced".to_string()),
+        _ => {
+            let (limit, allocated) = memory?;
+            (allocated.saturating_add(REC_PEAK_BYTES) > limit).then(|| {
+                format!(
+                    "{} MiB allocated + {} MiB for recursion > {} MiB working-set limit",
+                    allocated >> 20,
+                    REC_PEAK_BYTES >> 20,
+                    limit >> 20
+                )
+            })
+        }
+    }
+}
+
+/// Item Z12: before lift/join, drop this thread's cached segment prover (its HAL's pool and the
+/// buffers it keeps between segments) when the working-set budget cannot hold it beside
+/// recursion: when what is allocated now plus recursion's own peak would exceed the limit.
+///
+/// Before Z12 the segment prover stayed cached until the Groth16 wrap's `release_hal_buffers`, so
+/// the recursion phase's peak was the segment prover's held memory plus recursion's own (4 GiB
+/// budget, po2 17: 3801 MiB instead of ~1.9 GB). Under an explicit budget the allocator drains
+/// every pool before refusing, so the sum only costs drains; on a real Mac it is real memory.
+/// At the default budget both fit and nothing changes. After a release the next proof rebuilds the
+/// prover (the PSOs are process-wide and stay); in the worker the wrap releases it after every
+/// proof anyway. Runs on the proving thread (the cache is per thread); a prover in use is left
+/// alone (`release_cached_segment_prover`).
+#[cfg(feature = "metal")]
+fn release_segment_prover_before_recursion() {
+    #[cfg(test)]
+    let forced = RELEASE_SEG_MODE.with(|m| *m.borrow());
+    #[cfg(not(test))]
+    let forced: Option<&str> = None;
+    let mode = match forced {
+        Some(m) => m.to_string(),
+        None => std::env::var(RELEASE_SEG_BEFORE_REC_ENV).unwrap_or_default(),
+    };
+    // Only auto mode asks the device (one `MTLDevice` query, microseconds).
+    let memory = match mode.trim() {
+        "0" | "1" => None,
+        _ => risc0_zkp::hal::metal::device_memory(),
+    };
+    let Some(reason) = seg_release_reason(&mode, memory) else {
+        return;
+    };
+    let t = std::time::Instant::now();
+    release_cached_segment_prover();
+    #[cfg(test)]
+    SEG_RELEASES.with(|n| n.set(n.get() + 1));
+    tracing::debug!(
+        "released the segment prover before recursion ({reason}) in {:.1} ms",
+        t.elapsed().as_secs_f64() * 1e3
+    );
+}
+
 fn with_segment_prover<R>(f: impl FnOnce(&dyn SegmentProver) -> Result<R>) -> Result<R> {
     let _gpu = super::exclusive_gpu();
     CACHED_SEGMENT_PROVER.with(|cell| {
@@ -1370,6 +1454,10 @@ impl ProverImpl {
         } else {
             match session.povw_job_id.is_some() {
                 true => {
+                    // The PoVW path folds through the generic `Compress`, not
+                    // `composite_to_succinct` below, so it releases here.
+                    #[cfg(feature = "metal")]
+                    release_segment_prover_before_recursion();
                     let work_receipt = self.composite_to_succinct_povw(&composite_receipt)?;
                     let unwrapped = self.unwrap_povw(&work_receipt)?;
                     (unwrapped, Some(work_receipt), None)
@@ -1815,6 +1903,9 @@ impl ProverServer for ProverImpl {
         use crate::host::recursion::prove::{
             join_with_opts, lift_with_opts, make_succinct_receipt, Prover as RecursionProverJob,
         };
+
+        #[cfg(feature = "metal")]
+        release_segment_prover_before_recursion();
 
         let t_pipeline = std::time::Instant::now();
         let segments = &composite_receipt.segments;

@@ -21,6 +21,8 @@ mod prover_impl;
 mod tests;
 #[cfg(all(test, feature = "metal"))]
 mod tests_metal_wrap;
+#[cfg(all(test, feature = "metal"))]
+mod tests_z12;
 pub(crate) mod union_peak;
 
 use std::rc::Rc;

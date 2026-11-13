@@ -268,7 +268,7 @@ pub(crate) fn parse_bytes(text: &str) -> Option<u64> {
 
 /// The budget named by [MAX_WORKING_SET_ENV], if set and valid (a malformed value is reported and
 /// ignored).
-fn env_working_set_limit() -> Option<u64> {
+pub(crate) fn env_working_set_limit() -> Option<u64> {
     let text = std::env::var(MAX_WORKING_SET_ENV).ok()?;
     let parsed = parse_bytes(&text);
     if parsed.is_none() {
