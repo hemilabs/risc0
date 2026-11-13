@@ -65,7 +65,7 @@ pub(crate) fn shrink_wrap(identity_p254_seal_bytes: &[u8]) -> Result<Seal> {
         .arg("--rm")
         .arg("-v")
         .arg(format!("{}:/mnt", work_dir.to_string_lossy()))
-        .arg("risczero/risc0-groth16-prover:v2026-10-20.1")
+        .arg(IMAGE)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()?;
@@ -82,7 +82,7 @@ pub(crate) fn shrink_wrap(identity_p254_seal_bytes: &[u8]) -> Result<Seal> {
     proof_json.try_into()
 }
 
-pub(crate) const IMAGE: &str = "risczero/risc0-groth16-prover:v2025-04-03.1";
+pub(crate) const IMAGE: &str = "risczero/risc0-groth16-prover:v2026-10-20.1";
 
 /// RISC0_GROTH16_FAST=0 disables the intel fast path.
 #[cfg(feature = "intel")]
