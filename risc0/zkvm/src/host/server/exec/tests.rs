@@ -1429,7 +1429,14 @@ fn keccak_update2() {
         session.pending_keccaks[0].claim_digest,
         digest!("4be4abacf05e312a566673392786c5ae69b8c7ed2b77bb2d63119e035420866c")
     );
-    assert_eq!(session.pending_keccaks[0].po2, 15,);
+    // One permutation: proved at the smallest keccak po2 (K10 rightsizing), not at the max of 15
+    // (unless RISC0_KECCAK_RIGHTSIZE_PO2=0).
+    let rightsize = !std::env::var("RISC0_KECCAK_RIGHTSIZE_PO2").is_ok_and(|v| v.trim() == "0");
+    assert_eq!(session.pending_keccaks[0].input.len(), 1);
+    assert_eq!(
+        session.pending_keccaks[0].po2,
+        if rightsize { 14 } else { 15 }
+    );
 }
 
 #[test_log::test]
