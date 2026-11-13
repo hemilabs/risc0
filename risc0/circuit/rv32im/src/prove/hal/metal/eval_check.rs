@@ -66,6 +66,11 @@
 //! Max. [EVAL_FLAT_ENV]=0 runs the nested-chain kernels of before R22 (`ef_eval_split_nest`,
 //! `ef_eval_split_fc_nest`). eval_regime.rs guards the compiler regime of the kernels.
 //!
+//! R23 (docs/metal-port/notes/R23.md): the flat chain issues its trace loads one window of
+//! statements ahead of their use (to_metal.py hoist(), the Metal form of ROCm's hoist_hip.py),
+//! ~3.5 % faster split kernels; [EVAL_HOIST_ENV]=0 runs R22's flat kernels
+//! (`ef_eval_split_nohoist`, `ef_eval_split_fc_nohoist`).
+//!
 //! The R7 CPU path (the `hal/cpu.rs` loop over `risc0_circuit_rv32im_cpu_poly_fp` on host views of
 //! the shared buffers) is kept as a debugging fallback, selected with
 //! `RISC0_METAL_RV32IM_CPU_PHASES=eval` (a comma list of `witgen,accum,eval`).
@@ -205,6 +210,60 @@ pub(crate) const NEST_KERNEL: &str = "ef_eval_split_nest";
 /// R22: the nested-chain specialized split kernel.
 pub(crate) const FC_NEST_KERNEL: &str = "ef_eval_split_fc_nest";
 
+/// R23: `RISC0_METAL_RV32IM_EVAL_HOIST`: `1` (default) runs the flat split kernels with the trace
+/// loads issued ahead (`ef_eval_split`, `ef_eval_split_fc`), `0` R22's flat kernels without
+/// (`ef_eval_split_nohoist`, lazy, and `ef_eval_split_fc_nohoist`; the revert knob). Only read when
+/// [EVAL_FLAT_ENV] selects the flat chain (the nested kernels never hoist). Read on every call;
+/// unknown values are an error.
+pub(crate) const EVAL_HOIST_ENV: &str = "RISC0_METAL_RV32IM_EVAL_HOIST";
+/// R23: the flat plain split kernel without hoisted trace loads (built on first use).
+pub(crate) const NOHOIST_KERNEL: &str = "ef_eval_split_nohoist";
+/// R23: the flat specialized split kernel without hoisted trace loads.
+pub(crate) const FC_NOHOIST_KERNEL: &str = "ef_eval_split_fc_nohoist";
+
+/// The split-kernel form [EVAL_FLAT_ENV] and [EVAL_HOIST_ENV] select.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum ChainForm {
+    /// The flat chain with the trace loads issued ahead (R23, default).
+    Hoist,
+    /// The flat chain with every load at its use (R22).
+    Flat,
+    /// The nested chain (pre-R22).
+    Nest,
+}
+
+impl ChainForm {
+    /// The plain split kernel of this form.
+    pub(crate) fn plain_kernel(self) -> &'static str {
+        match self {
+            ChainForm::Hoist => "ef_eval_split",
+            ChainForm::Flat => NOHOIST_KERNEL,
+            ChainForm::Nest => NEST_KERNEL,
+        }
+    }
+}
+
+pub(crate) fn parse_hoist(v: &str) -> anyhow::Result<bool> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "" | "1" | "on" => Ok(true),
+        "0" | "off" => Ok(false),
+        _ => anyhow::bail!("{EVAL_HOIST_ENV}={v:?}: expected `1` or `0`"),
+    }
+}
+
+/// The form [EVAL_FLAT_ENV] and [EVAL_HOIST_ENV] select now.
+pub(crate) fn chain_form() -> anyhow::Result<ChainForm> {
+    if !flat_chain()? {
+        return Ok(ChainForm::Nest);
+    }
+    let hoist = std::env::var(EVAL_HOIST_ENV).map_or(Ok(true), |v| parse_hoist(&v))?;
+    Ok(if hoist {
+        ChainForm::Hoist
+    } else {
+        ChainForm::Flat
+    })
+}
+
 pub(crate) fn parse_flat(v: &str) -> anyhow::Result<bool> {
     match v.trim().to_ascii_lowercase().as_str() {
         "" | "1" | "on" | "flat" => Ok(true),
@@ -218,12 +277,13 @@ pub(crate) fn flat_chain() -> anyhow::Result<bool> {
     std::env::var(EVAL_FLAT_ENV).map_or(Ok(true), |v| parse_flat(&v))
 }
 
-/// The specialized split kernel of the flat ([FC_KERNEL]) or nested ([FC_NEST_KERNEL]) chain.
-pub(crate) fn fc_kernel(flat: bool) -> &'static str {
-    if flat {
-        FC_KERNEL
-    } else {
-        FC_NEST_KERNEL
+/// The specialized split kernel of the form: [FC_KERNEL] (hoisted flat chain), [FC_NOHOIST_KERNEL]
+/// or [FC_NEST_KERNEL].
+pub(crate) fn fc_kernel(form: ChainForm) -> &'static str {
+    match form {
+        ChainForm::Hoist => FC_KERNEL,
+        ChainForm::Flat => FC_NOHOIST_KERNEL,
+        ChainForm::Nest => FC_NEST_KERNEL,
     }
 }
 
@@ -235,12 +295,13 @@ pub(crate) fn fc_unit(unit: &str, domain: u32) -> String {
     format!("{unit}_fc{domain}")
 }
 
-/// [fc_unit] of the flat or (R22, `<unit>_fcnest<domain>`) the nested specialized kernel.
-pub(crate) fn fc_unit_of(unit: &str, domain: u32, flat: bool) -> String {
-    if flat {
-        fc_unit(unit, domain)
-    } else {
-        format!("{unit}_fcnest{domain}")
+/// [fc_unit] of the default specialized kernel, `<unit>_fcnh<domain>` of the unhoisted flat one
+/// (R23) and `<unit>_fcnest<domain>` of the nested one (R22).
+pub(crate) fn fc_unit_of(unit: &str, domain: u32, form: ChainForm) -> String {
+    match form {
+        ChainForm::Hoist => fc_unit(unit, domain),
+        ChainForm::Flat => format!("{unit}_fcnh{domain}"),
+        ChainForm::Nest => format!("{unit}_fcnest{domain}"),
     }
 }
 
@@ -252,10 +313,10 @@ enum FcState {
     Failed,
 }
 
-/// Specialized PSO states by (domain, flat chain) (one rv32im library per process), and the
+/// Specialized PSO states by (domain, chain form) (one rv32im library per process), and the
 /// condition variable [FcMode::Wait] waits on.
 type FcStates = (
-    std::sync::Mutex<std::collections::HashMap<(u32, bool), FcState>>,
+    std::sync::Mutex<std::collections::HashMap<(u32, ChainForm), FcState>>,
     std::sync::Condvar,
 );
 fn fc_states() -> &'static FcStates {
@@ -268,15 +329,15 @@ fn fc_states() -> &'static FcStates {
 fn build_fc(
     kernels: &super::Rv32imKernels,
     domain: u32,
-    flat: bool,
+    form: ChainForm,
 ) -> anyhow::Result<metal::ComputePipelineState> {
-    let name = fc_kernel(flat);
+    let name = fc_kernel(form);
     let src = kernels
         .source
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("no kernel source for a specialized PSO"))?;
     let lib = kernels.kernels.library();
-    let unit = fc_unit_of(src.unit, domain, flat);
+    let unit = fc_unit_of(src.unit, domain, form);
     let (pso, r) = risc0_zkp::hal::metal::archive::specialized_pipeline(
         src.archive_dir.clone(),
         lib.device(),
@@ -316,20 +377,20 @@ fn build_fc(
 }
 
 /// Record the outcome of a domain's build and wake [FcMode::Wait] callers.
-fn fc_finish(domain: u32, flat: bool, res: anyhow::Result<metal::ComputePipelineState>) {
+fn fc_finish(domain: u32, form: ChainForm, res: anyhow::Result<metal::ComputePipelineState>) {
     let state = match res {
         Ok(pso) => FcState::Ready(Box::leak(Box::new(pso))),
         Err(e) => {
             tracing::warn!(
                 "rv32im Metal: no {} PSO specialized for domain {domain} ({e:#}); the plain PSO \
                  stays in use",
-                fc_kernel(flat)
+                fc_kernel(form)
             );
             FcState::Failed
         }
     };
     let (states, cv) = fc_states();
-    states.lock().unwrap().insert((domain, flat), state);
+    states.lock().unwrap().insert((domain, form), state);
     cv.notify_all();
 }
 
@@ -358,7 +419,7 @@ pub(crate) fn fc_prewarm(kernels: &'static super::Rv32imKernels) {
             return;
         };
         // R22: the specializations of the chain form in use at library load.
-        let flat = flat_chain().unwrap_or(true);
+        let form = chain_form().unwrap_or(ChainForm::Hoist);
         let spawned = std::thread::Builder::new()
             .name("rv32im-fc-prewarm".into())
             .spawn(move || {
@@ -374,8 +435,8 @@ pub(crate) fn fc_prewarm(kernels: &'static super::Rv32imKernels) {
                             &dir,
                             device,
                             src.bytes,
-                            &fc_unit_of(src.unit, domain, flat),
-                            fc_kernel(flat),
+                            &fc_unit_of(src.unit, domain, form),
+                            fc_kernel(form),
                             &[(0, domain)],
                         )?;
                         Some((risc0_zkp::hal::metal::archive::archive_used(&base)?, domain))
@@ -385,13 +446,13 @@ pub(crate) fn fc_prewarm(kernels: &'static super::Rv32imKernels) {
                 for (_, domain) in cached {
                     {
                         let mut map = fc_states().0.lock().unwrap();
-                        if map.contains_key(&(domain, flat)) {
+                        if map.contains_key(&(domain, form)) {
                             continue;
                         }
-                        map.insert((domain, flat), FcState::Building);
+                        map.insert((domain, form), FcState::Building);
                     }
-                    let res = metal::objc::rc::autoreleasepool(|| build_fc(kernels, domain, flat));
-                    fc_finish(domain, flat, res);
+                    let res = metal::objc::rc::autoreleasepool(|| build_fc(kernels, domain, form));
+                    fc_finish(domain, form, res);
                 }
             });
         if let Err(e) = spawned {
@@ -400,7 +461,7 @@ pub(crate) fn fc_prewarm(kernels: &'static super::Rv32imKernels) {
     });
 }
 
-/// The [fc_kernel] PSO (flat or nested chain) specialized for `domain` if it is ready. Otherwise (first call for this
+/// The [fc_kernel] PSO (of the chain form) specialized for `domain` if it is ready. Otherwise (first call for this
 /// domain) starts its build: on a background thread for [FcMode::Background] (None until it is
 /// ready), or waits for it for [FcMode::Wait]. None for [FcMode::Off], after a failed build, or
 /// when `kernels` has no source (test-loaded libraries).
@@ -408,14 +469,14 @@ pub(crate) fn fc_pipeline(
     kernels: &'static super::Rv32imKernels,
     domain: u32,
     mode: FcMode,
-    flat: bool,
+    form: ChainForm,
 ) -> Option<&'static metal::ComputePipelineState> {
     if mode == FcMode::Off || kernels.source.is_none() || !fc_domain_in_range(domain) {
         return None;
     }
     let (states, cv) = fc_states();
     let mut map = states.lock().unwrap();
-    let key = (domain, flat);
+    let key = (domain, form);
     match map.get(&key) {
         Some(FcState::Ready(pso)) => return Some(pso),
         Some(FcState::Failed) => return None,
@@ -425,8 +486,8 @@ pub(crate) fn fc_pipeline(
             let spawned = std::thread::Builder::new()
                 .name(format!("rv32im-fc{domain}"))
                 .spawn(move || {
-                    let res = metal::objc::rc::autoreleasepool(|| build_fc(kernels, domain, flat));
-                    fc_finish(domain, flat, res);
+                    let res = metal::objc::rc::autoreleasepool(|| build_fc(kernels, domain, form));
+                    fc_finish(domain, form, res);
                 });
             if let Err(e) = spawned {
                 map.insert(key, FcState::Failed);
@@ -592,30 +653,32 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
         self.ctx.require(Phase::EvalCheck)?;
         // R20: the domain-specialized split PSO once it is built ([EVAL_FC_ENV]).
         let domain = steps * INV_RATE;
-        // R22: the flat chain (default) or the nested one ([EVAL_FLAT_ENV]).
-        let flat = flat_chain()?;
+        // R22 / R23: the hoisted flat chain (default), R22's flat one or the nested one
+        // ([EVAL_FLAT_ENV], [EVAL_HOIST_ENV]).
+        let form = chain_form()?;
         let fc = match u32::try_from(domain) {
-            Ok(d) => fc_pipeline(self.ctx.kernels(), d, FcMode::current()?, flat),
+            Ok(d) => fc_pipeline(self.ctx.kernels(), d, FcMode::current()?, form),
             Err(_) => None,
         };
-        // R22: the regime guard's fallback replaces the plain PSO if that one is slow.
-        let fallback = if flat {
+        // R22: the regime guard's fallback replaces the plain PSO if that one is slow. R23: it
+        // covers both flat forms (the guard reads the hoisted kernel's regime; the unhoisted
+        // revert kernel has the same flat shape), so the revert knob stays guarded as in R22.
+        let fallback = if form != ChainForm::Nest {
             eval_regime::fallback_split()
         } else {
             None
         };
-        let plain = match (fc.is_some() || fallback.is_some(), flat) {
+        let plain = match (fc.is_some() || fallback.is_some(), form) {
             (true, _) => None,
-            (false, true) => Some(self.ctx.pipeline("ef_eval_split")),
-            (false, false) => Some(lazy_pipeline(self.ctx.library(), NEST_KERNEL)?),
+            (false, ChainForm::Hoist) => Some(self.ctx.pipeline("ef_eval_split")),
+            (false, _) => Some(lazy_pipeline(self.ctx.library(), form.plain_kernel())?),
         };
         tracing::debug!(
             "eval_check (Metal evalfast): {}",
-            match (fc.is_some(), fallback, flat) {
-                (true, _, _) => format!("{} specialized for the domain", fc_kernel(flat)),
-                (false, Some((name, _)), _) => format!("the eval regime guard's fallback ({name})"),
-                (false, None, true) => "plain ef_eval_split".into(),
-                (false, None, false) => format!("plain {NEST_KERNEL}"),
+            match (fc.is_some(), fallback) {
+                (true, _) => format!("{} specialized for the domain", fc_kernel(form)),
+                (false, Some((name, _))) => format!("the eval regime guard's fallback ({name})"),
+                (false, None) => format!("plain {}", form.plain_kernel()),
             }
         );
         let k = EfKernels {
@@ -1145,6 +1208,9 @@ mod ef_tests {
         /// R22: the nested-chain split kernels (plain, and specialized for the domain).
         EvalfastNest,
         EvalfastFcNest,
+        /// R23: the flat kernels without hoisted trace loads (plain, and specialized).
+        EvalfastNoHoist,
+        EvalfastFcNoHoist,
         EvalfastR12,
         EvalfastR15e,
         Baseline,
@@ -1218,10 +1284,20 @@ mod ef_tests {
                 Which::Evalfast => {
                     c.eval_check_evalfast(&check, &groups, &globals, inp.poly_mix, po2, steps)
                 }
-                Which::EvalfastFc | Which::EvalfastFcNest | Which::EvalfastNest => {
+                Which::EvalfastFc
+                | Which::EvalfastFcNest
+                | Which::EvalfastNest
+                | Which::EvalfastNoHoist
+                | Which::EvalfastFcNoHoist => {
                     let split = match which {
                         Which::EvalfastFc => fc_test_pso(c, FC_KERNEL, domain as u32),
                         Which::EvalfastFcNest => fc_test_pso(c, FC_NEST_KERNEL, domain as u32),
+                        Which::EvalfastFcNoHoist => {
+                            fc_test_pso(c, FC_NOHOIST_KERNEL, domain as u32)
+                        }
+                        Which::EvalfastNoHoist => {
+                            lazy_pipeline(c.ctx.library(), NOHOIST_KERNEL).unwrap()
+                        }
                         _ => lazy_pipeline(c.ctx.library(), NEST_KERNEL).unwrap(),
                     };
                     let k = EfKernels {
@@ -1283,7 +1359,15 @@ mod ef_tests {
         // R22: the nested-chain kernels (the revert switch) too.
         let (nest, nest_t, _) = gpu_checks(&c, inp, po2, Which::EvalfastNest, 1);
         let (fcn, fcn_t, _) = gpu_checks(&c, inp, po2, Which::EvalfastFcNest, 1);
-        for (what, r) in [("nested", &nest[0]), ("nested specialized", &fcn[0])] {
+        // R23: R22's flat kernels without hoisted loads (the revert switch).
+        let (nh, _, _) = gpu_checks(&c, inp, po2, Which::EvalfastNoHoist, 1);
+        let (fcnh, _, _) = gpu_checks(&c, inp, po2, Which::EvalfastFcNoHoist, 1);
+        for (what, r) in [
+            ("nested", &nest[0]),
+            ("nested specialized", &fcn[0]),
+            ("unhoisted", &nh[0]),
+            ("unhoisted specialized", &fcnh[0]),
+        ] {
             let n = mismatches(&cpu, r);
             assert_eq!(
                 n,
@@ -1409,8 +1493,13 @@ mod ef_tests {
             if n > 0 {
                 bad.push((seed, n));
             }
-            // R22: the nested-chain forms.
-            for which in [Which::EvalfastNest, Which::EvalfastFcNest] {
+            // R22: the nested-chain forms; R23: the unhoisted flat ones.
+            for which in [
+                Which::EvalfastNest,
+                Which::EvalfastFcNest,
+                Which::EvalfastNoHoist,
+                Which::EvalfastFcNoHoist,
+            ] {
                 let (r, t, _) = gpu_checks(&c, &inp, po2, which, 1);
                 let n = mismatches(&base[0], &r[0]);
                 println!(
@@ -1602,12 +1691,17 @@ mod ef_tests {
             let lib = hal.try_load_library(&bytes, names).unwrap();
             let fc_pso = fc.then(|| {
                 let domain = ((1usize << po2) * INV_RATE) as u32;
+                // R23: `R15E_FC_ARCHIVE=<dir>` keeps each arm's specialized PSO in a binary
+                // archive there (keyed by the metallib bytes), so repeated sessions skip the
+                // 12-20 s compile per arm.
+                let dir = std::env::var_os("R15E_FC_ARCHIVE").map(std::path::PathBuf::from);
+                let unit = format!("r15e_{name}");
                 let (p, _) = risc0_zkp::hal::metal::archive::specialized_pipeline(
-                    None,
+                    dir.clone(),
                     &hal.device,
                     &lib.library,
-                    &[],
-                    "unused",
+                    if dir.is_some() { &bytes } else { &[] },
+                    if dir.is_some() { &unit } else { "unused" },
                     &split,
                     &[(0, domain)],
                 )
@@ -1630,6 +1724,12 @@ mod ef_tests {
                 pso.static_threadgroup_memory_length()
             );
             vars.push((name.to_string(), lib, threads, split, fc_pso));
+        }
+        // R23: `R15E_PSO_ONLY=1` stops after building the PSOs (no inputs, no GPU buffers): a
+        // light run that fills the OS shader cache, so the timed run does not hold the GPU
+        // lock through 20-60 s compiles per specialized arm.
+        if std::env::var("R15E_PSO_ONLY").as_deref() == Ok("1") {
+            return;
         }
         // R19: `R15E_INPUT=seeded|high|extreme` draws the inputs from a seeded generator
         // (`R15E_SEED`, default 19) with that distribution ([Dist]) instead of `rand::rng()`.
@@ -1781,6 +1881,8 @@ mod ef_tests {
             FC_KERNEL,
             NEST_KERNEL,
             FC_NEST_KERNEL,
+            NOHOIST_KERNEL,
+            FC_NOHOIST_KERNEL,
         ] {
             assert!(k.get(name).is_none(), "{name} built at load");
             assert!(
@@ -1901,12 +2003,16 @@ mod ef_tests {
         let domain = 4u32 << 20;
         /// (kernel, function constants, expected in the fast regime)
         type Case<'a> = (&'a str, &'a [(usize, u32)], bool);
-        let cases: [Case; 5] = [
+        // R23: the unhoisted flat kernels (the HOIST=0 revert) last, so indices 2 / 4 stay the
+        // fallbacks.
+        let cases: [Case; 7] = [
             (PLAIN_KERNEL, &[], true),
             (FC_KERNEL, &[(0, domain)], true),
             (NEST_KERNEL, &[], true),
             (FC_NEST_KERNEL, &[(0, domain)], true),
             (FALLBACK_KERNELS[1].0, &[], false),
+            (NOHOIST_KERNEL, &[], true),
+            (FC_NOHOIST_KERNEL, &[(0, domain)], true),
         ];
         assert_eq!(FALLBACK_KERNELS[0].0, NEST_KERNEL);
         let built: Vec<_> = std::thread::scope(|s| {
@@ -2010,14 +2116,32 @@ mod ef_tests {
         assert_eq!(FcMode::parse("wait").unwrap(), FcMode::Wait);
         assert!(FcMode::parse("2").is_err());
         assert_eq!(fc_unit("rv32im", 4 << 20), "rv32im_fc4194304");
-        assert_eq!(fc_unit_of("rv32im", 4 << 20, true), "rv32im_fc4194304");
-        assert_eq!(fc_unit_of("rv32im", 4 << 20, false), "rv32im_fcnest4194304");
+        let d = 4 << 20;
+        assert_eq!(
+            fc_unit_of("rv32im", d, ChainForm::Hoist),
+            "rv32im_fc4194304"
+        );
+        assert_eq!(
+            fc_unit_of("rv32im", d, ChainForm::Flat),
+            "rv32im_fcnh4194304"
+        );
+        assert_eq!(
+            fc_unit_of("rv32im", d, ChainForm::Nest),
+            "rv32im_fcnest4194304"
+        );
         assert!(parse_flat("").unwrap() && parse_flat("1").unwrap());
         assert!(!parse_flat("0").unwrap() && !parse_flat(" nest ").unwrap());
         assert!(parse_flat("2").is_err());
+        assert!(parse_hoist("").unwrap() && parse_hoist("1").unwrap());
+        assert!(!parse_hoist("0").unwrap() && !parse_hoist(" OFF ").unwrap());
+        assert!(parse_hoist("2").is_err());
         assert_eq!(
-            (fc_kernel(true), fc_kernel(false)),
-            (FC_KERNEL, FC_NEST_KERNEL)
+            [ChainForm::Hoist, ChainForm::Flat, ChainForm::Nest].map(fc_kernel),
+            [FC_KERNEL, FC_NOHOIST_KERNEL, FC_NEST_KERNEL]
+        );
+        assert_eq!(
+            [ChainForm::Hoist, ChainForm::Flat, ChainForm::Nest].map(ChainForm::plain_kernel),
+            ["ef_eval_split", NOHOIST_KERNEL, NEST_KERNEL]
         );
         assert!(fc_domain_in_range(4 << 20) && fc_domain_in_range(4 << 13));
         assert!(!fc_domain_in_range(4 << 12) && !fc_domain_in_range(4 << 25));
