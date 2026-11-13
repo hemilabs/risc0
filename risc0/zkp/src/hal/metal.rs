@@ -94,7 +94,9 @@ pub use self::{
         MAX_SET_BYTES, MAX_WORKING_SET_ENV,
     },
 };
-pub use self::runtime::{profile_report, profile_take, ProfileEntry, PROFILE_ENV};
+pub use self::runtime::{
+    profile_report, profile_take, register_pso_name, ProfileEntry, PROFILE_ENV,
+};
 use super::{Buffer as _, Hal};
 use crate::{
     core::{

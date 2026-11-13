@@ -100,7 +100,9 @@ fn profiling() -> bool {
 static PSO_NAMES: Mutex<Option<HashMap<usize, &'static str>>> = Mutex::new(None);
 
 /// Record the kernel name of a PSO for the profiler (cheap; names are leaked once per PSO).
-pub(crate) fn register_pso_name(pso: &ComputePipelineStateRef, name: &str) {
+/// Public (C15) so circuit HALs that build their own PSOs (recursion `Pipelines`) are named in
+/// the profile too; a no-op unless [PROFILE_ENV] is set.
+pub fn register_pso_name(pso: &ComputePipelineStateRef, name: &str) {
     if !profiling() {
         return;
     }

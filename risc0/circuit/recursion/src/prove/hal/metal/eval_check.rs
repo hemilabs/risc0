@@ -18,7 +18,11 @@
 //! poly_mix powers go into a HAL-owned shared buffer (CUDA: `cudaMemcpyToSymbolAsync` into
 //! `__constant__ FpExt poly_mix[158]`), then the kernels C3 translated run over the evaluation
 //! domain on the open batch:
-//! - `lz` (default since C12): `ec_lz_part_0..5`, the split below with every part's Fp sums of
+//! - `rg` (default since C15): `ec_rg_part_0..13`, the `lz` form below with a Metal-only
+//!   regrouping of the poly_fp sum into 14 parts (`cuda2metal_eval.py --split-rg`,
+//!   `ec_regroup_metal.py`), the same bindings and running-sum protocol; every part compiles to a
+//!   small per-thread stack (`RISC0_METAL_REC_EC_REGROUP=0` reverts to `lz`);
+//! - `lz` (the C12/C13 default): `ec_lz_part_0..5`, the split below with every part's Fp sums of
 //!   products accumulated lazily (`cuda2metal_eval.py --split-lz`, ec_lazyfp.py's `lz2` form);
 //!   the same bindings and dispatch order as the split;
 //! - `split` (`RISC0_METAL_REC_KERNELS=split`, the C11 default): `ec_part_0..5` back to back
@@ -27,8 +31,9 @@
 //! - `monolith` (`RISC0_METAL_REC_KERNELS=monolith`, the pre-C11 default): one `eval_check`
 //!   dispatch (`eval_check.cu` + `ffi_supra.cu:43-68`).
 //!
-//! All three are bit-identical to the CPU `poly_fp` (tests below). The batch is flushed, not waited
-//! for, so the prover's `post_eval_check` host work overlaps the GPU (CUDA: async on the stream).
+//! All variants are bit-identical to the CPU `poly_fp` (tests below). The batch is flushed, not
+//! waited for, so the prover's `post_eval_check` host work overlaps the GPU (CUDA: async on the
+//! stream).
 //! eval_check has no asserts and every trace read is `& mask`-clamped, so there is no fault word;
 //! the host checks the buffer sizes the kernel relies on.
 //!
@@ -201,6 +206,32 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
         po2: usize,
         steps: usize,
     ) {
+        self.encode_eval_parts(
+            variant.names(),
+            kernels,
+            check,
+            groups,
+            globals,
+            poly_mix_pows,
+            po2,
+            steps,
+        )
+    }
+
+    /// [Self::encode_eval_check] with the kernels given by name, dispatched in order (C15: the
+    /// bench runs regroupings from other metallibs through it).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_eval_parts(
+        &self,
+        names: &[&str],
+        kernels: &Pipelines,
+        check: &BufferImpl<BabyBearElem>,
+        groups: &[&BufferImpl<BabyBearElem>],
+        globals: &[&BufferImpl<BabyBearElem>],
+        poly_mix_pows: &[BabyBearExtElem],
+        po2: usize,
+        steps: usize,
+    ) {
         const EXP_PO2: usize = log2_ceil(INV_RATE);
         let domain = steps * INV_RATE;
         let (ctrl, data, accum) = (
@@ -239,11 +270,7 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
         args[bind::OUT] = out.as_arg();
         args[bind::PARAMS] = KernelArg::Bytes(as_bytes(&params));
 
-        let psos: Vec<&ComputePipelineState> = variant
-            .names()
-            .iter()
-            .map(|n| kernels.pipeline(n))
-            .collect();
+        let psos: Vec<&ComputePipelineState> = names.iter().map(|n| kernels.pipeline(n)).collect();
         for pso in psos {
             // 1-D over the domain, threadgroups of min(256, PSO max) (`getSimpleConfig`) unless
             // RISC0_METAL_REC_EVAL_TG says otherwise (C11 sweep; the domain is a power of two,

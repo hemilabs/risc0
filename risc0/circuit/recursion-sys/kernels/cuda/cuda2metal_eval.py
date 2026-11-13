@@ -17,15 +17,16 @@
 "eval mode", errata 8.2).
 
 usage:
-  cuda2metal_eval.py -o OUTDIR [--split [--split-lz]] [--check] [--no-pin] [--compile]
-                     [--metallib PATH] [--define NAME=VALUE ...]
-  cuda2metal_eval.py --check [--split [--split-lz]]        # round trip + pins only
-  cuda2metal_eval.py --list-kernels [--split [--split-lz]] # the kernel entry names
+  cuda2metal_eval.py -o OUTDIR [--split [--split-lz [--split-rg]]] [--check] [--no-pin]
+                     [--compile] [--metallib PATH] [--define NAME=VALUE ...]
+  cuda2metal_eval.py --check [--split [--split-lz [--split-rg]]]        # round trip + pins only
+  cuda2metal_eval.py --list-kernels [--split [--split-lz [--split-rg]]] # the kernel entry names
 
 Inputs (kernels/cuda, checked in) -> outputs (OUTDIR, never checked in):
   eval_check.cu        -> eval_check.metal        + kernel eval_check (monolith, always)
   eval_check_split.cu  -> eval_check_split.metal  + kernels ec_part_0 .. ec_part_5 (--split)
                        -> eval_check_split_lz.metal + kernels ec_lz_part_0 .. 5 (--split-lz)
+  ec_regroup_metal.py  -> eval_check_split_rg.metal + kernels ec_rg_part_0 .. 13 (--split-rg)
 
 Monolith: poly_fp (zirgen output, 12k lines) becomes a `static inline` function whose first
 parameter is `const device FpExt* poly_mix` (CUDA reads a `__constant__ FpExt poly_mix[158]`
@@ -53,6 +54,14 @@ the kernels are renamed `ec_lz_part_P` so both splits link into one metallib. C1
 six parts at po2 18 (domain 2^20) 58.6 -> 47.8 ms per call on the M5 Max (lz1 49.3 ms, a per-part
 mix of lz1/lz2/RecLz-only 47.7 ms: no better than all-lz2; the lazy-REDC split without the RecLz
 pass, i.e. plain Fp, 97 ms).
+
+Split, regrouped (--split-rg, item C15): ec_regroup_metal.py runs eval_check_split.py's generator
+with a Metal-only grouping (14 parts instead of 6; two leaves split into their terms) and returns
+the CUDA-form split source, which then takes exactly the --split and --split-lz path above (branch
+selection, rules, round trip, lazy Fp 'lz2', uint4 mix loads); the kernels are renamed
+`ec_rg_part_P`. Only the grouping of field sums changes, so the result is bit-identical. C15
+measured eval_check at po2 18 44.2 -> 27.8 ms per call on the M5 Max: parts 0 and 5 of the
+6-part split compiled to 2.6 / 3.1 KB per-thread stacks, every regrouped part to <= 1.1 KB.
 
 Kernel bindings (all modes; RecEvalParams is defined in the generated prelude, 16 B):
   buffer(0) poly_mix  const device FpExt*  158 mix powers (CUDA __constant__ poly_mix)
@@ -119,6 +128,7 @@ import cuda2metal_common as c  # noqa: E402
 
 TG_SIZE = 256  # CUDA: __launch_bounds__(256, 1) (monolith) / kBlock = 256 (split, CUDA branch)
 NUM_PARTS = 6  # eval_check_split.cu kNumParts (checked against the source)
+RG = 'eval_check_split_rg'  # --split-rg (C15): the regrouped split's translation
 NS = 'risc0::circuit::recursion::cuda'
 HOST_PREFIX = '//c2m- '
 
@@ -209,13 +219,13 @@ EVAL_KERNEL = (
     "}\n" % (TG_SIZE, BINDINGS, TG_SIZE, SIG, NONCE, NS))
 
 
-def split_kernels():
+def split_kernels(nparts=NUM_PARTS):
     out = ("// Kernels ec_part_0 .. ec_part_%d: the CUDA `template <int P> __global__ ec_part`\n"
            "// instantiations (eval_check_split.cu, non-HIP branch), text-expanded. Dispatch all of\n"
            "// them in order on one serial encoder, each Grid::Threads(domain), threadgroup size\n"
            "// <= %d: part P > 0 reads the running sum part P - 1 left in `check`.\n%s"
-           % (NUM_PARTS - 1, TG_SIZE, BINDINGS))
-    for p in range(NUM_PARTS):
+           % (nparts - 1, TG_SIZE, BINDINGS))
+    for p in range(nparts):
         out += ("[[max_total_threads_per_threadgroup(%d)]]\n"
                 "kernel void ec_part_%d(\n%s) {\n%s"
                 "  %s::ec_part_body<%d>(poly_mix, gid, check, ctrl, data, accum, mix, out,\n"
@@ -230,6 +240,14 @@ KERNELS = {
     'eval_check_split_lz': ['ec_lz_part_%d' % p for p in range(NUM_PARTS)],
     'eval_check_split_lz_u32': ['ec_lz32_part_%d' % p for p in range(NUM_PARTS)],
 }
+
+
+def rg_parts():
+    import ec_regroup_metal  # kernels/cuda, next to this script (C15)
+    return ec_regroup_metal.NUM_PARTS
+
+
+KERNELS['eval_check_split_rg_lz'] = ['ec_rg_part_%d' % p for p in range(rg_parts())]
 
 
 # ---- split, lazy Fp (--split-lz, C12) -------------------------------------------------------
@@ -340,6 +358,23 @@ def lazy_fp(split_text):
     residual_scan('eval_check_split_lz', text)
     return text, counts
 
+
+def rg_lz(lz_text):
+    """eval_check_split_rg.metal (C15) from the lazy Fp form of the regrouped split's translation:
+    kernels renamed ec_rg_part_N, header noted. Returns (text, counts)."""
+    counts = c.Counter()
+    text, n = re.subn(r'^kernel void ec_lz_part_(\d+)\(', r'kernel void ec_rg_part_\1(', lz_text,
+                      flags=re.M)
+    counts.add('rg.kernels', n)
+    text, n = re.subn(r'^// Lazy Fp form \(--split-lz, C12;',
+                      '// Regrouped split (--split-rg, C15: ec_regroup_metal.py, %d parts; only\n'
+                      '// the grouping of field sums differs from eval_check_split.cu).\n'
+                      '// Lazy Fp form (--split-lz, C12;' % rg_parts(), text, flags=re.M)
+    counts.add('rg.header', n)
+    residual_scan('eval_check_split_rg', text)
+    return text, counts
+
+
 # Lines with no Metal meaning, kept as comments (reversible).
 DISABLE = [
     r'#include "cuda\.h"', r'#include "eval_check\.cuh"', r'#include <cstdint>',
@@ -435,6 +470,27 @@ PINNED = {
         'lz.parts': 6, 'lz.kernels': 6, 'lz.header': 1, 'lz.lz2_prod': 4855, 'lz.lz2_fin': 2557,
         'lz.uint4_add': 1,  # C13: rec_lz_add's mix read as one uint4 load (no &poly_mix[k])
         'tally.poly_mix_read': 171, 'tally.data_read': 1371, 'tally.fp_mul': 0,
+    },
+    RG: {
+        # The regrouped split (C15, ec_regroup_metal.py): 14 parts, the same rules and selection.
+        # Fewer HIP-only lines than the CUDA split: its per-part HIP variants are keyed by the
+        # 6-part numbering (they never reach Metal either way).
+        'select.directives': 59, 'select.dropped_lines': 6582,
+        'include_fp': 1, 'disable': 6, 'constexpr': 2, 'inv_rate': 1,
+        # 6 RecLz helpers + 14 parts + poly_fp_part + ec_part_body.
+        'qual.force': 22,
+        'poly_mix_def': 15, 'poly_mix_call': 15, 'lz_add_def': 1, 'lz_add_call': 1074,
+        'lz_mix_ptr': 1, 'thread_ref': 3, 'thread_u32_ptr': 5,
+        # 80 in the parts/dispatcher/body + 15 in the commented CUDA host code.
+        'ptr_param': 95, 'check_param': 2, 'body_def': 1, 'gid': 1, 'ext_index': 4,
+        'host.lines': 51, 'kernels': 14, 'tally.poly_mix_read': 184,
+        'tally.data_read': 1829, 'tally.fp_mul': 5047,
+    },
+    'eval_check_split_rg_lz': {
+        # The lazy Fp form ('lz2', uint4 mix loads) of RG, kernels ec_rg_part_0..13.
+        'lz.parts': 14, 'lz.kernels': 14, 'lz.header': 1, 'lz.lz2_prod': 5047, 'lz.lz2_fin': 2673,
+        'lz.uint4_add': 1, 'rg.kernels': 14, 'rg.header': 1,
+        'tally.poly_mix_read': 183, 'tally.data_read': 1829, 'tally.fp_mul': 0,
     },
     'eval_check_split_lz_u32': {
         # The C12 form of eval_check_split_lz (C13's revert, RISC0_METAL_REC_LZ_UINT4=0).
@@ -590,18 +646,20 @@ def translate(name, src):
     reproduce (the source, or for the split its branch-selected form)."""
     c.check_no_markers(src, name)
     counts = c.Counter()
-    if name == 'eval_check_split':
+    split = name in ('eval_check_split', RG)
+    nparts = rg_parts() if name == RG else NUM_PARTS
+    if split:
         m = re.search(r'^constexpr int kNumParts = (\d+);$', src, re.M)
-        if not m or int(m.group(1)) != NUM_PARTS:
-            raise c.TranslateError('split: kNumParts != %d' % NUM_PARTS)
+        if not m or int(m.group(1)) != nparts:
+            raise c.TranslateError('%s: kNumParts != %d' % (name, nparts))
         base = select_cuda_branches(src, counts)
     else:
         base = src
     out = c.apply_rules(base, rules(), counts)
-    if name == 'eval_check_split':
+    if split:
         out = comment_host_code(out, counts)
         prelude = PRELUDE_SPLIT
-        tail = split_kernels()
+        tail = split_kernels(nparts)
     else:
         prelude = PRELUDE_EVAL
         tail = EVAL_KERNEL
@@ -612,7 +670,7 @@ def translate(name, src):
     if not out.endswith('\n'):
         raise c.TranslateError('%s: input does not end with a newline' % name)
     out += '\n' + c.gen_block(tail)
-    counts.add('kernels', len(KERNELS[name]))
+    counts.add('kernels', nparts if split else len(KERNELS[name]))
     tallies(name, out, counts)
     residual_scan(name, out)
     return out, counts, base
@@ -637,6 +695,9 @@ def main(argv=None):
                     help='with --split: also write eval_check_split_lz.metal (kernels '
                     'ec_lz_part_0..5, lazy Fp form, C12; uint4 mix loads, C13) and '
                     'eval_check_split_lz_u32.metal (ec_lz32_part_0..5, four-load form)')
+    ap.add_argument('--split-rg', action='store_true',
+                    help='with --split-lz: also write eval_check_split_rg.metal (kernels '
+                    'ec_rg_part_0..N, the Metal-only regrouped split of ec_regroup_metal.py, C15)')
     ap.add_argument('--check', action='store_true',
                     help='round trip + pins + residuals; compare with OUTDIR files if present')
     ap.add_argument('--no-pin', action='store_true', help='report count mismatches only')
@@ -649,9 +710,12 @@ def main(argv=None):
 
     if a.split_lz and not a.split:
         ap.error('--split-lz needs --split')
+    if a.split_rg and not a.split_lz:
+        ap.error('--split-rg needs --split-lz')
     names = ['eval_check'] + (['eval_check_split'] if a.split else [])
     if a.list_kernels:
         names += ['eval_check_split_lz', 'eval_check_split_lz_u32'] if a.split_lz else []
+        names += ['eval_check_split_rg_lz'] if a.split_rg else []
         print('\n'.join(k for n in names for k in KERNELS[n]))
         return 0
     if not a.outdir and not a.check:
@@ -683,6 +747,24 @@ def main(argv=None):
             mismatches += c.check_pins('eval_check_split_lz_u32', lz32_counts,
                                        PINNED['eval_check_split_lz_u32'], strict=not a.no_pin)
             outs.append(('eval_check_split_lz_u32', lz32, lz32_counts, False))
+        if name == 'eval_check_split' and a.split_rg:
+            import ec_regroup_metal  # kernels/cuda (C15)
+            try:
+                rg_src, _ = ec_regroup_metal.regrouped(check=True)
+            except ec_regroup_metal.RegroupError as e:
+                raise c.TranslateError('split-rg: %s' % e)
+            rg, rg_counts, rg_base = translate(RG, rg_src)
+            mismatches += c.check_pins(RG, rg_counts, PINNED[RG], strict=not a.no_pin)
+            if a.check:
+                if untranslate(RG, rg) != rg_base:
+                    raise c.TranslateError('%s: round trip differs from the regrouped source' % RG)
+            rg_lz_text, rg_lz_counts = lazy_fp(rg)
+            rg_text, rg_more = rg_lz(rg_lz_text)
+            for k, v in rg_more.items():
+                rg_lz_counts.add(k, v)
+            mismatches += c.check_pins('eval_check_split_rg_lz', rg_lz_counts,
+                                       PINNED['eval_check_split_rg_lz'], strict=not a.no_pin)
+            outs.append(('eval_check_split_rg', rg_text, rg_lz_counts, a.check))
         for oname, otext, ocounts, rt in outs:
             dst = os.path.join(a.outdir, oname + '.metal') if a.outdir else None
             status = c.write_or_check(dst, otext, a.check) if dst else None

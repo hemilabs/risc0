@@ -44,6 +44,8 @@ mod c10_tests;
 mod c11_tests;
 #[cfg(all(test, feature = "test"))]
 mod c13_tests;
+#[cfg(all(test, feature = "test"))]
+mod c15_tests;
 pub(crate) mod capture;
 mod eval_check;
 pub(crate) mod profile;
@@ -77,9 +79,12 @@ use crate::prove::{
     RecursionReceipt,
 };
 
-/// Environment variable selecting the eval_check kernels: `lz` (the split in lazy Fp form, default
-/// since C12; uint4 mix-power loads since C13), `lz32` (the C12 four-load form, also
-/// `RISC0_METAL_REC_LZ_UINT4=0`), `split` (the C11 default) or `monolith` (PLAN 2.0). C11 measured the split 31 %
+/// Environment variable selecting the eval_check kernels: `rg` (the Metal-only regrouped split in
+/// lazy Fp form with uint4 mix loads, default since C15; also `RISC0_METAL_REC_EC_REGROUP=0`
+/// reverts it), `lz` (the 6-part split in lazy Fp form, the C12/C13 default; uint4 mix-power loads
+/// since C13), `lz32` (the C12 four-load form, also `RISC0_METAL_REC_LZ_UINT4=0`), `split` (the C11
+/// default) or `monolith` (PLAN 2.0). C15 measured the regrouped split 44.2 -> 27.8 ms per call at
+/// po2 18 (`docs/metal-port/notes/C15.md`). C11 measured the split 31 %
 /// faster per lift/join/resolve proof at po2 18 (interleaved A/B on captured zkvm proofs) and ~5x
 /// cheaper to build cold (7.5 s vs 36 s); C12 measured the lazy Fp split 58.6 -> 47.8 ms per
 /// eval_check call at po2 18 (see `docs/metal-port/notes/C12.md`).
@@ -120,8 +125,34 @@ const EVAL_SPLIT_LZ_U32: &[&str] = &[
 ];
 
 /// Environment variable (read once): `0` reverts the lazy Fp split's uint4 mix-power loads (C13)
-/// to the C12 four-load form ([EVAL_SPLIT_LZ_U32]). Only affects the default `lz` variant.
+/// to the C12 four-load form ([EVAL_SPLIT_LZ_U32]). Affects the `rg` and `lz` variants (both use
+/// uint4 loads; the four-load form exists only for the 6-part split).
 pub(crate) const REC_LZ_UINT4_ENV: &str = "RISC0_METAL_REC_LZ_UINT4";
+
+/// The regrouped lazy Fp split, in dispatch order (C15, `cuda2metal_eval.py --split-rg`): the same
+/// bindings and running-sum protocol as [EVAL_SPLIT_LZ], with `ec_regroup_metal.py`'s 14-part
+/// grouping of the poly_fp sum (every part's per-thread stack <= 1.1 KB, against 2.6 and 3.1 KB
+/// for parts 0 and 5 of the 6-part split).
+const EVAL_SPLIT_RG: &[&str] = &[
+    "ec_rg_part_0",
+    "ec_rg_part_1",
+    "ec_rg_part_2",
+    "ec_rg_part_3",
+    "ec_rg_part_4",
+    "ec_rg_part_5",
+    "ec_rg_part_6",
+    "ec_rg_part_7",
+    "ec_rg_part_8",
+    "ec_rg_part_9",
+    "ec_rg_part_10",
+    "ec_rg_part_11",
+    "ec_rg_part_12",
+    "ec_rg_part_13",
+];
+
+/// Environment variable (read once): `0` reverts the default regrouped split (C15, [EVAL_SPLIT_RG])
+/// to the 6-part lazy Fp split ([EVAL_SPLIT_LZ], the C13 default). Only affects the default.
+pub(crate) const REC_EC_REGROUP_ENV: &str = "RISC0_METAL_REC_EC_REGROUP";
 
 /// Which eval_check kernels the recursion Metal HAL uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,6 +161,7 @@ pub(crate) enum EvalKernels {
     Split,
     SplitLz,
     SplitLzU32,
+    SplitRg,
 }
 
 impl EvalKernels {
@@ -138,41 +170,49 @@ impl EvalKernels {
         match value.trim().to_ascii_lowercase().as_str() {
             "monolith" | "mono" | "eval_check" => Some(Self::Monolith),
             "split" | "ec_part" => Some(Self::Split),
-            "" | "lz" | "split-lz" | "split_lz" | "ec_lz_part" => Some(Self::SplitLz),
+            "" | "rg" | "split-rg" | "split_rg" | "ec_rg_part" => Some(Self::SplitRg),
+            "lz" | "split-lz" | "split_lz" | "ec_lz_part" => Some(Self::SplitLz),
             "lz32" | "lz-u32" | "lz_u32" | "ec_lz32_part" => Some(Self::SplitLzU32),
             _ => None,
         }
     }
 
-    /// The process-wide selection (read once): `RISC0_METAL_REC_KERNELS`, default the lazy Fp
-    /// split (C12; `split` reverts to the C11 default), with uint4 mix loads unless
-    /// `RISC0_METAL_REC_LZ_UINT4=0` (C13).
+    /// The process-wide selection (read once): `RISC0_METAL_REC_KERNELS`, default the regrouped
+    /// lazy Fp split (C15; `lz` is the C12/C13 6-part split, `split` the C11 default), unless
+    /// `RISC0_METAL_REC_EC_REGROUP=0` (C15 revert: `lz`), with uint4 mix loads unless
+    /// `RISC0_METAL_REC_LZ_UINT4=0` (C13 revert: `lz32`).
     pub(crate) fn selected() -> Self {
         static SEL: OnceLock<EvalKernels> = OnceLock::new();
         *SEL.get_or_init(|| {
             let v = match std::env::var(REC_KERNELS_ENV) {
                 Ok(v) => Self::parse(&v).unwrap_or_else(|| {
                     tracing::warn!(
-                        "{REC_KERNELS_ENV}={v:?} is not lz|lz32|split|monolith; using lz"
+                        "{REC_KERNELS_ENV}={v:?} is not rg|lz|lz32|split|monolith; using rg"
                     );
-                    Self::SplitLz
+                    Self::SplitRg
                 }),
-                Err(_) => Self::SplitLz,
+                Err(_) => Self::SplitRg,
             };
+            let v = Self::with_regroup(v, std::env::var(REC_EC_REGROUP_ENV).ok().as_deref());
             Self::with_uint4(v, std::env::var(REC_LZ_UINT4_ENV).ok().as_deref())
         })
     }
 
-    /// `v` with `RISC0_METAL_REC_LZ_UINT4` = `uint4` applied: `0` / `off` / `false` turns the
-    /// default [Self::SplitLz] into [Self::SplitLzU32]; other variants are unchanged.
+    /// `v` with `RISC0_METAL_REC_EC_REGROUP` = `regroup` applied: `0` / `off` / `false` turns the
+    /// default [Self::SplitRg] into [Self::SplitLz]; other variants are unchanged.
+    pub(crate) fn with_regroup(v: Self, regroup: Option<&str>) -> Self {
+        if v == Self::SplitRg && knob_off(regroup) {
+            Self::SplitLz
+        } else {
+            v
+        }
+    }
+
+    /// `v` with `RISC0_METAL_REC_LZ_UINT4` = `uint4` applied: `0` / `off` / `false` turns
+    /// [Self::SplitLz] and [Self::SplitRg] (both uint4) into the C12 four-load form
+    /// [Self::SplitLzU32]; other variants are unchanged.
     pub(crate) fn with_uint4(v: Self, uint4: Option<&str>) -> Self {
-        let off = uint4.is_some_and(|u| {
-            matches!(
-                u.trim().to_ascii_lowercase().as_str(),
-                "0" | "off" | "false"
-            )
-        });
-        if v == Self::SplitLz && off {
+        if matches!(v, Self::SplitLz | Self::SplitRg) && knob_off(uint4) {
             Self::SplitLzU32
         } else {
             v
@@ -186,13 +226,29 @@ impl EvalKernels {
             Self::Split => EVAL_SPLIT,
             Self::SplitLz => EVAL_SPLIT_LZ,
             Self::SplitLzU32 => EVAL_SPLIT_LZ_U32,
+            Self::SplitRg => EVAL_SPLIT_RG,
         }
     }
 
     /// Every variant (tests).
     #[allow(dead_code)]
-    pub(crate) const ALL: [EvalKernels; 4] =
-        [Self::Monolith, Self::Split, Self::SplitLz, Self::SplitLzU32];
+    pub(crate) const ALL: [EvalKernels; 5] = [
+        Self::Monolith,
+        Self::Split,
+        Self::SplitLz,
+        Self::SplitLzU32,
+        Self::SplitRg,
+    ];
+}
+
+/// Whether a boolean knob's value is `0` / `off` / `false` (unset or anything else: on).
+fn knob_off(value: Option<&str>) -> bool {
+    value.is_some_and(|u| {
+        matches!(
+            u.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false"
+        )
+    })
 }
 
 /// Whether `name` is one of the eval_check entry points (any variant).
@@ -283,7 +339,10 @@ impl Pipelines {
         };
         let mut pipelines = std::collections::HashMap::with_capacity(names.len());
         for (name, pso) in names.iter().zip(built) {
-            pipelines.insert(name.to_string(), pso?);
+            let pso = pso?;
+            // C15: named in the Z9 per-kernel profile (no-op unless RISC0_METAL_PROFILE is set).
+            risc0_zkp::hal::metal::register_pso_name(&pso, name);
+            pipelines.insert(name.to_string(), pso);
         }
         Ok(Self { pipelines })
     }
@@ -317,7 +376,13 @@ pub(crate) struct RecursionKernels {
 
 impl RecursionKernels {
     fn load(device: &DeviceRef) -> Result<Self> {
-        for names in [EVAL_MONOLITH, EVAL_SPLIT, EVAL_SPLIT_LZ, EVAL_SPLIT_LZ_U32] {
+        for names in [
+            EVAL_MONOLITH,
+            EVAL_SPLIT,
+            EVAL_SPLIT_LZ,
+            EVAL_SPLIT_LZ_U32,
+            EVAL_SPLIT_RG,
+        ] {
             for name in names {
                 if !METAL_KERNEL_NAMES.contains(name) {
                     bail!("risc0-circuit-recursion-sys METAL_KERNEL_NAMES does not list {name}");
@@ -883,7 +948,8 @@ mod c5_tests {
 
     #[test]
     fn eval_kernels_parse() {
-        assert_eq!(EvalKernels::parse(""), Some(EvalKernels::SplitLz));
+        assert_eq!(EvalKernels::parse(""), Some(EvalKernels::SplitRg));
+        assert_eq!(EvalKernels::parse(" RG"), Some(EvalKernels::SplitRg));
         assert_eq!(EvalKernels::parse("lz"), Some(EvalKernels::SplitLz));
         assert_eq!(EvalKernels::parse("monolith"), Some(EvalKernels::Monolith));
         assert_eq!(EvalKernels::parse(" Split "), Some(EvalKernels::Split));
@@ -893,7 +959,27 @@ mod c5_tests {
         assert_eq!(EvalKernels::SplitLz.names().len(), 6);
         assert_eq!(EvalKernels::parse("lz32"), Some(EvalKernels::SplitLzU32));
         assert_eq!(EvalKernels::SplitLzU32.names().len(), 6);
-        // C13: RISC0_METAL_REC_LZ_UINT4=0 reverts only the default variant.
+        assert_eq!(EvalKernels::SplitRg.names().len(), 14);
+        // C15: RISC0_METAL_REC_EC_REGROUP=0 reverts only the default variant.
+        let r = |v, s| EvalKernels::with_regroup(v, s);
+        assert_eq!(r(EvalKernels::SplitRg, None), EvalKernels::SplitRg);
+        assert_eq!(r(EvalKernels::SplitRg, Some("1")), EvalKernels::SplitRg);
+        assert_eq!(r(EvalKernels::SplitRg, Some("0")), EvalKernels::SplitLz);
+        assert_eq!(
+            r(EvalKernels::SplitRg, Some(" False")),
+            EvalKernels::SplitLz
+        );
+        assert_eq!(r(EvalKernels::SplitLz, Some("0")), EvalKernels::SplitLz);
+        assert_eq!(r(EvalKernels::Split, Some("0")), EvalKernels::Split);
+        // C13: RISC0_METAL_REC_LZ_UINT4=0 reverts the uint4 variants to the four-load form.
+        assert_eq!(
+            EvalKernels::with_uint4(EvalKernels::SplitRg, Some("0")),
+            EvalKernels::SplitLzU32
+        );
+        assert_eq!(
+            EvalKernels::with_uint4(EvalKernels::SplitRg, None),
+            EvalKernels::SplitRg
+        );
         let u = |v, s| EvalKernels::with_uint4(v, s);
         assert_eq!(u(EvalKernels::SplitLz, None), EvalKernels::SplitLz);
         assert_eq!(u(EvalKernels::SplitLz, Some("1")), EvalKernels::SplitLz);
@@ -914,7 +1000,7 @@ mod c5_tests {
         assert!(std::ptr::eq(a.kernels(), b.kernels()));
         let names: Vec<&str> = a.kernels().base.names().collect();
         let eval_names: usize = EvalKernels::ALL.iter().map(|v| v.names().len()).sum();
-        assert_eq!(eval_names, 19);
+        assert_eq!(eval_names, 33);
         assert_eq!(names.len(), METAL_KERNEL_NAMES.len() - eval_names);
         for name in METAL_KERNEL_NAMES.iter().filter(|n| !is_eval_kernel(n)) {
             assert!(a.kernels().base.get(name).is_some(), "{name}");
