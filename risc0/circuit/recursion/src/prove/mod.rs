@@ -59,6 +59,7 @@ use crate::{
     taps::TAPSET, CircuitImpl, REGISTER_GROUP_ACCUM, REGISTER_GROUP_CTRL, REGISTER_GROUP_DATA,
 };
 
+pub use self::ctrl_persist::{prewarm_p254_ctrl, P254Prewarm};
 pub use self::preflight::{InputStream, Preflight};
 pub use self::program::Program;
 

@@ -187,6 +187,11 @@ pub const KERNEL_NAMES: &[&str] = &[
     "p254_rows_ref",
     "p254_rows_w64",
     "p254_rows_w64c",
+    // poseidon254.metal: the unrolled pre-C16 `w64` and the 4-lane kernels (C16)
+    "p254_fold_w64u",
+    "p254_rows_w64u",
+    "p254_fold4_w64",
+    "p254_rows4_w64",
 ];
 
 /// Whether the Metal backend may be used for `unit` (one of `zkp`, `rv32im`, `recursion`,

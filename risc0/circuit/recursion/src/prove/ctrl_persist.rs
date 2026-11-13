@@ -333,6 +333,120 @@ pub(crate) fn store<H>(
     );
 }
 
+/// Environment variable (read per call): `0` makes [prewarm_p254_ctrl] a no-op (item C16 (b)).
+pub(crate) const PREWARM_ENV: &str = "RISC0_METAL_REC_P254_PREWARM";
+
+/// The device headroom [prewarm_p254_ctrl] wants free under the working-set limit: the commit of
+/// identity_p254's ctrl (23 columns x 2^20 rows of Poseidon254) on a fresh p254 HAL adds a peak of
+/// ~217 MB of device memory (coefficients, the evaluated domain, the Merkle nodes and the NTT
+/// scratch; measured in notes/C16.md), rounded up with a margin.
+const PREWARM_DEVICE_BYTES: u64 = 512 << 20;
+
+/// What [prewarm_p254_ctrl] did.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub enum P254Prewarm {
+    /// The group was committed on a temporary p254 prover and kept: the first identity_p254 of
+    /// this process rebuilds it instead of committing it.
+    Kept {
+        /// Wall time of the prewarm (prover creation, ctrl commit, host snapshot, release).
+        ms: f64,
+        /// Host bytes the kept group holds.
+        bytes: usize,
+    },
+    /// A group for this program is already kept (a previous prewarm or identity_p254).
+    AlreadyKept,
+    /// Nothing done; the reason (persistence off, not a Metal build, the knob, the budget).
+    Skipped(String),
+}
+
+/// Item C16 (b): commit identity_p254's ctrl group once, ahead of the first Groth16 wrap of the
+/// process, and keep its host copy (C13), so that the first wrap rebuilds it in ~6 ms instead of
+/// committing it (~150-170 ms of Poseidon254 Merkle hashing plus the ~88 MB snapshot copy). Later
+/// wraps are unchanged: they already rebuild it.
+///
+/// `po2` is the recursion programs' po2 (risc0-zkvm's `RECURSION_PO2`, 18). The commit runs on a
+/// temporary p254 prover that is dropped before returning (no HAL stays alive; the kept copy is
+/// host memory, ~103 MB, counted against C13's cap). It holds the process-wide GPU lock for its
+/// duration (~0.22-0.26 s on an M5 Max with warm pipelines), so call it when the GPU is idle, e.g.
+/// at worker start; it is safe from any thread.
+///
+/// Budget-gated: it does nothing when C13 persistence does not keep Poseidon254 groups
+/// (`RISC0_METAL_REC_CTRL_PERSIST`), when the group would not fit C13's host cap, or when the
+/// device has less than ~512 MiB free under its working-set limit (so a caller never pushes a
+/// small Mac's budget, e.g. while a segment prover holds its pool). `RISC0_METAL_REC_P254_PREWARM=0`
+/// turns it off.
+pub fn prewarm_p254_ctrl(po2: usize) -> anyhow::Result<P254Prewarm> {
+    if std::env::var(PREWARM_ENV).is_ok_and(|v| v.trim() == "0") {
+        return Ok(P254Prewarm::Skipped(format!("{PREWARM_ENV}=0")));
+    }
+    prewarm_p254_ctrl_impl(po2)
+}
+
+#[cfg(not(feature = "metal"))]
+fn prewarm_p254_ctrl_impl(_po2: usize) -> anyhow::Result<P254Prewarm> {
+    Ok(P254Prewarm::Skipped("not a Metal build".into()))
+}
+
+#[cfg(feature = "metal")]
+fn prewarm_p254_ctrl_impl(po2: usize) -> anyhow::Result<P254Prewarm> {
+    let hashfn = p254_suite_name();
+    if !wants(hashfn) {
+        return Ok(P254Prewarm::Skipped(format!(
+            "{PERSIST_ENV} does not keep Poseidon254 groups"
+        )));
+    }
+    if !risc0_zkp::hal::metal::enabled("recursion") {
+        return Ok(P254Prewarm::Skipped("Metal recursion disabled".into()));
+    }
+    let program = super::zkr::get_zkr("identity.zkr", po2)?;
+    let key = super::ctrl_cache_key(&program);
+    if state().entries.contains_key(&(hashfn.to_string(), key)) {
+        return Ok(P254Prewarm::AlreadyKept);
+    }
+    let Some((limit, allocated)) = risc0_zkp::hal::metal::device_memory() else {
+        return Ok(P254Prewarm::Skipped("no Metal device".into()));
+    };
+    if allocated.saturating_add(PREWARM_DEVICE_BYTES) > limit {
+        return Ok(P254Prewarm::Skipped(format!(
+            "{} MiB allocated + {} MiB > {} MiB working-set limit",
+            allocated >> 20,
+            PREWARM_DEVICE_BYTES >> 20,
+            limit >> 20
+        )));
+    }
+    // The bytes the kept copy will hold (coefficients, every Merkle node, the code), checked
+    // against the cap before any GPU work.
+    let size = 1usize << po2;
+    let domain = size * risc0_zkp::INV_RATE;
+    let elem = std::mem::size_of::<BabyBearElem>();
+    let bytes = super::RECURSION_CODE_SIZE * size * elem
+        + 2 * domain * std::mem::size_of::<risc0_zkp::core::digest::Digest>()
+        + program.code.len() * elem;
+    let cap = cap_bytes(limit as usize);
+    if !would_keep(hashfn, key, bytes, cap) {
+        return Ok(P254Prewarm::Skipped(format!(
+            "~{bytes} B would not fit the {cap} B ctrl-persist cap"
+        )));
+    }
+    let t0 = std::time::Instant::now();
+    {
+        let _gpu = risc0_zkp::hal::metal::exclusive();
+        let prover = super::recursion_prover("poseidon_254")?;
+        prover.prewarm(&program)?;
+        // `prover` (and its HAL) is dropped here: only the host copy stays.
+    }
+    let ms = t0.elapsed().as_secs_f64() * 1e3;
+    let s = state();
+    Ok(match s.entries.get(&(hashfn.to_string(), key)) {
+        Some(e) => {
+            tracing::debug!("C16 p254 ctrl prewarm: kept {} B in {ms:.1} ms", e.bytes);
+            P254Prewarm::Kept { ms, bytes: e.bytes }
+        }
+        None => P254Prewarm::Skipped("the group was not kept".into()),
+    })
+}
+
 /// Host bytes, number of groups, rebuilds and snapshots so far (tests and the bench).
 #[cfg(test)]
 pub(crate) fn stats() -> (usize, usize, usize, usize) {

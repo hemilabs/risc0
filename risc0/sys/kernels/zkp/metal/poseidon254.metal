@@ -20,8 +20,11 @@
 // poseidon254_constants.cuh (Montgomery form, R = 2^256). Three arithmetic variants with
 // bit-identical results (all equal the CPU hash suite, zkp/src/core/hash/poseidon_254):
 //   *_w64  (default): CIOS Montgomery with 64-bit multiply-accumulate in the redundant range
-//          [0, 2r), 3-term dot products with one reduction per word, SOS squaring on scalars.
-//   *_w64c: the same with squaring = CIOS multiplication (A/B baseline of the SOS squaring).
+//          [0, 2r), 3-term dot products with one reduction per word, SOS squaring on scalars;
+//          since item C16 compact (the S-boxes, matrix rows and word loops run as loops over one
+//          copy of their code, see `full_round`).
+//   *_w64u: the same fully unrolled (the pre-C16 *_w64; ~6x the native code).
+//   *_w64c: *_w64 with squaring = CIOS multiplication (A/B baseline of the SOS squaring).
 //   *_ref : bn254.h's Fr (G2's header: CIOS with 32-bit carry chains, fully reduced; a byte copy
 //           of groth16-sys/kernels/metal/bn254.h checked by a test), one reduction per product:
 //           the CUDA kernel's arithmetic, the revert path.
@@ -497,10 +500,12 @@ inline F sqr_cios(thread const F& a) { return mul(a, a.v); }
 
 // x0 * c0 + x1 * c1 + x2 * c2 (x < 2r, c constant-table elements < r) with one reduction per word:
 // T < 7r + 1 between steps (9 words), result < 2.13 r; csub2r'd by the callers.
+// LOOP (item C16): the word loop is not unrolled (one copy of its body; see `full_round`).
+template <bool LOOP>
 inline F dot3k(thread const F& x0, thread const F& x1, thread const F& x2, constant uint32_t* c0,
                constant uint32_t* c1, constant uint32_t* c2) {
   uint32_t t0 = 0, t1 = 0, t2 = 0, t3 = 0, t4 = 0, t5 = 0, t6 = 0, t7 = 0, t8 = 0, t9 = 0;
-#pragma unroll
+#pragma unroll(LOOP ? 1 : 8)
   for (int i = 0; i < 8; i++) {
     W64_MAC(x0.v, c0[i], t0, t1, t2, t3, t4, t5, t6, t7, t8, t9)
     W64_MAC(x1.v, c1[i], t0, t1, t2, t3, t4, t5, t6, t7, t8, t9)
@@ -509,10 +514,10 @@ inline F dot3k(thread const F& x0, thread const F& x1, thread const F& x2, const
   }
   return F{{t0, t1, t2, t3, t4, t5, t6, t7}};
 }
-// x * c (c a constant-table element).
-inline F mulk(thread const F& x, constant uint32_t* c) {
+// x * c (c a constant-table element). LOOP as dot3k.
+template <bool LOOP> inline F mulk(thread const F& x, constant uint32_t* c) {
   uint32_t t0 = 0, t1 = 0, t2 = 0, t3 = 0, t4 = 0, t5 = 0, t6 = 0, t7 = 0, t8 = 0, t9 = 0;
-#pragma unroll
+#pragma unroll(LOOP ? 1 : 8)
   for (int i = 0; i < 8; i++) {
     W64_MAC(x.v, c[i], t0, t1, t2, t3, t4, t5, t6, t7, t8, t9)
     W64_REDUCE(t0, t1, t2, t3, t4, t5, t6, t7, t8, t9)
@@ -737,7 +742,15 @@ inline F addk(thread const F& x, constant uint32_t* c) {
   return csub2r(s);
 }
 
-template <bool SOS> inline F sbox(thread const F& x) {
+// x^8. LOOP: the three squarings in a loop (one copy of the squaring code).
+template <bool SOS, bool LOOP> inline F sbox(thread const F& x) {
+  if (LOOP) {
+    F y = x;
+#pragma unroll 1
+    for (int i = 0; i < 3; i++)
+      y = sqr<SOS>(y);
+    return y;
+  }
   F x2 = sqr<SOS>(x);
   F x4 = sqr<SOS>(x2);
   return sqr<SOS>(x4);
@@ -757,27 +770,61 @@ inline F from_mont(thread const F& x) {
   return csub(mul(x, one), RM);
 }
 
-template <bool SOS>
+// One full round. LOOP (item C16, the default kernels): the three S-boxes and the three matrix rows
+// each run as a loop over one copy of their code, the cells rotating through scalars (no private
+// array). The fully unrolled form (LOOP = false, `*_w64u`, the pre-C16 kernels) is ~275 KB of
+// native code per kernel, beyond what the GPU's instruction cache holds: the loops bring it to
+// ~44 KB and the throughput-bound rows kernel ~17 % faster (notes/C16.md).
+template <bool SOS, bool LOOP>
 inline void full_round(thread F& s0, thread F& s1, thread F& s2, uint32_t rc, uint32_t mat,
                        bool only0) {
-  F x0 = sbox<SOS>(addk(s0, C[rc + 0]));
-  F x1 = sbox<SOS>(addk(s1, C[rc + 1]));
-  F x2 = sbox<SOS>(addk(s2, C[rc + 2]));
-  F n0 = csub2r(dot3k(x0, x1, x2, C[mat + 0], C[mat + 1], C[mat + 2]));
+  if (LOOP) {
+    // After three steps (s0, s1, s2) = (x0, x1, x2).
+#pragma unroll 1
+    for (uint32_t k = 0; k < 3; k++) {
+      F x = sbox<SOS, LOOP>(addk(s0, C[rc + k]));
+      s0 = s1;
+      s1 = s2;
+      s2 = x;
+    }
+    // After kn steps o2 = n(kn - 1); after three (o0, o1, o2) = (n0, n1, n2).
+    F o0 = s0, o1 = s1, o2 = s2;
+    uint32_t kn = only0 ? 1 : 3;
+#pragma unroll 1
+    for (uint32_t k = 0; k < kn; k++) {
+      F n = csub2r(
+          dot3k<LOOP>(s0, s1, s2, C[mat + 3 * k], C[mat + 3 * k + 1], C[mat + 3 * k + 2]));
+      o0 = o1;
+      o1 = o2;
+      o2 = n;
+    }
+    if (only0) {
+      s0 = o2;
+    } else {
+      s0 = o0;
+      s1 = o1;
+      s2 = o2;
+    }
+    return;
+  }
+  F x0 = sbox<SOS, LOOP>(addk(s0, C[rc + 0]));
+  F x1 = sbox<SOS, LOOP>(addk(s1, C[rc + 1]));
+  F x2 = sbox<SOS, LOOP>(addk(s2, C[rc + 2]));
+  F n0 = csub2r(dot3k<LOOP>(x0, x1, x2, C[mat + 0], C[mat + 1], C[mat + 2]));
   if (!only0) {
-    F n1 = csub2r(dot3k(x0, x1, x2, C[mat + 3], C[mat + 4], C[mat + 5]));
-    F n2 = csub2r(dot3k(x0, x1, x2, C[mat + 6], C[mat + 7], C[mat + 8]));
+    F n1 = csub2r(dot3k<LOOP>(x0, x1, x2, C[mat + 3], C[mat + 4], C[mat + 5]));
+    F n2 = csub2r(dot3k<LOOP>(x0, x1, x2, C[mat + 6], C[mat + 7], C[mat + 8]));
     s1 = n1;
     s2 = n2;
   }
   s0 = n0;
 }
 
-template <bool SOS> inline void mix(thread F& s0, thread F& s1, thread F& s2) {
+template <bool SOS, bool LOOP> inline void mix(thread F& s0, thread F& s1, thread F& s2) {
   uint32_t rc = SP_RC;
 #pragma unroll 1
   for (uint32_t r = 0; r < 4; r++) {
-    full_round<SOS>(s0, s1, s2, rc, r == 3 ? SP_PRE : SP_MDS, false);
+    full_round<SOS, LOOP>(s0, s1, s2, rc, r == 3 ? SP_PRE : SP_MDS, false);
     rc += 3;
   }
   s0 = addk(s0, C[rc + 0]);
@@ -787,21 +834,31 @@ template <bool SOS> inline void mix(thread F& s0, thread F& s1, thread F& s2) {
 #pragma unroll 1
   for (uint32_t pr = 0; pr < ROUNDS_PARTIAL; pr++) {
     uint32_t sp = SP_SPARSE + pr * 4;
-    F p0 = sbox<SOS>(s0);
+    F p0 = sbox<SOS, LOOP>(s0);
     if (pr + 1 < ROUNDS_PARTIAL) {
       p0 = addk(p0, C[rc]);
       rc++;
     }
-    F n0 = csub2r(dot3k(p0, s1, s2, C[SP_M00], C[sp + 0], C[sp + 1]));
-    F n1 = add(s1, mulk(p0, C[sp + 2]));
-    F n2 = add(s2, mulk(p0, C[sp + 3]));
+    F n0 = csub2r(dot3k<LOOP>(p0, s1, s2, C[SP_M00], C[sp + 0], C[sp + 1]));
+    if (LOOP) {
+      // n1, n2 from one code copy: after two steps (s1, s2) = (n1, n2).
+#pragma unroll 1
+      for (uint32_t j = 0; j < 2; j++) {
+        F n = add(s1, mulk<LOOP>(p0, C[sp + 2 + j]));
+        s1 = s2;
+        s2 = n;
+      }
+    } else {
+      F n1 = add(s1, mulk<LOOP>(p0, C[sp + 2]));
+      F n2 = add(s2, mulk<LOOP>(p0, C[sp + 3]));
+      s1 = n1;
+      s2 = n2;
+    }
     s0 = n0;
-    s1 = n1;
-    s2 = n2;
   }
 #pragma unroll 1
   for (uint32_t r = 0; r < 4; r++) {
-    full_round<SOS>(s0, s1, s2, rc, SP_MDS, r == 3);
+    full_round<SOS, LOOP>(s0, s1, s2, rc, SP_MDS, r == 3);
     rc += 3;
   }
 }
@@ -827,6 +884,72 @@ inline void store(device uint32_t* out, thread const F& s0) {
     out[i] = r.v[i];
 }
 } // namespace w64
+// ---------------------------------------------------------------------------------------------
+// Lane-parallel permutation (item C16): 4 SIMD lanes per hash, lane k (k < 3; lane 3 repeats
+// lane 2) holds cell k. For the small, latency-bound fold layers at the top of a Merkle tree
+// (one hash per thread leaves the GPU almost idle there: ~0.87 ms per layer whatever its size).
+// - Full round: each lane adds its round constant and applies the S-box to its own cell (the
+//   three S-boxes run side by side instead of one after another), the lanes exchange the three
+//   results with simd_shuffle, and lane k forms output cell k with its matrix row (dot3k).
+// - Partial round: every lane runs the S-box (only lane 0's is used: the lanes run in lockstep,
+//   so the others cost no time), then lane k forms output cell k as one dot3k over
+//   (p0, s1, s2): lane 0 with (M_0_0, sparse[0], sparse[1]), lane 1 with (sparse[2], 1, 0),
+//   lane 2 with (sparse[3], 0, 1), "1" being R mod r (Montgomery one: x * 1 = x). So the two
+//   constant products of cells 1 and 2 run beside lane 0's dot product.
+// Each lane's state stays in [0, 2r) as in `mix`, and the cells are congruent mod r to `mix`'s,
+// so the canonical digest is bit-identical (the redundant representations may differ).
+// The whole hash group (4 consecutive threads) is either in range or not, and a lane only reads
+// lanes of its own group, so no shuffle reads an inactive lane.
+// ---------------------------------------------------------------------------------------------
+namespace lanes {
+using w64::F;
+
+constant uint32_t ZERO8[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+
+inline F shfl(thread const F& x, ushort lane) {
+  F r;
+#pragma unroll
+  for (int i = 0; i < 8; i++)
+    r.v[i] = metal::simd_shuffle(x.v[i], lane);
+  return r;
+}
+
+template <bool SOS> inline void mix4(thread F& s, uint32_t k, ushort base) {
+  uint32_t rc = SP_RC;
+#pragma unroll 1
+  for (uint32_t r = 0; r < 8; r++) {
+    if (r == 4) {
+      // The partial rounds, between the two halves of the full rounds.
+      s = w64::addk(s, C[rc + k]);
+      rc += 3;
+      constant uint32_t* ca = k == 0 ? C[SP_M00] : ZERO8;
+#pragma unroll 1
+      for (uint32_t pr = 0; pr < ROUNDS_PARTIAL; pr++) {
+        uint32_t sp = SP_SPARSE + pr * 4;
+        F p = w64::sbox<SOS, true>(s);
+        if (pr + 1 < ROUNDS_PARTIAL) {
+          p = w64::addk(p, C[rc]);
+          rc++;
+        }
+        F p0 = shfl(p, base);
+        F s1 = shfl(s, base + 1);
+        F s2 = shfl(s, base + 2);
+        constant uint32_t* c0 = k == 0 ? ca : C[sp + 1 + k];
+        constant uint32_t* c1 = k == 0 ? C[sp + 0] : (k == 1 ? bn254::FR_ONE : ZERO8);
+        constant uint32_t* c2 = k == 0 ? C[sp + 1] : (k == 2 ? bn254::FR_ONE : ZERO8);
+        s = w64::csub2r(w64::dot3k<true>(p0, s1, s2, c0, c1, c2));
+      }
+    }
+    uint32_t mat = (r == 3 ? SP_PRE : SP_MDS) + 3 * k;
+    F x = w64::sbox<SOS, true>(w64::addk(s, C[rc + k]));
+    rc += 3;
+    F x0 = shfl(x, base);
+    F x1 = shfl(x, base + 1);
+    F x2 = shfl(x, base + 2);
+    s = w64::csub2r(w64::dot3k<true>(x0, x1, x2, C[mat + 0], C[mat + 1], C[mat + 2]));
+  }
+}
+} // namespace lanes
 
 // ---------------------------------------------------------------------------------------------
 // Kernel bodies (shared by both arithmetic variants)
@@ -890,12 +1013,12 @@ struct ArRef {
   }
 };
 
-template <bool SOS> struct ArW64 {
+template <bool SOS, bool LOOP> struct ArW64 {
   static inline w64::F zero() { return w64::F{{0, 0, 0, 0, 0, 0, 0, 0}}; }
   static inline w64::F from_digest(const device uint32_t* d) { return w64::from_digest(d); }
   static inline w64::F from_packed(thread const uint32_t* v) { return w64::from_packed(v); }
   static inline void mix(thread w64::F& a, thread w64::F& b, thread w64::F& c) {
-    w64::mix<SOS>(a, b, c);
+    w64::mix<SOS, LOOP>(a, b, c);
   }
   static inline void store(device uint32_t* out, thread const w64::F& s0) { w64::store(out, s0); }
   static inline void store_zero(device uint32_t* out) {
@@ -934,7 +1057,7 @@ kernel void p254_fold_w64(device uint32_t* out [[buffer(0)]],
                           constant uint32_t& count [[buffer(2)]],
                           uint gid [[thread_position_in_grid]]) {
   if (gid < count)
-    fold_body<ArW64<true>, w64::F>(out, in, gid);
+    fold_body<ArW64<true, true>, w64::F>(out, in, gid);
 }
 
 kernel void p254_fold_w64c(device uint32_t* out [[buffer(0)]],
@@ -942,7 +1065,7 @@ kernel void p254_fold_w64c(device uint32_t* out [[buffer(0)]],
                            constant uint32_t& count [[buffer(2)]],
                            uint gid [[thread_position_in_grid]]) {
   if (gid < count)
-    fold_body<ArW64<false>, w64::F>(out, in, gid);
+    fold_body<ArW64<false, true>, w64::F>(out, in, gid);
 }
 
 kernel void p254_rows_w64(device uint32_t* out [[buffer(0)]],
@@ -951,7 +1074,7 @@ kernel void p254_rows_w64(device uint32_t* out [[buffer(0)]],
                           constant uint32_t& cols [[buffer(3)]],
                           uint gid [[thread_position_in_grid]]) {
   if (gid < rows)
-    rows_body<ArW64<true>, w64::F>(out, matrix, rows, cols, gid);
+    rows_body<ArW64<true, true>, w64::F>(out, matrix, rows, cols, gid);
 }
 
 kernel void p254_rows_w64c(device uint32_t* out [[buffer(0)]],
@@ -960,5 +1083,77 @@ kernel void p254_rows_w64c(device uint32_t* out [[buffer(0)]],
                            constant uint32_t& cols [[buffer(3)]],
                            uint gid [[thread_position_in_grid]]) {
   if (gid < rows)
-    rows_body<ArW64<false>, w64::F>(out, matrix, rows, cols, gid);
+    rows_body<ArW64<false, true>, w64::F>(out, matrix, rows, cols, gid);
+}
+
+// The pre-C16 `*_w64` kernels: the same arithmetic fully unrolled (~275 KB of native code each;
+// `RISC0_METAL_P254_KERNELS=w64u`, the revert path of the compact default).
+kernel void p254_fold_w64u(device uint32_t* out [[buffer(0)]],
+                           const device uint32_t* in [[buffer(1)]],
+                           constant uint32_t& count [[buffer(2)]],
+                           uint gid [[thread_position_in_grid]]) {
+  if (gid < count)
+    fold_body<ArW64<true, false>, w64::F>(out, in, gid);
+}
+
+kernel void p254_rows_w64u(device uint32_t* out [[buffer(0)]],
+                           const device uint32_t* matrix [[buffer(1)]],
+                           constant uint32_t& rows [[buffer(2)]],
+                           constant uint32_t& cols [[buffer(3)]],
+                           uint gid [[thread_position_in_grid]]) {
+  if (gid < rows)
+    rows_body<ArW64<true, false>, w64::F>(out, matrix, rows, cols, gid);
+}
+
+// hash_fold with 4 lanes per hash (`lanes::mix4`): thread 4i + k is lane k of output i; the grid
+// is exactly 4 * count threads. Bit-identical to p254_fold_w64.
+kernel void p254_fold4_w64(device uint32_t* out [[buffer(0)]],
+                           const device uint32_t* in [[buffer(1)]],
+                           constant uint32_t& count [[buffer(2)]],
+                           uint gid [[thread_position_in_grid]],
+                           ushort sl [[thread_index_in_simdgroup]]) {
+  uint32_t i = gid >> 2;
+  if (i >= count)
+    return;
+  uint32_t k = metal::min(gid & 3u, 2u);
+  w64::F s = k == 0 ? w64::F{{0, 0, 0, 0, 0, 0, 0, 0}} : w64::from_digest(in + (2 * i + k - 1) * 8);
+  lanes::mix4<true>(s, k, ushort(sl & ~ushort(3)));
+  if ((gid & 3u) == 0)
+    w64::store(out + i * 8, s);
+}
+
+// hash_rows with 4 lanes per row (`lanes::mix4`): thread 4r + k is lane k of row r; lanes 1 and 2
+// load the block's two cells, lane 0 carries cell 0. Bit-identical to p254_rows_w64.
+kernel void p254_rows4_w64(device uint32_t* out [[buffer(0)]],
+                           const device uint32_t* matrix [[buffer(1)]],
+                           constant uint32_t& rows [[buffer(2)]],
+                           constant uint32_t& cols [[buffer(3)]],
+                           uint gid [[thread_position_in_grid]],
+                           ushort sl [[thread_index_in_simdgroup]]) {
+  uint32_t row = gid >> 2;
+  if (row >= rows)
+    return;
+  bool lane0 = (gid & 3u) == 0;
+  if (cols == 0) {
+    if (lane0) {
+#pragma unroll
+      for (int i = 0; i < 8; i++)
+        out[row * 8 + i] = 0;
+    }
+    return;
+  }
+  uint32_t k = metal::min(gid & 3u, 2u);
+  ushort base = ushort(sl & ~ushort(3));
+  w64::F s = w64::F{{0, 0, 0, 0, 0, 0, 0, 0}};
+#pragma unroll 1
+  for (uint32_t col = 0; col < cols; col += 16) {
+    if (k != 0) {
+      uint32_t packed[8];
+      load_cell(matrix, rows, cols, row, col + 8 * (k - 1), packed);
+      s = w64::from_packed(packed);
+    }
+    lanes::mix4<true>(s, k, base);
+  }
+  if (lane0)
+    w64::store(out + row * 8, s);
 }
