@@ -42,6 +42,8 @@ mod accum;
 mod c10_tests;
 #[cfg(all(test, feature = "test"))]
 mod c11_tests;
+#[cfg(all(test, feature = "test"))]
+mod c13_tests;
 pub(crate) mod capture;
 mod eval_check;
 pub(crate) mod profile;
