@@ -207,7 +207,11 @@ ESIMD_INLINE Fp addk(const Fp& x, const K& c) {
 }
 
 ESIMD_INLINE Fp sbox(const Fp& x) {
-  return sqr(sqr(sqr(x)));  // x^8 (risc0's Poseidon-254 parameter set)
+  // x^7 (risc0 3.1's Poseidon-254; x^8, used before, is not a permutation of the BN254 scalar
+  // field). Products of operands < 2r stay < 2r.
+  const Fp x2 = sqr(x);
+  const Fp x4 = sqr(x2);
+  return mul(mul(x4, x2), x);
 }
 
 // canonical (< r) -> Montgomery (< 2r)
