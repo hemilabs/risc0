@@ -19,8 +19,31 @@ use anyhow::{anyhow, bail, Result};
 use super::Program;
 
 pub fn get_zkr(name: &str, po2: usize) -> Result<Program> {
-    let encoded = extract_zkr(ZkrSection::for_name(name), name)?;
+    let encoded = cached_zkr(name)?;
     Ok(Program::from_encoded(&encoded, po2))
+}
+
+/// The decoded zkr, decoded once per process: every lift and join asks for its program, and
+/// decompressing one (15-24 MB of xz) takes 50-80 ms, about twice what an RTX 5090 takes to prove
+/// it. A prover uses a handful of them (its segments' lifts, join, identity), tens of MB in all.
+fn cached_zkr(name: &str) -> Result<std::sync::Arc<Vec<u32>>> {
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex, OnceLock},
+    };
+    static CACHE: OnceLock<Mutex<HashMap<String, Arc<Vec<u32>>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(zkr) = cache.lock().unwrap().get(name) {
+        return Ok(zkr.clone());
+    }
+    // Decoded outside the lock: two threads may both decode a zkr the first time, not wait.
+    let zkr = Arc::new(extract_zkr(ZkrSection::for_name(name), name)?);
+    Ok(cache
+        .lock()
+        .unwrap()
+        .entry(name.to_string())
+        .or_insert(zkr)
+        .clone())
 }
 
 /// Iterate over all provided zkr programs, sorted by name.
