@@ -62,6 +62,10 @@
 //! (no failure was seen in the K5 runs). Each worker runs in its own autorelease pool, so the
 //! Objective-C objects the Metal calls autorelease (errors, descriptions) are freed per kernel.
 //!
+//! R20 adds [specialized_pipeline]: one PSO of a kernel specialized with function constants
+//! (`MTLFunctionConstantValues`), in an archive of its own whose key includes the constant
+//! values (rv32im's per-domain `ef_eval_split_fc`).
+//!
 //! The functions marked `#[doc(hidden)]` are test seams (keccak's archive tests use them).
 
 use std::{
@@ -599,6 +603,188 @@ enum Source {
 
 type Built<'a> = (&'a str, ComputePipelineState, Source);
 
+/// One PSO of `function` (`name` for messages): an archive hit if possible; else the function
+/// is compiled into the archive and the PSO loaded from there; else (archive error, or no
+/// archive) a plain build. [build_all]'s per-kernel step.
+fn build_function(
+    device: &DeviceRef,
+    function: &metal::FunctionRef,
+    name: &str,
+    archive: Option<&BinaryArchiveRef>,
+    add_nanos: &AtomicU64,
+) -> Result<(ComputePipelineState, Source)> {
+    let desc = ComputePipelineDescriptor::new();
+    desc.set_compute_function(Some(function));
+    let mut archive_err = None;
+    if let Some(archive) = archive {
+        desc.set_binary_archives(&[archive]);
+        let from_archive =
+            || new_pso_with_options(device, &desc, MTLPipelineOption::FailOnBinaryArchiveMiss);
+        if let Ok(pso) = from_archive() {
+            return Ok((pso, Source::Hit));
+        }
+        let t = Instant::now();
+        let added = archive.add_compute_pipeline_functions_with_descriptor(&desc);
+        add_nanos.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        match added {
+            Ok(_) => match from_archive() {
+                Ok(pso) => return Ok((pso, Source::Added)),
+                Err(e) => archive_err = Some(format!("not in the archive after adding: {e}")),
+            },
+            Err(e) => archive_err = Some(format!("adding to the archive: {e}")),
+        }
+        desc.set_binary_archives(&[]);
+    }
+    let pso = device
+        .new_compute_pipeline_state(&desc)
+        .map_err(|e| anyhow!("compute pipeline for {name}: {e}"))?;
+    Ok((pso, Source::Plain(archive_err)))
+}
+
+/// The archive-key name of `name` specialized with the `u32` function constants `constants`
+/// (`(index, value)` pairs): `name[fc<index>=<value>,...]`.
+#[doc(hidden)]
+pub fn specialized_name(name: &str, constants: &[(usize, u32)]) -> String {
+    let fc: Vec<String> = constants
+        .iter()
+        .map(|(i, v)| format!("fc{i}={v}"))
+        .collect();
+    format!("{name}[{}]", fc.join(","))
+}
+
+/// R20: the archive base ([archive_base]) of the specialization of `name` with `constants` under
+/// `unit`, as [specialized_pipeline] uses it (None when the OS build is unknown).
+#[doc(hidden)]
+pub fn specialized_archive_base(
+    dir: &Path,
+    device: &DeviceRef,
+    bytes: &[u8],
+    unit: &str,
+    name: &str,
+    constants: &[(usize, u32)],
+) -> Option<PathBuf> {
+    let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+    archive_base(
+        &dir,
+        device,
+        unit,
+        bytes,
+        &[specialized_name(name, constants).as_str()],
+    )
+}
+
+/// R20: the modification time (last written or loaded, see [open_archive_with]) of the newest
+/// archive file of `base` ([archive_base]), None if there is none (by name only; the content is
+/// verified when it is opened). Lets a caller load only the specializations that a previous
+/// process compiled, most recently used first, without compiling the others.
+pub fn archive_used(base: &Path) -> Option<SystemTime> {
+    let dir = base.parent()?;
+    let stem = base.file_name()?.to_str()?;
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| checksum_in_name(stem, n).is_some())
+        })
+        .filter_map(|e| e.metadata().and_then(|m| m.modified()).ok())
+        .max()
+}
+
+/// R20: one PSO of the kernel `name` of `library` (loaded from the metallib `bytes`), specialized
+/// with the `u32` function constants `constants` (`(index, value)` pairs, through
+/// `MTLFunctionConstantValues`), built through its own binary archive in `dir` (None: no
+/// archive) under `unit`.
+///
+/// The archive key ([archive_key]) covers the metallib, the device, the OS build and
+/// [specialized_name], so it includes the constant values: each specialization is a separate
+/// archive file and unit-level pruning ([prune_other_keys]) works as for [ArchivedKernels].
+/// Callers should give each specialization its own `unit` (e.g. with the value in it), so that
+/// the specializations of one metallib do not prune each other; unit names follow the module
+/// doc's rule (no unit is another's prefix followed by `-`). Same fallbacks as
+/// [ArchivedKernels::new_in]: an archive error is reported and logged, never fatal. Blocking
+/// (a cold specialization of a large kernel compiles for many seconds), so callers that must not
+/// wait run it on a thread of their own.
+pub fn specialized_pipeline(
+    dir: Option<PathBuf>,
+    device: &DeviceRef,
+    library: &metal::LibraryRef,
+    bytes: &[u8],
+    unit: &str,
+    name: &str,
+    constants: &[(usize, u32)],
+) -> Result<(ComputePipelineState, ArchiveReport)> {
+    let t0 = Instant::now();
+    let dir = dir.map(|d| std::path::absolute(&d).unwrap_or(d));
+    let values = metal::FunctionConstantValues::new();
+    for (index, value) in constants {
+        values.set_constant_value_at_index(
+            value as *const u32 as *const std::ffi::c_void,
+            metal::MTLDataType::UInt,
+            *index as u64,
+        );
+    }
+    let function = library
+        .get_function(name, Some(values))
+        .map_err(|e| anyhow!("metallib function {name} (specialized {constants:?}): {e}"))?;
+    let key_name = specialized_name(name, constants);
+    let base = dir
+        .as_deref()
+        .and_then(|dir| archive_base(dir, device, unit, bytes, &[key_name.as_str()]));
+    let mut report = ArchiveReport {
+        path: base.as_deref().map(|b| b.with_extension(ARCHIVE_EXT)),
+        ..Default::default()
+    };
+    if dir.is_some() && base.is_none() {
+        report
+            .errors
+            .push("OS build unknown: binary archive not used".into());
+    }
+    let opened = SystemTime::now();
+    let archive = base
+        .as_deref()
+        .and_then(|base| open_archive(device, base, &mut report));
+    let add_nanos = AtomicU64::new(0);
+    let (pso, source) = metal::objc::rc::autoreleasepool(|| {
+        build_function(device, &function, &key_name, archive.as_deref(), &add_nanos)
+    })?;
+    report.add_time = Duration::from_nanos(add_nanos.load(Ordering::Relaxed));
+    let mut added = false;
+    match source {
+        Source::Hit => report.hits += 1,
+        Source::Added => {
+            report.misses += 1;
+            added = true;
+        }
+        Source::Plain(err) => {
+            report.misses += 1;
+            if let Some(err) = err {
+                let msg = format!("{key_name}: {err}");
+                tracing::warn!("{unit}: Metal binary archive: {msg}; built without it");
+                report.errors.push(msg);
+            }
+        }
+    }
+    if let (Some(archive), Some(base), true) = (archive.as_deref(), base.as_deref(), added) {
+        let t_save = Instant::now();
+        match save_archive(archive, base, unit, opened) {
+            Ok(path) => {
+                report.saved = true;
+                report.path = Some(path);
+            }
+            Err(e) => {
+                let msg = format!("saving {}: {e:#}", base.display());
+                tracing::warn!("{unit}: Metal binary archive: {msg}; PSO unaffected");
+                report.errors.push(msg);
+            }
+        }
+        report.save_time = t_save.elapsed();
+    }
+    report.elapsed = t0.elapsed();
+    Ok((pso, report))
+}
+
 /// Each PSO: an archive hit if possible; else its function is compiled into the archive and the
 /// PSO loaded from there (one GPU compile per kernel); else (archive error) a plain build. Runs
 /// on up to `available_parallelism` threads: the compiler service compiles concurrently.
@@ -616,32 +802,8 @@ fn build_all<'a>(
         let function = library
             .get_function(name, None)
             .map_err(|e| anyhow!("metallib function {name}: {e}"))?;
-        let desc = ComputePipelineDescriptor::new();
-        desc.set_compute_function(Some(&function));
-        let mut archive_err = None;
-        if let Some(archive) = archive {
-            desc.set_binary_archives(&[archive]);
-            let from_archive =
-                || new_pso_with_options(device, &desc, MTLPipelineOption::FailOnBinaryArchiveMiss);
-            if let Ok(pso) = from_archive() {
-                return Ok((name, pso, Source::Hit));
-            }
-            let t = Instant::now();
-            let added = archive.add_compute_pipeline_functions_with_descriptor(&desc);
-            add_nanos.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            match added {
-                Ok(_) => match from_archive() {
-                    Ok(pso) => return Ok((name, pso, Source::Added)),
-                    Err(e) => archive_err = Some(format!("not in the archive after adding: {e}")),
-                },
-                Err(e) => archive_err = Some(format!("adding to the archive: {e}")),
-            }
-            desc.set_binary_archives(&[]);
-        }
-        let pso = device
-            .new_compute_pipeline_state(&desc)
-            .map_err(|e| anyhow!("compute pipeline for {name}: {e}"))?;
-        Ok((name, pso, Source::Plain(archive_err)))
+        let (pso, source) = build_function(device, &function, name, archive, add_nanos)?;
+        Ok((name, pso, source))
     };
 
     let threads = std::thread::available_parallelism()
