@@ -52,7 +52,7 @@ fn test_input() -> VecDeque<u32> {
     (0..16u32).map(|i| i * 0x101 + 7).collect()
 }
 
-fn preflight_for(po2: usize) -> (Arc<Program>, Preflight) {
+pub(super) fn preflight_for(po2: usize) -> (Arc<Program>, Preflight) {
     let program = get_zkr("test_recursion_circuit.zkr", po2).unwrap();
     let mut pf = Preflight::new(test_input());
     for (cycle, row) in program.code_by_row().enumerate() {
@@ -61,7 +61,7 @@ fn preflight_for(po2: usize) -> (Arc<Program>, Preflight) {
     (program, pf)
 }
 
-fn raw_trace(program: &Program, pf: &Preflight) -> RawPreflightTrace {
+pub(super) fn raw_trace(program: &Program, pf: &Preflight) -> RawPreflightTrace {
     RawPreflightTrace {
         wom: pf.trace.wom.as_ptr(),
         cycles: pf.trace.cycles.as_ptr(),
@@ -78,7 +78,11 @@ fn raw(v: &[BabyBearElem]) -> Vec<u32> {
 
 /// The CPU HAL witness (data, global) as the prover sets it up (ctrl transposed, data and global
 /// INVALID).
-fn cpu_witness(program: &Program, pf: &Preflight, mode: StepMode) -> (Vec<u32>, Vec<u32>) {
+pub(super) fn cpu_witness(
+    program: &Program,
+    pf: &Preflight,
+    mode: StepMode,
+) -> (Vec<u32>, Vec<u32>) {
     let total = 1usize << program.po2;
     let hal: CpuHal<BabyBear> = CpuHal::new(Sha256HashSuite::new_suite());
     let ctrl = hal.copy_from_elem("ctrl", &host_ctrl_for(program));
@@ -94,20 +98,20 @@ fn cpu_witness(program: &Program, pf: &Preflight, mode: StepMode) -> (Vec<u32>, 
     (raw(&data.to_vec()), raw(&global.to_vec()))
 }
 
-struct MetalRun {
-    hal: Arc<MetalHalPoseidon2>,
-    circuit: MetalCircuitHal<risc0_zkp::hal::metal::MetalHashPoseidon2>,
+pub(super) struct MetalRun {
+    pub(super) hal: Arc<MetalHalPoseidon2>,
+    pub(super) circuit: MetalCircuitHal<risc0_zkp::hal::metal::MetalHashPoseidon2>,
 }
 
 impl MetalRun {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let hal = Arc::new(MetalHalPoseidon2::new());
         let circuit = MetalCircuitHal::new(hal.clone()).unwrap();
         Self { hal, circuit }
     }
 
     /// The Metal witness (data, global); returns the peak device allocation during the call.
-    fn witness(
+    pub(super) fn witness(
         &self,
         program: &Program,
         trace: &RawPreflightTrace,
@@ -145,7 +149,12 @@ fn first_diff(a: &[u32], b: &[u32]) -> Option<usize> {
     a.iter().zip(b).position(|(x, y)| x != y)
 }
 
-fn assert_same(what: &str, total: usize, metal: &(Vec<u32>, Vec<u32>), cpu: &(Vec<u32>, Vec<u32>)) {
+pub(super) fn assert_same(
+    what: &str,
+    total: usize,
+    metal: &(Vec<u32>, Vec<u32>),
+    cpu: &(Vec<u32>, Vec<u32>),
+) {
     if let Some(i) = first_diff(&metal.0, &cpu.0) {
         panic!(
             "{what}: data differs at col {} row {}: metal {:#x} cpu {:#x}",
@@ -162,7 +171,11 @@ fn assert_same(what: &str, total: usize, metal: &(Vec<u32>, Vec<u32>), cpu: &(Ve
 
 /// Chains of at least `min_len` cycles executed on the host (`witgen::try_host_chains_range` with
 /// a configurable threshold; the production threshold is 16).
-fn chains_with_min_len(program: &Program, pf: &Preflight, min_len: usize) -> Option<HostChains> {
+pub(super) fn chains_with_min_len(
+    program: &Program,
+    pf: &Preflight,
+    min_len: usize,
+) -> Option<HostChains> {
     let cycles = &pf.trace.cycles[..program.code_rows()];
     let n = cycles.len();
     let (mut chains, mut heads, mut start, mut num_rows) = (Vec::new(), Vec::new(), 0usize, 0);
@@ -209,7 +222,7 @@ fn chains_with_min_len(program: &Program, pf: &Preflight, min_len: usize) -> Opt
     Some(out)
 }
 
-fn witgen_matches_cpu(po2: usize) {
+pub(super) fn witgen_matches_cpu(po2: usize) {
     let (program, pf) = preflight_for(po2);
     let total = 1usize << po2;
     let trace = raw_trace(&program, &pf);

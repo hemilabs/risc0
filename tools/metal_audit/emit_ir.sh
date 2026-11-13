@@ -25,7 +25,7 @@ emit() { # unit src includes...
 P=$ROOT/risc0
 for f in "$P/circuit/rv32im-sys/kernels/metal/misc.metal" "$RV"/metal/*.metal; do
   emit rv32im "$f" "$P/circuit/rv32im-sys/kernels/metal" "$RV/metal" & done
-for f in "$P/circuit/recursion-sys/kernels/metal/rec_kernels.metal" "$RC"/metal/*.metal; do
+for f in "$P"/circuit/recursion-sys/kernels/metal/*.metal "$RC"/metal/*.metal; do
   emit recursion "$f" "$P/circuit/recursion-sys/kernels/metal" & done
 wait
 n=0

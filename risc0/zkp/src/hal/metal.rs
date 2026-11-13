@@ -564,6 +564,14 @@ impl<MH: MetalHash> MetalHal<MH> {
         self.rt.set_debug(on);
     }
 
+    /// `RISC0_METAL_DEBUG=1`: panic if `buf` is bound in a batch of this HAL that has not been
+    /// observed complete. For buffers the caller owns and binds as [KernelArg::Buffer] (e.g. the
+    /// recursion witgen's prepare()-staged shared buffers, C14), which the HAL's own host
+    /// accessors never see. A no-op without debug mode.
+    pub fn debug_check_host_access(&self, buf: &BufferRef, name: &str, what: &str) {
+        self.rt.check_host_access(buf, name, what);
+    }
+
     /// Source-compatible: dispatch a zkp kernel by name over `count` threads (encode only).
     pub fn dispatch_by_name(&self, name: &str, args: &[KernelArg], count: u64) {
         self.launch(name, count, args);

@@ -1009,7 +1009,11 @@ fn build_metal_kernels() {
     const OUTPUT: &str = "metal_kernels_recursion";
     // Hand-written kernels (C1). `kernels/metal` is the include dir for context.h/extern.h (it is
     // also hashed into the metallib cache key, so editing a header rebuilds).
-    const SOURCES: &[&str] = &["kernels/metal/rec_kernels.metal"];
+    // C14: `rec_sort.metal`, the GPU WOM counting sort.
+    const SOURCES: &[&str] = &[
+        "kernels/metal/rec_kernels.metal",
+        "kernels/metal/rec_sort.metal",
+    ];
     // (translator, extra args, its outputs in `$OUT_DIR/metal`, the CUDA inputs it reads).
     type Translator = (
         &'static str,
