@@ -67,18 +67,24 @@ pub trait KeccakProver {
     }
 
     fn verify(&self, seal: &Seal) -> Result<()> {
-        let hash_suite = Poseidon2HashSuite::new_suite();
-
-        // We don't have a `code' buffer to verify.
-        let check_code_fn = |_: u32, _: &Digest| Ok(());
-
-        Ok(risc0_zkp::verify::verify(
-            &CircuitImpl,
-            &hash_suite,
-            seal,
-            check_code_fn,
-        )?)
+        verify_seal(seal)
     }
+}
+
+/// Verify a keccak seal on the CPU ([KeccakProver::verify] without a prover: it uses no HAL, so it
+/// can run on any thread, e.g. beside the next proof).
+pub fn verify_seal(seal: &[u32]) -> Result<()> {
+    let hash_suite = Poseidon2HashSuite::new_suite();
+
+    // We don't have a `code' buffer to verify.
+    let check_code_fn = |_: u32, _: &Digest| Ok(());
+
+    Ok(risc0_zkp::verify::verify(
+        &CircuitImpl,
+        &hash_suite,
+        seal,
+        check_code_fn,
+    )?)
 }
 
 /// A keccak proof's witness, made on the CPU by [host_witness].
