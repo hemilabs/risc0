@@ -11,12 +11,12 @@ static constexpr int P254_ROUNDS_HALF_FULL = 4;
 static constexpr int P254_ROUNDS_PARTIAL = 42;
 static constexpr int P254_ROUNDS_TOT = 2 * P254_ROUNDS_HALF_FULL + P254_ROUNDS_PARTIAL; // 50
 
-// S-box: x^8 via 3 squarings
+// S-box: x^7 (risc0 3.1; x^8, used before, is not a permutation of the BN254 scalar field).
 ESIMD_INLINE Fp sbox(const Fp& x) {
     Fp x2 = mont_mul(x, x);
     Fp x4 = mont_mul(x2, x2);
-    Fp x8 = mont_mul(x4, x4);
-    return x8;
+    Fp x6 = mont_mul(x4, x2);
+    return mont_mul(x6, x);
 }
 
 // Broadcast a constant Fp from AoS uint32_t[8] to all 16 lanes.
