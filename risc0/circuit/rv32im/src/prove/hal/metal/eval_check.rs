@@ -59,6 +59,13 @@
 //! specialization compiles for ~15 s and never blocks a segment). [EVAL_FC_ENV] selects the
 //! mode.
 //!
+//! R22 (docs/metal-port/notes/R22.md): the split kernels run a flat chain (to_metal.py): the
+//! generated chain functions are called one after another by poly_fp / rk_accblk instead of each
+//! calling the next, passing their Fp arguments through a `thread` array, so one chain frame is
+//! live at a time (native stack ~4 KB instead of ~19 KB) and the kernel is ~7 % faster on the M5
+//! Max. [EVAL_FLAT_ENV]=0 runs the nested-chain kernels of before R22 (`ef_eval_split_nest`,
+//! `ef_eval_split_fc_nest`). eval_regime.rs guards the compiler regime of the kernels.
+//!
 //! The R7 CPU path (the `hal/cpu.rs` loop over `risc0_circuit_rv32im_cpu_poly_fp` on host views of
 //! the shared buffers) is kept as a debugging fallback, selected with
 //! `RISC0_METAL_RV32IM_CPU_PHASES=eval` (a comma list of `witgen,accum,eval`).
@@ -188,12 +195,53 @@ impl FcMode {
 /// with function constants that was not created with constant values.
 pub(crate) const FC_KERNEL: &str = "ef_eval_split_fc";
 
+/// R22: `RISC0_METAL_RV32IM_EVAL_FLAT`: `1` (default) runs the flat-chain split kernels
+/// (`ef_eval_split`, `ef_eval_split_fc`), `0` the nested-chain ones of before R22
+/// (`ef_eval_split_nest`, lazy, and `ef_eval_split_fc_nest`; the revert knob). Read on every
+/// call; unknown values are an error.
+pub(crate) const EVAL_FLAT_ENV: &str = "RISC0_METAL_RV32IM_EVAL_FLAT";
+/// R22: the nested-chain plain split kernel (built on first use).
+pub(crate) const NEST_KERNEL: &str = "ef_eval_split_nest";
+/// R22: the nested-chain specialized split kernel.
+pub(crate) const FC_NEST_KERNEL: &str = "ef_eval_split_fc_nest";
+
+pub(crate) fn parse_flat(v: &str) -> anyhow::Result<bool> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "" | "1" | "on" | "flat" => Ok(true),
+        "0" | "off" | "nest" => Ok(false),
+        _ => anyhow::bail!("{EVAL_FLAT_ENV}={v:?}: expected `1` or `0`"),
+    }
+}
+
+/// Whether [EVAL_FLAT_ENV] selects the flat chain now.
+pub(crate) fn flat_chain() -> anyhow::Result<bool> {
+    std::env::var(EVAL_FLAT_ENV).map_or(Ok(true), |v| parse_flat(&v))
+}
+
+/// The specialized split kernel of the flat ([FC_KERNEL]) or nested ([FC_NEST_KERNEL]) chain.
+pub(crate) fn fc_kernel(flat: bool) -> &'static str {
+    if flat {
+        FC_KERNEL
+    } else {
+        FC_NEST_KERNEL
+    }
+}
+
 /// The archive unit of the specialization of `domain` of the library archived under `unit`: one
 /// unit per domain, so the domains of one metallib do not prune each other's archives (zkp
 /// archive.rs keeps a few keys per unit). `<unit>_fc<domain>` is no other unit's prefix followed
 /// by `-` (the archive module's naming rule).
 pub(crate) fn fc_unit(unit: &str, domain: u32) -> String {
     format!("{unit}_fc{domain}")
+}
+
+/// [fc_unit] of the flat or (R22, `<unit>_fcnest<domain>`) the nested specialized kernel.
+pub(crate) fn fc_unit_of(unit: &str, domain: u32, flat: bool) -> String {
+    if flat {
+        fc_unit(unit, domain)
+    } else {
+        format!("{unit}_fcnest{domain}")
+    }
 }
 
 /// The build state of one domain's specialized PSO.
@@ -204,38 +252,38 @@ enum FcState {
     Failed,
 }
 
-/// Specialized PSO states by domain (one rv32im library per process), and the condition variable
-/// [FcMode::Wait] waits on.
-fn fc_states() -> &'static (
-    std::sync::Mutex<std::collections::HashMap<u32, FcState>>,
+/// Specialized PSO states by (domain, flat chain) (one rv32im library per process), and the
+/// condition variable [FcMode::Wait] waits on.
+type FcStates = (
+    std::sync::Mutex<std::collections::HashMap<(u32, bool), FcState>>,
     std::sync::Condvar,
-) {
-    static S: std::sync::OnceLock<(
-        std::sync::Mutex<std::collections::HashMap<u32, FcState>>,
-        std::sync::Condvar,
-    )> = std::sync::OnceLock::new();
+);
+fn fc_states() -> &'static FcStates {
+    static S: std::sync::OnceLock<FcStates> = std::sync::OnceLock::new();
     S.get_or_init(Default::default)
 }
 
-/// Build (blocking) the PSO of [FC_KERNEL] specialized for `domain` from `kernels`'s library,
-/// through the binary archive of [fc_unit] (or none when `kernels` has no archive directory).
+/// Build (blocking) the PSO of [fc_kernel] specialized for `domain` from `kernels`'s library,
+/// through the binary archive of [fc_unit_of] (or none when `kernels` has no archive directory).
 fn build_fc(
     kernels: &super::Rv32imKernels,
     domain: u32,
+    flat: bool,
 ) -> anyhow::Result<metal::ComputePipelineState> {
+    let name = fc_kernel(flat);
     let src = kernels
         .source
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("no kernel source for a specialized PSO"))?;
     let lib = kernels.kernels.library();
-    let unit = fc_unit(src.unit, domain);
+    let unit = fc_unit_of(src.unit, domain, flat);
     let (pso, r) = risc0_zkp::hal::metal::archive::specialized_pipeline(
         src.archive_dir.clone(),
         lib.device(),
         lib,
         src.bytes,
         &unit,
-        FC_KERNEL,
+        name,
         &[(0, domain)],
     )?;
     // R22: refuse a specialization the back end compiled into the slow regime (eval_regime.rs).
@@ -243,14 +291,14 @@ fn build_fc(
         let info = r
             .path
             .as_deref()
-            .and_then(|p| eval_regime::archive_info(p, FC_KERNEL));
+            .and_then(|p| eval_regime::archive_info(p, name));
         let regime = eval_regime::Regime::of(info, eval_regime::settings().1);
-        if !eval_regime::fc_acceptable(kernels, domain, regime) {
+        if !eval_regime::fc_acceptable(kernels, name, domain, regime) {
             anyhow::bail!("refused by the eval regime guard (slow compiler regime)");
         }
     }
     tracing::info!(
-        "rv32im Metal: {FC_KERNEL} for domain {domain} in {:.2} s (binary archive {}: {} hits, \
+        "rv32im Metal: {name} for domain {domain} in {:.2} s (binary archive {}: {} hits, \
          {} misses{})",
         r.elapsed.as_secs_f64(),
         r.path
@@ -268,19 +316,20 @@ fn build_fc(
 }
 
 /// Record the outcome of a domain's build and wake [FcMode::Wait] callers.
-fn fc_finish(domain: u32, res: anyhow::Result<metal::ComputePipelineState>) {
+fn fc_finish(domain: u32, flat: bool, res: anyhow::Result<metal::ComputePipelineState>) {
     let state = match res {
         Ok(pso) => FcState::Ready(Box::leak(Box::new(pso))),
         Err(e) => {
             tracing::warn!(
-                "rv32im Metal: no {FC_KERNEL} PSO specialized for domain {domain} ({e:#}); the \
-                 plain PSO stays in use"
+                "rv32im Metal: no {} PSO specialized for domain {domain} ({e:#}); the plain PSO \
+                 stays in use",
+                fc_kernel(flat)
             );
             FcState::Failed
         }
     };
     let (states, cv) = fc_states();
-    states.lock().unwrap().insert(domain, state);
+    states.lock().unwrap().insert((domain, flat), state);
     cv.notify_all();
 }
 
@@ -308,6 +357,8 @@ pub(crate) fn fc_prewarm(kernels: &'static super::Rv32imKernels) {
         let Some(dir) = src.archive_dir.clone() else {
             return;
         };
+        // R22: the specializations of the chain form in use at library load.
+        let flat = flat_chain().unwrap_or(true);
         let spawned = std::thread::Builder::new()
             .name("rv32im-fc-prewarm".into())
             .spawn(move || {
@@ -323,8 +374,8 @@ pub(crate) fn fc_prewarm(kernels: &'static super::Rv32imKernels) {
                             &dir,
                             device,
                             src.bytes,
-                            &fc_unit(src.unit, domain),
-                            FC_KERNEL,
+                            &fc_unit_of(src.unit, domain, flat),
+                            fc_kernel(flat),
                             &[(0, domain)],
                         )?;
                         Some((risc0_zkp::hal::metal::archive::archive_used(&base)?, domain))
@@ -334,13 +385,13 @@ pub(crate) fn fc_prewarm(kernels: &'static super::Rv32imKernels) {
                 for (_, domain) in cached {
                     {
                         let mut map = fc_states().0.lock().unwrap();
-                        if map.contains_key(&domain) {
+                        if map.contains_key(&(domain, flat)) {
                             continue;
                         }
-                        map.insert(domain, FcState::Building);
+                        map.insert((domain, flat), FcState::Building);
                     }
-                    let res = metal::objc::rc::autoreleasepool(|| build_fc(kernels, domain));
-                    fc_finish(domain, res);
+                    let res = metal::objc::rc::autoreleasepool(|| build_fc(kernels, domain, flat));
+                    fc_finish(domain, flat, res);
                 }
             });
         if let Err(e) = spawned {
@@ -349,7 +400,7 @@ pub(crate) fn fc_prewarm(kernels: &'static super::Rv32imKernels) {
     });
 }
 
-/// The [FC_KERNEL] PSO specialized for `domain` if it is ready. Otherwise (first call for this
+/// The [fc_kernel] PSO (flat or nested chain) specialized for `domain` if it is ready. Otherwise (first call for this
 /// domain) starts its build: on a background thread for [FcMode::Background] (None until it is
 /// ready), or waits for it for [FcMode::Wait]. None for [FcMode::Off], after a failed build, or
 /// when `kernels` has no source (test-loaded libraries).
@@ -357,26 +408,28 @@ pub(crate) fn fc_pipeline(
     kernels: &'static super::Rv32imKernels,
     domain: u32,
     mode: FcMode,
+    flat: bool,
 ) -> Option<&'static metal::ComputePipelineState> {
     if mode == FcMode::Off || kernels.source.is_none() || !fc_domain_in_range(domain) {
         return None;
     }
     let (states, cv) = fc_states();
     let mut map = states.lock().unwrap();
-    match map.get(&domain) {
+    let key = (domain, flat);
+    match map.get(&key) {
         Some(FcState::Ready(pso)) => return Some(pso),
         Some(FcState::Failed) => return None,
         Some(FcState::Building) => {}
         None => {
-            map.insert(domain, FcState::Building);
+            map.insert(key, FcState::Building);
             let spawned = std::thread::Builder::new()
                 .name(format!("rv32im-fc{domain}"))
                 .spawn(move || {
-                    let res = metal::objc::rc::autoreleasepool(|| build_fc(kernels, domain));
-                    fc_finish(domain, res);
+                    let res = metal::objc::rc::autoreleasepool(|| build_fc(kernels, domain, flat));
+                    fc_finish(domain, flat, res);
                 });
             if let Err(e) = spawned {
-                map.insert(domain, FcState::Failed);
+                map.insert(key, FcState::Failed);
                 tracing::warn!("rv32im Metal: cannot start the {FC_KERNEL} specialization: {e}");
                 return None;
             }
@@ -386,7 +439,7 @@ pub(crate) fn fc_pipeline(
         return None;
     }
     loop {
-        match map.get(&domain) {
+        match map.get(&key) {
             Some(FcState::Ready(pso)) => return Some(pso),
             Some(FcState::Building) => map = cv.wait(map).unwrap(),
             _ => return None,
@@ -539,26 +592,37 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
         self.ctx.require(Phase::EvalCheck)?;
         // R20: the domain-specialized split PSO once it is built ([EVAL_FC_ENV]).
         let domain = steps * INV_RATE;
+        // R22: the flat chain (default) or the nested one ([EVAL_FLAT_ENV]).
+        let flat = flat_chain()?;
         let fc = match u32::try_from(domain) {
-            Ok(d) => fc_pipeline(self.ctx.kernels(), d, FcMode::current()?),
+            Ok(d) => fc_pipeline(self.ctx.kernels(), d, FcMode::current()?, flat),
             Err(_) => None,
         };
         // R22: the regime guard's fallback replaces the plain PSO if that one is slow.
-        let fallback = eval_regime::fallback_split();
+        let fallback = if flat {
+            eval_regime::fallback_split()
+        } else {
+            None
+        };
+        let plain = match (fc.is_some() || fallback.is_some(), flat) {
+            (true, _) => None,
+            (false, true) => Some(self.ctx.pipeline("ef_eval_split")),
+            (false, false) => Some(lazy_pipeline(self.ctx.library(), NEST_KERNEL)?),
+        };
         tracing::debug!(
             "eval_check (Metal evalfast): {}",
-            if fc.is_some() {
-                "ef_eval_split_fc specialized for the domain"
-            } else if fallback.is_some() {
-                "the eval regime guard's fallback (ef_eval_split_r15e)"
-            } else {
-                "plain ef_eval_split"
+            match (fc.is_some(), fallback, flat) {
+                (true, _, _) => format!("{} specialized for the domain", fc_kernel(flat)),
+                (false, Some((name, _)), _) => format!("the eval regime guard's fallback ({name})"),
+                (false, None, true) => "plain ef_eval_split".into(),
+                (false, None, false) => format!("plain {NEST_KERNEL}"),
             }
         );
         let k = EfKernels {
             split: fc
-                .or(fallback)
-                .unwrap_or_else(|| self.ctx.pipeline("ef_eval_split")),
+                .or(fallback.map(|(_, pso)| pso))
+                .or(plain)
+                .expect("a split PSO"),
             combine: self.ctx.pipeline("ef_combine"),
             threads: EF_THREADS,
         };
@@ -1078,6 +1142,9 @@ mod ef_tests {
         Evalfast,
         /// R20: evalfast with the split PSO specialized for the domain ([fc_test_pso]).
         EvalfastFc,
+        /// R22: the nested-chain split kernels (plain, and specialized for the domain).
+        EvalfastNest,
+        EvalfastFcNest,
         EvalfastR12,
         EvalfastR15e,
         Baseline,
@@ -1087,16 +1154,17 @@ mod ef_tests {
     /// binary archive (the OS shader cache makes repeats cheap) and kept for the process.
     fn fc_test_pso(
         c: &MetalCircuitHal<risc0_zkp::hal::metal::MetalHashSha256>,
+        name: &'static str,
         domain: u32,
     ) -> &'static metal::ComputePipelineState {
         use std::{
             collections::HashMap,
             sync::{Mutex, OnceLock},
         };
-        static PSOS: OnceLock<Mutex<HashMap<u32, &'static metal::ComputePipelineState>>> =
+        static PSOS: OnceLock<Mutex<HashMap<(&str, u32), &'static metal::ComputePipelineState>>> =
             OnceLock::new();
         let psos = PSOS.get_or_init(Default::default);
-        if let Some(p) = psos.lock().unwrap().get(&domain) {
+        if let Some(p) = psos.lock().unwrap().get(&(name, domain)) {
             return p;
         }
         let lib = c.ctx.library();
@@ -1107,17 +1175,17 @@ mod ef_tests {
             lib,
             &[],
             "unused",
-            FC_KERNEL,
+            name,
             &[(0, domain)],
         )
         .unwrap();
         println!(
-            "R20 {FC_KERNEL} specialized for domain {domain}: PSO in {:?}",
+            "R20 {name} specialized for domain {domain}: PSO in {:?}",
             t.elapsed()
         );
         psos.lock()
             .unwrap()
-            .entry(domain)
+            .entry((name, domain))
             .or_insert_with(|| Box::leak(Box::new(pso)))
     }
 
@@ -1150,9 +1218,14 @@ mod ef_tests {
                 Which::Evalfast => {
                     c.eval_check_evalfast(&check, &groups, &globals, inp.poly_mix, po2, steps)
                 }
-                Which::EvalfastFc => {
+                Which::EvalfastFc | Which::EvalfastFcNest | Which::EvalfastNest => {
+                    let split = match which {
+                        Which::EvalfastFc => fc_test_pso(c, FC_KERNEL, domain as u32),
+                        Which::EvalfastFcNest => fc_test_pso(c, FC_NEST_KERNEL, domain as u32),
+                        _ => lazy_pipeline(c.ctx.library(), NEST_KERNEL).unwrap(),
+                    };
                     let k = EfKernels {
-                        split: fc_test_pso(c, domain as u32),
+                        split,
                         combine: c.ctx.pipeline("ef_combine"),
                         threads: EF_THREADS,
                     };
@@ -1207,6 +1280,18 @@ mod ef_tests {
         let (r12, r12_t, _) = gpu_checks(&c, inp, po2, Which::EvalfastR12, 1);
         let (r15e, r15e_t, _) = gpu_checks(&c, inp, po2, Which::EvalfastR15e, 1);
         let (fc, fc_t, _) = gpu_checks(&c, inp, po2, Which::EvalfastFc, 2);
+        // R22: the nested-chain kernels (the revert switch) too.
+        let (nest, nest_t, _) = gpu_checks(&c, inp, po2, Which::EvalfastNest, 1);
+        let (fcn, fcn_t, _) = gpu_checks(&c, inp, po2, Which::EvalfastFcNest, 1);
+        for (what, r) in [("nested", &nest[0]), ("nested specialized", &fcn[0])] {
+            let n = mismatches(&cpu, r);
+            assert_eq!(
+                n,
+                0,
+                "po2 {po2}: evalfast ({what}) vs CPU: {n} of {} differ",
+                cpu.len()
+            );
+        }
         for (i, f) in fc.iter().enumerate() {
             let n = mismatches(&cpu, f);
             assert_eq!(
@@ -1248,8 +1333,9 @@ mod ef_tests {
         );
         println!(
             "R12 eval_check po2 {po2} ({kind} inputs): {} elements bit-exact (evalfast x{reps} == \
-             evalfast specialized x2 == evalfast_r15e == \
+             evalfast specialized x2 == nested == nested specialized == evalfast_r15e == \
              evalfast_r12 == baseline == CPU); evalfast {fast_t:?}, specialized {fc_t:?}, \
+             nested {nest_t:?}, nested specialized {fcn_t:?}, \
              evalfast_r15e {r15e_t:?}, \
              evalfast_r12 {r12_t:?}, baseline {base_t:?}, \
              CPU HAL {cpu_time:?}; inputs {} B, peak \
@@ -1322,6 +1408,17 @@ mod ef_tests {
             );
             if n > 0 {
                 bad.push((seed, n));
+            }
+            // R22: the nested-chain forms.
+            for which in [Which::EvalfastNest, Which::EvalfastFcNest] {
+                let (r, t, _) = gpu_checks(&c, &inp, po2, which, 1);
+                let n = mismatches(&base[0], &r[0]);
+                println!(
+                    "R22 evalfast {which:?} seed {seed} po2 {po2}: {n} elements differ; {t:?}"
+                );
+                if n > 0 {
+                    bad.push((seed, n));
+                }
             }
         }
         assert!(
@@ -1682,6 +1779,8 @@ mod ef_tests {
             "ef_eval_split_r12",
             "ef_eval_split_r15e",
             FC_KERNEL,
+            NEST_KERNEL,
+            FC_NEST_KERNEL,
         ] {
             assert!(k.get(name).is_none(), "{name} built at load");
             assert!(
@@ -1783,15 +1882,15 @@ mod ef_tests {
 
     /// R22: the regime guard reads the OS driver's compile of each candidate split kernel from a
     /// binary archive (eval_regime.rs). Fails when the default kernels (plain, and specialized for
-    /// po2 20) are not in the fast regime, i.e. after a toolchain / OS / generator change that
-    /// costs ~2.4x eval_check time; also checks that the field still separates the regimes
-    /// (R15e's form is slow today) and that the fallback PSO built through an archive is
-    /// CPU-exact.
+    /// po2 20, flat and nested chain) are not in the fast regime, i.e. after a toolchain / OS /
+    /// generator change that costs ~2.4x eval_check time; also checks that the field still
+    /// separates the regimes (R15e's form is slow today) and that the fallback PSOs built
+    /// through archives are CPU-exact.
     #[test]
     fn eval_regime_guard_kernels() {
         use risc0_zkp::hal::metal::archive;
 
-        use super::eval_regime::{archive_info, Regime, FALLBACK_KERNEL, PLAIN_KERNEL, STACK_MAX};
+        use super::eval_regime::{archive_info, Regime, FALLBACK_KERNELS, PLAIN_KERNEL, STACK_MAX};
         let dir = std::env::temp_dir().join(format!("risc0-r22-guard-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1802,11 +1901,14 @@ mod ef_tests {
         let domain = 4u32 << 20;
         /// (kernel, function constants, expected in the fast regime)
         type Case<'a> = (&'a str, &'a [(usize, u32)], bool);
-        let cases: [Case; 3] = [
+        let cases: [Case; 5] = [
             (PLAIN_KERNEL, &[], true),
             (FC_KERNEL, &[(0, domain)], true),
-            (FALLBACK_KERNEL, &[], false),
+            (NEST_KERNEL, &[], true),
+            (FC_NEST_KERNEL, &[(0, domain)], true),
+            (FALLBACK_KERNELS[1].0, &[], false),
         ];
+        assert_eq!(FALLBACK_KERNELS[0].0, NEST_KERNEL);
         let built: Vec<_> = std::thread::scope(|s| {
             let hs: Vec<_> = cases
                 .iter()
@@ -1867,32 +1969,34 @@ mod ef_tests {
                 );
             }
         }
-        // The archive-built fallback PSO computes the same check as the CPU.
+        // The archive-built fallback PSOs (nest, r15e) compute the same check as the CPU.
         let po2 = 10;
         let inp = Inputs::random(po2);
         let cpu = cpu_check(&inp, po2);
         let steps = 1 << po2;
         let [code, data, accum, mix, out] = [&inp.code, &inp.data, &inp.accum, &inp.mix, &inp.out]
             .map(|b| hal.copy_from_elem("in", b));
-        let check = hal.alloc_elem("check", ExtVal::EXT_SIZE * steps * INV_RATE);
-        check.view_mut(|v| v.fill(Val::new_raw(0x7fff_ffff)));
-        let k = EfKernels {
-            split: built[2].0.as_ref().unwrap(),
-            combine: c.ctx.pipeline("ef_combine"),
-            threads: EF_THREADS,
-        };
-        c.eval_check_ef_with(
-            &k,
-            &check,
-            &[&accum, &code, &data],
-            &[&mix, &out],
-            inp.poly_mix,
-            po2,
-            steps,
-            None,
-        )
-        .unwrap();
-        assert_eq!(mismatches(&cpu, &check.to_vec()), 0);
+        for i in [2, 4] {
+            let check = hal.alloc_elem("check", ExtVal::EXT_SIZE * steps * INV_RATE);
+            check.view_mut(|v| v.fill(Val::new_raw(0x7fff_ffff)));
+            let k = EfKernels {
+                split: built[i].0.as_ref().unwrap(),
+                combine: c.ctx.pipeline("ef_combine"),
+                threads: EF_THREADS,
+            };
+            c.eval_check_ef_with(
+                &k,
+                &check,
+                &[&accum, &code, &data],
+                &[&mix, &out],
+                inp.poly_mix,
+                po2,
+                steps,
+                None,
+            )
+            .unwrap();
+            assert_eq!(mismatches(&cpu, &check.to_vec()), 0, "{}", cases[i].0);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1906,6 +2010,15 @@ mod ef_tests {
         assert_eq!(FcMode::parse("wait").unwrap(), FcMode::Wait);
         assert!(FcMode::parse("2").is_err());
         assert_eq!(fc_unit("rv32im", 4 << 20), "rv32im_fc4194304");
+        assert_eq!(fc_unit_of("rv32im", 4 << 20, true), "rv32im_fc4194304");
+        assert_eq!(fc_unit_of("rv32im", 4 << 20, false), "rv32im_fcnest4194304");
+        assert!(parse_flat("").unwrap() && parse_flat("1").unwrap());
+        assert!(!parse_flat("0").unwrap() && !parse_flat(" nest ").unwrap());
+        assert!(parse_flat("2").is_err());
+        assert_eq!(
+            (fc_kernel(true), fc_kernel(false)),
+            (FC_KERNEL, FC_NEST_KERNEL)
+        );
         assert!(fc_domain_in_range(4 << 20) && fc_domain_in_range(4 << 13));
         assert!(!fc_domain_in_range(4 << 12) && !fc_domain_in_range(4 << 25));
         assert!(!fc_domain_in_range((4 << 20) + 4));

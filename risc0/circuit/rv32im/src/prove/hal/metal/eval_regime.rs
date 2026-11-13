@@ -14,10 +14,13 @@
 
 //! R22: the eval_check compiler-regime guard (docs/metal-port/notes/R22.md).
 //!
-//! R18 / R21: the time of the evalfast split kernel follows the native per-thread stack the
-//! Apple GPU back end gives it, in two clusters with nothing between them: ~18-21 KB (the fast
-//! regime, today's `ef_eval_split` and `ef_eval_split_fc`) and 32-40 KB (~2.4x slower, e.g.
-//! `ef_eval_split_r15e`). eval_check is ~60 % of a segment, so an OS or toolchain update that
+//! R18 / R21: the time of the nested-chain evalfast split kernel follows the native per-thread
+//! stack the Apple GPU back end gives it, in two clusters with nothing between them: ~18-21 KB
+//! (the fast regime: `ef_eval_split_nest`, `ef_eval_split_fc_nest`, the defaults before R22) and
+//! 32-40 KB (~2.4x slower, e.g. `ef_eval_split_r15e`). R22 measured that the stack size is a
+//! symptom, not the cause (padding the stack by 16 KB costs < 1 %); the flat chain (R22's
+//! default) has a ~4 KB stack and is ~7 % faster. The guard's limit separates both fast forms
+//! from the slow cluster. eval_check is ~60 % of a segment, so an OS or toolchain update that
 //! moves the kernel into the slow cluster would cost ~+45 % STARK time without any error.
 //!
 //! The binary archives the process already writes (zkp `archive`) hold the native code the OS
@@ -25,8 +28,9 @@
 //! `tools/metal_audit/agx_size.py` reads offline). This module reads it ([native_info]) for:
 //! - the plain `ef_eval_split`, once per process on a background thread at library load
 //!   ([start]): a loud warning if it is in the slow regime, and with [GuardMode::Fallback] (the
-//!   default) a background build of `ef_eval_split_r15e` through its own archive, used instead
-//!   of the plain PSO if *it* is in the fast regime ([fallback_split]);
+//!   default) background builds of the [FALLBACK_KERNELS] (the nested chain, then R15e's form)
+//!   through archives of their own; the first in the fast regime replaces the plain PSO
+//!   ([fallback_split]);
 //! - each domain-specialized `ef_eval_split_fc` PSO when it is built (eval_check.rs
 //!   `build_fc`): a slow one is not used while the plain PSO is not slow ([fc_acceptable]).
 //!
@@ -339,11 +343,15 @@ pub(crate) fn archive_info(path: &Path, name: &str) -> Option<NativeInfo> {
 
 // ---- The process-wide guard ----
 
-/// The plain split kernel.
+/// The plain split kernel (the flat chain, R22).
 pub(crate) const PLAIN_KERNEL: &str = "ef_eval_split";
-/// The fallback candidate: R15e's form (16-byte row loads), a different code shape for the back
-/// end; slow today (36 KB stack), the best known alternative if the default's regime is lost.
-pub(crate) const FALLBACK_KERNEL: &str = "ef_eval_split_r15e";
+/// The fallback candidates, in order, each a different code shape for the back end: the nested
+/// chain (the pre-R22 default, fast regime today) and R15e's form (16-byte row loads; slow today,
+/// 36 KB stack).
+pub(crate) const FALLBACK_KERNELS: [(&str, &str); 2] = [
+    (super::eval_check::NEST_KERNEL, "nest"),
+    ("ef_eval_split_r15e", "r15e"),
+];
 
 /// The regime of the process library's plain `ef_eval_split`, read once from the archive the
 /// library was loaded through.
@@ -359,26 +367,31 @@ pub(crate) fn plain_regime(kernels: &super::Rv32imKernels) -> Regime {
     })
 }
 
-/// The fallback split PSO, set by [start] only when the plain one is slow and the fallback fast.
-static FALLBACK: OnceLock<&'static metal::ComputePipelineState> = OnceLock::new();
+/// The fallback split kernel and PSO, set by [start] only when the plain one is slow and a
+/// candidate is fast.
+static FALLBACK: OnceLock<(&'static str, &'static metal::ComputePipelineState)> = OnceLock::new();
 
-/// The split PSO to use instead of the plain `ef_eval_split` (None: the plain one).
-pub(crate) fn fallback_split() -> Option<&'static metal::ComputePipelineState> {
+/// The split kernel and PSO to use instead of the plain `ef_eval_split` (None: the plain one).
+pub(crate) fn fallback_split() -> Option<(&'static str, &'static metal::ComputePipelineState)> {
     FALLBACK.get().copied()
 }
 
-/// Whether a domain-specialized PSO in `fc` regime may be used: a slow one is refused (the
-/// plain PSO is used for that domain) unless the plain kernel is slow too, or the guard only
-/// warns. Logs the outcome.
-pub(crate) fn fc_acceptable(kernels: &super::Rv32imKernels, domain: u32, fc: Regime) -> bool {
+/// Whether the domain-specialized PSO of `name` in `fc` regime may be used: a slow one is
+/// refused (the plain PSO is used for that domain) unless the plain kernel is slow too, or the
+/// guard only warns. Logs the outcome.
+pub(crate) fn fc_acceptable(
+    kernels: &super::Rv32imKernels,
+    name: &str,
+    domain: u32,
+    fc: Regime,
+) -> bool {
     let (mode, _) = settings();
     if mode == GuardMode::Off {
         return true;
     }
     let Regime::Slow(_) = fc else {
         tracing::debug!(
-            "rv32im Metal eval regime guard: {} for domain {domain}: {}",
-            super::eval_check::FC_KERNEL,
+            "rv32im Metal eval regime guard: {name} for domain {domain}: {}",
             fc.describe()
         );
         return true;
@@ -386,9 +399,8 @@ pub(crate) fn fc_acceptable(kernels: &super::Rv32imKernels, domain: u32, fc: Reg
     let plain = plain_regime(kernels);
     let refuse = mode == GuardMode::Fallback && !matches!(plain, Regime::Slow(_));
     tracing::warn!(
-        "rv32im Metal eval regime guard: {} for domain {domain}: {} (plain {PLAIN_KERNEL}: {}); \
-         eval_check is ~2.4x slower in this regime (docs/metal-port/notes/R22.md); {}",
-        super::eval_check::FC_KERNEL,
+        "rv32im Metal eval regime guard: {name} for domain {domain}: {} (plain {PLAIN_KERNEL}: \
+         {}); eval_check is ~2.4x slower in this regime (docs/metal-port/notes/R22.md); {}",
         fc.describe(),
         plain.describe(),
         if refuse {
@@ -401,8 +413,8 @@ pub(crate) fn fc_acceptable(kernels: &super::Rv32imKernels, domain: u32, fc: Reg
 }
 
 /// Once per process, on a background thread: check the plain split kernel's regime, warn if it
-/// is slow, and (in [GuardMode::Fallback]) build the fallback through its own binary archive and
-/// use it if it is fast.
+/// is slow, and (in [GuardMode::Fallback]) build the [FALLBACK_KERNELS] through binary archives
+/// of their own and use the first one in the fast regime.
 pub(crate) fn start(kernels: &'static super::Rv32imKernels) {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -420,7 +432,7 @@ pub(crate) fn start(kernels: &'static super::Rv32imKernels) {
                 match plain {
                     _ if force => tracing::warn!(
                         "rv32im Metal eval regime guard: {EVAL_GUARD_ENV}=force (testing): \
-                         {PLAIN_KERNEL}: {}; switching to {FALLBACK_KERNEL} regardless",
+                         {PLAIN_KERNEL}: {}; switching to the first fallback that builds",
                         plain.describe()
                     ),
                     Regime::Fast(_) => {
@@ -438,53 +450,49 @@ pub(crate) fn start(kernels: &'static super::Rv32imKernels) {
                         );
                         return;
                     }
-                    Regime::Slow(_) => {}
-                }
-                if !force {
-                    tracing::warn!(
+                    Regime::Slow(_) => tracing::warn!(
                         "rv32im Metal eval regime guard: {PLAIN_KERNEL}: {} (limit {max} B). The \
-                     Metal compiler put the eval kernel in its slow regime (R18/R21: ~2.4x \
-                     eval_check time, ~+45 % per segment). {}",
+                         Metal compiler put the eval kernel in its slow regime (R18/R21: ~2.4x \
+                         eval_check time, ~+45 % per segment). {}",
                         plain.describe(),
-                        if mode != GuardMode::Warn {
-                            format!("Trying {FALLBACK_KERNEL} in the background.")
-                        } else {
+                        if mode == GuardMode::Warn {
                             format!("{EVAL_GUARD_ENV}=warn: no fallback.")
+                        } else {
+                            "Trying the fallback kernels in the background.".into()
                         }
-                    );
+                    ),
                 }
                 if mode == GuardMode::Warn {
                     return;
                 }
-                let res = metal::objc::rc::autoreleasepool(|| build_fallback(kernels));
-                match res {
-                    Ok((pso, r)) if force => {
-                        tracing::warn!(
-                            "rv32im Metal eval regime guard: using {FALLBACK_KERNEL} ({}; \
-                             {EVAL_GUARD_ENV}=force)",
+                for (name, tag) in FALLBACK_KERNELS {
+                    let res =
+                        metal::objc::rc::autoreleasepool(|| build_fallback(kernels, name, tag));
+                    match res {
+                        Ok((pso, r)) if force || matches!(r, Regime::Fast(_)) => {
+                            tracing::warn!(
+                                "rv32im Metal eval regime guard: using {name} instead of \
+                                 {PLAIN_KERNEL} ({}{}; {EVAL_GUARD_ENV}=warn keeps \
+                                 {PLAIN_KERNEL})",
+                                r.describe(),
+                                if force { ", force" } else { "" }
+                            );
+                            let _ = FALLBACK.set((name, Box::leak(Box::new(pso))));
+                            return;
+                        }
+                        Ok((_, r)) => tracing::warn!(
+                            "rv32im Metal eval regime guard: fallback {name}: {}",
                             r.describe()
-                        );
-                        let _ = FALLBACK.set(Box::leak(Box::new(pso)));
+                        ),
+                        Err(e) => tracing::warn!(
+                            "rv32im Metal eval regime guard: cannot build {name} ({e:#})"
+                        ),
                     }
-                    Ok((pso, Regime::Fast(i))) => {
-                        tracing::warn!(
-                            "rv32im Metal eval regime guard: {FALLBACK_KERNEL} is in the fast \
-                             regime (native stack {} B): using it instead of {PLAIN_KERNEL} \
-                             ({EVAL_GUARD_ENV}=warn keeps {PLAIN_KERNEL})",
-                            i.stack
-                        );
-                        let _ = FALLBACK.set(Box::leak(Box::new(pso)));
-                    }
-                    Ok((_, r)) => tracing::warn!(
-                        "rv32im Metal eval regime guard: {FALLBACK_KERNEL}: {}; keeping \
-                         {PLAIN_KERNEL}",
-                        r.describe()
-                    ),
-                    Err(e) => tracing::warn!(
-                        "rv32im Metal eval regime guard: cannot build {FALLBACK_KERNEL} ({e:#}); \
-                         keeping {PLAIN_KERNEL}"
-                    ),
                 }
+                tracing::warn!(
+                    "rv32im Metal eval regime guard: no fallback in the fast regime; keeping \
+                     {PLAIN_KERNEL}"
+                );
             });
         if let Err(e) = spawned {
             tracing::warn!("rv32im Metal: cannot start the eval regime guard: {e}");
@@ -492,10 +500,12 @@ pub(crate) fn start(kernels: &'static super::Rv32imKernels) {
     });
 }
 
-/// Build [FALLBACK_KERNEL] through a binary archive of its own (unit `<unit>_r15e`) and read its
-/// regime from that archive.
+/// Build the fallback `name` through a binary archive of its own (unit `<unit>_<tag>`) and read
+/// its regime from that archive.
 fn build_fallback(
     kernels: &super::Rv32imKernels,
+    name: &str,
+    tag: &str,
 ) -> anyhow::Result<(metal::ComputePipelineState, Regime)> {
     let src = kernels
         .source
@@ -507,14 +517,11 @@ fn build_fallback(
         lib.device(),
         lib,
         src.bytes,
-        &format!("{}_r15e", src.unit),
-        FALLBACK_KERNEL,
+        &format!("{}_{tag}", src.unit),
+        name,
         &[],
     )?;
-    let info = r
-        .path
-        .as_deref()
-        .and_then(|p| archive_info(p, FALLBACK_KERNEL));
+    let info = r.path.as_deref().and_then(|p| archive_info(p, name));
     Ok((pso, Regime::of(info, settings().1)))
 }
 
