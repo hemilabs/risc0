@@ -113,7 +113,8 @@ pub(crate) const EXPECTED_KERNELS: &[(Phase, &[&str])] = &[
         ],
     ),
     // R12 evalfast (eval_check_ef.metal). The R10 baseline `eval_check` and R15e's
-    // `ef_eval_split_r12` are built lazily by the eval_check host when selected (R15e).
+    // `ef_eval_split_r12` are built lazily by the eval_check host when selected (R15e); R20's
+    // `ef_eval_split_fc` only as per-domain specializations (eval_check.rs fc_pipeline).
     (Phase::EvalCheck, &["ef_eval_split", "ef_combine"]),
 ];
 
@@ -185,6 +186,18 @@ pub(crate) struct Rv32imKernels {
     kernels: LoadedKernels,
     /// Expected kernels the library does not have, by phase.
     missing: Vec<(Phase, &'static str)>,
+    /// R20: where the process-wide library came from, for the per-domain specialized
+    /// `ef_eval_split` PSOs (eval_check.rs); None for test-loaded libraries.
+    pub(crate) source: Option<KernelSource>,
+}
+
+/// R20: the metallib bytes of the process-wide [Rv32imKernels], its archive unit and the
+/// archive directory (None: no binary archive), from which eval_check builds its specialized
+/// PSOs through `risc0_zkp::hal::metal::archive::specialized_pipeline`.
+pub(crate) struct KernelSource {
+    pub(crate) bytes: &'static [u8],
+    pub(crate) unit: &'static str,
+    pub(crate) archive_dir: Option<std::path::PathBuf>,
 }
 
 impl Rv32imKernels {
@@ -269,7 +282,11 @@ impl Rv32imKernels {
             );
             LoadedKernels::Plain(k)
         };
-        Ok(Self { kernels, missing })
+        Ok(Self {
+            kernels,
+            missing,
+            source: None,
+        })
     }
 
     /// The process-wide instance, loaded through `hal` on first use.
@@ -290,24 +307,33 @@ impl Rv32imKernels {
                     std::fs::read(&path)
                         .map_err(|e| format!("reading {path:?} ({METALLIB_OVERRIDE_ENV}): {e}"))
                 });
-                let (bytes, unit): (&[u8], &str) = match &override_lib {
+                let (bytes, unit): (&'static [u8], &'static str) = match override_lib {
                     None => (METAL_LIB, ARCHIVE_UNIT),
-                    Some(Ok(bytes)) => (bytes, "rv32im_override"),
-                    Some(Err(e)) => return Err(e.clone()),
+                    // Once per process (debug builds only): kept for the specialized PSOs.
+                    Some(Ok(bytes)) => (Vec::leak(bytes), "rv32im_override"),
+                    Some(Err(e)) => return Err(e),
                 };
-                Self::load_from_in(
+                let archive_dir = archive::archive_dir();
+                let mut k = Self::load_from_in(
                     hal,
                     bytes,
                     METAL_KERNEL_NAMES,
                     EXPECTED_KERNELS,
                     use_archive(),
-                    archive::archive_dir(),
+                    archive_dir.clone(),
                     unit,
                 )
-                .map_err(|e| format!("{e:#}"))
+                .map_err(|e| format!("{e:#}"))?;
+                k.source = Some(KernelSource {
+                    bytes,
+                    unit,
+                    archive_dir: if use_archive() { archive_dir } else { None },
+                });
+                Ok(k)
             })
             .as_ref()
             .map_err(|e| anyhow!("loading the rv32im metallib: {e}"))
+            .inspect(|k| eval_check::fc_prewarm(k))
     }
 
     /// Fails, naming the missing kernels, if `phase` cannot run on Metal with this metallib.
@@ -422,6 +448,12 @@ impl<MH: MetalHash> MetalRv32imCtx<MH> {
     #[allow(dead_code)]
     pub fn library(&self) -> &metal::LibraryRef {
         self.kernels.kernels.library()
+    }
+
+    /// The process-wide rv32im kernels (R20: eval_check's specialized PSOs are built from them
+    /// on a background thread).
+    pub(crate) fn kernels(&self) -> &'static Rv32imKernels {
+        self.kernels
     }
 
     /// Fails, naming the missing kernels, if `phase` cannot run on Metal with this metallib.
