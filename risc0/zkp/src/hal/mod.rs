@@ -214,6 +214,26 @@ pub trait Hal {
         count: usize,
     );
 
+    /// True if [Hal::mix_poly_coeffs_fused] is implemented (Metal, Z15).
+    fn has_mix_poly_coeffs_fused(&self) -> bool {
+        false
+    }
+
+    /// Fused FRI mixing (Z15): `out` (`count * n` extension elements, any initial contents)
+    /// becomes what zeroing it and then calling, for each `(input, combo_ids)` of `inputs` in
+    /// order, `mix_poly_coeffs(out, mix^k, mix, input, combo_ids, combo_ids.len(), count)`
+    /// produces, where `k` is the number of inputs of the earlier groups.
+    #[allow(clippy::type_complexity)]
+    fn mix_poly_coeffs_fused(
+        &self,
+        _out: &Self::Buffer<Self::ExtElem>,
+        _mix: &Self::ExtElem,
+        _inputs: &[(&Self::Buffer<Self::Elem>, &[u32])],
+        _count: usize,
+    ) {
+        unimplemented!()
+    }
+
     fn eltwise_add_elem(
         &self,
         output: &Self::Buffer<Self::Elem>,
@@ -302,7 +322,10 @@ pub trait Hal {
     /// `matrix[row + i * row_size]` (query-major, as `gather_samples`) and the digests at
     /// `node_indices` (as `batch_get_digest_at`).
     #[allow(clippy::type_complexity)]
-    fn gather_multi(&self, _jobs: &[GatherJob<'_, Self>]) -> Option<Vec<(Vec<Self::Elem>, Vec<Digest>)>>
+    fn gather_multi(
+        &self,
+        _jobs: &[GatherJob<'_, Self>],
+    ) -> Option<Vec<(Vec<Self::Elem>, Vec<Digest>)>>
     where
         Self: Sized,
     {

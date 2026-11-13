@@ -403,6 +403,18 @@ pub(crate) struct ScratchBuffers {
     pub scratch: Option<BufferImpl<u32>>,
     /// poly_mix powers for eval_check (R10).
     pub poly_mix: Option<BufferImpl<ExtVal>>,
+    /// Z15: `pf` may be bound by GPU work not yet observed complete (set by `upload_preflight`,
+    /// cleared by witgen once its phase-end wait returned).
+    pub pf_busy: bool,
+    /// Z15: the same for `perm` (accum).
+    pub perm_busy: bool,
+}
+
+/// Z15 (LEADS #23 / #32) revert knob: `RISC0_METAL_SYNC_TRIM=0` makes the preflight copy and the
+/// accum permutation wait for all GPU work first, as before, instead of only when their scratch
+/// buffer may still be in use.
+pub(crate) fn sync_trim() -> bool {
+    !matches!(std::env::var("RISC0_METAL_SYNC_TRIM").as_deref(), Ok(v) if v.trim() == "0")
 }
 
 /// A buffer of at least `size` elements: `cur` if large enough, else a new one with 25 % headroom.
@@ -482,8 +494,9 @@ impl<MH: MetalHash> MetalRv32imCtx<MH> {
     }
 
     /// Copy cycles | txns | bigint_bytes of `trace` into the HAL-owned preflight buffer. The
-    /// buffer is reused (grown with 25 % headroom), so the caller must not have GPU work using it
-    /// in flight: this syncs first.
+    /// buffer is reused (grown with 25 % headroom), so no GPU work may use it in flight: this
+    /// syncs first unless witgen marked the buffer idle after its phase-end wait (Z15; the copy
+    /// then overlaps the GPU work already queued for this segment).
     #[allow(dead_code)]
     pub(crate) fn upload_preflight(
         &self,
@@ -494,15 +507,22 @@ impl<MH: MetalHash> MetalRv32imCtx<MH> {
             trace.txns.len(),
             trace.bigint_bytes.len(),
         );
-        self.hal.try_sync()?;
-        let t = std::time::Instant::now();
         let mut s = self
             .scratch
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if s.pf_busy || !sync_trim() {
+            self.hal.try_sync()?;
+        }
+        let t = std::time::Instant::now();
         let buf = grow(&self.hal, &mut s.pf, "preflight", layout.bytes);
         s.pf_layout = layout;
-        buf.view_mut(|dst| {
+        s.pf_busy = true;
+        // SAFETY: no batch that bound the buffer is outstanding (`pf_busy`, or synced above), and
+        // nothing that uses it is encoded until this returns. Not `view_mut`, which would wait for
+        // all queued GPU work.
+        let dst = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr(), buf.size()) };
+        {
             let mut copy = |off: usize, src: &[u8]| dst[off..off + src.len()].copy_from_slice(src);
             // SAFETY: both are #[repr(C)] plain-old-data structs of u32/u8 fields (sizes asserted).
             let cycles = unsafe {
@@ -520,7 +540,7 @@ impl<MH: MetalHash> MetalRv32imCtx<MH> {
             copy(layout.cycles_offset, cycles);
             copy(layout.txns_offset, txns);
             copy(layout.bigint_offset, &trace.bigint_bytes);
-        });
+        }
         pipeline_host_stat(3, t.elapsed());
         Ok((buf, layout))
     }

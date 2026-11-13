@@ -97,6 +97,124 @@ fn profiling() -> bool {
     *ON.get_or_init(|| env_flag(PROFILE_ENV))
 }
 
+/// Z15 sync tracer (measurement tool, off by default). With `RISC0_METAL_SYNC_TRACE=1` every
+/// [Runtime::try_sync] that had GPU work to wait for adds one record to a process-wide table: the
+/// host wait, the wake latency (host time when the wait returned minus the last command buffer's
+/// `GPUEndTime`) and the call site (the first `risc0` frame of a backtrace outside this module).
+/// Each commit that finds the GPU idle after a sync also records the host gap since that sync
+/// returned (GPU idle time spent on the host). [sync_trace_take] returns and clears the table;
+/// `RISC0_METAL_SYNC_TRACE=2` also prints every record to stderr. Capturing backtraces costs
+/// tens of microseconds per sync, so wall times under the tracer are not comparable; counts and
+/// wake latencies are.
+pub const SYNC_TRACE_ENV: &str = "RISC0_METAL_SYNC_TRACE";
+
+fn sync_trace_level() -> u8 {
+    static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var(SYNC_TRACE_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<u8>().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// One [SYNC_TRACE_ENV] record.
+#[derive(Clone, Debug)]
+pub struct SyncRecord {
+    /// The first `risc0` frame outside the Metal runtime/buffer modules.
+    pub site: String,
+    /// Host time blocked in `waitUntilCompleted`, seconds.
+    pub wait_secs: f64,
+    /// Host time the wait returned minus the last batch's `GPUEndTime`, seconds.
+    pub wake_secs: f64,
+    /// Host gap between the previous sync's return and the next commit that found the GPU idle
+    /// (filled in when that commit happens; 0 if none followed yet).
+    pub idle_after_secs: f64,
+}
+
+static SYNC_TRACE: Mutex<Vec<SyncRecord>> = Mutex::new(Vec::new());
+static LAST_SYNC_END: Mutex<Option<f64>> = Mutex::new(None);
+
+/// Host time in seconds on the same clock as `GPUStartTime` / `GPUEndTime` (mach absolute time).
+fn host_secs() -> f64 {
+    #[repr(C)]
+    struct Timebase {
+        numer: u32,
+        denom: u32,
+    }
+    extern "C" {
+        fn mach_absolute_time() -> u64;
+        fn mach_timebase_info(info: *mut Timebase) -> i32;
+    }
+    static TB: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
+    let (n, d) = *TB.get_or_init(|| {
+        let mut tb = Timebase { numer: 0, denom: 0 };
+        // SAFETY: plain libSystem call filling a local struct.
+        unsafe { mach_timebase_info(&mut tb) };
+        (tb.numer.max(1), tb.denom.max(1))
+    });
+    // SAFETY: plain libSystem call.
+    let t = unsafe { mach_absolute_time() };
+    t as f64 * n as f64 / d as f64 * 1e-9
+}
+
+fn sync_site() -> String {
+    let bt = std::backtrace::Backtrace::force_capture().to_string();
+    let lines: Vec<&str> = bt.lines().map(str::trim).collect();
+    let mut out = Vec::new();
+    for (k, l) in lines.iter().enumerate() {
+        if out.len() == 3 {
+            break;
+        }
+        if l.starts_with("at ") {
+            continue;
+        }
+        let l = l.trim_start_matches(|c: char| c.is_ascii_digit() || c == ':' || c == ' ');
+        if !l.contains("risc0")
+            || l.contains("hal::metal::runtime")
+            || l.contains("hal::metal::buffer")
+            || l.contains("sync_site")
+        {
+            continue;
+        }
+        let l = match l.rsplit_once("::h") {
+            Some((a, h)) if h.len() == 16 && h.chars().all(|c| c.is_ascii_hexdigit()) => a,
+            _ => l,
+        };
+        // Keep the method path, drop generic arguments.
+        let mut depth = 0;
+        let short: String = l
+            .chars()
+            .filter(|&c| {
+                match c {
+                    '<' => depth += 1,
+                    '>' => depth -= 1,
+                    _ => return depth <= 1,
+                }
+                false
+            })
+            .collect();
+        let at = lines
+            .get(k + 1)
+            .filter(|n| n.starts_with("at "))
+            .and_then(|n| n.rsplit('/').next())
+            .unwrap_or("");
+        out.push(format!("{short} [{at}]"));
+    }
+    out.join(" <- ")
+}
+
+/// Take (and clear) the [SYNC_TRACE_ENV] records.
+pub fn sync_trace_take() -> Vec<SyncRecord> {
+    std::mem::take(&mut *SYNC_TRACE.lock())
+}
+
+#[allow(unexpected_cfgs)]
+fn gpu_end_time(cmd: &CommandBuffer) -> f64 {
+    // SAFETY: plain Objective-C property read on a live, completed command buffer.
+    unsafe { msg_send![cmd.as_ptr() as *mut Object, GPUEndTime] }
+}
+
 static PSO_NAMES: Mutex<Option<HashMap<usize, &'static str>>> = Mutex::new(None);
 
 /// Record the kernel name of a PSO for the profiler (cheap; names are leaked once per PSO).
@@ -715,6 +833,16 @@ impl Runtime {
     /// Commit the open batch (no wait).
     fn close(&self, st: &mut State) {
         if let Some(mut open) = st.open.take() {
+            if sync_trace_level() > 0 && st.in_flight.is_empty() {
+                if let Some(t) = LAST_SYNC_END.lock().take() {
+                    if let Some(r) = SYNC_TRACE.lock().last_mut() {
+                        r.idle_after_secs = host_secs() - t;
+                        if sync_trace_level() > 1 {
+                            eprintln!("[sync-trace] idle {:.3} ms", r.idle_after_secs * 1e3);
+                        }
+                    }
+                }
+            }
             open.encoder.end();
             open.cmd.commit();
             st.in_flight.push_back(InFlight {
@@ -996,9 +1124,31 @@ impl Runtime {
     pub(crate) fn try_sync(&self) -> Result<()> {
         let _lock = exclusive();
         let mut st = self.lock_state();
+        let trace = sync_trace_level() > 0 && (st.open.is_some() || !st.in_flight.is_empty());
+        let t0 = if trace { host_secs() } else { 0.0 };
         self.close(&mut st);
         for batch in st.in_flight.iter() {
             batch.cmd.wait_until_completed();
+        }
+        if trace {
+            let t1 = host_secs();
+            let end = st.in_flight.back().map_or(t1, |b| gpu_end_time(&b.cmd));
+            let rec = SyncRecord {
+                site: sync_site(),
+                wait_secs: t1 - t0,
+                wake_secs: t1 - end,
+                idle_after_secs: 0.0,
+            };
+            if sync_trace_level() > 1 {
+                eprintln!(
+                    "[sync-trace] wait {:.3} ms wake {:.1} us at {}",
+                    rec.wait_secs * 1e3,
+                    rec.wake_secs * 1e6,
+                    rec.site
+                );
+            }
+            SYNC_TRACE.lock().push(rec);
+            *LAST_SYNC_END.lock() = Some(host_secs());
         }
         self.poll(&mut st);
         debug_assert!(st.in_flight.is_empty());

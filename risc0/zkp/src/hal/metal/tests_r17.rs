@@ -228,6 +228,34 @@ fn r17_mix() {
             });
             t.add(&case, r);
         }
+        // Z15: the fused write-once mix (one group, garbage initial contents) against the CPU
+        // mix into zeroes.
+        let c_zero = cpu.alloc_extelem_zeroed("out", n_combos * count);
+        cpu.mix_poly_coeffs(
+            &c_zero,
+            &BabyBearExtElem::ONE,
+            &mix,
+            &cpu.copy_from_elem("in", &input),
+            &cpu.copy_from_u32("combos", &combos),
+            input_size,
+            count,
+        );
+        let want = c_zero.to_vec();
+        let case = format!("mix/Z15 fused input_size {input_size} count 2^{po2}");
+        let r = stress(&case, &want, reps, || {
+            let out = metal.copy_from_extelem("out", &out0);
+            let fused = super::mix::mix_poly_coeffs_fused(
+                &metal,
+                &out,
+                &mix,
+                &[(&m_in, combos.as_slice())],
+                count,
+                false,
+            );
+            assert!(fused);
+            out.to_vec()
+        });
+        t.add(&case, r);
     }
     t.check();
 }

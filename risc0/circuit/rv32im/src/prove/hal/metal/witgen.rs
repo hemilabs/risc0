@@ -718,6 +718,8 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
 
         // Phase end: wait, then the fault word.
         hal.try_sync()?;
+        // Z15: every batch that bound the preflight copy has completed.
+        ctx.scratch().pf_busy = false;
         timing_mark("done");
         drop(perm_bufs);
         drop(snapshot);
