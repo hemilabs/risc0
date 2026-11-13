@@ -510,3 +510,98 @@ fn c13_ab_jobs_in_process() {
     }
     println!("C13AB B faster in {wins}/{pairs} pairs");
 }
+
+/// In-process interleaved A/B of the eval_check mix-power loads (C13 sub-track b) on the replayed
+/// captures with one cached prover per hash suite (`c11_bench_captures`' shape): per proof, A =
+/// the C12 four-load lazy split (`ec_lz32_part_*`), B = the uint4 form (`ec_lz_part_*`), so both
+/// see the same GPU contention; the order alternates per round (ABBA). `C13_REPS` (default 8)
+/// rounds after a warm round of each.
+/// `C13_AA=1` runs A in both arms. Prints `C13UAB` lines (per-round sums, B faster count).
+#[test]
+#[ignore]
+fn c13_ab_uint4_in_process() {
+    use super::eval_check::test_override::with_variant;
+    let _guard = global_state_test_lock();
+    let reps = env_usize("C13_REPS", 8);
+    let aa = env_usize("C13_AA", 0) == 1;
+    let caps = load_captures();
+    assert!(!caps.is_empty(), "no captures");
+    let mut provers: std::collections::HashMap<String, Box<dyn RecursionProver>> =
+        Default::default();
+    for (_, c) in &caps {
+        if !provers.contains_key(&c.hashfn) {
+            provers.insert(c.hashfn.clone(), recursion_prover(&c.hashfn).unwrap());
+        }
+    }
+    let arms = [
+        EvalKernels::SplitLzU32,
+        if aa {
+            EvalKernels::SplitLzU32
+        } else {
+            EvalKernels::SplitLz
+        },
+    ];
+    let mut sums = [vec![], vec![]];
+    // With RISC0_METAL_REC_PROFILE=1: every proof's eval_check phase (ms) per arm.
+    let mut ec: [Vec<f64>; 2] = [vec![], vec![]];
+    let mut wins = 0;
+    let mut n = 0;
+    for rep in 0..=reps {
+        let mut sum = [0.0f64; 2];
+        for (_, c) in &caps {
+            // ABBA: the arm that runs second on a capture gains from the first's warm-up (an
+            // A-vs-A in fixed order measured the second ~6 % faster), so the order alternates.
+            let order: [usize; 2] = if rep % 2 == 0 { [0, 1] } else { [1, 0] };
+            for arm in order {
+                let v = arms[arm];
+                let pf = replay_preflight(c);
+                let t = Instant::now();
+                let r = with_variant(v, || {
+                    provers[&c.hashfn].prove_shared(&c.program, c.input.clone(), pf)
+                })
+                .unwrap();
+                sum[arm] += t.elapsed().as_secs_f64() * 1e3;
+                std::hint::black_box(r);
+                if rep > 0 && profile::enabled() {
+                    if let Some((_, ms)) =
+                        profile::entries().iter().find(|(l, _)| *l == "eval_check")
+                    {
+                        ec[arm].push(*ms);
+                    }
+                }
+            }
+        }
+        if rep > 0 {
+            wins += (sum[1] < sum[0]) as usize;
+            n += 1;
+            println!("C13UPAIR {rep} A={:.1} B={:.1}", sum[0], sum[1]);
+            sums[0].push(sum[0]);
+            sums[1].push(sum[1]);
+        }
+    }
+    for (arm, v) in ["A(lz32)", if aa { "B(lz32)" } else { "B(uint4)" }]
+        .iter()
+        .zip(sums.iter_mut())
+    {
+        let (lo, hi) = (
+            v.iter().cloned().fold(f64::MAX, f64::min),
+            v.iter().cloned().fold(0.0, f64::max),
+        );
+        println!(
+            "C13UAB {arm} round median={:.1} [{lo:.1}, {hi:.1}]",
+            median(v)
+        );
+    }
+    println!("C13UAB B faster in {wins}/{n} rounds");
+    for (arm, v) in ["A", "B"].iter().zip(ec.iter_mut()) {
+        if !v.is_empty() {
+            let lo = v.iter().cloned().fold(f64::MAX, f64::min);
+            let n = v.len();
+            let m = median(v);
+            println!(
+                "C13UEC {arm} eval_check n={n} median={m:.2} min={lo:.2} p25={:.2}",
+                v[n / 4]
+            );
+        }
+    }
+}
