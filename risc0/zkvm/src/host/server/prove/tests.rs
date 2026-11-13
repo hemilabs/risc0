@@ -565,7 +565,7 @@ fn sys_input() {
 #[case(ReceiptKind::Groth16, ReceiptKind::Succinct)]
 #[case(ReceiptKind::Groth16, ReceiptKind::Groth16)]
 #[test_log::test]
-#[cfg(any(feature = "cuda", feature = "docker"))]
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "docker"))]
 fn compress(#[case] from: ReceiptKind, #[case] into: ReceiptKind) {
     let from_receipt = prove_nothing(from).receipt;
     let opts = ProverOpts::default().with_receipt_kind(into);
@@ -597,7 +597,7 @@ fn compress(#[case] from: ReceiptKind, #[case] into: ReceiptKind) {
 #[case(ReceiptKind::Groth16, ReceiptKind::Succinct)]
 #[case(ReceiptKind::Groth16, ReceiptKind::Groth16)]
 #[test_log::test]
-#[cfg(any(feature = "cuda", feature = "docker"))]
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "docker"))]
 fn fake_compress(#[case] from: ReceiptKind, #[case] into: ReceiptKind) {
     use crate::{DevModeProver, FakeReceipt, ProverServer as _};
 
@@ -618,7 +618,7 @@ fn fake_compress(#[case] from: ReceiptKind, #[case] into: ReceiptKind) {
 }
 
 #[test_log::test]
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 fn shrink_wrap() {
     // Perform many proofs in parallel. The initial implementation of the
     // groth16 prover on CUDA had issues with this. Ensure that we got a groth16
@@ -639,7 +639,7 @@ fn shrink_wrap() {
 #[case(ReceiptKind::Succinct)]
 #[case(ReceiptKind::Groth16)]
 #[test_log::test]
-#[cfg(any(feature = "cuda", feature = "docker"))]
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "docker"))]
 fn verify_in_guest(#[case] kind: ReceiptKind) {
     use risc0_zkvm_methods::VERIFY_ELF;
 

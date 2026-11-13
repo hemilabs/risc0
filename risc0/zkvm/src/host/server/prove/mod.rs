@@ -23,9 +23,9 @@ pub(crate) mod union_peak;
 
 use std::rc::Rc;
 
-use anyhow::{anyhow, bail, ensure, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use risc0_core::field::baby_bear::{BabyBear, Elem, ExtElem};
-use risc0_groth16::prove::shrink_wrap;
+use risc0_groth16::prove::shrink_wrap_with;
 use risc0_zkp::hal::{CircuitHal, Hal};
 
 use self::{dev_mode::DevModeProver, prover_impl::ProverImpl};
@@ -40,6 +40,20 @@ use crate::{
     ExecutorEnv, PreflightResults, ProverOpts, Receipt, ReceiptClaim, ReceiptKind, Segment,
     Session, VerifierContext, WorkClaim,
 };
+
+/// Verify a Groth16 receipt this prover just produced, before handing it out.
+/// A faulty shrink-wrap (prover, witness or GPU bug) then fails here, instead of
+/// surfacing later as an invalid proof, e.g. on chain. Costs a few milliseconds.
+pub(crate) fn check_groth16_receipt(receipt: &Groth16Receipt<ReceiptClaim>) -> Result<()> {
+    receipt
+        .verify_integrity_with_context(&VerifierContext::default())
+        .map_err(|e| {
+            // A bad seal may come from a damaged derived-data cache of the Groth16 prover:
+            // discard those, so the next wrap rebuilds them instead of failing the same way.
+            risc0_groth16::prove::invalidate_caches();
+            anyhow!("Groth16 receipt failed verification: {e}")
+        })
+}
 
 mod private {
     use super::{dev_mode::DevModeProver, prover_impl::ProverImpl};
@@ -72,7 +86,13 @@ pub trait ProverServer: private::Sealed {
     fn prove_segment(&self, ctx: &VerifierContext, segment: &Segment) -> Result<SegmentReceipt> {
         tracing::debug!("prove_segment");
         let results = self.segment_preflight(segment)?;
-        self.prove_segment_core(ctx, results)
+        let receipt = self.prove_segment_core(ctx, results)?;
+        if std::env::var("RISC0_SKIP_VERIFY").is_err() {
+            receipt
+                .verify_integrity_with_context(ctx)
+                .context("verify segment")?;
+        }
+        Ok(receipt)
     }
 
     /// Run preflight on the specified [Segment].
@@ -194,14 +214,40 @@ pub trait ProverServer: private::Sealed {
         &self,
         receipt: &SuccinctReceipt<ReceiptClaim>,
     ) -> Result<Groth16Receipt<ReceiptClaim>> {
+        let t0 = std::time::Instant::now();
+        // Let the Groth16 prover load its proving key while identity_p254 runs.
+        if let Err(e) = risc0_groth16::prove::prestart_prover() {
+            tracing::warn!("groth16 prover prestart failed (non-fatal): {e}");
+        }
         let ident_receipt = self.identity_p254(receipt).unwrap();
+        let ident_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        let t1 = std::time::Instant::now();
         let seal_bytes = ident_receipt.get_seal_bytes();
-        let seal = shrink_wrap(&seal_bytes)?.to_vec();
-        Ok(Groth16Receipt {
+        let seal_ms = t1.elapsed().as_secs_f64() * 1000.0;
+
+        // Hand the GPU to the Groth16 prover, then take it back. See `release_hal_buffers`. The
+        // first release runs while the wrap computes its witness on another thread.
+        #[cfg(any(feature = "rocm", feature = "intel"))]
+        prover_impl::release_cached_provers();
+        let t2 = std::time::Instant::now();
+        let seal = shrink_wrap_with(&seal_bytes, release_hal_buffers)?.to_vec();
+        release_hal_buffers();
+        let wrap_ms = t2.elapsed().as_secs_f64() * 1000.0;
+
+        eprintln!(
+            "[succinct_to_groth16] identity_p254={ident_ms:.1}ms get_seal={seal_ms:.1}ms \
+             shrink_wrap={wrap_ms:.1}ms total={:.1}ms",
+            t0.elapsed().as_secs_f64() * 1000.0,
+        );
+
+        let groth16_receipt = Groth16Receipt {
             seal,
             claim: receipt.claim.clone(),
             verifier_parameters: Groth16ReceiptVerifierParameters::default().digest(),
-        })
+        };
+        check_groth16_receipt(&groth16_receipt)?;
+        Ok(groth16_receipt)
     }
 
     /// Compress a receipt into one with a smaller representation.
@@ -354,6 +400,7 @@ where
         &self,
         composite_receipt: &CompositeReceipt,
     ) -> anyhow::Result<SuccinctReceipt<Claim>> {
+        let t_pipeline = std::time::Instant::now();
         // Compress all receipts in the top-level session into one succinct receipt for the session.
         let continuation_receipt = composite_receipt
             .segments
@@ -361,18 +408,25 @@ where
             .try_fold(
                 None,
                 |left: Option<SuccinctReceipt<Claim>>, right: &SegmentReceipt| -> Result<_> {
-                    Ok(Some(match left {
-                        Some(left) => self.join(&left, &self.lift(right)?)?,
-                        None => self.lift(right)?,
-                    }))
+                    let lifted = self.lift(right)?;
+                    let result = match left {
+                        Some(left) => self.join(&left, &lifted)?,
+                        None => lifted,
+                    };
+                    Ok(Some(result))
                 },
             )?
             .ok_or_else(|| {
                 anyhow!("malformed composite receipt has no continuation segment receipts")
             })?;
 
+        eprintln!(
+            "[composite_to_succinct] lift/join done: {:.1}s",
+            t_pipeline.elapsed().as_secs_f64()
+        );
+
         // Compress assumptions and resolve them to get the final succinct receipt.
-        composite_receipt.assumption_receipts.iter().try_fold(
+        let result = composite_receipt.assumption_receipts.iter().try_fold(
             continuation_receipt,
             |conditional: SuccinctReceipt<Claim>, assumption: &InnerAssumptionReceipt| match assumption {
                 InnerAssumptionReceipt::Succinct(assumption) => self.resolve(&conditional, assumption),
@@ -386,7 +440,13 @@ where
                     "compressing composite receipts with Groth16 receipt assumptions is not supported"
                 )
             },
-        )
+        )?;
+
+        eprintln!(
+            "[composite_to_succinct] total: {:.1}s",
+            t_pipeline.elapsed().as_secs_f64()
+        );
+        Ok(result)
     }
 }
 
@@ -421,4 +481,40 @@ pub fn get_prover_server(opts: &ProverOpts) -> Result<Rc<dyn ProverServer>> {
     }
 
     Ok(Rc::new(ProverImpl::new(opts.clone())))
+}
+
+/// Exclusive use of the CUDA GPU against other threads, for one proving call: hold the result for
+/// the call. The provers cache their HALs per thread, so the HALs can't hold it (see
+/// `risc0_zkp::hal::cuda::singleton`); the calls that prove do. Reentrant on one thread.
+#[cfg(feature = "cuda")]
+pub(crate) fn exclusive_gpu() -> impl Sized {
+    risc0_zkp::hal::cuda::exclusive()
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn exclusive_gpu() -> impl Sized {}
+
+/// Return the STARK HAL's cached device memory to the driver, around the Groth16 wrap.
+///
+/// The wrap allocates through sppark rather than through the HAL, so it cannot reclaim what the HAL
+/// is caching and fails instead; see `risc0_zkp::hal::cuda::clear_buffer_pool`. Called BEFORE the wrap
+/// so it fits beside what the STARK left behind, and AFTER it so the next proof's STARK is not
+/// competing with the wrap's freed scratch.
+///
+/// On ROCm the HAL has the same pool, released by its own `clear_buffer_pool`. On Windows a HIP
+/// allocation beyond the card's memory does not fail but spills into shared system memory, so
+/// without this a session's keccak proofs ran beside the segments' cached buffers on an RX 9070 XT
+/// (16 GB), with up to 12.5 GB spilled and each keccak eval_check at ~7x its time.
+///
+/// On Intel the HAL's pool (capped at 16 GiB) is released the same way: neither the Groth16 prover
+/// nor the keccak eval_check allocates through it. Without this, a session's keccak proofs and its
+/// wrap, and the next session's segments, ran with the segments' idle buffers still cached and
+/// spilled into shared system memory on an Arc Pro B70 (32 GB), at 2-5x the time.
+pub(crate) fn release_hal_buffers() {
+    #[cfg(feature = "cuda")]
+    risc0_zkp::hal::cuda::clear_buffer_pool();
+    #[cfg(feature = "rocm")]
+    risc0_zkp::hal::hip::clear_buffer_pool();
+    #[cfg(feature = "intel")]
+    risc0_zkp::hal::intel::release_idle_buffers();
 }

@@ -19,6 +19,10 @@ use risc0_zkp::hal::Hal;
 pub(crate) mod cpu;
 #[cfg(feature = "cuda")]
 pub(crate) mod cuda;
+#[cfg(feature = "rocm")]
+pub(crate) mod hip;
+#[cfg(feature = "intel")]
+pub(crate) mod intel;
 // #[cfg(all(
 //     feature = "prove",
 //     any(all(target_os = "macos", target_arch = "aarch64"), target_os = "ios")
@@ -35,6 +39,65 @@ pub(crate) trait CircuitWitnessGenerator<H: Hal> {
         data: &H::Buffer<H::Elem>,
         global: &H::Buffer<H::Elem>,
     ) -> Result<()>;
+
+    /// Like `generate_witness`, with the rows of some sequential chains already computed on
+    /// the host. HALs without support ignore them and run every chain.
+    #[allow(clippy::too_many_arguments)]
+    fn generate_witness_with_chains(
+        &self,
+        mode: StepMode,
+        total_cycles: u32,
+        preflight: &RawPreflightTrace,
+        _host_chains: Option<&super::witgen::HostChains>,
+        ctrl: &H::Buffer<H::Elem>,
+        data: &H::Buffer<H::Elem>,
+        global: &H::Buffer<H::Elem>,
+    ) -> Result<()> {
+        self.generate_witness(mode, total_cycles, preflight, ctrl, data, global)
+    }
+
+    /// Upload a witness that was generated on the host ahead of time.
+    fn upload_host_witness(
+        &self,
+        _data: &H::Buffer<H::Elem>,
+        _global: &H::Buffer<H::Elem>,
+        _host_data: Vec<H::Elem>,
+        _host_global: Vec<H::Elem>,
+    ) -> Result<()> {
+        anyhow::bail!("upload_host_witness not supported by this HAL")
+    }
+
+    /// Whether this HAL has the witness buffer passes below (`init_rows`, `fill_tail`,
+    /// `zeroize_rows`); without them the witgen uses the generic HAL passes.
+    fn has_row_passes(&self) -> bool {
+        false
+    }
+
+    /// A fresh column-major buffer of `rows` rows per column: INVALID in rows [0, live), zero
+    /// after (the generic path fills it all with INVALID and zeroizes it after the witgen, which
+    /// writes no row >= live).
+    fn init_rows(&self, _buf: &H::Buffer<H::Elem>, _rows: usize, _live: usize) -> Result<()> {
+        anyhow::bail!("init_rows not supported by this HAL")
+    }
+
+    /// `value` in the last `zk` rows of every column.
+    // Set aside with the fork's row-pass witgen fast path (v3.1.0 uses independent-random
+    // tail blinding instead); kept for re-application. See the v3.1.0 rebase decision log.
+    #[allow(dead_code)]
+    fn fill_tail(
+        &self,
+        _buf: &H::Buffer<H::Elem>,
+        _rows: usize,
+        _zk: usize,
+        _value: H::Elem,
+    ) -> Result<()> {
+        anyhow::bail!("fill_tail not supported by this HAL")
+    }
+
+    /// INVALID -> zero in rows [0, live) of every column.
+    fn zeroize_rows(&self, _buf: &H::Buffer<H::Elem>, _rows: usize, _live: usize) -> Result<()> {
+        anyhow::bail!("zeroize_rows not supported by this HAL")
+    }
 }
 
 pub(crate) trait CircuitAccumulator<H: Hal> {

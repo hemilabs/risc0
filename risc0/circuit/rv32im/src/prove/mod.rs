@@ -25,6 +25,18 @@ use crate::execute::segment::Segment;
 
 pub use witgen::PreflightResults;
 
+/// The `rand_z` of a segment preflight ([PreflightResults::new]): random, or one with the
+/// `witgen_debug` feature (reproducible witnesses).
+pub fn preflight_rand_z() -> crate::zirgen::circuit::ExtVal {
+    cfg_if! {
+        if #[cfg(feature = "witgen_debug")] {
+            <crate::zirgen::circuit::ExtVal as risc0_core::field::Elem>::ONE
+        } else {
+            <crate::zirgen::circuit::ExtVal as risc0_core::field::Elem>::random(&mut rand::rng())
+        }
+    }
+}
+
 const GLOBAL_MIX: usize = 0;
 const GLOBAL_OUT: usize = 1;
 
@@ -40,16 +52,136 @@ pub trait SegmentProver {
     fn preflight(&self, segment: &Segment) -> Result<PreflightResults>;
 
     fn prove_core(&self, preflight_results: PreflightResults) -> Result<Seal>;
+
+    /// Pipeline-aware proving: performs the main phase for this segment
+    /// (overlapping GPU eval_check from the previous segment), completes the
+    /// previous segment's deferred finalize, then launches eval_check for
+    /// the current segment.
+    ///
+    /// Returns the seal for the PREVIOUS segment (None on first call).
+    fn prove_begin(&self, preflight_results: PreflightResults) -> Result<Option<Seal>> {
+        // Default: sequential, no pipelining.
+        Ok(Some(self.prove_core(preflight_results)?))
+    }
+
+    /// Complete the last segment's deferred finalize and return its seal.
+    /// Only valid after at least one prove_begin call.
+    fn prove_end(&self) -> Result<Seal> {
+        anyhow::bail!("prove_end: no pending work (default impl)")
+    }
+
+    /// Discards any seal left pending by an earlier pipeline, e.g. a session
+    /// that failed between prove_begin and prove_end. Call before a new one.
+    fn reset_pipeline(&self) {}
+}
+
+/// Frees the Intel eval_check scratch slab (~1.4 GB at po2=20) between
+/// proving sessions; it is reallocated by the next eval_check. Best effort:
+/// a failure is logged, not returned, since the proof is already complete.
+#[cfg(feature = "intel")]
+pub fn release_intel_scratch() {
+    if let Err(e) = risc0_sys::ffi_wrap(|| unsafe {
+        risc0_circuit_rv32im_sys::risc0_circuit_rv32im_intel_eval_check_release()
+    }) {
+        tracing::warn!("releasing Intel eval_check scratch failed: {e}");
+    }
 }
 
 pub fn segment_prover() -> Result<Box<dyn SegmentProver>> {
     cfg_if! {
         if #[cfg(feature = "cuda")] {
             self::hal::cuda::segment_prover()
+        } else if #[cfg(feature = "rocm")] {
+            self::hal::hip::segment_prover()
         // } else if #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), target_os = "ios"))] {
         // self::hal::metal::segment_prover(hashfn)
+        } else if #[cfg(feature = "intel")] {
+            self::hal::intel::segment_prover()
         } else {
             self::hal::cpu::segment_prover()
         }
     }
+}
+
+/// Make one pinned host allocation, once per process, before HIP work goes to other threads.
+///
+/// On Windows, HIP deadlocks when a process's first pinned host allocation (`hipHostMalloc`)
+/// races its first kernel launch and stream sync on another thread: both wait for good on a
+/// runtime lock, with the CPU and GPU idle. `prove_session_impl` hits exactly that: the
+/// `rocm_warmup` thread launches and syncs while segment 0's preflight allocates its pinned
+/// witgen slots, so every proof hung on an RX 9070 XT. One allocation first (on any thread,
+/// before the race) avoids it; `hipInit` and `hipSetDevice` alone do not.
+#[cfg(feature = "rocm")]
+pub fn rocm_prime_host_alloc() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        risc0_sys::hip::hipInit(0);
+        risc0_sys::hip::hipSetDevice(risc0_zkp::hal::hip::get_device_for_thread());
+        let mut p = std::ptr::null_mut();
+        if risc0_sys::hip::hipHostMalloc(&mut p, 1 << 20, 0) == risc0_sys::hip::HIP_SUCCESS {
+            risc0_sys::hip::hipHostFree(p);
+        }
+    });
+}
+
+/// Trigger HIP module loading so the first kernel launch doesn't stall.
+/// This is a no-op on non-ROCm builds. Mirrors cuda_warmup() but adds
+/// hipInit/hipSetDevice for HIP runtime initialization.
+#[cfg(feature = "rocm")]
+pub fn rocm_warmup() {
+    use risc0_sys::ffi_wrap;
+    // Initialize HIP runtime and select the thread's device.
+    risc0_zkp::hal::hip::auto_configure_hw_queues();
+    unsafe {
+        risc0_sys::hip::hipInit(0);
+        risc0_sys::hip::hipSetDevice(risc0_zkp::hal::hip::get_device_for_thread());
+    }
+    // Warmup rv32im circuit kernels (par_stepExec, stepAccum, finalizeAccum, eval_check).
+    // The C function names are the same regardless of CUDA or HIP compilation.
+    let _ = ffi_wrap(|| unsafe { risc0_circuit_rv32im_sys::risc0_circuit_rv32im_cuda_warmup() });
+    let _ = ffi_wrap(|| unsafe {
+        risc0_circuit_rv32im_sys::risc0_circuit_rv32im_cuda_warmup_eval_check()
+    });
+    // Warmup sppark NTT kernels (normally loaded during HipHal::new -> sppark_init)
+    let err = unsafe { risc0_sys::cuda::sppark_init() };
+    if err.code != 0 {
+        tracing::warn!("sppark_init warmup failed: {err}");
+    }
+    // Warmup poseidon2 kernels
+    let err = unsafe { risc0_sys::cuda::sppark_poseidon2_init() };
+    if err.code != 0 {
+        tracing::warn!("sppark_poseidon2_init warmup failed: {err}");
+    }
+    // Warmup risc0-zkp kernels (eltwise, sha, bit_reverse, etc.)
+    extern "C" {
+        fn risc0_zkp_cuda_warmup() -> *const std::os::raw::c_char;
+    }
+    let _ = ffi_wrap(|| unsafe { risc0_zkp_cuda_warmup() });
+}
+
+/// Trigger CUDA module loading so the first kernel launch doesn't stall.
+/// This is a no-op on non-CUDA builds.
+#[cfg(feature = "cuda")]
+pub fn cuda_warmup() {
+    use risc0_sys::ffi_wrap;
+    // Warmup rv32im circuit kernels (par_stepExec, stepAccum, finalizeAccum, eval_check)
+    let _ = ffi_wrap(|| unsafe { risc0_circuit_rv32im_sys::risc0_circuit_rv32im_cuda_warmup() });
+    let _ = ffi_wrap(|| unsafe {
+        risc0_circuit_rv32im_sys::risc0_circuit_rv32im_cuda_warmup_eval_check()
+    });
+    // Warmup sppark NTT kernels (normally loaded during CudaHal::new → sppark_init)
+    let err = unsafe { risc0_sys::cuda::sppark_init() };
+    if err.code != 0 {
+        tracing::warn!("sppark_init warmup failed: {err}");
+    }
+    // Warmup poseidon2 kernels
+    let err = unsafe { risc0_sys::cuda::sppark_poseidon2_init() };
+    if err.code != 0 {
+        tracing::warn!("sppark_poseidon2_init warmup failed: {err}");
+    }
+    // Warmup risc0-zkp kernels (eltwise, sha, bit_reverse, etc.)
+    extern "C" {
+        fn risc0_zkp_cuda_warmup() -> *const std::os::raw::c_char;
+    }
+    let _ = ffi_wrap(|| unsafe { risc0_zkp_cuda_warmup() });
 }

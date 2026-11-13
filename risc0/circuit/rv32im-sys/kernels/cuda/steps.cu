@@ -25451,6 +25451,7 @@ BigIntTopStateStruct x4 = exec_TopExtract(ctx,arg0, global3);
 AccumStruct x5 = exec_Accum(ctx,x4, arg1_0, layout2);
 return x5;
 }
+#ifdef __HIPCC__  // CUDA: stepAccumA in accum_tu.cu (accum_tu_gen.py)
 __device__ ComponentStruct exec_TopAccum(ExecContext& ctx,BoundLayout<TopLayout> arg0, BoundLayout<LayoutAccumLayout> layout1, GlobalBuf global2, GlobalBuf mix3)   {
 // zirgen/dsl/passes/GenerateAccum.cpp:525
 BoundLayout<_mixLayout> x4 = BIND_LAYOUT(kLayoutMix, mix3);
@@ -30669,5 +30670,6 @@ BoundLayout<LayoutAccumLayout> x5 = BIND_LAYOUT(kLayout_TopAccum, accum0);
 ComponentStruct x6 = exec_TopAccum(ctx,x4, x5, global2, mix3);
 return ;
 }
+#endif  // __HIPCC__
 
 } // namespace risc0::circuit::rv32im_v2::cuda

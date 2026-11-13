@@ -19,7 +19,12 @@
 #include "fpext.h"
 
 #include <cassert>
+#ifdef __HIPCC__
+#include <array>
+namespace cuda { namespace std { using ::std::array; } }
+#else
 #include <cuda/std/array>
+#endif
 
 #if defined(__clang__)
 #pragma clang diagnostic ignored "-Wunused-parameter"

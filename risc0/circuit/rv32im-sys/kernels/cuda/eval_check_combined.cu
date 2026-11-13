@@ -1,0 +1,277 @@
+// Combined compilation of all eval_check device functions + kernel into a single
+// translation unit, compiled WITHOUT -dc (separate compilation). This allows
+// NVCC to inline the 20 device functions in the poly_fp call chain, eliminating
+// 19 cross-TU function calls with full ABI overhead (save/restore all registers,
+// pass parameters through local memory → ~9KB local memory per thread).
+
+#include "eval_check_0.cu"
+#include "eval_check_1.cu"
+#include "eval_check_2.cu"
+#include "eval_check_3.cu"
+
+// --- eval_check kernel + host wrappers (moved from ffi_supra.cu) ---
+
+#include "cuda.h"
+#include <cstdlib>
+
+namespace risc0::circuit::rv32im_v2::cuda {
+
+// 3.1.0's eval_check.cuh declares poly_mix `extern` (the NVIDIA path defines it in a
+// separate object). This ROCm-only combined build is one TU compiled without -dc and
+// links no such object, so it must own the definition itself.
+__constant__ FpExt poly_mix[kNumPolyMixPows];
+
+#ifdef __HIPCC__
+// RDNA4: 128 threads reduces scratch working set → better cache reuse
+#ifndef EVAL_CHECK_THREADS
+#define EVAL_CHECK_THREADS 128
+#endif
+#else
+#ifndef EVAL_CHECK_THREADS
+#define EVAL_CHECK_THREADS 256
+#endif
+#endif
+
+// Diagnostic kernel: write poly_mix[0..3] and data samples to check[0..15]
+// Called with <<<1,1>>> before eval_check to verify constant memory
+__global__ void eval_check_diag(Fp* check,
+                                const Fp* ctrl,
+                                const Fp* data,
+                                const Fp* accum,
+                                const Fp* mix,
+                                const Fp* out,
+                                uint32_t domain) {
+  // Write poly_mix first 4 values (each is FpExt = 4 Fp)
+  // check[0..3] = poly_mix[0] components
+  for (int i = 0; i < 4; i++) check[i] = poly_mix[0][i];
+  // check[4..7] = poly_mix[1] components
+  for (int i = 0; i < 4; i++) check[4+i] = poly_mix[1][i];
+  // check[8] = ctrl[0], check[9] = data[0], check[10] = accum[0]
+  check[8] = ctrl[0];
+  check[9] = data[0];
+  check[10] = accum[0];
+  check[11] = mix[0];
+  check[12] = out[0];
+  // check[13] = domain as Fp
+  check[13] = Fp(domain);
+  // check[14..15] = poly_mix[483] components (last)
+  check[14] = poly_mix[483][0];
+  check[15] = poly_mix[483][1];
+}
+
+__launch_bounds__(EVAL_CHECK_THREADS, 1)
+__global__ void eval_check(Fp* check,
+                           const Fp* ctrl,
+                           const Fp* data,
+                           const Fp* accum,
+                           const Fp* mix,
+                           const Fp* out,
+                           const Fp rou,
+                           uint32_t po2,
+                           uint32_t domain) {
+  // Enable shared memory spilling: trades STACK for SHARED, improving L1 cache
+  // utilization. With CUDA 12.9+: REG:255 STACK:8560 SHARED:16384 (~5% speedup).
+  // PTX-only inline-asm directive; HIP/clang rejects it as "unknown directive".
+#ifndef __HIPCC__
+  asm volatile (".pragma \"enable_smem_spilling\";");
+#endif
+  uint32_t cycle = blockDim.x * blockIdx.x + threadIdx.x;
+  if (cycle < domain) {
+    FpExt tot = poly_fp(cycle, domain, ctrl, out, data, mix, accum);
+#ifdef __HIPCC__
+    Fp x = rou ^ (unsigned)cycle;
+    Fp y = (Fp(3) * x) ^ (unsigned)(1 << po2);
+#else
+    Fp x = pow(rou, cycle);
+    Fp y = pow(Fp(3) * x, 1 << po2);
+#endif
+    FpExt ret = tot * inv(y - Fp(1));
+    check[domain * 0 + cycle] = ret[0];
+    check[domain * 1 + cycle] = ret[1];
+    check[domain * 2 + cycle] = ret[2];
+    check[domain * 3 + cycle] = ret[3];
+  }
+}
+
+} // namespace risc0::circuit::rv32im_v2::cuda
+
+using namespace risc0::circuit::rv32im_v2::cuda;
+
+// Secondary stream for eval_check pipelining.
+// eval_check runs on this separate stream so that subsequent segments'
+// main phase (witgen, commit, accum) can overlap with it on the persistent stream.
+// eval_check uses only ~6% of GPU wave slots (128 out of 2048), so 94% of
+// compute resources remain available for concurrent work.
+static cudaStream_t getEvalCheckStream() {
+  int dev = getCachedDevice();
+  static cudaStream_t streams[16] = {};
+  if (!streams[dev]) {
+    CUDA_OK(cudaStreamCreateWithFlags(&streams[dev], cudaStreamNonBlocking));
+  }
+  return streams[dev];
+}
+
+static cudaEvent_t getEvalCheckEvent() {
+  int dev = getCachedDevice();
+  static cudaEvent_t events[16] = {};
+  if (!events[dev]) {
+    CUDA_OK(cudaEventCreateWithFlags(&events[dev], cudaEventDisableTiming));
+  }
+  return events[dev];
+}
+
+extern "C" {
+
+const char* risc0_circuit_rv32im_cuda_eval_check(Fp* check,
+                                                 const Fp* ctrl,
+                                                 const Fp* data,
+                                                 const Fp* accum,
+                                                 const Fp* mix,
+                                                 const Fp* out,
+                                                 const Fp& rou,
+                                                 uint32_t po2,
+                                                 uint32_t domain,
+                                                 const FpExt* poly_mix_pows) {
+  try {
+    // Use separate stream for eval_check to enable pipelining:
+    // eval_check(N) runs concurrently with main phase of segment N+1.
+    cudaStream_t stream = getEvalCheckStream();
+
+    // Make eval_check stream wait for persistent stream's prior work to complete.
+    // This ensures that the input buffers (ctrl, data, accum, mix, out) written
+    // by the main phase on the persistent stream are visible to eval_check.
+    {
+      cudaEvent_t event = getEvalCheckEvent();
+      CUDA_OK(cudaEventRecord(event, getPersistentStream()));
+      CUDA_OK(cudaStreamWaitEvent(stream, event, 0));
+    }
+
+    const int block = EVAL_CHECK_THREADS;
+    const int grid = (domain + block - 1) / block;
+    // Maximize L1 cache for local memory spills
+    static bool cacheConfigSet = false;
+    if (!cacheConfigSet) {
+      cudaFuncSetCacheConfig((const void*)eval_check, cudaFuncCachePreferL1);
+      cacheConfigSet = true;
+    }
+    // Copy poly_mix_pows to __constant__ memory on eval_check stream.
+    // Stage into a persistent host buffer so the source remains valid
+    // until the async copy executes (it's queued behind an event wait).
+    {
+      static char poly_mix_staging[sizeof(poly_mix)];
+      memcpy(poly_mix_staging, poly_mix_pows, sizeof(poly_mix));
+#ifdef __HIPCC__
+      // HIP: hipMemcpyToSymbol doesn't work reliably without -fgpu-rdc.
+      // Use hipGetSymbolAddress + hipMemcpyAsync instead.
+      void* dev_ptr = nullptr;
+      CUDA_OK(hipGetSymbolAddress(&dev_ptr, HIP_SYMBOL(poly_mix)));
+      CUDA_OK(hipMemcpyAsync(dev_ptr, poly_mix_staging, sizeof(poly_mix),
+                              hipMemcpyHostToDevice, stream));
+#else
+      CUDA_OK(cudaMemcpyToSymbolAsync(poly_mix, poly_mix_staging, sizeof(poly_mix),
+                                       0, cudaMemcpyHostToDevice, stream));
+#endif
+    }
+    // Surface any async errors from prior operations (e.g., previous eval_check).
+    // Previously this was swallowed with (void)cudaGetLastError(), which could
+    // mask real errors and lead to silently incorrect proofs.
+    CUDA_OK(cudaGetLastError());
+
+    eval_check<<<grid, block, 0, stream>>>(
+        check, ctrl, data, accum, mix, out, rou, po2, domain);
+    CUDA_OK(cudaGetLastError());
+    // Re-enable eval_check<->witgen pipelining on pre-Blackwell GPUs.
+    //
+    // The unconditional sync below was added to mitigate a ~1% data-corruption
+    // bug observed only on RTX 5090 (sm_120, Blackwell), where REG:255
+    // eval_check kernels concurrent with the next segment's witgen produced
+    // wrong values despite using separate streams and non-overlapping buffers.
+    // On Ada (sm_89, RTX 4090) and earlier the pipelining is safe and recovers
+    // ~5-9 s per 21-segment composite STARK at po2=21.
+    //
+    // eval_check_dep() records an event on this stream and makes the
+    // persistent stream wait on it; with that in place, dependent work in the
+    // next prove_begin is correctly ordered even when this sync is skipped.
+    static int s_force_sync = -1;
+    static int s_skip_sync = -1;
+    if (s_force_sync < 0) {
+      s_force_sync = std::getenv("RISC0_EVAL_CHECK_FORCE_SYNC") ? 1 : 0;
+      s_skip_sync = std::getenv("RISC0_EVAL_CHECK_SKIP_SYNC") ? 1 : 0;
+    }
+    bool needs_sync;
+    if (s_force_sync) {
+      needs_sync = true;
+    } else if (s_skip_sync) {
+      needs_sync = false;
+    } else {
+#ifdef __HIPCC__
+      // On HIP/ROCm, default to the serialized path. eval_check<->witgen
+      // pipelining was only ever validated safe on pre-Blackwell NVIDIA; on
+      // RDNA3 (gfx1100) it reproduces the same intermittent concurrent-kernel
+      // corruption seen on Blackwell, producing invalid multi-segment proofs.
+      // Also: `cudaDevAttrComputeCapabilityMajor` is CUDA-only and undeclared
+      // for the AMD platform, so the compute-capability gate below cannot be
+      // used here. Override with RISC0_EVAL_CHECK_SKIP_SYNC=1 to experiment.
+      needs_sync = true;
+#else
+      // Sync only on Blackwell+ (compute capability major >= 12).
+      static int s_cc_major = -1;
+      if (s_cc_major < 0) {
+        int dev = getCachedDevice();
+        cudaDeviceGetAttribute(&s_cc_major, cudaDevAttrComputeCapabilityMajor, dev);
+      }
+      needs_sync = s_cc_major >= 12;
+#endif
+    }
+    if (needs_sync) {
+      CUDA_OK(cudaStreamSynchronize(stream));
+    }
+  } catch (const std::exception& err) {
+    return strdup(err.what());
+  } catch (...) {
+    return strdup("Generic exception");
+  }
+  return nullptr;
+}
+
+// Make the persistent stream, and the host, wait for eval_check to complete. eval_check runs
+// asynchronously on pre-Blackwell NVIDIA GPUs (see needs_sync above); elsewhere it has already
+// completed and this returns at once.
+const char* risc0_circuit_rv32im_cuda_eval_check_dep() {
+  try {
+    cudaEvent_t event = getEvalCheckEvent();
+    CUDA_OK(cudaEventRecord(event, getEvalCheckStream()));
+    CUDA_OK(cudaStreamWaitEvent(getPersistentStream(), event, 0));
+    // Wait on the host too. The caller (DeferredFinalize::complete) frees what eval_check
+    // reads -- the committed groups' evaluated buffers, released in low-memory mode -- as soon
+    // as this returns, and only kernels on the persistent stream are ordered after eval_check
+    // by the wait above. A freed buffer goes back to the pool, where synchronous copies (e.g.
+    // restore_coeffs' upload, on the legacy stream) and sppark's kernels (on its own
+    // non-blocking stream) can reuse it while eval_check still reads it; and a >= 8 GB (VMM)
+    // buffer is unmapped at once. Finalize waits for eval_check's result next anyway; what
+    // this gives up is overlapping eval_check with that restore_coeffs upload.
+    CUDA_OK(cudaStreamSynchronize(getEvalCheckStream()));
+  } catch (const std::exception& err) {
+    return strdup(err.what());
+  } catch (...) {
+    return strdup("Generic exception");
+  }
+  return nullptr;
+}
+
+const char* risc0_circuit_rv32im_cuda_warmup_eval_check() {
+  try {
+    cudaStream_t stream = getEvalCheckStream();
+    // Launch eval_check with domain=0 to trigger kernel binary loading.
+    eval_check<<<1, 1, 0, stream>>>(nullptr, nullptr, nullptr, nullptr,
+                                     nullptr, nullptr, Fp(0), 0, 0);
+    CUDA_OK(cudaStreamSynchronize(stream));
+  } catch (const std::exception& err) {
+    return strdup(err.what());
+  } catch (...) {
+    return strdup("Generic exception");
+  }
+  return nullptr;
+}
+
+} // extern "C"

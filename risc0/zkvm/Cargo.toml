@@ -37,6 +37,26 @@ test = true
 name = "recursion"
 required-features = ["prove"]
 
+[[example]]
+name = "prove_bench"
+required-features = ["prove"]
+
+[[example]]
+name = "prove_and_verify"
+required-features = ["prove"]
+
+[[example]]
+name = "sha256_bench"
+required-features = ["prove"]
+
+[[example]]
+name = "prove_busy"
+required-features = ["prove"]
+
+[[example]]
+name = "prove_e2e"
+required-features = ["prove"]
+
 [dependencies]
 anyhow = { version = "1.0", default-features = false }
 borsh = { version = "1.5", default-features = false, features = ["derive"] }
@@ -163,6 +183,22 @@ cuda = [
   "risc0-circuit-rv32im/cuda",
   "risc0-groth16/cuda",
   "risc0-zkp/cuda",
+]
+rocm = [
+  "prove",
+  "risc0-circuit-keccak/rocm",
+  "risc0-circuit-recursion/rocm",
+  "risc0-circuit-rv32im/rocm",
+  "risc0-groth16/rocm",
+  "risc0-zkp/rocm",
+]
+intel = [
+  "prove",
+  "risc0-groth16/intel",
+  "risc0-circuit-keccak/intel",
+  "risc0-circuit-recursion/intel",
+  "risc0-circuit-rv32im/intel",
+  "risc0-zkp/intel",
 ]
 default = ["client", "bonsai"]
 r0vm-ver-compat = []

@@ -1,6 +1,8 @@
 
 // This code is automatically generated
 
+#pragma once
+
 #include "supra/fp.h"
 
 

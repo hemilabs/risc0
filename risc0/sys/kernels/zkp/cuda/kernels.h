@@ -41,7 +41,12 @@ __global__ void eltwise_zeroize_fp(Fp* elems, uint32_t count);
 
 __global__ void eltwise_zeroize_fpext(FpExt* elems, uint32_t count);
 
-__global__ void fri_fold(Fp* out, const Fp* in, const FpExt* mix, const uint32_t count);
+// `__restrict__` as in the definition: MSVC mangles it into the symbol name (GCC does
+// not), so a declaration without it names a different function there.
+__global__ void fri_fold(Fp* __restrict__ out,
+                         const Fp* __restrict__ in,
+                         const FpExt* __restrict__ mix,
+                         const uint32_t count);
 
 __global__ void mix_poly_coeffs(FpExt* out,
                                 const Fp* in,
@@ -65,9 +70,17 @@ __global__ void scatter(Fp* into,
                         const Fp* values,
                         const uint32_t count);
 
+__global__ void scatter_bits(Fp* into,
+                             const uint32_t* data,
+                             const uint32_t cycles,
+                             const uint32_t count);
+
 __global__ void sha_rows(ShaDigest* out, const Fp* matrix, uint32_t count, uint32_t colSize);
 
 __global__ void sha_fold(ShaDigest* out, const ShaDigest* in, uint32_t count);
+
+__global__ void gather_digests(
+    uint32_t* dst, const uint32_t* src, const uint32_t* indices, uint32_t count);
 
 __global__ void combos_prepare(FpExt* combos,
                                const FpExt* coeffU,
