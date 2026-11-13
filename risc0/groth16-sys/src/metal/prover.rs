@@ -727,43 +727,23 @@ impl MetalProver {
         let fres_path = setup.fres_path.as_path();
 
         // Sizes first (a few KB of reads), so that an over-budget machine fails before loading.
-        let header = srs::read_zkey_header(srs_path)?;
-        let wn = header.witness_len();
-        let n = header.domain_size;
-        ensure!(
-            n.is_power_of_two() && n >= 2,
-            "groth16-metal: domain size {n} is not a power of two >= 2"
-        );
-        let lg = n.trailing_zeros();
-        ensure!(
-            wn > header.num_public && wn <= u32::MAX as usize && n <= u32::MAX as usize,
-            "groth16-metal: witness length {wn} / domain {n} out of range"
-        );
-        let coeffs_bytes = planned_coeff_bytes(coeffs_path, mem.compact)?;
-        let cap = wn.max(n) as u32;
-        let cfg = msm_config_from_env();
-        let fuzz_blocks = small::fuzz_blocks(wn as u64);
-        let fuzz_len = 2 * fuzz_blocks;
-        let wsum_bytes = wsum_bytes(cfg);
-        let ntt_bytes = ((n as u64 / 2).max(1) + 4096 + 2 * (n as u64 >> 12).max(1)) * FR_BYTES;
-        let scratch_sizes = MsmScratch::sizes_for(cap, cfg);
-        // Item G10 aliasing: c in the scratch's `sorted` buffer (index 4 of the sizes) and the
-        // fuzz regenerated per proof at the start of a, b, when they fit.
-        let c_in_scratch = mem.alias && scratch_sizes[4] >= n as u64 * FR_BYTES;
-        let fuzz_late = mem.alias && fuzz_len <= 2 * n as u64;
-        let polys = if c_in_scratch { 2 } else { 3 };
-        // ... and the MSM piece buffer in a, b (free from MSM H's sort to the end of the proof).
-        let pieces_lent = mem.alias && scratch_sizes[5] <= polys * n as u64 * FR_BYTES;
-        let own = (polys * n as u64 + wn as u64 + if fuzz_late { 0 } else { fuzz_len }) * FR_BYTES
-            + wsum_bytes
-            + 16;
-        stats.planned_bytes = header.points_bytes()
-            + coeffs_bytes
-            + own
-            + ntt_bytes
-            + scratch_sizes.iter().sum::<u64>()
-            - if pieces_lent { scratch_sizes[5] } else { 0 }
-            + PLAN_SLACK;
+        let Layout {
+            wn,
+            n,
+            lg,
+            cap,
+            cfg,
+            fuzz_blocks,
+            fuzz_len,
+            wsum_bytes,
+            ntt_bytes,
+            c_in_scratch,
+            fuzz_late,
+            polys,
+            pieces_lent,
+            planned_bytes,
+        } = layout(srs_path, coeffs_path, mem)?;
+        stats.planned_bytes = planned_bytes;
         check_working_set(
             device,
             "the Groth16 prover (proving key, coefficients and scratch)",
@@ -908,9 +888,49 @@ impl MetalProver {
         r: Fr,
         s: Fr,
     ) -> Result<Proof> {
+        self.prove_from(Some(witness), opts, r, s)
+    }
+
+    /// The prover's shared witness buffer ([Self::witness_len] elements, each four
+    /// little-endian u64 limbs of a canonical Fr), for the host to write the witness into
+    /// before [Self::prove_in_place] (item G13: no host copy of the 180 MB witness, no upload).
+    /// Not in use by the GPU between proofs (every proof waits for its command buffers).
+    pub fn witness_buffer(&mut self) -> &mut [[u64; 4]] {
+        // Safety: a shared buffer of wn * 32 bytes (alloc'd in new_with), page-aligned, owned
+        // by self and borrowed mutably with it; the GPU does not use it outside a proof.
+        unsafe { std::slice::from_raw_parts_mut(self.witness.contents() as *mut [u64; 4], self.wn) }
+    }
+
+    /// [Self::prove] of the witness the host wrote into [Self::witness_buffer].
+    pub fn prove_in_place(&mut self, opts: &ProveOptions) -> Result<Proof> {
+        let (r, s) = (random_fr()?, random_fr()?);
+        self.prove_from(None, opts, r, s)
+    }
+
+    /// Prove the witness `witness` (copied into the shared buffer), or with `None` the one
+    /// already in it.
+    fn prove_from(
+        &mut self,
+        witness: Option<&[u8]>,
+        opts: &ProveOptions,
+        r: Fr,
+        s: Fr,
+    ) -> Result<Proof> {
         let t0 = Instant::now();
         let k = kernels()?;
         let (wn, n) = (self.wn, self.n);
+        let copy = witness.is_some();
+        let witness: &[u8] = match witness {
+            Some(w) => w,
+            // Safety: the shared witness buffer (wn * 32 bytes), idle between proofs; only read
+            // here before the GPU work is encoded.
+            None => unsafe {
+                std::slice::from_raw_parts(
+                    self.witness.contents() as *const u8,
+                    wn * FR_BYTES as usize,
+                )
+            },
+        };
         ensure!(
             witness.len() == wn * FR_BYTES as usize,
             "groth16-metal: witness of {} bytes, expected {wn} elements ({} bytes)",
@@ -929,11 +949,13 @@ impl MetalProver {
         let t = Instant::now();
         // Safety: shared buffers of at least these sizes, not in use by the GPU.
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                witness.as_ptr(),
-                self.witness.contents() as *mut u8,
-                witness.len(),
-            );
+            if copy {
+                std::ptr::copy_nonoverlapping(
+                    witness.as_ptr(),
+                    self.witness.contents() as *mut u8,
+                    witness.len(),
+                );
+            }
             std::ptr::write_bytes(self.fault.contents() as *mut u8, 0, 16);
         }
         let upload_ms = ms(t);
@@ -1247,6 +1269,88 @@ impl MetalProver {
 /// The ChaCha state of the CUDA prover's fuzz (all-zero key and nonce).
 fn fuzz_state() -> [u32; 16] {
     small::chacha_state(&[0; 32], &[0; 12])
+}
+
+/// The prover's buffer layout and device footprint for a key, from the files' headers (a few KB
+/// of reads; nothing is loaded).
+struct Layout {
+    wn: usize,
+    n: usize,
+    lg: u32,
+    cap: u32,
+    cfg: MsmConfig,
+    fuzz_blocks: u64,
+    fuzz_len: u64,
+    wsum_bytes: u64,
+    ntt_bytes: u64,
+    c_in_scratch: bool,
+    fuzz_late: bool,
+    polys: u64,
+    pieces_lent: bool,
+    /// The whole footprint, checked against the working-set budget before loading.
+    planned_bytes: u64,
+}
+
+fn layout(srs_path: &Path, coeffs_path: &Path, mem: MemOptions) -> Result<Layout> {
+    // Sizes first (a few KB of reads), so that an over-budget machine fails before loading.
+    let header = srs::read_zkey_header(srs_path)?;
+    let wn = header.witness_len();
+    let n = header.domain_size;
+    ensure!(
+        n.is_power_of_two() && n >= 2,
+        "groth16-metal: domain size {n} is not a power of two >= 2"
+    );
+    let lg = n.trailing_zeros();
+    ensure!(
+        wn > header.num_public && wn <= u32::MAX as usize && n <= u32::MAX as usize,
+        "groth16-metal: witness length {wn} / domain {n} out of range"
+    );
+    let coeffs_bytes = planned_coeff_bytes(coeffs_path, mem.compact)?;
+    let cap = wn.max(n) as u32;
+    let cfg = msm_config_from_env();
+    let fuzz_blocks = small::fuzz_blocks(wn as u64);
+    let fuzz_len = 2 * fuzz_blocks;
+    let wsum_bytes = wsum_bytes(cfg);
+    let ntt_bytes = ((n as u64 / 2).max(1) + 4096 + 2 * (n as u64 >> 12).max(1)) * FR_BYTES;
+    let scratch_sizes = MsmScratch::sizes_for(cap, cfg);
+    // Item G10 aliasing: c in the scratch's `sorted` buffer (index 4 of the sizes) and the
+    // fuzz regenerated per proof at the start of a, b, when they fit.
+    let c_in_scratch = mem.alias && scratch_sizes[4] >= n as u64 * FR_BYTES;
+    let fuzz_late = mem.alias && fuzz_len <= 2 * n as u64;
+    let polys = if c_in_scratch { 2 } else { 3 };
+    // ... and the MSM piece buffer in a, b (free from MSM H's sort to the end of the proof).
+    let pieces_lent = mem.alias && scratch_sizes[5] <= polys * n as u64 * FR_BYTES;
+    let own = (polys * n as u64 + wn as u64 + if fuzz_late { 0 } else { fuzz_len }) * FR_BYTES
+        + wsum_bytes
+        + 16;
+    let planned_bytes =
+        header.points_bytes() + coeffs_bytes + own + ntt_bytes + scratch_sizes.iter().sum::<u64>()
+            - if pieces_lent { scratch_sizes[5] } else { 0 }
+            + PLAN_SLACK;
+    Ok(Layout {
+        wn,
+        n,
+        lg,
+        cap,
+        cfg,
+        fuzz_blocks,
+        fuzz_len,
+        wsum_bytes,
+        ntt_bytes,
+        c_in_scratch,
+        fuzz_late,
+        polys,
+        pieces_lent,
+        planned_bytes,
+    })
+}
+
+/// The device footprint a [MetalProver] for `setup` would allocate with the memory switches
+/// `mem` (what [MetalProver::new_with] checks against the working-set budget), without loading
+/// anything. Item G13: the early key load decides with it whether the key fits beside the work
+/// still to come.
+pub fn planned_bytes(setup: &SetupParams, mem: MemOptions) -> Result<u64> {
+    Ok(layout(setup.srs_path.as_path(), setup.pcoeffs_path.as_path(), mem)?.planned_bytes)
 }
 
 /// Bytes the coefficients will take on the GPU, from the file header (before loading): the

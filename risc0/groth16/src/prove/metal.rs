@@ -37,7 +37,10 @@
 //! Memory (G8): the key is loaded only after `pre_gpu` (the zkvm's `release_hal_buffers`) has
 //! returned, never beside the STARK prover's pools; [prestart] does not load it.
 
-use std::path::Path;
+use std::{
+    path::Path,
+    sync::atomic::{AtomicU8, Ordering},
+};
 
 use anyhow::{anyhow, Context as _, Result};
 use risc0_groth16_sys::{MetalUnavailable, ProverParams, SetupParams};
@@ -72,30 +75,162 @@ fn preload(dir: &Path) -> Result<()> {
     risc0_groth16_sys::metal_preload(&setup).context("failed to load the groth16 proving key")
 }
 
-/// Load the witness graph (in-process witness generation).
+/// Load the witness graph (in-process witness generation) and compile it for this process's
+/// evaluator ([super::metal_witness]).
 pub(crate) fn preload_graph() -> Result<()> {
-    super::fast::preload()
+    super::metal_witness::preload()
 }
 
-/// Prepare a wrap in the background: build the witness graph (CPU). Unlike the Intel prestart,
-/// this does **not** load the proving key: the zkvm calls it before identity_p254, while the
-/// STARK prover's HAL pools are still allocated, and on unified memory a key loaded then sits
-/// beside them (5.7 GB on top of 2-11 GB of pools: 16.6-17.6 GB peaks at po2 20 without a
-/// budget, and a refused load under an 8 GiB one; zk-miner M1, fixed in G8). [shrink_wrap_with]
-/// loads the key after `pre_gpu` has released those pools, overlapped with the witness. Checks
-/// that the component is installed (the error the Intel prestart returns).
+/// Prepare a wrap in the background: build the witness graph (CPU), and (item G13) start loading
+/// the proving key if it fits beside what is still to come ([early_key_load]).
+///
+/// G8: the zkvm calls this before identity_p254, while the STARK prover's HAL pools may still be
+/// allocated, and on unified memory a key loaded then sits beside them (5.7 GB on top of 2-11 GB
+/// of pools: 16.6-17.6 GB peaks at po2 20 without a budget, and a refused load under an 8 GiB
+/// one; zk-miner M1). So the early load waits until those pools are gone (the zkvm releases them
+/// right after this call, Z10) and loads only if the key and identity_p254's own working set then
+/// fit the working-set limit; otherwise [shrink_wrap_with] loads the key after `pre_gpu`, as
+/// before. Checks that the component is installed (the error the Intel prestart returns).
 pub(crate) fn prestart() -> Result<()> {
-    component_dir()?;
+    let dir = component_dir()?;
     std::thread::spawn(|| {
         if let Err(e) = preload_graph() {
             tracing::warn!("groth16 witness graph preload failed: {e:#}");
         }
     });
+    if early_key_enabled()
+        && EARLY_KEY
+            .compare_exchange(
+                EARLY_IDLE,
+                EARLY_WAITING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    {
+        std::thread::spawn(move || {
+            if let Err(e) = early_key_load(&dir) {
+                tracing::warn!("groth16 early key load failed (the wrap loads it): {e:#}");
+            }
+            EARLY_KEY.store(EARLY_IDLE, Ordering::Release);
+        });
+    }
     Ok(())
 }
 
+/// Item G13 (c): whether [prestart] may load the proving key early (`RISC0_G16_METAL_EARLY_KEY=0`
+/// turns it off: the key is then always loaded after `pre_gpu`, the G8 order).
+fn early_key_enabled() -> bool {
+    std::env::var("RISC0_G16_METAL_EARLY_KEY").as_deref() != Ok("0")
+}
+
+/// What identity_p254 (its own recursion HAL, run after [prestart]) may still allocate beside an
+/// early-loaded key: its measured peak is ~1.4-1.7 GiB (BASELINES 5b: 1731 MiB for a whole
+/// fibonacci recursion phase), plus margin.
+const P254_RESERVE_BYTES: u64 = 2 << 30;
+
+/// The longest [early_key_load] waits for the STARK pools to be released and the key to fit; the
+/// wrap also stops the wait when it starts ([stop_early_key_wait]).
+const EARLY_KEY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// [early_key_load]'s state: no loader, a loader waiting for room, a loader loading (it holds
+/// the prover cache's lock), or a waiting loader told to give up by the wrap.
+static EARLY_KEY: AtomicU8 = AtomicU8::new(EARLY_IDLE);
+const EARLY_IDLE: u8 = 0;
+const EARLY_WAITING: u8 = 1;
+const EARLY_LOADING: u8 = 2;
+const EARLY_STOP: u8 = 3;
+
+/// Called when the wrap starts: a loader still waiting for room gives up (the wrap loads the key
+/// after `pre_gpu` instead); one already loading finishes (the wrap waits for it on the cache).
+fn stop_early_key_wait() {
+    let _ = EARLY_KEY.compare_exchange(
+        EARLY_WAITING,
+        EARLY_STOP,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+}
+
+/// Whether an early key load fits: nothing beyond identity_p254's share is allocated (no STARK
+/// pools; G8), and the key plus identity_p254's reserve fit the working-set limit on top of what
+/// is.
+fn early_key_fits(allocated: u64, planned: u64, limit: u64) -> bool {
+    allocated <= P254_RESERVE_BYTES
+        && allocated
+            .saturating_add(planned)
+            .saturating_add(P254_RESERVE_BYTES)
+            <= limit
+}
+
+/// Load the proving key during identity_p254 if it fits ([early_key_fits]), polling the device's
+/// allocation while the caller releases the STARK pools (freeing 5-11 GiB of pools can take
+/// longer than identity_p254's first allocations), until it fits, the wrap starts
+/// ([stop_early_key_wait]) or [EARLY_KEY_WAIT] passes. A no-op if the key is cached.
+fn early_key_load(dir: &Path) -> Result<()> {
+    let t0 = std::time::Instant::now();
+    let verbose = std::env::var_os("RISC0_VERBOSE").is_some();
+    let setup = SetupParams::new(dir).context("failed to create groth16 setup params")?;
+    let planned = risc0_groth16_sys::metal_planned_bytes(&setup)?;
+    let limit = risc0_groth16_sys::effective_working_set_limit()
+        .ok_or_else(|| anyhow!("no Metal device"))?;
+    let mut allocated;
+    let go = loop {
+        allocated = risc0_groth16_sys::metal::allocated_bytes();
+        if early_key_fits(allocated, planned, limit) {
+            // Claim the load unless the wrap has started meanwhile.
+            break EARLY_KEY
+                .compare_exchange(
+                    EARLY_WAITING,
+                    EARLY_LOADING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok();
+        }
+        if EARLY_KEY.load(Ordering::Acquire) != EARLY_WAITING || t0.elapsed() >= EARLY_KEY_WAIT {
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    };
+    let mib = |b: u64| b as f64 / (1u64 << 20) as f64;
+    if !go {
+        let msg = format!(
+            "groth16-metal: no early key load after {:.1} ms ({:.0} MiB allocated, key {:.0} MiB, \
+             limit {:.0} MiB); the wrap loads it after pre_gpu",
+            t0.elapsed().as_secs_f64() * 1000.0,
+            mib(allocated),
+            mib(planned),
+            mib(limit)
+        );
+        tracing::debug!("{msg}");
+        if verbose {
+            eprintln!("[{msg}]");
+        }
+        return Ok(());
+    }
+    let waited = t0.elapsed();
+    let r = risc0_groth16_sys::metal_preload(&setup);
+    if verbose {
+        eprintln!(
+            "[groth16-metal] early key load: waited {:.1} ms ({:.0} MiB allocated, key {:.0} MiB, \
+             limit {:.0} MiB), loaded in {:.1} ms{}",
+            waited.as_secs_f64() * 1000.0,
+            mib(allocated),
+            mib(planned),
+            mib(limit),
+            (t0.elapsed() - waited).as_secs_f64() * 1000.0,
+            if r.is_err() { " (failed)" } else { "" }
+        );
+    }
+    match r {
+        Err(e) if is_unavailable(&e) => Ok(()),
+        r => r,
+    }
+}
+
 /// Start loading the proving key early. CUDA-only gating (its loader waits for
-/// [prestart_key_go]); on Metal, [prestart] already loads in the background, so a no-op.
+/// [prestart_key_go]); on Metal, [prestart] loads it early when it fits, so a no-op.
 pub(crate) fn prestart_key() {}
 
 /// Release a pending [prestart_key] loader (no-op on Metal).
@@ -113,6 +248,8 @@ pub(crate) fn preload_srs() -> Result<()> {
 
 /// Free the proving key, coefficients and scratch cached on the GPU.
 pub(crate) fn release_srs() -> Result<()> {
+    // An early load still waiting for room must not load the key after this release.
+    stop_early_key_wait();
     let _gpu = risc0_zkp::hal::metal::exclusive();
     risc0_groth16_sys::metal_release().context("failed to release the groth16 prover")
 }
@@ -191,12 +328,52 @@ fn aligned_copy(seal: &[u8]) -> Option<Vec<u32>> {
     )
 }
 
-/// The GPU wrap. The witness is computed on a helper thread while the calling thread runs
-/// `pre_gpu` (the zkvm releases the STARK prover's HAL pools there) and **then** loads the proving
-/// key if it is not cached, so the key never coexists with the pools it replaces (G8; before,
-/// the loader started first and raced the release). The key load (~1 s) still overlaps the
-/// witness (~0.7-1.4 s). Then the prove, under the GPU lock. Writes `proof.json` and
-/// `public.json` into `work_dir`.
+/// Item G13 (b): whether the `par` evaluator writes the witness straight into the prover's shared
+/// witness buffer (`RISC0_G16_METAL_DIRECT=0` computes it into a host vector beside the key load
+/// and copies it, as the other evaluators do).
+fn direct_enabled() -> bool {
+    std::env::var("RISC0_G16_METAL_DIRECT").as_deref() != Ok("0")
+}
+
+/// A witness computed into host memory.
+enum HostWitness {
+    /// [super::metal_witness] (`par` without the direct write, or `fast`).
+    Limbs(Vec<[u64; 4]>),
+    /// [super::fast] (`ref`).
+    Elements(Vec<wtns_file::FieldElement<32>>),
+}
+
+impl HostWitness {
+    fn compute(seal: &[u8]) -> Result<Self> {
+        if super::metal_witness::witness_len().is_some() {
+            super::metal_witness::witness(seal).map(Self::Limbs)
+        } else {
+            super::fast::witness(seal).map(Self::Elements)
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        const _: () = assert!(std::mem::size_of::<wtns_file::FieldElement<32>>() == 32);
+        match self {
+            // Little-endian limbs of little-endian u64s: the canonical little-endian bytes.
+            Self::Limbs(w) => bytemuck::cast_slice(w),
+            // Safety: FieldElement<32> is a plain [u8; 32] newtype (size asserted above,
+            // alignment 1).
+            Self::Elements(w) => unsafe {
+                std::slice::from_raw_parts(w.as_ptr() as *const u8, w.len() * 32)
+            },
+        }
+    }
+}
+
+/// The GPU wrap. Writes `proof.json` and `public.json` into `work_dir`.
+///
+/// - `par` evaluator with the key cached or loaded early by [prestart] (item G13): `pre_gpu` (the
+///   zkvm releases the STARK HAL pools there), then under the GPU lock the witness straight into
+///   the prover's shared buffer (~25-35 ms) and the prove.
+/// - Otherwise the witness is computed on a helper thread while the calling thread runs `pre_gpu`
+///   and **then** loads the proving key if it is not cached, so the key never coexists with the
+///   pools it replaces (G8); then the prove, under the GPU lock.
 fn gpu_prove(
     identity_p254_seal_bytes: &[u8],
     pre_gpu: &mut Option<impl FnOnce()>,
@@ -215,11 +392,52 @@ fn gpu_prove(
     let t0 = std::time::Instant::now();
     let ms = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1000.0;
 
+    // A loader still waiting for room gives up now: the key is loaded after pre_gpu below.
+    stop_early_key_wait();
+    // The direct write needs the prover first, so it is taken only when the key is already
+    // cached or being loaded early (metal_is_loaded waits for that load): otherwise the witness
+    // runs beside the key load below rather than after it.
+    if direct_enabled()
+        && super::metal_witness::is_par()
+        && risc0_groth16_sys::metal::metal_is_loaded()
+    {
+        if let Some(f) = pre_gpu.take() {
+            f();
+        }
+        let pre_gpu_ms = ms(t0);
+        // Check the seal before the key load (a bad seal is an error, not a load).
+        super::fast::seal_inputs(identity_p254_seal_bytes)?;
+        preload(&dir)?;
+        let loaded_ms = ms(t0);
+        let _gpu = risc0_zkp::hal::metal::exclusive();
+        let locked_ms = ms(t0);
+        let mut witness_ms = 0.0;
+        let params = ProverParams::new(work_dir, std::ptr::null())
+            .context("failed to create groth16 prover parameters")?;
+        risc0_groth16_sys::metal_prove_in_place(&params, &setup, |buf| {
+            let t = std::time::Instant::now();
+            let r = super::metal_witness::witness_into(identity_p254_seal_bytes, buf)
+                .context("failed to calculate the groth16 witness");
+            witness_ms = ms(t);
+            r
+        })
+        .context("groth16 prove failed")?;
+        if verbose {
+            eprintln!(
+                "[groth16-metal] pre_gpu done={pre_gpu_ms:.1}ms key loaded={loaded_ms:.1}ms gpu \
+                 lock={locked_ms:.1}ms witness (par, in place)={witness_ms:.1}ms proved={:.1}ms \
+                 (since the wrap started)",
+                ms(t0)
+            );
+        }
+        return read_proof(&params);
+    }
+
     let mut pre_gpu_ms = 0.0;
     let mut loaded_ms = 0.0;
     let (witness, witness_ms, loaded) = std::thread::scope(|sc| {
         let h = sc.spawn(|| {
-            let w = super::fast::witness(identity_p254_seal_bytes);
+            let w = HostWitness::compute(identity_p254_seal_bytes);
             (w, ms(t0))
         });
         if let Some(f) = pre_gpu.take() {
@@ -241,13 +459,9 @@ fn gpu_prove(
     let _gpu = risc0_zkp::hal::metal::exclusive();
     let locked_ms = ms(t0);
 
-    const _: () = assert!(std::mem::size_of::<wtns_file::FieldElement<32>>() == 32);
-    // Safety: FieldElement<32> is a plain [u8; 32] newtype (size asserted above, alignment 1).
-    let witness_bytes =
-        unsafe { std::slice::from_raw_parts(witness.as_ptr() as *const u8, witness.len() * 32) };
-    let params = ProverParams::new(work_dir, witness.as_ptr() as *const u8)
+    let params = ProverParams::new(work_dir, witness.as_bytes().as_ptr())
         .context("failed to create groth16 prover parameters")?;
-    risc0_groth16_sys::metal_prove_witness(witness_bytes, &params, &setup)
+    risc0_groth16_sys::metal_prove_witness(witness.as_bytes(), &params, &setup)
         .context("groth16 prove failed")?;
     if verbose {
         eprintln!(
@@ -257,7 +471,11 @@ fn gpu_prove(
             ms(t0)
         );
     }
+    read_proof(&params)
+}
 
+/// The proof the prover wrote to `params.proof_path`.
+fn read_proof(params: &ProverParams) -> Result<Seal> {
     let contents = std::fs::read_to_string(params.proof_path.as_path())
         .context("failed to read the groth16 proof")?;
     let proof_json: ProofJson =
@@ -285,6 +503,24 @@ mod tests {
         if risc0_groth16_sys::metal_supported().is_ok() && !told_otherwise {
             assert!(enabled());
         }
+    }
+
+    /// Item G13 (c): the early key load's gate.
+    #[test]
+    fn early_key_gate() {
+        const GIB: u64 = 1 << 30;
+        let key = 3928 << 20; // the rzup key with the default memory switches
+                              // 36 GB Mac (28 GiB limit), after the zkvm released the STARK pools: load.
+        assert!(early_key_fits(1476 << 20, key, 28 * GIB));
+        // 8 GiB budget: the key, identity_p254's reserve and what is allocated fit.
+        assert!(early_key_fits(1476 << 20, key, 8 * GIB));
+        // 4 GiB budget: never (the key alone is ~3.84 GiB).
+        assert!(!early_key_fits(0, key, 4 * GIB));
+        // 5 GiB: the key fits but not with identity_p254's reserve.
+        assert!(!early_key_fits(0, key, 5 * GIB));
+        // STARK pools still allocated (G8): not beside them, whatever the limit.
+        assert!(!early_key_fits(4602757120, key, 28 * GIB));
+        assert!(!early_key_fits(u64::MAX, key, u64::MAX));
     }
 
     #[test]

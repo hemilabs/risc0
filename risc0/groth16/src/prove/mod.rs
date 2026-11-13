@@ -34,11 +34,23 @@ mod intel;
     not(any(feature = "cuda", feature = "rocm", feature = "intel"))
 ))]
 mod metal;
+#[cfg(all(
+    feature = "metal",
+    not(any(feature = "cuda", feature = "rocm", feature = "intel"))
+))]
+mod metal_witness;
 mod seal_format;
 mod seal_to_json;
-#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[cfg(any(
+    feature = "cuda",
+    feature = "rocm",
+    all(feature = "metal", not(feature = "intel"))
+))]
 mod witness_fast;
-#[cfg(feature = "cuda")]
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal", not(any(feature = "rocm", feature = "intel")))
+))]
 mod witness_par;
 
 use anyhow::Result;

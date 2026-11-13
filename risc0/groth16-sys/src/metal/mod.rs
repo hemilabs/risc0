@@ -321,6 +321,39 @@ pub fn metal_prove_witness(
     prove_into(prover, witness, prover_params)
 }
 
+/// [metal_prove] with the witness written straight into the prover's shared witness buffer by
+/// `fill` (item G13: no 180 MB host vector, no copy). `fill` gets [prover::MetalProver::
+/// witness_buffer] (`num_vars` canonical elements as little-endian u64 limbs) and must write every
+/// element. Builds the prover (loads the key) first if it is not cached.
+pub fn metal_prove_in_place(
+    prover_params: &ProverParams,
+    setup_params: &SetupParams,
+    fill: impl FnOnce(&mut [[u64; 4]]) -> Result<()>,
+) -> Result<()> {
+    let mut slot = cache();
+    let prover = cached_prover(&mut slot, setup_params)?;
+    fill(prover.witness_buffer())?;
+    let proof = prover.prove_in_place(&prover::ProveOptions::from_env())?;
+    proof.write_files(
+        prover_params.proof_path.as_path(),
+        prover_params.public_path.as_path(),
+    )
+}
+
+/// The working-set limit that applies to this process's GPU allocations: the explicit budget's
+/// ([working_set_limit]), else the device's `recommendedMaxWorkingSetSize`; `None` without a
+/// Metal device.
+pub fn effective_working_set_limit() -> Option<u64> {
+    let device = metal::Device::system_default()?;
+    Some(working_set_limit(&device).unwrap_or_else(|| device.recommended_max_working_set_size()))
+}
+
+/// The device footprint of the prover for `setup_params` with the environment's memory switches
+/// ([prover::planned_bytes]); reads only the files' headers.
+pub fn metal_planned_bytes(setup_params: &SetupParams) -> Result<u64> {
+    prover::planned_bytes(setup_params, prover::MemOptions::from_env())
+}
+
 fn prove_into(
     prover: &mut prover::MetalProver,
     witness: &[u8],
