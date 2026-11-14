@@ -23,6 +23,8 @@ mod tests;
 mod tests_metal_wrap;
 #[cfg(all(test, feature = "metal"))]
 mod tests_z12;
+#[cfg(all(test, feature = "metal", not(any(feature = "cuda", feature = "rocm"))))]
+mod tests_z17;
 pub(crate) mod union_peak;
 
 use std::rc::Rc;
