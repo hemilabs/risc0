@@ -365,6 +365,11 @@ pub(crate) mod tests {
         PHASE_ENTRIES.with(|e| std::array::from_fn(|i| e[i].get()))
     }
 
+    /// `v == Val::INVALID` without `Elem::eq`, which debug-asserts that both sides are valid.
+    fn is_invalid(v: &Val) -> bool {
+        v.as_u32_montgomery() == Val::INVALID.as_u32_montgomery()
+    }
+
     fn scatter_matches_host(po2: usize) {
         let _gpu = gpu_test_lock();
         let hal = Rc::new(MetalHalSha256::new());
@@ -382,13 +387,18 @@ pub(crate) mod tests {
             .unwrap();
         let actual = data.buf.to_vec();
         assert_eq!(actual.len(), expected.len());
-        let diffs = actual.iter().zip(&expected).filter(|(a, e)| a != e).count();
+        // Compared by bit pattern: `Elem::eq` debug-asserts validity, and INVALID is not valid.
+        let diffs = actual
+            .iter()
+            .zip(&expected)
+            .filter(|(a, e)| a.as_u32_montgomery() != e.as_u32_montgomery())
+            .count();
         assert_eq!(
             diffs, 0,
             "po2 {po2}: {diffs} cells differ from the host scatter"
         );
         // The scatter wrote something (not only INVALID cells survive).
-        assert!(actual.iter().any(|v| *v != Val::INVALID));
+        assert!(actual.iter().any(|v| !is_invalid(v)));
     }
 
     #[test]
@@ -445,7 +455,7 @@ pub(crate) mod tests {
             );
             // A rejected info writes nothing.
             assert!(
-                data.buf.to_vec().iter().all(|v| *v == Val::INVALID),
+                data.buf.to_vec().iter().all(is_invalid),
                 "{desc}"
             );
         }
