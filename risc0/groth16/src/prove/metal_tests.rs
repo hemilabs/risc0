@@ -626,6 +626,315 @@ fn witness_bit_equal_to_reference() {
     }
 }
 
+/// Item W7-G1: the cached graph is released and rebuilt on demand; a rebuilt graph gives the same
+/// witness, a holder keeps a released graph alive, and the idle hook frees nothing that is in use.
+#[test]
+fn graph_release_and_rebuild() {
+    use super::super::metal_witness as mw;
+    let _lock = gpu_test_lock();
+    if component_dir().is_err() || mw::kind() == mw::Kind::Ref {
+        eprintln!("skipped: no risc0-groth16 component, or the ref evaluator");
+        return;
+    }
+    let seal = seal_words();
+    mw::clear_reservations();
+    mw::preload_for_wrap().unwrap();
+    assert!(mw::is_cached());
+    let first = mw::witness(seal).unwrap();
+    let builds = mw::builds();
+
+    // Held by a wrap: the idle hook leaves it (it may still free an idle `fast.rs` program of
+    // another test); a release drops the cache, not the holder's copy.
+    let held = mw::wrap_graph().unwrap();
+    let d0 = mw::drops();
+    mw::release_idle_now();
+    assert!(mw::is_cached());
+    assert_eq!(mw::drops(), d0);
+    assert!(mw::release());
+    assert!(!mw::is_cached());
+    assert!(held.witness(seal, true).unwrap() == first);
+
+    // Rebuilt on the next use, bit-equal.
+    let t = Instant::now();
+    let again = mw::witness(seal).unwrap();
+    eprintln!(
+        "W7-G1 rebuild + witness: {:.1} ms",
+        t.elapsed().as_secs_f64() * 1e3
+    );
+    assert!(mw::builds() > builds);
+    assert!(mw::is_cached());
+    assert!(again == first, "the rebuilt graph's witness differs");
+
+    // Fix round 1: a wrap still holding the old graph does not empty the cache of the new one
+    // (another wrap's prestart built it while this wrap proved).
+    let d0 = mw::drops();
+    assert!(mw::release_slot(Some(&held), 0).is_none());
+    assert!(mw::is_cached());
+    drop(held);
+    assert_eq!(
+        mw::drops(),
+        d0 + 1,
+        "the old graph is dropped by its last holder"
+    );
+
+    // Idle: the hook's mechanism drops it (and says how much it freed).
+    let d0 = mw::drops();
+    let freed = mw::release_idle_now();
+    assert_eq!(mw::drops(), d0 + 1);
+    eprintln!("W7-G1 release_idle freed {:.1} MiB", mib(freed));
+    assert!(!mw::is_cached());
+    let d1 = mw::drops();
+    mw::release_idle_now();
+    assert_eq!(mw::drops(), d1);
+    // The public hook (Metal enabled or not) never fails.
+    let _ = crate::prove::release_graph();
+}
+
+/// Item W7-G1 (fix round 1, PLAN 8.7): the drop counter the release tests assert on counts only
+/// graphs that were the process's cached graph, so tests that compile throw-away evaluators
+/// (`witness_with`, in [witness_evaluators_bit_equal], which runs in parallel without the lock)
+/// cannot move it.
+#[test]
+fn uncached_graphs_do_not_count_as_cached_drops() {
+    use super::super::metal_witness as mw;
+    let _lock = gpu_test_lock();
+    if component_dir().is_err() {
+        eprintln!("skipped: no risc0-groth16 component");
+        return;
+    }
+    let d0 = mw::drops();
+    let w = mw::witness_with(mw::Kind::Fast, 1, seal_words()).unwrap();
+    assert!(!w.is_empty());
+    assert_eq!(mw::drops(), d0, "a throw-away graph's drop was counted");
+}
+
+/// Item W7-G1 (fix round 1): the pressure-drain hook does not drop the graph when the drop cannot
+/// lower the footprint (libmalloc's large cache on and no explicit `RISC0_G16_GRAPH_RELEASE=1`):
+/// there a drop frees nothing and each rebuild leaves ~580 MiB more behind.
+#[test]
+fn release_hook_keeps_the_graph_with_the_large_cache_on() {
+    use super::super::metal_witness as mw;
+    let _lock = gpu_test_lock();
+    if component_dir().is_err() || mw::kind() == mw::Kind::Ref {
+        eprintln!("skipped: no risc0-groth16 component, or the ref evaluator");
+        return;
+    }
+    mw::clear_reservations();
+    mw::preload_for_wrap().unwrap();
+    assert!(mw::is_cached());
+    let d0 = mw::drops();
+    let freed = crate::prove::release_graph();
+    if mw::idle_release_allowed() {
+        eprintln!("large cache off or release forced: the hook drops the idle graph");
+        assert_eq!(mw::drops(), d0 + 1);
+        assert!(!mw::is_cached());
+    } else {
+        assert_eq!(freed, 0);
+        assert_eq!(
+            mw::drops(),
+            d0,
+            "the hook dropped the graph with the large cache on"
+        );
+        assert!(mw::is_cached());
+    }
+}
+
+/// Item W7-G1 fix round 2 (the round-2 review's finding): a pressure drain that fires while a wrap
+/// runs (here from `pre_gpu`, where the zkvm releases the STARK pools and where W7-A1's drain
+/// would fire) must not drop the wrap's graph: before the fix the hook freed ~950 MiB and the wrap
+/// rebuilt the graph synchronously (0.7-0.9 s, under the GPU lock on the in-place path). Uses the
+/// hook's mechanism ([release_idle_now]: the public hook is a no-op with the large cache on),
+/// three cycles, every proof verified.
+#[test]
+fn drain_during_a_wrap_keeps_its_graph() {
+    use super::super::metal_witness as mw;
+    let _lock = gpu_test_lock();
+    if !available() || mw::kind() == mw::Kind::Ref {
+        return;
+    }
+    for i in 0..3 {
+        mw::preload_for_wrap().unwrap();
+        let b0 = mw::builds();
+        let freed = std::cell::Cell::new(None);
+        let dir = tempfile::tempdir().unwrap();
+        let r = gpu_prove(
+            seal_words(),
+            &mut Some(|| freed.set(Some(mw::release_idle_now()))),
+            dir.path(),
+        );
+        let seal = match r {
+            Err(e) if refused_by_budget(&e) => return,
+            r => r.unwrap(),
+        };
+        check_proof(&seal, dir.path());
+        eprintln!(
+            "W7G1DRAIN cycle {i}: the drain in pre_gpu freed {:.1} MiB; builds {} -> {}",
+            mib(freed.get().unwrap_or(0)),
+            b0,
+            mw::builds()
+        );
+        assert_eq!(mw::wraps_in_progress(), 0);
+        assert_eq!(freed.get(), Some(0), "the drain in pre_gpu freed memory");
+        assert_eq!(
+            mw::builds(),
+            b0,
+            "the drain dropped the wrap's graph: the wrap rebuilt it synchronously"
+        );
+    }
+}
+
+/// Item W7-G1 fix round 2: what keeps the graph from a drain or a wrap's after-witness release
+/// besides a handle: a wrap in progress before its witness, another wrap still in progress (the
+/// last one out releases), and a prestart reservation until a wrap takes it.
+#[test]
+fn wraps_in_progress_and_reservations_keep_the_graph() {
+    use super::super::metal_witness as mw;
+    let _lock = gpu_test_lock();
+    if component_dir().is_err() || mw::kind() == mw::Kind::Ref {
+        eprintln!("skipped: no risc0-groth16 component, or the ref evaluator");
+        return;
+    }
+    assert_eq!(mw::wraps_in_progress(), 0);
+    mw::clear_reservations();
+    mw::preload_for_wrap().unwrap();
+    let d0 = mw::drops();
+    {
+        // A wrap in its pre_gpu (no handle yet): the drain leaves the graph.
+        let w1 = mw::WrapGuard::begin();
+        assert_eq!(mw::release_idle_now(), 0);
+        assert!(mw::is_cached());
+        // A second wrap in progress: the first one's after-witness release (with or without its
+        // handle) leaves the cache to the last wrap out.
+        let w2 = mw::WrapGuard::begin();
+        let held = mw::wrap_graph().unwrap();
+        assert!(mw::release_slot(Some(&held), 1).is_none());
+        assert!(mw::release_slot(None, 1).is_none());
+        assert!(mw::is_cached());
+        drop((held, w2, w1));
+    }
+    assert_eq!(mw::wraps_in_progress(), 0);
+    // The next job's prestart reserved the graph: neither a drain nor a failed wrap's release
+    // (no handle) drops it, until a wrap takes the reservation and finishes.
+    mw::reserve_for_wrap();
+    assert_eq!(mw::release_idle_now(), 0);
+    assert!(mw::release_slot(None, 0).is_none());
+    assert!(mw::is_cached());
+    {
+        let _w = mw::WrapGuard::begin();
+        assert_eq!(mw::release_idle_now(), 0);
+        assert!(mw::is_cached());
+    }
+    assert_eq!(
+        mw::drops(),
+        d0,
+        "the graph was dropped while in use or reserved"
+    );
+    // Taken and finished: idle, the drain's mechanism drops it.
+    mw::release_idle_now();
+    assert!(!mw::is_cached());
+    assert_eq!(mw::drops(), d0 + 1);
+}
+
+/// Item W7-G1 fix round 1 (the review's hook finding, kept as a check): five cycles of a wrap's
+/// prestart build, a verified wrap and the pressure-drain hook. The footprint before each hook
+/// call must not climb cycle over cycle (before the fix, with the large cache on, it rose ~580
+/// MiB per cycle: 4044 -> 6365 MiB). Heavy: `cargo test ... w7g1_hook_cycle -- --ignored
+/// --nocapture --test-threads 1` under gpu-run.
+#[test]
+#[ignore]
+fn w7g1_hook_cycle() {
+    use risc0_groth16_sys::metal::filemap::process_memory;
+    let _lock = gpu_test_lock();
+    if !available() {
+        return;
+    }
+    let mut before = Vec::new();
+    for i in 0..5 {
+        super::super::metal_witness::preload_for_wrap().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let seal = match gpu_prove(seal_words(), &mut Some(|| {}), dir.path()) {
+            Err(e) if refused_by_budget(&e) => return,
+            r => r.unwrap(),
+        };
+        check_proof(&seal, dir.path());
+        let f = process_memory().phys_footprint;
+        let freed = crate::prove::release_graph();
+        eprintln!(
+            "W7G1HOOK cycle {i}: footprint {:.1} MiB before the hook, freed {:.1} MiB",
+            mib(f),
+            mib(freed)
+        );
+        before.push(f);
+    }
+    // Cycles 1..4 against cycle 1 (cycle 0 is before the key's pools settle): within 256 MiB.
+    let growth = before[4].saturating_sub(before[1]);
+    assert!(
+        growth < 256 << 20,
+        "footprint grew {:.1} MiB over 3 hook cycles",
+        mib(growth)
+    );
+}
+
+/// Item W7-G1 measurement helper (not a check): the graph's share of the process footprint and
+/// its build times (first build, rebuild with the digest known), then the footprint after the
+/// release. `cargo test ... w7g1_graph_share -- --ignored --nocapture --test-threads 1`.
+#[test]
+#[ignore]
+fn w7g1_graph_share() {
+    use super::super::metal_witness as mw;
+    use risc0_groth16_sys::metal::filemap::process_memory;
+    let _lock = gpu_test_lock();
+    if component_dir().is_err() {
+        return;
+    }
+    let fp = || process_memory().phys_footprint;
+    let rounds: usize = std::env::var("W7G1_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    let pause: u64 = std::env::var("W7G1_PAUSE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let start = fp();
+    for round in 0..rounds {
+        std::thread::sleep(Duration::from_millis(pause));
+        let f0 = fp();
+        eprintln!(
+            "W7G1SHARE round {round}: footprint {:.1} MiB at the start (+{:.1} over the first)",
+            mib(f0),
+            mib(f0.saturating_sub(start))
+        );
+        let t = Instant::now();
+        mw::preload_for_wrap().unwrap();
+        let build_ms = t.elapsed().as_secs_f64() * 1e3;
+        let f1 = fp();
+        let t = Instant::now();
+        let w = mw::witness(seal_words()).unwrap();
+        let wit_ms = t.elapsed().as_secs_f64() * 1e3;
+        drop(w);
+        let f2 = fp();
+        let t = Instant::now();
+        let d0 = mw::drops();
+        mw::release();
+        let rel_ms = t.elapsed().as_secs_f64() * 1e3;
+        eprintln!(
+            "W7G1SHARE round {round}: graphs dropped by the release: {}",
+            mw::drops() - d0
+        );
+        let f3 = fp();
+        eprintln!(
+            "W7G1SHARE round {round} kind {:?}: build {build_ms:.1} ms, footprint +{:.1} MiB; \
+             witness {wit_ms:.1} ms, after it +{:.1} MiB; release {rel_ms:.1} ms, after it \
+             {:+.1} MiB vs before the build",
+            mw::kind(),
+            mib(f1.saturating_sub(f0)),
+            mib(f2.saturating_sub(f0)),
+            (f3 as f64 - f0 as f64) / (1u64 << 20) as f64
+        );
+    }
+}
+
 /// Item G13: the compiled evaluators (`par` with several thread counts, `fast`) give the same
 /// witness as the reference generator, element by element, for the fixture and a perturbed seal.
 #[test]

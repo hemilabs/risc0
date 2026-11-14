@@ -126,8 +126,13 @@ pub(crate) fn preload_graph() -> Result<()> {
 /// before. Checks that the component is installed (the error the Intel prestart returns).
 pub(crate) fn prestart() -> Result<()> {
     let dir = component_dir()?;
+    // The wrap's own build (item W7-G1: with the graph released after each wrap, this is where
+    // it is rebuilt, beside identity_p254; otherwise it is usually built already).
+    // Fix round 2: reserved for the wrap that follows (a pressure drain during identity_p254
+    // leaves it; see reserve_for_wrap).
+    super::metal_witness::reserve_for_wrap();
     std::thread::spawn(|| {
-        if let Err(e) = preload_graph() {
+        if let Err(e) = super::metal_witness::preload_for_wrap() {
             tracing::warn!("groth16 witness graph preload failed: {e:#}");
         }
     });
@@ -280,6 +285,12 @@ pub(crate) fn preload_srs() -> Result<()> {
     }
 }
 
+/// Item W7-G1: drop the witness graph if no wrap is using it (a memory-pressure drain hook; never
+/// waits). Returns the bytes freed.
+pub(crate) fn release_graph() -> u64 {
+    super::metal_witness::release_idle()
+}
+
 /// Free the proving key, coefficients and scratch cached on the GPU.
 pub(crate) fn release_srs() -> Result<()> {
     // An early load still waiting for room must not load the key after this release.
@@ -377,12 +388,39 @@ enum HostWitness {
     Elements(Vec<wtns_file::FieldElement<32>>),
 }
 
+/// Item W7-G1 (G15 section 5): whether the graph in hand may evaluate with `par` now, beside
+/// `allocated` bytes of GPU memory ([super::metal_witness::par_fits]): always for `par`; for
+/// `par_transient` only with headroom. Fix round 1: decided from the graph `g` the wrap holds, not
+/// from the process's cache (which another wrap may have released or rebuilt meanwhile).
+fn par_allowed(g: &super::metal_witness::Graph, allocated: u64) -> bool {
+    if !g.is_par_transient() || !super::metal_witness::par_gate_enabled() {
+        return true;
+    }
+    match risc0_groth16_sys::effective_working_set_limit() {
+        Some(limit) => super::metal_witness::par_fits(
+            limit,
+            allocated,
+            super::metal_witness::pressure_normal(),
+        ),
+        None => true,
+    }
+}
+
 impl HostWitness {
-    fn compute(seal: &[u8]) -> Result<Self> {
-        if super::metal_witness::witness_len().is_some() {
-            super::metal_witness::witness(seal).map(Self::Limbs)
-        } else {
-            super::fast::witness(seal).map(Self::Elements)
+    /// The witness (`allocated`: the GPU memory beside it, for the `par_transient` gate). The
+    /// graph is let go of (and released, with the graph release on) as soon as it is computed.
+    fn compute(seal: &[u8], allocated: u64, release: &ReleaseGraphAfterWrap) -> Result<Self> {
+        match super::metal_witness::wrap_graph() {
+            Some(g) => {
+                let w = g.witness(seal, par_allowed(&g, allocated)).map(Self::Limbs);
+                release.now(Some(g));
+                w
+            }
+            None => {
+                let w = super::fast::witness(seal).map(Self::Elements);
+                release.now(None);
+                w
+            }
         }
     }
 
@@ -413,6 +451,11 @@ fn gpu_prove(
     pre_gpu: &mut Option<impl FnOnce()>,
     work_dir: &Path,
 ) -> Result<Seal> {
+    // Item W7-G1: with the graph release on, the graph is released once the witness is computed
+    // (below); this also releases it when the wrap fails before that. Fix round 2: first, so
+    // that the wrap is in progress ([super::metal_witness::WrapGuard]) for all of it: a pressure
+    // drain in `pre_gpu`, the key load or the GPU-lock wait leaves the graph alone.
+    let release = ReleaseGraphAfterWrap::begin();
     // Aligned for `fast::witness` (see shrink_wrap_or_docker; a no-op when called from there).
     let copy = aligned_copy(identity_p254_seal_bytes);
     let identity_p254_seal_bytes: &[u8] = match &copy {
@@ -431,10 +474,12 @@ fn gpu_prove(
     // The direct write needs the prover first, so it is taken only when the key is already
     // cached or being loaded early (metal_is_loaded waits for that load): otherwise the witness
     // runs beside the key load below rather than after it.
-    if direct_enabled()
-        && super::metal_witness::is_par()
-        && risc0_groth16_sys::metal::metal_is_loaded()
-    {
+    // Fix round 2: the wrap holds the graph it decided on until its witness.
+    let in_place = direct_enabled()
+        .then(super::metal_witness::par_graph)
+        .flatten()
+        .filter(|_| risc0_groth16_sys::metal::metal_is_loaded());
+    if let Some(graph) = in_place {
         if let Some(f) = pre_gpu.take() {
             f();
         }
@@ -448,11 +493,15 @@ fn gpu_prove(
         let mut witness_ms = 0.0;
         let params = ProverParams::new(work_dir, std::ptr::null())
             .context("failed to create groth16 prover parameters")?;
+        let allow_par = par_allowed(&graph, risc0_groth16_sys::metal::allocated_bytes());
         risc0_groth16_sys::metal_prove_in_place(&params, &setup, |buf| {
             let t = std::time::Instant::now();
-            let r = super::metal_witness::witness_into(identity_p254_seal_bytes, buf)
+            let r = graph
+                .witness_into(identity_p254_seal_bytes, buf, allow_par)
                 .context("failed to calculate the groth16 witness");
             witness_ms = ms(t);
+            // Item W7-G1: the graph is not needed after the witness (dropped off this thread).
+            release.now(Some(graph));
             r
         })
         .context("groth16 prove failed")?;
@@ -478,7 +527,12 @@ fn gpu_prove(
             f();
         }
         pre_gpu_ms = ms(t0);
-        let w = HostWitness::compute(identity_p254_seal_bytes);
+        // The key is loaded after the witness: beside it is what is allocated now.
+        let w = HostWitness::compute(
+            identity_p254_seal_bytes,
+            risc0_groth16_sys::metal::allocated_bytes(),
+            &release,
+        );
         let w_ms = ms(t0);
         let loaded = preload(&dir);
         loaded_ms = ms(t0);
@@ -486,7 +540,13 @@ fn gpu_prove(
     } else {
         std::thread::scope(|sc| {
             let h = sc.spawn(|| {
-                let w = HostWitness::compute(identity_p254_seal_bytes);
+                // Normally not `par_transient` here (see above). Fix round 1: if a build that was
+                // still running when that was decided turns out to be `par_transient`, the gate
+                // counts the key loading beside it (what is allocated plus the key's planned
+                // bytes), so its array does not coexist with the key load unchecked.
+                let beside = risc0_groth16_sys::metal::allocated_bytes()
+                    .saturating_add(risc0_groth16_sys::metal_planned_bytes(&setup).unwrap_or(0));
+                let w = HostWitness::compute(identity_p254_seal_bytes, beside, &release);
                 (w, ms(t0))
             });
             if let Some(f) = pre_gpu.take() {
@@ -522,6 +582,39 @@ fn gpu_prove(
         );
     }
     read_proof(&params)
+}
+
+/// Item W7-G1: [super::metal_witness::release_after_wrap] once per wrap: at the witness
+/// ([Self::now]), or when dropped if the wrap failed before it. Fix round 1: the drop does nothing
+/// once the witness released, so it never discards a graph that a later wrap's prestart built
+/// while this wrap's GPU prove ran. Fix round 2: also the wrap's
+/// [super::metal_witness::WrapGuard] (dropped after the release, so that the release sees this
+/// wrap as its own).
+struct ReleaseGraphAfterWrap {
+    done: std::sync::atomic::AtomicBool,
+    _wrap: super::metal_witness::WrapGuard,
+}
+
+impl ReleaseGraphAfterWrap {
+    fn begin() -> Self {
+        Self {
+            done: std::sync::atomic::AtomicBool::new(false),
+            _wrap: super::metal_witness::WrapGuard::begin(),
+        }
+    }
+
+    fn now(&self, held: Option<std::sync::Arc<super::metal_witness::Graph>>) {
+        self.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        super::metal_witness::release_after_wrap(held);
+    }
+}
+
+impl Drop for ReleaseGraphAfterWrap {
+    fn drop(&mut self) {
+        if !*self.done.get_mut() {
+            super::metal_witness::release_after_wrap(None);
+        }
+    }
 }
 
 /// The proof the prover wrote to `params.proof_path`.
@@ -668,6 +761,9 @@ mod tests {
         crate::prove::prestart_prover().unwrap();
         crate::prove::preload_graph().unwrap();
         crate::prove::release_srs().unwrap();
+        // W7-G1 fix round 2: no wrap follows this prestart; its reservation would keep the graph
+        // from the idle-release tests that run after this one in the same process.
+        super::super::metal_witness::clear_reservations();
     }
 }
 

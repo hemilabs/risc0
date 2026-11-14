@@ -104,9 +104,37 @@ pub fn preload_graph_background() {
     }
 }
 
+/// Item W7-G1: drop the cached Groth16 witness graph (~0.9 GB live) if no wrap is using it and no
+/// build is running; the next wrap's [prestart_prover] rebuilds it (0.7-0.9 s measured with its
+/// file digest known, beside identity_p254). Never waits, never takes the GPU lock: meant for a
+/// memory-pressure drain (`risc0_zkp::hal::metal::register_idle_releaser`).
+///
+/// "In use" covers a whole wrap, from its start (so also its `pre_gpu`, key load and GPU-lock
+/// wait, before it touches the graph), and the graph [prestart_prover] built for the wrap that
+/// follows it (until that wrap starts, or 30 s, `RISC0_G16_GRAPH_RESERVE_MS`): a drain there would
+/// only move the rebuild onto the wrap's critical path, not lower the wrap's peak.
+///
+/// It drops the graph only where that lowers the footprint: when the process was **spawned** with
+/// `MallocLargeCache=0` (libmalloc reads it at process start; a later `set_var` does not count),
+/// or with `RISC0_G16_GRAPH_RELEASE=1`; `RISC0_G16_GRAPH_RELEASE=0` turns it off. Otherwise (the
+/// macOS default) it is a no-op: with libmalloc's large cache on, a drop frees nothing and each
+/// rebuild leaves ~580 MiB more behind, so a drain followed by a wrap would grow the process.
+/// Returns the bytes freed (0 when nothing was idle, the drop is not allowed, or off Metal).
+pub fn release_graph() -> u64 {
+    #[cfg(all(
+        feature = "metal",
+        not(any(feature = "cuda", feature = "rocm", feature = "intel"))
+    ))]
+    if self::metal::enabled() {
+        return self::metal::release_graph();
+    }
+    0
+}
+
 /// Start the Groth16 prover ahead of [shrink_wrap] so that it loads its
 /// proving key while the caller finishes `identity_p254` (intel and metal builds
 /// with the rzup `risc0-groth16` component installed; otherwise a no-op).
+/// Item W7-G1 (Metal, graph release on): also where the witness graph is built for the wrap.
 pub fn prestart_prover() -> Result<()> {
     cfg_if::cfg_if! {
         if #[cfg(all(feature = "intel", not(any(feature = "cuda", feature = "rocm"))))] {
