@@ -1137,19 +1137,27 @@ fn intel_eval_xmx_enabled() -> bool {
     )
 }
 
-/// The `-fsycl-targets=` argument for the GPUs without Xe2's DPAS among the build's targets
-/// (anything but Battlemage and Lunar Lake, e.g. spir64 or an Alchemist target), or None. The
-/// XMX linking chains are written for Xe2's SIMD16 DPAS and gave wrong values on Alchemist (Arc
-/// A770, SIMD8 DPAS), so with XMX on, eval_check is also built without it for these targets, as
-/// risc0_rv32im_intel_noxmx, which risc0_rv32im_intel loads on such a GPU.
+/// The `-fsycl-targets=` argument for eval_check without the XMX linking chains,
+/// risc0_rv32im_intel_noxmx, which risc0_rv32im_intel loads unless RISC0_INTEL_EVAL_NOXMX=0 asks
+/// for the chains on a GPU with Xe2's DPAS (see eval_check.cpp): the build's targets other than
+/// Battlemage and Lunar Lake (e.g. spir64 or an Alchemist target), and spir64 for those. Ahead of
+/// time, the chains gave wrong values on Alchemist (Arc A770, SIMD8 DPAS), and on Battlemage the
+/// driver's compile of the SPIR-V (once, then cached) runs faster than either compiler's ahead-of-
+/// time code: 307 ms per po2=20 segment on an Arc Pro B70, against 335 ms from oneAPI 2026.0's
+/// ocloc and 730 ms for the chains from the Linux build's IGC.
 fn intel_non_xmx_targets() -> Option<String> {
     let arg = risc0_build_kernel::intel_sycl_targets_arg();
-    let rest: Vec<&str> = arg
+    let all: Vec<&str> = arg
         .trim_start_matches("-fsycl-targets=")
         .split(',')
         .map(str::trim)
-        .filter(|t| !t.is_empty() && !t.contains("bmg") && !t.contains("lnl"))
+        .filter(|t| !t.is_empty())
         .collect();
+    let xe2 = |t: &&str| t.contains("bmg") || t.contains("lnl");
+    let mut rest: Vec<&str> = all.iter().filter(|t| !xe2(t)).copied().collect();
+    if all.iter().any(xe2) && !rest.iter().any(|t| t.starts_with("spir64")) {
+        rest.push("spir64");
+    }
     (!rest.is_empty()).then(|| format!("-fsycl-targets={}", rest.join(",")))
 }
 
@@ -1781,6 +1789,10 @@ fn build_intel_kernels() {
             }
             cmd.arg("-DRISC0_INTEL_EVAL_FAST");
             cmd.arg("-DRISC0_INTEL_EVAL_LOHI");
+            if intel_eval_xmx_enabled() {
+                // The kernel has the XMX chains, and risc0_rv32im_intel_noxmx is built beside it.
+                cmd.arg("-DRISC0_RV32IM_EVAL_XMX");
+            }
             // LSC cache-control override 6 on loads and stores: -4.5 ms per
             // po2=20 segment on this kernel, bit-identical (7 gives wrong output).
             xs_options.push_str(" -igc_opts 'DisableRecompilation=1,LscLoadCacheControlOverride=6,LscStoreCacheControlOverride=6'");
