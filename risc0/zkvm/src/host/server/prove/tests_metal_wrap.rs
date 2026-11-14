@@ -123,6 +123,8 @@ fn env_u64(name: &str, default: u64) -> u64 {
 #[test]
 #[ignore = "sets the process-wide working-set budget; run alone (see the module docs)"]
 fn metal_wrap_after_stark() {
+    super::tests::require_gpu_run_heavy("metal_wrap_after_stark");
+    let _heavy = super::tests::heavy_test_lock();
     let budget = match std::env::var("RISC0_G8_BUDGET").as_deref() {
         Ok("none") => None,
         Ok(v) => Some(v.parse::<u64>().expect("RISC0_G8_BUDGET")),

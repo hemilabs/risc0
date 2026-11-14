@@ -22,7 +22,7 @@
 
 use risc0_zkvm_methods::{multi_test::MultiTestSpec, MULTI_TEST_ELF, MULTI_TEST_ID};
 
-use super::prover_impl::exec_stream::{EXEC_STREAM_MODE, STREAMED};
+use super::prover_impl::exec_stream::{EXEC_STREAM_ENV, EXEC_STREAM_MODE, STREAMED};
 use crate::{get_prover_server, sha::Digestible, ExecutorEnv, InnerReceipt, ProverOpts, Receipt};
 
 fn streamed() -> u64 {
@@ -34,6 +34,20 @@ fn with_mode<R>(mode: Option<&'static str>, f: impl FnOnce() -> R) -> R {
     let r = f();
     EXEC_STREAM_MODE.with(|m| *m.borrow_mut() = None);
     r
+}
+
+/// The tests that prove through the default mode (`None`: the process environment) need the
+/// stream on. With `RISC0_METAL_EXEC_STREAM=0` in the environment (a suite run with the knob
+/// off) they skip, saying why, instead of failing (W7-V1).
+fn skip_if_knob_off(test: &str) -> bool {
+    let off = std::env::var(EXEC_STREAM_ENV).is_ok_and(|v| v.trim() == "0");
+    if off {
+        eprintln!(
+            "{test}: skipped: {EXEC_STREAM_ENV}=0 in the environment turns the stream off, and \
+             this test proves through the default mode"
+        );
+    }
+    off
 }
 
 /// Seeded, so two executions of it are the same (the guest's `sys_rand` reads otherwise differ).
@@ -64,6 +78,9 @@ fn prove(mode: Option<&'static str>, opts: &ProverOpts, env: ExecutorEnv<'_>) ->
 /// claims, and under `witgen_debug` the same seals), journal and claim; both verify.
 #[test]
 fn z17_stream_matches_loop() {
+    if skip_if_knob_off("z17_stream_matches_loop") {
+        return;
+    }
     let opts = ProverOpts::composite();
     let (old, s0) = prove(Some("0"), &opts, busy_env(1 << 18, 16));
     assert!(!s0, "RISC0_METAL_EXEC_STREAM=0 streamed");
@@ -102,6 +119,10 @@ fn z17_stream_matches_loop() {
 /// the segment prover back in its cache) verifies, twice on one thread.
 #[test]
 fn z17_stream_succinct_twice() {
+    if skip_if_knob_off("z17_stream_succinct_twice") {
+        return;
+    }
+    let _heavy = super::tests::heavy_test_lock();
     let opts = ProverOpts::succinct();
     for _ in 0..2 {
         let (receipt, s) = prove(None, &opts, busy_env(1 << 17, 16));
@@ -115,6 +136,9 @@ fn z17_stream_succinct_twice() {
 /// error, and the next session on the thread proves (the pending finalize was drained).
 #[test]
 fn z17_stream_error_then_prove() {
+    if skip_if_knob_off("z17_stream_error_then_prove") {
+        return;
+    }
     let opts = ProverOpts::composite();
     let env = ExecutorEnv::builder()
         .write(&MultiTestSpec::BusyLoop { cycles: 1 << 19 })
@@ -167,6 +191,9 @@ fn within<R: Send + 'static>(what: &str, f: impl FnOnce() -> R + Send + 'static)
 /// proof on the calling thread waited for it forever.
 #[test]
 fn z17_prove_inside_io_callback() {
+    if skip_if_knob_off("z17_prove_inside_io_callback") {
+        return;
+    }
     use risc0_zkvm_methods::multi_test::SYS_MULTI_TEST;
     let (receipt, s) = within("prove inside an io callback", || {
         let env = ExecutorEnv::builder()
@@ -253,6 +280,8 @@ fn z17_eligibility() {
 #[test]
 #[ignore = "po2 20 sessions (~9.4 GiB of GPU memory); run alone"]
 fn z17_first_segment_probe() {
+    super::tests::require_gpu_run_heavy("z17_first_segment_probe");
+    let _heavy = super::tests::heavy_test_lock();
     let env_u64 = |k: &str, d: u64| {
         std::env::var(k)
             .ok()

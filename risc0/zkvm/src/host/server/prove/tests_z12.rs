@@ -123,6 +123,8 @@ fn env_u64(name: &str, default: u64) -> u64 {
 #[test]
 #[ignore = "reads the process-wide working-set budget and times whole proofs; run alone"]
 fn z12_stark_phases() {
+    super::tests::require_gpu_run_heavy("z12_stark_phases");
+    let _heavy = super::tests::heavy_test_lock();
     let po2 = env_u64("Z12_PO2", 18) as u32;
     let cycles = env_u64("Z12_CYCLES", 1 << 21);
     let reps = env_u64("Z12_REPS", 1);
@@ -223,6 +225,7 @@ fn z12_release_reason() {
 /// Uses the thread-local mode override, so it does not change the tests running beside it.
 #[test]
 fn z12_release_then_reprove() {
+    let _heavy = super::tests::heavy_test_lock();
     let prove = |mode: &'static str| {
         RELEASE_SEG_MODE.with(|m| *m.borrow_mut() = Some(mode));
         let before = SEG_RELEASES.with(|n| n.get());
