@@ -1496,6 +1496,11 @@ mod tests {
     }
 
     #[test]
+    fn batch_expand_into_evaluate_ntt_by_2() {
+        testutil::batch_expand_into_evaluate_ntt_by_2(IntelHalSha256::new());
+    }
+
+    #[test]
     fn batch_interpolate_ntt() {
         testutil::batch_interpolate_ntt(IntelHalSha256::new());
     }
