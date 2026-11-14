@@ -340,6 +340,7 @@ pub(crate) const PREWARM_ENV: &str = "RISC0_METAL_REC_P254_PREWARM";
 /// identity_p254's ctrl (23 columns x 2^20 rows of Poseidon254) on a fresh p254 HAL adds a peak of
 /// ~217 MB of device memory (coefficients, the evaluated domain, the Merkle nodes and the NTT
 /// scratch; measured in notes/C16.md), rounded up with a margin.
+#[cfg(feature = "metal")]
 const PREWARM_DEVICE_BYTES: u64 = 512 << 20;
 
 /// What [prewarm_p254_ctrl] did.
