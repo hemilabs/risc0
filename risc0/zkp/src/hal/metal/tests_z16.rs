@@ -557,7 +557,20 @@ fn w7z1_gc_fake_dir() {
         &format!("rv32im-{}-{}.binarchive", k('d'), s('4')),
         min(10),
     );
-    // unit rv32im_fc262144: two keys, both kept.
+    // Fix round 1: key 7 (5 h) is the second-newest key used more than an hour ago; the live
+    // key c (this process's, the oldest of all) must survive and g go.
+    put(
+        &dir,
+        &format!("rv32im-{}-{}.binarchive", k('7'), s('8')),
+        h(5),
+    );
+    // A unit nobody has used for 40 days (a retired kernel set): deleted.
+    put(
+        &dir,
+        &format!("rv32im_r15e-{}-{}.binarchive", k('6'), s('9')),
+        h(40 * 24),
+    );
+    // unit rv32im_fc262144 (not loaded by this process): two keys within 30 days, both kept.
     put(
         &dir,
         &format!("rv32im_fc262144-{}-{}.binarchive", k('e'), s('5')),
@@ -616,10 +629,15 @@ fn w7z1_gc_fake_dir() {
     );
     put(&root, &format!("{}.metallib", "0".repeat(64)), h(900));
 
+    // This process's key: rv32im c.
+    let kc = k('c');
+    let live = |unit: &str, key: &str| unit == "rv32im" && key == kc;
+    let none = |_: &str, _: &str| false;
     let want: Vec<String> = vec![
         format!(".zkp-{}.binarchive.tmp123", k('a')),
         format!("metal_kernels_zkp-{}.metallib", m('c')),
-        format!("rv32im-{}-{}.binarchive", k('c'), s('3')),
+        format!("rv32im-{}-{}.binarchive", k('7'), s('8')),
+        format!("rv32im_r15e-{}-{}.binarchive", k('6'), s('9')),
     ];
     let names = |r: &archive::GcReport| {
         let mut v: Vec<String> = r
@@ -630,28 +648,168 @@ fn w7z1_gc_fake_dir() {
         v.sort();
         v
     };
-    let dry = archive::gc_archives(&dir, Some(&root), now, 2, true);
+    // One unit only (a later load's pass): that unit's files, no temporary files, no metallibs.
+    let one = archive::gc_archives_of(&dir, Some(&root), now, 2, true, &live, Some("rv32im"));
+    assert_eq!(
+        names(&one),
+        [format!("rv32im-{}-{}.binarchive", k('7'), s('8'))]
+    );
+    let dry = archive::gc_archives(&dir, Some(&root), now, 2, true, &live);
     assert_eq!(names(&dry), want);
-    assert_eq!(dry.bytes, 300);
-    // rv32im key b was used 30 min ago, metal_kernels_rv32im c 12 h ago: both left.
-    assert_eq!(dry.recent, 2);
+    assert_eq!(dry.bytes, 400);
+    // rv32im keys a and b were used 20 and 30 min ago, metal_kernels_rv32im c 12 h ago: left.
+    // The bare-hash metallib is not a GC candidate at all.
+    assert_eq!(dry.recent, 3);
     let count = |d: &std::path::Path| std::fs::read_dir(d).unwrap().count();
     let (before_dir, before_root) = (count(&dir), count(&root));
-    assert_eq!(before_dir, 10);
-    let r = archive::gc_archives(&dir, Some(&root), now, 2, false);
+    assert_eq!(before_dir, 12);
+    let r = archive::gc_archives(&dir, Some(&root), now, 2, false, &live);
     assert_eq!(names(&r), want);
-    assert_eq!(count(&dir), before_dir - 2);
+    assert_eq!(count(&dir), before_dir - 3);
     assert_eq!(count(&root), before_root - 1);
+    assert!(dir
+        .join(format!("rv32im-{}-{}.binarchive", k('c'), s('3')))
+        .exists());
+    assert!(root.join(format!("{}.metallib", "0".repeat(64))).exists());
     // Idempotent.
-    assert!(archive::gc_archives(&dir, Some(&root), now, 2, false)
+    assert!(
+        archive::gc_archives(&dir, Some(&root), now, 2, false, &live)
+            .deleted
+            .is_empty()
+    );
+    // keep = 1: rv32im keeps only its live key c (d, a, b are recent); rv32im_fc262144 is not
+    // live and within 30 days: nothing goes.
+    let r = archive::gc_archives(&dir, None, now, 1, false, &live);
+    assert!(r.deleted.is_empty(), "{:?}", r.deleted);
+    // With no live key at all (a process that loaded none of these units) nothing used within
+    // 30 days goes, whatever the count (the bug of the first version: it kept the two newest
+    // by time and deleted a running binary's own older archives).
+    // (Two hours later, so no archive is "recent"; only the temporary file of the save that was
+    // in progress then goes.)
+    let r = archive::gc_archives(&dir, None, now + Duration::from_secs(7200), 1, false, &none);
+    let gone: Vec<_> = r
         .deleted
-        .is_empty());
-    // keep = 1: only the newest key of each unit stays (rv32im a and b are recent), so only
-    // rv32im_fc262144 key f goes.
-    let r = archive::gc_archives(&dir, None, now, 1, false);
-    assert_eq!(r.deleted.len(), 1, "{:?}", r.deleted);
-    assert!(r.deleted[0].0.to_string_lossy().contains(&k('f')));
+        .iter()
+        .map(|(p, _)| p.file_name().unwrap())
+        .collect();
+    assert_eq!(
+        gone,
+        [format!(".zkp-{}.binarchive.tmp456", k('b')).as_str()]
+    );
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// W7-Z1 fix round 1 (review reproduction): the GC never deletes an archive this process
+/// loaded, even when it is the unit's oldest key, unused for over an hour, and two other keys
+/// were used more recently. A real zkp archive is written and loaded through a directory of the
+/// test's own (which registers its key, [archive::register_live]), backdated to 4 h, and two
+/// newer decoy keys are added (3 h, 2 h); the GC then deletes the older decoy, keeps the newer
+/// one and the live archive, and a second load is all hits from the same file.
+#[test]
+fn w7z1_gc_keeps_live_archive() {
+    use std::time::{Duration, SystemTime};
+    let device = Device::system_default().unwrap();
+    if archive::os_build().is_none() {
+        return;
+    }
+    let dir = temp_dir("gc-live");
+    let names = &KERNEL_NAMES[..4];
+    let unit = ZKP_ARCHIVE_UNIT;
+    let first =
+        archive::ArchivedKernels::new_in(Some(dir.clone()), &device, unit, METAL_LIB, names)
+            .unwrap();
+    let live = first.report.path.clone().unwrap();
+    assert!(first.report.saved, "{:?}", first.report);
+    drop(first);
+    let now = SystemTime::now();
+    let set_age = |p: &std::path::Path, hours: u64| {
+        std::fs::File::options()
+            .write(true)
+            .open(p)
+            .unwrap()
+            .set_modified(now - Duration::from_secs(hours * 3600))
+            .unwrap();
+    };
+    set_age(&live, 4);
+    let decoy = |c: char, hours: u64| {
+        let key: String = std::iter::repeat_n(c, 24).collect();
+        let sum: String = std::iter::repeat_n('1', 16).collect();
+        let p = dir.join(format!("{unit}-{key}-{sum}.binarchive"));
+        std::fs::write(&p, b"x").unwrap();
+        set_age(&p, hours);
+        p
+    };
+    let (older, newer) = (decoy('a', 3), decoy('b', 2));
+    let r = archive::gc_archives(&dir, None, now, 2, false, &archive::is_live);
+    assert_eq!(r.deleted.len(), 1, "{:?}", r.deleted);
+    assert_eq!(r.deleted[0].0, older);
+    assert!(live.exists() && newer.exists());
+    let again =
+        archive::ArchivedKernels::new_in(Some(dir.clone()), &device, unit, METAL_LIB, names)
+            .unwrap();
+    let r = &again.report;
+    assert!(
+        r.loaded && r.misses == 0 && r.path.as_deref() == Some(live.as_path()),
+        "{r:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// W7-Z1 fix round 1: a warm load (the runtime archive file exists and serves every PSO) never
+/// opens the offline archive, so a warm start with `RISC0_METAL_AOT_DIR` set does not read or
+/// checksum it; a runtime archive that misses some kernels opens it for those.
+#[test]
+fn w7z1_aot_not_opened_when_warm() {
+    let device = Device::system_default().unwrap();
+    let (Some(arch), Some(_)) = (archive::gpu_architecture(&device), archive::os_build()) else {
+        return;
+    };
+    let unit = ZKP_ARCHIVE_UNIT;
+    let (rt, aot, part) = (
+        temp_dir("warm-rt"),
+        temp_dir("warm-aot"),
+        temp_dir("warm-part"),
+    );
+    let names = &KERNEL_NAMES[..6];
+    let load = |dir: &std::path::Path, aot: Option<std::path::PathBuf>, names: &[&str]| {
+        archive::ArchivedKernels::new_in_aot(
+            Some(dir.to_path_buf()),
+            aot,
+            &device,
+            unit,
+            METAL_LIB,
+            names,
+            None,
+        )
+        .unwrap()
+    };
+    // The offline file holds all six kernels.
+    load(&rt, None, names);
+    place_aot(&aot, &arch, &std::fs::read(only_archive(&rt)).unwrap());
+    // Warm: all six from the runtime archive, the offline file never opened.
+    let k = load(&rt, Some(aot.clone()), names);
+    let r = &k.report;
+    assert!(r.loaded && r.errors.is_empty(), "{r:?}");
+    assert_eq!((r.hits, r.aot_hits, r.misses), (6, 0, 0), "{r:?}");
+    assert!(r.aot_path.is_none() && r.aot_bytes == 0, "{r:?}");
+    drop(k);
+    // Partly warm: the runtime archive file of the six-kernel key holds only two kernels (an
+    // archive of the first two, renamed); the other four come from the offline file.
+    load(&part, None, &names[..2]);
+    let two = std::fs::read(only_archive(&part)).unwrap();
+    let _ = std::fs::remove_dir_all(&part);
+    std::fs::create_dir_all(&part).unwrap();
+    let base = archive::archive_base(&part, &device, unit, METAL_LIB, names).unwrap();
+    std::fs::write(archive::archive_file(&base, &two), &two).unwrap();
+    let k = load(&part, Some(aot.clone()), names);
+    let r = &k.report;
+    assert!(r.loaded && r.errors.is_empty(), "{r:?}");
+    assert_eq!((r.hits, r.aot_hits, r.misses), (6, 4, 0), "{r:?}");
+    assert!(r.aot_path.is_some(), "{r:?}");
+    drop(k);
+    for d in [rt, aot, part] {
+        let _ = std::fs::remove_dir_all(d);
+    }
 }
 
 /// W7-Z1 manual dry run of the GC on this machine's real archive directory and build cache
@@ -670,6 +828,7 @@ fn w7z1_gc_dry_run_here() {
         std::time::SystemTime::now(),
         archive::DEFAULT_GC_KEEP,
         std::env::var("W7Z1_GC_APPLY").is_err(),
+        &archive::is_live,
     );
     for (p, size) in &r.deleted {
         println!("W7Z1GC delete {size:>10} {}", p.display());

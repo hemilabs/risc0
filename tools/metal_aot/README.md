@@ -13,12 +13,30 @@ evidence: `docs/metal-port/notes/W7-Z1.md`. This file is the packaging manifest 
 | same, worker process wall | 75.0-91.7 s | 2.10-2.11 s |
 | po2 20 specialized eval PSO (`ef_eval_split_fc`), first install | 18.3-24.0 s | 5.5-6.1 s (the rest is `newFunctionWithName:constantValues:`, which no archive removes) |
 
+Warm starts (fix round 1, 8 interleaved rounds, worker pipelines from log timestamps, start footprint):
+
+| warm start, runtime archive present | pipelines | start footprint |
+|---|---|---|
+| base worker, no offline dir | 0.0745 s (0.071-0.080) | 511 MiB (507-527) |
+| W7-Z1 worker, `RISC0_METAL_AOT_DIR` **set**, natively compiled runtime archive | 0.0725 s (0.068-0.078) | 513 MiB (502-524) |
+| W7-Z1 worker, no offline dir, natively compiled runtime archive | 0.075 s (0.071-0.082) | 513 MiB (503-529) |
+| W7-Z1 worker, no offline dir, runtime archive **seeded** from the offline files | 0.0945 s (0.089-0.117) | 558 MiB (543-593) |
+
+Keeping `RISC0_METAL_AOT_DIR` set costs nothing on a warm start: the offline file is opened only when a
+PSO misses in the runtime archive. A runtime archive seeded from `metal-tt` files costs ~20 ms and ~45 MiB
+more at every start than a natively compiled one (the `metal-tt` rv32im archive is 53 MB against 23 MB;
+its unit load takes 0.05 s instead of 0.03 s). That is the steady state of a packaged install (first
+install seeds, later starts load the seed); the alternative, recompiling natively, costs the 60-90 s of
+GPU compiles this set exists to avoid.
+
 ## Files
 
 `<unit>-<digest24>-<arch>-<os key>-<checksum16>.binarchive`
 
 - `unit`: the runtime archive unit (`zkp`, `rv32im`, `rv32im_fc<domain>`, `recursion`,
   `recursion_splitrg`, `keccak`, `groth16`; optional `keccakstrict` and the recursion revert variants).
+  The built set has no `keccakstrict` (strict-eval knob) or revert-variant files: those knob paths still
+  compile on a first install (keccakstrict ~35 MB of PSOs).
 - `digest24`: the first 24 hex digits of the parallel chunked sha256 (`archive::parallel_digest`) of the
   metallib the binary embeds. A different risc0 build (any kernel change) has another digest: rebuild.
 - `arch`: `MTLDevice.architecture.name`, the `metal-tt -arch` name.
@@ -85,6 +103,10 @@ The metallibs must be the ones the shipped binary embeds: check that the `digest
 `metallib_sha256` there is the plain sha256 of the input metallib, comparable with
 `target/release/build/*-sys-*/out/*.metallib` of the worker build).
 
+`metal-tt` output is not byte-reproducible: rebuilding a unit from the same metallib gives a file of the same
+size with another sha256 and checksum name (seen on g17s zkp). The runtime matches by stem, so either file
+works, but `SHA256SUMS` can only be checked against the files as built, not re-derived by rebuilding.
+
 Cost on an M5 Max (load 5-60, other agents running): about 4 min of 1 core per arch for the whole set
 (rv32im 25-94 s, keccak 13-112 s, groth16 20-56 s, five fc units 20-44 s each, the rest a few s);
 10 arches took 12 min wall with `--jobs 5` (~2.2 GB RAM per metal-tt for rv32im).
@@ -123,6 +145,11 @@ What to ship and how:
    are not opened). A minor update keeps using `macos<major>` files; if Metal finds a binary unusable it is
    a miss (compile), never a wrong PSO.
 5. After the first successful start the offline dir can be deleted (the runtime archive holds the clones).
+   Keeping it set is also free on warm starts (table above).
+6. The runtime archive GC (once a day per directory, `RISC0_METAL_ARCHIVE_GC=0` off) keeps the running
+   worker's own keys plus one previous key per unit it loads; units it does not load lose only keys
+   unused for 30 days. Test suites and dev builds that share the user's default archive directory should
+   run with `RISC0_METAL_ARCHIVE_GC=0` (their GC acts on the worker's archives too).
 
 Knobs: `RISC0_METAL_AOT_DIR` (unset: no offline archives), `RISC0_METAL_AOT_FC=0` (no specialized PSOs from
 them), `RISC0_METAL_AOT_SEED=0` (no clone into the runtime archive), `RISC0_METAL_ARCHIVE=0` (no archives

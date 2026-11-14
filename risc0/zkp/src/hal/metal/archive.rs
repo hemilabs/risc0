@@ -98,11 +98,18 @@
 //!   `RISC0_METAL_AOT_SEED=0` disables it.
 //! - **Specialized PSOs** ([specialized_pipeline]) try the offline archive of their unit too
 //!   (`build_archive.py --fc`), unless `RISC0_METAL_AOT_FC=0`.
-//! - **GC** ([gc_archives]): at most once a day, on a background thread at the first
-//!   process-wide load, each unit keeps its [DEFAULT_GC_KEEP] most recently used keys and the
-//!   older ones are deleted (never a file used or written in the last hour); stale build-cache
-//!   metallibs beside the archive directory likewise. `RISC0_METAL_ARCHIVE_GC=0` disables it,
-//!   `=dry` only logs.
+//! - **GC** ([gc_archives], [start_gc]): at most once a day per directory, on background
+//!   threads after each process-wide load has opened its archive. Every unit this process loads
+//!   keeps its current key (registered before it is opened, [register_live]) and its
+//!   `[DEFAULT_GC_KEEP] - 1` most recently used other keys; units it does not load lose only keys
+//!   unused for 30 days; a file used or written in the last hour is never deleted; stale
+//!   build-cache metallibs beside the archive directory go after a day.
+//!   `RISC0_METAL_ARCHIVE_GC=0` disables it, `=dry` only logs. Test suites and dev runs on a
+//!   shared machine should set `RISC0_METAL_ARCHIVE_GC=0` when they use the default directory:
+//!   their GC acts on everyone's archives.
+//! - **Warm loads** never open the offline archive: when the runtime archive file was loaded,
+//!   each PSO is looked up there first and the offline file is read, checksummed and opened only
+//!   at the first miss.
 //!
 //! The functions marked `#[doc(hidden)]` are test seams (keccak's archive tests use them).
 
@@ -289,14 +296,17 @@ impl ArchivedKernels {
                 .errors
                 .push("OS build unknown: binary archive not used".into());
         }
-        if dir.as_deref().is_some_and(is_process_dir) {
-            start_gc(dir.as_deref().unwrap());
+        if let Some(base) = base.as_deref() {
+            register_live(base);
         }
         let opened = SystemTime::now();
         let archive = base
             .as_deref()
             .and_then(|base| open_archive(device, base, &mut report));
-        let aot = aot_dir.and_then(|d| open_aot_archive(&d, device, unit, bytes, &mut report));
+        if dir.as_deref().is_some_and(is_process_dir) {
+            start_gc(dir.as_deref().unwrap(), unit);
+        }
+        let aot = LazyAot::new(aot_dir, device, unit, bytes);
 
         let add_nanos = AtomicU64::new(0);
         let built = build_all(
@@ -304,12 +314,14 @@ impl ArchivedKernels {
             &library,
             names,
             Archives {
-                aot: aot.as_deref(),
+                aot: &aot,
                 runtime: archive.as_deref(),
+                runtime_first: report.loaded,
             },
             &add_nanos,
             threads,
         )?;
+        aot.merge_into(&mut report);
         let mut pipelines = HashMap::with_capacity(names.len());
         let mut added = 0;
         for (name, pso, source) in built {
@@ -363,19 +375,24 @@ impl ArchivedKernels {
         }
         report.elapsed = t0.elapsed();
         tracing::debug!(
-            "{unit}: {} PSOs in {:.2} s (archive {}: {} hits, {} misses, loaded {}, adds {:.2} s, saved {} in {:.2} s)",
+            "{unit}: {} PSOs in {:.2} s (archive {}: {} hits, {} misses, loaded {}, adds {:.2} s, saved {} in {:.2} s; offline {}: {} hits)",
             names.len(),
             report.elapsed.as_secs_f64(),
             report
                 .path
                 .as_deref()
                 .map_or("off".into(), |p| p.display().to_string()),
-            report.hits,
+            report.hits - report.aot_hits,
             report.misses,
             report.loaded,
             report.add_time.as_secs_f64(),
             report.saved,
             report.save_time.as_secs_f64(),
+            report
+                .aot_path
+                .as_deref()
+                .map_or("not opened".into(), |p| p.display().to_string()),
+            report.aot_hits,
         );
         Ok(Self {
             library,
@@ -1031,12 +1048,59 @@ enum Source {
 
 type Built<'a> = (&'a str, ComputePipelineState, Source);
 
-/// The archives a PSO may come from: the read-only offline one (Z16, tried first) and the
-/// runtime one (hit, else compiled into it).
+/// The archives a PSO may come from: the read-only offline one (Z16) and the runtime one (hit,
+/// else compiled into it). The offline one is tried first unless the runtime archive was loaded
+/// from a file ([Self::runtime_first]).
 #[derive(Clone, Copy)]
 struct Archives<'a> {
-    aot: Option<&'a BinaryArchiveRef>,
+    aot: &'a LazyAot<'a>,
     runtime: Option<&'a BinaryArchiveRef>,
+    /// The runtime archive was loaded from a file: try it before the offline archive, which is
+    /// then opened only if some PSO misses there (fix round 1: a warm start with
+    /// [AOT_DIR_ENV] set paid for reading, checksumming and opening every offline file).
+    runtime_first: bool,
+}
+
+/// W7-Z1: the offline archive of a load, opened ([open_aot_archive]) at its first use by any
+/// PSO-building thread, or never.
+struct LazyAot<'a> {
+    dir: Option<PathBuf>,
+    device: &'a DeviceRef,
+    unit: &'a str,
+    bytes: &'a [u8],
+    archive: std::sync::OnceLock<Option<BinaryArchive>>,
+    /// What opening it reported ([ArchiveReport::aot_path], `aot_bytes`, errors).
+    report: Mutex<ArchiveReport>,
+}
+
+impl<'a> LazyAot<'a> {
+    fn new(dir: Option<PathBuf>, device: &'a DeviceRef, unit: &'a str, bytes: &'a [u8]) -> Self {
+        Self {
+            dir,
+            device,
+            unit,
+            bytes,
+            archive: Default::default(),
+            report: Default::default(),
+        }
+    }
+
+    fn get(&self) -> Option<&BinaryArchiveRef> {
+        let dir = self.dir.as_deref()?;
+        self.archive
+            .get_or_init(|| {
+                let mut r = self.report.lock().unwrap();
+                open_aot_archive(dir, self.device, self.unit, self.bytes, &mut r)
+            })
+            .as_deref()
+    }
+
+    fn merge_into(&self, report: &mut ArchiveReport) {
+        let mut r = self.report.lock().unwrap();
+        report.aot_path = r.aot_path.take();
+        report.aot_bytes = r.aot_bytes;
+        report.errors.append(&mut r.errors);
+    }
 }
 
 /// One PSO of `function` (`name` for messages): an archive hit if possible; else the function
@@ -1051,14 +1115,19 @@ fn build_function(
 ) -> Result<(ComputePipelineState, Source)> {
     let desc = ComputePipelineDescriptor::new();
     desc.set_compute_function(Some(function));
-    if let Some(aot) = archives.aot {
-        desc.set_binary_archives(&[aot]);
-        if let Ok(pso) =
-            new_pso_with_options(device, &desc, MTLPipelineOption::FailOnBinaryArchiveMiss)
-        {
-            return Ok((pso, Source::AotHit));
-        }
+    let hit = |archive: &BinaryArchiveRef| {
+        desc.set_binary_archives(&[archive]);
+        let pso = new_pso_with_options(device, &desc, MTLPipelineOption::FailOnBinaryArchiveMiss);
         desc.set_binary_archives(&[]);
+        pso.ok()
+    };
+    if let (true, Some(runtime)) = (archives.runtime_first, archives.runtime) {
+        if let Some(pso) = hit(runtime) {
+            return Ok((pso, Source::Hit));
+        }
+    }
+    if let Some(pso) = archives.aot.get().and_then(hit) {
+        return Ok((pso, Source::AotHit));
     }
     let archive = archives.runtime;
     let mut archive_err = None;
@@ -1066,8 +1135,11 @@ fn build_function(
         desc.set_binary_archives(&[archive]);
         let from_archive =
             || new_pso_with_options(device, &desc, MTLPipelineOption::FailOnBinaryArchiveMiss);
-        if let Ok(pso) = from_archive() {
-            return Ok((pso, Source::Hit));
+        // (Already tried above when it was loaded from a file.)
+        if !archives.runtime_first {
+            if let Ok(pso) = from_archive() {
+                return Ok((pso, Source::Hit));
+            }
         }
         let t = Instant::now();
         let added = archive.add_compute_pipeline_functions_with_descriptor(&desc);
@@ -1220,19 +1292,27 @@ pub fn specialized_pipeline_in(
             .errors
             .push("OS build unknown: binary archive not used".into());
     }
+    if let Some(base) = base.as_deref() {
+        register_live(base);
+    }
     let opened = SystemTime::now();
     let archive = base
         .as_deref()
         .and_then(|base| open_archive(device, base, &mut report));
-    let aot = aot_dir.and_then(|d| open_aot_archive(&d, device, unit, bytes, &mut report));
+    if dir.as_deref().is_some_and(is_process_dir) {
+        start_gc(dir.as_deref().unwrap(), unit);
+    }
+    let aot = LazyAot::new(aot_dir, device, unit, bytes);
     let add_nanos = AtomicU64::new(0);
     let archives = Archives {
-        aot: aot.as_deref(),
+        aot: &aot,
         runtime: archive.as_deref(),
+        runtime_first: report.loaded,
     };
     let (pso, source) = metal::objc::rc::autoreleasepool(|| {
         build_function(device, &function, &key_name, archives, &add_nanos)
     })?;
+    aot.merge_into(&mut report);
     report.add_time = Duration::from_nanos(add_nanos.load(Ordering::Relaxed));
     let mut added = false;
     match source {
@@ -1458,6 +1538,9 @@ pub const GC_MIN_AGE: Duration = Duration::from_secs(3600);
 /// W7-Z1: a build-cache metallib is never deleted within a day of its last use, the rule
 /// `risc0-build-kernel`'s own cleanup follows (a build running now may be about to copy it).
 pub const GC_METALLIB_MIN_AGE: Duration = Duration::from_secs(24 * 3600);
+/// W7-Z1: runtime archive keys of a unit this process has not loaded are deleted once unused for
+/// this long ([ARCHIVE_MAX_AGE], the save-time rule).
+pub const GC_UNUSED_MAX_AGE: Duration = ARCHIVE_MAX_AGE;
 
 /// What [gc_archives] deleted (or, dry, would delete).
 #[derive(Clone, Debug, Default)]
@@ -1491,24 +1574,39 @@ fn runtime_archive_parts(name: &str) -> Option<(&str, &str)> {
     (hex(sum, CHECKSUM_LEN) && hex(key, 24) && !unit.is_empty()).then_some((unit, key))
 }
 
-/// `<stem>-<key32>.metallib` or `<sha256>.metallib` (`risc0-build-kernel`'s cache names)
-/// split into (stem, key); temporary outputs (`.tmp<pid>.metallib`) do not match.
+/// `<stem>-<key32>.metallib` (`risc0-build-kernel`'s cache names) split into (stem, key);
+/// temporary outputs (`.tmp<pid>.metallib`) and bare `<sha256>.metallib` names (one file per
+/// unrelated kernel source, no stem to group them by) do not match and are left alone.
 fn metallib_parts(name: &str) -> Option<(&str, &str)> {
     let rest = name.strip_suffix(".metallib")?;
     let hex = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit());
     match rest.rsplit_once('-') {
-        Some((stem, key)) if key.len() == 32 && hex(key) => Some((stem, key)),
-        None if rest.len() == 64 && hex(rest) => Some(("", rest)),
+        Some((stem, key)) if key.len() == 32 && hex(key) && !stem.is_empty() => Some((stem, key)),
         _ => None,
     }
 }
 
-/// Group `files` by (group, key) and delete, per group, every key beyond the `keep` most
-/// recently used ones (a key's time is its newest file's), except files used within
-/// `min_age` of `now`.
+/// How [gc_groups] decides which keys of a group survive.
+#[derive(Clone, Copy)]
+enum GcPolicy<'a> {
+    /// The build cache: the `keep` newest keys of each group.
+    Newest(usize),
+    /// Runtime archives. A unit with a key that `live(unit, key)` names (this process loaded
+    /// or is loading it) keeps those keys and its `keep - 1` newest other keys. A unit with no
+    /// live key keeps every key used within `unused` (its current key cannot be known: the
+    /// process may load it later, or another binary uses it).
+    Live {
+        keep: usize,
+        unused: Duration,
+        live: &'a dyn Fn(&str, &str) -> bool,
+    },
+}
+
+/// Group `files` by (group, key) and delete the keys `policy` does not keep (a key's time is its
+/// newest file's), except files used within `min_age` of `now`.
 fn gc_groups(
     files: Vec<(String, String, GcFile)>,
-    keep: usize,
+    policy: GcPolicy,
     min_age: Duration,
     now: SystemTime,
     dry: bool,
@@ -1523,15 +1621,34 @@ fn gc_groups(
             .or_default()
             .push(f);
     }
-    for (_, keys) in groups {
-        let mut keys: Vec<(SystemTime, Vec<GcFile>)> = keys
-            .into_values()
-            .map(|fs| (fs.iter().map(|f| f.modified).max().unwrap(), fs))
+    for (group, keys) in groups {
+        let mut keys: Vec<(SystemTime, String, Vec<GcFile>)> = keys
+            .into_iter()
+            .map(|(k, fs)| (fs.iter().map(|f| f.modified).max().unwrap(), k, fs))
             .collect();
         keys.sort_by_key(|k| std::cmp::Reverse(k.0));
-        for (i, (_, fs)) in keys.into_iter().enumerate() {
+        let any_live = match policy {
+            GcPolicy::Live { live, .. } => keys.iter().any(|(_, k, _)| live(&group, k)),
+            GcPolicy::Newest(_) => false,
+        };
+        let mut others = 0;
+        for (used, key, fs) in keys {
+            let keep_key = match policy {
+                GcPolicy::Newest(keep) => {
+                    others += 1;
+                    others <= keep
+                }
+                GcPolicy::Live { live, .. } if live(&group, &key) => true,
+                GcPolicy::Live { keep, .. } if any_live => {
+                    others += 1;
+                    others < keep
+                }
+                GcPolicy::Live { unused, .. } => {
+                    now.duration_since(used).map_or(true, |age| age < unused)
+                }
+            };
             for f in fs {
-                if i < keep {
+                if keep_key {
                     report.kept += 1;
                     continue;
                 }
@@ -1551,26 +1668,50 @@ fn gc_groups(
     }
 }
 
-/// W7-Z1: the archive GC. In `dir` (a runtime archive directory) each unit keeps the `keep`
-/// most recently used keys (metallib, device, OS build, kernel set: [archive_key]); the files of
-/// older keys are deleted unless used within [GC_MIN_AGE] of `now`, and so are temporary files
-/// of interrupted saves older than that. In `metallib_dir` (the `risc0-build-kernel` cache, when
-/// given) each output stem keeps its `keep` newest metallibs and older ones unused for
-/// [GC_METALLIB_MIN_AGE] go. Offline archives and every other file are never touched. With
-/// `dry` nothing is deleted and the report lists what would be.
+/// W7-Z1: the archive GC. In `dir` (a runtime archive directory), for each unit (keys: metallib,
+/// device, OS build, kernel set, [archive_key]):
 ///
-/// Why "most recently used" and not "referenced by the installed workers": a runtime key hashes
-/// the metallib digest together with the device, the OS build and the kernel set of each unit
-/// (and the function constants of each specialization), which an installed binary does not
-/// expose, so the GC cannot compute the keys another binary would use. The keep-two rule leaves
-/// the current binary's archives and those of the one before it (e.g. a backup worker); any
-/// other binary pays one cold build if it is run again.
+/// - a unit with a key `live(unit, key)` names (this process's own, [register_live]) keeps it
+///   and its `keep - 1` most recently used other keys;
+/// - a unit with no live key keeps every key used within [GC_UNUSED_MAX_AGE] and loses the rest
+///   (a unit nobody uses any more, e.g. a retired kernel set, goes after that time);
+/// - a file used (loaded or written) within [GC_MIN_AGE] of `now` is never deleted, nor are
+///   offline archives or any other file; temporary files of interrupted saves older than that
+///   are.
+///
+/// In `metallib_dir` (the `risc0-build-kernel` cache, when given) each output stem keeps its
+/// `keep` newest metallibs and older ones unused for [GC_METALLIB_MIN_AGE] go. With `dry`
+/// nothing is deleted and the report lists what would be.
+///
+/// Why the current process's keys and not "referenced by the installed workers": a runtime key
+/// hashes the metallib digest together with the device, the OS build and the kernel set of each
+/// unit (and the function constants of each specialization), which an installed binary does not
+/// expose, so the GC cannot compute the keys another binary would use. The one binary whose keys
+/// are known is the running one; its other units, and every other binary's, fall under the
+/// unused-for rule (fix round 1: the first version kept each unit's two newest keys by time and
+/// could delete the running binary's own archives).
 pub fn gc_archives(
     dir: &Path,
     metallib_dir: Option<&Path>,
     now: SystemTime,
     keep: usize,
     dry: bool,
+    live: &dyn Fn(&str, &str) -> bool,
+) -> GcReport {
+    gc_archives_of(dir, metallib_dir, now, keep, dry, live, None)
+}
+
+/// [gc_archives] restricted to the runtime archives of `only_unit` (when given; temporary files
+/// and the build cache are then left to the full pass).
+#[doc(hidden)]
+pub fn gc_archives_of(
+    dir: &Path,
+    metallib_dir: Option<&Path>,
+    now: SystemTime,
+    keep: usize,
+    dry: bool,
+    live: &dyn Fn(&str, &str) -> bool,
+    only_unit: Option<&str>,
 ) -> GcReport {
     let keep = keep.max(1);
     let mut report = GcReport::default();
@@ -1588,8 +1729,13 @@ pub fn gc_archives(
             let name = e.file_name().to_string_lossy().into_owned();
             let Some(f) = stat(&e) else { continue };
             if let Some((unit, key)) = runtime_archive_parts(&name) {
-                files.push((unit.to_string(), key.to_string(), f));
-            } else if name.starts_with('.') && name.contains(&format!(".{ARCHIVE_EXT}.tmp")) {
+                if only_unit.is_none_or(|u| u == unit) {
+                    files.push((unit.to_string(), key.to_string(), f));
+                }
+            } else if only_unit.is_none()
+                && name.starts_with('.')
+                && name.contains(&format!(".{ARCHIVE_EXT}.tmp"))
+            {
                 let old = now
                     .duration_since(f.modified)
                     .is_ok_and(|age| age >= GC_MIN_AGE);
@@ -1599,9 +1745,17 @@ pub fn gc_archives(
                 }
             }
         }
-        gc_groups(files, keep, GC_MIN_AGE, now, dry, &mut report);
+        let policy = GcPolicy::Live {
+            keep,
+            unused: GC_UNUSED_MAX_AGE,
+            live,
+        };
+        gc_groups(files, policy, GC_MIN_AGE, now, dry, &mut report);
     }
-    if let Some(Ok(entries)) = metallib_dir.map(std::fs::read_dir) {
+    if let Some(Ok(entries)) = metallib_dir
+        .filter(|_| only_unit.is_none())
+        .map(std::fs::read_dir)
+    {
         let files = entries
             .flatten()
             .filter_map(|e| {
@@ -1610,18 +1764,53 @@ pub fn gc_archives(
                 Some((stem.to_string(), key.to_string(), stat(&e)?))
             })
             .collect();
-        gc_groups(files, keep, GC_METALLIB_MIN_AGE, now, dry, &mut report);
+        let policy = GcPolicy::Newest(keep);
+        gc_groups(files, policy, GC_METALLIB_MIN_AGE, now, dry, &mut report);
     }
     report
 }
 
+/// The runtime archive bases ([archive_base] file names, `<unit>-<key24>`) this process has
+/// loaded or is loading ([register_live]); [start_gc] never deletes them.
+fn live_set() -> &'static Mutex<std::collections::HashSet<String>> {
+    static LIVE: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    LIVE.get_or_init(Default::default)
+}
+
+/// W7-Z1: record that this process uses the runtime archive of `base` ([archive_base]), before
+/// it opens it: the GC keeps it.
+#[doc(hidden)]
+pub fn register_live(base: &Path) {
+    if let Some(name) = base.file_name().and_then(|n| n.to_str()) {
+        live_set().lock().unwrap().insert(name.to_string());
+    }
+}
+
+/// Whether `unit`'s key `key` was registered by [register_live] in this process.
+#[doc(hidden)]
+pub fn is_live(unit: &str, key: &str) -> bool {
+    live_set()
+        .lock()
+        .unwrap()
+        .contains(&format!("{unit}-{key}"))
+}
+
 /// The [ARCHIVE_GC_KEEP_ENV] setting.
+///
+/// An explicit [ARCHIVE_KEEP_ENV] (a user keeping several binaries warm) raises it: the daily GC
+/// never keeps fewer keys than the save-time prune would.
 fn gc_keep() -> usize {
-    std::env::var(ARCHIVE_GC_KEEP_ENV)
+    let keep = std::env::var(ARCHIVE_GC_KEEP_ENV)
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&n| n >= 1)
-        .unwrap_or(DEFAULT_GC_KEEP)
+        .unwrap_or(DEFAULT_GC_KEEP);
+    if std::env::var_os(ARCHIVE_KEEP_ENV).is_some() {
+        keep.max(keep_archives())
+    } else {
+        keep
+    }
 }
 
 /// The build-kernel metallib cache that holds the default archive directory
@@ -1632,58 +1821,80 @@ fn metallib_cache_of(dir: &Path) -> Option<PathBuf> {
         .then(|| parent.to_path_buf())
 }
 
-/// W7-Z1: once per process, at the first process-wide load: run [gc_archives] on `dir` (and the
-/// build cache beside it) on a background thread, at most once per [GC_INTERVAL] per directory
-/// (its `.gc-stamp` file). Off with [ARCHIVE_GC_ENV]`=0`; `dry` logs what it would delete.
-fn start_gc(dir: &Path) {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
+/// W7-Z1: the archive GC of a process, started by each process-wide load once it has opened (and
+/// so marked used) its runtime archive. The first call decides whether the GC is due: at most
+/// once per [GC_INTERVAL] per directory (its `.gc-stamp` file), off with [ARCHIVE_GC_ENV]`=0`,
+/// `dry` only logs (and writes no stamp, so it scans at every start). If it is due, the first
+/// call runs [gc_archives] on `dir` (and the build cache beside it) on a background thread, and
+/// every later process-wide load of this process runs the same rules for its own `unit`
+/// ([gc_archives_of]), so each unit the process loads keeps its current key plus `keep - 1`
+/// others while units it never loads are only cleared of keys unused for [GC_UNUSED_MAX_AGE].
+/// The keys this process registered ([register_live]) are checked when each file is
+/// considered, so a unit that starts loading meanwhile is kept too.
+fn start_gc(dir: &Path, unit: &str) {
+    static MODE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    let mut first = false;
+    let mode = *MODE.get_or_init(|| {
+        first = true;
         let mode = std::env::var(ARCHIVE_GC_ENV).unwrap_or_default();
         let mode = mode.trim().to_ascii_lowercase();
         if matches!(mode.as_str(), "0" | "off" | "false") {
-            return;
+            return None;
         }
         let dry = mode == "dry";
-        let dir = dir.to_path_buf();
-        let stamp = dir.join(".gc-stamp");
-        let now = SystemTime::now();
-        let due = std::fs::metadata(&stamp)
+        let due = std::fs::metadata(dir.join(".gc-stamp"))
             .and_then(|m| m.modified())
-            .map_or(true, |t| {
-                now.duration_since(t).map_or(true, |a| a >= GC_INTERVAL)
-            });
-        if !due && !dry {
-            return;
-        }
-        let _ = std::thread::Builder::new()
-            .name("metal-archive-gc".into())
-            .spawn(move || {
-                let t = Instant::now();
+            .map_or(true, |t| t.elapsed().map_or(true, |a| a >= GC_INTERVAL));
+        (due || dry).then_some(dry)
+    });
+    let Some(dry) = mode else {
+        return;
+    };
+    let dir = dir.to_path_buf();
+    let unit = unit.to_string();
+    let now = SystemTime::now();
+    let _ = std::thread::Builder::new()
+        .name("metal-archive-gc".into())
+        .spawn(move || {
+            let t = Instant::now();
+            let r = if first {
                 if !dry
                     && (std::fs::create_dir_all(&dir).is_err()
-                        || std::fs::write(&stamp, b"").is_err())
+                        || std::fs::write(dir.join(".gc-stamp"), b"").is_err())
                 {
                     return;
                 }
                 let cache = metallib_cache_of(&dir);
-                let r = gc_archives(&dir, cache.as_deref(), now, gc_keep(), dry);
-                for (p, size) in &r.deleted {
-                    tracing::debug!(
-                        "Metal archive GC: {} {} ({size} B)",
-                        if dry { "would delete" } else { "deleted" },
-                        p.display()
-                    );
-                }
-                tracing::info!(
-                    "Metal archive GC{}: {} files, {:.1} MB {}; {} kept, {} recent ({:.2} s)",
-                    if dry { " (dry run)" } else { "" },
-                    r.deleted.len(),
-                    r.bytes as f64 / 1e6,
-                    if dry { "to delete" } else { "deleted" },
-                    r.kept,
-                    r.recent,
-                    t.elapsed().as_secs_f64()
+                gc_archives(&dir, cache.as_deref(), now, gc_keep(), dry, &is_live)
+            } else {
+                gc_archives_of(&dir, None, now, gc_keep(), dry, &is_live, Some(&unit))
+            };
+            for (p, size) in &r.deleted {
+                tracing::debug!(
+                    "Metal archive GC: {} {} ({size} B)",
+                    if dry { "would delete" } else { "deleted" },
+                    p.display()
                 );
-            });
-    });
+            }
+            let msg = format!(
+                "Metal archive GC{}{}: {} files, {:.1} MB {}; {} kept, {} recent ({:.2} s)",
+                if dry { " (dry run)" } else { "" },
+                if first {
+                    String::new()
+                } else {
+                    format!(" of {unit}")
+                },
+                r.deleted.len(),
+                r.bytes as f64 / 1e6,
+                if dry { "to delete" } else { "deleted" },
+                r.kept,
+                r.recent,
+                t.elapsed().as_secs_f64()
+            );
+            if first || !r.deleted.is_empty() {
+                tracing::info!("{msg}");
+            } else {
+                tracing::debug!("{msg}");
+            }
+        });
 }
