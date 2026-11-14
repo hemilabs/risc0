@@ -522,8 +522,11 @@ fn z14_prefill_round_trip() {
             }
             let got = hal.alloc_elem_init("data", n, value);
             assert_eq!(hal.rt.prefill_stats(), (0, 0), "{case}: taken");
+            // Bit patterns, not `==`: Fp's PartialEq debug-asserts validity, and INVALID is not.
             assert!(
-                got.to_vec().iter().all(|&x| x == value),
+                got.to_vec()
+                    .iter()
+                    .all(|x| x.as_u32_montgomery() == value.as_u32_montgomery()),
                 "{case} {value:?}: not filled"
             );
             drop(got);
