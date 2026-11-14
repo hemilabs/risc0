@@ -231,7 +231,7 @@ fn c4_kernel_names_match_rec_kernels_and_translators() {
     expected.extend(list_kernels("cuda2metal_steps.py", &[]));
     expected.extend(list_kernels(
         "cuda2metal_eval.py",
-        &["--split", "--split-lz"],
+        &["--split", "--split-lz", "--split-rg"],
     ));
     assert_eq!(
         listed, expected,

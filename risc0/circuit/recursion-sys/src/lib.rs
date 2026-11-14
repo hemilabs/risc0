@@ -80,6 +80,22 @@ pub const METAL_KERNEL_NAMES: &[&str] = &[
     "ec_lz32_part_3",
     "ec_lz32_part_4",
     "ec_lz32_part_5",
+    // $OUT_DIR/metal/eval_check_split_rg.metal (C15 `--split-rg`; the Metal-only regrouped split
+    // in lazy Fp form, parts 0..13 in order)
+    "ec_rg_part_0",
+    "ec_rg_part_1",
+    "ec_rg_part_2",
+    "ec_rg_part_3",
+    "ec_rg_part_4",
+    "ec_rg_part_5",
+    "ec_rg_part_6",
+    "ec_rg_part_7",
+    "ec_rg_part_8",
+    "ec_rg_part_9",
+    "ec_rg_part_10",
+    "ec_rg_part_11",
+    "ec_rg_part_12",
+    "ec_rg_part_13",
 ];
 
 use risc0_core::field::baby_bear::{BabyBearElem, BabyBearExtElem};

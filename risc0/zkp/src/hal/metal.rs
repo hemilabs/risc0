@@ -104,8 +104,8 @@ pub use self::{
     },
 };
 pub use self::runtime::{
-    profile_report, profile_take, sync_trace_take, ProfileEntry, SyncRecord, PROFILE_ENV,
-    SYNC_TRACE_ENV,
+    profile_report, profile_take, register_pso_name, sync_trace_take, ProfileEntry, SyncRecord,
+    PROFILE_ENV, SYNC_TRACE_ENV,
 };
 use super::{Buffer as _, Hal};
 use crate::{
