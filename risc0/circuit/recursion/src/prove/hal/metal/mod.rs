@@ -1281,7 +1281,8 @@ mod c5_tests {
                 "recursion_monolith",
                 "recursion_split",
                 "recursion_splitlz",
-                "recursion_splitlzu32"
+                "recursion_splitlzu32",
+                "recursion_splitrg"
             ]
         );
         units.push("recursion".into());
