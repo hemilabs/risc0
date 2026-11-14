@@ -2393,6 +2393,30 @@ fn build_metal_kernels() {
         // in the background and uses it once ready (RISC0_METAL_RV32IM_EVAL_FC).
         write_if_changed(&gen_dir.join("eval_check_ef_fc.metal"), R20_EF_FC_TU);
         generated.push(gen_dir.join("eval_check_ef_fc.metal"));
+        // R22: the flat chain is the default form of the TUs above; the nested form (pre-R22) of
+        // the plain and the specialized split kernel, ef_eval_split_nest / ef_eval_split_fc_nest,
+        // for the runtime revert switch RISC0_METAL_RV32IM_EVAL_FLAT=0 (lazy PSOs).
+        write_if_changed(&gen_dir.join("eval_check_ef_nest.metal"), R22_EF_NEST_TU);
+        generated.push(gen_dir.join("eval_check_ef_nest.metal"));
+        write_if_changed(
+            &gen_dir.join("eval_check_ef_fc_nest.metal"),
+            R22_EF_FC_NEST_TU,
+        );
+        generated.push(gen_dir.join("eval_check_ef_fc_nest.metal"));
+        // R23: the TUs above issue their trace loads ahead of use (to_metal.py hoist()); the
+        // flat chain without that (R22's kernels), ef_eval_split_nohoist /
+        // ef_eval_split_fc_nohoist, for the runtime revert switch RISC0_METAL_RV32IM_EVAL_HOIST=0
+        // (lazy PSOs).
+        write_if_changed(
+            &gen_dir.join("eval_check_ef_nohoist.metal"),
+            R23_EF_NOHOIST_TU,
+        );
+        generated.push(gen_dir.join("eval_check_ef_nohoist.metal"));
+        write_if_changed(
+            &gen_dir.join("eval_check_ef_fc_nohoist.metal"),
+            R23_EF_FC_NOHOIST_TU,
+        );
+        generated.push(gen_dir.join("eval_check_ef_fc_nohoist.metal"));
         println!("cargo:rerun-if-env-changed=RISC0_METAL_EF_WIDE");
         match env::var("RISC0_METAL_EF_WIDE").as_deref() {
             Err(_) | Ok("1") => {}
@@ -2449,6 +2473,145 @@ fn build_metal_kernels() {
     };
     let metallib = out_dir.join(name).with_extension("metallib");
     println!("cargo:rustc-env=RV32IM_METAL_PATH={}", metallib.display());
+
+    // ---- BEGIN R22 eval regime guard (metal) ----
+    // R21/R22: the evalfast split kernel's speed follows the native per-thread stack the Apple
+    // back end gives it (fast ~18-21 KB, slow 32-40 KB: ~2.4x eval_check time). Translate it
+    // offline (tools/metal_audit/agx_size.py, metal-tt) and warn, or fail, when it lands in the
+    // slow regime, so a toolchain or generator change cannot flip it unnoticed.
+    if !skip {
+        r22_regime_guard(&out_dir, &metallib);
+    }
+    // ---- END R22 eval regime guard (metal) ----
+}
+
+/// R22: `RISC0_METAL_EF_STACK_GUARD` = `warn` (default: cargo warnings), `fail` (panic) or `0`
+/// (skip); `RISC0_METAL_EF_STACK_MAX` = the limit in bytes (default [R22_STACK_MAX]);
+/// `RISC0_METAL_EF_STACK_GUARD_ARCH` = metal-tt's `-arch` (default `applegpu_g17s`, the M5
+/// family the limit was calibrated on).
+const R22_STACK_MAX: u64 = 24576;
+/// R22: the domain the build-time check specializes `ef_eval_split_fc` for (po2 20).
+const R22_FC_DOMAIN: u32 = 4 << 20;
+
+/// R22: run agx_size.py's stack guard on `ef_eval_split` (from `metallib`) and on
+/// `ef_eval_split_fc` specialized for [R22_FC_DOMAIN] (from its own `.air`, when this build
+/// compiled it: metal-tt cannot specialize a function of a multi-module metallib). The result is
+/// kept in `$OUT_DIR/r22_regime_guard.txt` under the metallib's digest, so an unchanged
+/// metallib is not translated again (~30 s).
+fn r22_regime_guard(out_dir: &Path, metallib: &Path) {
+    use sha2::Digest as _;
+    for var in [
+        "RISC0_METAL_EF_STACK_GUARD",
+        "RISC0_METAL_EF_STACK_MAX",
+        "RISC0_METAL_EF_STACK_GUARD_ARCH",
+    ] {
+        println!("cargo:rerun-if-env-changed={var}");
+    }
+    let mode = env::var("RISC0_METAL_EF_STACK_GUARD").unwrap_or_else(|_| "warn".into());
+    let fail = match mode.trim() {
+        "0" | "off" => return,
+        "" | "warn" => false,
+        "1" | "fail" => true,
+        v => panic!("RISC0_METAL_EF_STACK_GUARD must be warn, fail or 0, not `{v}`"),
+    };
+    let limit: u64 = env::var("RISC0_METAL_EF_STACK_MAX")
+        .map(|v| {
+            v.trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("RISC0_METAL_EF_STACK_MAX must be bytes, not `{v}`"))
+        })
+        .unwrap_or(R22_STACK_MAX);
+    let arch =
+        env::var("RISC0_METAL_EF_STACK_GUARD_ARCH").unwrap_or_else(|_| "applegpu_g17s".into());
+    let tool = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
+        .join("../../../tools/metal_audit/agx_size.py");
+    let say = |msg: &str| {
+        if fail {
+            panic!("rv32im eval regime guard (RISC0_METAL_EF_STACK_GUARD=fail): {msg}");
+        }
+        for line in msg.lines() {
+            println!("cargo:warning=rv32im eval regime guard: {line}");
+        }
+    };
+    if !tool.exists() {
+        // A packaged crate has no tools/ directory: nothing to check with.
+        return;
+    }
+    rerun_if_changed(&tool);
+    let Ok(bytes) = std::fs::read(metallib) else {
+        return say(&format!("cannot read {}", metallib.display()));
+    };
+    let key = format!(
+        "{} limit={limit} arch={arch}",
+        hex_digest(&sha2::Sha256::digest(&bytes))
+    );
+    let record = out_dir.join("r22_regime_guard.txt");
+    let fc_air = out_dir
+        .join("metal_kernels_rv32im")
+        .join("metal")
+        .join("eval_check_ef_fc.air");
+    let cached = std::fs::read_to_string(&record)
+        .ok()
+        .and_then(|s| s.strip_prefix(&format!("{key}\n")).map(str::to_string));
+    let report = cached.unwrap_or_else(|| {
+        let run = |lib: &Path, func: &str| -> (bool, String) {
+            let mut cmd = risc0_build_kernel::python_command();
+            cmd.env("PYTHONDONTWRITEBYTECODE", "1")
+                .arg(&tool)
+                .args(["--arch", &arch, "--guard-stack", &limit.to_string()])
+                .arg(lib)
+                .arg(func);
+            match cmd.output() {
+                Ok(o) => (
+                    o.status.code() == Some(2),
+                    format!(
+                        "{}{}",
+                        String::from_utf8_lossy(&o.stdout),
+                        String::from_utf8_lossy(&o.stderr)
+                    ),
+                ),
+                Err(e) => (false, format!("could not run {cmd:?}: {e}\n")),
+            }
+        };
+        let fc_spec = format!("ef_eval_split_fc@0={R22_FC_DOMAIN}");
+        let (plain, fc) = std::thread::scope(|s| {
+            let fc = s.spawn(|| fc_air.exists().then(|| run(&fc_air, &fc_spec)));
+            (run(metallib, "ef_eval_split"), fc.join().unwrap())
+        });
+        let mut report = format!("plain slow={}\n{}", plain.0, plain.1);
+        match fc {
+            Some((slow, out)) => report += &format!("fc slow={slow}\n{out}"),
+            None => report += "fc not checked (metallib from the kernel cache: no .air)\n",
+        }
+        let _ = std::fs::write(&record, format!("{key}\n{report}"));
+        report
+    });
+    let slow = report.contains(" slow=true");
+    // Anything but a clean pass (e.g. metal-tt missing, metadata not understood) is reported
+    // as a warning; only a measured slow-regime stack fails under `fail`.
+    let clean = report
+        .lines()
+        .all(|l| !l.contains("REGIME GUARD") && !l.contains("could not run") && !l.contains("ERR"));
+    if slow {
+        say(&format!(
+            "the evalfast split kernel compiled into the SLOW stack regime (limit {limit} B; \
+             expect eval_check ~2.4x slower; docs/metal-port/notes/R22.md):\n{report}"
+        ));
+    } else if !clean {
+        println!(
+            "cargo:warning=rv32im eval regime guard: check incomplete (not failing): {}",
+            report.replace('\n', " | ")
+        );
+    } else if metal_build_timings() {
+        println!(
+            "cargo:warning=rv32im eval regime guard: ok: {}",
+            report.replace('\n', " | ")
+        );
+    }
+}
+
+fn hex_digest(d: &[u8]) -> String {
+    d.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// R2's CUDA-to-Metal translator (relative to the crate root, the build script's cwd).
@@ -2507,6 +2670,36 @@ const R18_EF_R15E_TU: &str = "// GENERATED by rv32im-sys/build.rs (R18) -- do no
 const R20_EF_FC_TU: &str = "// GENERATED by rv32im-sys/build.rs (R20) -- do not edit.\n\
 // eval_check_ef.metal with the domain as function constant 0, kernel ef_eval_split_fc (RISC0_METAL_RV32IM_EVAL_FC).\n\
 #define EF_FC_FORM 1\n\
+#include \"eval_check_ef.metal\"\n";
+
+/// R22: `$OUT_DIR/metal/eval_check_ef_nest.metal`, eval_check_ef.metal with the nested chain
+/// calls (the pre-R22 form), split kernel `ef_eval_split_nest`.
+const R22_EF_NEST_TU: &str = "// GENERATED by rv32im-sys/build.rs (R22) -- do not edit.\n\
+// eval_check_ef.metal with the nested chain, kernel ef_eval_split_nest (RISC0_METAL_RV32IM_EVAL_FLAT=0).\n\
+#define EF_NEST_FORM 1\n\
+#include \"eval_check_ef.metal\"\n";
+
+/// R22: `$OUT_DIR/metal/eval_check_ef_fc_nest.metal`, R20's specialized kernel with the nested
+/// chain calls, `ef_eval_split_fc_nest`.
+const R22_EF_FC_NEST_TU: &str = "// GENERATED by rv32im-sys/build.rs (R22) -- do not edit.\n\
+// eval_check_ef.metal with the domain as function constant 0 and the nested chain, kernel ef_eval_split_fc_nest.\n\
+#define EF_FC_FORM 1\n\
+#define EF_NEST_FORM 1\n\
+#include \"eval_check_ef.metal\"\n";
+
+/// R23: `$OUT_DIR/metal/eval_check_ef_nohoist.metal`, eval_check_ef.metal with every trace load
+/// at its use (R22's flat kernel), split kernel `ef_eval_split_nohoist`.
+const R23_EF_NOHOIST_TU: &str = "// GENERATED by rv32im-sys/build.rs (R23) -- do not edit.\n\
+// eval_check_ef.metal without the hoisted trace loads, kernel ef_eval_split_nohoist (RISC0_METAL_RV32IM_EVAL_HOIST=0).\n\
+#define EF_NO_HOIST 1\n\
+#include \"eval_check_ef.metal\"\n";
+
+/// R23: `$OUT_DIR/metal/eval_check_ef_fc_nohoist.metal`, R20's specialized kernel without the
+/// hoisted trace loads, `ef_eval_split_fc_nohoist`.
+const R23_EF_FC_NOHOIST_TU: &str = "// GENERATED by rv32im-sys/build.rs (R23) -- do not edit.\n\
+// eval_check_ef.metal with the domain as function constant 0, without the hoisted trace loads, kernel ef_eval_split_fc_nohoist.\n\
+#define EF_FC_FORM 1\n\
+#define EF_NO_HOIST 1\n\
 #include \"eval_check_ef.metal\"\n";
 
 const R12_EF_TABLES_STUB: &str = r#"// GENERATED by rv32im-sys/build.rs (RISC0_SKIP_BUILD_KERNELS stub) -- do not edit.
