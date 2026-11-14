@@ -2090,8 +2090,15 @@ impl ProverServer for ProverImpl {
         // RISC0_RECURSION_PREWITGEN); then run the prepared join while the
         // background thread prepares lift(k+2). The fold order (and therefore
         // the receipt) is unchanged; only the GPU/CPU overlap differs.
+        // Intel: lift and join as a tree (see rec_tree), unless RISC0_RECURSION_TREE=0.
+        #[cfg(feature = "intel")]
+        if num_segments >= 2 && rec_tree::enabled() {
+            accumulator = Some(rec_tree::reduce(segments, &recursion_opts)?);
+        }
+
         // Default on; RISC0_RECURSION_REORDER=0 uses the sequential loop below.
-        let reorder = !matches!(std::env::var("RISC0_RECURSION_REORDER").as_deref(), Ok("0"));
+        let reorder = accumulator.is_none()
+            && !matches!(std::env::var("RISC0_RECURSION_REORDER").as_deref(), Ok("0"));
         if reorder && num_segments >= 2 {
             let spawn_lift_prep =
                 |idx: usize| -> Result<std::thread::JoinHandle<Result<RecursionProverJob>>> {
@@ -2203,7 +2210,7 @@ impl ProverServer for ProverImpl {
             accumulator = Some(acc);
         }
 
-        for step_idx in 0..(if reorder && num_segments >= 2 {
+        for step_idx in 0..(if accumulator.is_some() {
             0
         } else {
             num_segments
@@ -2347,6 +2354,164 @@ fn release_pool_on_po2_growth(po2: u32) {
     }
     #[cfg(not(feature = "cuda"))]
     let _ = po2;
+}
+
+/// Lift and join a composite receipt's segments as a tree on Intel GPUs.
+///
+/// The linear fold (`acc = join(acc, lift(k))`) prepares each join (preflight and host witgen on
+/// the CPU, ~125 ms on a Ryzen 9 for po2=20 segments) only once the previous join is done, while the
+/// GPU runs the next lift (~110 ms on an Arc Pro B70): the GPU waited 12-30 ms per step, and
+/// ~115 ms before the last join. A join of any two adjacent ranges is as valid as the fold's (the
+/// join program checks that the left receipt's post state is the right one's pre state), so here
+/// every pair of adjacent finished ranges is joined, preparations run ahead on background threads,
+/// and the GPU takes whichever prepared proof is ready. The final receipt's claim is the same.
+#[cfg(feature = "intel")]
+mod rec_tree {
+    use super::*;
+    use crate::host::recursion::prove::{make_succinct_receipt, Prover as Job};
+    use std::collections::BTreeMap;
+    use std::thread::JoinHandle;
+
+    /// On unless `RISC0_RECURSION_TREE=0`.
+    pub(super) fn enabled() -> bool {
+        static ON: LazyLock<bool> =
+            LazyLock::new(|| std::env::var("RISC0_RECURSION_TREE").as_deref() != Ok("0"));
+        *ON
+    }
+
+    /// Lift preparations kept in flight, and join preparations at most in flight.
+    const LIFT_PREPS: usize = 2;
+    const JOIN_PREPS: usize = 2;
+
+    /// A preparation thread, joined when dropped so none outlives the proving call on an error.
+    struct Prep(Option<JoinHandle<Result<Job>>>);
+
+    impl Prep {
+        fn spawn(mut job: Job) -> Self {
+            Self(Some(std::thread::spawn(move || {
+                job.prepare()?;
+                Ok(job)
+            })))
+        }
+
+        fn is_finished(&self) -> bool {
+            self.0.as_ref().is_none_or(|h| h.is_finished())
+        }
+
+        fn join(mut self) -> Result<Job> {
+            let h = self
+                .0
+                .take()
+                .ok_or_else(|| anyhow!("recursion preparation already joined"))?;
+            h.join()
+                .map_err(|_| anyhow!("recursion preparation panicked"))?
+        }
+    }
+
+    impl Drop for Prep {
+        fn drop(&mut self) {
+            if let Some(h) = self.0.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    struct Pending {
+        /// The segments `start..end` the proof covers.
+        start: usize,
+        end: usize,
+        /// The joined claim (a join), or None (the lift of segment `start`).
+        claim: Option<ReceiptClaim>,
+        prep: Prep,
+    }
+
+    pub(super) fn reduce(
+        segments: &[SegmentReceipt],
+        opts: &ProverOpts,
+    ) -> Result<SuccinctReceipt<ReceiptClaim>> {
+        let n = segments.len();
+        let t0 = std::time::Instant::now();
+        let mut idle = std::time::Duration::ZERO;
+        // Finished proofs by first segment: (end, receipt).
+        let mut done: BTreeMap<usize, (usize, SuccinctReceipt<ReceiptClaim>)> = BTreeMap::new();
+        let mut pending: Vec<Pending> = Vec::new();
+        let mut next_lift = 0;
+        loop {
+            // Join every adjacent pair of finished ranges, up to JOIN_PREPS preparations.
+            while pending.iter().filter(|p| p.claim.is_some()).count() < JOIN_PREPS {
+                let Some((s, m)) = done
+                    .iter()
+                    .find_map(|(&s, (e, _))| done.contains_key(e).then_some((s, *e)))
+                else {
+                    break;
+                };
+                let (_, a) = done.remove(&s).unwrap();
+                let (e, b) = done.remove(&m).unwrap();
+                let claim = a.claim.join(&b.claim)?.value()?;
+                let job = Job::new_join(&a, &b, opts.clone())?;
+                pending.push(Pending {
+                    start: s,
+                    end: e,
+                    claim: Some(claim),
+                    prep: Prep::spawn(job),
+                });
+            }
+            while next_lift < n && pending.iter().filter(|p| p.claim.is_none()).count() < LIFT_PREPS
+            {
+                let job = Job::new_lift(&segments[next_lift], opts.clone())?;
+                pending.push(Pending {
+                    start: next_lift,
+                    end: next_lift + 1,
+                    claim: None,
+                    prep: Prep::spawn(job),
+                });
+                next_lift += 1;
+            }
+            if pending.is_empty() {
+                break;
+            }
+            // A prepared join first (it frees two receipts and feeds the next join), else the
+            // earliest prepared lift; or wait for one.
+            let ready = pending
+                .iter()
+                .position(|p| p.claim.is_some() && p.prep.is_finished())
+                .or_else(|| pending.iter().position(|p| p.prep.is_finished()));
+            let Some(i) = ready else {
+                let t = std::time::Instant::now();
+                std::thread::sleep(std::time::Duration::from_micros(200));
+                idle += t.elapsed();
+                continue;
+            };
+            let p = pending.remove(i);
+            let mut job = p.prep.join()?;
+            let receipt = job.run()?;
+            let decoded = ReceiptClaim::decode(&mut receipt.out_stream())?;
+            let claim = match p.claim {
+                Some(claim) => decoded.merge(&claim)?,
+                None => decoded.merge(&segments[p.start].claim)?,
+            };
+            done.insert(
+                p.start,
+                (p.end, make_succinct_receipt(job, receipt, claim)?),
+            );
+        }
+        if *VERBOSE {
+            eprintln!(
+                "[composite_to_succinct] tree: {n} segments in {:.1}ms, waited {:.1}ms for preparations",
+                t0.elapsed().as_secs_f64() * 1e3,
+                idle.as_secs_f64() * 1e3
+            );
+        }
+        let (start, (end, receipt)) = done
+            .pop_first()
+            .ok_or_else(|| anyhow!("recursion tree produced no receipt"))?;
+        ensure!(
+            start == 0 && end == n && done.is_empty(),
+            "recursion tree left {} ranges",
+            done.len() + 1
+        );
+        Ok(receipt)
+    }
 }
 
 /// Lift (and left-fold join) segment receipts on the main thread between segment proofs, with
