@@ -19,7 +19,7 @@ use anyhow::{anyhow, bail, ensure, Context, Result};
 static VERBOSE: LazyLock<bool> = LazyLock::new(|| std::env::var("RISC0_VERBOSE").is_ok());
 
 use super::{
-    keccak::{prove_keccak, prove_keccak_with},
+    keccak::{prove_and_lift_keccaks, prove_keccak, prove_keccak_with, reuse_keccak_prover},
     ProverServer,
 };
 use risc0_circuit_rv32im::prove::SegmentProver;
@@ -1322,61 +1322,85 @@ impl ProverImpl {
         }
 
         let t_keccaks = std::time::Instant::now();
-        std::thread::scope(|scope| -> Result<()> {
-            // On Intel and AMD GPUs a keccak proof's witness is made on the CPU, about half of
-            // the proof's time: make each on a thread, a proof ahead of the GPU, so the two
-            // overlap. (On CUDA the GPU makes it.) Metal is excluded: its prover makes the witness
-            // itself (`HOST_WITNESS = false`, `prove_host_witness` returns None), so a host
-            // witness would be dropped after a wasted CPU witgen while holding ~1.15 GB per
-            // witness at po2 18. The thread uses no HAL. Returning early drops `witnesses`, which
-            // ends the thread.
-            let witnesses = (cfg!(any(feature = "intel", feature = "rocm"))
-                && session.pending_keccaks.len() > 1)
-                .then(|| {
-                    let (tx, rx) = mpsc::sync_channel(1);
-                    let requests = &session.pending_keccaks;
-                    scope.spawn(move || {
-                        for request in requests {
-                            let witness = risc0_circuit_keccak::prove::host_witness(
-                                &request.input,
-                                request.po2,
-                            );
-                            if tx.send(witness).is_err() {
-                                break;
-                            }
-                        }
-                    });
-                    rx
-                });
-            for (i, proof_request) in session.pending_keccaks.iter().enumerate() {
-                let t_keccak = std::time::Instant::now();
-                let witness = match &witnesses {
-                    Some(rx) => Some(
-                        rx.recv()
-                            .map_err(|_| anyhow!("the keccak witness thread ended early"))?
-                            .context("keccak witness")?,
-                    ),
-                    None => None,
-                };
-                let wait_ms = t_keccak.elapsed().as_secs_f64() * 1000.0;
-                let receipt = prove_keccak_with(proof_request, witness).context("prove keccak")?;
-                let prove_ms = t_keccak.elapsed().as_secs_f64() * 1000.0;
+        // K10: on Metal, one keccak prover proves all the requests and is dropped before the
+        // lifts (`prove_and_lift_keccaks`). The per-request loop below stays for the other
+        // backends (unmeasured there; on Intel and AMD it overlaps host witnesses), and
+        // `RISC0_KECCAK_REUSE_HAL=0` restores it on Metal.
+        let two_phase = cfg!(feature = "metal") && reuse_keccak_prover();
+        if two_phase {
+            prove_and_lift_keccaks(&session.pending_keccaks, |i, receipt| {
                 receipt.verify_integrity_with_context(&keccak_ctx)?;
                 tracing::debug!("adding keccak assumption: {}", receipt.claim.digest());
                 let t_insert = std::time::Instant::now();
                 keccak_receipts.insert(receipt)?;
                 if *VERBOSE {
                     eprintln!(
-                        "[keccak] {i}: po2={} witness wait={wait_ms:.1}ms \
-                         prove+lift={prove_ms:.1}ms insert={:.1}ms total={:.1}ms",
-                        proof_request.po2,
+                        "[keccak] {i}: po2={} insert={:.1}ms",
+                        session.pending_keccaks[i].po2,
                         t_insert.elapsed().as_secs_f64() * 1000.0,
-                        t_keccak.elapsed().as_secs_f64() * 1000.0,
                     );
                 }
-            }
-            Ok(())
-        })?;
+                Ok(())
+            })
+            .context("prove keccak")?;
+        } else {
+            std::thread::scope(|scope| -> Result<()> {
+                // On Intel and AMD GPUs a keccak proof's witness is made on the CPU, about half of
+                // the proof's time: make each on a thread, a proof ahead of the GPU, so the two
+                // overlap. (On CUDA the GPU makes it.) Metal is excluded: its prover makes the witness
+                // itself (`HOST_WITNESS = false`, `prove_host_witness` returns None), so a host
+                // witness would be dropped after a wasted CPU witgen while holding ~1.15 GB per
+                // witness at po2 18. The thread uses no HAL. Returning early drops `witnesses`, which
+                // ends the thread.
+                let witnesses = (cfg!(any(feature = "intel", feature = "rocm"))
+                    && session.pending_keccaks.len() > 1)
+                    .then(|| {
+                        let (tx, rx) = mpsc::sync_channel(1);
+                        let requests = &session.pending_keccaks;
+                        scope.spawn(move || {
+                            for request in requests {
+                                let witness = risc0_circuit_keccak::prove::host_witness(
+                                    &request.input,
+                                    request.po2,
+                                );
+                                if tx.send(witness).is_err() {
+                                    break;
+                                }
+                            }
+                        });
+                        rx
+                    });
+                for (i, proof_request) in session.pending_keccaks.iter().enumerate() {
+                    let t_keccak = std::time::Instant::now();
+                    let witness = match &witnesses {
+                        Some(rx) => Some(
+                            rx.recv()
+                                .map_err(|_| anyhow!("the keccak witness thread ended early"))?
+                                .context("keccak witness")?,
+                        ),
+                        None => None,
+                    };
+                    let wait_ms = t_keccak.elapsed().as_secs_f64() * 1000.0;
+                    let receipt =
+                        prove_keccak_with(proof_request, witness).context("prove keccak")?;
+                    let prove_ms = t_keccak.elapsed().as_secs_f64() * 1000.0;
+                    receipt.verify_integrity_with_context(&keccak_ctx)?;
+                    tracing::debug!("adding keccak assumption: {}", receipt.claim.digest());
+                    let t_insert = std::time::Instant::now();
+                    keccak_receipts.insert(receipt)?;
+                    if *VERBOSE {
+                        eprintln!(
+                            "[keccak] {i}: po2={} witness wait={wait_ms:.1}ms \
+                         prove+lift={prove_ms:.1}ms insert={:.1}ms total={:.1}ms",
+                            proof_request.po2,
+                            t_insert.elapsed().as_secs_f64() * 1000.0,
+                            t_keccak.elapsed().as_secs_f64() * 1000.0,
+                        );
+                    }
+                }
+                Ok(())
+            })?;
+        }
 
         // NOTE: Calling keccak_receipts.root() proves the union tree.
         let t_root = std::time::Instant::now();
