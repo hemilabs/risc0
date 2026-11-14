@@ -167,19 +167,18 @@ impl<IH: IntelHash> IntelCircuitHal<IH> {
     }
 }
 
-/// The degree-split eval_check (see eval_check): on when risc0_rv32im_intel_hi / _lo are present
-/// and the GPU is Xe2 (or RISC0_INTEL_EVAL_SPLIT=1), unless RISC0_INTEL_EVAL_SPLIT=0 or
-/// RISC0_INTEL_EVAL_NOXMX=0 (which asks for the whole kernel with the XMX chains).
-fn split_eval_enabled(queue: *mut std::ffi::c_void) -> bool {
+/// The parts of the degree-split eval_check (see eval_check): 3 or 2 when its libraries are present
+/// and the GPU is Xe2 (or RISC0_INTEL_EVAL_SPLIT=1), else 0; also 0 with RISC0_INTEL_EVAL_SPLIT=0
+/// or RISC0_INTEL_EVAL_NOXMX=0 (which asks for the whole kernel with the XMX chains).
+fn split_eval_parts(queue: *mut std::ffi::c_void) -> i32 {
     if std::env::var("RISC0_INTEL_EVAL_SPLIT").as_deref() == Ok("0")
         || std::env::var("RISC0_INTEL_EVAL_NOXMX").as_deref() == Ok("0")
     {
-        return false;
+        return 0;
     }
-    let available = unsafe {
+    unsafe {
         risc0_circuit_rv32im_sys::risc0_circuit_rv32im_intel_eval_check_parts_available(queue)
-    };
-    available == 1
+    }
 }
 
 impl<IH: IntelHash> CircuitWitnessGenerator<IntelHal<IH>> for IntelCircuitHal<IH> {
@@ -335,6 +334,11 @@ impl<IH: IntelHash> CircuitHal<IntelHal<IH>> for IntelCircuitHal<IH> {
         // miscompare is multipass-specific.
         let use_multipass =
             std::env::var_os("RISC0_MULTIPASS").is_some() && !phase_disabled("multipass");
+        let split_parts = if use_multipass {
+            0
+        } else {
+            split_eval_parts(queue)
+        };
 
         if use_multipass {
             // 2-way multi-pass: allocate intermediate buffer, run pass1 then pass2
@@ -418,20 +422,32 @@ impl<IH: IntelHash> CircuitHal<IntelHal<IH>> for IntelCircuitHal<IH> {
             // Keep intermediate buffers alive until eval_check_dep()
             *self.eval_check_inter_fp.lock() = Some(inter_fp);
             *self.eval_check_inter_ext.lock() = Some(inter_ext);
-        } else if split_eval_enabled(queue) {
+        } else if split_parts >= 2 {
             // Split by degree (rv32im-sys evalfast/degsplit.py). Every constraint term vanishes
-            // on the trace domain, so the quotient of the terms of degree <= 3 has degree < 2N
-            // (N = steps): it is fixed by its values on the even rows of the 4N-point coset,
+            // on the trace domain, so the quotient of the terms of degree <= d has degree
+            // < (d - 1) N (N = steps).
+            //
+            // Degree <= 3: < 2N, fixed by its values on the even rows of the 4N-point coset,
             // x = 3 w^(2j). As P(y) = Q_lo(3y) those are P on the 2N-th roots of unity, in
             // natural order; interpolating them and evaluating P on the 4N-th roots (the same
             // pair of HAL calls a PolyGroup makes) gives Q_lo(3 w^i) on every row.
+            //
+            // Degree 4 (with three parts): < 3N, fixed by its values on three of the four cosets
+            // of the trace domain (rows 4m + c, c < 3): their size-N interpolations give the
+            // fourth coset's coefficients (eval_check_coset3), evaluated back at size N.
             let half = domain / 2;
+            let quarter = domain / 4;
             let check_lo = self._hal.alloc_elem("check_lo", 4 * half);
+            let check_mid =
+                (split_parts == 3).then(|| self._hal.alloc_elem("check_mid", 12 * quarter));
             risc0_sys::intel::esimd_check(unsafe {
                 risc0_circuit_rv32im_sys::risc0_circuit_rv32im_intel_eval_check_parts(
                     queue,
                     check.as_device_ptr().0 as *mut std::ffi::c_void,
                     check_lo.as_device_ptr().0 as *mut std::ffi::c_void,
+                    check_mid.as_ref().map_or(std::ptr::null_mut(), |b| {
+                        b.as_device_ptr().0 as *mut std::ffi::c_void
+                    }),
                     groups[REGISTER_GROUP_DATA].as_device_ptr().0 as *const std::ffi::c_void,
                     groups[REGISTER_GROUP_ACCUM].as_device_ptr().0 as *const std::ffi::c_void,
                     globals[GLOBAL_OUT].as_device_ptr().0 as *const std::ffi::c_void,
@@ -447,6 +463,44 @@ impl<IH: IntelHash> CircuitHal<IntelHal<IH>> for IntelCircuitHal<IH> {
             self._hal
                 .batch_expand_into_evaluate_ntt(&lo_all, &check_lo, 4, EXP_PO2 - 1);
             self._hal.eltwise_add_elem(check, check, &lo_all);
+            if let Some(mid) = check_mid {
+                let check_ptr = check.as_device_ptr().0 as *mut std::ffi::c_void;
+                // Cosets 0, 1, 2 as computed, then coset 3 from their coefficients.
+                risc0_sys::intel::esimd_check(unsafe {
+                    risc0_circuit_rv32im_sys::risc0_circuit_rv32im_intel_eval_check_add_cosets(
+                        queue,
+                        check_ptr,
+                        mid.as_device_ptr().0 as *const std::ffi::c_void,
+                        domain as u32,
+                        0,
+                        3,
+                    )
+                });
+                self._hal.batch_interpolate_ntt(&mid, 12);
+                let coeffs3 = self._hal.alloc_elem("check_mid_c3", 4 * quarter);
+                risc0_sys::intel::esimd_check(unsafe {
+                    risc0_circuit_rv32im_sys::risc0_circuit_rv32im_intel_eval_check_coset3(
+                        queue,
+                        coeffs3.as_device_ptr().0 as *mut std::ffi::c_void,
+                        mid.as_device_ptr().0 as *const std::ffi::c_void,
+                        rou_raw,
+                        po2 as u32,
+                    )
+                });
+                let coset3 = self._hal.alloc_elem("check_mid_v3", 4 * quarter);
+                self._hal
+                    .batch_expand_into_evaluate_ntt(&coset3, &coeffs3, 4, 0);
+                risc0_sys::intel::esimd_check(unsafe {
+                    risc0_circuit_rv32im_sys::risc0_circuit_rv32im_intel_eval_check_add_cosets(
+                        queue,
+                        check_ptr,
+                        coset3.as_device_ptr().0 as *const std::ffi::c_void,
+                        domain as u32,
+                        3,
+                        1,
+                    )
+                });
+            }
             if std::env::var_os("RISC0_INTEL_EVAL_SPLIT_CHECK").is_some() {
                 self.split_eval_crosscheck(
                     check,

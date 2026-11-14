@@ -216,19 +216,23 @@ extern "C" {
     /// Frees eval_check's scratch slab (waits for the queue first).
     pub fn risc0_circuit_rv32im_intel_eval_check_release() -> *const std::os::raw::c_char;
 
-    /// 1 when the degree-split eval_check (risc0_rv32im_intel_hi / _lo) is available and on for
-    /// the queue's GPU (Xe2, or RISC0_INTEL_EVAL_SPLIT=1), else 0. Decided on the first call.
+    /// The number of parts of the degree-split eval_check (3: risc0_rv32im_intel_hi, _mid and
+    /// _lo; 2: _hi and _lo) when available and on for the queue's GPU (Xe2, or
+    /// RISC0_INTEL_EVAL_SPLIT=1), else 0. Decided on the first call.
     pub fn risc0_circuit_rv32im_intel_eval_check_parts_available(
         queue: *mut std::os::raw::c_void,
     ) -> std::os::raw::c_int;
 
-    /// The degree-split eval_check: the constraint terms of degree > 3 on every row of the
-    /// `domain`-point coset into `check` (4 * domain), and those of degree <= 3 on its even rows
-    /// into `check_lo` (4 * domain / 2), which the caller extends to every row and adds.
+    /// The degree-split eval_check on the `domain`-point coset: the constraint terms of the
+    /// highest degrees on every row into `check` (4 * domain); those of degree <= 3 on its even
+    /// rows into `check_lo` (4 * domain / 2); with three parts, those of degree 4 on cosets 0, 1, 2
+    /// of the trace domain into `check_mid` (4 * 3 * domain / 4, coset-major; null with two
+    /// parts). The caller recovers the rest of lo and mid and adds them.
     pub fn risc0_circuit_rv32im_intel_eval_check_parts(
         queue: *mut std::os::raw::c_void,
         check: *mut std::os::raw::c_void,
         check_lo: *mut std::os::raw::c_void,
+        check_mid: *mut std::os::raw::c_void,
         data: *const std::os::raw::c_void,
         accum: *const std::os::raw::c_void,
         out: *const std::os::raw::c_void,
@@ -237,6 +241,27 @@ extern "C" {
         rou: u32,
         po2: u32,
         domain: u32,
+    ) -> *const std::os::raw::c_char;
+
+    /// Adds `n` cosets of the trace domain, stored coset-major in `src` (4 limbs * n * domain / 4),
+    /// into their rows 4 m + c0 + c of `check` (4 * domain).
+    pub fn risc0_circuit_rv32im_intel_eval_check_add_cosets(
+        queue: *mut std::os::raw::c_void,
+        check: *mut std::os::raw::c_void,
+        src: *const std::os::raw::c_void,
+        domain: u32,
+        c0: u32,
+        n: u32,
+    ) -> *const std::os::raw::c_char;
+
+    /// The degree-4 part's coefficients on coset 3 of the trace domain (4 * 2^po2, bit-reversed
+    /// order) from those on cosets 0, 1, 2 (`coeffs`, batch_interpolate_ntt of check_mid).
+    pub fn risc0_circuit_rv32im_intel_eval_check_coset3(
+        queue: *mut std::os::raw::c_void,
+        out: *mut std::os::raw::c_void,
+        coeffs: *const std::os::raw::c_void,
+        rou: u32,
+        po2: u32,
     ) -> *const std::os::raw::c_char;
 
     // 2-way multi-pass eval_check (separate .so files per pass)
