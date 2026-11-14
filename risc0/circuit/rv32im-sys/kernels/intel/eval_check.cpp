@@ -209,11 +209,14 @@ RV_EVAL_FN(risc0_circuit_rv32im_intel_eval_check_release)() {
 }
 
 #ifndef RISC0_RV32IM_EVAL_NOXMX
-// The exports: this library's kernel on GPUs with Xe2's DPAS (Battlemage, Lunar Lake), and
-// risc0_rv32im_intel_noxmx's, loaded from this library's directory, on the others. The XMX
-// linking chains are written for Xe2's SIMD16 DPAS; on Alchemist (Arc A770), whose DPAS runs at
-// SIMD8, they gave wrong values in every row (built ahead of time or by the driver alike).
-// RISC0_INTEL_EVAL_NOXMX=1 picks the second library on any GPU.
+// The exports: risc0_rv32im_intel_noxmx's kernel, loaded from this library's directory, and this
+// library's (the XMX linking chains) only with RISC0_INTEL_EVAL_NOXMX=0 on a GPU with Xe2's DPAS
+// (Battlemage, Lunar Lake). The chains are written for Xe2's SIMD16 DPAS; on Alchemist (Arc A770),
+// whose DPAS runs at SIMD8, they gave wrong values in every row (built ahead of time or by the
+// driver alike). On the v3.1.0 circuit they also lost their gain on Xe2: on an Arc Pro B70 the
+// kernel spills 91 KB per thread (12.5 KB on v3.0) and took 730 ms per po2=20 segment, against
+// 307 ms without XMX (the driver's compile of the SPIR-V; it ignores DisableRecompilation, so
+// the XMX kernel itself only ever gets IGC's recompiled form there, at 1.3-1.4 s).
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -279,9 +282,8 @@ void load_noxmx(NoXmx& n) {
     }
 #endif
     if (!n.eval || !n.release) {
-        n.error = "eval_check: this GPU has no Xe2 DPAS and needs " + file +
-                  ", built when RISC0_INTEL_SYCL_TARGETS includes a target other than Battlemage "
-                  "or Lunar Lake (the default includes spir64)";
+        n.error = "eval_check: needs " + file +
+                  " (built beside this library when it has the XMX chains)";
         n.eval = nullptr;
         n.release = nullptr;
     }
@@ -293,9 +295,17 @@ NoXmx g_noxmx;
 // Decided once, for the first queue's device (a process proves on one device).
 const NoXmx& noxmx_for(sycl::queue* q) {
     std::call_once(g_noxmx_once, [q] {
+#ifdef RISC0_RV32IM_EVAL_XMX
         const char* force = std::getenv("RISC0_INTEL_EVAL_NOXMX");
-        g_noxmx.use = (force && std::strcmp(force, "0") != 0) || !has_xe2_dpas(q->get_device());
+        const bool xmx = force && std::strcmp(force, "0") == 0 && has_xe2_dpas(q->get_device());
+        g_noxmx.use = !xmx;
         if (g_noxmx.use) load_noxmx(g_noxmx);
+#else
+        // Built without the chains (RISC0_INTEL_EVAL_XMX=0 or RISC0_INTEL_EVAL_FAST=0): this
+        // library's kernel is the one to run, and there is no second library.
+        (void)q;
+        g_noxmx.use = false;
+#endif
     });
     return g_noxmx;
 }
