@@ -21,6 +21,11 @@ mod hal;
 mod p2fast;
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 mod pinned;
+/// Metal: the trace staged in a shared buffer (C14, `hal/metal/staging.rs`).
+#[cfg(feature = "metal")]
+mod pinned {
+    pub(crate) use super::hal::metal::staging::MetalStaged as PinnedTrace;
+}
 mod preflight;
 mod program;
 mod witgen;
@@ -199,6 +204,28 @@ pub(crate) fn host_prep_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var("RISC0_CUDA_REC_PREP").as_deref() != Ok("0"));
     *ON
+}
+
+/// Metal (C14): stage a prepared preflight's witgen inputs (trace and host chains) in a shared
+/// Metal buffer, off the GPU thread (`hal/metal/staging.rs`; off by default,
+/// `RISC0_METAL_REC_STAGE=1` = on).
+#[cfg(feature = "metal")]
+pub(crate) fn stage_metal(preflight: &Preflight) {
+    if !host_chains_backend() || !hal::metal::staging::stage_enabled() {
+        return;
+    }
+    let t0 = std::time::Instant::now();
+    let staged = {
+        let chains = preflight.host_chains.lock().unwrap();
+        let t = &preflight.trace;
+        pinned::PinnedTrace::new(&t.wom, &t.cycles, &t.iops, chains.as_ref())
+    };
+    tracing::debug!(
+        "recursion Metal staging: staged={} {:.1}ms",
+        staged.is_some(),
+        t0.elapsed().as_secs_f64() * 1e3
+    );
+    *preflight.pinned.lock().unwrap() = staged;
 }
 
 fn preflight_is_streaming(p: &Preflight) -> bool {
@@ -443,6 +470,9 @@ impl Prover {
                 );
             }
         }
+        // Metal (C14): the same inputs in a shared Metal buffer the witgen binds in place.
+        #[cfg(feature = "metal")]
+        stage_metal(&preflight);
         self.prepared_preflight = Some(preflight);
         Ok(())
     }

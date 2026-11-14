@@ -110,8 +110,8 @@ fn load_captures() -> Vec<(String, capture::Capture)> {
         .collect()
 }
 
-/// A preflight for a replay, prepared as zkvm's `prepare()` does (trace and host chains off the
-/// timed path).
+/// A preflight for a replay, prepared as zkvm's `prepare()` does (trace, host chains and the C14
+/// Metal staging off the timed path).
 fn replay_preflight(c: &capture::Capture) -> Option<Preflight> {
     let p = c.preflight()?;
     if crate::prove::host_chains_backend() {
@@ -127,6 +127,8 @@ fn replay_preflight(c: &capture::Capture) -> Option<Preflight> {
         }
         *p.host_chains.lock().unwrap() = chains;
     }
+    // C14: and staged in a shared Metal buffer, as `prepare()` does (`RISC0_METAL_REC_STAGE`).
+    crate::prove::stage_metal(&p);
     Some(p)
 }
 

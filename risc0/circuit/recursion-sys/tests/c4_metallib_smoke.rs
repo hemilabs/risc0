@@ -202,6 +202,17 @@ const C1_NAMES: &[&str] = &[
     "scatterHostChains",
 ];
 
+/// C14's `rec_sort.metal` (listed right after rec_kernels.metal's).
+const C14_NAMES: &[&str] = &[
+    "recSortHist",
+    "recScanBlocks",
+    "recScanSums",
+    "recScanAdd",
+    "recSortScatter",
+    "recSortCheck",
+    "recCopyWords",
+];
+
 #[test]
 fn c4_kernel_names_match_rec_kernels_and_translators() {
     let listed: Vec<&str> = METAL_KERNEL_NAMES.to_vec();
@@ -212,7 +223,11 @@ fn c4_kernel_names_match_rec_kernels_and_translators() {
         "duplicate METAL_KERNEL_NAMES entry"
     );
 
-    let mut expected: Vec<String> = C1_NAMES.iter().map(|s| s.to_string()).collect();
+    let mut expected: Vec<String> = C1_NAMES
+        .iter()
+        .chain(C14_NAMES)
+        .map(|s| s.to_string())
+        .collect();
     expected.extend(list_kernels("cuda2metal_steps.py", &[]));
     expected.extend(list_kernels(
         "cuda2metal_eval.py",
@@ -220,7 +235,7 @@ fn c4_kernel_names_match_rec_kernels_and_translators() {
     ));
     assert_eq!(
         listed, expected,
-        "METAL_KERNEL_NAMES must be rec_kernels.metal's kernels followed by the translators' \
+        "METAL_KERNEL_NAMES must be rec_kernels.metal's and rec_sort.metal's kernels followed by the translators' \
          --list-kernels output"
     );
 }
@@ -282,7 +297,10 @@ fn c4_metallib_has_every_kernel_and_builds_each_pipeline_once() {
             );
             assert!(max > 0, "{name}: maxTotalThreadsPerThreadgroup is 0");
             // Every translated kernel and the scan carry max_total_threads_per_threadgroup(256).
-            if !C1_NAMES.contains(name) || *name == "prefixProductsChunks" {
+            // C14's scan kernels declare it too; its other kernels do not.
+            let c14_free =
+                C14_NAMES.contains(name) && !matches!(*name, "recScanBlocks" | "recScanSums");
+            if (!C1_NAMES.contains(name) && !c14_free) || *name == "prefixProductsChunks" {
                 assert!(max <= 256, "{name}: max threads {max} > the declared 256");
             }
             msg!((); func, "release");

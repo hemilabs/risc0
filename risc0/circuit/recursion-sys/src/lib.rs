@@ -43,6 +43,14 @@ pub const METAL_KERNEL_NAMES: &[&str] = &[
     "recZeroizeRows",
     "markHostChains",
     "scatterHostChains",
+    // kernels/metal/rec_sort.metal (C14: GPU WOM counting sort)
+    "recSortHist",
+    "recScanBlocks",
+    "recScanSums",
+    "recScanAdd",
+    "recSortScatter",
+    "recSortCheck",
+    "recCopyWords",
     // $OUT_DIR/metal/step_*.metal (C2 `cuda2metal_steps.py --list-kernels`)
     "parStepExec",
     "parStepVerifyWom",

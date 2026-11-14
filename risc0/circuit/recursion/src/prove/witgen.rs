@@ -172,12 +172,12 @@ pub(crate) struct HostChains {
     pub pinned: Option<[usize; 5]>,
 }
 
-#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "metal"))]
 fn pinned_ptr<T>(p: Option<&super::pinned::PinnedTrace>, i: usize) -> Option<*const T> {
     p.map(|p| p.ptr::<T>(i))
 }
 
-#[cfg(not(any(feature = "cuda", feature = "rocm")))]
+#[cfg(not(any(feature = "cuda", feature = "rocm", feature = "metal")))]
 fn pinned_ptr<T>(_p: Option<&()>, _i: usize) -> Option<*const T> {
     None
 }
@@ -408,11 +408,11 @@ where
             BabyBearElem::INVALID,
         );
 
-        #[cfg(any(feature = "cuda", feature = "rocm"))]
+        #[cfg(any(feature = "cuda", feature = "rocm", feature = "metal"))]
         let pinned_guard = preflight.pinned.lock().unwrap();
-        #[cfg(any(feature = "cuda", feature = "rocm"))]
+        #[cfg(any(feature = "cuda", feature = "rocm", feature = "metal"))]
         let pinned = pinned_guard.as_ref();
-        #[cfg(not(any(feature = "cuda", feature = "rocm")))]
+        #[cfg(not(any(feature = "cuda", feature = "rocm", feature = "metal")))]
         let pinned: Option<&()> = None;
         let raw_trace = RawPreflightTrace {
             wom: pinned_ptr(pinned, 0).unwrap_or(preflight.trace.wom.as_ptr()),

@@ -127,8 +127,9 @@ pub struct Preflight {
     /// `witgen::host_chains`), so the GPU witgen does not run them one thread at a time.
     pub(crate) host_chains: std::sync::Mutex<Option<super::witgen::HostChains>>,
 
-    /// Page-locked copy of the trace and host chains (see `host_prep_enabled`).
-    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    /// Page-locked copy of the trace and host chains (see `host_prep_enabled`); on Metal a
+    /// shared-buffer copy (C14, `RISC0_METAL_REC_STAGE`).
+    #[cfg(any(feature = "cuda", feature = "rocm", feature = "metal"))]
     pub(crate) pinned: std::sync::Mutex<Option<super::pinned::PinnedTrace>>,
 }
 
@@ -156,7 +157,7 @@ impl Preflight {
             iop_idx: 0,
             host_witness: std::sync::Mutex::new(None),
             host_chains: std::sync::Mutex::new(None),
-            #[cfg(any(feature = "cuda", feature = "rocm"))]
+            #[cfg(any(feature = "cuda", feature = "rocm", feature = "metal"))]
             pinned: std::sync::Mutex::new(None),
         }
     }

@@ -47,6 +47,7 @@ mod c13_tests;
 pub(crate) mod capture;
 mod eval_check;
 pub(crate) mod profile;
+pub(crate) mod staging;
 #[cfg(all(test, feature = "test"))]
 mod tests;
 mod witgen;
