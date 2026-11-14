@@ -69,6 +69,8 @@ mod tests_z10;
 mod tests_z13;
 #[cfg(test)]
 mod tests_z14;
+#[cfg(test)]
+mod tests_z16;
 
 use std::{
     fmt::Debug,
@@ -93,7 +95,7 @@ use risc0_core::{
 use self::runtime::Runtime;
 pub use self::{
     buffer::BufferImpl,
-    kernels::MetalKernels,
+    kernels::{MetalKernels, ZKP_ARCHIVE_ENV, ZKP_ARCHIVE_UNIT},
     poseidon2::{MetalHashPoseidon2, Poseidon2Config, Poseidon2Kernels},
     poseidon254::{MetalHashPoseidon254, Poseidon254Config, Poseidon254Kernels},
     runtime::{
@@ -277,7 +279,7 @@ pub(crate) fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
 fn zkp_kernels(device: &Device) -> &'static MetalKernels {
     static ONCE: OnceLock<MetalKernels> = OnceLock::new();
     ONCE.get_or_init(|| {
-        MetalKernels::new(device, METAL_LIB, KERNEL_NAMES)
+        MetalKernels::new_zkp(device, METAL_LIB, KERNEL_NAMES)
             .unwrap_or_else(|e| panic!("zkp metallib: {e:#}"))
     })
 }

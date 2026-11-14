@@ -33,6 +33,8 @@
 
 mod accum;
 mod eval_check;
+// Z16: the segment-po2 prewarm of the specialized eval_check PSO (`prove::metal_prewarm_segment_po2`).
+pub(crate) use eval_check::prewarm_segment_po2;
 mod witgen;
 
 // R8: preflight leaves the per-cycle columns to the Metal witgen (witgen::DEFER_CYCLE_COLS).
