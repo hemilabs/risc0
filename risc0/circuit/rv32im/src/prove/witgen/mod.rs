@@ -179,8 +179,8 @@ pub(crate) struct WitnessGenerator<H: Hal> {
 
 /// Once a segment's witgen buffers are freed: let the HAL refill them in the background (beside
 /// eval_check) for a next segment of the same size, as `hal_generate_witness` (data) and `accum`
-/// allocate them. A no-op on HALs without `prefill_elem` (all but HIP), and above po2 21, where
-/// eval_check needs that memory back.
+/// allocate them. A no-op on HALs without `prefill_elem` (all but HIP and Metal), and above
+/// po2 21, where eval_check needs that memory back.
 pub(crate) fn prefill_next_segment<H, C>(hal: &H, circuit_hal: &C, cycles: usize)
 where
     H: Hal<Field = CircuitField, Elem = Val, ExtElem = ExtVal>,
