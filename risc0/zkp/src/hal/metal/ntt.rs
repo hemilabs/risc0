@@ -595,6 +595,7 @@ impl<MH: MetalHash> MetalHal<MH> {
         lg_blowup: usize,
         cols: usize,
         chunk: usize,
+        natural: bool,
     ) {
         let zk = self.ntt_zk_table(lg);
         let chunk = if chunk == 0 {
@@ -618,7 +619,9 @@ impl<MH: MetalHash> MetalHal<MH> {
                 lg + lg_blowup,
                 false,
             );
-            self.bitrev_batched((coeffs, c0 * n), lg, k);
+            if natural {
+                self.bitrev_batched((coeffs, c0 * n), lg, k);
+            }
             c0 += chunk;
         }
     }
@@ -740,6 +743,19 @@ impl<MH: MetalHash> MetalHal<MH> {
         witness: &BufferImpl<Fp>,
         count: usize,
     ) {
+        self.ntt_commit_coeffs_lde_impl(coeffs, evaluated, witness, count, true);
+    }
+
+    /// `ntt_commit_coeffs_lde`; `natural`: bit-reverse the coefficients to natural order (else
+    /// they stay in the inverse NTT's bit-reversed order: Z14's `commit_coeffs_lde_bit_reversed`).
+    pub(crate) fn ntt_commit_coeffs_lde_impl(
+        &self,
+        coeffs: &BufferImpl<Fp>,
+        evaluated: &BufferImpl<Fp>,
+        witness: &BufferImpl<Fp>,
+        count: usize,
+        natural: bool,
+    ) {
         scope!("commit_coeffs_lde");
         let row_size = witness.size() / count;
         assert_eq!(row_size * count, witness.size());
@@ -753,7 +769,7 @@ impl<MH: MetalHash> MetalHal<MH> {
             (10..=23).contains(&lg),
             "commit_coeffs_lde: lg_domain_size {lg} out of range"
         );
-        self.nttx_commit(coeffs, evaluated, witness, lg, lg_blowup, count, 0);
+        self.nttx_commit(coeffs, evaluated, witness, lg, lg_blowup, count, 0, natural);
         self.flush();
     }
 
@@ -840,6 +856,31 @@ pub(crate) mod test_hooks {
         }
     }
 
+    /// Z13: `ct_x` of `cols` columns of 2^(lg - 2) from `input` expanded x4 into `output` (column
+    /// strides 2^(lg - 2) and 2^lg), zeros synthesised on load (the commit's form).
+    pub(crate) fn ct_expand4<MH: MetalHash>(
+        hal: &MetalHal<MH>,
+        cols: usize,
+        input: &BufferImpl<Fp>,
+        output: &BufferImpl<Fp>,
+        lg: usize,
+    ) {
+        let n = 1usize << (lg - 2);
+        hal.ct_x(cols, (input, 0), n, 2, (output, 0), 4 * n, lg, false);
+    }
+
+    /// Z13: `gs_x` (no zk shift) of `cols` columns of 2^lg from `input` into `output`.
+    pub(crate) fn gs<MH: MetalHash>(
+        hal: &MetalHal<MH>,
+        cols: usize,
+        input: &BufferImpl<Fp>,
+        output: &BufferImpl<Fp>,
+        lg: usize,
+    ) {
+        let n = 1usize << lg;
+        hal.gs_x(cols, (input, 0), n, (output, 0), n, lg, None);
+    }
+
     pub(crate) fn zk_table(lg: usize) -> Vec<Fp> {
         super::zk_table(lg)
     }
@@ -859,7 +900,7 @@ pub(crate) mod test_hooks {
         chunk: usize,
     ) {
         let lg_blowup = log2_ceil(crate::INV_RATE);
-        hal.nttx_commit(coeffs, evaluated, witness, lg, lg_blowup, cols, chunk);
+        hal.nttx_commit(coeffs, evaluated, witness, lg, lg_blowup, cols, chunk, true);
         hal.flush();
     }
 

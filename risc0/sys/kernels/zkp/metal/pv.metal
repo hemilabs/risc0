@@ -420,6 +420,129 @@ pv_rows<1>(device uint4*, const device uint*, constant uint&, constant uint&, ui
 template [[host_name("pv_rows_k_z9")]] kernel void
 pv_rows<2>(device uint4*, const device uint*, constant uint&, constant uint&, uint);
 
+// ---- Z14: pv_rows with a commit's side work folded in ----
+// Mirrored by `PvSideParams` in poseidon2.rs (32 bytes). Bit reversal: `cols` columns of 2^lg
+// words at column stride `stride` in `io`, in place (lg >= 10; cols = 0: none). Fills: `fill_n[k]`
+// uint4s of `fill[k]` set to the word `fill_v[k]` (fill_n[k] = 0: none).
+struct PvSideParams {
+  uint lg;
+  uint cols;
+  uint stride;
+  uint _pad;
+  uint fill_n0;
+  uint fill_v0;
+  uint fill_n1;
+  uint fill_v1;
+};
+
+// Two 32 x 32 tiles with rows padded to 33 words (the transposed reads hit distinct banks).
+#define PV_BR_PITCH 33u
+#define PV_BR_TILE (32u * PV_BR_PITCH)
+
+PV_INLINE uint pv_rev5(uint i) {
+  return reverse_bits(i) >> 27;
+}
+
+// Bit-reverse tile pair (t, rev(t)) of one column. A column of 2^lg words is a 32 x 2^(lg-10) x 32
+// array (hi, t, lo) at hi * 2^(lg-5) + t * 32 + lo; the bit reversal maps (hi, t, lo) to
+// (rev5(lo), rev(t), rev5(hi)): tile t, transposed with both coordinates reversed, goes to tile
+// rev(t), and back. Both tiles are staged in threadgroup memory (no private array: R17), 8 words
+// per thread and tile; one 128-thread group per pair. Ends with the threadgroup memory free.
+PV_INLINE void pv_br_pair(device uint* col, uint step, uint t, uint tr,
+                          threadgroup uint* x, uint tid) {
+  device uint* a = col + t * 32u;
+  device uint* b = col + tr * 32u;
+  threadgroup uint* xb = x + PV_BR_TILE;
+#pragma unroll
+  for (uint j = 0; j < 8; j++) {
+    const uint w = j * 128u + tid, r = w >> 5, c = w & 31u;
+    x[r * PV_BR_PITCH + c] = a[r * step + c];
+    xb[r * PV_BR_PITCH + c] = b[r * step + c];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+  // tile rev(t)[r][c] = tile t[rev5(c)][rev5(r)], and the other way round (for t == rev(t) both
+  // stores write the same values to the same words).
+#pragma unroll
+  for (uint j = 0; j < 8; j++) {
+    const uint w = j * 128u + tid, r = w >> 5, c = w & 31u;
+    const uint s = pv_rev5(c) * PV_BR_PITCH + pv_rev5(r);
+    b[r * step + c] = x[s];
+    a[r * step + c] = xb[s];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+// pv_rows, plus side work that touches neither `m` nor `out`, after the hash: threadgroup g
+// bit-reverses the tile pairs u = g, g + groups, ... of `io` (unit u = column u >> (lg - 10), tile
+// u & (2^(lg-10) - 1); a unit whose tile is above its reverse is the other half of a pair and
+// skipped), then the grid fills `fill0` / `fill1` (grid-stride). The memory-bound side work hides
+// under the ALU-bound hash (Z14). Launched as pv_rows with whole 128-thread groups (dim_x a
+// multiple of 128) and 2 * PV_BR_TILE words of threadgroup memory.
+template <int V>
+[[max_total_threads_per_threadgroup(128)]]
+kernel void pv_rows_side(device uint4* out [[buffer(0)]],
+                         const device uint* m [[buffer(1)]],
+                         constant uint& dim_x [[buffer(2)]],
+                         constant uint& dim_y [[buffer(3)]],
+                         device uint* io [[buffer(4)]],
+                         constant PvSideParams& sp [[buffer(5)]],
+                         device uint4* fill0 [[buffer(6)]],
+                         device uint4* fill1 [[buffer(7)]],
+                         threadgroup uint* xchg [[threadgroup(0)]],
+                         uint gid [[thread_position_in_grid]],
+                         uint tid [[thread_index_in_threadgroup]],
+                         uint g [[threadgroup_position_in_grid]],
+                         uint groups [[threadgroups_per_grid]]) {
+  if (gid < dim_x) {
+    uint x[24];
+#pragma unroll
+    for (int i = 0; i < 24; i++)
+      x[i] = 0;
+    const uint stride = dim_x, cols = dim_y;
+    const device uint* p = m + gid;
+    uint i = 0;
+    do {
+#pragma unroll
+      for (int j = 0; j < 16; j++, i++) {
+        if (i < cols) {
+          x[j] = *p;
+          p += stride;
+        } else {
+          x[j] = 0u;
+        }
+      }
+      pv::permute<V>(x);
+    } while (i < cols);
+    out[2 * gid] = uint4(x[0], x[1], x[2], x[3]);
+    out[2 * gid + 1] = uint4(x[4], x[5], x[6], x[7]);
+  }
+  if (sp.cols != 0u) {
+    const uint lgm = sp.lg - 10u;
+    const uint tiles = 1u << lgm;
+    const uint units = tiles * sp.cols;
+    const uint step = 1u << (sp.lg - 5u);
+#pragma unroll 1
+    for (uint u = g; u < units; u += groups) {
+      const uint t = u & (tiles - 1u);
+      const uint tr = lgm == 0u ? 0u : (reverse_bits(t) >> (32u - lgm));
+      if (t <= tr)
+        pv_br_pair(io + ulong(u >> lgm) * sp.stride, step, t, tr, xchg, tid);
+    }
+  }
+  const uint nt = groups * 128u;
+#pragma unroll 1
+  for (uint k = g * 128u + tid; k < sp.fill_n0; k += nt)
+    fill0[k] = uint4(sp.fill_v0);
+#pragma unroll 1
+  for (uint k = g * 128u + tid; k < sp.fill_n1; k += nt)
+    fill1[k] = uint4(sp.fill_v1);
+}
+
+template [[host_name("pv_rows_side_k_z9")]] kernel void
+pv_rows_side<2>(device uint4*, const device uint*, constant uint&, constant uint&, device uint*,
+                constant PvSideParams&, device uint4*, device uint4*, threadgroup uint*, uint, uint,
+                uint, uint);
+
 // =========================== pv_small.cuh (latency kernels, SIMD 32) ===========================
 namespace pvs {
 

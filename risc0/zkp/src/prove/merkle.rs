@@ -145,12 +145,31 @@ impl<H: Hal> MerkleTreeProver<H> {
         cols: usize,
         queries: usize,
     ) -> Self {
+        Self::new_bit_reverse(hal, matrix, rows, cols, queries, None)
+    }
+
+    /// [Self::new], and also bit-reverse the `count` columns of `coeffs` (Z14: a commit's
+    /// coefficients, which the hash does not read) with [Hal::hash_rows_bit_reverse], so a HAL can
+    /// fold that pass into the row hash.
+    pub fn new_bit_reverse(
+        hal: &H,
+        matrix: &H::Buffer<H::Elem>,
+        rows: usize,
+        cols: usize,
+        queries: usize,
+        bit_reverse: Option<(&H::Buffer<H::Elem>, usize)>,
+    ) -> Self {
         assert_eq!(matrix.size(), rows * cols);
         let params = MerkleTreeParams::new(rows, cols, queries);
         // Allocate nodes
         let nodes = hal.alloc_digest("nodes", rows * 2);
         // hash each column
-        hal.hash_rows(&nodes.slice(rows, rows), matrix);
+        match bit_reverse {
+            Some((coeffs, count)) => {
+                hal.hash_rows_bit_reverse(&nodes.slice(rows, rows), matrix, coeffs, count)
+            }
+            None => hal.hash_rows(&nodes.slice(rows, rows), matrix),
+        }
         // For each layer, hash up the layer below
         scope!("hash_fold", {
             hal.hash_fold_tree(&nodes, params.layers);

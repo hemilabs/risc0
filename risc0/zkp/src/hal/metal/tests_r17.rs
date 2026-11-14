@@ -337,6 +337,37 @@ fn r17_hash() {
             t.add(&case, r);
         }
     }
+    // Z14: the row hash with a commit's coefficient bit reversal (threadgroup-memory tile pairs)
+    // folded in (`pv_rows_side_k_z9`): digests and reversed coefficients, as u32 words.
+    {
+        let hal = MetalHalPoseidon2::new();
+        let cols = 200;
+        let (lg, count) = (po2 - 2, 23);
+        let matrix = elems(&mut rng, rows * cols);
+        let coeffs_in = elems(&mut rng, count << lg);
+        assert!(hal.fuses_bit_reverse_into_hash(rows, cols, lg));
+        let words = |d: &[crate::core::digest::Digest], c: &[BabyBearElem]| -> Vec<u32> {
+            let mut w: Vec<u32> = d.iter().flat_map(|d| d.as_words().to_vec()).collect();
+            w.extend(c.iter().map(|x| x.as_u32()));
+            w
+        };
+        let want = {
+            let (want_rows, _) = (&hal as &dyn HashCase).cpu_ref(&matrix, rows);
+            let cpu = CpuHal::<BabyBear>::new(hal.get_hash_suite().clone());
+            let c = cpu.copy_from_elem("c", &coeffs_in);
+            cpu.batch_bit_reverse(&c, count);
+            words(&want_rows, &c.to_vec())
+        };
+        let m = hal.copy_from_elem("m", &matrix);
+        let case = format!("hash_rows_bit_reverse/poseidon2 {cols}x2^{po2}, {count}x2^{lg}");
+        let r = stress(&case, &want, reps, || {
+            let out = hal.alloc_digest("rows", rows);
+            let c = hal.copy_from_elem("c", &coeffs_in);
+            hal.hash_rows_bit_reverse(&out, &m, &c, count);
+            words(&out.to_vec(), &c.to_vec())
+        });
+        t.add(&case, r);
+    }
     t.check();
 }
 
