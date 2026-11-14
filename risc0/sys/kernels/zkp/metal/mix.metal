@@ -224,3 +224,109 @@ mix_poly_coeffs_v2_t<false>(device FpExt*,
                             uint3,
                             uint3,
                             uint3);
+
+// ---- Z15 fused, write-once mix (LEADS #22 segtail-mix-wide) ----
+// One dispatch mixes every input of every group (accum, code, data, check: up to 4 coefficient
+// buffers) into the combos buffer, which it writes exactly once: no zero fill, no
+// read-modify-write. The host sorts the inputs by combo id; entry e of combo c (entries
+// [comboBegin[c], comboBegin[c+1])) names its source (buffer << 28 | poly) and its mix-power
+// index. Each thread owns 4 consecutive rows (one 16-byte load per input), accumulates
+// sum_e mixPow[e] * in_e[row] per row with one REDC per two products (as v2), and stores the 4
+// FpExt of each combo. Exact field arithmetic with canonical outputs: bit-identical to zeroed
+// combos + mix_poly_coeffs per group (the sum order does not matter).
+//
+// Bindings: 0 out (FpExt[count * nCombos], as uint4), 1-4 in0..in3 (Fp[count * polys], as uint4;
+// unused slots bind any buffer), 5 pows (uint4 raw FpExt per power), 6 entries (uint2: src,
+// pow), 7 comboBegin (u32[nCombos + 1]), 8 MixFusedParams. Grid: dispatch_threads(count / 4).
+// R17: no calls (every helper is always_inline) and the accumulators are scalars indexed only
+// by fully unrolled constant loops.
+
+struct MixFusedParams {
+  uint32_t count;   // rows per polynomial (a multiple of 4)
+  uint32_t nCombos; // combo slots in out
+  uint32_t _pad[2];
+};
+
+static inline __attribute__((always_inline)) uint32_t mf_addmod(uint32_t a, uint32_t b) {
+  uint32_t r = a + b;
+  return r >= Fp::P ? r - Fp::P : r;
+}
+
+static inline __attribute__((always_inline)) uint32_t
+mf_redc_pair(uint32_t a0, uint32_t b0, uint32_t a1, uint32_t b1) {
+  uint64_t o64 = (uint64_t)a0 * b0 + (uint64_t)a1 * b1;
+  uint32_t low = -uint32_t(o64);
+  uint32_t red = Fp::M * low;
+  o64 += uint64_t(red) * uint64_t(Fp::P);
+  uint32_t ret = o64 >> 32;
+  return ret >= Fp::P ? ret - Fp::P : ret;
+}
+
+#define MF_ACC_STEP(W, V0, V1, M0, M1)                                                         \
+  a##W##0 = mf_addmod(a##W##0, mf_redc_pair(V0, M0.x, V1, M1.x));                              \
+  a##W##1 = mf_addmod(a##W##1, mf_redc_pair(V0, M0.y, V1, M1.y));                              \
+  a##W##2 = mf_addmod(a##W##2, mf_redc_pair(V0, M0.z, V1, M1.z));                              \
+  a##W##3 = mf_addmod(a##W##3, mf_redc_pair(V0, M0.w, V1, M1.w));
+
+static inline __attribute__((always_inline)) const device uint4*
+mf_src(uint32_t src,
+       uint32_t count4,
+       const device uint4* in0,
+       const device uint4* in1,
+       const device uint4* in2,
+       const device uint4* in3) {
+  uint32_t b = src >> 28;
+  const device uint4* base = b == 0 ? in0 : b == 1 ? in1 : b == 2 ? in2 : in3;
+  return base + (size_t)(src & 0x0fffffffu) * count4;
+}
+
+kernel void mix_poly_coeffs_fused(device uint4* out [[buffer(0)]],
+                                  const device uint4* in0 [[buffer(1)]],
+                                  const device uint4* in1 [[buffer(2)]],
+                                  const device uint4* in2 [[buffer(3)]],
+                                  const device uint4* in3 [[buffer(4)]],
+                                  constant uint4* pows [[buffer(5)]],
+                                  constant uint2* entries [[buffer(6)]],
+                                  constant uint32_t* comboBegin [[buffer(7)]],
+                                  constant MixFusedParams& p [[buffer(8)]],
+                                  uint gid [[thread_position_in_grid]]) {
+  const uint32_t count4 = p.count / 4;
+  if (gid >= count4) {
+    return;
+  }
+  for (uint32_t c = 0; c < p.nCombos; c++) {
+    uint32_t a00 = 0, a01 = 0, a02 = 0, a03 = 0;
+    uint32_t a10 = 0, a11 = 0, a12 = 0, a13 = 0;
+    uint32_t a20 = 0, a21 = 0, a22 = 0, a23 = 0;
+    uint32_t a30 = 0, a31 = 0, a32 = 0, a33 = 0;
+    uint32_t e = comboBegin[c];
+    const uint32_t end = comboBegin[c + 1];
+    for (; e + 1 < end; e += 2) {
+      uint2 e0 = entries[e];
+      uint2 e1 = entries[e + 1];
+      uint4 v0 = mf_src(e0.x, count4, in0, in1, in2, in3)[gid];
+      uint4 v1 = mf_src(e1.x, count4, in0, in1, in2, in3)[gid];
+      uint4 m0 = pows[e0.y];
+      uint4 m1 = pows[e1.y];
+      MF_ACC_STEP(0, v0.x, v1.x, m0, m1)
+      MF_ACC_STEP(1, v0.y, v1.y, m0, m1)
+      MF_ACC_STEP(2, v0.z, v1.z, m0, m1)
+      MF_ACC_STEP(3, v0.w, v1.w, m0, m1)
+    }
+    if (e < end) {
+      uint2 e0 = entries[e];
+      uint4 v0 = mf_src(e0.x, count4, in0, in1, in2, in3)[gid];
+      uint4 m0 = pows[e0.y];
+      uint4 z = uint4(0);
+      MF_ACC_STEP(0, v0.x, 0u, m0, z)
+      MF_ACC_STEP(1, v0.y, 0u, m0, z)
+      MF_ACC_STEP(2, v0.z, 0u, m0, z)
+      MF_ACC_STEP(3, v0.w, 0u, m0, z)
+    }
+    device uint4* o = out + (size_t)c * p.count + (size_t)gid * 4;
+    o[0] = uint4(a00, a01, a02, a03);
+    o[1] = uint4(a10, a11, a12, a13);
+    o[2] = uint4(a20, a21, a22, a23);
+    o[3] = uint4(a30, a31, a32, a33);
+  }
+}

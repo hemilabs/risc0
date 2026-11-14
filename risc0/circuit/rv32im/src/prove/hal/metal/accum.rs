@@ -458,6 +458,8 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
         );
         // End of the phase (PLAN 2.6): close the batch; errors are attributed to accum.
         scope!("accum_finalize_wait", hal.try_sync())?;
+        // Z15: every batch that bound the perm has completed.
+        self.ctx.scratch().perm_busy = false;
         test_mark("waited");
         if let Some(fault) = pending_fault {
             check_fault(fault.to_vec()[0])?;
@@ -489,12 +491,19 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
         let win = win.filter(|_| n > 1);
         let perm: Option<BufferImpl<u32>> = match win {
             Some(win) => {
-                hal.try_sync()?;
                 let buf = {
                     let mut s = self.ctx.scratch();
+                    // Z15: wait only if a previous call's batches may still read the perm (the
+                    // phase-end wait clears `perm_busy`); the host build then overlaps the GPU
+                    // work queued before this phase.
+                    if s.perm_busy || !super::sync_trim() {
+                        hal.try_sync()?;
+                    }
+                    s.perm_busy = true;
                     grow(hal, &mut s.perm, "accum_perm", n)
                 };
-                // SAFETY: synced; nothing that uses `buf` is encoded until this returns.
+                // SAFETY: no batch that used the perm is outstanding (above); nothing that uses
+                // `buf` is encoded until this returns.
                 let host = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr(), n) };
                 test_mark("perm_synced");
                 scope!("accum_perm", build_perm(&preflight.cycles, win, host));

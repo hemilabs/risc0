@@ -418,6 +418,37 @@ impl<H: Hal> DeferredFinalize<H> {
         // Sometimes it's a requirement for matching generated code, but even when
         // it's not we keep the order for consistency.
 
+        // The check group's evaluation at z^EXT_SIZE does not depend on the interpolation below:
+        // queue it first (async on GPU HALs), so it runs while the host interpolates (ROCm builds;
+        // RISC0_EVAL_U_EARLY=0 keeps the old order).
+        let z_pow = z.pow(ext_size);
+        let check_eval = |hal: &H| {
+            let which = Vec::from_iter(0u32..H::CHECK_SIZE as u32);
+            let xs = vec![z_pow; H::CHECK_SIZE];
+            let out = hal.alloc_extelem("out", H::CHECK_SIZE);
+            let which = hal.copy_from_u32("which", which.as_slice());
+            let xs = hal.copy_from_extelem("xs", xs.as_slice());
+            hal.batch_evaluate_any(
+                check_group.coeffs.as_ref().expect("coeffs must be restored"),
+                H::CHECK_SIZE,
+                &which,
+                &xs,
+                &out,
+            );
+            out
+        };
+        static EVAL_U_EARLY: LazyLock<bool> = LazyLock::new(|| {
+            cfg!(feature = "rocm")
+                && !matches!(std::env::var("RISC0_EVAL_U_EARLY").as_deref(), Ok(v) if v.starts_with('0'))
+        });
+        // Z15 (LEADS #23): on Metal, queue the check group's evaluation before the host reads
+        // eval_u, so both come back with one wait instead of two (`RISC0_METAL_SYNC_TRIM=0`: the
+        // old order). Same values.
+        static EVAL_U_ONE_SYNC: LazyLock<bool> = LazyLock::new(|| {
+            cfg!(feature = "metal")
+                && !matches!(std::env::var("RISC0_METAL_SYNC_TRIM").as_deref(), Ok(v) if v.trim() == "0")
+        });
+        let mut early_check = None;
         let _eu_verbose = std::env::var_os("RISC0_VERBOSE").is_some();
         let _eu_t0 = std::time::Instant::now();
         let mut eval_u: Vec<H::ExtElem> = Vec::new();
@@ -459,6 +490,10 @@ impl<H: Hal> DeferredFinalize<H> {
                 offset += group_size;
             }
 
+            if *EVAL_U_ONE_SYNC {
+                early_check = Some(check_eval(hal));
+            }
+
             // Single D2H transfer instead of one per group.
             combined_out.view(|view| {
                 eval_u.extend_from_slice(view);
@@ -466,30 +501,7 @@ impl<H: Hal> DeferredFinalize<H> {
         });
         let _eu_t_be = _eu_t0.elapsed();
 
-        // The check group's evaluation at z^EXT_SIZE does not depend on the interpolation below:
-        // queue it first (async on GPU HALs), so it runs while the host interpolates (ROCm builds;
-        // RISC0_EVAL_U_EARLY=0 keeps the old order).
-        let z_pow = z.pow(ext_size);
-        let check_eval = |hal: &H| {
-            let which = Vec::from_iter(0u32..H::CHECK_SIZE as u32);
-            let xs = vec![z_pow; H::CHECK_SIZE];
-            let out = hal.alloc_extelem("out", H::CHECK_SIZE);
-            let which = hal.copy_from_u32("which", which.as_slice());
-            let xs = hal.copy_from_extelem("xs", xs.as_slice());
-            hal.batch_evaluate_any(
-                check_group.coeffs.as_ref().expect("coeffs must be restored"),
-                H::CHECK_SIZE,
-                &which,
-                &xs,
-                &out,
-            );
-            out
-        };
-        static EVAL_U_EARLY: LazyLock<bool> = LazyLock::new(|| {
-            cfg!(feature = "rocm")
-                && !matches!(std::env::var("RISC0_EVAL_U_EARLY").as_deref(), Ok(v) if v.starts_with('0'))
-        });
-        let early_check = EVAL_U_EARLY.then(|| check_eval(hal));
+        let early_check = early_check.or_else(|| EVAL_U_EARLY.then(|| check_eval(hal)));
         // The FRI mixing buffer's zero fill does not depend on the mix either: queue it now too.
         let combo_count = self.taps.combos_size();
         let early_combos = EVAL_U_EARLY.then(|| {
@@ -564,64 +576,113 @@ impl<H: Hal> DeferredFinalize<H> {
         let mix = self.iop.random_ext_elem();
         tracing::debug!("Mix = {mix:?}");
 
-        // Do the coefficient mixing
-        // Begin by making a zeroed output buffer
-        let combos = scope!(
-            "alloc(combos)",
-            match early_combos {
-                Some(combos) => combos,
-                None => hal.alloc_extelem_zeroed("combos", self.cycles * (combo_count + 1)),
-            }
-        );
-        scope!("mix_poly_coeffs", {
-            let mut cur_mix = H::ExtElem::ONE;
-
-            // Pre-compute all which arrays (combo_ids) for groups + check, upload once.
-            let total_group_regs: usize = self
-                .groups
-                .iter()
-                .enumerate()
-                .map(|(id, _)| self.taps.group_size(id))
-                .sum();
-            let mut all_mix_which = Vec::with_capacity(total_group_regs + H::CHECK_SIZE);
-            for (id, _) in self.groups.iter().enumerate() {
-                for reg in self.taps.group_regs(id) {
-                    all_mix_which.push(reg.combo_id() as u32);
+        // Do the coefficient mixing. Z15: a HAL with a fused mix writes every combo once
+        // (no zero fill, no per-group read-modify-write); the result is the same.
+        let combos = if hal.has_mix_poly_coeffs_fused() && early_combos.is_none() {
+            let combos = hal.alloc_extelem("combos", self.cycles * (combo_count + 1));
+            scope!("mix_poly_coeffs", {
+                let mut ids: Vec<Vec<u32>> = self
+                    .groups
+                    .iter()
+                    .enumerate()
+                    .map(|(id, _)| {
+                        self.taps
+                            .group_regs(id)
+                            .map(|reg| reg.combo_id() as u32)
+                            .collect()
+                    })
+                    .collect();
+                ids.push(vec![combo_count as u32; H::CHECK_SIZE]);
+                #[allow(clippy::type_complexity)]
+                let mut inputs: Vec<(&H::Buffer<H::Elem>, &[u32])> = self
+                    .groups
+                    .iter()
+                    .zip(ids.iter())
+                    .map(|(pg, ids)| {
+                        (
+                            pg.as_ref()
+                                .unwrap()
+                                .coeffs
+                                .as_ref()
+                                .expect("coeffs must be restored"),
+                            ids.as_slice(),
+                        )
+                    })
+                    .collect();
+                inputs.push((
+                    check_group
+                        .coeffs
+                        .as_ref()
+                        .expect("coeffs must be restored"),
+                    ids.last().unwrap().as_slice(),
+                ));
+                hal.mix_poly_coeffs_fused(&combos, &mix, &inputs, self.cycles);
+            });
+            combos
+        } else {
+            // Do the coefficient mixing
+            // Begin by making a zeroed output buffer
+            let combos = scope!(
+                "alloc(combos)",
+                match early_combos {
+                    Some(combos) => combos,
+                    None => hal.alloc_extelem_zeroed("combos", self.cycles * (combo_count + 1)),
                 }
-            }
-            let check_which_offset = all_mix_which.len();
-            for _ in 0..H::CHECK_SIZE {
-                all_mix_which.push(combo_count as u32);
-            }
-            let mix_which_buf = hal.copy_from_u32("which", &all_mix_which);
+            );
+            scope!("mix_poly_coeffs", {
+                let mut cur_mix = H::ExtElem::ONE;
 
-            let mut which_offset = 0;
-            for (id, pg) in self.groups.iter().enumerate() {
-                let pg = pg.as_ref().unwrap();
-                let group_size = self.taps.group_size(id);
+                // Pre-compute all which arrays (combo_ids) for groups + check, upload once.
+                let total_group_regs: usize = self
+                    .groups
+                    .iter()
+                    .enumerate()
+                    .map(|(id, _)| self.taps.group_size(id))
+                    .sum();
+                let mut all_mix_which = Vec::with_capacity(total_group_regs + H::CHECK_SIZE);
+                for (id, _) in self.groups.iter().enumerate() {
+                    for reg in self.taps.group_regs(id) {
+                        all_mix_which.push(reg.combo_id() as u32);
+                    }
+                }
+                let check_which_offset = all_mix_which.len();
+                for _ in 0..H::CHECK_SIZE {
+                    all_mix_which.push(combo_count as u32);
+                }
+                let mix_which_buf = hal.copy_from_u32("which", &all_mix_which);
+
+                let mut which_offset = 0;
+                for (id, pg) in self.groups.iter().enumerate() {
+                    let pg = pg.as_ref().unwrap();
+                    let group_size = self.taps.group_size(id);
+                    hal.mix_poly_coeffs(
+                        &combos,
+                        &cur_mix,
+                        &mix,
+                        pg.coeffs.as_ref().expect("coeffs must be restored"),
+                        &mix_which_buf.slice(which_offset, group_size),
+                        group_size,
+                        self.cycles,
+                    );
+                    cur_mix *= mix.pow(group_size);
+                    which_offset += group_size;
+                }
+
                 hal.mix_poly_coeffs(
                     &combos,
                     &cur_mix,
                     &mix,
-                    pg.coeffs.as_ref().expect("coeffs must be restored"),
-                    &mix_which_buf.slice(which_offset, group_size),
-                    group_size,
+                    check_group
+                        .coeffs
+                        .as_ref()
+                        .expect("coeffs must be restored"),
+                    &mix_which_buf.slice(check_which_offset, H::CHECK_SIZE),
+                    H::CHECK_SIZE,
                     self.cycles,
                 );
-                cur_mix *= mix.pow(group_size);
-                which_offset += group_size;
-            }
-
-            hal.mix_poly_coeffs(
-                &combos,
-                &cur_mix,
-                &mix,
-                check_group.coeffs.as_ref().expect("coeffs must be restored"),
-                &mix_which_buf.slice(check_which_offset, H::CHECK_SIZE),
-                H::CHECK_SIZE,
-                self.cycles,
-            );
-        });
+            });
+            combos
+        };
 
         scope!("load_combos", {
             let reg_sizes: Vec<_> = self.taps.regs().map(|x| x.size() as u32).collect();

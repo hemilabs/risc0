@@ -247,6 +247,147 @@ kernel void eu2_main(device FpExt* partial [[buffer(0)]],
   }
 }
 
+// Z15: (lo + hi * 2^32) * 2^-32 mod p, canonical, for lo, hi < 2^35.
+static inline __attribute__((always_inline)) uint32_t eu_reduce_lohi(uint64_t lo, uint64_t hi) {
+  // REDC(lo): lo < 2^35 < p * 2^32, so the result is < 2p (as in Fp::mul).
+  uint32_t low = -uint32_t(lo);
+  uint32_t red = Fp::M * low;
+  uint64_t o64 = lo + uint64_t(red) * uint64_t(Fp::P);  // < 2^35 + 2^63
+  uint32_t r0 = o64 >> 32;
+  r0 = r0 >= Fp::P ? r0 - Fp::P : r0;
+  // hi mod p = (h0 + h1 * 2^32) mod p with h0 = hi mod 2^32 (< 3p) and h1 = hi >> 32 (< 8):
+  // 2^32 mod p = 268435454, so h1 * 268435454 < p.
+  uint32_t h0 = uint32_t(hi);
+  h0 = h0 >= Fp::P ? h0 - Fp::P : h0;
+  h0 = h0 >= Fp::P ? h0 - Fp::P : h0;
+  uint32_t h1 = uint32_t(hi >> 32) * 268435454u;
+  return eu_addmod(eu_addmod(r0, h0), h1);
+}
+
+// Z15: eu2_main with one reduction per point per step. The 16 inner products and the 4 products
+// of each component of acc * step are summed exactly (groups of four products of values < p fit
+// in 64 bits; their 32-bit halves are summed in lo / hi) and reduced once:
+// acc' = (sum of products) * 2^-32 mod p, the canonical value eu2_main's per-pair REDCs and
+// FpExt * FpExt (x^4 = -11, so the wrapped terms use NBETA * step, precomputed) give.
+// Same bindings and grid as eu2_main.
+[[max_total_threads_per_threadgroup(EU_THREADS)]]
+kernel void eu2_main_lz(device FpExt* partial [[buffer(0)]],
+                        const device Fp* coeffs [[buffer(1)]],
+                        const device uint32_t* which [[buffer(2)]],
+                        const device FpExt* xs [[buffer(3)]],
+                        const device FpExt* pw [[buffer(4)]],
+                        const device FpExt* ps [[buffer(5)]],
+                        constant Eu2Params& p [[buffer(6)]],
+                        uint3 blockIdx [[threadgroup_position_in_grid]],
+                        uint3 threadIdx [[thread_position_in_threadgroup]],
+                        uint3 gridDim [[threadgroups_per_grid]]) {
+  const uint32_t s = blockIdx.x;
+  const uint32_t e = blockIdx.y;
+  const uint32_t S = gridDim.x;
+  const uint32_t t = threadIdx.x;
+  const uint32_t deg = p.deg;
+  const uint32_t chunk = p.chunk;
+  const device Fp* poly = coeffs + (size_t)which[e] * deg + (size_t)s * chunk;
+  FpExt x = xs[e];
+  FpExt xp[EU_J];
+  xp[0] = FpExt(1);
+  for (int j = 1; j < EU_J; j++) {
+    xp[j] = xp[j - 1] * x;
+  }
+  // step = x^(J*THREADS)
+  FpExt step = FpExt(pw[(size_t)e * EU_THREADS + (EU_THREADS - 1)]) * (xp[EU_J - 1] * x);
+  const uint32_t s0 = step.elems[0].asRaw();
+  const uint32_t s1 = step.elems[1].asRaw();
+  const uint32_t s2 = step.elems[2].asRaw();
+  const uint32_t s3 = step.elems[3].asRaw();
+  const uint32_t n1 = (Fp(Fp::P - 11) * step.elems[1]).asRaw();
+  const uint32_t n2 = (Fp(Fp::P - 11) * step.elems[2]).asRaw();
+  const uint32_t n3 = (Fp(Fp::P - 11) * step.elems[3]).asRaw();
+  const uint32_t iters = chunk / (EU_J * EU_THREADS);
+  const device uint4* p4 = reinterpret_cast<const device uint4*>(poly);
+  uint32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+  for (int k = (int)iters - 1; k >= 0; k--) {
+    size_t base = ((size_t)k * EU_THREADS + t) * (EU_J / 4);
+    uint32_t c[EU_J];
+    for (int q = 0; q < EU_J / 4; q++) {
+      uint4 v = p4[base + q];
+      c[4 * q + 0] = v.x;
+      c[4 * q + 1] = v.y;
+      c[4 * q + 2] = v.z;
+      c[4 * q + 3] = v.w;
+    }
+    // acc * step, one group of four products per component.
+    uint64_t q0 = (uint64_t)a0 * s0 + (uint64_t)a1 * n3 + (uint64_t)a2 * n2 + (uint64_t)a3 * n1;
+    uint64_t q1 = (uint64_t)a0 * s1 + (uint64_t)a1 * s0 + (uint64_t)a2 * n3 + (uint64_t)a3 * n2;
+    uint64_t q2 = (uint64_t)a0 * s2 + (uint64_t)a1 * s1 + (uint64_t)a2 * s0 + (uint64_t)a3 * n3;
+    uint64_t q3 = (uint64_t)a0 * s3 + (uint64_t)a1 * s2 + (uint64_t)a2 * s1 + (uint64_t)a3 * s0;
+    uint64_t lo0 = (uint32_t)q0, hi0 = q0 >> 32;
+    uint64_t lo1 = (uint32_t)q1, hi1 = q1 >> 32;
+    uint64_t lo2 = (uint32_t)q2, hi2 = q2 >> 32;
+    uint64_t lo3 = (uint32_t)q3, hi3 = q3 >> 32;
+    // + inner = sum_j c[j] * x^j, four groups of four products per component.
+    for (int j = 0; j < EU_J; j += 4) {
+      uint64_t r0 = (uint64_t)c[j] * xp[j].elems[0].asRaw() +
+                    (uint64_t)c[j + 1] * xp[j + 1].elems[0].asRaw() +
+                    (uint64_t)c[j + 2] * xp[j + 2].elems[0].asRaw() +
+                    (uint64_t)c[j + 3] * xp[j + 3].elems[0].asRaw();
+      uint64_t r1 = (uint64_t)c[j] * xp[j].elems[1].asRaw() +
+                    (uint64_t)c[j + 1] * xp[j + 1].elems[1].asRaw() +
+                    (uint64_t)c[j + 2] * xp[j + 2].elems[1].asRaw() +
+                    (uint64_t)c[j + 3] * xp[j + 3].elems[1].asRaw();
+      uint64_t r2 = (uint64_t)c[j] * xp[j].elems[2].asRaw() +
+                    (uint64_t)c[j + 1] * xp[j + 1].elems[2].asRaw() +
+                    (uint64_t)c[j + 2] * xp[j + 2].elems[2].asRaw() +
+                    (uint64_t)c[j + 3] * xp[j + 3].elems[2].asRaw();
+      uint64_t r3 = (uint64_t)c[j] * xp[j].elems[3].asRaw() +
+                    (uint64_t)c[j + 1] * xp[j + 1].elems[3].asRaw() +
+                    (uint64_t)c[j + 2] * xp[j + 2].elems[3].asRaw() +
+                    (uint64_t)c[j + 3] * xp[j + 3].elems[3].asRaw();
+      lo0 += (uint32_t)r0;
+      hi0 += r0 >> 32;
+      lo1 += (uint32_t)r1;
+      hi1 += r1 >> 32;
+      lo2 += (uint32_t)r2;
+      hi2 += r2 >> 32;
+      lo3 += (uint32_t)r3;
+      hi3 += r3 >> 32;
+    }
+    // lo, hi < 5 * 2^32 here.
+    a0 = eu_reduce_lohi(lo0, hi0);
+    a1 = eu_reduce_lohi(lo1, hi1);
+    a2 = eu_reduce_lohi(lo2, hi2);
+    a3 = eu_reduce_lohi(lo3, hi3);
+  }
+  FpExt acc(Fp::fromRaw(a0), Fp::fromRaw(a1), Fp::fromRaw(a2), Fp::fromRaw(a3));
+  acc = acc * FpExt(pw[(size_t)e * EU_THREADS + t]);
+  // block reduce: 32-lane groups, then across the 8 SIMD groups.
+  for (ushort d = 16; d > 0; d >>= 1) {
+    acc += fpext_shfl_down(acc, d);
+  }
+  threadgroup uint32_t red_raw[EU_THREADS / 32 * 4];
+  if ((t & 31) == 0) {
+    for (int i = 0; i < 4; i++) {
+      red_raw[(t >> 5) * 4 + i] = acc.elems[i].asRaw();
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (t < 32) {
+    FpExt v;
+    if (t < EU_THREADS / 32) {
+      v = FpExt(Fp::fromRaw(red_raw[t * 4 + 0]),
+                Fp::fromRaw(red_raw[t * 4 + 1]),
+                Fp::fromRaw(red_raw[t * 4 + 2]),
+                Fp::fromRaw(red_raw[t * 4 + 3]));
+    }
+    for (ushort d = 16; d > 0; d >>= 1) {
+      v += fpext_shfl_down(v, d);
+    }
+    if (t == 0) {
+      partial[(size_t)e * S + s] = v * FpExt(ps[(size_t)e * S + s]);
+    }
+  }
+}
+
 // grid = nEvals, block = 32
 [[max_total_threads_per_threadgroup(32)]]
 kernel void eu2_reduce(device FpExt* out [[buffer(0)]],

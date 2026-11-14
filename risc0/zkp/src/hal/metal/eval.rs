@@ -114,6 +114,18 @@ pub(crate) fn eval_plan(deg: u32, n_evals: u32, coeffs_addr: u64) -> EvalPath {
     EvalPath::Eu2 { s, chunk: deg / s }
 }
 
+/// Z15: `eu2_main_lz` (one reduction per 16 products) unless `RISC0_METAL_EU_LAZY=0` (the CUDA
+/// pairwise-REDC `eu2_main`). Both give the same canonical values. Read per call.
+pub(crate) const EU_LAZY_ENV: &str = "RISC0_METAL_EU_LAZY";
+
+pub(crate) fn eu2_main_kernel() -> &'static str {
+    if matches!(std::env::var(EU_LAZY_ENV).as_deref(), Ok(v) if v.trim() == "0") {
+        "eu2_main"
+    } else {
+        "eu2_main_lz"
+    }
+}
+
 /// `Hal::batch_evaluate_any` body; `force` overrides [eval_plan] (tests, benchmarks).
 pub(crate) fn batch_evaluate_any<MH: MetalHash>(
     hal: &MetalHal<MH>,
@@ -177,7 +189,8 @@ pub(crate) fn batch_evaluate_any<MH: MetalHash>(
             }];
             let p = || KernelArg::Bytes(as_bytes(&params));
             let threads = MTLSize::new(EU_THREADS as u64, 1, 1);
-            for name in ["eu2_main", "eu2_reduce"] {
+            let main = eu2_main_kernel();
+            for name in [main, "eu2_reduce"] {
                 super::kernels::assert_simd_width(hal.pipeline(name), name);
             }
             hal.dispatch(
@@ -190,7 +203,7 @@ pub(crate) fn batch_evaluate_any<MH: MetalHash>(
                 &[],
             );
             hal.dispatch(
-                hal.pipeline("eu2_main"),
+                hal.pipeline(main),
                 &[
                     part.as_arg(),
                     coeffs.as_arg(),

@@ -34,6 +34,7 @@ mod buffer;
 mod eval;
 mod kernels;
 mod mdiv;
+mod mix;
 mod ntt;
 mod poseidon2;
 mod poseidon254;
@@ -60,6 +61,8 @@ mod tests_z8b;
 mod tests_r17;
 #[cfg(test)]
 mod tests_z9;
+#[cfg(test)]
+mod tests_z15;
 #[cfg(test)]
 mod tests_z10;
 #[cfg(test)]
@@ -98,7 +101,10 @@ pub use self::{
         MAX_SET_BYTES, MAX_WORKING_SET_ENV,
     },
 };
-pub use self::runtime::{profile_report, profile_take, ProfileEntry, PROFILE_ENV};
+pub use self::runtime::{
+    profile_report, profile_take, sync_trace_take, ProfileEntry, SyncRecord, PROFILE_ENV,
+    SYNC_TRACE_ENV,
+};
 use super::{Buffer as _, Hal};
 use crate::{
     core::{
@@ -128,6 +134,7 @@ pub const KERNEL_NAMES: &[&str] = &[
     "mix_poly_coeffs_v1",
     "mix_poly_coeffs_v2",
     "mix_poly_coeffs_v2_dcids",
+    "mix_poly_coeffs_fused",
     // sha.metal
     "sha_fold",
     "sha_rows",
@@ -167,6 +174,7 @@ pub const KERNEL_NAMES: &[&str] = &[
     "batch_evaluate_any",
     "eu2_pows",
     "eu2_main",
+    "eu2_main_lz",
     "eu2_reduce",
     // mdiv.metal (Z5)
     "mdiv_agg0_e8",
@@ -849,6 +857,21 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
         eval::mix_poly_coeffs(
             self, output, mix_start, mix, input, combos, input_size, count, None,
         );
+    }
+
+    fn has_mix_poly_coeffs_fused(&self) -> bool {
+        mix::mix_fused_enabled()
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn mix_poly_coeffs_fused(
+        &self,
+        out: &Self::Buffer<Self::ExtElem>,
+        mix: &Self::ExtElem,
+        inputs: &[(&Self::Buffer<Self::Elem>, &[u32])],
+        count: usize,
+    ) {
+        mix::mix_poly_coeffs_fused(self, out, mix, inputs, count, !mix::mix_fused_enabled());
     }
 
     fn hash_fold(&self, io: &Self::Buffer<Digest>, input_size: usize, output_size: usize) {
