@@ -199,11 +199,11 @@ fn load_average() -> String {
 #[test]
 #[ignore = "measurement: run alone with --ignored --nocapture --test-threads 1"]
 fn pipeline_bench() {
+    let _lock = super::tests::begin_heavy_test("pipeline_bench", super::tests::GpuRunClass::Heavy);
     assert!(
         super::tests::harness_is_single_threaded(),
         "pipeline_bench sets environment variables: run it with --test-threads 1"
     );
-    let _lock = super::tests::metal_test_lock();
     let segs = Arc::new(load_segments());
     let variants =
         parse_variants(&std::env::var("R14_VARIANTS").unwrap_or_else(|_| "A:;B:".into()));

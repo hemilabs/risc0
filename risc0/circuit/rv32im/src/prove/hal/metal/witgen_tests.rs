@@ -511,6 +511,8 @@ fn shift_loop(iters: u32) -> Program {
 /// `witgen_tu_gen.py --map-lowering loop` build). `RISC0_METAL_WITGEN_AMP_REPS` calls (default 4).
 #[test]
 fn witgen_sorted_amplifier() {
+    // W7-R1: ~4 GB of footprint (a po2 20 witgen on the GPU and the CPU): one large test at a time.
+    let _lock = crate::prove::hal::metal::tests::large_test_lock();
     let h = Harness::new();
     let pfs = preflights(shift_loop(1 << 17), 20);
     let pf = &pfs[0];
@@ -1205,6 +1207,10 @@ fn timed_witgen(
 #[test]
 #[ignore]
 fn r15w_witgen_ab() {
+    let _lock = crate::prove::hal::metal::tests::begin_heavy_test(
+        "r15w_witgen_ab",
+        crate::prove::hal::metal::tests::GpuRunClass::Heavy,
+    );
     let pairs: usize = env_or("R15W_PAIRS", 7);
     let variants: Vec<(String, WitgenTune)> = std::env::var("R15W_VARIANTS")
         .unwrap_or_else(|_| "r13;base;r13".into())
