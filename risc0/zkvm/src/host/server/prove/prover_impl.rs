@@ -24,12 +24,26 @@ use super::{
 };
 use risc0_circuit_rv32im::prove::SegmentProver;
 
+#[cfg(all(feature = "metal", not(any(feature = "cuda", feature = "rocm"))))]
+pub(crate) mod exec_stream;
+
 thread_local! {
     // ManuallyDrop prevents TLS cleanup from dropping CUDA buffers after the CUDA
     // context is already destroyed (which causes a panic/abort on process exit).
     // GPU memory is reclaimed by CUDA context teardown regardless.
+    #[cfg(not(all(feature = "metal", not(any(feature = "cuda", feature = "rocm", feature = "intel")))))]
     static CACHED_SEGMENT_PROVER: std::mem::ManuallyDrop<RefCell<Option<Box<dyn SegmentProver>>>> =
         std::mem::ManuallyDrop::new(RefCell::new(None));
+    // On Metal the prover is dropped when its thread exits (item Z17, docs/metal-port/notes/
+    // Z17.md "Test memory"). Its MetalHal pool (up to half of recommendedMaxWorkingSetSize, ~9.4
+    // GiB at po2 20) is ordinary unified memory with no context to outlive, and the recursion
+    // provers' cache already drops this way. With ManuallyDrop every thread that proved and
+    // exited without `release_hal_buffers` leaked its pool until process exit: libtest runs each
+    // test on a fresh thread, so the host::server::prove:: suite grew to ~37 GB in one process
+    // (more than a 36 GB Mac's RAM) at any --test-threads.
+    #[cfg(all(feature = "metal", not(any(feature = "cuda", feature = "rocm", feature = "intel"))))]
+    static CACHED_SEGMENT_PROVER: RefCell<Option<Box<dyn SegmentProver>>> =
+        const { RefCell::new(None) };
 }
 
 /// Completes, and discards, whatever segment the cached prover still has pending when dropped.
@@ -265,6 +279,24 @@ fn start_metal_warmup() {
             tracing::warn!("metal warmup thread not started: {e}");
         }
     });
+}
+
+/// The multi-GPU recursion worker (ROCm): the succinct receipt and, for Groth16, its
+/// identity_p254 receipt.
+type RecursionWorker = std::thread::JoinHandle<
+    Result<(
+        SuccinctReceipt<ReceiptClaim>,
+        Option<SuccinctReceipt<ReceiptClaim>>,
+    )>,
+>;
+
+/// What the segment loop hands [ProverImpl::prove_session_tail] besides the segment receipts.
+#[derive(Default)]
+struct SessionTail {
+    recursion_tx: Option<mpsc::Sender<SegmentReceipt>>,
+    recursion_worker: Option<RecursionWorker>,
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    rec_pipe: Option<rec_pipe::RecPipe>,
 }
 
 /// An implementation of a Prover that runs locally.
@@ -847,7 +879,7 @@ impl ProverImpl {
         #[cfg(not(feature = "rocm"))]
         let multi_gpu_active = false;
 
-        let (mut recursion_tx, recursion_worker) = if multi_gpu_active {
+        let (recursion_tx, recursion_worker) = if multi_gpu_active {
             let (tx, rx) = mpsc::channel::<SegmentReceipt>();
             let max_po2 = self.opts.max_segment_po2;
             let want_groth16 = self.opts.receipt_kind == ReceiptKind::Groth16;
@@ -1274,6 +1306,40 @@ impl ProverImpl {
             }
         } // !early_seal
 
+        self.prove_session_tail(
+            ctx,
+            session,
+            segments,
+            skip_verify,
+            SessionTail {
+                recursion_tx,
+                recursion_worker,
+                #[cfg(any(feature = "cuda", feature = "rocm"))]
+                rec_pipe,
+            },
+        )
+    }
+
+    /// Everything after the segment proofs: the journal and assumptions merged into the last
+    /// segment's claim, the keccak proofs, the composite receipt and, per the receipt kind, the
+    /// recursion and the Groth16 wrap. Shared by the segment loop above and the executor stream
+    /// (item Z17, `exec_stream`), which proves the segments while the guest executes. Called with
+    /// the session's GPU lock held.
+    fn prove_session_tail(
+        &self,
+        ctx: &VerifierContext,
+        session: &Session,
+        mut segments: Vec<SegmentReceipt>,
+        skip_verify: bool,
+        tail: SessionTail,
+    ) -> Result<ProveInfo> {
+        #[allow(unused_mut)]
+        let SessionTail {
+            mut recursion_tx,
+            recursion_worker,
+            #[cfg(any(feature = "cuda", feature = "rocm"))]
+            mut rec_pipe,
+        } = tail;
         let (assumptions, session_assumption_receipts): (Vec<_>, Vec<_>) =
             session.assumptions.iter().cloned().unzip();
 
@@ -1673,6 +1739,12 @@ impl ProverServer for ProverImpl {
             if let Some(po2) = po2 {
                 env.segment_limit_po2 = Some(po2.min(self.opts.max_segment_po2 as u32));
             }
+        }
+        // Item Z17: prove the segments while the guest executes (RISC0_METAL_EXEC_STREAM=0 reverts).
+        #[cfg(all(feature = "metal", not(any(feature = "cuda", feature = "rocm"))))]
+        match exec_stream::eligible(&self.opts, &env) {
+            Ok(()) => return self.prove_streamed(ctx, env, elf),
+            Err(reason) => tracing::debug!("exec stream off: {reason}"),
         }
         let session = ExecutorImpl::from_elf(env, elf)?.run()?;
         self.prove_session(ctx, &session)
