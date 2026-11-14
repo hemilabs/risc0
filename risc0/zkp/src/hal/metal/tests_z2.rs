@@ -374,11 +374,28 @@ fn ntt_expand_ratios_lg_1_20() {
     }
 }
 
-/// commit_coeffs_lde over its whole lg range up to 20 (fused on Metal; unfused CPU).
+/// commit_coeffs_lde over its whole lg range up to 20 (fused on Metal; unfused CPU). 211 columns
+/// stop at lg 16: at lg 17..20 this test alone peaked above 17 GiB of RSS (killed there), enough
+/// to exhaust a 36 GB Mac beside other provers. The full range is the ignored
+/// `ntt_commit_coeffs_lde_lg_10_20_full` (run it alone, under the heavy GPU lock).
 #[test]
 fn ntt_commit_coeffs_lde_lg_10_20() {
+    commit_coeffs_lde_range(16);
+}
+
+/// [ntt_commit_coeffs_lde_lg_10_20] with 211 columns up to lg 20 (> 17 GiB of RSS).
+#[test]
+#[ignore]
+fn ntt_commit_coeffs_lde_lg_10_20_full() {
+    commit_coeffs_lde_range(20);
+}
+
+fn commit_coeffs_lde_range(max_lg_wide: usize) {
     for cols in COLS {
         for lg in 10..=20 {
+            if cols == 211 && lg > max_lg_wide {
+                continue;
+            }
             let w = vec![random_vec(cols << lg)];
             two_way("commit", lg, cols, &w, |r, i| {
                 let (c, e, w_after) = r.commit(&i[0], cols);
