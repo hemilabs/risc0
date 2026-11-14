@@ -264,6 +264,29 @@ extern "C" {
     /// Frees eval_check's scratch slab (waits for the queue first).
     pub fn risc0_circuit_rv32im_intel_eval_check_release() -> *const std::os::raw::c_char;
 
+    /// 1 when the degree-split eval_check (risc0_rv32im_intel_hi / _lo) is available and on for
+    /// the queue's GPU (Xe2, or RISC0_INTEL_EVAL_SPLIT=1), else 0. Decided on the first call.
+    pub fn risc0_circuit_rv32im_intel_eval_check_parts_available(
+        queue: *mut std::os::raw::c_void,
+    ) -> std::os::raw::c_int;
+
+    /// The degree-split eval_check: the constraint terms of degree > 3 on every row of the
+    /// `domain`-point coset into `check` (4 * domain), and those of degree <= 3 on its even rows
+    /// into `check_lo` (4 * domain / 2), which the caller extends to every row and adds.
+    pub fn risc0_circuit_rv32im_intel_eval_check_parts(
+        queue: *mut std::os::raw::c_void,
+        check: *mut std::os::raw::c_void,
+        check_lo: *mut std::os::raw::c_void,
+        data: *const std::os::raw::c_void,
+        accum: *const std::os::raw::c_void,
+        out: *const std::os::raw::c_void,
+        mix: *const std::os::raw::c_void,
+        poly_mix: *const std::os::raw::c_void,
+        rou: u32,
+        po2: u32,
+        domain: u32,
+    ) -> *const std::os::raw::c_char;
+
     // 2-way multi-pass eval_check (separate .so files per pass)
     pub fn risc0_circuit_rv32im_intel_eval_check_pass1(
         queue: *mut std::os::raw::c_void,

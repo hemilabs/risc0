@@ -203,6 +203,22 @@ def p_hoist_global():
             else: repl[n['line']]=['  Fp %s = poly_mix[%d].elems[0];'%(nm(F,i),hb+slot)]
             stats['hoist_roots_'+t]+=1
     body='\n'.join(code)+'\n'+'\n'.join('  tab[%d] = %s;'%(k,h if t=='E' else 'FpExt(%s)'%h) for k,(h,t) in enumerate(slots))
+    # A hoisted root may be a link over an absorb product poly_mix[PMBASE+q] = poly_mix[a] *
+    # poly_mix[b] (degsplit.py's variants leave some such links with uniform factors): link over
+    # its factors instead, `B + Y * pm[a] * pm[b]` as `t = 0 + Y * pm[a]; B + t * pm[b]`.
+    hmax=max([int(x) for x in re.findall(r'\bh(\d+)\b',body)]+[0])
+    qlines=[]
+    for l in body.split('\n'):
+        mq=re.fullmatch(r'(\s*)(Fp|FpExt) (h\d+) = (.+) \+ (.+) \* poly_mix\[(\d+)\];',l)
+        if mq and PMBASE<=int(mq.group(6))<PMBASE+len(QT):
+            ind,ty,h,b,y,k=mq.groups(); a,c=QT[int(k)-PMBASE]
+            hmax+=1; t='h%d'%hmax
+            qlines.append('%sFpExt %s = FpExt(0) + %s * poly_mix[%d];'%(ind,t,y,a))
+            qlines.append('%s%s %s = %s + %s * poly_mix[%d];'%(ind,ty,h,b,t,c))
+            stats['hoist_qsplit']+=1
+        else:
+            qlines.append(l)
+    body='\n'.join(qlines)
     # rk_hoist runs on the GLOBAL poly_mix array, which holds only the first
     # PMBASE entries; the Q-table products and hoist slots (>= PMBASE) exist
     # only in SLM. verify.py's interpreter has them all, so a hoisted read of

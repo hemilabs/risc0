@@ -15,7 +15,9 @@
 #  8. swapuni.py, idx32.py, lincomb.py (3), lincombF.py (2)   final peepholes
 #  9. xmxlink.py       poly_mix linking chains on XMX (DPAS); RISC0_INTEL_EVAL_XMX=0 skips
 #
-# usage: pipeline.py <in amalgamation> <out amalgamation> <work dir>
+# usage: pipeline.py <in amalgamation> <out amalgamation> <work dir> [--variant]
+#   --variant: the input is a degsplit.py part of the circuit; the EXPECT pins below describe the
+#   whole circuit, so they are not checked (each step's numeric verification still is).
 import os
 import subprocess
 import sys
@@ -23,6 +25,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 PARENT = os.path.dirname(HERE)
 src, out, work = sys.argv[1], sys.argv[2], sys.argv[3]
+VARIANT = '--variant' in sys.argv[4:]
 os.makedirs(work, exist_ok=True)
 env = dict(os.environ, PYTHONHASHSEED='0')  # the passes iterate dicts/sets
 
@@ -79,7 +82,7 @@ if XMX:
 else:
     run(os.path.join(HERE, 'lincombF.py'), w('lc.cpp'), out, '2')
 log = ''.join(LOG)
-for e in EXPECT:
+for e in ([] if VARIANT else EXPECT):
     if e not in log:
         sys.exit('evalfast pipeline: expected "%s" in the pass output; the generated '
                  'circuit or a pass changed shape (re-measure and update EXPECT)' % e)
