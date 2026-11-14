@@ -332,6 +332,8 @@ extern "C" {
         bigint_len: u32,
         table_split_cycle: u32,
         last_cycle: u32,
+        // witgen::CYCLE_COLS (5) when the host injector left those columns out, else null.
+        cycle_cols: *const u32,
     ) -> *const std::os::raw::c_char;
 
     pub fn risc0_circuit_rv32im_intel_accum(

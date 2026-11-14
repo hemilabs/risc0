@@ -57,19 +57,24 @@ fn drops_data_after_accum(cycles: usize, unified_memory: bool, early: bool) -> b
     cycles >= (1 << 22) || (unified_memory && early)
 }
 
-/// On CUDA and ROCm the witgen kernel writes the five per-cycle columns (CYCLE_COLS) from the
-/// uploaded cycles, so the host injector leaves them out (5 of its ~5.1 entries per row at
-/// po2=20). Part of the witgen staging feature (`RISC0_CUDA_WITGEN_STAGE=0` keeps them in the
-/// injector).
+/// On CUDA, ROCm and Intel the witgen kernel writes the five per-cycle columns (CYCLE_COLS) from
+/// the uploaded cycles, so the host injector leaves them out (5 of its ~5.1 entries per row at
+/// po2=20). On CUDA and ROCm part of the witgen staging feature (`RISC0_CUDA_WITGEN_STAGE=0`
+/// keeps them in the injector); on Intel `RISC0_INTEL_DEFER_CYCLE_COLS=0` does.
 /// On Metal the witgen's `injectCycleCols` writes them (PLAN 4.2 R8) when the GPU witgen is opted
 /// in (`RISC0_METAL_RV32IM_GPU_PHASES=witgen`, not overridden by `RISC0_METAL_RV32IM_CPU_PHASES`)
 /// and the rv32im Metal prover is enabled; with the default CPU witgen the host scatters them.
 static DEFER_CYCLE_COLS: LazyLock<bool> = LazyLock::new(|| {
     #[cfg(any(feature = "cuda", feature = "rocm"))]
     return cuda_stage::enabled();
-    #[cfg(all(feature = "metal", not(any(feature = "cuda", feature = "rocm"))))]
+    #[cfg(all(feature = "intel", not(any(feature = "cuda", feature = "rocm"))))]
+    return std::env::var("RISC0_INTEL_DEFER_CYCLE_COLS").as_deref() != Ok("0");
+    #[cfg(all(
+        feature = "metal",
+        not(any(feature = "cuda", feature = "rocm", feature = "intel"))
+    ))]
     return super::hal::metal::defers_cycle_cols();
-    #[cfg(not(any(feature = "cuda", feature = "rocm", feature = "metal")))]
+    #[cfg(not(any(feature = "cuda", feature = "rocm", feature = "intel", feature = "metal")))]
     false
 });
 

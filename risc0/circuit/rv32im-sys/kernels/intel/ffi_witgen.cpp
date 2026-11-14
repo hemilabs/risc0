@@ -234,6 +234,9 @@ static int sort_env(const char* name, int def) {
 #ifndef SORT_CH
 #define SORT_CH 256u
 #endif
+#ifndef SORT_WINDOW_LOG2_DEFAULT
+#define SORT_WINDOW_LOG2_DEFAULT 13
+#endif
 template <uint32_t NB> class WitgenSortScan;
 class WitgenAccumScan;
 
@@ -280,12 +283,30 @@ static uint32_t scan_width(sycl::queue& q, uint32_t want) {
 }
 
 static constexpr uint32_t SORT_NB = 128;
+// Blocks of SORT_CH cycles per sort window: the permutation sorts each window of
+// cycles by key, not the whole range. A global sort by major let each major's pass
+// touch rows spread over the whole trace, re-fetching each data sector from memory
+// once per major (the CUDA/HIP kernels sort per window for the same reason);
+// within a window the rows a pass touches stay in cache. 0 = one window (global).
+static uint32_t sort_window_blocks(uint32_t nblk) {
+  const int lg = sort_env("RISC0_WITGEN_SORT_WINDOW_LOG2", SORT_WINDOW_LOG2_DEFAULT);
+  if (lg <= 0) return nblk;
+  const uint32_t w = (1u << lg) / SORT_CH;
+  return w ? (w < nblk ? w : nblk) : 1;
+}
 template <uint32_t NB>
 static void sort_range_t(sycl::queue& q, const risc0::circuit::rv32im_v2::intel::PreflightCycle* cyc,
                        uint32_t lo, uint32_t hi, uint32_t* perm, uint32_t* cnt, uint32_t keymode) {
   if (hi <= lo) return;
   const uint32_t n = hi - lo;
-  const uint32_t nblk = (n + SORT_CH - 1) / SORT_CH;
+  const uint32_t nblk0 = (n + SORT_CH - 1) / SORT_CH;
+  // Counts in (window, key, block-in-window) order: the exclusive scan then places
+  // each window's cycles in its own range of perm, sorted by key (stable).
+  const uint32_t bpw = sort_window_blocks(nblk0);
+  const uint32_t nblk = (nblk0 + bpw - 1) / bpw * bpw;
+  auto cidx = [=](uint32_t k, uint32_t b) -> size_t {
+    return (size_t(b / bpw) * NB + k) * bpw + b % bpw;
+  };
   auto key = [=](uint32_t c) -> uint32_t {
     uint32_t mj = cyc[c].major; if (mj > 15) mj = 15;
     if (NB == 16) return mj;
@@ -298,7 +319,7 @@ static void sort_range_t(sycl::queue& q, const risc0::circuit::rv32im_v2::intel:
     for (uint32_t k = 0; k < NB; k++) c[k] = 0;
     uint32_t s = lo + b * SORT_CH, e = sycl::min(s + SORT_CH, hi);
     for (uint32_t i = s; i < e; i++) c[key(i)]++;
-    for (uint32_t k = 0; k < NB; k++) cnt[size_t(k) * nblk + b] = c[k];
+    for (uint32_t k = 0; k < NB; k++) cnt[cidx(k, b)] = c[k];
   });
   const uint32_t tot = NB * nblk;
   const uint32_t SW = scan_width<WitgenSortScan<NB>>(q, 1024);
@@ -325,7 +346,7 @@ static void sort_range_t(sycl::queue& q, const risc0::circuit::rv32im_v2::intel:
   q.parallel_for(sycl::range<1>(nblk), [=](sycl::id<1> id) {
     uint32_t b = id[0];
     uint32_t off[NB];
-    for (uint32_t k = 0; k < NB; k++) off[k] = cnt[size_t(k) * nblk + b];
+    for (uint32_t k = 0; k < NB; k++) off[k] = cnt[cidx(k, b)];
     uint32_t s = lo + b * SORT_CH, e = sycl::min(s + SORT_CH, hi);
     for (uint32_t i = s; i < e; i++) perm[lo + off[key(i)]++] = i;
   });
@@ -342,7 +363,9 @@ static void sort_build(sycl::queue& q, const risc0::circuit::rv32im_v2::intel::P
     g_sort.perm = sycl::malloc_device<uint32_t>(last, q);
     g_sort.perm_cap = last;
   }
-  size_t need = size_t(SORT_NB) * ((last + SORT_CH - 1) / SORT_CH + 1);
+  // Each range's blocks round up to whole windows (at most one window of padding).
+  const uint32_t nb_all = (last + SORT_CH - 1) / SORT_CH;
+  size_t need = size_t(SORT_NB) * (nb_all + 2 * size_t(sort_window_blocks(nb_all)) + 1);
   if (need > g_sort.cnt_cap) {
     if (g_sort.cnt) sycl::free(g_sort.cnt, q);
     g_sort.cnt = sycl::malloc_device<uint32_t>(need, q);
@@ -369,7 +392,8 @@ const char* risc0_circuit_rv32im_intel_witgen(
     const MemoryTransaction* h_txns, uint32_t txns_len,
     const uint8_t* h_bigint, uint32_t bigint_len,
     uint32_t table_split_cycle,
-    uint32_t last_cycle)
+    uint32_t last_cycle,
+    const uint32_t* h_cycle_cols)
 {
   try {
     auto& q = *static_cast<sycl::queue*>(queue_ptr);
@@ -396,6 +420,27 @@ const char* risc0_circuit_rv32im_intel_witgen(
     const bool asort_pre = mode == kStepModeParallel && sort_env("RISC0_ACCUM_SORT", 1) != 0;
     if (wsort || asort_pre) sort_build(q, g_cache.d_cycles, table_split_cycle, last_cycle);
     const uint32_t* wperm = wsort ? g_sort.perm : nullptr;
+
+    // The five per-cycle columns (witgen::CYCLE_COLS: cycle, next pc low/high, next state, next
+    // machine mode), which the host injector leaves out when h_cycle_cols is given: written
+    // here from the uploaded cycles, after the host scatter and before the step kernels, so
+    // the same values win as when the injector set them after the row's back entries.
+    if (h_cycle_cols) {
+      const uint32_t c0 = h_cycle_cols[0], c1 = h_cycle_cols[1], c2 = h_cycle_cols[2],
+                     c3 = h_cycle_cols[3], c4 = h_cycle_cols[4];
+      risc0::Fp* d = static_cast<risc0::Fp*>(d_data_ptr);
+      const PreflightCycle* cyc = g_cache.d_cycles;
+      const size_t rows = data_rows;
+      q.parallel_for(sycl::range<1>(cycles_len), [=](sycl::id<1> id) {
+        const uint32_t row = id[0];
+        const PreflightCycle c = cyc[row];
+        d[size_t(c0) * rows + row] = risc0::Fp(row);
+        d[size_t(c1) * rows + row] = risc0::Fp(c.pc & 0xffffu);
+        d[size_t(c2) * rows + row] = risc0::Fp(c.pc >> 16);
+        d[size_t(c3) * rows + row] = risc0::Fp(c.state);
+        d[size_t(c4) * rows + row] = risc0::Fp(uint32_t(c.machineMode));
+      });
+    }
 
     auto t1 = std::chrono::steady_clock::now();
 
