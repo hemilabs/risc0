@@ -34,6 +34,7 @@
 //   3 witness Fr[witness_len]   4 fault atomic_uint   5 constant WitnessPolyParams
 
 #include "bn254.h"
+#include "bn254_fast.h"
 
 using namespace metal;
 using namespace bn254;
@@ -112,6 +113,10 @@ struct WitnessPolyCompactParams {
   uint32_t pad[3];
 };
 
+// NC (item G15): the products through bn254_fast.h's mul_nc (no-carry CIOS; the same value as
+// `*` for canonical inputs, which the kernel checks: a non-canonical input sets fault 4 and the
+// proof is refused either way).
+template <bool NC>
 [[max_total_threads_per_threadgroup(256)]]
 kernel void witness_into_poly_compact(device Fr* out [[buffer(0)]],
                                       const device uint2* cs [[buffer(1)]],
@@ -149,9 +154,19 @@ kernel void witness_into_poly_compact(device Fr* out [[buffer(0)]],
     Fr w = witness[c.x];
     if (!v.is_canonical() || !w.is_canonical())
       bad = 4u;
-    sum += w * v;
+    sum += NC ? mul_nc(w, v) : w * v;
   }
   if (bad)
     atomic_fetch_or_explicit(fault, bad, memory_order_relaxed);
   out[row] = sum;
 }
+
+// Explicit instantiations, written out (build.rs reads the host_name strings literally).
+template [[host_name("witness_into_poly_compact")]] kernel void
+witness_into_poly_compact<false>(device Fr*, const device uint2*, const device uint32_t*,
+                                 const device Fr*, device atomic_uint*, const device Fr*,
+                                 const device uint32_t*, constant WitnessPolyCompactParams&, uint);
+template [[host_name("witness_into_poly_compact_nc")]] kernel void
+witness_into_poly_compact<true>(device Fr*, const device uint2*, const device uint32_t*,
+                                const device Fr*, device atomic_uint*, const device Fr*,
+                                const device uint32_t*, constant WitnessPolyCompactParams&, uint);

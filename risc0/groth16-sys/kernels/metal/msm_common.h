@@ -34,33 +34,36 @@ struct MsmParams {
   uint32_t wcount;     // windows in this group
   uint32_t booth;      // 1: signed (Booth) digits, msm_digit_booth (item G9)
   uint32_t lenperm;    // 1: bucket threads take the pieces in length order (item G12)
-  uint32_t _pad[2];
+  uint32_t tr;         // item G15: transposed scalars (msm_hist_count writes them, msm_scatter
+                       // reads them: word k of scalar i at k * n + i); 0 = row-major only
+  uint32_t _pad;
 };
 
 // Sorted entries of a Booth sort carry the digit's sign in the top bit of the scalar index.
 constant uint32_t MSM_NEG = 0x80000000u;
 
-// The c-bit digit of window w of a canonical little-endian 256-bit scalar (8 x u32). Bits above
-// 255 read as zero; the windows may straddle a limb boundary.
-inline uint32_t msm_digit(const device uint32_t* s, uint32_t w, uint32_t c) {
+// The c-bit digit of window w of a canonical little-endian 256-bit scalar (8 x u32, word k at
+// s[k * stride]: 1 row-major, n transposed). Bits above 255 read as zero; the windows may
+// straddle a limb boundary.
+inline uint32_t msm_digit(const device uint32_t* s, uint32_t w, uint32_t c, uint32_t stride = 1) {
   uint32_t bit = w * c;
   uint32_t lo = bit >> 5;
   uint32_t sh = bit & 31;
-  uint32_t v = s[lo] >> sh;
+  uint32_t v = s[(size_t)lo * stride] >> sh;
   if (sh + c > 32 && lo + 1 < 8)
-    v |= s[lo + 1] << (32 - sh);
+    v |= s[(size_t)(lo + 1) * stride] << (32 - sh);
   return v & ((1u << c) - 1);
 }
 
 // `nb` (<= 32) bits of a little-endian 256-bit scalar from bit `bit`; bits above 255 read 0.
-inline uint32_t msm_bits(const device uint32_t* s, uint32_t bit, uint32_t nb) {
+inline uint32_t msm_bits(const device uint32_t* s, uint32_t bit, uint32_t nb, uint32_t stride = 1) {
   uint32_t lo = bit >> 5;
   uint32_t sh = bit & 31;
   if (lo >= 8)
     return 0;
-  uint32_t v = s[lo] >> sh;
+  uint32_t v = s[(size_t)lo * stride] >> sh;
   if (sh + nb > 32 && lo + 1 < 8)
-    v |= s[lo + 1] << (32 - sh);
+    v |= s[(size_t)(lo + 1) * stride] << (32 - sh);
   return nb >= 32 ? v : v & ((1u << nb) - 1);
 }
 
@@ -69,9 +72,10 @@ inline uint32_t msm_bits(const device uint32_t* s, uint32_t bit, uint32_t nb) {
 // in [-2^(c-1), 2^(c-1)]. sum_{w<W} d_w 2^(wc) = s whenever s < 2^(Wc - 1) (the host picks W).
 // Returns |d| and sets `neg` for d < 0.
 inline uint32_t msm_digit_booth(const device uint32_t* s, uint32_t w, uint32_t c,
-                                thread bool& neg) {
+                                thread bool& neg, uint32_t stride = 1) {
   // The c + 1 bits from bit wc - 1 (for w = 0, bits 0..c-1 shifted up, bit -1 = 0).
-  uint32_t v = w == 0 ? (msm_bits(s, 0, c) << 1) : msm_bits(s, w * c - 1, c + 1);
+  uint32_t v =
+      w == 0 ? (msm_bits(s, 0, c, stride) << 1) : msm_bits(s, w * c - 1, c + 1, stride);
   uint32_t mag = (v >> 1) + (v & 1);
   bool top = ((v >> c) & 1) != 0;
   neg = top && mag != (1u << c);

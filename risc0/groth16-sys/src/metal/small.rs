@@ -62,6 +62,7 @@ pub const SMALL_KERNEL_NAMES: &[&str] = &[
     "fr_add",
     "witness_into_poly",
     "witness_into_poly_compact",
+    "witness_into_poly_compact_nc",
     "chacha_fuzz",
     "fr_powers",
     "fr_scale",
@@ -241,6 +242,7 @@ pub struct SmallKernels {
     fr_add: ComputePipelineState,
     witness_into_poly: ComputePipelineState,
     witness_into_poly_compact: ComputePipelineState,
+    witness_into_poly_compact_nc: ComputePipelineState,
     chacha_fuzz: ComputePipelineState,
     fr_powers: ComputePipelineState,
     fr_scale: ComputePipelineState,
@@ -261,6 +263,7 @@ impl SmallKernels {
             fr_add: pso("fr_add")?,
             witness_into_poly: pso("witness_into_poly")?,
             witness_into_poly_compact: pso("witness_into_poly_compact")?,
+            witness_into_poly_compact_nc: pso("witness_into_poly_compact_nc")?,
             chacha_fuzz: pso("chacha_fuzz")?,
             fr_powers: pso("fr_powers")?,
             fr_scale: pso("fr_scale")?,
@@ -387,6 +390,7 @@ impl SmallKernels {
     /// `cs[j] = (s, value index)` (two u32) into `table` (`table_len` Fr), and row `i` writes
     /// `out[rowc[i]]`. Bit-identical to [Self::witness_into_poly] on the coefficients it was
     /// derived from; same fault bits (a value index out of the table is `BAD_INDEX`).
+    /// `nc` (item G15): the products through `mul_nc` (bn254_fast.h; same values).
     #[allow(clippy::too_many_arguments)]
     pub fn witness_into_poly_compact(
         &self,
@@ -403,6 +407,7 @@ impl SmallKernels {
         table: BufSlice,
         table_len: u64,
         rowc: BufSlice,
+        nc: bool,
     ) {
         out.check(out_len * FR_BYTES, "witness_into_poly_compact out");
         cs.check(coeff_len * 8, "witness_into_poly_compact cs");
@@ -421,7 +426,11 @@ impl SmallKernels {
         };
         Self::dispatch(
             enc,
-            &self.witness_into_poly_compact,
+            if nc {
+                &self.witness_into_poly_compact_nc
+            } else {
+                &self.witness_into_poly_compact
+            },
             &[out, cs, indices, witness, fault, table, rowc],
             &p,
             rows,

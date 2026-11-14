@@ -166,6 +166,8 @@ pub mod buf {
         pub const SCALARS: u64 = 0;
         pub const HIST: u64 = 1;
         pub const PARAMS: u64 = 2;
+        /// Item G15: the transposed copy (out, with `MsmParams::tr`).
+        pub const TR: u64 = 3;
     }
     pub mod window_scan {
         pub const HIST: u64 = 0;
@@ -227,7 +229,10 @@ pub struct MsmParams {
     pub booth: u32,
     /// Item G12: length order ([MsmTune::lenperm]).
     pub lenperm: u32,
-    pub _pad: [u32; 2],
+    /// Item G15: msm_hist_count writes a transposed copy of the scalars, msm_scatter reads it
+    /// ([MsmScratch::set_dense]).
+    pub tr: u32,
+    pub _pad: u32,
 }
 const _: () = assert!(std::mem::size_of::<MsmParams>() == 64);
 
@@ -641,6 +646,21 @@ impl MsmKernels {
         scalars: MsmBuf,
         n: u32,
     ) {
+        for part in SortPart::ALL {
+            self.encode_sort_part(enc, sc, scalars, n, part);
+        }
+    }
+
+    /// One part of [Self::encode_sort] (item G15: profiling splits the sort into these, one
+    /// command buffer each). Encoding every part of [SortPart::ALL] in order is `encode_sort`.
+    pub fn encode_sort_part(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        sc: &mut MsmScratch,
+        scalars: MsmBuf,
+        n: u32,
+        part: SortPart,
+    ) {
         assert!(
             n <= sc.cap_n,
             "MSM of {n} scalars exceeds the scratch capacity {}",
@@ -671,6 +691,14 @@ impl MsmKernels {
             lenperm: lenperm as u32,
             ..Default::default()
         };
+        let dense = sc.dense;
+        let tr = sc.dense_tr.clone();
+        if let Some((b, o)) = &tr {
+            assert!(
+                b.length() >= o + n as u64 * 32,
+                "MSM transposed scalars do not fit the lent buffer"
+            );
+        }
         assert!(
             n.div_ceil(p.piece) + n.min(p.nbuckets - 1) <= MsmConfig::max_pieces_nb(n, nbuckets)
                 && MsmConfig::max_pieces_nb(n, nbuckets) <= sc.max_pieces
@@ -682,40 +710,73 @@ impl MsmKernels {
         );
         let table = p.nwins as u64 * p.nbuckets as u64;
 
-        enc.set_compute_pipeline_state(&self.clear);
-        enc.set_buffer(buf::clear::HIST, Some(&sc.hist), 0);
-        set_params(enc, buf::clear::PARAMS, &p);
-        dispatch_1d(enc, &self.clear, table);
+        if part == SortPart::Clear {
+            enc.set_compute_pipeline_state(&self.clear);
+            enc.set_buffer(buf::clear::HIST, Some(&sc.hist), 0);
+            set_params(enc, buf::clear::PARAMS, &p);
+            dispatch_1d(enc, &self.clear, table);
+        }
 
-        if n > 0 {
+        if part == SortPart::Hist && n > 0 {
             enc.set_compute_pipeline_state(&self.hist_count);
             enc.set_buffer(buf::hist_count::SCALARS, Some(scalars.buf), scalars.offset);
             enc.set_buffer(buf::hist_count::HIST, Some(&sc.hist), 0);
-            set_params(enc, buf::hist_count::PARAMS, &p);
+            let q = match &tr {
+                Some((b, o)) => {
+                    enc.set_buffer(buf::hist_count::TR, Some(b), *o);
+                    MsmParams { tr: 1, ..p }
+                }
+                None => {
+                    // Not read (tr = 0); bound for the validation layer.
+                    enc.set_buffer(buf::hist_count::TR, Some(&sc.hist), 0);
+                    p
+                }
+            };
+            set_params(enc, buf::hist_count::PARAMS, &q);
             dispatch_1d(enc, &self.hist_count, n as u64);
         }
 
         let ts = self.window_scan.max_total_threads_per_threadgroup().min(TG);
         let tg_bytes = 2 * ts * 4;
         assert!(tg_bytes <= MAX_TG_BYTES);
-        enc.set_compute_pipeline_state(&self.window_scan);
-        enc.set_buffer(buf::window_scan::HIST, Some(&sc.hist), 0);
-        enc.set_buffer(buf::window_scan::OFFSET, Some(&sc.offset), 0);
-        enc.set_buffer(buf::window_scan::PIECE_OFF, Some(&sc.piece_off), 0);
-        enc.set_buffer(buf::window_scan::TOTALS, Some(&sc.totals), 0);
-        set_params(enc, buf::window_scan::PARAMS, &p);
-        enc.set_threadgroup_memory_length(0, tg_bytes);
-        enc.dispatch_thread_groups(MTLSize::new(p.nwins as u64, 1, 1), MTLSize::new(ts, 1, 1));
+        if part == SortPart::Scan {
+            enc.set_compute_pipeline_state(&self.window_scan);
+            enc.set_buffer(buf::window_scan::HIST, Some(&sc.hist), 0);
+            enc.set_buffer(buf::window_scan::OFFSET, Some(&sc.offset), 0);
+            enc.set_buffer(buf::window_scan::PIECE_OFF, Some(&sc.piece_off), 0);
+            enc.set_buffer(buf::window_scan::TOTALS, Some(&sc.totals), 0);
+            set_params(enc, buf::window_scan::PARAMS, &p);
+            enc.set_threadgroup_memory_length(0, tg_bytes);
+            enc.dispatch_thread_groups(MTLSize::new(p.nwins as u64, 1, 1), MTLSize::new(ts, 1, 1));
+        }
 
-        if n > 0 {
+        if part == SortPart::Scatter && n > 0 {
             enc.set_compute_pipeline_state(&self.scatter);
-            enc.set_buffer(buf::scatter::SCALARS, Some(scalars.buf), scalars.offset);
+            let p = match &tr {
+                Some((b, o)) => {
+                    enc.set_buffer(buf::scatter::SCALARS, Some(b), *o);
+                    MsmParams { tr: 1, ..p }
+                }
+                None => {
+                    enc.set_buffer(buf::scatter::SCALARS, Some(scalars.buf), scalars.offset);
+                    p
+                }
+            };
             enc.set_buffer(buf::scatter::HIST, Some(&sc.hist), 0);
             enc.set_buffer(buf::scatter::SORTED, Some(&sc.sorted), 0);
-            set_params(enc, buf::scatter::PARAMS, &p);
-            dispatch_1d(enc, &self.scatter, n as u64);
+            if dense {
+                // Item G15: one window per dispatch (serial dispatches on tracked buffers).
+                for w0 in 0..p.nwins {
+                    let q = MsmParams { w0, wcount: 1, ..p };
+                    set_params(enc, buf::scatter::PARAMS, &q);
+                    dispatch_1d(enc, &self.scatter, n as u64);
+                }
+            } else {
+                set_params(enc, buf::scatter::PARAMS, &p);
+                dispatch_1d(enc, &self.scatter, n as u64);
+            }
         }
-        if lenperm {
+        if part == SortPart::Len && lenperm {
             // Item G12: the pieces of each window in length order (msm_sort.metal).
             enc.set_compute_pipeline_state(&self.len_clear);
             enc.set_buffer(0, Some(&sc.lhist), 0);
@@ -744,6 +805,11 @@ impl MsmKernels {
         }
         sc.sorted_params = Some(p);
         sc.sorted_tune = sc.tune;
+        if part == SortPart::Len {
+            // The last part: the dense setting applied to this sort only.
+            sc.dense = false;
+            sc.dense_tr = None;
+        }
     }
 
     /// The MSM over the scalars of the last [Self::encode_sort] on `sc`, by window:
@@ -895,6 +961,41 @@ impl MsmKernels {
     }
 }
 
+/// The dispatch groups of a sort ([MsmKernels::encode_sort_part]), in encoding order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SortPart {
+    /// msm_clear.
+    Clear,
+    /// msm_hist_count.
+    Hist,
+    /// msm_window_scan.
+    Scan,
+    /// msm_scatter.
+    Scatter,
+    /// The item G12 length order (msm_len_*), when the tune has it.
+    Len,
+}
+
+impl SortPart {
+    pub const ALL: [SortPart; 5] = [
+        Self::Clear,
+        Self::Hist,
+        Self::Scan,
+        Self::Scatter,
+        Self::Len,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Clear => "clear",
+            Self::Hist => "hist",
+            Self::Scan => "scan",
+            Self::Scatter => "scatter",
+            Self::Len => "len",
+        }
+    }
+}
+
 /// One dispatch of an MSM (see [MsmKernels::msm_stages]).
 #[derive(Clone, Copy, Debug)]
 pub enum MsmStage {
@@ -971,6 +1072,10 @@ pub struct MsmScratch {
     sorted_tune: MsmTune,
     /// The sorts' scalars are below 2^scalar_bits (Booth window count; default 256).
     scalar_bits: u32,
+    /// Item G15 ([Self::set_dense]): the next sort scatters one window per dispatch, from a
+    /// transposed copy of the scalars in `dense_tr` (buffer, offset) when given.
+    dense: bool,
+    dense_tr: Option<(Buffer, u64)>,
 }
 
 impl MsmScratch {
@@ -1078,6 +1183,8 @@ impl MsmScratch {
             tune: MsmTune::default(),
             sorted_tune: MsmTune::default(),
             scalar_bits: 256,
+            dense: false,
+            dense_tr: None,
         })
     }
 
@@ -1105,6 +1212,18 @@ impl MsmScratch {
 
     pub fn tune(&self) -> MsmTune {
         self.tune
+    }
+
+    /// Item G15: the next sort ([MsmKernels::encode_sort]) has dense scalars (nonzero digits in
+    /// almost every window, e.g. MSM H's uniformly random ones). Its scatter then runs one
+    /// window per dispatch, so that the scattered index stores of a dispatch fall into one
+    /// window's `n` entries instead of all windows' (fewer partial-line write-backs). With
+    /// `tr` = (buffer, offset) of at least 32 n free bytes, the count pass also writes a
+    /// transposed copy of the scalars there, and each window's scatter reads only the words
+    /// that hold its digit. Applies to one sort; the results are the same either way.
+    pub fn set_dense(&mut self, dense: bool, tr: Option<(&BufferRef, u64)>) {
+        self.dense = dense;
+        self.dense_tr = tr.filter(|_| dense).map(|(b, o)| (b.to_owned(), o));
     }
 
     /// Declare that the following sorts' scalars are below 2^bits (1..=256), e.g. 254 for

@@ -611,6 +611,75 @@ fn g14_witness_like_scalars() {
     );
 }
 
+/// Item G15: dense sorts ([MsmScratch::set_dense]: one window per scatter dispatch, with and
+/// without the transposed copy, at an offset in a larger buffer) give the same MSMs as the
+/// normal sort, for uniform, witness-like and all r - 1 scalars, Booth and unsigned digits,
+/// several window widths, an odd n and a `first` offset; the setting applies to one sort only.
+#[test]
+fn g15_dense_sort() {
+    let Some(g) = gpu() else { return };
+    let mut rng = ChaCha8Rng::seed_from_u64(0x15);
+    let n = (1 << 15) + 3;
+    let p1 = points::<G1Projective>(n, &mut rng);
+    let p2 = points::<G2Projective>(n, &mut rng);
+    let b1 = g.buffer(&words::<G1>(&p1));
+    let b2 = g.buffer(&words::<G2>(&p2));
+    // The transposed copy goes 4 KiB into a buffer with room to spare.
+    let tr = g.buffer(&vec![0u32; 8 * n + 4096]);
+    let tr_off = 4096u64;
+    let first = n / 3;
+    let uniform: Vec<Fr> = (0..n).map(|_| Fr::rand(&mut rng)).collect();
+    let cases = [
+        ("uniform", uniform),
+        ("witness-like", witness_like_scalars(n, &mut rng)),
+        ("all r - 1", vec![-Fr::one(); n]),
+    ];
+    let cfgs = [
+        MsmConfig::default(),
+        MsmConfig {
+            wbits: 11,
+            seg: 5,
+            ..Default::default()
+        },
+    ];
+    for (what, s) in &cases {
+        let want1: G1Projective = ark_msm(&p1, s);
+        let want2: G2Projective = ark_msm(&p2, s);
+        let want_c: G1Projective = ark_msm(&p1[..n - first], &s[first..]);
+        let sw: Vec<u32> = s.iter().flat_map(scalar_words).collect();
+        let bs = g.buffer(&sw);
+        for cfg in cfgs {
+            let mut sc = MsmScratch::new(&g.device, n as u32, cfg).unwrap();
+            for (tune, bits) in [
+                (MsmTune::all(), 254),
+                (MsmTune::all(), 256),
+                (MsmTune::none(), 256),
+            ] {
+                sc.set_tune(tune);
+                sc.set_scalar_bits(bits);
+                for mode in ["dense+tr", "dense", "plain after dense"] {
+                    let ctx = format!("{what} {mode} {tune:?} bits {bits} {cfg:?}");
+                    match mode {
+                        "dense+tr" => sc.set_dense(true, Some((&tr, tr_off))),
+                        "dense" => sc.set_dense(true, None),
+                        _ => {}
+                    }
+                    g.sort(&mut sc, MsmBuf::new(&bs), n as u32).unwrap();
+                    assert!(!sc.dense && sc.dense_tr.is_none(), "{ctx}: one sort only");
+                    let (got1, _) = g.msm_sorted::<G1>(&sc, MsmBuf::new(&b1), 0).unwrap();
+                    assert_eq!(got1.into_affine(), want1.into_affine(), "G1 {ctx}");
+                    let (got2, _) = g.msm_sorted::<G2>(&sc, MsmBuf::new(&b2), 0).unwrap();
+                    assert_eq!(got2.into_affine(), want2.into_affine(), "G2 {ctx}");
+                    let (got, _) = g
+                        .msm_sorted::<G1>(&sc, MsmBuf::new(&b1), first as u32)
+                        .unwrap();
+                    assert_eq!(got.into_affine(), want_c.into_affine(), "G1 first {ctx}");
+                }
+            }
+        }
+    }
+}
+
 /// Raw 256-bit scalars >= r (the kernels take any integer): the result is (s mod r) * P.
 #[test]
 fn msm_raw_scalars_above_r() {
@@ -753,6 +822,39 @@ fn r17_msm_repeat() {
         "R17AUDIT groth16 msm G1+G2 witness-like 2^{lg}: {reps}/{reps} reps x 2 scalar widths \
          equal ark (0 differ)"
     );
+    // Item G15: dense sorts (one window per scatter dispatch, transposed scalars), as the prover
+    // runs them for H (uniform scalars) and the witness.
+    let tr = g.buffer(&vec![0u32; 8 * n]);
+    let (b1, b2) = (g.buffer(&words::<G1>(&p1)), g.buffer(&words::<G2>(&p2)));
+    let uniform: Vec<Fr> = (0..n).map(|_| Fr::rand(&mut rng)).collect();
+    for (what, s) in [("uniform", &uniform), ("witness-like", &s)] {
+        let want1: G1Projective = ark_msm(&p1, s);
+        let want2: G2Projective = ark_msm(&p2, s);
+        let sw: Vec<u32> = s.iter().flat_map(scalar_words).collect();
+        let bs = g.buffer(&sw);
+        let mut sc = MsmScratch::new(&g.device, n as u32, cfg).unwrap();
+        sc.set_scalar_bits(254);
+        for rep in 0..reps {
+            sc.set_dense(true, Some((&tr, 0)));
+            g.sort(&mut sc, MsmBuf::new(&bs), n as u32).unwrap();
+            let (got1, _) = g.msm_sorted::<G1>(&sc, MsmBuf::new(&b1), 0).unwrap();
+            assert_eq!(
+                got1.into_affine(),
+                want1.into_affine(),
+                "G1 dense {what} rep {rep}"
+            );
+            let (got2, _) = g.msm_sorted::<G2>(&sc, MsmBuf::new(&b2), 0).unwrap();
+            assert_eq!(
+                got2.into_affine(),
+                want2.into_affine(),
+                "G2 dense {what} rep {rep}"
+            );
+        }
+        println!(
+            "R17AUDIT groth16 msm G1+G2 dense sort {what} 2^{lg}: {reps}/{reps} reps equal ark \
+             (0 differ)"
+        );
+    }
 }
 
 /// G12 investigation (ignored): the G10 note's one-off wrong G2 result (n = 1000, wbits = 1,

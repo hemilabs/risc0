@@ -87,7 +87,9 @@ use super::{
     check_working_set,
     coeffs::{Coeffs, FuzzedResults, FuzzedResultsArk},
     compact::CompactCoeffs,
-    msm::{MsmBuf, MsmConfig, MsmCurve, MsmKernels, MsmScratch, MsmStage, MsmTune, G1, G2},
+    msm::{
+        MsmBuf, MsmConfig, MsmCurve, MsmKernels, MsmScratch, MsmStage, MsmTune, SortPart, G1, G2,
+    },
     ntt::{NttKernels, NttPlan, NttSchedule},
     pipelines,
     small::{self, BufSlice, SmallKernels},
@@ -250,6 +252,23 @@ pub struct Tuning {
     /// bit for bit. Revert: `RISC0_G16_METAL_FUZZ=1` or `RISC0_G16_METAL_G14=0` (or
     /// `RISC0_G16_METAL_G9_OFF=nofuzz`).
     pub nofuzz: bool,
+    /// `hdense` (item G15): MSM H's sort scatters one window per dispatch
+    /// ([MsmScratch::set_dense]); H's scalars are uniformly random, so every window holds a
+    /// digit of almost every scalar, and a dispatch's scattered stores then stay within one
+    /// window's entries. Revert: `RISC0_G16_METAL_G15_OFF=hdense` or `RISC0_G16_METAL_G15=0`.
+    pub hdense: bool,
+    /// `htr` (item G15, with `hdense`): the count pass of H's sort also writes the scalars
+    /// transposed into b (free once the NTT stage has made h), so that each window's scatter
+    /// reads only the words of its digit. Revert: `RISC0_G16_METAL_G15_OFF=htr`.
+    pub htr: bool,
+    /// `wtr` (item G15): the witness sort as a dense one with a transposed copy in a
+    /// ([MsmScratch::set_dense]): its scatter reads only the words of each window's digit
+    /// (~3 ms per wrap; without the copy, one window per dispatch is slower for the mostly-zero
+    /// witness). Revert: `RISC0_G16_METAL_G15_OFF=wtr`.
+    pub wtr: bool,
+    /// `poly_nc` (item G15): `witness_into_poly_compact` multiplies with bn254_fast.h's
+    /// `mul_nc` (same values). Revert: `RISC0_G16_METAL_G15_OFF=poly_nc`.
+    pub poly_nc: bool,
 }
 
 impl Default for Tuning {
@@ -267,6 +286,10 @@ impl Tuning {
         "lenperm",
         "lent_groups",
         "nofuzz",
+        "hdense",
+        "htr",
+        "wtr",
+        "poly_nc",
     ];
 
     /// The MSM switches.
@@ -288,6 +311,10 @@ impl Tuning {
             lenperm: true,
             lent_groups: true,
             nofuzz: true,
+            hdense: true,
+            htr: true,
+            wtr: true,
+            poly_nc: true,
         }
     }
 
@@ -300,6 +327,10 @@ impl Tuning {
             lenperm: false,
             lent_groups: false,
             nofuzz: false,
+            hdense: false,
+            htr: false,
+            wtr: false,
+            poly_nc: false,
         }
     }
 
@@ -312,6 +343,10 @@ impl Tuning {
             "lenperm" => self.lenperm = on,
             "lent_groups" => self.lent_groups = on,
             "nofuzz" => self.nofuzz = on,
+            "hdense" => self.hdense = on,
+            "htr" => self.htr = on,
+            "wtr" => self.wtr = on,
+            "poly_nc" => self.poly_nc = on,
             _ => return false,
         }
         true
@@ -347,7 +382,11 @@ impl Tuning {
             return Self::none();
         }
         let mut t = Self::all();
-        for var in ["RISC0_G16_METAL_G9_OFF", "RISC0_G16_METAL_G12_OFF"] {
+        for var in [
+            "RISC0_G16_METAL_G9_OFF",
+            "RISC0_G16_METAL_G12_OFF",
+            "RISC0_G16_METAL_G15_OFF",
+        ] {
             if let Ok(off) = std::env::var(var) {
                 for name in off.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                     if !t.set(name, false) {
@@ -370,6 +409,14 @@ impl Tuning {
         }
         if std::env::var("RISC0_G16_METAL_G14").as_deref() == Ok("0") {
             t.nofuzz = false;
+        }
+
+        // Item G15's switches, all off.
+        if std::env::var("RISC0_G16_METAL_G15").as_deref() == Ok("0") {
+            t.hdense = false;
+            t.htr = false;
+            t.wtr = false;
+            t.poly_nc = false;
         }
         t
     }
@@ -1015,7 +1062,17 @@ impl MetalProver {
         run.fill_new(abc, 2 * nn * FR_BYTES);
         let coeffs = &self.coeffs;
         run.stage("witness_poly", 0, |enc| {
-            encode_witness_poly(small, enc, coeffs.as_ref(), abc, nn, w, wn as u64, fault);
+            encode_witness_poly(
+                small,
+                enc,
+                coeffs.as_ref(),
+                abc,
+                nn,
+                w,
+                wn as u64,
+                fault,
+                opts.tune.poly_nc,
+            );
             small.fr_mul(
                 enc,
                 BufSlice::at(c_buf, c_off),
@@ -1051,11 +1108,23 @@ impl MetalProver {
         let srs = &self.srs;
         let wsums = &self.wsums;
         let out = |slot: Slot| MsmBuf::at(wsums, slot_offset(cfg, slot));
-        run.stage("sort_h", 1, |enc| {
-            msm.encode_sort(enc, scratch, MsmBuf::new(abc), n as u32)
-        });
         let deep =
             opts.profile && std::env::var("RISC0_G16_METAL_PROFILE_MSM").as_deref() == Ok("1");
+        // Item G15: H's scalars are dense; b (abc at n) is free once the NTT stage has made h.
+        scratch.set_dense(
+            opts.tune.hdense,
+            opts.tune.htr.then_some((abc as &BufferRef, fr(nn))),
+        );
+        sort_stage(
+            &mut run,
+            msm,
+            scratch,
+            "sort_h",
+            1,
+            MsmBuf::new(abc),
+            n as u32,
+            deep,
+        );
         let h_pts = pts(&srs.h);
         msm_stage::<G1>(
             &mut run,
@@ -1077,9 +1146,22 @@ impl MetalProver {
                 small.fr_add(enc, BufSlice::new(w), BufSlice::new(abc), wn as u64);
             });
         }
-        run.stage("sort_w", 2, |enc| {
-            msm.encode_sort(enc, scratch, MsmBuf::new(w), wn as u32)
-        });
+        // Item G15 `wtr`: the witness sort scatters one window per dispatch from a transposed
+        // copy in a (free once sort_h has consumed h; the G10 late fuzz, when on, was added to
+        // the witness above).
+        if opts.tune.wtr && abc.length() >= fr(wn as u64) {
+            scratch.set_dense(true, Some((abc as &BufferRef, 0)));
+        }
+        sort_stage(
+            &mut run,
+            msm,
+            scratch,
+            "sort_w",
+            2,
+            MsmBuf::new(w),
+            wn as u32,
+            deep,
+        );
         let a_pts = pts(&srs.a);
         msm_stage::<G1>(
             &mut run,
@@ -1436,6 +1518,7 @@ pub(crate) fn encode_witness_poly(
     w: &BufferRef,
     wn: u64,
     fault: &BufferRef,
+    nc: bool,
 ) {
     match coeffs {
         CoeffsRef::Full(coeffs) => {
@@ -1494,6 +1577,7 @@ pub(crate) fn encode_witness_poly(
                     slice_of(&c.table, 0),
                     ntab,
                     slice_of(&c.rowc, ind_off),
+                    nc,
                 );
             }
         }
@@ -1582,6 +1666,32 @@ fn msm_config_from_env() -> MsmConfig {
         }
     }
     cfg
+}
+
+/// One sort as a [Run] stage; with `deep` (profiling), every part of it is its own stage
+/// (`label.clear`, `label.hist`, ...; item G15).
+#[allow(clippy::too_many_arguments)]
+fn sort_stage(
+    run: &mut Run,
+    msm: &MsmKernels,
+    scratch: &mut MsmScratch,
+    label: &str,
+    group: u32,
+    scalars: MsmBuf,
+    n: u32,
+    deep: bool,
+) {
+    if !deep {
+        run.stage(label, group, |enc| {
+            msm.encode_sort(enc, scratch, scalars, n)
+        });
+        return;
+    }
+    for part in SortPart::ALL {
+        run.stage(&format!("{label}.{}", part.name()), group, |enc| {
+            msm.encode_sort_part(enc, scratch, scalars, n, part)
+        });
+    }
 }
 
 /// One MSM as a [Run] stage; with `deep` (profiling), every dispatch of it is its own stage
