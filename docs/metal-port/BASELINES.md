@@ -769,3 +769,204 @@ warm speed: there is no graph wait any more.
 - Not measured here: 8-10 and 16-20-core parts (PLAN 9.1; R18/R20's regime, R21's footprint sensitivity, K9's
   chunk crossover), a real 16 GB Mac, `comprehensive_zkvm_test`, CPU prover baselines. G13's separate
   sub-knobs were not measured one by one.
+
+# Wave 6
+
+Baseline after the wave-6 merges: Z14, Z15, Z16, Z17, C14, C15, C16, G15, R22, R23, K10 (risc0; Z13 was a
+NO-GO with nothing merged). zk-miner is unchanged since wave 5c: M9 (the worker prewarm that would call C16's
+`prewarm_p254_ctrl` and Z16's `metal_prewarm_segment_po2`) is **not** merged, so neither prewarm runs here.
+
+| | |
+|---|---|
+| Date | 2026-11-14, 02:44-03:33 local time |
+| Machine | Apple M5 Max, 40-core GPU, 36 GB unified memory (28.1 GiB recommended working set), macOS 27.2.1 (26B131) |
+| risc0 | `zkminer/metal` @ `ef90a0d1e13fc66cd80bd25d32bf10f58abed8cd` (Z17 merge record) |
+| zk-miner | `metal` @ `0ca7ec9f346703f976487b30e93c63a8c74b33f8` (as wave 5c; clean tree, path-patched to the risc0 checkout above) |
+| Worker | `cargo build --release -p zkminer-prove-risc0 --features metal --bin zkminer-prove-risc0-metal`, installed to `~/.zkminer/provers/zkminer-prove-risc0-metal` (sha256 `b27efa9e…a322`; the wave-5c binary is kept beside it as `.w5c-bak`) |
+| Benchmark command | `target/release/zkminer-prove-risc0-metal --benchmark` (full suite; `BENCH_ONLY=<name>` for one program) under `/usr/bin/time -l`, `RUST_LOG=info` |
+| Machine state | Every GPU command ran alone under `bin/gpu-run` (heavy lock). Other agents' short probes ran between some of this run's commands; no other prover ran during a timed command. Load averages 1.5-4.9 (each log records its start / end load). |
+| Logs | `/Users/user/zkminer/baseline-w6/` (`full/`, `cold/`, `phab/`, `wab_def/`, `bud_4g/`, `bud_8g/`, `bud/`, `prof/`; drivers and parsers in `scripts/`) |
+
+Before the timed runs, one `RISC0_METAL_RV32IM_EVAL_FC=wait` memory-merkle run per budget (`warm/`) checked that
+the specialized eval PSOs were in the archive (all hits), and one run per revert arm warmed that arm's PSOs
+(R22's nested `ef_eval_split_fc_nest` for domain 2^22 took 12.3 s once) and G15's version-1 coefficient cache.
+
+## 6.1 Worker `--benchmark` (full suite, po2 20 segments)
+
+Three full default runs (`full1-3.log`), interleaved with two `RISC0_METAL_EXEC_STREAM=0` runs (6.3). Load
+2.4 -> 2.1, 2.1 -> 1.8, 1.9 -> 1.9. Every run proved, wrapped and verified every program.
+
+| program | cycles | wave 5c (s) | wave 6 runs 1 / 2 / 3 (s) | change | RTX 4090 (s) | Metal / 4090 |
+|---|---|---|---|---|---|---|
+| fibonacci | 32,768 | 0.37 / 0.36 | 0.31 / 0.31 / 0.31 | -0.05 s | 0.48 | 0.65x |
+| sha256-chain | 46,137,344 | 56.37 / 56.09 | 50.38 / 49.88 / 50.26 | -10.7 % | 35.82 | 1.40x |
+| ecdsa-verify | 65,011,712 | 78.81 / 78.63 | 69.95 / 70.31 / 70.15 | -10.9 % | 47.65 | 1.47x |
+| bigint-mul | 27,525,120 | 34.08 / 33.83 | 30.20 / 30.26 / 30.34 | -10.9 % | 19.77 | 1.53x |
+| memory-merkle | 7,340,032 | 9.18 / 9.12 | 8.22 / 8.22 / 8.22 | -10.2 % | 5.70 | 1.44x |
+| chacha-mix | 8,404,992 | 10.68 / 10.68 | 9.57 / 9.58 / 9.55 | -10.4 % | 6.67 | 1.43x |
+| **all (sum of cycles / sum of STARK time)** | 154,451,968 | 189.49 / 188.71 s, 818K c/s | 168.63 / 168.56 / 168.83 s, **916K / 916K / 915K c/s** | **+12.0 % c/s** | 116.09 s, 1.33M c/s | **1.45x** |
+
+- The RTX 5090 (~2.3M c/s) is **2.51x** this Mac (wave 5c: 2.82x). The 4090 gap fell from 1.63x to 1.45x.
+- Segments / recursion (run 1): 139.2 + 29.5 s (wave 5c 152.2 + 37.3 s): segments -8.6 %, recursion -21 %.
+  A worker segment is 0.974 s (memory-merkle 6.82 s / 7; wave 5c 1.06 s). In a `RISC0_VERBOSE=1` memory-merkle
+  run (`prof/mm_verbose.log`) the steady segments take 931-935 ms; the first takes 1187 ms.
+- Recursion per proof (same log): steady lift 93.5 ms, join 99.8-100.9 ms (wave 5c ~135 ms per lift/join
+  averaged); memory-merkle's 13 proofs take 1.40 s (wave 5c 1.75 s).
+
+**Groth16 wrap** (first and warm reported separately):
+
+| wrap | identity_p254 | shrink_wrap | total |
+|---|---|---|---|
+| warm: every wrap after the first in a process (15 samples, runs 1-3) | **732-753 ms** (median 735; wave 5c 918-922) | 611-623 ms (wave 5c 689-701) | **1.34-1.38 s** (median 1.35; wave 5c 1.61-1.62) |
+| first wrap of a `--benchmark` process (fibonacci) | 894.6-898.0 ms | 612-617 ms | **1.51 s** (wave 5c 1.80-1.81) |
+| first wrap of a fresh `BENCH_ONLY=fibonacci` worker (13 runs, `cold/warm*`, `cold/coldos*`) | 895-909 ms | 615-623 ms | **1.52-1.53 s** (wave 5c 1.80-1.81) |
+| first wrap of a fresh `BENCH_ONLY=memory-merkle` worker (14 A runs of 6.3) | 890-895 ms | 610-617 ms | 1.50-1.51 s |
+
+- **The warm wrap (1.35 s) is now 0.65 s faster than the RTX 4090's (~2.0 s); the first wrap (1.51 s) is 0.5 s
+  faster.**
+- The first wrap is still ~160 ms slower than a warm one: identity_p254 commits its ctrl group on the first job
+  (`ctrl=157.2ms(Committed)`, `prof/g16.log`). C16's `prewarm_p254_ctrl` would remove it but needs zk-miner M9.
+
+**First job of a fresh worker** (`BENCH_ONLY=fibonacci`, process wall from `time -l`): **1.92-1.99 s** (13 fresh
+runs; wave 5c 2.29-2.32 s).
+
+**Memory.**
+
+| | wave 5c | wave 6 |
+|---|---|---|
+| process peak footprint, full suite (`time -l`) | 15.67 / 15.67 GB | **15.12 / 15.13 / 15.14 GB** |
+| `--benchmark` process lifetime peak | 14942 / 14942 MiB | 14422 / 14430 / 14438 MiB |
+| CPU user time of the full suite | 29.0 / 29.0 s | 28.0 / 28.4 / 28.3 s |
+| wall time of the full suite | 199.6 / 198.7 s | **177.1 / 177.1 / 177.3 s** |
+
+Metal peaks per phase at po2 20 (MiB, segments / recursion / wrap): memory-merkle 9416 / 9416 / 5377, bigint-mul
+(largest) 10217 / 10217 / 5377, chacha-mix 9508 / 9508 / 5377, fibonacci 344 / 1477 / 5377. These are the wave-5c
+peaks plus 30 MiB in the wrap and fibonacci's recursion column (5347 -> 5377, 1449 -> 1477).
+
+## 6.2 Cold start
+
+`BENCH_ONLY=fibonacci`; `cold/`. Load 1.5-4.8.
+
+| | pipeline build | process wall (`time -l`) | first wrap |
+|---|---|---|---|
+| warm (8 runs, interleaved with the next two rows) | 0.1 s | **1.92-1.99 s** | 1.52 s |
+| cold OS shader cache (`MTL_SHADER_CACHE_SIZE=0`), archives present (5 runs; the wave-5c method) | **0.1 s** (all archive hits) | **1.93-1.99 s** (wave 5c 11.68-12.12 s) | 1.52-1.53 s |
+| same, `RISC0_METAL_ARCHIVE_ZKP=0 RISC0_METAL_ARCHIVE_REC=0` (Z16 off, 3 runs) | 7.9-9.2 s (rv32im+zkp 7.9-9.2, recursion 7.8-9.1) | 9.71-11.04 s | 1.51 s |
+| first install: `MTL_SHADER_CACHE_SIZE=0` and an empty `RISC0_METAL_ARCHIVE_DIR` (3 runs) | **65.5-84.8 s** (rv32im+zkp 65.5-84.8: zkp 72 PSOs 14.3 s, rv32im 13 PSOs 60.3 s; recursion, keccak, groth16 27-32 s each in parallel) | 67.3-86.6 s | 1.51-1.52 s |
+
+- **Z16 holds: a cold OS shader cache now costs nothing** (pipelines 0.1 s; wave 5c 9.5-9.9 s). Z16 off gives the
+  wave-5c behaviour back (7.9-9.2 s).
+- A first install (no archive anywhere) takes 65-85 s, dominated by rv32im's 13 PSOs (~60 s). Shipping Z16's
+  offline archives (`RISC0_METAL_AOT_DIR`) is the remaining fix (Z16 packaging open issue).
+
+## 6.3 Per-phase breakdown (quiet machine)
+
+### po2 20 rv32im segment
+`risc0-circuit-rv32im` release lib test `prove_po2_sweep`, `R11_PO2S=20 R11_CPU=0 R11_REPS=4`: the A and A2 arms
+of `phab/` (14 processes, per-process median of reps 1-3; load 2.2-4.4). Every seal verifies (168 / 168 across
+`phab/`). Peak GPU allocation 9303 MiB (unchanged).
+
+| phase | wave 5c ms | wave 6 ms | share |
+|---|---|---|---|
+| preflight + alloc | 11 | 11 | 1.2 % |
+| witgen | 8 | 6 | 0.6 % |
+| data commit | 217 | **210 [209-210]** | 22.5 % |
+| accum | 9 | 8 | 0.9 % |
+| accum commit | 112-113 | **109** | 11.7 % |
+| eval_check (flat + hoisted, specialized) | 608 [604-617] | **540 [533-544]** | 57.9 % |
+| FRI + tail | 53-54 | **50 [49-50]** | 5.4 % |
+| **segment** | 1020 [1016-1029] | **933 [926-937]** (-8.5 %) | |
+
+### identity_p254 + shrink_wrap (worker, `BENCH_ONLY=fibonacci`, `RISC0_VERBOSE=1 RISC0_G16_METAL_PROFILE=1`, `prof/g16.log`)
+- **identity_p254, first job** (880 ms in the prover; 896 ms in the wrap): preflight 11.0, witgen 24.1,
+  ctrl 157.2 (committed), data commit 424.5, accum 5.1, accum commit 95.3, check commit 122.1, FRI 31.8 ms.
+  GPU (`prof/p254.log`, `RISC0_METAL_REC_PROFILE=1 RISC0_METAL_PROFILE=1`): 827.6 ms, `p254_rows_w64` 548.0 ms
+  (66 %, 5 calls), `p254_fold_w64` 189.3 ms (23 %, 31 calls), C16's `p254_fold4_w64` 23.5 ms (85 calls) and
+  `p254_rows4_w64` 3.2 ms (2 calls). Wave 5c first job: GPU 1047.5 ms (rows 653.3, fold 313.9).
+- **identity_p254, later jobs**: 732-753 ms in the worker (C13's kept ctrl group; ~157 ms less than the first).
+- **shrink_wrap** (one wrap, key early-loaded, `par` witness): GPU ms zero + witness_poly 39.9, NTT 82.8,
+  sort_h 12.6, MSM H 174.9, sort_w 6.2, MSM A / B1 / C 36.4 / 36.6 / 36.3, MSM B2 150.4, **sum 576.0**
+  (wave 5c 625.5); wrap 611 ms (wave 5c 692). MSM H (188 ms with its sort) and B2 (150 ms) are now 59 % of the GPU sum.
+  Device allocation 3941.7 MiB.
+
+## 6.4 Wave-6 revert knobs: quiet interleaved A/B
+
+Every arm proved, wrapped and verified: worker 56 / 56 (default) + 40 / 40 (budgets) processes with every Groth16
+receipt `verified`; rv32im 42 / 42 sweep processes, 168 seals verified; 5 / 5 full suites.
+
+**In-process phase A/B** (`phab/`, `scripts/phab.sh`, `scripts/phana.py`): `prove_po2_sweep` po2 20, 7 rounds of A,
+R22, R23, Z14, Z15, A2 (start rotated by 2 each round), each arm against the mean of its round's A and A2. Load
+2.2-4.4. A2-A: eval_check 0.0 [-10, +1] ms, data commit 0 [-1, +1], FRI + tail 0 [-1, +1], segment 0.0 [-10, +1] ms.
+
+| item | knob (off) | phase | on (default) | off | per-round delta (off - on), off slower in | verdict |
+|---|---|---|---|---|---|---|
+| R22 + R23 (flat chain, hoist) | `RISC0_METAL_RV32IM_EVAL_FLAT=0` (nested chain; hoist exists only in the flat form) | eval_check | 540 ms | 601 [600-607] ms | **+61.5 ms [+61.0, +69.0]**, 7/7 | **holds** (the nested arm equals wave 5c's 608 ms) |
+| R23 hoist | `RISC0_METAL_RV32IM_EVAL_HOIST=0` (R22 flat) | eval_check | 540 ms | 561 [558-572] ms | **+23.0 ms [+18.0, +32.5]**, 7/7 | **holds** (R23 claimed -17 to -20 ms). R22 alone is therefore ~-38 ms (R22 claimed ~-38). |
+| Z14 commit fusion | `RISC0_METAL_COMMIT_FUSE=0` | data commit; accum commit; segment | 210; 109; 933 ms | 216; 112; 947 ms | data +6.0 [+6, +7], accum commit +3.0, witgen +2.0, accum +1.0; **segment +16.0 ms [+12.0, +19.5]**, 7/7 | **holds** (Z14 claimed -16 ms) |
+| Z15 tail (lazy eu, fused mix, sync trim) | `RISC0_METAL_EU_LAZY=0 RISC0_METAL_MIX_FUSED=0 RISC0_METAL_SYNC_TRIM=0` | FRI + tail; segment | 50; 933 ms | 53.5; 938 ms | FRI + tail **+3.5 ms [+3.0, +4.5]**, 7/7; segment +4.0 [+1.0, +13.0], 7/7 | **holds** (Z15 expected ~-5 ms; measured -4) |
+
+**Worker A/B, default budget** (`wab_def/`, `scripts/wab.sh`, `scripts/wana.py`): `BENCH_ONLY=memory-merkle
+--benchmark`, 7 rounds of A1, C15, C14, C16, G15, Z17, RV, A2 (start rotated by 3), each arm against the mean of its
+round's A1 and A2. Load 1.6-2.6. A2-A1: STARK +0.04 [-0.06, +0.08] s, recursion 0.00 [-0.01, 0.00] s,
+identity_p254 -1.3 [-3.5, +1.9] ms, shrink_wrap -0.7 [-6.5, +3.1] ms, footprint +0.003 GB.
+
+| item | knob (off) | phase | on (default) median | off median | per-round delta (off - on), off slower in | verdict |
+|---|---|---|---|---|---|---|
+| C15 recursion eval regroup | `RISC0_METAL_REC_EC_REGROUP=0` | recursion (13 proofs); identity_p254 | 1.41 s; 892 ms | 1.63 s; 910 ms | rec **+0.220 s [+0.220, +0.235] (~17 ms per proof)**, 7/7; identity_p254 +17.3 ms, 7/7 | **holds** (C15 claimed -17 ms per proof) |
+| C14 GPU WOM sort | `RISC0_METAL_REC_GPU_SORT=0` | recursion | 1.41 s | 1.49 s | rec **+0.080 s [+0.070, +0.090] (~6 ms per proof)**, 7/7; identity_p254 +4.2 ms, 7/7 | **holds** (C14 expected -4 / -6 ms per lift / join; it did not resolve on a shared machine) |
+| C16 compact + 4-lane p254 kernels | `RISC0_METAL_P254_KERNELS=w64u RISC0_METAL_P254_LANES=0` | identity_p254 (first job) | 892.6 ms | 1083.1 ms | **+190.7 ms [+189.8, +192.0]**, 7/7; wrap +0.19 s | **holds** (C16 expected ~-160 ms warm). Warm identity_p254 is 735 ms (C16 expected ~760). Metal peaks unchanged. |
+| G15 shrink_wrap kernels + coefficient order | `RISC0_G16_METAL_G15=0 RISC0_G16_METAL_COEFF_ORDER=natural` | shrink_wrap | 613 ms | 690 ms | **+76.8 ms [+72.9, +80.8]**, 7/7 | **holds** (G15 expected ~-75 ms) |
+| wave-6 rv32im items together (R22, R23, Z14, Z15) | the four knob sets of the phase A/B | segments (7); footprint | 6.83 s; 12.95 GB | 7.39 s; 14.18 GB | segments **+0.555 s [+0.515, +0.585] (+79 ms per segment)**, 7/7; recursion +0.03 s; **footprint +1.23 GB**, 7/7 | **holds**; the phase sum is +81.5 ms. The 1.2 GB footprint saving was not attributed to one item. Metal peak 16 MiB lower with the knobs off. |
+| Z17 executor stream | `RISC0_METAL_EXEC_STREAM=0` | segments | 6.83 s | 6.87 s | +0.025 s [-0.025, +0.070], 5/7 | **not resolved on memory-merkle** (its executor is 42 ms; A2-A1 spread is ±0.08 s). See the full-suite A/B below. |
+
+**Z17 on the full suite** (`full/`): `z17off1`, `full3`, `z17off2` run back to back after `full1-2`.
+STARK 169.63 / 169.03 s off against 168.63 / 168.56 / 168.83 s on; segments 140.16 / 139.51 against 139.16 / 139.06
+/ 139.38 s. Off is +0.6 s (+0.35 %) by median, slower than each neighbouring A run; Z17 estimated ~-0.85 s.
+**Holds, weakly** (2 off runs; the margin is about twice the A-A spread of the three A runs, 0.27 s).
+
+**Not measured separately:** K10 (keccak; 0 % of this benchmark, no keccak requests), C14's opt-in staging
+(`RISC0_METAL_REC_STAGE=1`, default off), Z14's `RISC0_METAL_PREFILL=0` alone, Z15's three knobs one by one,
+G15's single `RISC0_G16_METAL_G15_OFF=` switches, C16's `RISC0_METAL_RELEASE_SEG_BEFORE_REC` default change,
+R22's regime guard (no speed effect by design; the log shows `ef_eval_split: native stack 3984 B ... fast regime`).
+
+## 6.5 Simulated budgets (`RISC0_METAL_MAX_WORKING_SET_BYTES`)
+
+`BENCH_ONLY=fibonacci` (3 fresh runs per budget, `bud/`) and `BENCH_ONLY=memory-merkle` (5 rounds of A1, G15, RV,
+A2 per budget, `bud_4g/`, `bud_8g/`; load 1.6-2.5). **Everything proves, wraps and verifies at both budgets.**
+
+| budget | program | segment po2 | STARK | Groth16 wrap (identity_p254 + shrink_wrap) | Metal peak MiB (segments / recursion / wrap) | process peak footprint |
+|---|---|---|---|---|---|---|
+| 4 GiB | fibonacci | 18 | 0.31 s | **1.64 s** (0.885 + 0.750; wave 5c 1.93) | 344 / 1477 / 3942 | 4.56-4.58 GB (wave 5c 4.54-4.56) |
+| 4 GiB | memory-merkle | 18 | **14.45 [14.43-14.48] s** (8.29 + 6.16), 8,388,608 cycles, **581K c/s** (wave 5c 16.80 s, 499K) | 1.63-1.64 s | 2492 / 1828 / 3942 | **5.50 GB** (wave 5c 6.76) |
+| 8 GiB | fibonacci | 19 | 0.31 s | 1.65 s (0.890-0.895 + 0.749-0.755; wave 5c 1.94-1.95) | 344 / 1477 / 5377 | 4.62-4.63 GB (wave 5c 4.62) |
+| 8 GiB | memory-merkle | 19 | **10.58 [10.53-10.61] s** (7.65 + 2.93), 7,864,320 cycles, **743K c/s** (wave 5c 12.03 s, 654K) | 1.65-1.66 s | 4784 / 3096 / 5377 | **7.58 GB** (wave 5c 8.74) |
+| 28.1 GiB (default) | memory-merkle | 20 | 8.24 s, 891K c/s | 1.51 s first / 1.35 s warm | 9420 / 9420 / 5377 | 12.95 GB (BENCH_ONLY; wave 5c 14.17) |
+
+Budget A/B (per-round delta against the mean of A1 and A2; A2-A1 STARK +0.02 [-0.06, +0.07] s at 4 GiB, -0.01
+[-0.05, +0.02] s at 8 GiB):
+
+| budget | arm | delta, off slower in | verdict |
+|---|---|---|---|
+| 4 GiB | G15 off | shrink_wrap **+76.8 ms [+74.2, +80.1]**, 5/5 | holds (with the `fast` evaluator) |
+| 4 GiB | rv32im items off | segments **+0.640 s [+0.595, +0.715]**, recursion +0.140 s, STARK +0.775 s, 5/5; footprint **+1.32 GB** | holds |
+| 8 GiB | G15 off | shrink_wrap **+75.5 ms [+74.7, +81.4]**, 5/5 | holds |
+| 8 GiB | rv32im items off | segments **+0.635 s [+0.570, +0.665]**, recursion +0.070 s, STARK +0.705 s, 5/5; footprint **+1.16 GB** | holds |
+
+- Below 20 GiB, shrink_wrap is 0.75 s against 0.61 s at the default budget (`fast` evaluator, as in wave 5c).
+- Recursion is 43 % of memory-merkle's STARK at 4 GiB (6.16 of 14.45 s; wave 5c 46 %).
+
+## 6.6 Open items from this baseline
+
+- **No wave-6 knob fails to hold.** Z17 is the weakest (+0.35 % of the full-suite STARK with 2 off runs; not
+  resolved on memory-merkle). Everything else beats its A-A spread in every round.
+- **STARK 916K c/s, 1.45x the RTX 4090's time, 2.51x below the RTX 5090.** A po2 20 segment is 933 ms: eval_check
+  58 %, data commit 22.5 %, accum commit 11.7 %. The commits (319 ms) are the next segment target after Z13's NO-GO.
+- **First-job wrap**: still +160 ms over warm (identity_p254's ctrl commit). zk-miner M9 (calling
+  `prewarm_p254_ctrl` and `metal_prewarm_segment_po2` at worker start) would remove it and the first segment's
+  ~250 ms excess (1187 against 932 ms steady).
+- **First install** takes 65-85 s of PSO compiles (rv32im ~60 s). A cold OS cache with archives present is now free.
+  Shipping offline archives (Z16 packaging) is the fix.
+- The ~1.2 GB footprint saving of the rv32im wave-6 items (6.4) is unattributed; a per-knob footprint A/B
+  would place it (Z14's prefill is the likely candidate).
+- Not measured here: K10 (no keccak in the benchmark), 8-10 and 16-20-core parts, a real 16 GB Mac,
+  `comprehensive_zkvm_test`, CPU prover baselines.
