@@ -38,8 +38,9 @@ const P: u32 = 0x7800_0001;
 const R: [u32; 8] = [
     0xf0000001, 0x43e1f593, 0x79b97091, 0x2833e848, 0x8181585d, 0xb85045b6, 0xe131a029, 0x30644e72,
 ];
-const ALL: [Poseidon254Kernels; 3] = [
+const ALL: [Poseidon254Kernels; 4] = [
     Poseidon254Kernels::W64,
+    Poseidon254Kernels::W64Unrolled,
     Poseidon254Kernels::W64Cios,
     Poseidon254Kernels::Ref,
 ];
@@ -113,13 +114,6 @@ fn cpu_tree(cpu: &Cpu, io: &[Digest], layers: usize) -> Vec<Digest> {
     b.to_vec()
 }
 
-fn cfg(kernels: Poseidon254Kernels) -> Poseidon254Config {
-    Poseidon254Config {
-        kernels,
-        ..Default::default()
-    }
-}
-
 fn metal_rows_with(
     hal: &MetalHalPoseidon254,
     c: &Poseidon254Config,
@@ -172,16 +166,25 @@ fn fold_matches_cpu() {
         let io = digests(&mut rng(100 + i as u64), 4 * n);
         let want = cpu_fold(&cpu, &io, n);
         for k in ALL {
-            for tg in [0, 96] {
+            // lanes: 0 = one thread per hash, MAX = the 4-lane kernel (`p254_fold4_w64`) for
+            // every layer (`Ref` ignores it).
+            for (tg, lanes) in [
+                (0, 0),
+                (96, 0),
+                (0, u32::MAX),
+                (96, u32::MAX),
+                (30, u32::MAX),
+            ] {
                 let c = Poseidon254Config {
                     kernels: k,
                     tg,
+                    lanes,
                     ..Default::default()
                 };
                 let got = metal_fold_with(&hal, &c, &io, n);
                 assert!(
                     got == want,
-                    "fold {k:?} tg {tg} n {n}: first diff at {:?}",
+                    "fold {k:?} tg {tg} lanes {lanes} n {n}: first diff at {:?}",
                     first_diff(&got, &want)
                 );
             }
@@ -205,12 +208,21 @@ fn rows_matches_cpu() {
             let m = elems(&mut rng(seed), rows * cols);
             let want = cpu_rows(&cpu, &m, rows);
             for k in ALL {
-                let got = metal_rows_with(&hal, &cfg(k), &m, rows);
-                assert!(
-                    got == want,
-                    "rows {k:?} {rows} x {cols}: first diff at {:?}",
-                    first_diff(&got, &want)
-                );
+                // lanes MAX: the 4-lane kernel (`p254_rows4_w64`; `Ref` ignores it).
+                for (tg, lanes) in [(0, 0), (0, u32::MAX), (30, u32::MAX)] {
+                    let c = Poseidon254Config {
+                        kernels: k,
+                        tg,
+                        lanes,
+                        ..Default::default()
+                    };
+                    let got = metal_rows_with(&hal, &c, &m, rows);
+                    assert!(
+                        got == want,
+                        "rows {k:?} tg {tg} lanes {lanes} {rows} x {cols}: first diff at {:?}",
+                        first_diff(&got, &want)
+                    );
+                }
             }
         }
     }
@@ -347,7 +359,7 @@ fn time_ms(hal: &MetalHalPoseidon254, f: impl FnOnce()) -> f64 {
 }
 
 /// Kernel timing at the recursion shapes, the variants interleaved (`Z10_BENCH_REPS`, default 7;
-/// `Z10_BENCH_VARIANTS`, `kernels[:tg[:cpu_tail[:cpu_rows]]]` comma list, e.g. `w64,w64c,ref` or
+/// `Z10_BENCH_VARIANTS`, `kernels[:tg[:cpu_tail[:cpu_rows[:lanes]]]]` comma list, e.g. `w64,w64c,ref` or
 /// `w64:0:0:0,w64:0:2048:1024` for threadgroup sizes). Prints
 /// `Z10BENCH` lines: median / min / max ms per shape and variant, and the per-proof total.
 #[test]
@@ -362,7 +374,7 @@ fn bench_kernels() {
         .unwrap_or_else(|_| "w64,w64c,ref".into())
         .split(',')
         .map(|v| {
-            // kernels[:tg[:cpu_tail[:cpu_rows]]]
+            // kernels[:tg[:cpu_tail[:cpu_rows[:lanes]]]]
             let f: Vec<&str> = v.split(':').collect();
             let num = |i: usize| f.get(i).map_or(0, |x| x.parse().unwrap());
             let k = f[0];
@@ -370,9 +382,11 @@ fn bench_kernels() {
                 tg: num(1),
                 cpu_tail: num(2),
                 cpu_rows: num(3),
+                lanes: num(4),
                 kernels: match k {
                     "ref" => Poseidon254Kernels::Ref,
                     "w64c" => Poseidon254Kernels::W64Cios,
+                    "w64u" => Poseidon254Kernels::W64Unrolled,
                     _ => Poseidon254Kernels::W64,
                 },
             }
@@ -421,12 +435,13 @@ fn bench_kernels() {
             let (rmin, rmax) = minmax(&tr[vi]);
             let (fmin, fmax) = minmax(&tf[vi]);
             println!(
-                "Z10BENCH {name} {rows}x{cols} {:?}/tg{}/t{}/r{}: rows med {:.2} ms [{rmin:.2}, {rmax:.2}] \
+                "Z10BENCH {name} {rows}x{cols} {:?}/tg{}/t{}/r{}/l{}: rows med {:.2} ms [{rmin:.2}, {rmax:.2}] \
                  tree med {:.2} ms [{fmin:.2}, {fmax:.2}]",
                 c.kernels,
                 c.tg,
                 c.cpu_tail,
                 c.cpu_rows,
+                c.lanes,
                 median(&mut tr[vi].clone()),
                 median(&mut tf[vi].clone()),
             );
@@ -435,11 +450,12 @@ fn bench_kernels() {
     for (vi, c) in variants.iter().enumerate() {
         let (mn, mx) = minmax(&totals[vi]);
         println!(
-            "Z10BENCH total {:?}/tg{}/t{}/r{}: med {:.1} ms [{mn:.1}, {mx:.1}]",
+            "Z10BENCH total {:?}/tg{}/t{}/r{}/l{}: med {:.1} ms [{mn:.1}, {mx:.1}]",
             c.kernels,
             c.tg,
             c.cpu_tail,
             c.cpu_rows,
+            c.lanes,
             median(&mut totals[vi].clone())
         );
     }
@@ -559,8 +575,18 @@ fn r17_p254_stress() {
         io.extend_from_slice(&want);
         let want_fold = cpu_fold(&cpu, &io, rows / 2);
         let mb = hal.copy_from_elem("m", &m);
-        for k in ALL {
-            let c = cfg(k);
+        // Each arithmetic variant one thread per hash (lanes 0), plus the 4-lane kernels (C16)
+        // for every hash, so both run at full size.
+        let variants = ALL
+            .iter()
+            .map(|&k| (k, 0))
+            .chain([(Poseidon254Kernels::W64, u32::MAX)]);
+        for (k, lanes) in variants {
+            let c = Poseidon254Config {
+                kernels: k,
+                lanes,
+                ..Default::default()
+            };
             let (mut vs_first, mut vs_cpu, mut fvs_first, mut fvs_cpu) = (0, 0, 0, 0);
             let (mut first, mut ffirst): (Option<Vec<Digest>>, Option<Vec<Digest>>) = (None, None);
             for _ in 0..reps {
@@ -580,15 +606,15 @@ fn r17_p254_stress() {
                 }
             }
             println!(
-                "R17AUDIT zkp hash_rows/poseidon254 {k:?} {cols}x2^{po2}: {vs_first}/{reps} reps \
+                "R17AUDIT zkp hash_rows/poseidon254 {k:?}/l{lanes} {cols}x2^{po2}: {vs_first}/{reps} reps \
                  differ from rep 0, {vs_cpu}/{reps} differ from CPU"
             );
             println!(
-                "R17AUDIT zkp hash_fold/poseidon254 {k:?} 2^{po2}: {fvs_first}/{reps} reps differ \
+                "R17AUDIT zkp hash_fold/poseidon254 {k:?}/l{lanes} 2^{po2}: {fvs_first}/{reps} reps differ \
                  from rep 0, {fvs_cpu}/{reps} differ from CPU"
             );
             if vs_first + vs_cpu + fvs_first + fvs_cpu > 0 {
-                bad.push((k, cols));
+                bad.push((k, lanes, cols));
             }
         }
     }
@@ -596,4 +622,15 @@ fn r17_p254_stress() {
         bad.is_empty(),
         "R17AUDIT poseidon254 nondeterministic or wrong: {bad:?}"
     );
+}
+
+/// C16: the 4-lane threshold follows the GPU's core count (128 hashes per core).
+#[test]
+fn default_lanes_follows_core_count() {
+    use super::poseidon254::{default_lanes, LANES_FALLBACK, LANES_PER_CORE};
+    let lanes = default_lanes();
+    println!("C16 default 4-lane threshold: {lanes} hashes");
+    assert!(lanes >= LANES_FALLBACK.min(LANES_PER_CORE));
+    assert_eq!(lanes % LANES_PER_CORE, 0);
+    assert_eq!(Poseidon254Config::default().lanes, lanes);
 }

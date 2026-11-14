@@ -74,7 +74,9 @@ pub(crate) fn release_cached_provers() {
 
 /// Revert knob for item Z12 (docs/metal-port/notes/Z12.md): `0` keeps the segment prover cached
 /// through recursion (the pre-Z12 behaviour), `1` always releases it, unset (or anything else)
-/// decides from the working-set budget (see `release_segment_prover_before_recursion`).
+/// decides from the working-set budget and, since item C16, also releases it when a Groth16 wrap
+/// follows in the same call; `budget` decides from the budget only (the pre-C16 auto mode). See
+/// `release_segment_prover_before_recursion`.
 #[cfg(feature = "metal")]
 pub(crate) const RELEASE_SEG_BEFORE_REC_ENV: &str = "RISC0_METAL_RELEASE_SEG_BEFORE_REC";
 
@@ -128,8 +130,16 @@ pub(crate) fn seg_release_reason(mode: &str, memory: Option<(u64, u64)>) -> Opti
 /// prover (the PSOs are process-wide and stay); in the worker the wrap releases it after every
 /// proof anyway. Runs on the proving thread (the cache is per thread); a prover in use is left
 /// alone (`release_cached_segment_prover`).
+///
+/// Item C16 (c): in auto mode it also releases when this call goes on to a Groth16 wrap
+/// (`wrap_follows`). The wrap drops the segment prover anyway (`succinct_to_groth16`'s release
+/// before identity_p254, then `release_hal_buffers`), and dropping it there, beside the recursion
+/// provers, cost identity_p254 50-80 ms at the default budget (notes/C16.md), against ~20-30 ms
+/// here; recursion also runs ~20 ms faster without the segment pool beside it (BASELINES 5c.3).
+/// Nothing that outlives the call changes: the next session rebuilds the prover either way.
+/// `RISC0_METAL_RELEASE_SEG_BEFORE_REC=budget` keeps the pre-C16 auto mode.
 #[cfg(feature = "metal")]
-fn release_segment_prover_before_recursion() {
+fn release_segment_prover_before_recursion(wrap_follows: bool) {
     #[cfg(test)]
     let forced = RELEASE_SEG_MODE.with(|m| *m.borrow());
     #[cfg(not(test))]
@@ -138,12 +148,18 @@ fn release_segment_prover_before_recursion() {
         Some(m) => m.to_string(),
         None => std::env::var(RELEASE_SEG_BEFORE_REC_ENV).unwrap_or_default(),
     };
+    let auto = !matches!(mode.trim(), "0" | "1" | "budget");
     // Only auto mode asks the device (one `MTLDevice` query, microseconds).
     let memory = match mode.trim() {
         "0" | "1" => None,
         _ => risc0_zkp::hal::metal::device_memory(),
     };
-    let Some(reason) = seg_release_reason(&mode, memory) else {
+    let reason = if auto && wrap_follows {
+        Some("a Groth16 wrap follows".to_string())
+    } else {
+        seg_release_reason(&mode, memory)
+    };
+    let Some(reason) = reason else {
         return;
     };
     let t = std::time::Instant::now();
@@ -1457,7 +1473,9 @@ impl ProverImpl {
                     // The PoVW path folds through the generic `Compress`, not
                     // `composite_to_succinct` below, so it releases here.
                     #[cfg(feature = "metal")]
-                    release_segment_prover_before_recursion();
+                    release_segment_prover_before_recursion(
+                        self.opts.receipt_kind == ReceiptKind::Groth16,
+                    );
                     let work_receipt = self.composite_to_succinct_povw(&composite_receipt)?;
                     let unwrapped = self.unwrap_povw(&work_receipt)?;
                     (unwrapped, Some(work_receipt), None)
@@ -1904,8 +1922,10 @@ impl ProverServer for ProverImpl {
             join_with_opts, lift_with_opts, make_succinct_receipt, Prover as RecursionProverJob,
         };
 
+        // C16: this prover's options say whether a Groth16 wrap follows (`prove_session`, and
+        // `compress` with the options the prover was made with).
         #[cfg(feature = "metal")]
-        release_segment_prover_before_recursion();
+        release_segment_prover_before_recursion(self.opts.receipt_kind == ReceiptKind::Groth16);
 
         let t_pipeline = std::time::Instant::now();
         let segments = &composite_receipt.segments;

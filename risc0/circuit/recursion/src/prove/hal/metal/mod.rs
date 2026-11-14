@@ -46,6 +46,8 @@ mod c11_tests;
 mod c13_tests;
 #[cfg(all(test, feature = "test"))]
 mod c15_tests;
+#[cfg(all(test, feature = "test"))]
+mod c16_tests;
 pub(crate) mod capture;
 mod eval_check;
 pub(crate) mod profile;
