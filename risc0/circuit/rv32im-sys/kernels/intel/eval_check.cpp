@@ -14,25 +14,42 @@ static const char* make_error(const char* msg) { return strdup(msg); }
 
 // This source is built several times (see build.rs): as risc0_rv32im_intel, with the XMX linking
 // chains; as risc0_rv32im_intel_noxmx (RISC0_RV32IM_EVAL_NOXMX), without them; and as
-// risc0_rv32im_intel_hi and _lo (RISC0_RV32IM_EVAL_PART_HI / _LO), the constraint polynomial's
-// terms of degree > 3 and <= 3 (evalfast/degsplit.py), without the chains. The later libraries
-// export the same functions with their suffix; the first library's exports pick one (end of file).
+// risc0_rv32im_intel_lo, _mid and _hi (RISC0_RV32IM_EVAL_PART_LO / _MID / _HI), the constraint
+// polynomial's terms of degree <= 3, 4 and 5 (evalfast/degsplit.py), without the chains. The later
+// libraries export the same functions with their suffix; the first library's exports pick one
+// (end of file).
 //
-// The _lo library evaluates only the even rows of the 4N-point coset (RK_ROWSTEP 2) into a
-// 2N-row output: every constraint term vanishes on the trace domain, so its part of the quotient
-// has degree < (3 - 1) * N = 2N, and the host extends it to the odd rows with two NTTs (intel.rs).
+// Every constraint term vanishes on the trace domain H (|H| = N = domain / 4), so the quotient of
+// the terms of degree <= d by Z_H has degree < (d - 1) * N. The _lo library evaluates only the even
+// rows of the 4N-point coset (2N rows, row j at output row j / 2); the _mid library only the rows
+// of three of its four cosets of H, cycle = 4 m + c for c < 3, coset-major (output row c N + m).
+// The host recovers the rest (intel.rs, and the helpers at the end of this file).
 #if defined(RISC0_RV32IM_EVAL_PART_HI)
 #define RV_EVAL_FN(name) extern "C" const char* name##_hi
-#define RK_ROWSTEP 1u
 #elif defined(RISC0_RV32IM_EVAL_PART_LO)
 #define RV_EVAL_FN(name) extern "C" const char* name##_lo
-#define RK_ROWSTEP 2u
+#elif defined(RISC0_RV32IM_EVAL_PART_MID)
+#define RV_EVAL_FN(name) extern "C" const char* name##_mid
 #elif defined(RISC0_RV32IM_EVAL_NOXMX)
 #define RV_EVAL_FN(name) extern "C" const char* name##_noxmx
-#define RK_ROWSTEP 1u
 #else
 #define RV_EVAL_FN(name) static const char* name##_local
-#define RK_ROWSTEP 1u
+#endif
+#if defined(RISC0_RV32IM_EVAL_PART_LO)
+#define RK_OUT_ROWS(domain) ((domain) / 2)
+#define RK_CYCLE(orow, domain) ((orow) * 2u)
+#define RK_OUT_INDEX(orow, domain) (orow)
+#elif defined(RISC0_RV32IM_EVAL_PART_MID)
+// Rows in order, skipping those of coset 3 (so a work-group reads nearly contiguous rows; a
+// coset-major order, rows 4 apart, left the kernel waiting on memory), each written to its
+// coset-major output row.
+#define RK_OUT_ROWS(domain) ((domain) / 4 * 3)
+#define RK_CYCLE(orow, domain) ((orow) + (orow) / 3u)
+#define RK_OUT_INDEX(orow, domain) (((orow) % 3u) * ((domain) / 4) + (orow) / 3u)
+#else
+#define RK_OUT_ROWS(domain) (domain)
+#define RK_CYCLE(orow, domain) (orow)
+#define RK_OUT_INDEX(orow, domain) (orow)
 #endif
 
 #ifdef RK_NWORDS
@@ -143,8 +160,8 @@ RV_EVAL_FN(risc0_circuit_rv32im_intel_eval_check)(
         }
         const uint32_t wgsz = WG_SIZE;
         constexpr uint32_t POLY_MIX_COUNT = 484;
-        // Output rows: every RK_ROWSTEP-th row of the domain, row j at check[i * out_rows + j].
-        const uint32_t out_rows = domain / RK_ROWSTEP;
+        // Output rows (see RK_OUT_ROWS / RK_CYCLE / RK_OUT_INDEX above).
+        const uint32_t out_rows = RK_OUT_ROWS(domain);
 #ifdef RK_NWORDS
         std::lock_guard<std::mutex> slab_lock(g_slab_mutex);
         const uint32_t tile = slab_tile(q, out_rows);
@@ -165,7 +182,7 @@ RV_EVAL_FN(risc0_circuit_rv32im_intel_eval_check)(
 #else
                     uint32_t orow = item.get_global_id(0);
 #endif
-                    uint32_t cycle = orow * RK_ROWSTEP;
+                    uint32_t cycle = RK_CYCLE(orow, domain);
                     uint32_t lid = item.get_local_id(0);
                     for (uint32_t i = lid; i < POLY_MIX_COUNT; i += wgsz) slm[i] = poly_mix[i];
                     sycl::group_barrier(item.get_group());
@@ -189,7 +206,7 @@ RV_EVAL_FN(risc0_circuit_rv32im_intel_eval_check)(
                     Fp quot = inv(y - Fp(1));
 #endif
                     for (uint32_t i = 0; i < 4; i++)
-                        check[i * out_rows + orow] = tot.elems[i] * quot;
+                        check[i * out_rows + RK_OUT_INDEX(orow, domain)] = tot.elems[i] * quot;
                 });
         });
 #ifdef RK_NWORDS
@@ -225,7 +242,7 @@ RV_EVAL_FN(risc0_circuit_rv32im_intel_eval_check_release)() {
 }
 
 #if !defined(RISC0_RV32IM_EVAL_NOXMX) && !defined(RISC0_RV32IM_EVAL_PART_HI) && \
-    !defined(RISC0_RV32IM_EVAL_PART_LO)
+    !defined(RISC0_RV32IM_EVAL_PART_LO) && !defined(RISC0_RV32IM_EVAL_PART_MID)
 // The exports: risc0_rv32im_intel_noxmx's kernel, loaded from this library's directory, and this
 // library's (the XMX linking chains) only with RISC0_INTEL_EVAL_NOXMX=0 on a GPU with Xe2's DPAS
 // (Battlemage, Lunar Lake). The chains are written for Xe2's SIMD16 DPAS; on Alchemist (Arc A770),
@@ -350,17 +367,21 @@ extern "C" const char* risc0_circuit_rv32im_intel_eval_check_sync(void* queue_pt
     return risc0_circuit_rv32im_intel_eval_check_sync_local(queue_ptr);
 }
 
-// The split evaluation: risc0_rv32im_intel_hi's kernel (the terms of degree > 3) on every row
-// into `check` (4 * domain), and risc0_rv32im_intel_lo's (degree <= 3) on the even rows into
-// `check_lo` (4 * domain / 2). The caller extends check_lo to every row and adds it (intel.rs).
+// The split evaluation (degsplit.py's parts): risc0_rv32im_intel_hi's kernel on every row into
+// `check` (4 * domain), risc0_rv32im_intel_lo's (degree <= 3) on the even rows into `check_lo`
+// (4 * domain / 2) and, when built, risc0_rv32im_intel_mid's (degree 4) on cosets 0, 1 and 2 of H
+// into `check_mid` (4 * 3 * domain / 4, coset-major). The caller recovers the rest of lo and mid and
+// adds them (intel.rs). Without _mid, _hi holds every term of degree > 3.
 namespace {
 std::once_flag g_parts_once;
-NoXmx g_hi, g_lo;
+NoXmx g_hi, g_lo, g_mid;
+int g_parts = 0;
 }  // namespace
 
-// 1 when both libraries load (they are built beside this one when it has the XMX chains) and the
-// queue's GPU is one the split was measured on (Xe2: Battlemage, Lunar Lake), or
-// RISC0_INTEL_EVAL_SPLIT=1 asks for it on any GPU. Decided once, for the first queue's device.
+// The number of parts (3: hi, mid, lo; 2: hi, lo) when their libraries load (they are built beside
+// this one when it has the XMX chains) and the queue's GPU is one the split was measured on (Xe2:
+// Battlemage, Lunar Lake), or RISC0_INTEL_EVAL_SPLIT=1 asks for it on any GPU; else 0. Decided
+// once, for the first queue's device.
 extern "C" int risc0_circuit_rv32im_intel_eval_check_parts_available(void* queue_ptr) {
 #ifdef RISC0_RV32IM_EVAL_XMX
     try {
@@ -372,10 +393,12 @@ extern "C" int risc0_circuit_rv32im_intel_eval_check_parts_available(void* queue
             if (!want) return;
             load_part(g_hi, "hi");
             load_part(g_lo, "lo");
-            g_hi.use = g_hi.eval && g_lo.eval;
+            if (!g_hi.eval || !g_lo.eval) return;
+            load_part(g_mid, "mid");
+            g_parts = g_mid.eval ? 3 : 2;
         });
     } catch (...) { return 0; }
-    return g_hi.use ? 1 : 0;
+    return g_parts;
 #else
     (void)queue_ptr;
     return 0;
@@ -383,25 +406,94 @@ extern "C" int risc0_circuit_rv32im_intel_eval_check_parts_available(void* queue
 }
 
 extern "C" const char* risc0_circuit_rv32im_intel_eval_check_parts(
-    void* queue_ptr, void* d_check, void* d_check_lo, const void* d_data, const void* d_accum,
-    const void* d_out, const void* d_mix, const void* d_poly_mix, uint32_t rou_raw, uint32_t po2,
-    uint32_t domain) {
-    if (!risc0_circuit_rv32im_intel_eval_check_parts_available(queue_ptr))
-        return make_error("eval_check: risc0_rv32im_intel_hi / _lo are not available");
+    void* queue_ptr, void* d_check, void* d_check_lo, void* d_check_mid, const void* d_data,
+    const void* d_accum, const void* d_out, const void* d_mix, const void* d_poly_mix,
+    uint32_t rou_raw, uint32_t po2, uint32_t domain) {
+    const int parts = risc0_circuit_rv32im_intel_eval_check_parts_available(queue_ptr);
+    if (parts == 0) return make_error("eval_check: risc0_rv32im_intel_hi / _lo are not available");
+    if ((parts == 3) != (d_check_mid != nullptr))
+        return make_error("eval_check: check_mid must be given exactly when _mid is built");
     if (const char* err = g_hi.eval(queue_ptr, d_check, d_data, d_accum, d_out, d_mix,
                                     d_poly_mix, rou_raw, po2, domain))
         return err;
+    if (parts == 3) {
+        if (const char* err = g_mid.eval(queue_ptr, d_check_mid, d_data, d_accum, d_out, d_mix,
+                                         d_poly_mix, rou_raw, po2, domain))
+            return err;
+    }
     return g_lo.eval(queue_ptr, d_check_lo, d_data, d_accum, d_out, d_mix, d_poly_mix, rou_raw,
                      po2, domain);
+}
+
+// check[i * domain + 4 m + c0 + c] += src[(i * n + c) * q + m] for the 4 limbs i, c < n, m < q =
+// domain / 4: adds n cosets of H, stored coset-major, into their rows of `check`.
+extern "C" const char* risc0_circuit_rv32im_intel_eval_check_add_cosets(
+    void* queue_ptr, void* d_check, const void* d_src, uint32_t domain, uint32_t c0, uint32_t n) {
+    auto* q = static_cast<sycl::queue*>(queue_ptr);
+    try {
+        auto* check = static_cast<Fp*>(d_check);
+        const auto* src = static_cast<const Fp*>(d_src);
+        const uint32_t qn = domain / 4;
+        q->parallel_for(sycl::range<1>(size_t(4) * n * qn), [=](sycl::id<1> id) {
+            const size_t k = id[0];
+            const uint32_t m = uint32_t(k % qn);
+            const size_t ic = k / qn;
+            const uint32_t c = uint32_t(ic % n), i = uint32_t(ic / n);
+            Fp& dst = check[size_t(i) * domain + size_t(m) * 4 + c0 + c];
+            dst = dst + src[k];
+        });
+        return nullptr;
+    } catch (const sycl::exception& e) { return make_error(e.what()); }
+    catch (const std::exception& e) { return make_error(e.what()); }
+    catch (...) { return make_error("Unknown error in eval_check_add_cosets"); }
+}
+
+// Coset 3 of the degree-4 part from its cosets 0, 1, 2. Its quotient Q has degree < 3N, so
+// Q(x) = sum_{i<N} x^i q_i(x^N) with each q_i of degree <= 2. On coset c (x = 3 w^(4m+c), w the
+// 4N-th root `rou`), x^N = y_c = 3^N w4^c (w4 = w^N), so the values there are the size-N transform
+// of a_{c,i} = (3 w^c)^i q_i(y_c). The y_c are a constant times the 4th roots of unity, so
+// sum_c y_c^-3 q_i(y_c) = 0 for a quadratic q_i, which gives
+//   a_{3,i} = -sum_{k=1..3} w^(k (i + 3N)) a_{3-k,i}.
+// `coeffs`: batch_interpolate_ntt of the three cosets (limb-major, then coset), so coefficient i
+// sits at position bitrev(i); `out` gets a_3 in the same order (4 limbs * N).
+extern "C" const char* risc0_circuit_rv32im_intel_eval_check_coset3(
+    void* queue_ptr, void* d_out, const void* d_coeffs, uint32_t rou_raw, uint32_t po2) {
+    auto* q = static_cast<sycl::queue*>(queue_ptr);
+    try {
+        auto* out = static_cast<Fp*>(d_out);
+        const auto* co = static_cast<const Fp*>(d_coeffs);
+        Fp w;
+        std::memcpy(&w, &rou_raw, sizeof(uint32_t));
+        const uint32_t qn = 1u << po2;
+        q->parallel_for(sycl::range<1>(qn), [=](sycl::id<1> id) {
+            const uint32_t pos = uint32_t(id[0]);
+            uint32_t r = pos, ci = 0;
+            for (uint32_t b = 0; b < po2; b++) { ci = (ci << 1) | (r & 1u); r >>= 1; }
+            const Fp t = pow(w, size_t(ci) + 3 * size_t(qn));
+            const Fp t2 = t * t, t3 = t2 * t;
+            for (uint32_t i = 0; i < 4; i++) {
+                const Fp a0 = co[(size_t(i) * 3 + 0) * qn + pos];
+                const Fp a1 = co[(size_t(i) * 3 + 1) * qn + pos];
+                const Fp a2 = co[(size_t(i) * 3 + 2) * qn + pos];
+                out[size_t(i) * qn + pos] = Fp(0) - (t * a2 + t2 * a1 + t3 * a0);
+            }
+        });
+        return nullptr;
+    } catch (const sycl::exception& e) { return make_error(e.what()); }
+    catch (const std::exception& e) { return make_error(e.what()); }
+    catch (...) { return make_error("Unknown error in eval_check_coset3"); }
 }
 
 extern "C" const char* risc0_circuit_rv32im_intel_eval_check_release() {
     if (g_noxmx.use && g_noxmx.release) {
         if (const char* err = g_noxmx.release()) return err;
     }
-    if (g_hi.use) {
+    if (g_parts) {
         if (const char* err = g_hi.release()) return err;
         if (const char* err = g_lo.release()) return err;
+        if (g_parts == 3) {
+            if (const char* err = g_mid.release()) return err;
+        }
     }
     return risc0_circuit_rv32im_intel_eval_check_release_local();
 }

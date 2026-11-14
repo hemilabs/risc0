@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-# degsplit.py in.cpp out_hi.cpp out_lo.cpp [DMAX]: split the constraint polynomial poly_fp of an
-# eval_check amalgamation (build.rs's intel_eval_check_amalg.cpp) into two: out_hi keeps the
-# linked terms of degree > DMAX (default 3), out_lo those of degree <= DMAX, each with the code
-# only the other needed removed. out_hi + out_lo == in, for any inputs.
+# degsplit.py in.cpp out_0.cpp ... out_k.cpp [--cuts c1,...,ck]: split the constraint polynomial
+# poly_fp of an eval_check amalgamation (build.rs's intel_eval_check_amalg.cpp) by the degree of
+# its linked terms: out_0 keeps the terms of degree <= c1, out_i those in (c_i, c_i+1], out_k those
+# > ck (default cuts: 3), each with the code only the others needed removed. The parts add up to
+# `in` for any inputs (verify_split.py checks it).
 #
 # Why: every linked term (a constraint, times its selectors) vanishes on the trace domain H
-# (|H| = N = 2^po2) for a valid witness, so the quotient of the degree-<=DMAX part by Z_H = x^N - 1
-# has degree < (DMAX - 1) * N. With DMAX = 3 that is < 2N: eval_check can evaluate it on the even
-# half of its 4N-point coset and extend it to the odd half (see eval_check.cpp and intel.rs),
-# instead of evaluating it on all 4N points.
+# (|H| = N = 2^po2) for a valid witness, so the quotient of a part of degree <= d by Z_H = x^N - 1
+# has degree < (d - 1) * N and is fixed by fewer than the 4N points of eval_check's coset: degree
+# <= 3 by its even half (2N), degree 4 by three of its four cosets of H (3N). See eval_check.cpp
+# and intel.rs.
 #
 # Degrees are in units of N: a trace load (data, accum, through a hoisted _h param or a per-row
 # array slot) is 1, a global, mix or constant 0, a product adds, a sum takes the max. A link
@@ -18,8 +19,19 @@
 import re, sys, collections
 from dag import build_all
 
-src_path, out_hi, out_lo = sys.argv[1], sys.argv[2], sys.argv[3]
-DMAX = int(sys.argv[4]) if len(sys.argv) > 4 else 3
+args = sys.argv[1:]
+CUTS = [3]
+if '--cuts' in args:
+    i = args.index('--cuts')
+    CUTS = [int(c) for c in args[i + 1].split(',')]
+    args = args[:i] + args[i + 2:]
+src_path, OUTS = args[0], args[1:]
+assert len(OUTS) == len(CUTS) + 1 and CUTS == sorted(CUTS), 'degsplit: need one output per part'
+
+
+def part_of(d):
+    """The part a term of degree d goes to: the number of cuts below d."""
+    return sum(1 for c in CUTS if d > c)
 src, lines, funcs, wrapper, Fs = build_all(src_path)
 FN = {F.name: F for F in Fs}
 fmeta = {f['name']: f for f in funcs}
@@ -184,22 +196,23 @@ def run(fname, argmap):
 root = run('poly_fp', {})
 assert is_acc(root)
 # A sub-sum may reach the result more than once (a block's constraints under several selectors);
-# a term is removed from every use at once, so it goes to out_lo only if all its uses have degree
-# <= DMAX (out_hi is evaluated on every point and takes any degree).
+# a term is removed from every use at once, so it goes to the part of its highest-degree use (a
+# part's points suffice for any lower degree).
 uses = collections.defaultdict(set)
 for d, leaf in terms[root]:
     uses[leaf].add(d)
-mixed = [leaf for leaf, ds in uses.items() if len({d > DMAX for d in ds}) > 1]
+mixed = [leaf for leaf, ds in uses.items() if len({part_of(d) for d in ds}) > 1]
 leaf_deg = {leaf: max(ds) for leaf, ds in uses.items()}
-sys.stderr.write('degsplit: %d terms used at degrees on both sides of %d (kept in hi)\n' % (len(mixed), DMAX))
+sys.stderr.write('degsplit: %d terms used at degrees in more than one part (kept in the highest)\n'
+                 % len(mixed))
 hist = collections.Counter(d for d, _ in terms[root])
 sys.stderr.write('degsplit: %d terms, by degree %s\n' % (len(leaf_deg), dict(sorted(hist.items()))))
 # every link node is a leaf or a nested link (whose factor is an accumulator)
 leaf_set = set(leaf_deg)
 
 
-def variant(keep_hi):
-    removed = {g for g, d in leaf_deg.items() if (d > DMAX) != keep_hi}
+def variant(part):
+    removed = {g for g, d in leaf_deg.items() if part_of(d) != part}
     # zero accumulators and link aliases, in execution order (gids were created in that order)
     zero = {}
     alias = {}
@@ -312,8 +325,8 @@ def variant(keep_hi):
     return body + wrapper, kept, len(live)
 
 
-for path, hi in ((out_hi, True), (out_lo, False)):
-    text, kept, nlive = variant(hi)
+for part, path in enumerate(OUTS):
+    text, kept, nlive = variant(part)
     open(path, 'w').write(text)
-    sys.stderr.write('degsplit: %s: %d terms, %d live nodes\n' % ('hi' if hi else 'lo', kept, nlive))
+    sys.stderr.write('degsplit: part %d: %d terms, %d live nodes\n' % (part, kept, nlive))
 print('degsplit: ok')

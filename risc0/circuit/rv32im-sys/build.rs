@@ -1611,7 +1611,7 @@ fn build_intel_kernels() {
         .flatten();
     let noxmx_path = risc0_build_kernel::intel_library_path(&cache_dir, "risc0_rv32im_intel_noxmx");
     // The degree-split parts (see below), built with the library without XMX.
-    let part_paths: Vec<PathBuf> = ["hi", "lo"]
+    let part_paths: Vec<PathBuf> = ["lo", "mid", "hi"]
         .iter()
         .map(|p| {
             risc0_build_kernel::intel_library_path(&cache_dir, &format!("risc0_rv32im_intel_{p}"))
@@ -1887,34 +1887,35 @@ fn build_intel_kernels() {
             eprintln!("  Built {}", noxmx_path.display());
 
             // The constraint polynomial split by degree (evalfast/degsplit.py): the terms of
-            // degree > 3 (risc0_rv32im_intel_hi, run on every row) and <= 3
-            // (risc0_rv32im_intel_lo, run on the even rows; see eval_check.cpp), each through the
-            // same pipeline without XMX and built like the library above.
-            let hi_src = out_dir.join("intel_eval_check_amalg_hi.cpp");
-            let lo_src = out_dir.join("intel_eval_check_amalg_lo.cpp");
+            // degree <= 3 (risc0_rv32im_intel_lo, run on the even rows), 4 (_mid, run on three of
+            // the four cosets of the trace domain) and 5 (_hi, every row); see eval_check.cpp.
+            // Each goes through the same pipeline without XMX and is built like the library above.
+            let parts = ["lo", "mid", "hi"];
+            let srcs: Vec<PathBuf> = parts
+                .iter()
+                .map(|p| out_dir.join(format!("intel_eval_check_amalg_{p}.cpp")))
+                .collect();
             let output = risc0_build_kernel::python_command()
                 .arg("kernels/intel/evalfast/degsplit.py")
                 .arg(&amalg_path)
-                .arg(&hi_src)
-                .arg(&lo_src)
+                .args(&srcs)
+                .args(["--cuts", "3,4"])
                 .output()
                 .unwrap_or_else(|e| panic!("failed to run evalfast/degsplit.py: {e}"));
             if !output.status.success() {
                 stamp::write(&stamp_path, &mono_hash, &icpx_version, "failed");
                 panic!(
-                    "evalfast/degsplit.py failed:
-{}",
+                    "evalfast/degsplit.py failed:\n{}",
                     String::from_utf8_lossy(&output.stderr)
                 );
             }
             eprint!("{}", String::from_utf8_lossy(&output.stderr));
-            // The split is exact for any inputs: check hi + lo == whole numerically.
+            // The split is exact for any inputs: check that the parts add up to the whole.
             let output = risc0_build_kernel::python_command()
                 .env("PYTHONHASHSEED", "0")
                 .arg("kernels/intel/evalfast/verify_split.py")
                 .arg(&amalg_path)
-                .arg(&hi_src)
-                .arg(&lo_src)
+                .args(&srcs)
                 .arg("3")
                 .output()
                 .unwrap_or_else(|e| panic!("failed to run evalfast/verify_split.py: {e}"));
@@ -1922,15 +1923,13 @@ fn build_intel_kernels() {
             if !output.status.success() || !out.contains("ALL OK") {
                 stamp::write(&stamp_path, &mono_hash, &icpx_version, "failed");
                 panic!(
-                    "evalfast/verify_split.py: the degree split does not add up to the whole                      polynomial:
-{out}{}",
+                    "evalfast/verify_split.py: the degree split does not add up to the whole \
+                     polynomial:\n{out}{}",
                     String::from_utf8_lossy(&output.stderr)
                 );
             }
-            for (part, src, define) in [
-                ("hi", &hi_src, "-DRISC0_RV32IM_EVAL_PART_HI"),
-                ("lo", &lo_src, "-DRISC0_RV32IM_EVAL_PART_LO"),
-            ] {
+            for (part, src) in parts.iter().zip(&srcs) {
+                let define = format!("-DRISC0_RV32IM_EVAL_PART_{}", part.to_uppercase());
                 let fast = out_dir.join(format!("intel_eval_check_amalg_fast_{part}.cpp"));
                 let status = risc0_build_kernel::python_command()
                     .env("RISC0_INTEL_EVAL_XMX", "0")
@@ -1963,8 +1962,7 @@ fn build_intel_kernels() {
                 if !output.status.success() {
                     stamp::write(&stamp_path, &mono_hash, &icpx_version, "failed");
                     panic!(
-                        "Intel eval_check part {part} compilation failed:
-{}{}",
+                        "Intel eval_check part {part} compilation failed:\n{}{}",
                         String::from_utf8_lossy(&output.stdout),
                         String::from_utf8_lossy(&output.stderr)
                     );
@@ -1982,8 +1980,9 @@ fn build_intel_kernels() {
     risc0_build_kernel::intel_link_library(&cache_dir, "risc0_rv32im_intel");
     if noxmx_targets.is_some() {
         intel_place_unlinked_library(&cache_dir, "risc0_rv32im_intel_noxmx");
-        intel_place_unlinked_library(&cache_dir, "risc0_rv32im_intel_hi");
-        intel_place_unlinked_library(&cache_dir, "risc0_rv32im_intel_lo");
+        for part in ["lo", "mid", "hi"] {
+            intel_place_unlinked_library(&cache_dir, &format!("risc0_rv32im_intel_{part}"));
+        }
     }
 
     // mono_path is the monolithic amalgamation without kernel wrapper (for multipass gen)

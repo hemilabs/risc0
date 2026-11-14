@@ -681,20 +681,21 @@ mod testutil {
         hal.batch_expand_into_evaluate_ntt(&output, &input, count, expand_bits);
     }
 
-    /// Expands by 2 instead of INV_RATE (4), as the Intel rv32im eval_check extends the part of
-    /// the check polynomial that it evaluates on half of the coset.
+    /// Expands by 2 and by 1 instead of INV_RATE (4), as the Intel rv32im eval_check recovers the
+    /// parts of the check polynomial that it evaluates on half or three quarters of the coset.
     pub(crate) fn batch_expand_into_evaluate_ntt_by_2<H: Hal>(hal_gpu: H) {
         let mut rng = rand::rng();
         let hal_cpu = CpuHal::new(hal_gpu.get_hash_suite().clone());
         let hal = DualHal::new(Rc::new(hal_cpu), Rc::new(hal_gpu));
 
         let count = 4;
-        let expand_bits = 1;
         let steps = 1 << 17;
-        let domain = steps << expand_bits;
-        let input = generate_elem(&hal, &mut rng, count * steps);
-        let output = hal.alloc_elem("output", count * domain);
-        hal.batch_expand_into_evaluate_ntt(&output, &input, count, expand_bits);
+        for expand_bits in [1, 0] {
+            let domain = steps << expand_bits;
+            let input = generate_elem(&hal, &mut rng, count * steps);
+            let output = hal.alloc_elem("output", count * domain);
+            hal.batch_expand_into_evaluate_ntt(&output, &input, count, expand_bits);
+        }
     }
 
     pub(crate) fn batch_expand_into_evaluate_ntt_large<H: Hal>(hal_gpu: H) {
