@@ -605,6 +605,7 @@ mod c7_tests {
     /// rows).
     #[test]
     fn accum_matches_cpu_scan_edges() {
+        let _heavy = crate::prove::hal::metal::heavy_test_lock();
         for n in [1, 2, 2047, 2048, 2049, 4097] {
             check_equivalence(16, Some(n));
         }
@@ -616,6 +617,7 @@ mod c7_tests {
     /// plus the realistic lift/join shape 2^18 - ZK_CYCLES at po2 18.
     #[test]
     fn accum_matches_cpu_full() {
+        let _heavy = crate::prove::hal::metal::heavy_test_lock();
         check_equivalence(16, None);
         check_equivalence(18, None);
         check_equivalence(18, Some((1 << 18) - ZK_CYCLES as u32));
@@ -643,6 +645,7 @@ mod c7_tests {
     /// error naming the phase instead of a wrong witness, and the HAL stays usable.
     #[test]
     fn accum_fault_on_invalid_input() {
+        let _heavy = crate::prove::hal::metal::heavy_test_lock();
         let (hal, m) = metal();
         let mut inputs = Inputs::new(16, None, 7);
         let t = inputs.total as usize;
@@ -665,6 +668,7 @@ mod c7_tests {
     /// past the groups. Host shape checks reject non-power-of-two totals and short buffers.
     #[test]
     fn accum_fault_on_bad_shape() {
+        let _heavy = crate::prove::hal::metal::heavy_test_lock();
         let (hal, m) = metal();
         let words = |n: usize| hal.copy_from_elem("x", &vec![BabyBearElem::ZERO; n]);
         let (ctrl, data, accum) = (
@@ -696,6 +700,7 @@ mod c7_tests {
     /// (lift/join: risc0-zkvm host::recursion tests with RISC0_METAL_REC_ACCUM_CHECK=1).
     #[test]
     fn accum_real_trace_shadow_check() {
+        let _heavy = crate::prove::hal::metal::heavy_test_lock();
         let _guard = crate::prove::hal::metal::global_state_test_lock();
         for po2 in [16, 18] {
             let program = get_zkr("test_recursion_circuit.zkr", po2).unwrap();

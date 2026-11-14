@@ -299,26 +299,51 @@ fn staged_inputs(
 /// still use a staged buffer, so its preflight may drop it and the pool may hand it to the next
 /// `prepare()` to rewrite. The HAL's own host accessors never see these caller-owned buffers;
 /// its in-flight tracking does record them (they are bound as `KernelArg::Buffer`).
+///
+/// W7-C1 (C14 review r2): every `Err` the witgen returns after encoding the staged inputs comes
+/// after a sync (`check_fault` waits for every batch first), but a panic (e.g. a budget panic
+/// while growing a scratch buffer) can unwind with batches still reading them. So unless the
+/// witgen reached its end ([Self::done]), the buffers are retired instead of pooled
+/// (`staging::retire`): a later `prepare()` can then never rewrite a buffer an aborted batch may
+/// still read (Metal itself keeps the buffer alive until its command buffers complete).
 struct StagedReleaseCheck<'a, MH: MetalHash> {
     hal: &'a MetalHal<MH>,
     st: &'a Staged,
+    done: std::cell::Cell<bool>,
 }
 
-impl<MH: MetalHash> Drop for StagedReleaseCheck<'_, MH> {
-    fn drop(&mut self) {
-        if std::thread::panicking() {
-            return;
-        }
+impl<MH: MetalHash> StagedReleaseCheck<'_, MH> {
+    fn inputs(&self) -> impl Iterator<Item = &metal::Buffer> {
         let st = self.st;
         let mut ins = vec![&st.wom, &st.cycles, &st.iops];
         if let Some(ch) = &st.chains {
             ins.extend([&ch.heads, &ch.cycles, &ch.rows, &ch.wom_idx, &ch.wom_rows]);
         }
-        for i in ins {
-            if let In::Raw(b, _) = i {
-                self.hal
-                    .debug_check_host_access(b, "C14 staged witgen input", "release");
+        ins.into_iter().filter_map(|i| match i {
+            In::Raw(b, _) => Some(b),
+            In::Buf(_) => None,
+        })
+    }
+
+    /// The witgen finished (every batch that read the staged inputs has completed).
+    fn done(&self) {
+        self.done.set(true);
+    }
+}
+
+impl<MH: MetalHash> Drop for StagedReleaseCheck<'_, MH> {
+    fn drop(&mut self) {
+        if std::thread::panicking() || !self.done.get() {
+            for b in self.inputs() {
+                super::staging::retire(b);
             }
+            if std::thread::panicking() {
+                return;
+            }
+        }
+        for b in self.inputs() {
+            self.hal
+                .debug_check_host_access(b, "C14 staged witgen input", "release");
         }
     }
 }
@@ -1060,9 +1085,11 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
         // C14: inputs staged by prepare() in a shared buffer are bound in place (no host copies,
         // no sync before parStepExec).
         let staged = staged_inputs(preflight, host_chains, data.size() / steps)?;
-        let _release_check = staged
-            .as_ref()
-            .map(|st| StagedReleaseCheck { hal: &self.hal, st });
+        let release_check = staged.as_ref().map(|st| StagedReleaseCheck {
+            hal: &self.hal,
+            st,
+            done: Default::default(),
+        });
         let (cycles, wom, iops, wom_rows, wom_index) = {
             let mut s = self.scratch();
             let cycles = grow(
@@ -1255,6 +1282,9 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
             ms(t_all - t_sort),
             ms(t_all)
         );
+        if let Some(c) = &release_check {
+            c.done();
+        }
         Ok(())
     }
 }

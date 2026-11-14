@@ -95,6 +95,7 @@ fn host_sort(rows: &[WomRow], counts: &[u32]) -> (Vec<WomRow>, Vec<u32>) {
 
 #[test]
 fn gpu_sort_matches_host_sort() {
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     let run = Run::new();
     let mut rng = rand::rngs::StdRng::seed_from_u64(14);
     // Scan sizes: one partial block, several blocks, and (1.2M addresses) more than 1024
@@ -163,6 +164,7 @@ fn gpu_sort_flags() {
 /// counts show which sort ran.
 #[test]
 fn witgen_gpu_sort_paths_match_cpu() {
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     use super::c6_tests::witgen_matches_cpu;
     for (label, on, fallback) in [
         ("gpu", true, false),
@@ -257,17 +259,21 @@ fn staged_witgen_matches_cpu(po2: usize) {
 
 #[test]
 fn staged_witgen_matches_cpu_po2_16() {
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     super::super::staging::with_stage(true, || staged_witgen_matches_cpu(16));
 }
 
 #[test]
 fn staged_witgen_matches_cpu_po2_18() {
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     super::super::staging::with_stage(true, || staged_witgen_matches_cpu(18));
 }
 
-/// With staging off (the default; `RISC0_METAL_REC_STAGE` unset or 0), a staged trace is copied on the host path.
+/// With staging off (`RISC0_METAL_REC_STAGE=0`; on by default since W7-C1), a staged trace is
+/// copied on the host path.
 #[test]
 fn staged_trace_with_staging_off_takes_host_path() {
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     use super::{
         super::staging::{with_stage, MetalStaged},
         c6_tests::{assert_same, cpu_witness, preflight_for, raw_trace, MetalRun},
@@ -290,9 +296,22 @@ fn staged_trace_with_staging_off_takes_host_path() {
     assert_eq!(thread_calls(Call::Staged), n);
 }
 
+/// W7-C1: `RISC0_METAL_REC_STAGE` is on unless `0` / `off` / `false`.
+#[test]
+fn stage_knob_parses() {
+    use super::super::staging::parse_stage;
+    for v in [None, Some(""), Some("1"), Some("on"), Some(" true ")] {
+        assert!(parse_stage(v), "{v:?}");
+    }
+    for v in [Some("0"), Some("off"), Some("FALSE"), Some(" 0 ")] {
+        assert!(!parse_stage(v), "{v:?}");
+    }
+}
+
 /// Unstaged pointers (a plain host trace) take the host path even with staging enabled.
 #[test]
 fn unstaged_trace_takes_host_path() {
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     use super::c6_tests::{preflight_for, raw_trace, MetalRun};
     let (program, pf) = preflight_for(16);
     let trace = raw_trace(&program, &pf);
@@ -311,6 +330,7 @@ fn unstaged_trace_takes_host_path() {
 /// recovers and a good staged trace still matches the CPU.
 #[test]
 fn staged_chain_faults() {
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     use super::{
         super::staging::{with_stage, MetalStaged},
         c6_tests::{
@@ -349,10 +369,16 @@ fn staged_chain_faults() {
         trace.iops = st.ptr(2);
         hc.pinned = Some(std::array::from_fn(|i| st.ptr::<u32>(3 + i) as usize));
         let n = thread_calls(Call::Staged);
+        let retired = super::super::staging::retired_count();
         let r = with_stage(true, || {
             m.witness(&program, &trace, StepMode::Parallel, Some(&hc))
         });
         assert_eq!(thread_calls(Call::Staged) - n, 1, "staged path not taken");
+        drop(st);
+        // W7-C1: a witgen that returned Err leaves its staged buffer out of the pool; one that
+        // finished returns it.
+        let delta = super::super::staging::retired_count() - retired;
+        assert_eq!(delta, usize::from(r.is_err()), "retired {delta} buffers");
         r
     };
     for (label, corrupt) in cases {
@@ -376,6 +402,7 @@ fn staged_chain_faults() {
 /// unsynced batch still reads, and passes once synced; a staged witgen in debug mode passes it.
 #[test]
 fn debug_check_covers_staged_buffers() {
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     use super::{
         super::staging::{lookup, with_stage, MetalStaged},
         c6_tests::{assert_same, cpu_witness, preflight_for, raw_trace, MetalRun},
@@ -438,6 +465,8 @@ fn debug_check_covers_staged_buffers() {
 #[test]
 #[ignore]
 fn c14_gpu_sort_repeat() {
+    crate::prove::hal::metal::require_heavy_gpu_run("c14_gpu_sort_repeat");
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     let reps: usize = std::env::var("R17_AUDIT_REPS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -455,4 +484,85 @@ fn c14_gpu_sort_repeat() {
     }
     println!("R17AUDIT recursion gpu_sort: {bad}/{reps} reps differ from the host sort");
     assert_eq!(bad, 0);
+}
+
+/// W7-C1 fix round 1: a new staging buffer must leave `STAGE_MARGIN_BYTES` under the working-set
+/// limit (prepare() allocates without the GPU lock, beside a Prove that may be allocating).
+#[test]
+fn stage_admission_keeps_margin() {
+    use super::super::staging::{admit, STAGE_MARGIN_BYTES as M};
+    let (l, cap) = (4u64 << 30, 36u64 << 20);
+    assert!(admit(None, cap));
+    assert!(admit(Some((l, l - M - cap)), cap));
+    assert!(!admit(Some((l, l - M - cap + 1)), cap));
+    assert!(!admit(Some((l, l - cap)), cap), "no margin left");
+    assert!(!admit(Some((l, u64::MAX)), cap));
+    assert!(!admit(Some((M, 0)), cap));
+}
+
+/// W7-C1 fix round 1: near the working-set limit staging gives way. `prepare()`'s staging
+/// (`stage_metal`) leaves the preflight unstaged, the pooled buffers are released first, and the
+/// witgen then takes the host path and still matches the CPU.
+#[test]
+fn staging_gives_way_near_the_limit() {
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
+    use super::{
+        super::staging::{drain_pool, with_stage, MetalStaged, FAKE_DEVICE_MEMORY},
+        c6_tests::{assert_same, cpu_witness, preflight_for, raw_trace, MetalRun},
+    };
+    let (program, pf) = preflight_for(16);
+    let t = &pf.trace;
+    let l = 4u64 << 30;
+    let set = |m: Option<(u64, u64)>| FAKE_DEVICE_MEMORY.with(|f| f.set(m));
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FAKE_DEVICE_MEMORY.with(|f| f.set(None));
+        }
+    }
+    let _reset = Reset;
+    // Earlier tests may have pooled larger buffers.
+    drain_pool();
+    // Room: staged. Dropping it pools the buffer.
+    set(Some((l, 1 << 30)));
+    drop(MetalStaged::new(&t.wom, &t.cycles, &t.iops, None).expect("staged with room"));
+    // A larger request than the pooled buffer, 100 MiB short of the margin: not staged, and the
+    // pool was drained trying.
+    set(Some((l, l - (100 << 20))));
+    // (Twice the pooled buffer: its size is rounded up to a whole MiB with 25 % headroom.)
+    let pooled = std::mem::size_of_val(&t.wom[..])
+        + std::mem::size_of_val(&t.cycles[..])
+        + std::mem::size_of_val(&t.iops[..]);
+    let one = std::mem::size_of_val(&t.cycles[0]);
+    let big: Vec<_> = t
+        .cycles
+        .iter()
+        .cycle()
+        .take((2 * pooled + (4 << 20)) / one)
+        .cloned()
+        .collect();
+    assert!(MetalStaged::new(&t.wom, &big, &t.iops, None).is_none());
+    assert_eq!(drain_pool(), 0, "pool not drained before giving way");
+    // prepare()'s staging leaves the preflight unstaged.
+    with_stage(true, || crate::prove::stage_metal(&pf));
+    assert!(pf.pinned.lock().unwrap().is_none(), "staged past the limit");
+    set(None);
+    // ... and the witgen of the unstaged preflight takes the host path and matches the CPU.
+    let cpu = cpu_witness(&program, &pf, StepMode::Parallel);
+    let n = thread_calls(Call::Staged);
+    let (d, g, _) = with_stage(true, || {
+        MetalRun::new()
+            .witness(
+                &program,
+                &raw_trace(&program, &pf),
+                StepMode::Parallel,
+                None,
+            )
+            .unwrap()
+    });
+    assert_same("staging gave way", 1 << 16, &(d, g), &cpu);
+    assert_eq!(thread_calls(Call::Staged), n);
+    // With room again prepare() stages it.
+    with_stage(true, || crate::prove::stage_metal(&pf));
+    assert!(pf.pinned.lock().unwrap().is_some(), "not staged with room");
 }
