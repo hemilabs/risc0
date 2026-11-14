@@ -12,14 +12,27 @@ using namespace risc0;
 
 static const char* make_error(const char* msg) { return strdup(msg); }
 
-// This source is built twice when the targets include GPUs without Xe2's DPAS (see
-// intel_non_xmx_targets in build.rs): as risc0_rv32im_intel, with the XMX linking chains, and
-// as risc0_rv32im_intel_noxmx (RISC0_RV32IM_EVAL_NOXMX), without them, exporting the same
-// functions with an _noxmx suffix. The first library's exports pick one per device (end of file).
-#ifdef RISC0_RV32IM_EVAL_NOXMX
+// This source is built several times (see build.rs): as risc0_rv32im_intel, with the XMX linking
+// chains; as risc0_rv32im_intel_noxmx (RISC0_RV32IM_EVAL_NOXMX), without them; and as
+// risc0_rv32im_intel_hi and _lo (RISC0_RV32IM_EVAL_PART_HI / _LO), the constraint polynomial's
+// terms of degree > 3 and <= 3 (evalfast/degsplit.py), without the chains. The later libraries
+// export the same functions with their suffix; the first library's exports pick one (end of file).
+//
+// The _lo library evaluates only the even rows of the 4N-point coset (RK_ROWSTEP 2) into a
+// 2N-row output: every constraint term vanishes on the trace domain, so its part of the quotient
+// has degree < (3 - 1) * N = 2N, and the host extends it to the odd rows with two NTTs (intel.rs).
+#if defined(RISC0_RV32IM_EVAL_PART_HI)
+#define RV_EVAL_FN(name) extern "C" const char* name##_hi
+#define RK_ROWSTEP 1u
+#elif defined(RISC0_RV32IM_EVAL_PART_LO)
+#define RV_EVAL_FN(name) extern "C" const char* name##_lo
+#define RK_ROWSTEP 2u
+#elif defined(RISC0_RV32IM_EVAL_NOXMX)
 #define RV_EVAL_FN(name) extern "C" const char* name##_noxmx
+#define RK_ROWSTEP 1u
 #else
 #define RV_EVAL_FN(name) static const char* name##_local
+#define RK_ROWSTEP 1u
 #endif
 
 #ifdef RK_NWORDS
@@ -130,15 +143,17 @@ RV_EVAL_FN(risc0_circuit_rv32im_intel_eval_check)(
         }
         const uint32_t wgsz = WG_SIZE;
         constexpr uint32_t POLY_MIX_COUNT = 484;
+        // Output rows: every RK_ROWSTEP-th row of the domain, row j at check[i * out_rows + j].
+        const uint32_t out_rows = domain / RK_ROWSTEP;
 #ifdef RK_NWORDS
         std::lock_guard<std::mutex> slab_lock(g_slab_mutex);
-        const uint32_t tile = slab_tile(q, domain);
+        const uint32_t tile = slab_tile(q, out_rows);
         uint32_t* slab = g_slab;
-        for (uint32_t tile_base = 0; tile_base < domain; tile_base += tile) {
-        const uint32_t rows = (domain - tile_base) < tile ? (domain - tile_base) : tile;
+        for (uint32_t tile_base = 0; tile_base < out_rows; tile_base += tile) {
+        const uint32_t rows = (out_rows - tile_base) < tile ? (out_rows - tile_base) : tile;
         uint32_t global_size = ((rows + WG_SIZE - 1) / WG_SIZE) * WG_SIZE;
 #else
-        uint32_t global_size = ((domain + WG_SIZE - 1) / WG_SIZE) * WG_SIZE;
+        uint32_t global_size = ((out_rows + WG_SIZE - 1) / WG_SIZE) * WG_SIZE;
 #endif
         q->submit([&](sycl::handler& h) {
             sycl::local_accessor<FpExt, 1> slm(sycl::range<1>(POLY_MIX_COUNT), h);
@@ -146,10 +161,11 @@ RV_EVAL_FN(risc0_circuit_rv32im_intel_eval_check)(
                 [=](sycl::nd_item<1> item) {
 #ifdef RK_NWORDS
                     uint32_t lrow = item.get_global_id(0);
-                    uint32_t cycle = tile_base + lrow;
+                    uint32_t orow = tile_base + lrow;
 #else
-                    uint32_t cycle = item.get_global_id(0);
+                    uint32_t orow = item.get_global_id(0);
 #endif
+                    uint32_t cycle = orow * RK_ROWSTEP;
                     uint32_t lid = item.get_local_id(0);
                     for (uint32_t i = lid; i < POLY_MIX_COUNT; i += wgsz) slm[i] = poly_mix[i];
                     sycl::group_barrier(item.get_group());
@@ -159,7 +175,7 @@ RV_EVAL_FN(risc0_circuit_rv32im_intel_eval_check)(
                                    reinterpret_cast<Fp*>(slab + (size_t)(lrow / RK_STRIDE) * RK_NWORDS * RK_STRIDE +
                                                          (lrow % RK_STRIDE))};
 #else
-                    if (cycle >= domain) return;
+                    if (orow >= out_rows) return;
                     Fp* args[4] = {accum, data, out, mix};
 #endif
                     FpExt* pm = slm.get_multi_ptr<sycl::access::decorated::no>().get();
@@ -173,7 +189,7 @@ RV_EVAL_FN(risc0_circuit_rv32im_intel_eval_check)(
                     Fp quot = inv(y - Fp(1));
 #endif
                     for (uint32_t i = 0; i < 4; i++)
-                        check[i * domain + cycle] = tot.elems[i] * quot;
+                        check[i * out_rows + orow] = tot.elems[i] * quot;
                 });
         });
 #ifdef RK_NWORDS
@@ -208,7 +224,8 @@ RV_EVAL_FN(risc0_circuit_rv32im_intel_eval_check_release)() {
     catch (...) { return make_error("Unknown error in eval_check_release"); }
 }
 
-#ifndef RISC0_RV32IM_EVAL_NOXMX
+#if !defined(RISC0_RV32IM_EVAL_NOXMX) && !defined(RISC0_RV32IM_EVAL_PART_HI) && \
+    !defined(RISC0_RV32IM_EVAL_PART_LO)
 // The exports: risc0_rv32im_intel_noxmx's kernel, loaded from this library's directory, and this
 // library's (the XMX linking chains) only with RISC0_INTEL_EVAL_NOXMX=0 on a GPU with Xe2's DPAS
 // (Battlemage, Lunar Lake). The chains are written for Xe2's SIMD16 DPAS; on Alchemist (Arc A770),
@@ -245,8 +262,8 @@ bool has_xe2_dpas(const sycl::device& d) {
            a == sx::architecture::intel_gpu_bmg_g31 || a == sx::architecture::intel_gpu_lnl_m;
 }
 
-// Loads the second library from this library's directory.
-void load_noxmx(NoXmx& n) {
+// Loads risc0_rv32im_intel_<suffix> from this library's directory.
+void load_part(NoXmx& n, const std::string& sfx) {
 #ifdef _WIN32
     HMODULE self = nullptr;
     char path[MAX_PATH];
@@ -258,13 +275,13 @@ void load_noxmx(NoXmx& n) {
         return;
     }
     std::string file(path);
-    file = file.substr(0, file.find_last_of("\\/") + 1) + "risc0_rv32im_intel_noxmx.dll";
+    file = file.substr(0, file.find_last_of("\\/") + 1) + "risc0_rv32im_intel_" + sfx + ".dll";
     HMODULE lib = LoadLibraryA(file.c_str());
     if (lib) {
         n.eval = reinterpret_cast<EvalFn>(
-            GetProcAddress(lib, "risc0_circuit_rv32im_intel_eval_check_noxmx"));
-        n.release = reinterpret_cast<ReleaseFn>(
-            GetProcAddress(lib, "risc0_circuit_rv32im_intel_eval_check_release_noxmx"));
+            GetProcAddress(lib, ("risc0_circuit_rv32im_intel_eval_check_" + sfx).c_str()));
+        n.release = reinterpret_cast<ReleaseFn>(GetProcAddress(
+            lib, ("risc0_circuit_rv32im_intel_eval_check_release_" + sfx).c_str()));
     }
 #else
     Dl_info info;
@@ -273,12 +290,13 @@ void load_noxmx(NoXmx& n) {
         return;
     }
     std::string file(info.dli_fname);
-    file = file.substr(0, file.find_last_of('/') + 1) + "librisc0_rv32im_intel_noxmx.so";
+    file = file.substr(0, file.find_last_of('/') + 1) + "librisc0_rv32im_intel_" + sfx + ".so";
     void* lib = dlopen(file.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (lib) {
-        n.eval = reinterpret_cast<EvalFn>(dlsym(lib, "risc0_circuit_rv32im_intel_eval_check_noxmx"));
+        n.eval = reinterpret_cast<EvalFn>(
+            dlsym(lib, ("risc0_circuit_rv32im_intel_eval_check_" + sfx).c_str()));
         n.release = reinterpret_cast<ReleaseFn>(
-            dlsym(lib, "risc0_circuit_rv32im_intel_eval_check_release_noxmx"));
+            dlsym(lib, ("risc0_circuit_rv32im_intel_eval_check_release_" + sfx).c_str()));
     }
 #endif
     if (!n.eval || !n.release) {
@@ -288,6 +306,8 @@ void load_noxmx(NoXmx& n) {
         n.release = nullptr;
     }
 }
+
+void load_noxmx(NoXmx& n) { load_part(n, "noxmx"); }
 
 std::once_flag g_noxmx_once;
 NoXmx g_noxmx;
@@ -330,9 +350,58 @@ extern "C" const char* risc0_circuit_rv32im_intel_eval_check_sync(void* queue_pt
     return risc0_circuit_rv32im_intel_eval_check_sync_local(queue_ptr);
 }
 
+// The split evaluation: risc0_rv32im_intel_hi's kernel (the terms of degree > 3) on every row
+// into `check` (4 * domain), and risc0_rv32im_intel_lo's (degree <= 3) on the even rows into
+// `check_lo` (4 * domain / 2). The caller extends check_lo to every row and adds it (intel.rs).
+namespace {
+std::once_flag g_parts_once;
+NoXmx g_hi, g_lo;
+}  // namespace
+
+// 1 when both libraries load (they are built beside this one when it has the XMX chains) and the
+// queue's GPU is one the split was measured on (Xe2: Battlemage, Lunar Lake), or
+// RISC0_INTEL_EVAL_SPLIT=1 asks for it on any GPU. Decided once, for the first queue's device.
+extern "C" int risc0_circuit_rv32im_intel_eval_check_parts_available(void* queue_ptr) {
+#ifdef RISC0_RV32IM_EVAL_XMX
+    try {
+        std::call_once(g_parts_once, [queue_ptr] {
+            const char* force = std::getenv("RISC0_INTEL_EVAL_SPLIT");
+            const bool want =
+                (force && std::strcmp(force, "1") == 0) ||
+                has_xe2_dpas(static_cast<sycl::queue*>(queue_ptr)->get_device());
+            if (!want) return;
+            load_part(g_hi, "hi");
+            load_part(g_lo, "lo");
+            g_hi.use = g_hi.eval && g_lo.eval;
+        });
+    } catch (...) { return 0; }
+    return g_hi.use ? 1 : 0;
+#else
+    (void)queue_ptr;
+    return 0;
+#endif
+}
+
+extern "C" const char* risc0_circuit_rv32im_intel_eval_check_parts(
+    void* queue_ptr, void* d_check, void* d_check_lo, const void* d_data, const void* d_accum,
+    const void* d_out, const void* d_mix, const void* d_poly_mix, uint32_t rou_raw, uint32_t po2,
+    uint32_t domain) {
+    if (!risc0_circuit_rv32im_intel_eval_check_parts_available(queue_ptr))
+        return make_error("eval_check: risc0_rv32im_intel_hi / _lo are not available");
+    if (const char* err = g_hi.eval(queue_ptr, d_check, d_data, d_accum, d_out, d_mix,
+                                    d_poly_mix, rou_raw, po2, domain))
+        return err;
+    return g_lo.eval(queue_ptr, d_check_lo, d_data, d_accum, d_out, d_mix, d_poly_mix, rou_raw,
+                     po2, domain);
+}
+
 extern "C" const char* risc0_circuit_rv32im_intel_eval_check_release() {
     if (g_noxmx.use && g_noxmx.release) {
         if (const char* err = g_noxmx.release()) return err;
+    }
+    if (g_hi.use) {
+        if (const char* err = g_hi.release()) return err;
+        if (const char* err = g_lo.release()) return err;
     }
     return risc0_circuit_rv32im_intel_eval_check_release_local();
 }

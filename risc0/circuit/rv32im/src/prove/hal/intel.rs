@@ -25,7 +25,7 @@ use risc0_zkp::{
         intel::{
             BufferImpl as IntelBuffer, IntelHal, IntelHalPoseidon2, IntelHash, IntelHashPoseidon2,
         },
-        AccumPreflight, CircuitHal, Hal,
+        AccumPreflight, Buffer as _, CircuitHal, Hal,
     },
     INV_RATE,
 };
@@ -107,6 +107,79 @@ impl<IH: IntelHash> IntelCircuitHal<IH> {
             eval_check_inter_ext: Mutex::new(None),
         }
     }
+
+    /// RISC0_INTEL_EVAL_SPLIT_CHECK=1: compares the split eval_check's `check` with the whole
+    /// polynomial's kernel on every row (waits for the queue), and panics on any difference.
+    #[allow(clippy::too_many_arguments)]
+    fn split_eval_crosscheck(
+        &self,
+        check: &IntelBuffer<Val>,
+        groups: &[&IntelBuffer<Val>],
+        globals: &[&IntelBuffer<Val>],
+        poly_mix_buf: &IntelBuffer<u32>,
+        queue: *mut std::ffi::c_void,
+        rou_raw: u32,
+        po2: usize,
+        domain: usize,
+    ) {
+        let whole = self._hal.alloc_elem("check_whole", 4 * domain);
+        risc0_sys::intel::esimd_check(unsafe {
+            risc0_circuit_rv32im_sys::risc0_circuit_rv32im_intel_eval_check(
+                queue,
+                whole.as_device_ptr().0 as *mut std::ffi::c_void,
+                groups[REGISTER_GROUP_DATA].as_device_ptr().0 as *const std::ffi::c_void,
+                groups[REGISTER_GROUP_ACCUM].as_device_ptr().0 as *const std::ffi::c_void,
+                globals[GLOBAL_OUT].as_device_ptr().0 as *const std::ffi::c_void,
+                globals[GLOBAL_MIX].as_device_ptr().0 as *const std::ffi::c_void,
+                poly_mix_buf.as_device_ptr().0 as *const std::ffi::c_void,
+                rou_raw,
+                po2 as u32,
+                domain as u32,
+            )
+        });
+        let got = check.to_vec();
+        let want = whole.to_vec();
+        let bad: Vec<usize> = (0..got.len()).filter(|&i| got[i] != want[i]).collect();
+        eprintln!(
+            "[eval_check split] po2={po2}: {} of {} values differ from the whole kernel{}",
+            bad.len(),
+            got.len(),
+            if bad.is_empty() {
+                ""
+            } else {
+                " (first rows below)"
+            }
+        );
+        for &i in bad.iter().take(8) {
+            eprintln!(
+                "  limb {} row {} ({}): split {:?} whole {:?}",
+                i / domain,
+                i % domain,
+                if (i % domain) % 2 == 0 { "even" } else { "odd" },
+                got[i],
+                want[i]
+            );
+        }
+        assert!(
+            bad.is_empty(),
+            "split eval_check differs from the whole kernel"
+        );
+    }
+}
+
+/// The degree-split eval_check (see eval_check): on when risc0_rv32im_intel_hi / _lo are present
+/// and the GPU is Xe2 (or RISC0_INTEL_EVAL_SPLIT=1), unless RISC0_INTEL_EVAL_SPLIT=0 or
+/// RISC0_INTEL_EVAL_NOXMX=0 (which asks for the whole kernel with the XMX chains).
+fn split_eval_enabled(queue: *mut std::ffi::c_void) -> bool {
+    if std::env::var("RISC0_INTEL_EVAL_SPLIT").as_deref() == Ok("0")
+        || std::env::var("RISC0_INTEL_EVAL_NOXMX").as_deref() == Ok("0")
+    {
+        return false;
+    }
+    let available = unsafe {
+        risc0_circuit_rv32im_sys::risc0_circuit_rv32im_intel_eval_check_parts_available(queue)
+    };
+    available == 1
 }
 
 impl<IH: IntelHash> CircuitWitnessGenerator<IntelHal<IH>> for IntelCircuitHal<IH> {
@@ -328,6 +401,47 @@ impl<IH: IntelHash> CircuitHal<IntelHal<IH>> for IntelCircuitHal<IH> {
             // Keep intermediate buffers alive until eval_check_dep()
             *self.eval_check_inter_fp.lock() = Some(inter_fp);
             *self.eval_check_inter_ext.lock() = Some(inter_ext);
+        } else if split_eval_enabled(queue) {
+            // Split by degree (rv32im-sys evalfast/degsplit.py). Every constraint term vanishes
+            // on the trace domain, so the quotient of the terms of degree <= 3 has degree < 2N
+            // (N = steps): it is fixed by its values on the even rows of the 4N-point coset,
+            // x = 3 w^(2j). As P(y) = Q_lo(3y) those are P on the 2N-th roots of unity, in
+            // natural order; interpolating them and evaluating P on the 4N-th roots (the same
+            // pair of HAL calls a PolyGroup makes) gives Q_lo(3 w^i) on every row.
+            let half = domain / 2;
+            let check_lo = self._hal.alloc_elem("check_lo", 4 * half);
+            risc0_sys::intel::esimd_check(unsafe {
+                risc0_circuit_rv32im_sys::risc0_circuit_rv32im_intel_eval_check_parts(
+                    queue,
+                    check.as_device_ptr().0 as *mut std::ffi::c_void,
+                    check_lo.as_device_ptr().0 as *mut std::ffi::c_void,
+                    groups[REGISTER_GROUP_DATA].as_device_ptr().0 as *const std::ffi::c_void,
+                    groups[REGISTER_GROUP_ACCUM].as_device_ptr().0 as *const std::ffi::c_void,
+                    globals[GLOBAL_OUT].as_device_ptr().0 as *const std::ffi::c_void,
+                    globals[GLOBAL_MIX].as_device_ptr().0 as *const std::ffi::c_void,
+                    poly_mix_buf.as_device_ptr().0 as *const std::ffi::c_void,
+                    rou_raw,
+                    po2 as u32,
+                    domain as u32,
+                )
+            });
+            self._hal.batch_interpolate_ntt(&check_lo, 4);
+            let lo_all = self._hal.alloc_elem("check_lo_all", 4 * domain);
+            self._hal
+                .batch_expand_into_evaluate_ntt(&lo_all, &check_lo, 4, EXP_PO2 - 1);
+            self._hal.eltwise_add_elem(check, check, &lo_all);
+            if std::env::var_os("RISC0_INTEL_EVAL_SPLIT_CHECK").is_some() {
+                self.split_eval_crosscheck(
+                    check,
+                    groups,
+                    globals,
+                    &poly_mix_buf,
+                    queue,
+                    rou_raw,
+                    po2,
+                    domain,
+                );
+            }
         } else {
             // Monolithic: single kernel call
             risc0_sys::intel::esimd_check(unsafe {
@@ -676,7 +790,14 @@ mod tests {
     /// the same run. Without selective clearing, future Phase 1.5+ tests
     /// would silently re-enable phases CI tried to disable.
     fn intel_eval_check(params: &EvalCheckParams, multipass: bool) -> Vec<Val> {
-        let _env = EnvGuard::new(&["RISC0_MULTIPASS", "RISC0_PHASE_DISABLE"]);
+        let _env = EnvGuard::new(&[
+            "RISC0_MULTIPASS",
+            "RISC0_PHASE_DISABLE",
+            "RISC0_INTEL_EVAL_SPLIT",
+        ]);
+        // These inputs are random, not a witness: the constraints do not vanish on the trace
+        // domain, so the degree-split evaluation (which relies on that) does not apply.
+        std::env::set_var("RISC0_INTEL_EVAL_SPLIT", "0");
         if let Ok(prev) = std::env::var("RISC0_PHASE_DISABLE") {
             let kept: Vec<&str> = prev
                 .split(',')
