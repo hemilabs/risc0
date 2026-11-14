@@ -68,13 +68,41 @@
 //!
 //! Z16 adds an optional read-only **offline (AOT) archive** per unit: `RISC0_METAL_AOT_DIR` names a
 //! directory of archives made ahead of time by `metal-tt` (`tools/metal_aot/build_archive.py`)
-//! for one GPU architecture each, named
-//! `<unit>-<chunked_digest(metallib)[..24]>-<MTLDevice.architecture.name>-<checksum>.binarchive`.
+//! for one GPU architecture each, named (since W7-Z1, below)
+//! `<unit>-<parallel_digest(metallib)[..24]>-<MTLDevice.architecture.name>-<os key>-<checksum>.binarchive`.
 //! The one matching this metallib and this GPU is checked against its checksum, loaded, and tried
 //! first for every PSO (`FailOnBinaryArchiveMiss`); a miss continues as above (the runtime
 //! archive, then a compile). So a first install on a GPU the shipped set covers compiles
 //! nothing, and any other GPU, OS or metallib just misses (a wrong archive is never fatal: Metal
 //! reports a miss, Z16 note). The directory is never written. Unset: no change.
+//!
+//! W7-Z1 completes the offline archives:
+//! - **AOT key**: the file name also carries an OS key,
+//!   `<unit>-<parallel_digest(metallib)[..24]>-<arch>-<os key>-<checksum>.binarchive`, where the
+//!   OS key is `os<ProductBuildVersion>` (e.g. `os26B131`: made for exactly this OS build) or
+//!   `macos<major>` (e.g. `macos27`: made with `metal-tt -macos-version-min <major>.0` for every
+//!   build of that major version, the packaging form). The runtime takes the exact-build file
+//!   first, then the major-version one; a file of another OS key is never opened (a clean miss).
+//!   AOT binaries come from the downloaded Metal toolchain (`metal-tt`), not the OS compiler, so
+//!   the key cannot name the compiler the OS would use; Metal itself treats a binary it cannot
+//!   use as a miss (Z16 note), which then costs a compile, never a wrong PSO. The digest and
+//!   checksum of AOT names are always [parallel_digest] ([ARCHIVE_HASH_ENV] only switches the
+//!   runtime archive's), so they match `tools/metal_aot/build_archive.py` in every hash mode.
+//! - **Who reads [AOT_DIR_ENV]**: only process-wide loads, i.e. those whose runtime archive
+//!   directory is the process's [archive_dir] ([process_aot_dir]). The explicit-directory test
+//!   seams ([ArchivedKernels::new_in] with a directory of their own) never see an offline
+//!   archive; [ArchivedKernels::new_in_aot] passes one explicitly.
+//! - **Seeding**: when the offline archive served every PSO and there was no runtime archive,
+//!   the offline file is copied (no compile) into the runtime archive on a background thread
+//!   ([seed_runtime_archive]), so a later start without the offline directory is still warm.
+//!   `RISC0_METAL_AOT_SEED=0` disables it.
+//! - **Specialized PSOs** ([specialized_pipeline]) try the offline archive of their unit too
+//!   (`build_archive.py --fc`), unless `RISC0_METAL_AOT_FC=0`.
+//! - **GC** ([gc_archives]): at most once a day, on a background thread at the first
+//!   process-wide load, each unit keeps its [DEFAULT_GC_KEEP] most recently used keys and the
+//!   older ones are deleted (never a file used or written in the last hour); stale build-cache
+//!   metallibs beside the archive directory likewise. `RISC0_METAL_ARCHIVE_GC=0` disables it,
+//!   `=dry` only logs.
 //!
 //! The functions marked `#[doc(hidden)]` are test seams (keccak's archive tests use them).
 
@@ -103,6 +131,14 @@ pub const ARCHIVE_ENV: &str = "RISC0_METAL_ARCHIVE";
 pub const ARCHIVE_DIR_ENV: &str = "RISC0_METAL_ARCHIVE_DIR";
 /// Z16: directory of read-only offline (`metal-tt`) archives (module docs). Unset: none.
 pub const AOT_DIR_ENV: &str = "RISC0_METAL_AOT_DIR";
+/// W7-Z1: `0` keeps the specialized (function-constant) PSOs out of the offline archives.
+pub const AOT_FC_ENV: &str = "RISC0_METAL_AOT_FC";
+/// W7-Z1: `0` disables copying a fully used offline archive into the runtime archive.
+pub const AOT_SEED_ENV: &str = "RISC0_METAL_AOT_SEED";
+/// W7-Z1: `0` disables the archive GC ([gc_archives]); `dry` logs what it would delete.
+pub const ARCHIVE_GC_ENV: &str = "RISC0_METAL_ARCHIVE_GC";
+/// W7-Z1: how many keys per unit the GC keeps (default [DEFAULT_GC_KEEP], minimum 1).
+pub const ARCHIVE_GC_KEEP_ENV: &str = "RISC0_METAL_ARCHIVE_GC_KEEP";
 const ARCHIVE_EXT: &str = "binarchive";
 
 /// What happened to the archive while the PSOs were built.
@@ -118,6 +154,11 @@ pub struct ArchiveReport {
     pub aot_hits: usize,
     /// Z16: the offline archive file that was loaded, if any.
     pub aot_path: Option<PathBuf>,
+    /// W7-Z1: size of [Self::aot_path] in bytes (mapped by Metal while the archive is open).
+    pub aot_bytes: u64,
+    /// W7-Z1: a background copy of the offline archive into the runtime archive was started
+    /// ([seed_runtime_archive]).
+    pub seeding: bool,
     /// PSOs not in the archive: compiled into it (or, on an archive error, built the plain way).
     /// Either compiles, unless the OS shader cache has the function.
     pub misses: usize,
@@ -189,6 +230,11 @@ impl ArchivedKernels {
 
     /// [Self::new_in] on at most `threads` PSO-building threads (None: `available_parallelism`;
     /// Z16: recursion's `RISC0_METAL_REC_PSO_THREADS`).
+    ///
+    /// W7-Z1: the offline archive ([AOT_DIR_ENV]) is used only when `dir` is the process's
+    /// archive directory ([process_aot_dir]): the process-wide loaders pass [archive_dir], the
+    /// tests their own directories, which therefore never see an offline archive from the
+    /// environment (PLAN 8.7).
     pub fn new_in_threads(
         dir: Option<PathBuf>,
         device: &DeviceRef,
@@ -197,7 +243,8 @@ impl ArchivedKernels {
         names: &[&str],
         threads: Option<usize>,
     ) -> Result<Self> {
-        Self::new_in_aot(dir, aot_dir(), device, unit, bytes, names, threads)
+        let aot = process_aot_dir(dir.as_deref());
+        Self::new_in_aot(dir, aot, device, unit, bytes, names, threads)
     }
 
     /// [Self::new_in_threads] with the offline archive directory given (None: no offline
@@ -241,6 +288,9 @@ impl ArchivedKernels {
             report
                 .errors
                 .push("OS build unknown: binary archive not used".into());
+        }
+        if dir.as_deref().is_some_and(is_process_dir) {
+            start_gc(dir.as_deref().unwrap());
         }
         let opened = SystemTime::now();
         let archive = base
@@ -286,6 +336,13 @@ impl ArchivedKernels {
             pipelines.insert(name.to_string(), pso);
         }
         report.add_time = Duration::from_nanos(add_nanos.load(Ordering::Relaxed));
+        maybe_seed(
+            &mut report,
+            base.as_deref(),
+            unit,
+            names.len(),
+            archive.is_some(),
+        );
 
         if let (Some(archive), Some(base)) = (archive.as_deref(), base.as_deref()) {
             if added > 0 {
@@ -361,6 +418,21 @@ pub fn aot_dir() -> Option<PathBuf> {
         })
 }
 
+/// Whether `dir` is the process's runtime archive directory ([archive_dir]), compared as
+/// absolute paths: the mark of a process-wide load ([process_aot_dir], [start_gc]).
+#[doc(hidden)]
+pub fn is_process_dir(dir: &Path) -> bool {
+    let abs = |d: &Path| std::path::absolute(d).unwrap_or_else(|_| d.to_path_buf());
+    archive_dir().is_some_and(|p| abs(&p) == abs(dir))
+}
+
+/// W7-Z1: the offline archive directory for a load whose runtime archive is in `dir`:
+/// [aot_dir] when `dir` is the process's [archive_dir] (a process-wide load), None otherwise
+/// (a test or tool with a directory of its own never reads [AOT_DIR_ENV]).
+pub fn process_aot_dir(dir: Option<&Path>) -> Option<PathBuf> {
+    dir.filter(|d| is_process_dir(d)).and_then(|_| aot_dir())
+}
+
 /// Z16: `MTLDevice.architecture.name` (e.g. `applegpu_g17s`, the `metal-tt -arch` name); None if
 /// the OS does not have it (macOS < 14).
 #[allow(unexpected_cfgs)]
@@ -383,17 +455,66 @@ pub fn gpu_architecture(device: &DeviceRef) -> Option<String> {
     }
 }
 
-/// Z16: `<unit>-<chunked_digest(bytes)[..24]>-<arch>`, the stem of the offline archive of a
-/// metallib for one GPU architecture (`<stem>-<checksum>.binarchive`, as [archive_file]).
-#[doc(hidden)]
-pub fn aot_stem(unit: &str, bytes: &[u8], arch: &str) -> String {
-    format!("{unit}-{}-{arch}", &chunked_digest(bytes)[..24])
+/// W7-Z1: the OS keys an offline archive may carry on this machine, in the order they are
+/// tried: `os<ProductBuildVersion>` (made for exactly this OS build), then `macos<major>`
+/// (made for every build of this major version). Empty when neither is known.
+pub fn aot_os_keys() -> Vec<String> {
+    aot_os_keys_for(os_build().as_deref(), os_version().as_deref())
 }
 
-/// Z16: load the offline archive of `unit`/`bytes` for this GPU from `dir`, if there is one whose
-/// content matches the checksum in its name (a damaged archive can abort the process inside
-/// Metal, K8; the module docs). Never fatal and never writes `dir`: a missing, mismatched or
-/// unloadable file is reported (debug/warn) and skipped.
+/// [aot_os_keys] for the given OS build and product version (`27.2.1`).
+#[doc(hidden)]
+pub fn aot_os_keys_for(build: Option<&str>, version: Option<&str>) -> Vec<String> {
+    let mut keys = Vec::new();
+    if let Some(b) = build.filter(|b| is_key_part(b)) {
+        keys.push(format!("os{b}"));
+    }
+    let major = version
+        .and_then(|v| v.split('.').next())
+        .filter(|m| !m.is_empty() && m.bytes().all(|c| c.is_ascii_digit()));
+    if let Some(m) = major {
+        keys.push(format!("macos{m}"));
+    }
+    keys
+}
+
+/// An OS key part must not contain the `-` that separates the name's fields.
+fn is_key_part(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// Z16 / W7-Z1: `<unit>-<parallel_digest(bytes)[..24]>-<arch>-<os_key>`, the stem of the offline
+/// archive of a metallib for one GPU architecture and OS key ([aot_os_keys]);
+/// `<stem>-<aot_checksum>.binarchive` is the file. Always [parallel_digest], whatever
+/// [ARCHIVE_HASH_ENV] says, because `tools/metal_aot/build_archive.py` writes these names.
+#[doc(hidden)]
+pub fn aot_stem(unit: &str, bytes: &[u8], arch: &str, os_key: &str) -> String {
+    aot_stem_of(unit, &parallel_digest(bytes), arch, os_key)
+}
+
+/// [aot_stem] with the metallib digest already computed (hex).
+fn aot_stem_of(unit: &str, digest: &str, arch: &str, os_key: &str) -> String {
+    format!("{unit}-{}-{arch}-{os_key}", &digest[..24])
+}
+
+/// The checksum of an offline archive file's content: the first [CHECKSUM_LEN] hex digits of its
+/// [parallel_digest] (as `build_archive.py`; independent of [ARCHIVE_HASH_ENV]).
+#[doc(hidden)]
+pub fn aot_checksum(content: &[u8]) -> String {
+    parallel_digest(content)[..CHECKSUM_LEN].to_string()
+}
+
+/// The file name of an offline archive with stem `stem` ([aot_stem]) and content `content`.
+#[doc(hidden)]
+pub fn aot_file_name(stem: &str, content: &[u8]) -> String {
+    format!("{stem}-{}.{ARCHIVE_EXT}", aot_checksum(content))
+}
+
+/// Z16: load the offline archive of `unit`/`bytes` for this GPU and OS from `dir`, if there is
+/// one whose content matches the checksum in its name (a damaged archive can abort the process
+/// inside Metal, K8; the module docs). The OS keys are tried in [aot_os_keys] order; a file of
+/// another architecture, metallib or OS key is not opened at all. Never fatal and never writes
+/// `dir`: a missing, mismatched or unloadable file is reported (debug/warn) and skipped.
 fn open_aot_archive(
     dir: &Path,
     device: &DeviceRef,
@@ -402,67 +523,206 @@ fn open_aot_archive(
     report: &mut ArchiveReport,
 ) -> Option<BinaryArchive> {
     let arch = gpu_architecture(device)?;
-    let stem = aot_stem(unit, bytes, &arch);
-    let entries = std::fs::read_dir(dir).ok()?;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(sum) = name.to_str().and_then(|n| checksum_in_name(&stem, n)) else {
-            continue;
-        };
-        let path = entry.path();
-        let ok = std::fs::read(&path).is_ok_and(|c| archive_checksum(&c) == sum);
-        if !ok {
-            let msg = format!(
-                "offline archive {}: checksum mismatch; skipped",
-                path.display()
-            );
-            tracing::warn!("{unit}: Metal binary archive: {msg}");
-            report.errors.push(msg);
-            continue;
-        }
-        let desc = BinaryArchiveDescriptor::new();
-        desc.set_url(&file_url(&path));
-        match device.new_binary_archive_with_descriptor(&desc) {
-            Ok(a) => {
-                report.aot_path = Some(path);
-                return Some(a);
-            }
-            Err(e) => {
-                let msg = format!("offline archive {}: {e}; skipped", path.display());
+    open_aot_archive_for(dir, device, unit, bytes, &arch, &aot_os_keys(), report)
+}
+
+/// [open_aot_archive] with the architecture and OS keys given (tests).
+#[doc(hidden)]
+pub fn open_aot_archive_for(
+    dir: &Path,
+    device: &DeviceRef,
+    unit: &str,
+    bytes: &[u8],
+    arch: &str,
+    os_keys: &[String],
+    report: &mut ArchiveReport,
+) -> Option<BinaryArchive> {
+    let names: Vec<String> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+        .filter(|n| n.starts_with(unit) && n.ends_with(ARCHIVE_EXT))
+        .collect();
+    if names.is_empty() {
+        tracing::debug!("{unit}: no offline archive in {}", dir.display());
+        return None;
+    }
+    let digest = parallel_digest(bytes);
+    for os_key in os_keys {
+        let stem = aot_stem_of(unit, &digest, arch, os_key);
+        for name in &names {
+            let Some(sum) = checksum_in_name(&stem, name) else {
+                continue;
+            };
+            let path = dir.join(name);
+            let content = std::fs::read(&path);
+            let ok = content.as_ref().is_ok_and(|c| aot_checksum(c) == sum);
+            if !ok {
+                let msg = format!(
+                    "offline archive {}: checksum mismatch; skipped",
+                    path.display()
+                );
                 tracing::warn!("{unit}: Metal binary archive: {msg}");
                 report.errors.push(msg);
+                continue;
+            }
+            let size = content.map_or(0, |c| c.len() as u64);
+            let desc = BinaryArchiveDescriptor::new();
+            desc.set_url(&file_url(&path));
+            match device.new_binary_archive_with_descriptor(&desc) {
+                Ok(a) => {
+                    report.aot_path = Some(path);
+                    report.aot_bytes = size;
+                    return Some(a);
+                }
+                Err(e) => {
+                    let msg = format!("offline archive {}: {e}; skipped", path.display());
+                    tracing::warn!("{unit}: Metal binary archive: {msg}");
+                    report.errors.push(msg);
+                }
             }
         }
     }
     tracing::debug!(
-        "{unit}: no offline archive {stem}-*.{ARCHIVE_EXT} in {}",
+        "{unit}: no offline archive {unit}-{}-{arch}-<{}>-*.{ARCHIVE_EXT} in {}",
+        &digest[..24],
+        os_keys.join("|"),
         dir.display()
     );
     None
+}
+
+/// W7-Z1: copy the offline archive `aot` into the runtime archive of `base` ([archive_base]) as
+/// [save_archive] would write it (temporary file, checksum name, rename; then the same cleanup),
+/// unless a runtime archive file of `base` exists already. Every PSO of the load that calls it
+/// was an offline-archive hit, so the copy holds them all for this device and OS: a later start
+/// without [AOT_DIR_ENV] (or after the offline directory went away) loads them without a
+/// compile. Returns the file written (None: one existed).
+#[doc(hidden)]
+pub fn seed_runtime_archive(aot: &Path, base: &Path, unit: &str) -> Result<Option<PathBuf>> {
+    let dir = base
+        .parent()
+        .ok_or_else(|| anyhow!("no parent directory"))?;
+    if archive_used(base).is_some() {
+        return Ok(None);
+    }
+    std::fs::create_dir_all(dir)?;
+    // The runtime checksum is the offline one (both the parallel digest) unless
+    // [ARCHIVE_HASH_ENV] switched the runtime's: then the content is hashed again.
+    let sum_in_name = aot
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_suffix(&format!(".{ARCHIVE_EXT}")))
+        .and_then(|n| n.rsplit_once('-'))
+        .map(|(_, sum)| sum.to_string());
+    let sum = match sum_in_name {
+        Some(sum) if !std::env::var(ARCHIVE_HASH_ENV).is_ok_and(|v| v == "sha256") => sum,
+        _ => archive_checksum(&std::fs::read(aot)?),
+    };
+    let mut name = base.file_name().unwrap().to_os_string();
+    name.push(format!("-{sum}.{ARCHIVE_EXT}"));
+    let path = base.with_file_name(name);
+    let tmp = dir.join(format!(
+        ".{}.{ARCHIVE_EXT}.tmp{}",
+        base.file_name().unwrap().to_string_lossy(),
+        std::process::id()
+    ));
+    // On APFS `fs::copy` clones the file (no data copied, no extra space until one changes).
+    std::fs::copy(aot, &tmp)?;
+    // A clone keeps the offline file's time; the GC reads it as "last used".
+    std::fs::File::options()
+        .write(true)
+        .open(&tmp)?
+        .set_modified(SystemTime::now())?;
+    std::fs::rename(&tmp, &path)?;
+    let stem = base.file_name().unwrap().to_string_lossy().into_owned();
+    prune_other_keys(dir, unit, &stem, keep_archives(), SystemTime::now());
+    Ok(Some(path))
+}
+
+/// Whether the offline-archive seeding is enabled ([AOT_SEED_ENV] is not `0`).
+fn seed_enabled() -> bool {
+    !std::env::var(AOT_SEED_ENV).is_ok_and(|v| v.trim() == "0")
+}
+
+/// Start [seed_runtime_archive] on a background thread when the offline archive served all
+/// `n` PSOs of a load and no runtime archive was loaded (the runtime archive exists as an
+/// object, so `base` is writable in principle).
+fn maybe_seed(
+    report: &mut ArchiveReport,
+    base: Option<&Path>,
+    unit: &str,
+    n: usize,
+    have_runtime: bool,
+) {
+    let (Some(aot), Some(base)) = (report.aot_path.clone(), base) else {
+        return;
+    };
+    if n == 0 || report.aot_hits != n || report.loaded || !have_runtime || !seed_enabled() {
+        return;
+    }
+    let base = base.to_path_buf();
+    let unit = unit.to_string();
+    let spawned = std::thread::Builder::new()
+        .name(format!("metal-aot-seed-{unit}"))
+        .spawn(move || {
+            let t = Instant::now();
+            match seed_runtime_archive(&aot, &base, &unit) {
+                Ok(Some(p)) => tracing::debug!(
+                    "{unit}: offline archive copied to {} in {:.3} s",
+                    p.display(),
+                    t.elapsed().as_secs_f64()
+                ),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(
+                    "{unit}: copying the offline archive {} into the runtime archive: {e:#}",
+                    aot.display()
+                ),
+            }
+        });
+    report.seeding = spawned.is_ok();
 }
 
 /// The OS build (`ProductBuildVersion`, e.g. `25A354`): a new build can bring a new GPU compiler,
 /// whose binaries the old archive does not hold. None when neither the plist nor `sysctl` gives
 /// it: the archive is then not used at all ([archive_base]), because a key without the OS build
 /// would survive an OS update (K8).
+///
+/// W7-Z1: read once per process (the OS cannot change under a running process; every unit and
+/// specialization asked for it, one plist read each).
 #[doc(hidden)]
 pub fn os_build() -> Option<String> {
-    let plist = std::fs::read_to_string("/System/Library/CoreServices/SystemVersion.plist")
-        .unwrap_or_default();
-    let from_plist = plist
-        .split("<key>ProductBuildVersion</key>")
+    static B: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    B.get_or_init(|| {
+        plist_value("ProductBuildVersion").or_else(|| {
+            std::process::Command::new("/usr/sbin/sysctl")
+                .args(["-n", "kern.osversion"])
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+    })
+    .clone()
+}
+
+/// W7-Z1: the OS product version (`ProductVersion`, e.g. `27.2.1`), read once per process.
+#[doc(hidden)]
+pub fn os_version() -> Option<String> {
+    static V: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    V.get_or_init(|| plist_value("ProductVersion")).clone()
+}
+
+/// A string value of `/System/Library/CoreServices/SystemVersion.plist`.
+fn plist_value(key: &str) -> Option<String> {
+    let plist = std::fs::read_to_string("/System/Library/CoreServices/SystemVersion.plist").ok()?;
+    plist
+        .split(&format!("<key>{key}</key>"))
         .nth(1)
         .and_then(|rest| rest.split("<string>").nth(1))
         .and_then(|rest| rest.split("</string>").next())
-        .map(|s| s.trim().to_string());
-    from_plist.filter(|s| !s.is_empty()).or_else(|| {
-        std::process::Command::new("/usr/sbin/sysctl")
-            .args(["-n", "kern.osversion"])
-            .output()
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .filter(|s| !s.is_empty())
-    })
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Chunk size of [chunked_digest].
@@ -892,8 +1152,41 @@ pub fn archive_used(base: &Path) -> Option<SystemTime> {
 /// [ArchivedKernels::new_in]: an archive error is reported and logged, never fatal. Blocking
 /// (a cold specialization of a large kernel compiles for many seconds), so callers that must not
 /// wait run it on a thread of their own.
+///
+/// W7-Z1: a process-wide call (`dir` is [archive_dir]) first tries the offline archive of
+/// `unit` ([AOT_DIR_ENV], `build_archive.py --fc`), unless [AOT_FC_ENV] is `0`. Note that with a
+/// cold OS shader cache `newFunctionWithName:constantValues:` still specializes the function in
+/// the compiler service before any archive lookup (~6.5 s for rv32im's split kernel, Z16 note):
+/// the offline archive removes the GPU compile of a first install, not that step.
 pub fn specialized_pipeline(
     dir: Option<PathBuf>,
+    device: &DeviceRef,
+    library: &metal::LibraryRef,
+    bytes: &[u8],
+    unit: &str,
+    name: &str,
+    constants: &[(usize, u32)],
+) -> Result<(ComputePipelineState, ArchiveReport)> {
+    let aot = if aot_fc_enabled() {
+        process_aot_dir(dir.as_deref())
+    } else {
+        None
+    };
+    specialized_pipeline_in(dir, aot, device, library, bytes, unit, name, constants)
+}
+
+/// Whether specialized PSOs may come from offline archives ([AOT_FC_ENV] is not `0`).
+pub fn aot_fc_enabled() -> bool {
+    !std::env::var(AOT_FC_ENV).is_ok_and(|v| v.trim() == "0")
+}
+
+/// [specialized_pipeline] with the offline archive directory given (None: none) instead of
+/// derived from the environment (tests).
+#[allow(clippy::too_many_arguments)]
+#[doc(hidden)]
+pub fn specialized_pipeline_in(
+    dir: Option<PathBuf>,
+    aot_dir: Option<PathBuf>,
     device: &DeviceRef,
     library: &metal::LibraryRef,
     bytes: &[u8],
@@ -931,9 +1224,10 @@ pub fn specialized_pipeline(
     let archive = base
         .as_deref()
         .and_then(|base| open_archive(device, base, &mut report));
+    let aot = aot_dir.and_then(|d| open_aot_archive(&d, device, unit, bytes, &mut report));
     let add_nanos = AtomicU64::new(0);
     let archives = Archives {
-        aot: None,
+        aot: aot.as_deref(),
         runtime: archive.as_deref(),
     };
     let (pso, source) = metal::objc::rc::autoreleasepool(|| {
@@ -942,7 +1236,11 @@ pub fn specialized_pipeline(
     report.add_time = Duration::from_nanos(add_nanos.load(Ordering::Relaxed));
     let mut added = false;
     match source {
-        Source::Hit | Source::AotHit => report.hits += 1,
+        Source::Hit => report.hits += 1,
+        Source::AotHit => {
+            report.hits += 1;
+            report.aot_hits += 1;
+        }
         Source::Added => {
             report.misses += 1;
             added = true;
@@ -956,6 +1254,7 @@ pub fn specialized_pipeline(
             }
         }
     }
+    maybe_seed(&mut report, base.as_deref(), unit, 1, archive.is_some());
     if let (Some(archive), Some(base), true) = (archive.as_deref(), base.as_deref(), added) {
         let t_save = Instant::now();
         match save_archive(archive, base, unit, opened) {
@@ -1146,4 +1445,245 @@ pub fn prune_other_keys(dir: &Path, unit: &str, stem: &str, keep: usize, now: Sy
             let _ = std::fs::remove_file(path);
         }
     }
+}
+
+/// W7-Z1: keys per unit the GC keeps by default: the current one and the newest previous one.
+pub const DEFAULT_GC_KEEP: usize = 2;
+/// W7-Z1: the GC runs at most this often (per archive directory, `.gc-stamp`).
+pub const GC_INTERVAL: Duration = Duration::from_secs(24 * 3600);
+/// W7-Z1: an archive file used (loaded: its modification time is set, [open_archive_with]) or
+/// written less than this long ago is never deleted by the GC: a live process may be about to
+/// load it, or have it open.
+pub const GC_MIN_AGE: Duration = Duration::from_secs(3600);
+/// W7-Z1: a build-cache metallib is never deleted within a day of its last use, the rule
+/// `risc0-build-kernel`'s own cleanup follows (a build running now may be about to copy it).
+pub const GC_METALLIB_MIN_AGE: Duration = Duration::from_secs(24 * 3600);
+
+/// What [gc_archives] deleted (or, dry, would delete).
+#[derive(Clone, Debug, Default)]
+pub struct GcReport {
+    /// Files deleted, with their sizes.
+    pub deleted: Vec<(PathBuf, u64)>,
+    /// Bytes of [Self::deleted].
+    pub bytes: u64,
+    /// Files of the kept keys.
+    pub kept: usize,
+    /// Files of evicted keys left alone because they were used too recently.
+    pub recent: usize,
+}
+
+/// One file the GC considers.
+struct GcFile {
+    path: PathBuf,
+    size: u64,
+    modified: SystemTime,
+}
+
+/// `<unit>-<key>-<checksum>.binarchive` split into (unit, key) when `key` is 24 and the
+/// checksum [CHECKSUM_LEN] hex digits (a runtime archive name; offline names do not match).
+fn runtime_archive_parts(name: &str) -> Option<(&str, &str)> {
+    let rest = name.strip_suffix(ARCHIVE_EXT)?.strip_suffix('.')?;
+    let mut it = rest.rsplitn(3, '-');
+    let sum = it.next()?;
+    let key = it.next()?;
+    let unit = it.next()?;
+    let hex = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_hexdigit());
+    (hex(sum, CHECKSUM_LEN) && hex(key, 24) && !unit.is_empty()).then_some((unit, key))
+}
+
+/// `<stem>-<key32>.metallib` or `<sha256>.metallib` (`risc0-build-kernel`'s cache names)
+/// split into (stem, key); temporary outputs (`.tmp<pid>.metallib`) do not match.
+fn metallib_parts(name: &str) -> Option<(&str, &str)> {
+    let rest = name.strip_suffix(".metallib")?;
+    let hex = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit());
+    match rest.rsplit_once('-') {
+        Some((stem, key)) if key.len() == 32 && hex(key) => Some((stem, key)),
+        None if rest.len() == 64 && hex(rest) => Some(("", rest)),
+        _ => None,
+    }
+}
+
+/// Group `files` by (group, key) and delete, per group, every key beyond the `keep` most
+/// recently used ones (a key's time is its newest file's), except files used within
+/// `min_age` of `now`.
+fn gc_groups(
+    files: Vec<(String, String, GcFile)>,
+    keep: usize,
+    min_age: Duration,
+    now: SystemTime,
+    dry: bool,
+    report: &mut GcReport,
+) {
+    let mut groups: HashMap<String, HashMap<String, Vec<GcFile>>> = HashMap::new();
+    for (group, key, f) in files {
+        groups
+            .entry(group)
+            .or_default()
+            .entry(key)
+            .or_default()
+            .push(f);
+    }
+    for (_, keys) in groups {
+        let mut keys: Vec<(SystemTime, Vec<GcFile>)> = keys
+            .into_values()
+            .map(|fs| (fs.iter().map(|f| f.modified).max().unwrap(), fs))
+            .collect();
+        keys.sort_by_key(|k| std::cmp::Reverse(k.0));
+        for (i, (_, fs)) in keys.into_iter().enumerate() {
+            for f in fs {
+                if i < keep {
+                    report.kept += 1;
+                    continue;
+                }
+                let recent = now
+                    .duration_since(f.modified)
+                    .map_or(true, |age| age < min_age);
+                if recent {
+                    report.recent += 1;
+                    continue;
+                }
+                if dry || std::fs::remove_file(&f.path).is_ok() {
+                    report.bytes += f.size;
+                    report.deleted.push((f.path, f.size));
+                }
+            }
+        }
+    }
+}
+
+/// W7-Z1: the archive GC. In `dir` (a runtime archive directory) each unit keeps the `keep`
+/// most recently used keys (metallib, device, OS build, kernel set: [archive_key]); the files of
+/// older keys are deleted unless used within [GC_MIN_AGE] of `now`, and so are temporary files
+/// of interrupted saves older than that. In `metallib_dir` (the `risc0-build-kernel` cache, when
+/// given) each output stem keeps its `keep` newest metallibs and older ones unused for
+/// [GC_METALLIB_MIN_AGE] go. Offline archives and every other file are never touched. With
+/// `dry` nothing is deleted and the report lists what would be.
+///
+/// Why "most recently used" and not "referenced by the installed workers": a runtime key hashes
+/// the metallib digest together with the device, the OS build and the kernel set of each unit
+/// (and the function constants of each specialization), which an installed binary does not
+/// expose, so the GC cannot compute the keys another binary would use. The keep-two rule leaves
+/// the current binary's archives and those of the one before it (e.g. a backup worker); any
+/// other binary pays one cold build if it is run again.
+pub fn gc_archives(
+    dir: &Path,
+    metallib_dir: Option<&Path>,
+    now: SystemTime,
+    keep: usize,
+    dry: bool,
+) -> GcReport {
+    let keep = keep.max(1);
+    let mut report = GcReport::default();
+    let stat = |e: &std::fs::DirEntry| -> Option<GcFile> {
+        let m = e.metadata().ok()?;
+        m.is_file().then(|| GcFile {
+            path: e.path(),
+            size: m.len(),
+            modified: m.modified().unwrap_or(now),
+        })
+    };
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        let mut files = Vec::new();
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some(f) = stat(&e) else { continue };
+            if let Some((unit, key)) = runtime_archive_parts(&name) {
+                files.push((unit.to_string(), key.to_string(), f));
+            } else if name.starts_with('.') && name.contains(&format!(".{ARCHIVE_EXT}.tmp")) {
+                let old = now
+                    .duration_since(f.modified)
+                    .is_ok_and(|age| age >= GC_MIN_AGE);
+                if old && (dry || std::fs::remove_file(&f.path).is_ok()) {
+                    report.bytes += f.size;
+                    report.deleted.push((f.path, f.size));
+                }
+            }
+        }
+        gc_groups(files, keep, GC_MIN_AGE, now, dry, &mut report);
+    }
+    if let Some(Ok(entries)) = metallib_dir.map(std::fs::read_dir) {
+        let files = entries
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let (stem, key) = metallib_parts(&name)?;
+                Some((stem.to_string(), key.to_string(), stat(&e)?))
+            })
+            .collect();
+        gc_groups(files, keep, GC_METALLIB_MIN_AGE, now, dry, &mut report);
+    }
+    report
+}
+
+/// The [ARCHIVE_GC_KEEP_ENV] setting.
+fn gc_keep() -> usize {
+    std::env::var(ARCHIVE_GC_KEEP_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(DEFAULT_GC_KEEP)
+}
+
+/// The build-kernel metallib cache that holds the default archive directory
+/// (`<risc0 cache>/metal-archives`): its parent, when `dir` is that default directory.
+fn metallib_cache_of(dir: &Path) -> Option<PathBuf> {
+    let parent = dir.parent()?;
+    (dir.file_name()? == "metal-archives" && parent.file_name()? == "com.risczero.RISC-Zero.risc0")
+        .then(|| parent.to_path_buf())
+}
+
+/// W7-Z1: once per process, at the first process-wide load: run [gc_archives] on `dir` (and the
+/// build cache beside it) on a background thread, at most once per [GC_INTERVAL] per directory
+/// (its `.gc-stamp` file). Off with [ARCHIVE_GC_ENV]`=0`; `dry` logs what it would delete.
+fn start_gc(dir: &Path) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let mode = std::env::var(ARCHIVE_GC_ENV).unwrap_or_default();
+        let mode = mode.trim().to_ascii_lowercase();
+        if matches!(mode.as_str(), "0" | "off" | "false") {
+            return;
+        }
+        let dry = mode == "dry";
+        let dir = dir.to_path_buf();
+        let stamp = dir.join(".gc-stamp");
+        let now = SystemTime::now();
+        let due = std::fs::metadata(&stamp)
+            .and_then(|m| m.modified())
+            .map_or(true, |t| {
+                now.duration_since(t).map_or(true, |a| a >= GC_INTERVAL)
+            });
+        if !due && !dry {
+            return;
+        }
+        let _ = std::thread::Builder::new()
+            .name("metal-archive-gc".into())
+            .spawn(move || {
+                let t = Instant::now();
+                if !dry
+                    && (std::fs::create_dir_all(&dir).is_err()
+                        || std::fs::write(&stamp, b"").is_err())
+                {
+                    return;
+                }
+                let cache = metallib_cache_of(&dir);
+                let r = gc_archives(&dir, cache.as_deref(), now, gc_keep(), dry);
+                for (p, size) in &r.deleted {
+                    tracing::debug!(
+                        "Metal archive GC: {} {} ({size} B)",
+                        if dry { "would delete" } else { "deleted" },
+                        p.display()
+                    );
+                }
+                tracing::info!(
+                    "Metal archive GC{}: {} files, {:.1} MB {}; {} kept, {} recent ({:.2} s)",
+                    if dry { " (dry run)" } else { "" },
+                    r.deleted.len(),
+                    r.bytes as f64 / 1e6,
+                    if dry { "to delete" } else { "deleted" },
+                    r.kept,
+                    r.recent,
+                    t.elapsed().as_secs_f64()
+                );
+            });
+    });
 }

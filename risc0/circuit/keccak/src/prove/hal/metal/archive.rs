@@ -18,6 +18,11 @@
 //! rv32im and recursion use the same archive code under their own unit names; keccak keeps its
 //! unit name (`keccak`), so its archive files and keys are unchanged. This module re-exports it
 //! and keeps the archive tests, which run against the keccak metallib.
+//!
+//! W7-Z1: the two-archive (runtime + offline) hook is the shared one: `keccak_kernels` and
+//! `keccak_strict_kernels` load through `ArchivedKernels::new`, a process-wide load, so their
+//! PSOs are looked up in the offline archives of units `keccak` / `keccakstrict` in
+//! `RISC0_METAL_AOT_DIR` (`tools/metal_aot`) first; `aot_archive_hook` below tests it.
 
 pub(crate) use risc0_zkp::hal::metal::archive::*;
 
@@ -801,5 +806,80 @@ mod tests {
             t0.elapsed().as_secs_f64(),
             &misses[..misses.len().min(3)]
         );
+    }
+    /// W7-Z1 (e): the offline-archive hook on the keccak metallib. A runtime archive of the small
+    /// set, placed as the `keccak` offline archive for this GPU and OS, serves every PSO; a load
+    /// with a directory of its own does not read `RISC0_METAL_AOT_DIR` (only a process-wide one).
+    #[test]
+    fn aot_archive_hook() {
+        let _gpu = super::super::tests::gpu_test_lock();
+        let device = device();
+        let (Some(arch), Some(os)) = (
+            super::gpu_architecture(&device),
+            super::aot_os_keys().into_iter().next(),
+        ) else {
+            return;
+        };
+        let (rt, aot) = (temp_dir("w7z1-rt"), temp_dir("w7z1-aot"));
+        std::fs::create_dir_all(&aot).unwrap();
+        let names = small_set();
+        let first = ArchivedKernels::new_in(Some(rt.clone()), &device, "keccak", METAL_LIB, &names)
+            .unwrap();
+        assert_eq!(first.report.aot_hits, 0);
+        let content = std::fs::read(first.report.path.as_ref().unwrap()).unwrap();
+        let stem = super::aot_stem("keccak", METAL_LIB, &arch, &os);
+        std::fs::write(aot.join(super::aot_file_name(&stem, &content)), &content).unwrap();
+        let k = ArchivedKernels::new_in_aot(
+            None,
+            Some(aot.clone()),
+            &device,
+            "keccak",
+            METAL_LIB,
+            &names,
+            None,
+        )
+        .unwrap();
+        assert!(k.report.errors.is_empty(), "{:?}", k.report.errors);
+        assert_eq!((k.report.aot_hits, k.report.misses), (names.len(), 0));
+        assert!(names.iter().all(|n| k.get(n).is_some()));
+        for d in [rt, aot] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+    /// W7-Z1 (`--ignored`, manual; no GPU work beyond loading the library): writes the inputs of
+    /// `tools/metal_aot/build_all.py` for this crate into `W7Z1_DUMP`: the embedded metallib as
+    /// `keccak.metallib` and one JSON line per archive unit (`unit`, `metallib`, `names`, `fc`) appended to
+    /// `units.jsonl`.
+    #[test]
+    #[ignore]
+    fn w7z1_dump_aot_inputs() {
+        let dir = std::path::PathBuf::from(std::env::var("W7Z1_DUMP").expect("W7Z1_DUMP"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lib: &[u8] = METAL_LIB;
+        std::fs::write(dir.join("keccak.metallib"), lib).unwrap();
+        let mut lines = String::new();
+        let mut unit = |unit: &str, names: &[&str], fc: Option<String>| {
+            let names: Vec<String> = names.iter().map(|n| format!("\"{n}\"")).collect();
+            lines.push_str(&format!(
+                "{{\"unit\": \"{unit}\", \"metallib\": \"keccak.metallib\", \"names\": [{}], \"fc\": {}}}\n",
+                names.join(", "),
+                fc.map_or("null".to_string(), |f| format!("\"{f}\""))
+            ));
+        };
+        let names = super::super::kernel_names();
+        unit("keccak", &names, None);
+        unit(
+            "keccakstrict",
+            &risc0_circuit_keccak_sys::metal_eval::EVAL_STRICT_STAGE_NAMES,
+            None,
+        );
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("units.jsonl"))
+            .unwrap()
+            .write_all(lines.as_bytes())
+            .unwrap();
     }
 }
