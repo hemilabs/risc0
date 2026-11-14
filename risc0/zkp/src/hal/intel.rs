@@ -298,14 +298,17 @@ impl IntelBufferPool {
     }
 
     /// Returns the buffer back if the pool is full, so the caller frees it
-    /// outside the pool lock.
+    /// outside the pool lock. `room` is the most the pool may hold beside the
+    /// buffers in use (see [pool_room]).
     fn push(
         &mut self,
         size: usize,
         buf: IntelDeviceBuffer,
         max_bytes: usize,
+        room: usize,
     ) -> Option<IntelDeviceBuffer> {
-        if size < POOL_SMALL_THRESHOLD || self.total_cached + size <= max_bytes {
+        let cached = self.total_cached + size;
+        if size < POOL_SMALL_THRESHOLD || (cached <= max_bytes && cached <= room) {
             self.total_cached += size;
             self.cache.entry(size).or_default().push(buf);
             None
@@ -339,6 +342,25 @@ static BUFFER_POOL: LazyLock<Mutex<IntelBufferPool>> =
 /// [pool_max_bytes]).
 const POOL_SMALL_CARD_BYTES: usize = 20 << 30;
 
+/// Cards with at least this much memory may keep half of it in idle buffers (see
+/// [pool_max_bytes]).
+const POOL_LARGE_CARD_BYTES: usize = 24 << 30;
+
+/// Device memory left out of the pool's room for what the HAL does not track: the kernels' own
+/// allocations (the rv32im eval_check slab alone is 1.4 GB), twiddle tables and the driver's.
+const POOL_RESERVE_BYTES: usize = 4 << 30;
+
+/// The most the pool may hold while `live` bytes of HAL buffers are in use: the device's memory
+/// less those and [POOL_RESERVE_BYTES], so idle buffers never push the ones in use off the card
+/// (on Windows an allocation past the card's memory spills into shared memory instead of
+/// failing). Unlimited while the device's memory is unknown.
+fn pool_room(live: isize) -> usize {
+    match intel::device_total_memory() {
+        0 => usize::MAX,
+        total => total.saturating_sub(live.max(0) as usize + POOL_RESERVE_BYTES),
+    }
+}
+
 /// The pool's cap for this GPU (see [POOL_MAX_BYTES]). The device's memory is known once the
 /// queue exists, which every buffer's allocation has ensured.
 ///
@@ -349,6 +371,12 @@ const POOL_SMALL_CARD_BYTES: usize = 20 << 30;
 /// of pooled buffers left the next sessions' segments at 42-46 s after the first's 28 s (with up
 /// to 1.2 GB in shared memory); pooling only small buffers kept them at 28-30 s, with the first
 /// session no slower. Sessions at po2=19 took ~3% longer without the pool (64.4 s, from 62.1).
+///
+/// A card with at least [POOL_LARGE_CARD_BYTES] keeps up to half its memory: a po2=20 segment's
+/// buffers come to ~9.5 GB, so a quarter of an Arc Pro B70's 32 GB freed and reallocated the
+/// largest of them (the 3.5 GB data evaluations) every segment, and the driver idled the GPU ~25 ms
+/// readying the new allocation. With half, segments took 599 ms instead of 621 on the B70.
+/// [pool_room] keeps the larger pool off the buffers in use.
 fn pool_max_bytes() -> usize {
     static MAX: AtomicUsize = AtomicUsize::new(0);
     let max = MAX.load(Ordering::Relaxed);
@@ -362,6 +390,8 @@ fn pool_max_bytes() -> usize {
     let max = if cfg!(windows) && total < POOL_SMALL_CARD_BYTES {
         // Nonzero, as 0 means not yet known; [IntelBufferPool::push] keeps small buffers anyway.
         1
+    } else if total >= POOL_LARGE_CARD_BYTES {
+        (total / 2).min(POOL_MAX_BYTES)
     } else {
         (total / 4).min(POOL_MAX_BYTES)
     };
@@ -409,10 +439,16 @@ impl Drop for RawBuffer {
     fn drop(&mut self) {
         let size = self.buf.len();
         tracing::trace!("free: {size} bytes, {}", self.name);
-        tracker().lock().unwrap().free(size);
+        let live = {
+            let mut tracker = tracker().lock().unwrap();
+            tracker.free(size);
+            tracker.total
+        };
         let buf = unsafe { ManuallyDrop::take(&mut self.buf) };
         let max_bytes = pool_max_bytes();
-        let overflow = BUFFER_POOL.lock().push(size, buf, max_bytes);
+        let overflow = BUFFER_POOL
+            .lock()
+            .push(size, buf, max_bytes, pool_room(live));
         if overflow.is_some() {
             // Over the pool cap (reachable in long sessions): the buffer is freed, and
             // esimd_free_device does not wait for queued kernels still using it. Quietly: a
