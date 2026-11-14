@@ -1167,7 +1167,10 @@ impl<HH: HipHash + ?Sized> Hal for HipHal<HH> {
             let p = all.remove(i);
             drop(all);
             ffi_wrap(|| unsafe { risc0_zkp_hip_fill_join(p.done as *mut _, 1) }).unwrap();
-            buffer_pools().entry(device).or_default().push(p.bytes, p.buf);
+            buffer_pools()
+                .entry(device)
+                .or_default()
+                .push(p.bytes, p.buf);
         }
     }
 
@@ -1441,7 +1444,10 @@ impl<HH: HipHash + ?Sized> Hal for HipHal<HH> {
         }
     }
 
-    fn gather_multi(&self, jobs: &[GatherJob<'_, Self>]) -> Option<Vec<(Vec<Self::Elem>, Vec<Digest>)>> {
+    fn gather_multi(
+        &self,
+        jobs: &[GatherJob<'_, Self>],
+    ) -> Option<Vec<(Vec<Self::Elem>, Vec<Digest>)>> {
         // RISC0_HIP_GATHER_MULTI=0: one round trip per gather, as before.
         static ON: OnceLock<bool> = OnceLock::new();
         if !*ON.get_or_init(|| {

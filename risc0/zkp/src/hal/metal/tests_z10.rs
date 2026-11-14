@@ -365,6 +365,7 @@ fn time_ms(hal: &MetalHalPoseidon254, f: impl FnOnce()) -> f64 {
 #[test]
 #[ignore]
 fn bench_kernels() {
+    crate::hal::metal::require_gpu_run();
     let _lock = super::gpu_test_lock();
     let reps: usize = std::env::var("Z10_BENCH_REPS")
         .ok()
@@ -470,6 +471,7 @@ fn minmax(v: &[f64]) -> (f64, f64) {
 #[test]
 #[ignore]
 fn pso_report() {
+    crate::hal::metal::require_gpu_run();
     let hal = MetalHalPoseidon254::new();
     for name in super::KERNEL_NAMES
         .iter()
@@ -492,6 +494,7 @@ fn pso_report() {
 #[test]
 #[ignore]
 fn bench_scratch_lib() {
+    crate::hal::metal::require_gpu_run();
     let _lock = super::gpu_test_lock();
     let path = std::env::var("Z10_LIB").expect("Z10_LIB");
     let names: Vec<String> = std::env::var("Z10_KERNELS")
@@ -556,6 +559,7 @@ fn bench_scratch_lib() {
 #[test]
 #[ignore]
 fn r17_p254_stress() {
+    crate::hal::metal::require_gpu_run();
     let _lock = super::gpu_test_lock();
     let env = |k: &str, d: usize| -> usize {
         std::env::var(k)

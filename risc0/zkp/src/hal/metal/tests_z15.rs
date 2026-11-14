@@ -52,6 +52,7 @@ fn load_avg() -> String {
 #[test]
 #[ignore]
 fn z15_sync_latency_raw() {
+    crate::hal::metal::require_gpu_run();
     use metal::{MTLCommandBufferStatus, MTLSize};
     let _lock = super::gpu_test_lock();
     let hal = MetalHalPoseidon2::new();
@@ -272,6 +273,7 @@ fn mix_fused_knob() {
 #[test]
 #[ignore]
 fn z15_mix_bench() {
+    crate::hal::metal::require_gpu_run();
     let _lock = super::gpu_test_lock();
     let hal = MetalHalPoseidon2::new();
     let po2: usize = env_or("Z15_PO2", 20);
@@ -338,6 +340,7 @@ fn z15_mix_bench() {
 #[test]
 #[ignore]
 fn z15_eval_u_bench() {
+    crate::hal::metal::require_gpu_run();
     let _lock = super::gpu_test_lock();
     let hal = MetalHalPoseidon2::new();
     let po2: usize = env_or("Z15_PO2", 20);
@@ -493,6 +496,7 @@ fn eu2_lazy_matches_reference() {
 #[test]
 #[ignore]
 fn z15_pso_flag_bench() {
+    crate::hal::metal::require_gpu_run();
     use metal::{ComputePipelineDescriptor, MTLSize};
 
     use super::{Grid, KernelArg};
@@ -643,6 +647,7 @@ fn z15_pso_flag_bench() {
 #[test]
 #[ignore]
 fn z15_eu_s_bench() {
+    crate::hal::metal::require_gpu_run();
     use super::eval::{batch_evaluate_any, EvalPath};
     let _lock = super::gpu_test_lock();
     let hal = MetalHalPoseidon2::new();
@@ -654,7 +659,10 @@ fn z15_eu_s_bench() {
     let coeffs = hal.copy_from_elem("c", &random_vec(deg * polys));
     let which: Vec<u32> = (0..n as u32).map(|i| i * polys as u32 / n as u32).collect();
     let xs: Vec<BabyBearExtElem> = (0..n).map(|_| BabyBearExtElem::random(&mut rng)).collect();
-    let (w, x) = (hal.copy_from_u32("w", &which), hal.copy_from_extelem("x", &xs));
+    let (w, x) = (
+        hal.copy_from_u32("w", &which),
+        hal.copy_from_extelem("x", &xs),
+    );
     let ss = [2u32, 1, 4, 8];
     let mut t = vec![Vec::new(); ss.len()];
     let mut outs = vec![Vec::new(); ss.len()];

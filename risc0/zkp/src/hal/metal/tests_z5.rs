@@ -291,6 +291,8 @@ macro_rules! zero_rem_tests {
     ($($name:ident: $po2:expr,)*) => {$(
         #[test]
         fn $name() {
+            // > 2 GiB at po2 22 (W7-A1): one heavy test at a time.
+            let _heavy = ($po2 >= 22).then(super::heavy_test_lock);
             check_zero($po2, 7, 6, ROOTS, None);
         }
     )*};
@@ -313,6 +315,7 @@ macro_rules! nonzero_rem_tests {
     ($($name:ident: $po2:expr,)*) => {$(
         #[test]
         fn $name() {
+            let _heavy = ($po2 >= 22).then(super::heavy_test_lock);
             // Chunks 1 (2 roots) and 4 (2 roots) are random: 4 nonzero remainders.
             check_nonzero($po2, 7, 6, ROOTS, &[1, 4], None);
         }
@@ -336,6 +339,8 @@ nonzero_rem_tests! {
 /// and 18, E = 8 at po2 20..=22 (po2 22 at E = 8 is the K = 2 two-level scan).
 #[test]
 fn combos_divide_explicit_e() {
+    // 5.7 GB (W7-A1): one heavy test at a time.
+    let _heavy = super::heavy_test_lock();
     for (po2, e) in [(16, 16), (18, 16), (20, 8), (21, 8), (22, 8), (22, 16)] {
         let shape = mdiv_shape(1 << po2, e);
         assert!(shape.is_some());
@@ -404,6 +409,7 @@ fn gpu_ms(cb: &metal::CommandBufferRef) -> f64 {
 #[test]
 #[ignore]
 fn mdiv_timing() {
+    crate::hal::metal::require_gpu_run();
     let hal = MetalHalSha256::new();
     let cpu = CpuHal::<BabyBear>::new(crate::core::hash::sha::Sha256HashSuite::new_suite());
     let roots = &[2, 2, 2, 2, 2, 1];

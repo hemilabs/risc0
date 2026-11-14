@@ -155,6 +155,7 @@ pub(crate) fn ab<MH: MetalHash>(
 #[test]
 #[ignore = "measurement"]
 fn z9_ntt_commit_chunk_sweep() {
+    crate::hal::metal::require_gpu_run();
     let _lock = super::gpu_test_lock();
     let hal = MetalHalPoseidon2::new();
     let lg: usize = env_or("Z9_PO2", 20);
@@ -207,6 +208,7 @@ fn time_ms<MH: MetalHash>(hal: &super::MetalHal<MH>, reps: usize, mut f: impl Fn
 #[test]
 #[ignore = "measurement"]
 fn z9_microbench() {
+    crate::hal::metal::require_gpu_run();
     use super::{KernelArg, Poseidon2Config, Poseidon2Kernels};
     let _lock = super::gpu_test_lock();
     let t_new = Instant::now();
@@ -358,6 +360,7 @@ pub(crate) fn compositions(lg: usize, parts: usize, lo: usize) -> Vec<Vec<usize>
 #[test]
 #[ignore = "measurement"]
 fn z9_ntt_split_sweep() {
+    crate::hal::metal::require_gpu_run();
     use super::ntt::test_hooks;
     let _lock = super::gpu_test_lock();
     let hal = MetalHalPoseidon2::new();
@@ -438,6 +441,7 @@ fn parse_split(s: &str) -> Option<Vec<usize>> {
 #[test]
 #[ignore = "measurement"]
 fn z9_ntt_commit_combo() {
+    crate::hal::metal::require_gpu_run();
     use super::ntt::test_hooks;
     let _lock = super::gpu_test_lock();
     let hal = MetalHalPoseidon2::new();
@@ -626,6 +630,7 @@ mod poseidon2_z9 {
 #[test]
 #[ignore = "measurement"]
 fn z9_ab_poseidon2() {
+    crate::hal::metal::require_gpu_run();
     use super::{Poseidon2Config, Poseidon2Kernels};
     let _lock = super::gpu_test_lock();
     let pairs = env_or("Z9_PAIRS", 9);
@@ -689,6 +694,7 @@ fn z9_ab_poseidon2() {
 #[test]
 #[ignore = "measurement"]
 fn z9_poseidon2_crossovers() {
+    crate::hal::metal::require_gpu_run();
     use super::{poseidon2::PvKernel, MetalHashPoseidon2, Poseidon2Kernels};
     let _lock = super::gpu_test_lock();
     let hal = MetalHalPoseidon2::new();
@@ -782,6 +788,7 @@ fn z9_poseidon2_crossovers() {
 #[test]
 #[ignore = "measurement"]
 fn z9_eu2_s_sweep() {
+    crate::hal::metal::require_gpu_run();
     use risc0_core::field::baby_bear::BabyBearExtElem;
 
     use super::eval::{batch_evaluate_any, eval_plan, EvalPath};
@@ -850,6 +857,7 @@ fn z9_eu2_s_sweep() {
 #[test]
 #[ignore = "measurement"]
 fn z9_mdiv_crossover() {
+    crate::hal::metal::require_gpu_run();
     use risc0_core::field::baby_bear::BabyBearExtElem;
 
     use super::mdiv::{mdiv_default_e, mdiv_shape};
@@ -942,6 +950,7 @@ fn z9_mdiv_small_po2_gpu_equals_host() {
 #[test]
 #[ignore = "measurement"]
 fn z9_threads_1d_sweep() {
+    crate::hal::metal::require_gpu_run();
     use super::runtime::set_threads_1d;
     let _lock = super::gpu_test_lock();
     let hal = MetalHalPoseidon2::new();
@@ -984,6 +993,7 @@ fn z9_threads_1d_sweep() {
 #[test]
 #[ignore = "measurement"]
 fn z9_second_queue_overlap() {
+    crate::hal::metal::require_gpu_run();
     let _lock = super::gpu_test_lock();
     let pairs = env_or("Z9_PAIRS", 7);
     let ha = MetalHalPoseidon2::new();

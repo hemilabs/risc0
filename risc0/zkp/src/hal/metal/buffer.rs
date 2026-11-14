@@ -81,8 +81,7 @@ impl Drop for RawBuffer {
         // SAFETY: `buf` is not used again after this point.
         let buf = unsafe { ManuallyDrop::take(&mut self.buf) };
         if self.bypass_pool.load(Ordering::Relaxed) {
-            drop(buf);
-            self.rt.freed(self.bytes);
+            self.rt.freed(self.bytes, buf);
         } else {
             self.rt.release(self.bytes, buf);
         }

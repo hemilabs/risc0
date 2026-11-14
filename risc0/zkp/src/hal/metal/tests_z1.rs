@@ -431,6 +431,7 @@ fn hash_scalar_bindings() {
 #[test]
 #[ignore]
 fn timings() {
+    crate::hal::metal::require_gpu_run();
     let hal = MetalHalSha256::new();
     let mut rng = rng(9);
     fn time(hal: &MetalHalSha256, name: &str, mut f: impl FnMut()) {

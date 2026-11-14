@@ -163,6 +163,7 @@ fn z13_measured_ct_splits_are_exact() {
 #[test]
 #[ignore = "measurement"]
 fn z13_split_ab() {
+    crate::hal::metal::require_gpu_run();
     let _lock = super::gpu_test_lock();
     let hal = MetalHalPoseidon2::new();
     let cols: usize = env_or("Z9_COLS", 211);
@@ -221,6 +222,7 @@ fn z13_split_ab() {
 #[test]
 #[ignore = "measurement"]
 fn z13_commit_chunk_ab() {
+    crate::hal::metal::require_gpu_run();
     let _lock = super::gpu_test_lock();
     let hal = MetalHalPoseidon2::new();
     let po2: usize = env_or("Z9_PO2", 20);

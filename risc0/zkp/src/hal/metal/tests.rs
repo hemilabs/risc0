@@ -183,6 +183,9 @@ fn pool_reuse_across_batches() {
     // (every pool is drained on those since Z8b): plan 8.7 lock.
     let _lock = super::gpu_test_lock();
     let hal = MetalHalSha256::new();
+    // W7-A1: a pool group of its own, so other tests' pools never evict this one's.
+    hal.rt
+        .set_pool_group(super::runtime::Runtime::new_test_pool_group());
     let n = 1 << 14;
     let ones = hal.copy_from_elem("ones", &elems(std::iter::repeat_n(1, n)));
 
@@ -416,6 +419,9 @@ fn alloc_failure_drains_pool_and_retries() {
     // (every pool is drained on those since Z8b): plan 8.7 lock.
     let _lock = super::gpu_test_lock();
     let hal = MetalHalSha256::new();
+    // W7-A1: a pool group of its own, so other tests' pools never evict this one's.
+    hal.rt
+        .set_pool_group(super::runtime::Runtime::new_test_pool_group());
     let small = hal.alloc_elem("small", 1 << 10);
     let other = hal.alloc_elem("other", 1 << 12);
     drop(small);
@@ -520,6 +526,8 @@ macro_rules! combos_divide_po2 {
     ($($name:ident: $po2:expr,)*) => {$(
         #[test]
         fn $name() {
+            // > 2 GiB at po2 22 (W7-A1): one heavy test at a time.
+            let _heavy = ($po2 >= 22).then(super::heavy_test_lock);
             testutil::combos_divide(MetalHalSha256::new(), $po2);
         }
     )*};
@@ -718,6 +726,9 @@ fn z6_working_set_budget_errors_early() {
     // (every pool is drained on those since Z8b): plan 8.7 lock.
     let _lock = super::gpu_test_lock();
     let hal = MetalHalSha256::new();
+    // W7-A1: a pool group of its own, so other tests' pools never evict this one's.
+    hal.rt
+        .set_pool_group(super::runtime::Runtime::new_test_pool_group());
     let pooled = hal.alloc_elem("pooled", 1 << 18);
     drop(pooled);
     hal.sync();
@@ -782,6 +793,8 @@ fn z6_threadgroup_length_dedupe() {
 /// the device (no host spill at >= 2^22 rows and >= 512 MiB).
 #[test]
 fn z6_poly_group_no_coeffs_spill() {
+    // 3.9 GB (W7-A1): one heavy test at a time.
+    let _heavy = super::heavy_test_lock();
     use crate::prove::poly_group::PolyGroup;
     let hal = MetalHalPoseidon2::new();
     let count = 32;

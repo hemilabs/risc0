@@ -123,6 +123,8 @@ fn grid_below_u32_runs() {
 fn budget_failure_drains_every_pool() {
     let _lock = gpu_test_lock();
     let a = MetalHalSha256::new();
+    // W7-A1: a pool group of its own, so other tests' pools never evict this one's.
+    a.rt.set_pool_group(super::runtime::Runtime::new_test_pool_group());
     let b = MetalHalSha256::new();
     drop(a.alloc_elem("a_pooled", 1 << 18));
     a.sync();
@@ -144,6 +146,8 @@ fn budget_failure_drains_every_pool() {
 fn alloc_failure_drains_every_pool() {
     let _lock = gpu_test_lock();
     let a = MetalHalSha256::new();
+    // W7-A1: a pool group of its own, so other tests' pools never evict this one's.
+    a.rt.set_pool_group(super::runtime::Runtime::new_test_pool_group());
     let b = MetalHalSha256::new();
     drop(a.alloc_elem("a_pooled", 1 << 18));
     a.sync();
@@ -325,6 +329,8 @@ fn budget_scope_hal_counts_own_allocations() {
     use super::BudgetScope;
     let other = MetalHalSha256::new();
     let hal = MetalHalSha256::new();
+    hal.rt
+        .set_pool_group(super::runtime::Runtime::new_test_pool_group());
     hal.set_budget_scope(BudgetScope::Hal);
     assert_eq!(hal.budget_scope(), BudgetScope::Hal);
     // Device-wide usage far above the budget below.
