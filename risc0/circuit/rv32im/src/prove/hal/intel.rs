@@ -183,6 +183,17 @@ fn split_eval_enabled(queue: *mut std::ffi::c_void) -> bool {
 }
 
 impl<IH: IntelHash> CircuitWitnessGenerator<IntelHal<IH>> for IntelCircuitHal<IH> {
+    fn writes_cycle_cols(&self) -> bool {
+        true
+    }
+
+    /// The Intel witgen's stores are not checked against the cells' initial value, so the data
+    /// buffer can start zeroed: no INVALID fill, and no zeroize pass after witgen
+    /// (`RISC0_INTEL_ZERO_DATA=0` keeps the INVALID fill).
+    fn takes_zeroed_data(&self) -> bool {
+        std::env::var("RISC0_INTEL_ZERO_DATA").as_deref() != Ok("0")
+    }
+
     fn generate_witness(
         &self,
         mode: StepMode,
@@ -195,6 +206,11 @@ impl<IH: IntelHash> CircuitWitnessGenerator<IntelHal<IH>> for IntelCircuitHal<IH
         let cycles = preflight.cycles.len();
         tracing::debug!("witgen: {cycles} cycles (GPU)");
 
+        let cycle_cols = if preflight.cycle_cols_deferred {
+            crate::prove::witgen::CYCLE_COLS.as_ptr()
+        } else {
+            std::ptr::null()
+        };
         let queue = risc0_sys::intel::get_queue();
         borrowed_err_wrap(|| unsafe {
             risc0_circuit_rv32im_sys::risc0_circuit_rv32im_intel_witgen(
@@ -214,6 +230,7 @@ impl<IH: IntelHash> CircuitWitnessGenerator<IntelHal<IH>> for IntelCircuitHal<IH
                 preflight.bigint_bytes.len() as u32,
                 preflight.table_split_cycle,
                 cycles as u32,
+                cycle_cols,
             )
         })?;
 

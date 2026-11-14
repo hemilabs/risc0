@@ -29,14 +29,16 @@ use anyhow::{Context, Result};
 
 static VERBOSE: LazyLock<bool> = LazyLock::new(|| std::env::var("RISC0_VERBOSE").is_ok());
 
-/// On CUDA and ROCm the witgen kernel writes the five per-cycle columns (CYCLE_COLS) from the
-/// uploaded cycles, so the host injector leaves them out (5 of its ~5.1 entries per row at
-/// po2=20). Part of the witgen staging feature (`RISC0_CUDA_WITGEN_STAGE=0` keeps them in the
-/// injector).
+/// On CUDA, ROCm and Intel the witgen kernel writes the five per-cycle columns (CYCLE_COLS) from
+/// the uploaded cycles, so the host injector leaves them out (5 of its ~5.1 entries per row at
+/// po2=20). On CUDA and ROCm part of the witgen staging feature (`RISC0_CUDA_WITGEN_STAGE=0`
+/// keeps them in the injector); on Intel `RISC0_INTEL_DEFER_CYCLE_COLS=0` does.
 static DEFER_CYCLE_COLS: LazyLock<bool> = LazyLock::new(|| {
     #[cfg(any(feature = "cuda", feature = "rocm"))]
     return cuda_stage::enabled();
-    #[cfg(not(any(feature = "cuda", feature = "rocm")))]
+    #[cfg(all(feature = "intel", not(any(feature = "cuda", feature = "rocm"))))]
+    return std::env::var("RISC0_INTEL_DEFER_CYCLE_COLS").as_deref() != Ok("0");
+    #[cfg(not(any(feature = "cuda", feature = "rocm", feature = "intel")))]
     false
 });
 
