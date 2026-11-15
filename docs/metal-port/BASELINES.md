@@ -970,3 +970,245 @@ Budget A/B (per-round delta against the mean of A1 and A2; A2-A1 STARK +0.02 [-0
   would place it (Z14's prefill is the likely candidate).
 - Not measured here: K10 (no keccak in the benchmark), 8-10 and 16-20-core parts, a real 16 GB Mac,
   `comprehensive_zkvm_test`, CPU prover baselines.
+
+# Wave 7
+
+Baseline after the wave-7 merges. risc0: W7-A1, W7-Z1 (zkp), W7-R2, W7-R1 (rv32im), W7-C1 (recursion),
+W7-V1, W7-V2 (zkvm). **Not merged**: W7-T1 (memguard / NTT split check) and W7-G1 (Groth16 graph release),
+both held back for fix rounds (`notes/W7-merge-zkp.md`, `notes/W7-merge-groth16.md`), so G1's wrap-phase
+memory saving is not in these numbers. zk-miner: M9 (first-job prewarm, QoS, recycle policy), W7-M10
+(owner-active tier, off by default), W7-M11 (power state, tier table `w7`, packaged AOT, image-id pass-through).
+
+| | |
+|---|---|
+| Date | 2026-11-15, 14:21-15:14 local time |
+| Machine | Apple M5 Max, 40-core GPU, 36 GB unified memory (28.1 GiB recommended working set), macOS 27.2.1 (26B131) |
+| risc0 | `zkminer/metal` @ `e841e5263261347a0669f45b1a66cb6dc660076c` (zkvm unit merge record) |
+| zk-miner | `metal` @ `2bf2b24712f58c90a1329ac4e4f199e22e15bb24` (W7-M11 merge; clean tree, path-patched to the risc0 checkout above) |
+| Worker | `cargo build --release -p zkminer-prove-risc0 --features metal --bin zkminer-prove-risc0-metal`, installed to `~/.zkminer/provers/zkminer-prove-risc0-metal` (sha256 `731bcd24…d1d1`; the wave-6 binary is kept beside it as `.w6-bak`). Installed without `AOT_SRC`, so no `metal-aot/` directory (the default install) |
+| Method | as wave 6: `--benchmark` under `/usr/bin/time -l`, `RUST_LOG=info`, every GPU command alone under `bin/gpu-run` (heavy lock, `--no-budget`; budgets set with `RISC0_METAL_MAX_WORKING_SET_BYTES` inside the command). New for this wave: `RISC0_METAL_ARCHIVE_GC=0` on every run (W7-Z1: a shared machine must not GC other agents' archives) |
+| Machine state | No other cargo / test / prover process ran during this baseline (checked with `ps` before starting); load averages 1.6-4.3 (each log records start / end load). No memguard stop or kill in any log |
+| Logs | `/Users/user/zkminer/scratch/w7/baseline/` (`full/`, `cold/`, `phab_def/`, `phab_8g/`, `phab_8g_aip/`, `phab_4g/`, `wab_def/`, `wab_4g/`, `wab_8g/`, `bud/`, `sim/`, `r2tab/`, `keccak/`, `prof/`, `warm/`; drivers and parsers in `scripts/`, adapted from `baseline-w6/scripts`) |
+
+Warm-up before the timed runs: one `BENCH_ONLY=fibonacci` run and one `RISC0_METAL_RV32IM_EVAL_FC=wait`
+memory-merkle run at the default, 4 GiB and 8 GiB budgets (`warm/`; every specialized eval PSO was an archive hit).
+
+## 7.1 Worker `--benchmark` (full suite, po2 20 segments)
+
+Three full default runs back to back (`full/full1-3.log`). Load 2.6 -> 2.4, 2.3 -> 1.9, 1.9 -> 2.2. Every run
+proved, wrapped and verified every program (18 / 18 `verified`).
+
+| program | cycles | wave 5c (s) | wave 6 runs 1 / 2 / 3 (s) | wave 7 runs 1 / 2 / 3 (s) | RTX 4090 (s) | Metal / 4090 |
+|---|---|---|---|---|---|---|
+| fibonacci | 32,768 | 0.37 / 0.36 | 0.31 / 0.31 / 0.31 | 0.23 / 0.24 / 0.24 | 0.48 | 0.50x |
+| sha256-chain | 46,137,344 | 56.37 / 56.09 | 50.38 / 49.88 / 50.26 | 50.03 / 49.89 / 49.96 | 35.82 | 1.39x |
+| ecdsa-verify | 65,011,712 | 78.81 / 78.63 | 69.95 / 70.31 / 70.15 | 70.16 / 70.06 / 70.15 | 47.65 | 1.47x |
+| bigint-mul | 27,525,120 | 34.08 / 33.83 | 30.20 / 30.26 / 30.34 | 30.10 / 30.16 / 30.13 | 19.77 | 1.52x |
+| memory-merkle | 7,340,032 | 9.18 / 9.12 | 8.22 / 8.22 / 8.22 | 8.19 / 8.17 / 8.18 | 5.70 | 1.43x |
+| chacha-mix | 8,404,992 | 10.68 / 10.68 | 9.57 / 9.58 / 9.55 | 9.51 / 9.52 / 9.52 | 6.67 | 1.43x |
+| **all (sum of cycles / sum of STARK time)** | 154,451,968 | 189.49 / 188.71 s, 818K c/s | 168.63 / 168.56 / 168.83 s, 916K c/s | **168.22 / 168.04 / 168.18 s, 918K / 919K / 918K c/s** | 116.09 s, 1.33M c/s | **1.45x** |
+
+- **STARK is unchanged from wave 6** (median 168.18 against 168.63 s, -0.27 %; separate sessions, not an
+  interleaved A/B, so this is "no change"). Wave 7 was a memory / robustness wave: no item had a default-budget
+  STARK claim. fibonacci's -0.07 s is M9's first-job prewarm (7.4).
+- **Goal gap**: the program goal is >= 1.197M c/s, i.e. a full-suite STARK <= 129.0 s. This is 918K c/s:
+  **39.2 s (23.3 %) of STARK time still to remove**. RTX 4090 1.45x this Mac's time; RTX 5090 (~2.3M c/s) 2.50x.
+- Segments / recursion: 139.38 / 139.14 / 139.33 s + 28.82 / 28.87 / 28.85 s (wave 6 run 1: 139.2 + 29.5 s).
+
+**Groth16 wrap** (first and warm reported separately):
+
+| wrap | identity_p254 | shrink_wrap | total |
+|---|---|---|---|
+| warm: every wrap after the first in a process (15 samples, runs 1-3) | **734-743 ms** (median 739.5; wave 6 732-753) | 612-627 ms (median 620) | **1.35-1.37 s** (wave 6 1.34-1.38) |
+| first wrap of a `--benchmark` process (fibonacci) | 744.4 / 747.7 / 751.1 ms (wave 6 894.6-898.0) | 611-619 ms | **1.36 s** (wave 6 1.51) |
+| first wrap of a fresh `BENCH_ONLY=fibonacci` worker (10 runs, `cold/warm*`, `cold/coldos*`) | 745-750 ms | 616-618 ms | **1.36-1.37 s** (wave 6 1.52-1.53) |
+
+- **The first wrap now equals a warm one** (M9's prewarm calls C16's `prewarm_p254_ctrl`: "identity_p254 ctrl
+  kept (98 MiB) in 216 ms" at start). Warm wrap 1.36 s against the 4090's ~2.0 s.
+
+**First job of a fresh worker** (`BENCH_ONLY=fibonacci`, `time -l` wall, warm OS cache): **1.93-1.95 s** (5 runs;
+wave 6 1.92-1.99 s). It includes M9's synchronous first-job prewarm (0.23 s: po2 20 eval PSO 0.04 s, p254 ctrl 0.22 s).
+
+**Memory.**
+
+| | wave 6 | wave 7 |
+|---|---|---|
+| process peak footprint, full suite (`time -l`) | 15.12 / 15.13 / 15.14 GB | **14.69 / 14.69 / 14.69 GB** (-0.44 GB) |
+| `--benchmark` process lifetime peak | 14422-14438 MiB | 14007-14013 MiB |
+| CPU user time of the full suite | 28.0-28.4 s | 24.8-24.9 s |
+| wall time of the full suite | 177.1-177.3 s | 176.6-176.8 s |
+
+Metal peaks per phase at po2 20 (MiB, segments / recursion / wrap): memory-merkle 9405 / 9405 / 5376, bigint-mul
+(largest segments) 9580 / 8958 / 5376 (wave 6 10217 / 10217), chacha-mix 9370-9386 / 8249 / 5376, ecdsa-verify
+9466 / 9452 / 5376, fibonacci 339 / 1476 / 5376. Recursion peaks are now below the segment peaks for bigint and
+chacha (the W7-A1 process-wide pool cap evicts across pools; 7.4).
+
+## 7.2 Cold start
+
+`BENCH_ONLY=fibonacci`; `cold/`. 5 interleaved pairs warm / cold OS cache, then the other rows. Load 1.9-4.1.
+
+| | pipelines | first-job prewarm | process wall (`time -l`) | first wrap |
+|---|---|---|---|---|
+| warm (5 runs) | 0.1 s | 0.23 s | **1.93-1.95 s** | 1.36-1.37 s |
+| cold OS shader cache (`MTL_SHADER_CACHE_SIZE=0`), archives present (5 runs, the wave-5c / 6 method) | 0.1 s (all hits) | **6.70 s** (po2 20 `ef_eval_split_fc`, "1 hits, 0 misses" but 6.7 s) | **7.95-8.42 s** (wave 6 1.93-1.99 s) | 1.36-1.37 s |
+| same, `ZKMINER_METAL_PREWARM=0` (2 runs) | 0.1 s | none | 1.95-1.96 s | 1.53 s (identity_p254 904-907 ms) |
+| first install with an offline set: `MTL_SHADER_CACHE_SIZE=0`, empty `RISC0_METAL_ARCHIVE_DIR`, `RISC0_METAL_AOT_DIR` = this Mac's set from `W7-Z1/aot` installed by zk-miner's `install-metal-aot.sh` (11 archives, 165 MiB; 3 runs) | 0.1 s | 5.65-6.19 s | **7.40-7.95 s** | 1.36-1.37 s |
+| first install, no offline set (the default install; 2 runs) | **71.6-81.1 s** (rv32im+zkp 71.6-81.1; recursion 25-31, keccak 16-33, groth16 23-31 in parallel) | 18.8 s | **92.0-101.5 s** (wave 6 67.3-86.6 s) | 1.36-1.37 s |
+
+- **Regression in `--benchmark` with a cold OS shader cache: +6 s of wall** (1.95 -> 8.0-8.4 s). M9's first-job
+  prewarm runs synchronously in `--benchmark` and waits for the po2 20 specialized eval PSO, which takes 6.7 s
+  when the OS cache is cold even though the runtime archive hits. Wave 6 ran the plain kernel for that short job
+  instead. STARK and wrap are unaffected. In the IPC worker the prewarm runs in the background (M9), so this
+  costs a fresh worker's first job only if the job arrives within ~6.7 s. Not a default-path cost on a warm
+  machine; worth an M9 follow-up (wait only for archive-warm work in `--benchmark`, or measure what the IPC path
+  pays).
+- **W7-Z1 + W7-M11's offline set cuts a first install from 92-102 s to 7.4-8.0 s**, but only when the worker is
+  installed with `AOT_SRC`; the default `mac-install-worker` installs none, so a default first install is still
+  ~90-100 s.
+
+## 7.3 Per-phase breakdown (quiet machine)
+
+### po2 20 rv32im segment
+`risc0-circuit-rv32im` release lib test `prove_po2_sweep`, `R11_PO2S=20 R11_CPU=0 R11_REPS=4`: A and A2 arms of
+`phab_def/` (14 processes, per-process median of reps 1-3; load 1.9-3.0). Every seal verifies.
+Peak GPU allocation 9303 MiB (unchanged).
+
+| phase | wave 6 ms | wave 7 ms (A / A2 medians) | share |
+|---|---|---|---|
+| preflight + alloc | 11 | 12 / 12 | 1.3 % |
+| witgen | 6 | 6 / 6 | 0.6 % |
+| data commit | 210 | **210 / 210** | 22.5 % |
+| accum | 8 | 8 / 8 | 0.9 % |
+| accum commit | 109 | **109 / 109** | 11.7 % |
+| eval_check (flat + hoisted, specialized) | 540 | **542 [538-552] / 539 [535-544]** | 57.8 % |
+| FRI + tail | 50 | 50 / 50 | 5.3 % |
+| **segment** | 933 | **936 [932-950] / 933 [930-938]** (unchanged) | |
+
+In the worker (`prof/mm_verbose.log`, `RISC0_VERBOSE=1`) the steady segments take 933.6-936.7 ms and the first
+1124 ms (wave 6 1187 ms; M9's prewarm). At the worker's tiers (7.5): po2 20 at 8 GiB 1010-1012 ms (accum
+commit 132, data commit 227, FRI + tail 57-58 ms), po2 19 at 4 GiB 506-507 ms (peak 4080 MiB).
+
+### Recursion per proof (same verbose log)
+Steady lift 91.8-92.6 ms, join 96.9-97.5 ms (wave 6 93.5 / 99.8-100.9); first pair lift0+lift1 265 ms;
+memory-merkle's 13 proofs 1.37 s (wave 6 1.40 s).
+
+### identity_p254 + shrink_wrap (worker, `BENCH_ONLY=fibonacci`, `RISC0_VERBOSE=1 RISC0_G16_METAL_PROFILE=1`, `prof/g16.log`)
+- **identity_p254, first job** (744 ms in the prover; 749 ms in the wrap): preflight 10.9, witgen 26.1,
+  **ctrl 5.8 (Restored**; wave 6 157.2 Committed), data commit 438.0, accum 5.1, accum commit 95.7, check commit
+  122.0, FRI 31.6 ms. The data commit (438 ms, 59 %) is now the whole of what is left.
+- **shrink_wrap**: GPU ms zero + witness_poly 43.5, NTT 82.8, sort_h 12.6, MSM H 174.6, sort_w 6.0, MSM A / B1 / C
+  36.8 / 37.9 / 37.4, MSM B2 150.6, **sum 582.1** (wave 6 576.0); wrap 619 ms. Device allocation 3941.5 MiB.
+
+## 7.4 Wave-7 revert knobs: quiet interleaved A/B
+
+**Worker A/B** (`scripts/wab.sh`, `scripts/wana.py`): `BENCH_ONLY=memory-merkle --benchmark`, rounds of A1, C1,
+A1X, M9, R2, A2 (start rotated by 3 each round), each arm against the mean of its round's A1 and A2. Every one of
+the 102 worker runs proved, wrapped and `verified`.
+
+| arm | knob (off) |
+|---|---|
+| C1 (C14 staging default) | `RISC0_METAL_REC_STAGE=0` |
+| A1X (W7-A1 pool cap, pressure drain, system check) | `RISC0_METAL_POOL_GLOBAL=0 RISC0_METAL_PRESSURE_DRAIN=0 RISC0_METAL_SYSTEM_CHECK=0` |
+| M9 (first-job prewarm) | `ZKMINER_METAL_PREWARM=0` |
+| R2 (in-place accum, early data drop, post-mix coeff drop, prefill cap) | `RISC0_METAL_ACCUM_IN_PLACE=0 RISC0_METAL_DROP_COEFFS_AFTER_MIX=0 RISC0_METAL_DROP_DATA_EARLY=0 RISC0_METAL_PREFILL_CAP=limit8` |
+
+Default budget: 7 rounds, load 1.7-3.3. A2-A1 STARK +0.010 [-0.040, +0.060] s, recursion 0.000 [-0.010, +0.010],
+wrap 0.000, footprint -0.000 GB. 4 GiB (po2 18): 5 rounds, load 1.6-3.5, A2-A1 STARK 0.000 [-0.020, +0.010].
+8 GiB (po2 19): 5 rounds, load 1.6-4.3, A2-A1 STARK 0.000 [-0.040, +0.020]. Deltas are off - on, median [min, max],
+"n/N" = rounds in which off is larger.
+
+| item | budget | on (default) median | delta (off - on) | verdict |
+|---|---|---|---|---|
+| W7-C1 staging | default | rec 1.39 s | rec **+0.030 [+0.025, +0.035] 7/7** (~2.3 ms per proof); STARK +0.025, 6/7 | **holds** (C1 claimed -29 ms per worker lift/join set on memory-merkle: matches) |
+| W7-C1 staging | 4 GiB | rec 6.02 s | rec **+0.135 [+0.125, +0.140] 5/5**; footprint +0.023 GB | **holds** (C1: -138 ms) |
+| W7-C1 staging | 8 GiB | rec 2.87 s | rec **+0.060 [+0.055, +0.070] 5/5** | **holds** (C1: -63 ms) |
+| W7-A1 (all three) | default | STARK 8.16 s; 13.07 GB | STARK +0.000 [-0.035, +0.030] 3/7; footprint +0.011 GB 7/7; Metal peak +11 MiB | no change at the default budget |
+| W7-A1 (all three) | 4 GiB | STARK 13.72 s; 5.165 GB | **STARK +0.550 [+0.535, +0.580] 5/5** (all in segments); **footprint +0.434 GB 5/5**; Metal peak segments 2384 -> 2488, recursion 2183 -> 1910 MiB | **holds** (A1 claimed STARK -0.525 s, footprint -0.32 GB at 4 GiB) |
+| W7-A1 (all three) | 8 GiB | STARK 10.05 s; 7.246 GB | **STARK +0.390 [+0.345, +0.420] 5/5**; **footprint +0.462 GB 5/5**; Metal peak 4714 / 4321 -> 4780 / 3092 MiB | **holds** (A1 claimed -0.435 s, -0.51 GB) |
+| M9 prewarm | default | wrap 1.37 s; STARK 8.16 s | **identity_p254 +150.3 ms [+146.8, +151.6] 7/7** (wrap +0.150 s); **STARK +0.085 [+0.010, +0.110] 7/7** (segments: first-segment PSO); footprint **-0.127 GB** (the kept ctrl group and the specialized PSO cost 0.13 GB) | **holds** (M9: first wrap -150 ms) |
+| M9 prewarm | 4 GiB | | identity_p254 +154.9 ms 5/5, STARK +0.085 5/5, footprint -0.033 GB | holds |
+| M9 prewarm | 8 GiB | | identity_p254 +150.8 ms 5/5, STARK +0.070 5/5, footprint -0.131 GB | holds |
+| W7-R2 (all four) | default / 4 GiB / 8 GiB | | STARK +0.005 / -0.005 / +0.010 s, footprint 0.000 GB at all three | no change at the worker's tiers (po2 20 / 18 / 19): R2 changes only po2 19 at 4 GiB and po2 20 at 8 GiB, which the default tier table `w7` does not select |
+
+**In-process phase A/B for W7-R2 at its own shapes** (`scripts/phab.sh`, `prove_po2_sweep`, 7 rounds rotated;
+load 1.9-3.8):
+
+| shape | arm | result |
+|---|---|---|
+| po2 20, default budget (`phab_def/`) | R2 all four off | segment -1.0 [-6.5, +1.5] ms, 1/7 (A2-A -5.0 [-15, +4]): no change, as R2 claims |
+| po2 20, 8 GiB (`phab_8g/`) | R2 all four off | **fails, 7/7** ("allocating 1728053248 bytes for evaluated with 6872825856 already allocated would exceed the limit"); A proves in 1012 ms [1004-1020], peak 8129 MiB, seals verify. **Fit claim holds** |
+| po2 20, 8 GiB (`phab_8g_aip/`) | `RISC0_METAL_ACCUM_IN_PLACE=0` only | proves; accum commit **+10.5 ms [+9.5, +11.0] 7/7**, FRI + tail +3.0 7/7, **segment +15.0 [+8.5, +20.0] 7/7** (A2-A 0.0 [-6, +7]); peak 8014 vs 8129 MiB. **Holds** (R2: accum commit 134 vs 145 ms) |
+| po2 19, 4 GiB (`phab_4g/`) | R2 all four off | **fails, 7/7** (budget exceeded allocating `evaluated`); A 506-507 ms, peak 4080 MiB. **Fit claim holds** |
+| po2 19, 4 GiB | `RISC0_METAL_ACCUM_IN_PLACE=0` only | accum commit +5.5 [+5.0, +6.0] 7/7, segment +5.5 [+4.5, +7.0] 7/7 (A2-A +1.0 [-2, +3]); peak 4022 vs 4080 MiB. Holds |
+
+**What R2 buys when the tier table uses it** (`r2tab/`, memory-merkle, 3 interleaved pairs per budget, A = default
+table `w7`, R = `ZKMINER_METAL_TIER_TABLE=r2`; load 1.8-3.2):
+
+| budget | A (w7) | R (r2) | change |
+|---|---|---|---|
+| 4 GiB | po2 18, STARK 13.73-13.74 s (8,388,608 cycles, 611K c/s), footprint 5.16 GB, Metal 2384 / 2183 / 3942 MiB | po2 19, STARK **10.49-10.52 s** (7,864,320 cycles, **750K c/s**), footprint **6.99 GB**, Metal 4076 / 2240 / 3942 MiB | **+23 % c/s, +1.83 GB footprint** |
+| 8 GiB | po2 19, STARK 10.05-10.07 s (783K c/s), footprint 7.25 GB | po2 20, STARK **8.60-8.61 s** (7,340,032 cycles, **853K c/s**), footprint **11.77 GB** | +9 % c/s, **+4.52 GB footprint** (does not fit a 16 GB Mac's ~11.2 GiB allowance for the full suite; M11 rejected it) |
+
+**Other items** (no worker A/B here):
+- **W7-V2** (keccak): `k5_keccak_metal_e2e`, 4 GiB, `K5_E2E_PO2S=14,17,14,17`, 5 interleaved pairs A vs
+  `RISC0_KECCAK_SMALL_BUDGET_RELEASE=0` (`keccak/ab_*`, load 1.9-2.1): both arms prove every request; po2 17
+  1.76-1.77 / 1.69-1.71 s in both arms, footprint 5.98 GB in both. **No change on this harness**: V2's release
+  fires before a standalone po2 17 proof in the cached-prover path (`keccak_standalone_repeat`), which this e2e
+  test does not exercise; that test was not re-run here. Headroom cap: po2 18 is skipped at 4 GiB by design (7.5).
+- **W7-Z1 / W7-M11 AOT**: 7.2 (first install 92-102 s -> 7.4-8.0 s with a set). Warm start: no change claimed;
+  not re-measured.
+- **W7-M10** (enforcement, owner tier: both off by default; respawn-early is IPC-only), **M9 recycle / growth
+  net, QoS** (normal launch no change), **W7-M11 image-id pass-through** (after the STARK), **W7-R1 / W7-V1 /
+  W7-A1's test-suite footprint** (tests only): not measurable with `--benchmark`; not run.
+- **W7-T1, W7-G1**: not merged; nothing to A/B on this tree.
+
+## 7.5 Simulated budgets and hosts
+
+`BENCH_ONLY=fibonacci` (3 fresh runs per budget, `bud/`), memory-merkle (the A1 / A2 arms of 7.4), keccak
+(`keccak/k5_*`, 2 runs per budget). **Everything proves, wraps and verifies at both budgets.**
+
+| budget | program | segment po2 | STARK | Groth16 wrap (identity_p254 + shrink_wrap) | Metal peak MiB (segments / recursion / wrap) | process peak footprint |
+|---|---|---|---|---|---|---|
+| 4 GiB | fibonacci | 18 | 0.24 s | **1.49 s** (0.734-0.736 + 0.749-0.753; wave 6 1.64) | 339 / 1477 / 3942 | 4.53-4.54 GB (wave 6 4.56-4.58) |
+| 4 GiB | memory-merkle | 18 | **13.72 [13.71-13.74] s** (7.70 + 6.02), 8,388,608 cycles, **611K c/s** (wave 6 14.45 s, 581K) | 1.49-1.50 s | 2384 / 2183 / 3942 | **5.16-5.17 GB** (wave 6 5.50) |
+| 4 GiB | keccak e2e 14,17,18 | 14, 17 (18 skipped below 7084 MiB, V2 cap) | po2 14 0.78-0.83 s, po2 17 1.77 s (prove + lift + verify; no wrap in this test) | - | - | 5.81-5.82 GB |
+| 8 GiB | fibonacci | 19 | 0.24 s | 1.50-1.51 s (0.747-0.748 + 0.751-0.760; wave 6 1.65) | 339 / 1477 / 5377 | 4.62-4.63 GB |
+| 8 GiB | memory-merkle | 19 | **10.05 [10.03-10.09] s** (7.19 + 2.87), 7,864,320 cycles, **783K c/s** (wave 6 10.58 s, 743K) | 1.50-1.51 s | 4714 / 4321 / 5376 | **7.25 GB** (wave 6 7.58) |
+| 8 GiB | keccak e2e 14,17,18 | 14, 17, 18 | 0.77-0.78, 1.76-1.77, 2.93-2.94 s | - | - | 10.22-10.24 GB |
+| 28.1 GiB (default) | memory-merkle | 20 | 8.16 s, 899K c/s | 1.36 s first / 1.37 s warm | 9405 / 9405 / 5376 | 13.07 GB (`BENCH_ONLY`; wave 6 12.95) |
+
+- STARK at 4 GiB -5.0 % and at 8 GiB -5.0 % against wave 6, footprint -0.34 / -0.33 GB: W7-A1 (7.4) and W7-C1.
+- Wrap at both budgets -0.15 s (M9's kept ctrl group). shrink_wrap is still 0.75-0.76 s below 20 GiB (`fast`
+  evaluator) against 0.62 s at the default budget; G1 (not merged) was the item for the wrap-phase memory.
+- Recursion is 44 % of memory-merkle's STARK at 4 GiB (6.02 of 13.72 s).
+
+**Tier the worker selects on a simulated host** (`sim/`, memory-merkle, `ZKMINER_METAL_HOST_RAM_BYTES` = host
+RAM, `RISC0_METAL_MAX_WORKING_SET_BYTES` = that Mac's HAL limit, `ZKMINER_CUDA_VRAM_BYTES` = the dispatcher's
+figure, RAM - 8 GiB as M10 does; tier table `w7`; one run each):
+
+| host | HAL limit / planned figure | po2 chosen | STARK | wrap | Metal peaks MiB | footprint |
+|---|---|---|---|---|---|---|
+| 16 GB | 10.67 / 8 GiB | 19 | 9.96 s | 1.51 s | 4774 / 4774 / 5376 | 7.32 GB |
+| 18 GB | 12 / 10 GiB | 19 (po2 20's full-suite footprint model does not fit 18 GB) | 9.96 s | 1.51 s | 4774 / 4774 / 5376 | 7.30 GB |
+| 24 GB | 16 / 16 GiB | 20 | 8.25 s | 1.51 s | 9373 / 8598 / 5376 | 12.29 GB |
+
+Without the dispatcher figure (`--benchmark` plans with the HAL limit) the 18 GB case picks po2 20 at 12 GiB
+(8.44 s, 12.29 GB, `sim/h18_mm.log`): the footprint gate only removes rows above M8's, and M8 gives po2 20 from
+12 GiB. Not measured: the full suite at 16/18 GB footprints, a real 16 GB Mac.
+
+## 7.6 Open items from this baseline
+
+- **STARK 918K c/s, unchanged from wave 6; 23.3 % (39.2 s of 168.2 s) short of the 1.197M c/s goal.** A po2 20
+  segment is 934 ms: eval_check 58 %, data commit 22.5 %, accum commit 11.7 %. Recursion 28.8 s (17 % of STARK).
+- **M9 cold-OS-cache regression in `--benchmark`**: +6 s wall (7.2). Measure the IPC path (background prewarm)
+  with a cold OS cache and a job that arrives right after start before deciding.
+- **The default install ships no AOT set** (7.2): a first install still costs 92-102 s. `mac-install-worker`
+  needs an `AOT_SRC` in the release flow.
+- **Small Macs**: W7-R2's fits (po2 19 at 4 GiB, po2 20 at 8 GiB) hold and give +23 % / +9 % c/s on memory-merkle,
+  but the default tier table does not use them; the 4 GiB po2 19 tier costs +1.83 GB footprint (6.99 GB), which
+  W7-G1's graph release (not merged) was meant to offset. Merging G1 and re-deciding the `r2` table is the next
+  small-Mac lever.
+- W7-A1 carries the budget tiers this wave (-0.39 / -0.55 s STARK and -0.46 / -0.43 GB footprint at 8 / 4 GiB,
+  all in segments, as its note claimed); at the default budget it is a no-op for speed.
+- Not measured here: W7-V2's standalone-release path (`keccak_standalone_repeat`), IPC-only paths (M9 recycle,
+  M10 respawn-early), 8-10 and 16-20-core parts, a real 16 GB Mac, CPU prover baselines.
