@@ -164,12 +164,37 @@ pub fn plain_pso(device: &DeviceRef, lib: &LibraryRef, name: &str) -> Result<Com
 
 /// Build [archived_psos] from `bytes` through the archive in `dir` (None: no archive, a
 /// concurrent plain build).
+///
+/// W7-Z1: the two-archive hook of the circuit units: when `dir` is the process's archive
+/// directory (`prover.rs` passes `archive_dir()`), every PSO is first looked up in the offline
+/// archive of unit [ARCHIVE_UNIT] in `RISC0_METAL_AOT_DIR` (`tools/metal_aot`), then in the
+/// runtime archive; a test's own directory never reads the environment
+/// ([risc0_zkp::hal::metal::archive::process_aot_dir]).
 pub fn build_archived(
     device: &DeviceRef,
     dir: Option<std::path::PathBuf>,
     bytes: &[u8],
 ) -> Result<ArchivedKernels> {
-    ArchivedKernels::new_in(dir, device, ARCHIVE_UNIT, bytes, &archived_psos())
+    let aot = risc0_zkp::hal::metal::archive::process_aot_dir(dir.as_deref());
+    build_archived_in(device, dir, aot, bytes)
+}
+
+/// [build_archived] with the offline archive directory given (None: none).
+pub fn build_archived_in(
+    device: &DeviceRef,
+    dir: Option<std::path::PathBuf>,
+    aot: Option<std::path::PathBuf>,
+    bytes: &[u8],
+) -> Result<ArchivedKernels> {
+    ArchivedKernels::new_in_aot(
+        dir,
+        aot,
+        device,
+        ARCHIVE_UNIT,
+        bytes,
+        &archived_psos(),
+        None,
+    )
 }
 
 /// A one-line summary of an archive report (`RISC0_VERBOSE` / the worker log).
@@ -267,6 +292,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// W7-Z1 (e): the offline-archive hook. A runtime archive of the set placed in an offline
+    /// directory under this GPU's and OS's offline name serves every PSO (`aot_hits`); the
+    /// directory is not written; a test directory never reads `RISC0_METAL_AOT_DIR`.
+    #[test]
+    fn aot_archive_hook() {
+        use risc0_zkp::hal::metal::archive;
+        let _lock = crate::metal::test_lock::shared();
+        let Some(device) = device() else {
+            return;
+        };
+        let (Some(arch), Some(os)) = (
+            archive::gpu_architecture(&device),
+            archive::aot_os_keys().into_iter().next(),
+        ) else {
+            return;
+        };
+        let tmp = |n: &str| {
+            let d = std::env::temp_dir().join(format!("w7z1-g16-{n}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        };
+        let (rt, aot) = (tmp("rt"), tmp("aot"));
+        let first = build_archived(&device, Some(rt.clone()), crate::METAL_LIB).unwrap();
+        assert_eq!(first.report.aot_hits, 0, "{}", describe(&first.report));
+        let content = std::fs::read(first.report.path.as_ref().unwrap()).unwrap();
+        let stem = archive::aot_stem(ARCHIVE_UNIT, crate::METAL_LIB, &arch, &os);
+        std::fs::write(aot.join(archive::aot_file_name(&stem, &content)), &content).unwrap();
+        let n = archived_psos().len();
+        let k = build_archived_in(&device, None, Some(aot.clone()), crate::METAL_LIB).unwrap();
+        assert!(k.report.errors.is_empty(), "{:?}", k.report.errors);
+        assert_eq!((k.report.aot_hits, k.report.misses), (n, 0));
+        let src = PsoSource::archived(&device, &k);
+        SmallKernels::from_source(&src).unwrap();
+        assert_eq!(std::fs::read_dir(&aot).unwrap().count(), 1);
+        for d in [rt, aot] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
     /// Cold-start probe (G11; run with `MTL_SHADER_CACHE_SIZE=0` in a fresh process, one arm per
     /// process). `G11_ARM`: `plain` (serial plain build of every archived PSO, per set, the
     /// pre-G11 order and per-PSO times), `archive` (through the archive in `G11_DIR`, default the
@@ -335,5 +400,35 @@ mod tests {
             t0.elapsed().as_secs_f64(),
             k.archive.as_ref().map_or("off".into(), describe)
         );
+    }
+    /// W7-Z1 (`--ignored`, manual; no GPU work beyond loading the library): writes the inputs of
+    /// `tools/metal_aot/build_all.py` for this crate into `W7Z1_DUMP`: the embedded metallib as
+    /// `groth16.metallib` and one JSON line per archive unit (`unit`, `metallib`, `names`, `fc`) appended to
+    /// `units.jsonl`.
+    #[test]
+    #[ignore]
+    fn w7z1_dump_aot_inputs() {
+        let dir = std::path::PathBuf::from(std::env::var("W7Z1_DUMP").expect("W7Z1_DUMP"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lib: &[u8] = crate::METAL_LIB;
+        std::fs::write(dir.join("groth16.metallib"), lib).unwrap();
+        let mut lines = String::new();
+        let mut unit = |unit: &str, names: &[&str], fc: Option<String>| {
+            let names: Vec<String> = names.iter().map(|n| format!("\"{n}\"")).collect();
+            lines.push_str(&format!(
+                "{{\"unit\": \"{unit}\", \"metallib\": \"groth16.metallib\", \"names\": [{}], \"fc\": {}}}\n",
+                names.join(", "),
+                fc.map_or("null".to_string(), |f| format!("\"{f}\""))
+            ));
+        };
+        unit(ARCHIVE_UNIT, &archived_psos(), None);
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("units.jsonl"))
+            .unwrap()
+            .write_all(lines.as_bytes())
+            .unwrap();
     }
 }

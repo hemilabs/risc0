@@ -348,11 +348,15 @@ fn build_fc(
         &[(0, domain)],
     )?;
     // R22: refuse a specialization the back end compiled into the slow regime (eval_regime.rs).
+    // W7-Z1: a PSO from the offline archive (`RISC0_METAL_AOT_DIR`) is read from that file (the
+    // runtime archive may not exist yet).
     if eval_regime::settings().0 != eval_regime::GuardMode::Off {
-        let info = r
-            .path
-            .as_deref()
-            .and_then(|p| eval_regime::archive_info(p, name));
+        let info = if r.aot_hits > 0 {
+            r.aot_path.as_deref()
+        } else {
+            r.path.as_deref()
+        }
+        .and_then(|p| eval_regime::archive_info(p, name));
         let regime = eval_regime::Regime::of(info, eval_regime::settings().1);
         if !eval_regime::fc_acceptable(kernels, name, domain, regime) {
             anyhow::bail!("refused by the eval regime guard (slow compiler regime)");
@@ -362,9 +366,13 @@ fn build_fc(
         "rv32im Metal: {name} for domain {domain} in {:.2} s (binary archive {}: {} hits, \
          {} misses{})",
         r.elapsed.as_secs_f64(),
-        r.path
-            .as_deref()
-            .map_or("off".into(), |p| p.display().to_string()),
+        match (&r.aot_path, r.aot_hits) {
+            (Some(p), 1..) => format!("offline {}", p.display()),
+            _ => r
+                .path
+                .as_deref()
+                .map_or("off".into(), |p| p.display().to_string()),
+        },
         r.hits,
         r.misses,
         if r.errors.is_empty() {
@@ -586,6 +594,27 @@ pub(crate) fn fc_pipeline(
     }
 }
 
+/// W7-Z1: once per chain form, the warning that the eval regime guard's fallback `name` runs
+/// in place of that form's plain split kernel ([ChainForm::plain_kernel]).
+fn log_fallback_use(name: &str, form: ChainForm) {
+    static LOGGED: std::sync::Mutex<Vec<ChainForm>> = std::sync::Mutex::new(Vec::new());
+    let mut logged = LOGGED.lock().unwrap();
+    if logged.contains(&form) {
+        return;
+    }
+    logged.push(form);
+    tracing::warn!("{}", fallback_use_message(name, form));
+}
+
+/// The text of [log_fallback_use].
+pub(crate) fn fallback_use_message(name: &str, form: ChainForm) -> String {
+    format!(
+        "rv32im Metal eval regime guard: eval_check runs the fallback {name} in place of {} \
+         (chain form {form:?})",
+        form.plain_kernel()
+    )
+}
+
 /// evalfast threadgroup size: `EF_THREADS` of eval_check_ef.metal (its
 /// `[[max_total_threads_per_threadgroup]]`, CUDA's default 128). R15e: 64 is within noise of 128,
 /// 256 and 1024 are slower (notes/R15e.md).
@@ -751,11 +780,20 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
             (false, ChainForm::Hoist) => Some(self.ctx.pipeline("ef_eval_split")),
             (false, _) => Some(lazy_pipeline(self.ctx.library(), form.plain_kernel())?),
         };
+        // W7-Z1 (R23 verify r2): name the kernel the fallback replaces in this form (the
+        // guard's own start-up log names the hoisted `ef_eval_split` it measured; under
+        // `RISC0_METAL_RV32IM_EVAL_HOIST=0` the replaced kernel is `ef_eval_split_nohoist`).
+        if let (false, Some((name, _))) = (fc.is_some(), fallback) {
+            log_fallback_use(name, form);
+        }
         tracing::debug!(
             "eval_check (Metal evalfast): {}",
             match (fc.is_some(), fallback) {
                 (true, _) => format!("{} specialized for the domain", fc_kernel(form)),
-                (false, Some((name, _))) => format!("the eval regime guard's fallback ({name})"),
+                (false, Some((name, _))) => format!(
+                    "the eval regime guard's fallback ({name}) instead of {}",
+                    form.plain_kernel()
+                ),
                 (false, None) => format!("plain {}", form.plain_kernel()),
             }
         );
@@ -2058,6 +2096,158 @@ mod ef_tests {
             assert_eq!(mismatches(&cpu, &check.to_vec()), 0);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W7-Z1 (f): a specialized PSO from an offline archive (`RISC0_METAL_AOT_DIR`; a runtime
+    /// archive of this machine stands in for the `build_archive.py --fc` file, which the W7-Z1
+    /// note tests by hand): the file of the unit and constant serves the PSO (an AOT hit, no
+    /// compile), and its PSO gives the CPU's results; the same file under another constant's
+    /// unit is opened but misses cleanly (no error) and the PSO is built without it.
+    #[test]
+    fn w7z1_fc_aot_archive() {
+        use risc0_zkp::hal::metal::archive;
+        let po2 = 6;
+        let domain = ((1usize << po2) * INV_RATE) as u32;
+        let hal = Arc::new(MetalHalSha256::new());
+        let (Some(arch), Some(os)) = (
+            archive::gpu_architecture(&hal.device),
+            archive::aot_os_keys().into_iter().next(),
+        ) else {
+            return;
+        };
+        let tmp = |n: &str| {
+            let d = std::env::temp_dir().join(format!("risc0-w7z1-{n}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        };
+        let (rt, aot) = (tmp("fc-rt"), tmp("fc-aot"));
+        let c = MetalCircuitHal::new(hal.clone()).unwrap();
+        let lib = c.ctx.library();
+        let bytes = risc0_circuit_rv32im_sys::METAL_LIB;
+        let unit = fc_unit("rv32im_w7z1", domain);
+        let build = |dir: Option<std::path::PathBuf>, aot: Option<std::path::PathBuf>, d: u32| {
+            archive::specialized_pipeline_in(
+                dir,
+                aot,
+                &hal.device,
+                lib,
+                bytes,
+                &fc_unit("rv32im_w7z1", d),
+                FC_KERNEL,
+                &[(0, d)],
+            )
+            .unwrap()
+        };
+        let (_, r0) = build(Some(rt.clone()), None, domain);
+        assert!(r0.saved, "{r0:?}");
+        let content = std::fs::read(r0.path.as_ref().unwrap()).unwrap();
+        let stem = archive::aot_stem(&unit, bytes, &arch, &os);
+        let placed = aot.join(archive::aot_file_name(&stem, &content));
+        std::fs::write(&placed, &content).unwrap();
+
+        let (pso, r) = build(None, Some(aot.clone()), domain);
+        assert!(r.errors.is_empty(), "{r:?}");
+        assert_eq!((r.aot_hits, r.hits, r.misses), (1, 1, 0), "{r:?}");
+        assert_eq!(r.aot_path.as_deref(), Some(placed.as_path()));
+
+        let inp = Inputs::random(po2);
+        let cpu = cpu_check(&inp, po2);
+        let steps = 1 << po2;
+        let [code, data, accum, mix, out] = [&inp.code, &inp.data, &inp.accum, &inp.mix, &inp.out]
+            .map(|b| hal.copy_from_elem("in", b));
+        let check = hal.alloc_elem("check", ExtVal::EXT_SIZE * steps * INV_RATE);
+        check.view_mut(|v| v.fill(Val::new_raw(0x7fff_ffff)));
+        let k = EfKernels {
+            split: &pso,
+            combine: c.ctx.pipeline("ef_combine"),
+            threads: EF_THREADS,
+        };
+        c.eval_check_ef_with(
+            &k,
+            &check,
+            &[&accum, &code, &data],
+            &[&mix, &out],
+            inp.poly_mix,
+            po2,
+            steps,
+            None,
+        )
+        .unwrap();
+        assert_eq!(mismatches(&cpu, &check.to_vec()), 0);
+
+        // The domain's binary under the unit of another domain: found, opened, a clean miss.
+        let other = 2 * domain;
+        let stem = archive::aot_stem(&fc_unit("rv32im_w7z1", other), bytes, &arch, &os);
+        std::fs::remove_file(&placed).unwrap();
+        std::fs::write(aot.join(archive::aot_file_name(&stem, &content)), &content).unwrap();
+        let (_, r) = build(None, Some(aot.clone()), other);
+        assert!(r.aot_path.is_some() && r.errors.is_empty(), "{r:?}");
+        assert_eq!((r.aot_hits, r.misses), (0, 1), "{r:?}");
+        for d in [rt, aot] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// W7-Z1 (`--ignored`, manual; no GPU work beyond loading the library): writes the inputs of
+    /// `tools/metal_aot/build_all.py` for this crate into `W7Z1_DUMP`: the embedded metallib as
+    /// `rv32im.metallib` and one JSON line per archive unit (`unit`, `metallib`, `names`, `fc`) appended to
+    /// `units.jsonl`.
+    #[test]
+    #[ignore]
+    fn w7z1_dump_aot_inputs() {
+        let dir = std::path::PathBuf::from(std::env::var("W7Z1_DUMP").expect("W7Z1_DUMP"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lib: &[u8] = risc0_circuit_rv32im_sys::METAL_LIB;
+        std::fs::write(dir.join("rv32im.metallib"), lib).unwrap();
+        let mut lines = String::new();
+        let mut unit = |unit: &str, names: &[&str], fc: Option<String>| {
+            let names: Vec<String> = names.iter().map(|n| format!("\"{n}\"")).collect();
+            lines.push_str(&format!(
+                "{{\"unit\": \"{unit}\", \"metallib\": \"rv32im.metallib\", \"names\": [{}], \"fc\": {}}}\n",
+                names.join(", "),
+                fc.map_or("null".to_string(), |f| format!("\"{f}\""))
+            ));
+        };
+        let device = metal::Device::system_default().unwrap();
+        let available = device.new_library_with_data(lib).unwrap().function_names();
+        // What `Rv32imKernels::get` builds: the listed kernels and every expected one present.
+        let mut names: Vec<&str> = super::super::METAL_KERNEL_NAMES.to_vec();
+        for (_, list) in super::super::EXPECTED_KERNELS {
+            for n in *list {
+                if available.iter().any(|a| a == n) && !names.contains(n) {
+                    names.push(n);
+                }
+            }
+        }
+        unit(super::super::ARCHIVE_UNIT, &names, None);
+        // The default chain form's specializations for segment po2 16..=20 (domains 2^18..2^22).
+        for po2 in 16..=20usize {
+            let domain = ((1usize << po2) * INV_RATE) as u32;
+            unit(
+                &fc_unit(super::super::ARCHIVE_UNIT, domain),
+                &[FC_KERNEL],
+                Some(format!("0={domain}")),
+            );
+        }
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("units.jsonl"))
+            .unwrap()
+            .write_all(lines.as_bytes())
+            .unwrap();
+    }
+
+    /// W7-Z1 (R23 verify r2): the guard-fallback message names the plain kernel of the form in
+    /// use, not always the hoisted `ef_eval_split`.
+    #[test]
+    fn w7z1_fallback_message_names_the_replaced_kernel() {
+        let m = fallback_use_message(NEST_KERNEL, ChainForm::Flat);
+        assert!(m.contains(&format!("in place of {NOHOIST_KERNEL}")), "{m}");
+        let m = fallback_use_message(NEST_KERNEL, ChainForm::Hoist);
+        assert!(m.contains("in place of ef_eval_split "), "{m}");
     }
 
     /// Z16: the segment-po2 prewarm ignores po2s that are not segment po2s (no build, nothing
