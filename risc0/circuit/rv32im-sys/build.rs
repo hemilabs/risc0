@@ -605,7 +605,7 @@ fn build_rocm_kernels() {
             String::new()
         }
     );
-    let include_cuda2hip = format!("{}/util/cuda2hip.hpp", &sppark_root);
+    let include_cuda2hip = format!("{sppark_root}/util/cuda2hip.hpp");
     println!("cargo:rerun-if-env-changed=RISC0_HIP_EVAL_CHECK");
     let evalfast = env::var("RISC0_HIP_EVAL_CHECK").as_deref() != Ok("combined");
     let mut eval_check_flags: Vec<&str> = vec![
@@ -1116,6 +1116,7 @@ fn intel_xs_options() -> String {
 /// - IGC `DisableRecompilation=1`: mandatory with the above. Otherwise IGC's
 ///   retry heuristic picks a recompiled kernel with ~2.5 MB of private memory
 ///   per thread that runs ~2x slower than baseline.
+///
 /// Only the mono eval_check is affected; multipass, witgen, accum and
 /// recursion keep the original arithmetic.
 fn intel_eval_fast_enabled() -> bool {
@@ -1289,7 +1290,7 @@ fn compute_mono_hash(cxx_root: &str, icpx_version: &str) -> String {
         let mut scripts: Vec<PathBuf> = std::fs::read_dir("kernels/intel/evalfast")
             .expect("kernels/intel/evalfast")
             .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().map_or(false, |x| x == "py"))
+            .filter(|p| p.extension().is_some_and(|x| x == "py"))
             .collect();
         scripts.sort();
         in_tree.extend(scripts);
@@ -2021,7 +2022,7 @@ fn build_intel_kernels() {
         witgen_amalg.push_str("// Auto-generated SYCL witgen amalgamation\n");
         witgen_amalg.push_str("#include \"steps.h\"\n");
         witgen_amalg.push_str("#include \"witgen.h\"\n");
-        witgen_amalg.push_str("\n");
+        witgen_amalg.push('\n');
         witgen_amalg.push_str("namespace risc0::circuit::rv32im_v2::intel {\n");
 
         // Read steps.cpp, extract body, inject noinline
@@ -2106,7 +2107,7 @@ fn build_intel_kernels() {
             .arg("-Wno-unused-variable")
             .arg("-Wno-sign-compare")
             .arg("-Wno-unused-but-set-variable")
-            .arg(format!("-Ikernels/intel"))
+            .arg("-Ikernels/intel")
             .arg(format!("-I{cxx_root}"))
             .arg("-Ikernels/cxx")
             .arg(risc0_build_kernel::intel_sycl_targets_arg());

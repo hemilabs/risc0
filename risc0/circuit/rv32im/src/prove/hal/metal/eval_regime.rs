@@ -28,9 +28,9 @@
 //! `tools/metal_audit/agx_size.py` reads offline). This module reads it ([native_info]) for:
 //! - the plain `ef_eval_split`, once per process on a background thread at library load
 //!   ([start]): a loud warning if it is in the slow regime, and with [GuardMode::Fallback] (the
-//!   default) background builds of the [FALLBACK_KERNELS] (the nested chain, then R15e's form)
-//!   through archives of their own; the first in the fast regime replaces the plain PSO
-//!   ([fallback_split]);
+//!   default) background builds of the fallback kernels ([fallback_kernels]: R22's unhoisted
+//!   flat chain, then the nested chain, then R15e's form; W7-R1) through archives of their own;
+//!   the first in the fast regime replaces the plain PSO ([fallback_split]);
 //! - each domain-specialized `ef_eval_split_fc` PSO when it is built (eval_check.rs
 //!   `build_fc`): a slow one is not used while the plain PSO is not slow ([fc_acceptable]).
 //!
@@ -345,13 +345,51 @@ pub(crate) fn archive_info(path: &Path, name: &str) -> Option<NativeInfo> {
 
 /// The plain split kernel (the flat chain, R22).
 pub(crate) const PLAIN_KERNEL: &str = "ef_eval_split";
-/// The fallback candidates, in order, each a different code shape for the back end: the nested
-/// chain (the pre-R22 default, fast regime today) and R15e's form (16-byte row loads; slow today,
-/// 36 KB stack).
+/// The fallback candidates of R22 / R23, in order, each a different code shape for the back end:
+/// the nested chain (the pre-R22 default, fast regime today) and R15e's form (16-byte row loads;
+/// slow today, 36 KB stack). Since W7-R1 this is the order with [FALLBACK_ORDER_ENV]`=nest`.
 pub(crate) const FALLBACK_KERNELS: [(&str, &str); 2] = [
     (super::eval_check::NEST_KERNEL, "nest"),
     ("ef_eval_split_r15e", "r15e"),
 ];
+
+/// W7-R1 (R23 review P2): the default fallback order. R22's flat kernel without the hoisted trace
+/// loads (`ef_eval_split_nohoist`, the HOIST=0 revert kernel: the closest code shape to the plain
+/// kernel and only ~3 % slower than it, R23 3.3) first, then [FALLBACK_KERNELS]. The nested
+/// chain is ~7 % slower than the flat one (R22), so it is the second choice.
+pub(crate) const FALLBACK_KERNELS_NOHOIST_FIRST: [(&str, &str); 3] = [
+    (super::eval_check::NOHOIST_KERNEL, "nohoist"),
+    FALLBACK_KERNELS[0],
+    FALLBACK_KERNELS[1],
+];
+
+/// W7-R1: `RISC0_METAL_RV32IM_GUARD_FALLBACK`: the guard's fallback order. Unset / `nohoist`
+/// (default): [FALLBACK_KERNELS_NOHOIST_FIRST]; `nest`: [FALLBACK_KERNELS], the order before
+/// W7-R1 (the revert knob). Read once, by the guard's thread; an unknown value is logged and the
+/// default used.
+pub(crate) const FALLBACK_ORDER_ENV: &str = "RISC0_METAL_RV32IM_GUARD_FALLBACK";
+
+/// The fallback list [FALLBACK_ORDER_ENV]'s value `v` selects (None: unset).
+pub(crate) fn parse_fallback_order(
+    v: Option<&str>,
+) -> anyhow::Result<&'static [(&'static str, &'static str)]> {
+    match v.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("nohoist") | Some("1") => Ok(&FALLBACK_KERNELS_NOHOIST_FIRST),
+        Some("nest") => Ok(&FALLBACK_KERNELS),
+        Some(other) => {
+            anyhow::bail!("{FALLBACK_ORDER_ENV}={other:?}: expected `nohoist` (default) or `nest`")
+        }
+    }
+}
+
+/// The guard's fallback candidates in order ([FALLBACK_ORDER_ENV]).
+pub(crate) fn fallback_kernels() -> &'static [(&'static str, &'static str)] {
+    let v = std::env::var(FALLBACK_ORDER_ENV).ok();
+    parse_fallback_order(v.as_deref()).unwrap_or_else(|e| {
+        tracing::warn!("{e:#}; using the default order");
+        &FALLBACK_KERNELS_NOHOIST_FIRST
+    })
+}
 
 /// The regime of the process library's plain `ef_eval_split`, read once from the archive the
 /// library was loaded through.
@@ -413,7 +451,7 @@ pub(crate) fn fc_acceptable(
 }
 
 /// Once per process, on a background thread: check the plain split kernel's regime, warn if it
-/// is slow, and (in [GuardMode::Fallback]) build the [FALLBACK_KERNELS] through binary archives
+/// is slow, and (in [GuardMode::Fallback]) build the [fallback_kernels] through binary archives
 /// of their own and use the first one in the fast regime.
 pub(crate) fn start(kernels: &'static super::Rv32imKernels) {
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -465,7 +503,12 @@ pub(crate) fn start(kernels: &'static super::Rv32imKernels) {
                 if mode == GuardMode::Warn {
                     return;
                 }
-                for (name, tag) in FALLBACK_KERNELS {
+                let order = fallback_kernels();
+                tracing::info!(
+                    "rv32im Metal eval regime guard: fallback order {:?} ({FALLBACK_ORDER_ENV})",
+                    order.iter().map(|k| k.0).collect::<Vec<_>>()
+                );
+                for &(name, tag) in order {
                     let res =
                         metal::objc::rc::autoreleasepool(|| build_fallback(kernels, name, tag));
                     match res {
@@ -551,6 +594,34 @@ mod tests {
         };
         assert_eq!(Regime::of(Some(j), STACK_MAX), Regime::Slow(j));
         assert_eq!(Regime::of(None, STACK_MAX), Regime::Unknown);
+    }
+
+    #[test]
+    fn fallback_order_parsing() {
+        let names = |v: Option<&str>| -> Vec<&str> {
+            parse_fallback_order(v)
+                .unwrap()
+                .iter()
+                .map(|k| k.0)
+                .collect()
+        };
+        let new = vec![
+            "ef_eval_split_nohoist",
+            "ef_eval_split_nest",
+            "ef_eval_split_r15e",
+        ];
+        assert_eq!(names(None), new);
+        assert_eq!(names(Some("")), new);
+        assert_eq!(names(Some(" NoHoist ")), new);
+        assert_eq!(
+            names(Some("nest")),
+            vec!["ef_eval_split_nest", "ef_eval_split_r15e"]
+        );
+        assert!(parse_fallback_order(Some("r15e")).is_err());
+        // Every candidate has its own archive unit tag.
+        let tags: std::collections::HashSet<_> =
+            FALLBACK_KERNELS_NOHOIST_FIRST.iter().map(|k| k.1).collect();
+        assert_eq!(tags.len(), FALLBACK_KERNELS_NOHOIST_FIRST.len());
     }
 
     #[test]
