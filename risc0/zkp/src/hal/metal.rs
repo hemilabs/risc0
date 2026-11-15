@@ -224,6 +224,37 @@ fn prefill_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("RISC0_METAL_PREFILL").map_or(true, |v| v.trim() != "0"))
 }
 
+/// How many bytes `Hal::prefill_elem` may set aside (W7-R2).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PrefillCap {
+    /// Z14: an eighth of the working-set limit, kept across po2 changes.
+    Limit8,
+    /// W7-R2 (default): the headroom after the caller's next phase; released on a po2 change.
+    Headroom,
+}
+
+/// `RISC0_METAL_PREFILL_CAP=limit8` restores Z14's cap (default `headroom`).
+fn prefill_cap_mode() -> PrefillCap {
+    static MODE: OnceLock<PrefillCap> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        match std::env::var("RISC0_METAL_PREFILL_CAP")
+            .as_deref()
+            .map(str::trim)
+        {
+            Ok("limit8") => PrefillCap::Limit8,
+            _ => PrefillCap::Headroom,
+        }
+    })
+}
+
+/// `RISC0_METAL_PREFILL_LOG=1`: one line per `prefill_elem` decision (measurement).
+fn prefill_log() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RISC0_METAL_PREFILL_LOG").is_ok_and(|v| v.trim() == "1"))
+}
+
+const MIB: f64 = (1u64 << 20) as f64;
+
 /// Whether the Metal backend may be used for `unit` (one of `zkp`, `rv32im`, `recursion`,
 /// `keccak`, `groth16`): false if `RISC0_METAL=0`, or if the comma-separated list in
 /// `RISC0_METAL_SKIP` names the unit. Callers fall back to the CPU prover (groth16: Docker).
@@ -459,6 +490,20 @@ pub struct MetalHal<MH: MetalHash> {
     kernels: &'static MetalKernels,
     hash: Option<Box<MH>>,
     ntt: ntt::NttState,
+    r2: R2State,
+}
+
+/// W7-R2 bookkeeping of a [MetalHal] (it keeps to the HAL's own API over its runtime).
+#[derive(Default)]
+struct R2State {
+    /// The commit domain (rows) last seen by [MetalHal::note_commit_domain].
+    domain: std::sync::atomic::AtomicU64,
+    /// (bytes, word) of each Z14 set-aside this HAL made since the last po2 change. It may list
+    /// more than the runtime still holds (a buffer since taken, or released by a drain):
+    /// releasing such an entry finds nothing and does nothing.
+    prefill_keys: std::sync::Mutex<Vec<(u64, u32)>>,
+    /// The buffer given up to its next commit ([Hal::donate_to_commit]).
+    donation: std::sync::Mutex<Option<BufferImpl<BabyBearElem>>>,
 }
 
 impl<MH: MetalHash> Debug for MetalHal<MH> {
@@ -495,6 +540,7 @@ impl<MH: MetalHash> MetalHal<MH> {
             kernels,
             hash: None,
             ntt: ntt::NttState::new(),
+            r2: R2State::default(),
         };
         hal.hash = Some(Box::new(MH::new(&hal)));
         hal
@@ -590,6 +636,45 @@ impl<MH: MetalHash> MetalHal<MH> {
     /// Commit a batch after this many dispatches (default [DEFAULT_BATCH_DISPATCHES]).
     pub fn set_batch_limit(&self, dispatches: usize) {
         self.rt.set_batch_limit(dispatches);
+    }
+
+    /// W7-A1: a commit over `rows` rows marks the pool's po2 epoch. W7-R2: a new po2 also
+    /// releases the Z14 set-aside buffers, which were for the previous po2's sizes (not with
+    /// `RISC0_METAL_PREFILL_CAP=limit8`).
+    fn note_commit_domain(&self, rows: usize) {
+        self.rt.note_domain(rows);
+        let changed = self
+            .r2
+            .domain
+            .swap(rows as u64, std::sync::atomic::Ordering::Relaxed)
+            != rows as u64;
+        if changed && prefill_cap_mode() == PrefillCap::Headroom {
+            let released = self.prefill_release();
+            if released > 0 && prefill_log() {
+                eprintln!(
+                    "[prefill] po2 change: released {:.0} MiB of set-aside buffers",
+                    released as f64 / MIB
+                );
+            }
+        }
+    }
+
+    /// W7-R2: release the Z14 set-aside buffers this HAL made (they were for a po2 that did not
+    /// come back); returns the bytes released. Each is freed, not pooled (as a drain does): a fill
+    /// encoded in a row hash may still be in flight, and the command buffers that bind it keep it
+    /// alive until they complete.
+    fn prefill_release(&self) -> u64 {
+        let keys = std::mem::take(&mut *self.r2.prefill_keys.lock().unwrap());
+        let mut released = 0;
+        for (len, word) in keys {
+            if let Some((buf, _filled)) = self.rt.prefill_take(len, word) {
+                let raw = buffer::RawBuffer::from_pooled(&self.rt, "prefill_release", buf, len);
+                let out = BufferImpl::<u32>::from_raw(raw, (len / 4) as usize);
+                out.set_bypass_pool();
+                released += len;
+            }
+        }
+        released
     }
 
     /// The working-set limit in bytes: `RISC0_METAL_MAX_WORKING_SET_BYTES` (or
@@ -720,9 +805,19 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
     /// Z14: set aside a pooled buffer of `size` elements (one just freed, never a new
     /// allocation) for an upcoming `alloc_elem_init(.., size, value)`; its fill rides on the next
     /// commit row hash (`pv_rows_side_k_z9`) instead of a blit. Off with
-    /// `RISC0_METAL_PREFILL=0`, with a hash that does not carry fills, and beyond an eighth of
-    /// the working-set limit in set-aside bytes (a pool drain releases them).
+    /// `RISC0_METAL_PREFILL=0` and with a hash that does not carry fills. How many bytes may be
+    /// set aside: see [Self::prefill_elem_within] (`need` 0 here).
     fn prefill_elem(&self, size: usize, value: Self::Elem) {
+        self.prefill_elem_within(size, value, 0);
+    }
+
+    /// W7-R2: the set-aside bytes (with this buffer's) stay within the headroom left after the
+    /// caller's next phase, `free_size - need`, so set-aside memory (which the pool's LRU cap
+    /// does not release; only a drain does) never stands in for memory that phase needs. The
+    /// bound is conservative: `free_size` already excludes what is set aside. Set-asides go when
+    /// the commit domain (po2) changes. `RISC0_METAL_PREFILL_CAP=limit8`: Z14's cap of an eighth
+    /// of the working-set limit, kept across po2 changes.
+    fn prefill_elem_within(&self, size: usize, value: Self::Elem, need: usize) {
         let bytes = (size * std::mem::size_of::<Self::Elem>()) as u64;
         if !prefill_enabled()
             || !self.hash().carries_fills()
@@ -731,9 +826,34 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
         {
             return;
         }
-        let max = self.rt.working_set_limit() / 8;
-        self.rt
-            .prefill_reserve(bytes, value.as_u32_montgomery(), max);
+        let (max, free) = match prefill_cap_mode() {
+            PrefillCap::Limit8 => (self.rt.working_set_limit() / 8, 0),
+            PrefillCap::Headroom => {
+                let free = self.rt.free_size();
+                (free.saturating_sub(need as u64), free)
+            }
+        };
+        let word = value.as_u32_montgomery();
+        let kept = self.rt.prefill_reserve(bytes, word, max);
+        if kept {
+            let mut keys = self.r2.prefill_keys.lock().unwrap();
+            if !keys.contains(&(bytes, word)) {
+                keys.push((bytes, word));
+            }
+        }
+        if prefill_log() {
+            eprintln!(
+                "[prefill] {:.0} MiB word {:#x}: {} (need {:.0} MiB, free {:.0} MiB, cap {:.0} MiB, \
+                 allocated {:.0} MiB)",
+                bytes as f64 / MIB,
+                value.as_u32_montgomery(),
+                if kept { "set aside" } else { "not set aside" },
+                need as f64 / MIB,
+                free as f64 / MIB,
+                max as f64 / MIB,
+                self.rt.allocated_size() as f64 / MIB,
+            );
+        }
     }
 
     fn alloc_extelem_zeroed(&self, name: &'static str, size: usize) -> Self::Buffer<Self::ExtElem> {
@@ -801,7 +921,7 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
         count: usize,
     ) {
         // W7-A1: the commit domain marks the pool's po2 epoch.
-        self.rt.note_domain(src.size() / count.max(1));
+        self.note_commit_domain(src.size() / count.max(1));
         self.ntt_batch_interpolate_zk_shift_from(dst, src, count);
     }
 
@@ -817,7 +937,7 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
         count: usize,
     ) {
         // W7-A1: the commit domain marks the pool's po2 epoch.
-        self.rt.note_domain(witness.size() / count.max(1));
+        self.note_commit_domain(witness.size() / count.max(1));
         self.ntt_commit_coeffs_lde(coeffs, evaluated, witness, count);
     }
 
@@ -979,8 +1099,53 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
         count: usize,
     ) {
         // W7-A1: the commit domain marks the pool's po2 epoch.
-        self.rt.note_domain(witness.size() / count.max(1));
+        self.note_commit_domain(witness.size() / count.max(1));
         self.ntt_commit_coeffs_lde_impl(coeffs, evaluated, witness, count, false);
+    }
+
+    /// W7-R2: remembers a handle to `witness` (it stays allocated until it is committed or
+    /// another buffer is donated).
+    fn donate_to_commit(&self, witness: &Self::Buffer<Self::Elem>) {
+        *self.r2.donation.lock().unwrap() = Some(witness.clone());
+    }
+
+    /// W7-R2: the same view (GPU address and size) of the donated buffer.
+    fn take_commit_donation(&self, witness: &Self::Buffer<Self::Elem>) -> bool {
+        let mut slot = self.r2.donation.lock().unwrap();
+        let hit = slot.as_ref().is_some_and(|d| {
+            d.as_device_ptr() == witness.as_device_ptr() && d.size() == witness.size()
+        });
+        if hit {
+            *slot = None;
+        }
+        hit
+    }
+
+    /// W7-R2: Z13's chunked commit with the witness as its own coefficient buffer: each chunk's
+    /// inverse NTT runs in place (as `batch_interpolate_ntt` does) before its CT pass reads it.
+    fn commit_coeffs_lde_in_place(
+        &self,
+        io: &Self::Buffer<Self::Elem>,
+        evaluated: &Self::Buffer<Self::Elem>,
+        count: usize,
+        bit_reversed: bool,
+    ) {
+        self.note_commit_domain(io.size() / count.max(1));
+        let lg = crate::core::log2_ceil(io.size() / count.max(1));
+        if self.ntt_has_commit_coeffs_lde(lg) {
+            self.ntt_commit_coeffs_lde_impl(io, evaluated, io, count, !bit_reversed);
+        } else {
+            self.batch_interpolate_ntt_zk_shift(io, count);
+            self.batch_expand_into_evaluate_ntt(
+                evaluated,
+                io,
+                count,
+                crate::core::log2_ceil(crate::INV_RATE),
+            );
+            if !bit_reversed {
+                self.batch_bit_reverse(io, count);
+            }
+        }
     }
 
     fn zk_shift(&self, io: &Self::Buffer<Self::Elem>, poly_count: usize) {
@@ -1158,5 +1323,204 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
         scope!("combos_divide");
         let remainders = self.mdiv_combos_divide(combos, &chunks, cycles);
         super::report_nonzero_remainders(&chunks, &remainders);
+    }
+}
+
+#[cfg(test)]
+mod tests_r2 {
+    //! W7-R2 (small-Mac tier memory): the in-place commit (`Hal::commit_coeffs_lde_in_place`)
+    //! against the CPU prover's commit, the commit donation, and the Z14 prefill set-aside's
+    //! headroom cap and its release on a po2 change.
+
+    use risc0_core::field::{baby_bear::BabyBearElem as Fp, Elem as _};
+
+    use super::{poseidon2::Poseidon2Config, MetalHalPoseidon2, MetalHashPoseidon2};
+    use crate::{
+        core::hash::poseidon2::Poseidon2HashSuite,
+        hal::{cpu::CpuHal, Buffer as _, Hal},
+        prove::poly_group::PolyGroup,
+        INV_RATE,
+    };
+
+    fn random_vec(seed: u64, n: usize) -> Vec<Fp> {
+        let mut state = seed | 1;
+        (0..n)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                Fp::new((state % (risc0_core::field::baby_bear::P as u64)) as u32)
+            })
+            .collect()
+    }
+
+    fn set_fuse(hal: &MetalHalPoseidon2, on: bool) {
+        let hash: &MetalHashPoseidon2 = hal.hash();
+        hash.set_config(Poseidon2Config {
+            commit_fuse: on,
+            ..hash.config()
+        });
+    }
+
+    type Group = (Vec<Fp>, Vec<Fp>, crate::core::digest::Digest);
+
+    fn summary<H: Hal<Elem = Fp>>(g: &PolyGroup<H>) -> Group {
+        (
+            g.coeffs.as_ref().unwrap().to_vec(),
+            g.evaluated.as_ref().unwrap().to_vec(),
+            *g.merkle.root(),
+        )
+    }
+
+    /// The group an in-place commit of `witness` builds on `hal` (what
+    /// `Prover::commit_group_in_place` does).
+    fn in_place<H: Hal<Elem = Fp>>(hal: &H, witness_in: &[Fp], cols: usize, size: usize) -> Group {
+        let io = hal.copy_from_elem("accum", witness_in);
+        let evaluated = hal.alloc_elem("evaluated", io.size() * INV_RATE);
+        let bit_reversed =
+            hal.fuses_bit_reverse_into_hash(size * INV_RATE, cols, crate::core::log2_ceil(size));
+        hal.commit_coeffs_lde_in_place(&io, &evaluated, cols, bit_reversed);
+        let g = if bit_reversed {
+            PolyGroup::new_with_evaluated_bit_reversed(hal, io, evaluated, cols, size, "r2")
+        } else {
+            PolyGroup::new_with_evaluated(hal, io, evaluated, cols, size, "r2")
+        };
+        summary(&g)
+    }
+
+    /// Coefficients, evaluated domain and Merkle root of an in-place commit, on Metal (Z13's chunked
+    /// commit and the unfused fallback below its range, Z14's deferred bit reversal on and off) and
+    /// with the trait default on the CPU, equal the CPU prover's commit (`make_coeffs` +
+    /// `PolyGroup::new`) bit for bit, po2 10..20.
+    #[test]
+    fn r2_commit_in_place_matches_cpu() {
+        let cpu = CpuHal::new(Poseidon2HashSuite::new_suite());
+        let hal = MetalHalPoseidon2::new();
+        for (po2, cols) in [
+            (4, 3),
+            (10, 1),
+            (11, 5),
+            (12, 16),
+            (13, 17),
+            (14, 103),
+            (16, 3),
+            (18, 16),
+            (19, 2),
+            (20, 4),
+        ] {
+            let size = 1usize << po2;
+            let witness_in = random_vec(po2 as u64 * 131 + cols as u64, size * cols);
+            let want = {
+                let w = cpu.copy_from_elem("witness", &witness_in);
+                let coeffs = cpu.alloc_elem("coeffs", w.size());
+                cpu.batch_interpolate_ntt_zk_shift_from(&coeffs, &w, cols);
+                summary(&PolyGroup::new(&cpu, coeffs, cols, size, "ref"))
+            };
+            assert!(
+                in_place(&cpu, &witness_in, cols, size) == want,
+                "cpu default: po2 {po2} cols {cols}"
+            );
+            for fuse in [true, false] {
+                set_fuse(&hal, fuse);
+                let got = in_place(&hal, &witness_in, cols, size);
+                assert!(got.0 == want.0, "coeffs: po2 {po2} cols {cols} fuse {fuse}");
+                assert!(
+                    got.1 == want.1,
+                    "evaluated: po2 {po2} cols {cols} fuse {fuse}"
+                );
+                assert_eq!(got.2, want.2, "root: po2 {po2} cols {cols} fuse {fuse}");
+            }
+            set_fuse(&hal, true);
+        }
+    }
+
+    /// The headroom cap (`RISC0_METAL_PREFILL_CAP`, default): a buffer is set aside only while the
+    /// working-set headroom after the caller's next phase (`free_size - need`) covers it; a change of
+    /// the commit domain (po2) releases the set-aside buffers; the same domain keeps them.
+    #[test]
+    fn r2_prefill_headroom_and_po2_release() {
+        // Sets budgets and reads the device-wide allocation level.
+        let _lock = super::gpu_test_lock();
+        if !super::prefill_enabled() || super::prefill_cap_mode() != super::PrefillCap::Headroom {
+            eprintln!("r2_prefill_headroom_and_po2_release: prefill off or limit8 cap, skipped");
+            return;
+        }
+        let hal = MetalHalPoseidon2::new();
+        set_fuse(&hal, true);
+        let n = 1usize << 18;
+        let bytes = (n * 4) as u64;
+        let pooled = |seed| {
+            let b = hal.copy_from_elem("dirty", &random_vec(seed, n));
+            hal.sync();
+            drop(b);
+        };
+        hal.note_commit_domain(1 << 12);
+
+        // Headroom: none left after `need` -> nothing set aside (the buffer stays pooled).
+        pooled(1);
+        hal.prefill_elem_within(n, Fp::INVALID, usize::MAX / 2);
+        assert_eq!(hal.rt.prefill_stats(), (0, 0), "no headroom");
+        // With headroom for it -> set aside.
+        hal.prefill_elem_within(n, Fp::INVALID, 0);
+        assert_eq!(hal.rt.prefill_stats(), (1, 0), "headroom");
+        assert_eq!(
+            *hal.r2.prefill_keys.lock().unwrap(),
+            vec![(bytes, Fp::INVALID.as_u32_montgomery())]
+        );
+
+        // Same domain again: kept.
+        hal.note_commit_domain(1 << 12);
+        assert_eq!(hal.rt.prefill_stats(), (1, 0), "same po2 keeps");
+        // A new domain: released (freed, not pooled: the device allocation drops by its size), and
+        // the next alloc_elem_init is an ordinary (filled) allocation.
+        hal.sync();
+        let before = hal.rt.allocated_size();
+        hal.note_commit_domain(1 << 13);
+        assert_eq!(hal.rt.prefill_stats(), (0, 0), "po2 change releases");
+        assert!(hal.r2.prefill_keys.lock().unwrap().is_empty());
+        assert!(
+            hal.rt.allocated_size() + bytes <= before,
+            "released buffer freed: {} -> {}",
+            before,
+            hal.rt.allocated_size()
+        );
+        // A key whose buffer is gone (taken, or released by a drain) releases nothing.
+        hal.r2.prefill_keys.lock().unwrap().push((bytes, 7));
+        assert_eq!(hal.prefill_release(), 0);
+        let got = hal.alloc_elem_init("data", n, Fp::INVALID);
+        assert!(got
+            .to_vec()
+            .iter()
+            .all(|x| x.as_u32_montgomery() == Fp::INVALID.as_u32_montgomery()));
+        drop(got);
+
+        // A budget that leaves no headroom at all refuses even with need 0.
+        pooled(2);
+        hal.set_working_set_limit(Some(16));
+        hal.prefill_elem(n, Fp::ZERO);
+        hal.set_working_set_limit(None);
+        assert_eq!(hal.rt.prefill_stats(), (0, 0), "budget");
+        hal.trim_device_memory();
+    }
+
+    /// `Hal::donate_to_commit`: only the donated view matches, once; a later donation replaces it.
+    #[test]
+    fn r2_commit_donation() {
+        let hal = MetalHalPoseidon2::new();
+        let a = hal.alloc_elem("a", 1 << 10);
+        let b = hal.alloc_elem("b", 1 << 10);
+        assert!(!hal.take_commit_donation(&a), "nothing donated");
+        hal.donate_to_commit(&a);
+        assert!(!hal.take_commit_donation(&b), "other buffer");
+        assert!(!hal.take_commit_donation(&a.slice(0, 1 << 9)), "other view");
+        assert!(
+            hal.take_commit_donation(&a.clone()),
+            "donated buffer (any handle)"
+        );
+        assert!(!hal.take_commit_donation(&a), "consumed");
+        hal.donate_to_commit(&a);
+        hal.donate_to_commit(&b);
+        assert!(!hal.take_commit_donation(&a), "replaced");
+        assert!(hal.take_commit_donation(&b));
     }
 }

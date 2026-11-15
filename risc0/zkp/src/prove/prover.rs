@@ -20,14 +20,33 @@ use risc0_core::{
 };
 
 use crate::{
-    core::{digest::Digest, log2_ceil, poly::poly_interpolate},
+    core::{log2_ceil, poly::poly_interpolate},
     hal::{Buffer, CircuitHal, Hal},
-    prove::{fri::fri_prove, merkle::MerkleTreeProver, poly_group::PolyGroup, write_iop::WriteIOP},
+    prove::{
+        fri::{fri_prove, TreeOpenings},
+        merkle::MerkleTreeProver,
+        poly_group::PolyGroup,
+        write_iop::WriteIOP,
+    },
     taps::TapSet,
     INV_RATE,
 };
 
 static VERBOSE: LazyLock<bool> = LazyLock::new(|| std::env::var("RISC0_VERBOSE").is_ok());
+
+/// W7-R2: `RISC0_METAL_DROP_COEFFS_AFTER_MIX`: `0` keeps the groups' coefficients and the FRI
+/// mixing buffer until the end of the proof, `1` drops them after the mix, default when free
+/// memory is short (see `DeferredFinalize::complete`).
+static DROP_COEFFS_AFTER_MIX: LazyLock<u8> = LazyLock::new(|| {
+    match std::env::var("RISC0_METAL_DROP_COEFFS_AFTER_MIX")
+        .as_deref()
+        .map(str::trim)
+    {
+        Ok("0") => 0,
+        Ok("1") => 1,
+        _ => 2,
+    }
+});
 
 /// Object to generate a zero-knowledge proof of the execution of some circuit.
 pub struct Prover<'a, H: Hal> {
@@ -113,8 +132,12 @@ impl<'a, H: Hal> Prover<'a, H> {
     }
 
     /// Commits a given buffer to the IOP; the values must not subsequently
-    /// change.
+    /// change. W7-R2: a buffer its owner gave up with [Hal::donate_to_commit] is committed in
+    /// place ([Self::commit_group_in_place]); any other buffer is left unchanged.
     pub fn commit_group(&mut self, tap_group_index: usize, witness: &H::Buffer<H::Elem>) {
+        if self.hal.take_commit_donation(witness) {
+            return self.commit_group_in_place(tap_group_index, witness);
+        }
         scope_with!("commit_group({})", witness.name());
         let group_size = self.taps.group_size(tap_group_index);
         assert_eq!(witness.size() % group_size, 0);
@@ -163,6 +186,62 @@ impl<'a, H: Hal> Prover<'a, H> {
             let coeffs = make_coeffs(self.hal, witness, group_size);
             PolyGroup::new(self.hal, coeffs, group_size, self.cycles, witness.name())
         };
+        self.insert_committed_group(tap_group_index, group);
+    }
+
+    /// [Self::commit_group] that turns `witness` into the group's coefficient buffer instead of
+    /// allocating one (W7-R2, for budgets where the witness and its coefficients do not fit
+    /// together): `witness` holds the coefficients afterwards, so the caller must not read it as
+    /// the witness again. Same group (coefficients, LDE, Merkle tree) as [Self::commit_group].
+    pub fn commit_group_in_place(&mut self, tap_group_index: usize, witness: &H::Buffer<H::Elem>) {
+        scope_with!("commit_group_in_place({})", witness.name());
+        let group_size = self.taps.group_size(tap_group_index);
+        assert_eq!(witness.size() % group_size, 0);
+        assert_eq!(witness.size() / group_size, self.cycles);
+        assert!(
+            self.groups[tap_group_index].is_none(),
+            "Attempted to commit group {} more than once",
+            self.taps.group_name(tap_group_index)
+        );
+        let coeffs = witness.clone();
+        let group = if cfg!(feature = "circuit_debug") {
+            self.hal.batch_interpolate_ntt(&coeffs, group_size);
+            PolyGroup::new(self.hal, coeffs, group_size, self.cycles, witness.name())
+        } else {
+            let evaluated = self
+                .hal
+                .alloc_elem("evaluated", group_size * self.cycles * INV_RATE);
+            let bit_reversed = self.hal.fuses_bit_reverse_into_hash(
+                self.cycles * INV_RATE,
+                group_size,
+                log2_ceil(self.cycles),
+            );
+            self.hal
+                .commit_coeffs_lde_in_place(&coeffs, &evaluated, group_size, bit_reversed);
+            if bit_reversed {
+                PolyGroup::new_with_evaluated_bit_reversed(
+                    self.hal,
+                    coeffs,
+                    evaluated,
+                    group_size,
+                    self.cycles,
+                    witness.name(),
+                )
+            } else {
+                PolyGroup::new_with_evaluated(
+                    self.hal,
+                    coeffs,
+                    evaluated,
+                    group_size,
+                    self.cycles,
+                    witness.name(),
+                )
+            }
+        };
+        self.insert_committed_group(tap_group_index, group);
+    }
+
+    fn insert_committed_group(&mut self, tap_group_index: usize, group: PolyGroup<H>) {
         let group_ref = self.groups[tap_group_index].insert(group);
 
         group_ref.merkle.commit(&mut self.iop);
@@ -352,8 +431,8 @@ impl<H: Hal> DeferredFinalize<H> {
         // Evaluated will be reconstructed from coefficients before FRI batch_prove.
         // po2>=22 is always low_mem regardless of VRAM (peak > 32 GB even on 24 GB cards);
         // po2==21 is low_mem only on <20 GB cards.
-        let low_mem = self.po2 >= 22
-            || (hal.gpu_total_memory() < 20 * 1024 * 1024 * 1024 && self.po2 >= 21);
+        let low_mem =
+            self.po2 >= 22 || (hal.gpu_total_memory() < 20 * 1024 * 1024 * 1024 && self.po2 >= 21);
         if low_mem {
             for pg in self.groups.iter_mut() {
                 if let Some(pg) = pg.as_mut() {
@@ -388,7 +467,8 @@ impl<H: Hal> DeferredFinalize<H> {
         // invRate*size to 16 polys of size, without actually doing anything.
 
         // Make the PolyGroup + add it to the IOP;
-        let check_group = PolyGroup::new(hal, self.check_poly, H::CHECK_SIZE, self.cycles, "check");
+        let mut check_group =
+            PolyGroup::new(hal, self.check_poly, H::CHECK_SIZE, self.cycles, "check");
         check_group.merkle.commit(&mut self.iop);
         tracing::debug!("checkGroup: {}", check_group.merkle.root());
         let t_check_commit = ft.elapsed();
@@ -429,7 +509,10 @@ impl<H: Hal> DeferredFinalize<H> {
             let which = hal.copy_from_u32("which", which.as_slice());
             let xs = hal.copy_from_extelem("xs", xs.as_slice());
             hal.batch_evaluate_any(
-                check_group.coeffs.as_ref().expect("coeffs must be restored"),
+                check_group
+                    .coeffs
+                    .as_ref()
+                    .expect("coeffs must be restored"),
                 H::CHECK_SIZE,
                 &which,
                 &xs,
@@ -504,9 +587,8 @@ impl<H: Hal> DeferredFinalize<H> {
         let early_check = early_check.or_else(|| EVAL_U_EARLY.then(|| check_eval(hal)));
         // The FRI mixing buffer's zero fill does not depend on the mix either: queue it now too.
         let combo_count = self.taps.combos_size();
-        let early_combos = EVAL_U_EARLY.then(|| {
-            hal.alloc_extelem_zeroed("combos", self.cycles * (combo_count + 1))
-        });
+        let early_combos = EVAL_U_EARLY
+            .then(|| hal.alloc_extelem_zeroed("combos", self.cycles * (combo_count + 1)));
 
         // Now, convert the values to coefficients via interpolation
         let mut coeff_u = vec![H::ExtElem::ZERO; eval_u.len()];
@@ -721,6 +803,39 @@ impl<H: Hal> DeferredFinalize<H> {
 
         let t_combos = ft.elapsed();
 
+        // W7-R2: nothing reads the groups' coefficients after the mix (the FRI queries read the
+        // LDEs through the Merkle trees). On a unified-memory GPU HAL whose free working set is
+        // smaller than those coefficients, drop them now, so the FRI allocations below do not
+        // stack on them (with them, the FRI phase was a po2-20 segment's peak at an 8 GiB
+        // budget). Not with room to spare: freed early, the pool's LRU cap evicts them first,
+        // and the next segment's commits allocate afresh (+8 ms at po2 19 / 8 GiB). Not on the
+        // low-memory path, which re-expands the LDEs from them.
+        // `RISC0_METAL_DROP_COEFFS_AFTER_MIX`: `0` never, `1` always, default by free memory.
+        let drop_coeffs = !low_mem
+            && unified_memory_gpu(hal)
+            && match *DROP_COEFFS_AFTER_MIX {
+                0 => false,
+                1 => true,
+                _ => {
+                    let coeffs: usize = self
+                        .groups
+                        .iter()
+                        .flatten()
+                        .chain(std::iter::once(&check_group))
+                        .filter_map(|pg| pg.coeffs.as_ref())
+                        .map(|c| c.size() * std::mem::size_of::<H::Elem>())
+                        .sum();
+                    hal.gpu_free_memory() < coeffs
+                }
+            };
+        if drop_coeffs {
+            for pg in self.groups.iter_mut().flatten() {
+                pg.coeffs = None;
+                pg.coeffs_host = None;
+            }
+            check_group.coeffs = None;
+        }
+
         // Sum the combos up into one final polynomial + make it into 4 Fp polys.
         // Additionally, it needs to be bit reversed to make everyone happy
         let final_poly_coeffs = scope!("sum", {
@@ -728,6 +843,9 @@ impl<H: Hal> DeferredFinalize<H> {
             hal.eltwise_sum_extelem(&final_poly_coeffs, &combos);
             final_poly_coeffs
         });
+        if drop_coeffs {
+            drop(combos);
+        }
 
         // Finally do the FRI protocol to prove the degree of the polynomial
         scope!(
@@ -745,9 +863,9 @@ impl<H: Hal> DeferredFinalize<H> {
                 hal,
                 &mut self.iop,
                 &final_poly_coeffs,
-                |indices: &[usize]| -> Vec<Vec<(Vec<H::Elem>, Vec<Digest>)>> {
+                |indices: &[usize]| -> TreeOpenings<H::Elem> {
                     let mut groups = groups_cell.borrow_mut();
-                    let mut trees: Vec<Vec<(Vec<H::Elem>, Vec<Digest>)>> = Vec::new();
+                    let mut trees: TreeOpenings<H::Elem> = Vec::new();
                     for pg in groups.iter_mut() {
                         let pg = pg.as_mut().unwrap();
                         pg.restore_evaluated(hal);
@@ -757,7 +875,7 @@ impl<H: Hal> DeferredFinalize<H> {
                     trees.push(check_group.merkle.batch_prove(hal, indices));
                     let n = indices.len();
                     let num_trees = trees.len();
-                    let mut result: Vec<Vec<(Vec<H::Elem>, Vec<Digest>)>> = Vec::with_capacity(n);
+                    let mut result: TreeOpenings<H::Elem> = Vec::with_capacity(n);
                     for q in 0..n {
                         let mut query_data = Vec::with_capacity(num_trees);
                         for tree in trees.iter_mut() {
@@ -774,18 +892,18 @@ impl<H: Hal> DeferredFinalize<H> {
                 hal,
                 &mut self.iop,
                 &final_poly_coeffs,
-                |indices: &[usize]| -> Vec<Vec<(Vec<H::Elem>, Vec<Digest>)>> {
+                |indices: &[usize]| -> TreeOpenings<H::Elem> {
                     let mut jobs: Vec<(&MerkleTreeProver<H>, &[usize])> = self
                         .groups
                         .iter()
                         .map(|pg| (&pg.as_ref().unwrap().merkle, indices))
                         .collect();
                     jobs.push((&check_group.merkle, indices));
-                    let mut trees: Vec<Vec<(Vec<H::Elem>, Vec<Digest>)>> =
+                    let mut trees: TreeOpenings<H::Elem> =
                         MerkleTreeProver::batch_prove_many(hal, &jobs);
                     let n = indices.len();
                     let num_trees = trees.len();
-                    let mut result: Vec<Vec<(Vec<H::Elem>, Vec<Digest>)>> = Vec::with_capacity(n);
+                    let mut result: TreeOpenings<H::Elem> = Vec::with_capacity(n);
                     for q in 0..n {
                         let mut query_data = Vec::with_capacity(num_trees);
                         for tree in trees.iter_mut() {

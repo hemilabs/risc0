@@ -151,10 +151,7 @@ impl<H: Hal> PolyGroup<H> {
         if self.coeffs_host.is_some() {
             return;
         }
-        let coeffs = self
-            .coeffs
-            .take()
-            .expect("coeffs already released");
+        let coeffs = self.coeffs.take().expect("coeffs already released");
         let host: Vec<H::Elem> = coeffs.to_vec();
         // coeffs goes out of scope here -> device buffer freed (no other Rc refs).
         self.coeffs_host = Some(Rc::new(host));
