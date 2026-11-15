@@ -127,6 +127,37 @@ fn shorts_to_digest(elems: &[BabyBearElem]) -> Digest {
     Digest::try_from(words.as_slice()).unwrap()
 }
 
+/// Copy of `host::server::prove::tests::heavy_test_lock` (that module is private to `prove`): an
+/// exclusive `flock` on the same per-process file, so a heavy test here and one there exclude
+/// each other under the default parallel harness (W7-V1). Taken once, in a test's own body.
+struct HeavyTestLock(#[allow(dead_code)] std::fs::File);
+
+fn heavy_test_lock() -> HeavyTestLock {
+    let path =
+        std::env::temp_dir().join(format!("risc0-zkvm-heavy-test-{}.lock", std::process::id()));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .unwrap_or_else(|e| panic!("heavy test lock {}: {e}", path.display()));
+    file.lock()
+        .unwrap_or_else(|e| panic!("heavy test lock {}: {e}", path.display()));
+    HeavyTestLock(file)
+}
+
+/// Copy of `host::server::prove::tests::require_gpu_run_heavy`: an `#[ignore]`d po2 20
+/// measurement test fails unless `gpu-run`'s heavy (or huge) lock exported `GPU_RUN_MODE`.
+fn require_gpu_run_heavy(test: &str) {
+    match std::env::var("GPU_RUN_MODE").as_deref() {
+        Ok("heavy") | Ok("huge") => {}
+        other => panic!(
+            "{test} is a heavy measurement test: run it alone under `gpu-run` (heavy lock, which \
+             sets GPU_RUN_MODE=heavy); GPU_RUN_MODE is {other:?}"
+        ),
+    }
+}
+
 fn execute_elf(env: ExecutorEnv, elf: &[u8]) -> Result<Session> {
     ExecutorImpl::from_elf(env, elf)
         .unwrap()
@@ -214,6 +245,7 @@ static ECHO_SUCCINCT: LazyLock<(Journal, SuccinctReceipt<ReceiptClaim>)> = LazyL
 
 #[test_log::test]
 fn test_recursion_lift_then_unwrap_povw() {
+    let _heavy = heavy_test_lock();
     // Prove the base case
     let (journal, segment) = ECHO_SEGMENT.clone();
     let ctx = VerifierContext::default();
@@ -234,6 +266,7 @@ fn test_recursion_lift_then_unwrap_povw() {
 
 #[test_log::test]
 fn test_recursion_lift_join_unwrap_povw() -> anyhow::Result<()> {
+    let _heavy = heavy_test_lock();
     // Prove the base case
     let (journal, segments) = BUSY_LOOP_SEGMENTS.clone();
     let ctx = VerifierContext::default();
@@ -305,6 +338,11 @@ fn test_recursion_lift_join_unwrap_povw() -> anyhow::Result<()> {
 
 #[test_log::test]
 fn test_recursion_lift_join_identity_p254_e2e() {
+    let _heavy = heavy_test_lock();
+    lift_join_identity_p254_e2e();
+}
+
+fn lift_join_identity_p254_e2e() {
     // Prove the base case
     let (journal, segments) = BUSY_LOOP_SEGMENTS.clone();
 
@@ -339,15 +377,17 @@ fn test_recursion_lift_join_identity_p254_e2e() {
 #[cfg(any(feature = "cuda", feature = "rocm", feature = "metal"))]
 #[test_log::test]
 fn test_recursion_host_chains_check() {
+    let _heavy = heavy_test_lock();
     let before = risc0_circuit_recursion::prove::set_host_chains_check(true);
-    test_recursion_lift_join_identity_p254_e2e();
-    test_recursion_lift_resolve_e2e();
+    lift_join_identity_p254_e2e();
+    lift_resolve_e2e();
     let after = risc0_circuit_recursion::prove::set_host_chains_check(false);
     assert!(after > before, "no recursion witness was checked");
 }
 
 #[test_log::test]
 fn test_recursion_identity_sha256() {
+    let _heavy = heavy_test_lock();
     let (_, default_receipt) = ECHO_SUCCINCT.clone();
     let (_, control_id_sha256) = zkr::identity("sha-256").unwrap();
 
@@ -394,6 +434,11 @@ fn test_recursion_identity_sha256() {
 
 #[test_log::test]
 fn test_recursion_lift_resolve_e2e() {
+    let _heavy = heavy_test_lock();
+    lift_resolve_e2e();
+}
+
+fn lift_resolve_e2e() {
     let opts = ProverOpts::default();
     let prover = get_prover_server(&opts).unwrap();
 
@@ -457,6 +502,7 @@ fn test_recursion_lift_resolve_e2e() {
 
 #[test_log::test]
 fn test_recursion_lift_resolve_unwrap_povw() -> Result<()> {
+    let _heavy = heavy_test_lock();
     let (assumption_journal, assumption_receipt) = ECHO_SUCCINCT.clone();
 
     let povw_job_id: PovwJobId = rand::random();
@@ -583,6 +629,7 @@ fn stable_root() {
 
 #[test]
 fn union() {
+    let _heavy = heavy_test_lock();
     let mut mmr = MerkleMountainAccumulator::<UnionPeak>::new();
     for receipt in vec![ECHO_SUCCINCT.1.clone(); 5] {
         mmr.insert(receipt.into_unknown()).unwrap();
@@ -591,7 +638,10 @@ fn union() {
 }
 
 #[test_log::test]
+#[ignore = "measurement: po2 20, run alone under gpu-run"]
 fn bench_prove_segment_po2_20() {
+    require_gpu_run_heavy("bench_prove_segment_po2_20");
+    let _heavy = heavy_test_lock();
     // Benchmark: prove a single segment at po2=20 (~1M cycles)
     let segment_limit_po2 = 20;
     let cycles: u64 = 1 << segment_limit_po2;
@@ -632,7 +682,10 @@ fn bench_prove_segment_po2_20() {
 }
 
 #[test_log::test]
+#[ignore = "measurement: po2 20, run alone under gpu-run"]
 fn bench_prove_multi_segment_po2_20() {
+    require_gpu_run_heavy("bench_prove_multi_segment_po2_20");
+    let _heavy = heavy_test_lock();
     // Benchmark: prove 10+ segments at po2=20 sequentially using prove_segment.
     let segment_limit_po2 = 20;
     let cycles: u64 = 12 * (1 << segment_limit_po2);
@@ -701,7 +754,10 @@ fn bench_prove_multi_segment_po2_20() {
 }
 
 #[test_log::test]
+#[ignore = "measurement: po2 20, run alone under gpu-run"]
 fn bench_prove_session_pipelined_po2_20() {
+    require_gpu_run_heavy("bench_prove_session_pipelined_po2_20");
+    let _heavy = heavy_test_lock();
     // Benchmark: prove via prove_session (pipelined path) to test cross-segment overlap.
     let segment_limit_po2 = 20;
     let cycles: u64 = 5 * (1 << segment_limit_po2);

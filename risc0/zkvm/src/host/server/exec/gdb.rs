@@ -99,6 +99,26 @@ mod tests {
 
     #[test]
     fn end_to_end() {
+        // Needs rzup's riscv32im-gdb component: skip, saying why, when it is not installed.
+        let gdb_dir = match rzup::Rzup::new()
+            .and_then(|rzup| rzup.get_default_version(&rzup::Component::Gdb))
+        {
+            Ok(Some((_, path))) => path,
+            Ok(None) => {
+                eprintln!("end_to_end: skipped: rzup's gdb component is not installed");
+                return;
+            }
+            Err(e) => {
+                eprintln!("end_to_end: skipped: rzup's gdb component not found: {e}");
+                return;
+            }
+        };
+        let gdb_bin = gdb_dir.join("riscv32im-gdb");
+        if !gdb_bin.exists() {
+            eprintln!("end_to_end: skipped: {} does not exist", gdb_bin.display());
+            return;
+        }
+
         let (send, recv) = std::sync::mpsc::channel();
 
         std::thread::spawn(move || {
@@ -116,13 +136,6 @@ mod tests {
         });
 
         let (elf_path, address) = recv.recv().unwrap();
-
-        let rzup = rzup::Rzup::new().unwrap();
-        let (_, path) = rzup
-            .get_default_version(&rzup::Component::Gdb)
-            .unwrap()
-            .unwrap();
-        let gdb_bin = path.join("riscv32im-gdb");
 
         let mut gdb_script = NamedTempFile::with_suffix(".txt").unwrap();
         writeln!(&mut gdb_script, "target remote {address}").unwrap();

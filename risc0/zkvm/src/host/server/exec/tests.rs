@@ -1596,3 +1596,78 @@ fn povw_nonce_default_assignment() {
         assert_eq!(segment.inner.povw_nonce, None);
     }
 }
+
+/// W7-V1 (Z17 review's "executor oddity"): at `segment_limit_po2(15)` a BusyLoop is split into
+/// ~44 user cycles per segment, at 14 and 16 into thousands. Not a split bug: a segment splits
+/// once `user + paging + RESERVED_CYCLES` passes `2^po2 - max_insn_cycles`, and `max_insn_cycles`
+/// jumps from `MAX_INSN_CYCLES_LOWER_PO2` (2000) below po2 15 to `MAX_INSN_CYCLES` (25000, room for
+/// the largest bigint program; upstream #3098) from po2 15 on. At po2 15 that leaves
+/// 32768 - 25000 - 4113 (lookup tables) = 3655 cycles for user + paging, less than what a segment
+/// pays to page in its working set (4660 for this guest): every segment stops a few dozen
+/// instructions after its pages are in. This pins the rule at po2 14, 15 and 16 (numbers in
+/// `docs/metal-port/notes/W7-V1.md`).
+#[test_log::test]
+fn segment_split_po2_14_15_16() {
+    use risc0_circuit_rv32im::{
+        execute::platform::RESERVED_CYCLES, MAX_INSN_CYCLES, MAX_INSN_CYCLES_LOWER_PO2,
+    };
+    let cycles = 1u64 << 16;
+    for po2 in [14u32, 15, 16] {
+        let env = ExecutorEnv::builder()
+            .write(&MultiTestSpec::BusyLoop { cycles })
+            .unwrap()
+            .segment_limit_po2(po2)
+            .build()
+            .unwrap();
+        let session = execute_elf(env, MULTI_TEST_ELF).unwrap();
+        let max_insn = if po2 >= 15 {
+            MAX_INSN_CYCLES
+        } else {
+            MAX_INSN_CYCLES_LOWER_PO2
+        } as u32;
+        let threshold = (1u32 << po2) - max_insn;
+        let segments: Vec<_> = session
+            .segments
+            .iter()
+            .map(|s| s.resolve().unwrap())
+            .collect();
+        let n = segments.len();
+        let (mut user, mut paging) = (vec![], vec![]);
+        for s in &segments[..n - 1] {
+            assert_eq!(s.inner.po2, po2);
+            assert_eq!(s.inner.segment_threshold, threshold);
+            // Split as soon as the segment passed the threshold, and only then.
+            let used = s.inner.suspend_cycle + s.inner.paging_cycles + RESERVED_CYCLES as u32;
+            assert!(used > threshold, "po2 {po2} segment {}: {used}", s.index);
+            assert!(used < 1 << po2, "po2 {po2} segment {}: {used}", s.index);
+            user.push(s.inner.suspend_cycle);
+            paging.push(s.inner.paging_cycles);
+        }
+        user.sort_unstable();
+        paging.sort_unstable();
+        let (user_med, paging_med) = (user[user.len() / 2], paging[paging.len() / 2]);
+        println!(
+            "po2 {po2}: threshold {threshold} (2^{po2} - {max_insn}), reserved {RESERVED_CYCLES}, \
+             {n} segments, {} user cycles; per full segment: user median {user_med} \
+             [{}-{}], paging median {paging_med} [{}-{}]",
+            session.user_cycles,
+            user[0],
+            user[user.len() - 1],
+            paging[0],
+            paging[paging.len() - 1],
+        );
+        if po2 == 15 {
+            // The room MAX_INSN_CYCLES leaves is below the paging of one segment.
+            assert!(threshold - (RESERVED_CYCLES as u32) < paging_med);
+            assert!(
+                user_med < 1000,
+                "po2 15: {user_med} user cycles per segment"
+            );
+        } else {
+            assert!(
+                user_med > 4000,
+                "po2 {po2}: {user_med} user cycles per segment"
+            );
+        }
+    }
+}
