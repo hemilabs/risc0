@@ -130,6 +130,11 @@ const EVAL_SPLIT_LZ_U32: &[&str] = &[
 /// Environment variable (read once): `0` reverts the lazy Fp split's uint4 mix-power loads (C13)
 /// to the C12 four-load form ([EVAL_SPLIT_LZ_U32]). Affects the `rg` and `lz` variants (both use
 /// uint4 loads; the four-load form exists only for the 6-part split).
+///
+/// Note (W7-C1): on the default `rg` this reverts **two** optimizations at once: the four-load
+/// form exists only as the 6-part `lz32` split, so `0` also drops C15's regrouping (`rg` ->
+/// `lz32`, not "`rg` with four loads"). To revert C15 alone use `RISC0_METAL_REC_EC_REGROUP=0`
+/// (`lz`); to measure C13's uint4 loads alone compare `RISC0_METAL_REC_KERNELS=lz` with `lz32`.
 pub(crate) const REC_LZ_UINT4_ENV: &str = "RISC0_METAL_REC_LZ_UINT4";
 
 /// The regrouped lazy Fp split, in dispatch order (C15, `cuda2metal_eval.py --split-rg`): the same
@@ -859,6 +864,70 @@ pub(crate) fn global_state_test_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Serializes the memory-heavy tests (W7-C1): every test whose process footprint alone exceeds
+/// ~250 MB (a HAL at po2 >= 16, a CPU prover beside it, or a po2 18 witgen; up to 3.8 GB each,
+/// measured in notes/W7-C1.md) takes this lock as its first statement, before
+/// [global_state_test_lock] or any other test lock (one order everywhere, so no deadlock). Under
+/// the default parallel harness the suite then holds one such test at a time instead of every
+/// thread's own HAL at once (7-8.6 GB peak footprint before; 3.8 GB with this lock and the
+/// malloc setting below). Poison-tolerant.
+#[cfg(test)]
+pub(crate) fn heavy_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The test binary runs with libmalloc's large-allocation cache off (W7-C1). On this macOS a freed
+/// large block (a CPU prover's po2 18 buffers, a witness) stays in the process footprint, cached
+/// for a later request of the same size: across this suite's many sizes that kept 2-4 GB of freed
+/// memory in the footprint (measured 6.0 GB peak with [heavy_test_lock] alone, 3.8 GB with both;
+/// notes/W7-C1.md). libmalloc reads `MallocLargeCache` once, before any Rust code runs, so a
+/// constructor re-executes the binary with `MallocLargeCache=0` unless the variable is already
+/// set (`MallocLargeCache=1` keeps the cache; `RISC0_TEST_NO_REEXEC=1` skips the re-exec).
+///
+/// Not with `--ignored` (fix round 1): the ignored tests are the benches and replays run one at a
+/// time, where the footprint does not matter, and the cache off costs them time (the
+/// `c11_bench_captures` round over the 11 C11 captures took +7 ms, 1829 -> 1836 ms, under the
+/// re-exec; notes/W7-C1.md section 3).
+#[cfg(all(test, target_os = "macos"))]
+mod malloc_large_cache_off {
+    #[used]
+    #[link_section = "__DATA,__mod_init_func"]
+    static INIT: extern "C" fn() = reexec;
+
+    extern "C" fn reexec() {
+        if std::env::var_os("MallocLargeCache").is_some()
+            || std::env::var_os("RISC0_TEST_NO_REEXEC").is_some()
+            || std::env::args_os().any(|a| a == "--ignored")
+        {
+            return;
+        }
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        use std::os::unix::process::CommandExt;
+        let err = std::process::Command::new(exe)
+            .args(std::env::args_os().skip(1))
+            .env("MallocLargeCache", "0")
+            .exec();
+        // Only reached if the exec failed: run as we are.
+        eprintln!("risc0-circuit-recursion tests: re-exec with MallocLargeCache=0 failed: {err}");
+    }
+}
+
+/// Ignored heavy tests (benches, capture replays, stress repeats) run only under `bin/gpu-run`
+/// without `--light`, which exports `GPU_RUN_MODE=heavy`: they are sized for an exclusive GPU
+/// (W7-C1). Panics otherwise.
+#[cfg(test)]
+pub(crate) fn require_heavy_gpu_run(test: &str) {
+    let mode = std::env::var("GPU_RUN_MODE").unwrap_or_default();
+    assert!(
+        mode == "heavy",
+        "{test} is a heavy GPU test: run it under bin/gpu-run (heavy, not --light); \
+         GPU_RUN_MODE={mode:?}"
+    );
+}
+
 fn seal_check_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var(SEAL_CHECK_ENV).as_deref() == Ok("1"))
@@ -1225,11 +1294,13 @@ mod c5_tests {
 
     #[test]
     fn prove_test_zkr_po2_16_matches_cpu() {
+        let _heavy = crate::prove::hal::metal::heavy_test_lock();
         prove_test_zkr(16);
     }
 
     #[test]
     fn prove_test_zkr_po2_18_matches_cpu() {
+        let _heavy = crate::prove::hal::metal::heavy_test_lock();
         prove_test_zkr(18); // zkvm RECURSION_PO2
     }
 
@@ -1258,6 +1329,8 @@ mod c5_tests {
     #[test]
     #[ignore]
     fn z16_probe_warmup() {
+        crate::prove::hal::metal::require_heavy_gpu_run("z16_probe_warmup");
+        let _heavy = crate::prove::hal::metal::heavy_test_lock();
         let t = std::time::Instant::now();
         warmup().unwrap();
         println!(

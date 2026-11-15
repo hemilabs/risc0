@@ -587,22 +587,26 @@ mod c8_tests {
 
     #[test]
     fn variants_match_cpu_po2_4() {
+        let _heavy = crate::prove::hal::metal::heavy_test_lock();
         variants_match_cpu(4);
     }
 
     #[test]
     fn variants_match_cpu_po2_10() {
+        let _heavy = crate::prove::hal::metal::heavy_test_lock();
         variants_match_cpu(10);
     }
 
     #[test]
     fn variants_match_cpu_po2_16() {
+        let _heavy = crate::prove::hal::metal::heavy_test_lock();
         variants_match_cpu(16);
     }
 
     /// RECURSION_PO2: the shape of every lift/join/resolve/identity proof.
     #[test]
     fn variants_match_cpu_po2_18() {
+        let _heavy = crate::prove::hal::metal::heavy_test_lock();
         variants_match_cpu(18);
     }
 

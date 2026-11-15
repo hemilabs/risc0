@@ -75,6 +75,8 @@ fn stats(v: &[f64]) -> (f64, f64, f64) {
 #[test]
 #[ignore]
 fn c15_ab_eval_in_process() {
+    crate::prove::hal::metal::require_heavy_gpu_run("c15_ab_eval_in_process");
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     use super::eval_check::test_override::with_variant;
     let _guard = global_state_test_lock();
     let rounds = env_usize("C15_ROUNDS", 8);
@@ -164,6 +166,8 @@ fn c15_ab_eval_in_process() {
 #[test]
 #[ignore]
 fn c15_pso_times() {
+    crate::prove::hal::metal::require_heavy_gpu_run("c15_pso_times");
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     let _guard = global_state_test_lock();
     let device = metal::Device::system_default().unwrap();
     let sets = std::env::var("C15_PSO_SETS").unwrap_or_else(|_| "lz,rg".into());
@@ -224,6 +228,8 @@ fn kernel_arm(device: &metal::DeviceRef, spec: &str) -> (Vec<&'static str>, &'st
 #[test]
 #[ignore]
 fn c15_eval_kernel_bench() {
+    crate::prove::hal::metal::require_heavy_gpu_run("c15_eval_kernel_bench");
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     use risc0_zkp::{
         core::log2_ceil,
         field::{

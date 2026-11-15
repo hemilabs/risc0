@@ -41,6 +41,7 @@ fn test_input() -> VecDeque<u32> {
 /// HAL succeeds and matches the CPU prover.
 #[test]
 fn scratch_poison_recovers_after_budget_panic() {
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     // A full Metal proof: serialized with the tests that assert on process-wide state (PLAN 8.7).
     let _guard = crate::prove::hal::metal::global_state_test_lock();
     let hal = Arc::new(MetalHalPoseidon2::new());

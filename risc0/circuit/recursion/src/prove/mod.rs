@@ -21,8 +21,9 @@ mod hal;
 mod p2fast;
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 mod pinned;
-/// Metal: the trace staged in a shared buffer (C14, `hal/metal/staging.rs`).
-#[cfg(feature = "metal")]
+/// Metal: the trace staged in a shared buffer (C14, `hal/metal/staging.rs`). Only without CUDA and
+/// ROCm, whose `pinned.rs` defines the same module.
+#[cfg(all(feature = "metal", not(any(feature = "cuda", feature = "rocm"))))]
 mod pinned {
     pub(crate) use super::hal::metal::staging::MetalStaged as PinnedTrace;
 }
@@ -185,6 +186,10 @@ pub(crate) fn host_chains_backend() -> bool {
 /// between proofs (each program's committed ctrl group). The next proof rebuilds them.
 pub fn release_cached_provers() {
     PROVER_CACHE.with(|cache| cache.borrow_mut().clear());
+    // Metal (W7-C1): the pooled prepare() staging buffers (~80 MB) go too, so they do not sit
+    // beside the Groth16 wrap.
+    #[cfg(all(feature = "metal", not(any(feature = "cuda", feature = "rocm"))))]
+    hal::metal::staging::drain_pool();
 }
 
 /// Test hook: while on, each recursion witness generated with host-executed chains is
@@ -208,9 +213,9 @@ pub(crate) fn host_prep_enabled() -> bool {
 }
 
 /// Metal (C14): stage a prepared preflight's witgen inputs (trace and host chains) in a shared
-/// Metal buffer, off the GPU thread (`hal/metal/staging.rs`; off by default,
-/// `RISC0_METAL_REC_STAGE=1` = on).
-#[cfg(feature = "metal")]
+/// Metal buffer, off the GPU thread (`hal/metal/staging.rs`; on by default since W7-C1,
+/// `RISC0_METAL_REC_STAGE=0` = off).
+#[cfg(all(feature = "metal", not(any(feature = "cuda", feature = "rocm"))))]
 pub(crate) fn stage_metal(preflight: &Preflight) {
     if !host_chains_backend() || !hal::metal::staging::stage_enabled() {
         return;
@@ -472,7 +477,7 @@ impl Prover {
             }
         }
         // Metal (C14): the same inputs in a shared Metal buffer the witgen binds in place.
-        #[cfg(feature = "metal")]
+        #[cfg(all(feature = "metal", not(any(feature = "cuda", feature = "rocm"))))]
         stage_metal(&preflight);
         self.prepared_preflight = Some(preflight);
         Ok(())

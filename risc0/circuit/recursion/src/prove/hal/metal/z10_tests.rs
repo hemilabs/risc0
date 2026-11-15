@@ -78,6 +78,8 @@ fn random_elems(n: usize, seed: u64) -> Vec<BabyBearElem> {
 #[test]
 #[ignore]
 fn z10_profile_cpu_p254() {
+    crate::prove::hal::metal::require_heavy_gpu_run("z10_profile_cpu_p254");
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     let _guard = global_state_test_lock();
     let po2 = env_usize("Z10_PROFILE_PO2", 18);
     let reps = env_usize("Z10_PROFILE_REPS", 2);
@@ -174,11 +176,13 @@ fn p254_seal_matches_cpu(po2: usize) {
 
 #[test]
 fn p254_seal_matches_cpu_po2_16() {
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     p254_seal_matches_cpu(16);
 }
 
 #[test]
 fn p254_seal_matches_cpu_po2_18() {
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     p254_seal_matches_cpu(18); // RECURSION_PO2: identity_p254's shape
 }
 
@@ -186,6 +190,7 @@ fn p254_seal_matches_cpu_po2_18() {
 /// `RISC0_METAL_REC_P254=cpu`): a proof through it is served by the Metal circuit HAL.
 #[test]
 fn factory_p254_uses_metal() {
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     let _guard = global_state_test_lock();
     let program = get_zkr("test_recursion_circuit.zkr", 14).unwrap();
     let p = recursion_prover("poseidon_254").unwrap();
@@ -215,6 +220,8 @@ fn factory_p254_uses_metal() {
 #[test]
 #[ignore]
 fn z10_ab_p254_prover() {
+    crate::prove::hal::metal::require_heavy_gpu_run("z10_ab_p254_prover");
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     let _guard = global_state_test_lock();
     let po2 = env_usize("Z10_PROFILE_PO2", 18);
     let pairs = env_usize("Z10_AB_PAIRS", 7);
@@ -248,6 +255,8 @@ fn z10_ab_p254_prover() {
 #[test]
 #[ignore]
 fn z10_time_metal_p254() {
+    crate::prove::hal::metal::require_heavy_gpu_run("z10_time_metal_p254");
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     let _guard = global_state_test_lock();
     let po2 = env_usize("Z10_PROFILE_PO2", 18);
     let reps = env_usize("Z10_REPS", 5);

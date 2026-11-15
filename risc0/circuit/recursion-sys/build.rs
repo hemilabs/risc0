@@ -663,6 +663,9 @@ fn build_rocm_kernels() {
 }
 
 #[allow(dead_code)]
+// `-Xs` takes the whole `-options "..."` string as one argument, so the space inside it is not a
+// split argument (clippy::suspicious_command_arg_space).
+#[allow(clippy::suspicious_command_arg_space)]
 fn build_intel_kernels() {
     rerun_if_changed("kernels/intel");
     rerun_if_changed("kernels/cxx");
@@ -719,7 +722,7 @@ fn build_intel_kernels() {
         if recursion_optimize {
             cmd.arg("-O2")
                 .arg("-Xs")
-                .arg(format!("-options \"-cl-intel-256-GRF-per-thread\""));
+                .arg("-options \"-cl-intel-256-GRF-per-thread\"");
         } else {
             // Fast path (same recipe as rv32im eval_check): -Os, 256 GRF,
             // RISC0_INTEL_EVAL_FAST device helpers (mandatory: without them the

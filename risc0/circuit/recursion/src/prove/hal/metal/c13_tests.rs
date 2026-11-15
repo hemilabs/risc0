@@ -81,6 +81,8 @@ fn replay_preflight(c: &capture::Capture) -> Option<Preflight> {
 #[test]
 #[ignore]
 fn c13_bench_jobs() {
+    crate::prove::hal::metal::require_heavy_gpu_run("c13_bench_jobs");
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     let _guard = global_state_test_lock();
     let rounds = env_usize("C13_ROUNDS", 5);
     let caps = load_captures();
@@ -240,12 +242,14 @@ where
 
 #[test]
 fn c13_group_from_host_bit_exact_poseidon2() {
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     let _guard = global_state_test_lock();
     group_from_host_bit_exact(MetalHalPoseidon2::new);
 }
 
 #[test]
 fn c13_group_from_host_bit_exact_p254() {
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     let _guard = global_state_test_lock();
     group_from_host_bit_exact(MetalHalPoseidon254::new);
 }
@@ -425,11 +429,13 @@ fn fresh_prover_seal_matches_cpu(hashfn: &str, po2: usize) {
 
 #[test]
 fn c13_fresh_prover_seal_matches_cpu_poseidon2() {
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     fresh_prover_seal_matches_cpu("poseidon2", 18);
 }
 
 #[test]
 fn c13_fresh_prover_seal_matches_cpu_p254() {
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     fresh_prover_seal_matches_cpu("poseidon_254", 16);
 }
 
@@ -442,6 +448,8 @@ fn c13_fresh_prover_seal_matches_cpu_p254() {
 #[test]
 #[ignore]
 fn c13_ab_jobs_in_process() {
+    crate::prove::hal::metal::require_heavy_gpu_run("c13_ab_jobs_in_process");
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     use crate::prove::ctrl_persist::{set_test_mode, Mode};
     let _guard = global_state_test_lock();
     let pairs = env_usize("C13_PAIRS", 7);
@@ -520,6 +528,8 @@ fn c13_ab_jobs_in_process() {
 #[test]
 #[ignore]
 fn c13_ab_uint4_in_process() {
+    crate::prove::hal::metal::require_heavy_gpu_run("c13_ab_uint4_in_process");
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     use super::eval_check::test_override::with_variant;
     let _guard = global_state_test_lock();
     let reps = env_usize("C13_REPS", 8);

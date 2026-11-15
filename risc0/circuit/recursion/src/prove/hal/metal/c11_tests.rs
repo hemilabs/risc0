@@ -48,6 +48,8 @@ fn median(v: &mut [f64]) -> f64 {
 #[test]
 #[ignore]
 fn c11_bench_proofs() {
+    crate::prove::hal::metal::require_heavy_gpu_run("c11_bench_proofs");
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     let _guard = global_state_test_lock();
     let hashfn = std::env::var("C11_HASHFN").unwrap_or_else(|_| "poseidon2".into());
     let zkr = std::env::var("C11_ZKR").unwrap_or_else(|_| "test_recursion_circuit.zkr".into());
@@ -138,6 +140,8 @@ fn replay_preflight(c: &capture::Capture) -> Option<Preflight> {
 #[test]
 #[ignore]
 fn c11_bench_captures() {
+    crate::prove::hal::metal::require_heavy_gpu_run("c11_bench_captures");
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     let _guard = global_state_test_lock();
     let reps = env_usize("C11_REPS", 5);
     let caps = load_captures();
@@ -209,6 +213,8 @@ fn c11_bench_captures() {
 #[test]
 #[ignore]
 fn c11_captures_seal_match_cpu() {
+    crate::prove::hal::metal::require_heavy_gpu_run("c11_captures_seal_match_cpu");
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     let _guard = global_state_test_lock();
     for (name, c) in load_captures() {
         let metal = metal_recursion_prover(&c.hashfn).unwrap();
@@ -243,16 +249,19 @@ pub(crate) fn seal_matches_cpu(hashfn: &str, po2: usize) {
 
 #[test]
 fn c11_seal_matches_cpu_poseidon2_po2_16() {
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     seal_matches_cpu("poseidon2", 16);
 }
 
 #[test]
 fn c11_seal_matches_cpu_poseidon2_po2_18() {
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     seal_matches_cpu("poseidon2", 18);
 }
 
 #[test]
 fn c11_seal_matches_cpu_sha256_po2_16() {
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     seal_matches_cpu("sha-256", 16);
 }
 
@@ -262,6 +271,8 @@ fn c11_seal_matches_cpu_sha256_po2_16() {
 #[test]
 #[ignore]
 fn c11_pso_times() {
+    crate::prove::hal::metal::require_heavy_gpu_run("c11_pso_times");
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     let _guard = global_state_test_lock();
     let device = metal::Device::system_default().unwrap();
     let base: Vec<&str> = METAL_KERNEL_NAMES
@@ -315,6 +326,8 @@ fn c11_pso_times() {
 #[test]
 #[ignore]
 fn c11_eval_tg_sweep() {
+    crate::prove::hal::metal::require_heavy_gpu_run("c11_eval_tg_sweep");
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     use risc0_zkp::{
         core::log2_ceil,
         field::{baby_bear::BabyBearElem, map_pow, Elem as _, ExtElem as _, RootsOfUnity as _},
@@ -399,11 +412,13 @@ fn c11_eval_tg_sweep() {
 
 #[test]
 fn c11_row_passes_seal_matches_cpu_po2_16() {
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     witgen::with_row_passes(true, || seal_matches_cpu("poseidon2", 16));
 }
 
 #[test]
 fn c11_row_passes_seal_matches_cpu_po2_18() {
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     witgen::with_row_passes(true, || seal_matches_cpu("poseidon2", 18));
 }
 

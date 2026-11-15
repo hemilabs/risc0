@@ -44,18 +44,21 @@ const MAGIC: u32 = 0x5243_4331; // "RCC1"
 
 static SEQ: AtomicUsize = AtomicUsize::new(0);
 
+/// A captured preflight trace: `(wom, cycles, iops, output)`.
+pub(crate) type CapturedTrace = (
+    Vec<BabyBearExtElem>,
+    Vec<RawPreflightCycle>,
+    Vec<BabyBearExtElem>,
+    Vec<u32>,
+);
+
 /// A captured proof.
 pub(crate) struct Capture {
     pub hashfn: String,
     pub program: Arc<Program>,
     pub input: VecDeque<u32>,
-    /// `(wom, cycles, iops, output)` when the caller passed a prepared preflight.
-    pub trace: Option<(
-        Vec<BabyBearExtElem>,
-        Vec<RawPreflightCycle>,
-        Vec<BabyBearExtElem>,
-        Vec<u32>,
-    )>,
+    /// The trace when the caller passed a prepared preflight.
+    pub trace: Option<CapturedTrace>,
 }
 
 impl Capture {

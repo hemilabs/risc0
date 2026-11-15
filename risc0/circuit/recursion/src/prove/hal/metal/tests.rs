@@ -135,6 +135,7 @@ fn metallib_smoke() {
 /// (ZK noise); with the same seed they are identical; with different seeds they differ.
 #[test]
 fn noise_seed_controls_the_seal() {
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     let _guard = crate::prove::hal::metal::global_state_test_lock();
     let program = get_zkr("test_recursion_circuit.zkr", 16).unwrap();
     let cpu = crate::prove::hal::cpu::recursion_prover("poseidon2").unwrap();
@@ -188,22 +189,26 @@ fn seal_matches_cpu(hashfn: &str, po2: usize) {
 
 #[test]
 fn seal_matches_cpu_poseidon2_po2_16() {
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     seal_matches_cpu("poseidon2", 16);
 }
 
 #[test]
 fn seal_matches_cpu_poseidon2_po2_18() {
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     seal_matches_cpu("poseidon2", 18); // zkvm RECURSION_PO2: the lift/join shape
 }
 
 #[test]
 fn seal_matches_cpu_sha256_po2_16() {
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     seal_matches_cpu("sha-256", 16);
 }
 
 /// A seal mismatch is reported (not vacuous): the "CPU" side proves with another seed.
 #[test]
 fn seal_check_detects_a_difference() {
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     let _guard = crate::prove::hal::metal::global_state_test_lock();
     struct Reseeded(Box<dyn RecursionProver>);
     impl RecursionProver for Reseeded {
@@ -280,6 +285,7 @@ fn cpu_witgen_keeps_trace() {
 /// `test_recursion_host_chains_check` ignored on Metal.
 #[test]
 fn p254_cpu_fallback_with_host_chains_check() {
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     let _guard = crate::prove::hal::metal::global_state_test_lock();
     for hashfn in ["poseidon_254", "poseidon2"] {
         let program = get_zkr("test_recursion_circuit.zkr", 16).unwrap();
@@ -307,6 +313,8 @@ fn p254_cpu_fallback_with_host_chains_check() {
 #[test]
 #[ignore]
 fn r17_seal_repeat() {
+    crate::prove::hal::metal::require_heavy_gpu_run("r17_seal_repeat");
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
     let _guard = crate::prove::hal::metal::global_state_test_lock();
     let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
     let reps: usize = env("R17_AUDIT_REPS", "10").parse().unwrap();

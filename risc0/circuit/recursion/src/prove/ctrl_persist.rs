@@ -377,6 +377,12 @@ pub enum P254Prewarm {
 /// device has less than ~512 MiB free under its working-set limit (so a caller never pushes a
 /// small Mac's budget, e.g. while a segment prover holds its pool). `RISC0_METAL_REC_P254_PREWARM=0`
 /// turns it off.
+///
+/// The headroom and cap gates are checked before the GPU lock and again once it is held
+/// (W7-C1, LEADS2 S5): a Prove holds the lock for its whole call, so a prewarm started on a
+/// background thread during a Prove returns `Skipped("no headroom under the GPU lock: ..")`
+/// instead of committing beside that Prove's pools. `RISC0_METAL_P254_PREWARM_GATE=early`
+/// restores the pre-W7-C1 order (before the lock only).
 pub fn prewarm_p254_ctrl(po2: usize) -> anyhow::Result<P254Prewarm> {
     if std::env::var(PREWARM_ENV).is_ok_and(|v| v.trim() == "0") {
         return Ok(P254Prewarm::Skipped(format!("{PREWARM_ENV}=0")));
@@ -389,8 +395,98 @@ fn prewarm_p254_ctrl_impl(_po2: usize) -> anyhow::Result<P254Prewarm> {
     Ok(P254Prewarm::Skipped("not a Metal build".into()))
 }
 
+/// Environment variable (read per call): `early` restores the pre-W7-C1 gate order of
+/// [prewarm_p254_ctrl], which checks the device headroom and C13's cap only before taking
+/// `risc0_zkp::hal::metal::exclusive()`. Default (unset or anything else): check before the lock
+/// and again once it is held (LEADS2 S5).
+pub(crate) const PREWARM_GATE_ENV: &str = "RISC0_METAL_P254_PREWARM_GATE";
+
+/// Whether [PREWARM_GATE_ENV] asks for the pre-W7-C1 check order (the gates before the lock only).
+#[cfg(feature = "metal")]
+pub(crate) fn gate_early_only() -> bool {
+    std::env::var(PREWARM_GATE_ENV).is_ok_and(|v| v.trim().eq_ignore_ascii_case("early"))
+}
+
+/// Where [prewarm_p254_ctrl] reads the working-set limit and the device's allocation total:
+/// [risc0_zkp::hal::metal::device_memory] in production, a fake in the tests (W7-C1).
+#[cfg(feature = "metal")]
+pub(crate) trait Headroom {
+    /// `(limit, allocated)` in bytes, or `None` without a Metal device.
+    fn device_memory(&self) -> Option<(u64, u64)>;
+}
+
+#[cfg(feature = "metal")]
+pub(crate) struct MetalDeviceHeadroom;
+
+#[cfg(feature = "metal")]
+impl Headroom for MetalDeviceHeadroom {
+    fn device_memory(&self) -> Option<(u64, u64)> {
+        risc0_zkp::hal::metal::device_memory()
+    }
+}
+
+/// The gates of [prewarm_p254_ctrl] that depend on what other threads do: the group is not kept
+/// yet, the device has [PREWARM_DEVICE_BYTES] free under its working-set limit, and `bytes` fit
+/// C13's cap for that limit. `Ok(())` to go on, else the outcome to return.
+#[cfg(feature = "metal")]
+fn prewarm_gate(
+    src: &dyn Headroom,
+    hashfn: &str,
+    key: CtrlKey,
+    bytes: usize,
+    when: &str,
+) -> Result<(), P254Prewarm> {
+    if state().entries.contains_key(&(hashfn.to_string(), key)) {
+        return Err(P254Prewarm::AlreadyKept);
+    }
+    let Some((limit, allocated)) = src.device_memory() else {
+        return Err(P254Prewarm::Skipped("no Metal device".into()));
+    };
+    if allocated.saturating_add(PREWARM_DEVICE_BYTES) > limit {
+        return Err(P254Prewarm::Skipped(format!(
+            "no headroom {when}: {} MiB allocated + {} MiB > {} MiB working-set limit",
+            allocated >> 20,
+            PREWARM_DEVICE_BYTES >> 20,
+            limit >> 20
+        )));
+    }
+    let cap = cap_bytes(limit as usize);
+    if !would_keep(hashfn, key, bytes, cap) {
+        return Err(P254Prewarm::Skipped(format!(
+            "~{bytes} B would not fit the {cap} B ctrl-persist cap {when}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(feature = "metal")]
 fn prewarm_p254_ctrl_impl(po2: usize) -> anyhow::Result<P254Prewarm> {
+    prewarm_p254_ctrl_with(po2, &MetalDeviceHeadroom, gate_early_only(), |program| {
+        let prover = super::recursion_prover("poseidon_254")?;
+        prover.prewarm(program)
+        // `prover` (and its HAL) is dropped here: only the host copy stays.
+    })
+}
+
+/// [prewarm_p254_ctrl] with its headroom source, gate order and commit injected (tests).
+///
+/// The gates run before `exclusive()` is taken (cheap: no lock wait when there is clearly no
+/// room) and, unless `early_only`, again once it is held. A Prove holds `exclusive()` for its
+/// whole call (`risc0_zkvm`'s `exclusive_gpu`), so a prewarm that passed the first check while
+/// a proof was running would otherwise wake up next to that proof's segment pool (LEADS2 S5:
+/// a failed allocation at a 4 GiB budget, in the prewarm or in the next Prove). Under the lock
+/// no HAL on this process allocates, so the second check holds until the commit is done, with
+/// one exception: `prepare()` threads allocate the recursion staging buffers
+/// (`hal/metal/staging.rs`, on by default) without the lock. Those are 24-45 MB each (at most
+/// three pooled plus one per prepared proof), and each is admitted only if it leaves 512 MiB
+/// (`STAGE_MARGIN_BYTES`) under the limit, so they stay inside this gate's own 512 MiB margin.
+#[cfg(feature = "metal")]
+pub(crate) fn prewarm_p254_ctrl_with(
+    po2: usize,
+    src: &dyn Headroom,
+    early_only: bool,
+    commit: impl FnOnce(&Arc<Program>) -> anyhow::Result<()>,
+) -> anyhow::Result<P254Prewarm> {
     let hashfn = p254_suite_name();
     if !wants(hashfn) {
         return Ok(P254Prewarm::Skipped(format!(
@@ -402,20 +498,6 @@ fn prewarm_p254_ctrl_impl(po2: usize) -> anyhow::Result<P254Prewarm> {
     }
     let program = super::zkr::get_zkr("identity.zkr", po2)?;
     let key = super::ctrl_cache_key(&program);
-    if state().entries.contains_key(&(hashfn.to_string(), key)) {
-        return Ok(P254Prewarm::AlreadyKept);
-    }
-    let Some((limit, allocated)) = risc0_zkp::hal::metal::device_memory() else {
-        return Ok(P254Prewarm::Skipped("no Metal device".into()));
-    };
-    if allocated.saturating_add(PREWARM_DEVICE_BYTES) > limit {
-        return Ok(P254Prewarm::Skipped(format!(
-            "{} MiB allocated + {} MiB > {} MiB working-set limit",
-            allocated >> 20,
-            PREWARM_DEVICE_BYTES >> 20,
-            limit >> 20
-        )));
-    }
     // The bytes the kept copy will hold (coefficients, every Merkle node, the code), checked
     // against the cap before any GPU work.
     let size = 1usize << po2;
@@ -424,18 +506,21 @@ fn prewarm_p254_ctrl_impl(po2: usize) -> anyhow::Result<P254Prewarm> {
     let bytes = super::RECURSION_CODE_SIZE * size * elem
         + 2 * domain * std::mem::size_of::<risc0_zkp::core::digest::Digest>()
         + program.code.len() * elem;
-    let cap = cap_bytes(limit as usize);
-    if !would_keep(hashfn, key, bytes, cap) {
-        return Ok(P254Prewarm::Skipped(format!(
-            "~{bytes} B would not fit the {cap} B ctrl-persist cap"
-        )));
+    if let Err(outcome) = prewarm_gate(src, hashfn, key, bytes, "before the GPU lock") {
+        return Ok(outcome);
     }
+    #[cfg(test)]
+    test_hooks::EARLY_GATE_PASSED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let t0 = std::time::Instant::now();
     {
         let _gpu = risc0_zkp::hal::metal::exclusive();
-        let prover = super::recursion_prover("poseidon_254")?;
-        prover.prewarm(&program)?;
-        // `prover` (and its HAL) is dropped here: only the host copy stays.
+        if !early_only {
+            if let Err(outcome) = prewarm_gate(src, hashfn, key, bytes, "under the GPU lock") {
+                tracing::debug!("C16 p254 ctrl prewarm: {outcome:?} (re-checked under the lock)");
+                return Ok(outcome);
+            }
+        }
+        commit(&program)?;
     }
     let ms = t0.elapsed().as_secs_f64() * 1e3;
     let s = state();
@@ -446,6 +531,14 @@ fn prewarm_p254_ctrl_impl(po2: usize) -> anyhow::Result<P254Prewarm> {
         }
         None => P254Prewarm::Skipped("the group was not kept".into()),
     })
+}
+
+/// Test hooks of [prewarm_p254_ctrl_with] (W7-C1).
+#[cfg(all(test, feature = "metal"))]
+pub(crate) mod test_hooks {
+    /// Calls that passed the gate before the lock and are about to take `exclusive()`.
+    pub(crate) static EARLY_GATE_PASSED: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
 }
 
 /// Host bytes, number of groups, rebuilds and snapshots so far (tests and the bench).
