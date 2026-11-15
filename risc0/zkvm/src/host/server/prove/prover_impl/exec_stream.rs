@@ -135,6 +135,14 @@ impl SegmentRef for StreamedSegmentRef {
 /// thread-local state outside tests. Exactly one thread uses it at a time: the calling thread
 /// moves it into the proving thread before the stream and takes it back after joining that
 /// thread (`std::thread::scope`), so every access is ordered by the spawn and the join.
+///
+/// Why not a compiler-checked `Send` bound on rv32im's `SegmentProver` (item W7-V2 tried one,
+/// gated to Metal-only builds): the Metal and CPU provers are not `Send` as written, because the
+/// cached code `PolyGroup` (risc0-zkp `prove::poly_group`) holds `Option<Rc<Vec<Elem>>>` host
+/// spills (`coeffs_host`, `evaluated_host`). They stay `None` on Metal (spills are off on unified
+/// memory, `unified_memory_gpu`), and every clone of that group lives inside the prover or the
+/// segment proof it is finishing, so moving it with the prover is sound. Making those fields
+/// `Arc` in risc0-zkp would let the bound compile and this impl go.
 struct SendProver(Option<Box<dyn SegmentProver>>);
 
 unsafe impl Send for SendProver {}

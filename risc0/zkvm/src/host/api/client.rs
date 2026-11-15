@@ -210,6 +210,12 @@ impl Client {
     }
 
     /// Prove the specified keccak proof request.
+    ///
+    /// `proof_request.po2` is the size the executor asked for, which can be smaller than the
+    /// session's keccak max po2 (the smallest po2 whose circuit holds the batch, see
+    /// [crate::ProverServer::prove_keccak]); the receipt is lifted by that po2's keccak program.
+    /// Each call connects to a new server (one keccak prover each): reuse across a session's
+    /// requests applies to the in-process session path only.
     pub fn prove_keccak(
         &self,
         proof_request: crate::host::client::env::ProveKeccakRequest,

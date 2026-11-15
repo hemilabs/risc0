@@ -26,6 +26,9 @@
 //!   allocation. Uses only the public API, so it also builds against the unmodified tree (the A
 //!   arm).
 //!
+//! - `K10_SEGMENT_PO2` overrides the segment po2 of both jobs; by default a budget run uses the
+//!   worker's tier for the working-set limit (`segment_po2`), so `union:<n>` fits 4 and 8 GiB.
+//!
 //! Both are ignored (seconds to minutes, several GiB of GPU memory): run them under the machine's
 //! GPU lock.
 
@@ -52,6 +55,29 @@ fn claim_digest(po2: usize) -> Digest {
     compute_keccak_digest(bytemuck::cast_slice(&guest_inputs(po2)))
 }
 
+/// The segment po2 for this run: `K10_SEGMENT_PO2` if set, else the worker's tier for the Metal
+/// working-set limit (zk-miner `metal_sizing`, notes/M8.md: below 6 GiB po2 18, below 12 GiB
+/// po2 19), else the executor's default. Without it a budget run proves the guest at the default
+/// segment po2, which does not fit a 4 GiB budget (item W7-V2: the 4 GiB k5 po2-17 failure was a
+/// po2-19 segment on the stream thread, not the keccak proof).
+fn segment_po2() -> Option<u32> {
+    if let Ok(v) = std::env::var("K10_SEGMENT_PO2") {
+        return Some(v.trim().parse().expect("K10_SEGMENT_PO2"));
+    }
+    #[cfg(feature = "metal")]
+    if std::env::var_os("RISC0_METAL_MAX_WORKING_SET_BYTES").is_some() {
+        let (limit, _) = risc0_zkp::hal::metal::device_memory()?;
+        const GIB: u64 = 1 << 30;
+        if limit < 6 * GIB {
+            return Some(18);
+        }
+        if limit < 12 * GIB {
+            return Some(19);
+        }
+    }
+    None
+}
+
 fn env_list(name: &str, default: &str) -> Vec<usize> {
     std::env::var(name)
         .unwrap_or_else(|_| default.into())
@@ -61,13 +87,16 @@ fn env_list(name: &str, default: &str) -> Vec<usize> {
 }
 
 fn prove_small(guest_po2: usize, max_po2: usize) -> Receipt {
-    let env = ExecutorEnv::builder()
+    let mut builder = ExecutorEnv::builder();
+    builder
         .write(&(claim_digest(guest_po2), guest_po2 as u32))
         .unwrap()
         .keccak_max_po2(max_po2 as u32)
-        .unwrap()
-        .build()
         .unwrap();
+    if let Some(seg) = segment_po2() {
+        builder.segment_limit_po2(seg);
+    }
+    let env = builder.build().unwrap();
     let receipt = get_prover_server(&ProverOpts::fast())
         .unwrap()
         .prove(env, KECCAK_ELF)
@@ -78,11 +107,14 @@ fn prove_small(guest_po2: usize, max_po2: usize) -> Receipt {
 }
 
 fn prove_union(requests: usize) -> Receipt {
-    let env = ExecutorEnv::builder()
+    let mut builder = ExecutorEnv::builder();
+    builder
         .write(&MultiTestSpec::KeccakUnion(requests))
-        .unwrap()
-        .build()
         .unwrap();
+    if let Some(seg) = segment_po2() {
+        builder.segment_limit_po2(seg);
+    }
+    let env = builder.build().unwrap();
     let receipt = get_prover_server(&ProverOpts::fast())
         .unwrap()
         .prove(env, MULTI_TEST_ELF)

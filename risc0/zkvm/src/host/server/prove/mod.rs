@@ -20,12 +20,16 @@ mod prover_impl;
 #[cfg(test)]
 mod tests;
 #[cfg(all(test, feature = "metal"))]
-mod tests_metal_wrap;
-#[cfg(all(test, feature = "metal"))]
 mod tests_c16;
 #[cfg(all(test, feature = "metal"))]
+mod tests_metal_wrap;
+#[cfg(all(test, feature = "metal"))]
 mod tests_z12;
-#[cfg(all(test, feature = "metal", not(any(feature = "cuda", feature = "rocm"))))]
+#[cfg(all(
+    test,
+    feature = "metal",
+    not(any(feature = "cuda", feature = "rocm", feature = "intel"))
+))]
 mod tests_z17;
 pub(crate) mod union_peak;
 
@@ -80,6 +84,13 @@ pub trait ProverServer: private::Sealed {
     }
 
     /// Prove the specified ELF binary using the specified [VerifierContext].
+    ///
+    /// On Metal, when this process proves the keccak requests (no coprocessor callback), the
+    /// session's keccak max po2 is lowered to the largest po2 whose keccak proof fits the
+    /// working-set limit (po2 18 needs ~7 GiB, so below that it becomes 17;
+    /// `RISC0_KECCAK_PO2_HEADROOM_CAP=0` keeps it). The guest sees the smaller batch capacity:
+    /// `sys_keccak` reports a full batch sooner, and a guest that ignores that report fails
+    /// execution. [ProverServer::prove_session] gets no cap: its session was executed already.
     fn prove_with_ctx(
         &self,
         env: ExecutorEnv<'_>,
@@ -114,6 +125,16 @@ pub trait ProverServer: private::Sealed {
     ) -> Result<SegmentReceipt>;
 
     /// Prove the specified keccak request
+    ///
+    /// The request is proved at `request.po2`, which may be smaller than the session's keccak
+    /// max po2 (`ExecutorEnvBuilder::keccak_max_po2`): since K10 the executor asks for the
+    /// smallest po2 in [risc0_circuit_keccak::KECCAK_PO2_RANGE] whose circuit holds the batch
+    /// (`RISC0_KECCAK_RIGHTSIZE_PO2=0` restores the max), so a [crate::CoprocessorCallback]
+    /// sees requests of several sizes. The lifted receipt's control ID is that po2's
+    /// `KECCAK_CONTROL_IDS` entry, under `KECCAK_CONTROL_ROOT` for every po2. On Metal, at a
+    /// small working-set budget, the provers this thread cached (segment, recursion) are
+    /// released first when they leave no room for the proof (`RISC0_KECCAK_SMALL_BUDGET_RELEASE=0`
+    /// keeps them).
     fn prove_keccak(&self, request: &crate::ProveKeccakRequest)
         -> Result<SuccinctReceipt<Unknown>>;
 
