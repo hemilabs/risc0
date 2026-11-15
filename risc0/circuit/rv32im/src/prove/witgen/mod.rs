@@ -29,6 +29,14 @@ use anyhow::{Context, Result};
 
 static VERBOSE: LazyLock<bool> = LazyLock::new(|| std::env::var("RISC0_VERBOSE").is_ok());
 
+/// W7-R2: drop the data witness after `step_accum` at every po2 on unified-memory HALs, which
+/// are Metal and the CPU HAL (`CpuHal::has_unified_memory` is true), so the knob also changes
+/// CPU proofs; seals are unaffected because nothing reads the data witness after accum
+/// (`RISC0_METAL_DROP_DATA_EARLY=0`: only at po2>=22, as before, on every HAL).
+static DROP_DATA_EARLY: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("RISC0_METAL_DROP_DATA_EARLY").map_or(true, |v| v.trim() != "0")
+});
+
 /// On CUDA and ROCm the witgen kernel writes the five per-cycle columns (CYCLE_COLS) from the
 /// uploaded cycles, so the host injector leaves them out (5 of its ~5.1 entries per row at
 /// po2=20). Part of the witgen staging feature (`RISC0_CUDA_WITGEN_STAGE=0` keeps them in the
@@ -191,9 +199,16 @@ where
     }
     let zero_data = cfg!(feature = "cuda") || circuit_hal.takes_zeroed_data();
     let data_init = if zero_data { Val::ZERO } else { Val::INVALID };
-    hal.prefill_elem(cycles * REGCOUNT_DATA, data_init);
-    hal.prefill_elem(cycles * REGCOUNT_ACCUM, Val::INVALID);
+    // W7-R2: what the rest of this segment (eval_check, the check commit, FRI) still allocates
+    // after this point, so a budget-aware HAL keeps set-aside buffers out of its way.
+    let need = cycles * FINALIZE_BYTES_PER_CYCLE;
+    hal.prefill_elem_within(cycles * REGCOUNT_DATA, data_init, need);
+    hal.prefill_elem_within(cycles * REGCOUNT_ACCUM, Val::INVALID, need);
 }
+
+/// W7-R2: bytes per cycle the segment prover allocates after its witgen buffers are freed
+/// (eval_check's check polynomial, the check group's LDE and Merkle tree, FRI), with margin.
+const FINALIZE_BYTES_PER_CYCLE: usize = 1024;
 
 impl<H> WitnessGenerator<H>
 where
@@ -507,15 +522,72 @@ where
             );
         }
 
-        // At po2>=22, drop witgen.data right after step_accum reads it.
-        // Frees 3.4 GB that's otherwise live through commit_group(ACCUM)
-        // and eval_check. No other path reads it on the current HAL.
-        if self.cycles >= (1 << 22) {
+        // Drop witgen.data right after step_accum reads it: nothing reads it later (the data
+        // group holds its own coefficients and LDE). At po2>=22 this frees 3.4 GB that is
+        // otherwise live through commit_group(ACCUM) and eval_check. W7-R2: on unified-memory
+        // HALs (Metal and CPU) at every po2: 221 / 442 / 885 MB at po2 18 / 19 / 20, which is what the
+        // 4 GiB (po2 19) and 8 GiB (po2 20) budgets refuse in commit_group(ACCUM). On Metal the
+        // buffer returns to the pool (the next segment's prefill can still take it; a budget
+        // drain can release it). `RISC0_METAL_DROP_DATA_EARLY=0`: only at po2>=22.
+        if self.cycles >= (1 << 22) || (hal.has_unified_memory() && *DROP_DATA_EARLY) {
             self.data = None;
+        }
+
+        // W7-R2 step 3(a): when the separate coefficient buffer of the accum commit would not
+        // fit ([accum_in_place]), give the accum witness up to that commit, which then turns it
+        // into the group's coefficients in place. Nothing reads `self.accum` as the witness
+        // after the commit (the prover drops the witness generator right after it).
+        if accum_in_place(hal, self.cycles) {
+            hal.donate_to_commit(&self.accum.as_ref().unwrap().buf);
         }
 
         Ok(mix)
     }
+}
+
+/// W7-R2 step 2 (`RISC0_METAL_ACCUM_IN_PLACE`): `0` never, `1` always on unified-memory GPU
+/// HALs, default `auto`: on those when the planned live set of the accum commit
+/// ([accum_commit_plan]) exceeds the working-set limit less a safety fraction.
+fn accum_in_place<H: Hal>(hal: &H, cycles: usize) -> bool {
+    static MODE: LazyLock<u8> = LazyLock::new(|| {
+        match std::env::var("RISC0_METAL_ACCUM_IN_PLACE")
+            .as_deref()
+            .map(str::trim)
+        {
+            Ok("0") => 0,
+            Ok("1") => 1,
+            _ => 2,
+        }
+    });
+    let unified_gpu = hal.has_unified_memory() && hal.gpu_total_memory() != usize::MAX;
+    match *MODE {
+        0 => false,
+        1 => unified_gpu,
+        _ => {
+            unified_gpu
+                && accum_commit_plan(cycles) as f64
+                    > hal.gpu_total_memory() as f64 * (1.0 - ACCUM_IN_PLACE_MARGIN)
+        }
+    }
+}
+
+/// W7-R2: the share of the working-set limit kept free beyond [accum_commit_plan] (pipelines,
+/// small buffers, pooled buffers still bound by in-flight command buffers, fragmentation).
+const ACCUM_IN_PLACE_MARGIN: f64 = 0.15;
+
+/// W7-R2: the bytes live at the accum commit's peak with the data witness dropped
+/// (`RISC0_METAL_DROP_DATA_EARLY`) and a separate coefficient buffer: the code, data and accum
+/// groups (coefficients, INV_RATE LDE, Merkle nodes of 2 x domain digests) and the accum
+/// witness.
+fn accum_commit_plan(cycles: usize) -> usize {
+    use risc0_zkp::INV_RATE;
+    let elem = std::mem::size_of::<Val>();
+    let nodes = 2 * INV_RATE * cycles * std::mem::size_of::<risc0_zkp::core::digest::Digest>();
+    let group = |cols: usize| cols * cycles * elem * (1 + INV_RATE) + nodes;
+    group(REGCOUNT_CODE)
+        + group(REGCOUNT_DATA)
+        + group(REGCOUNT_ACCUM)
+        + REGCOUNT_ACCUM * cycles * elem
 }
 
 /// Serial preflight post-processing on the preflight thread (RISC0_CUDA_SERIAL_PREFLIGHT=0

@@ -74,13 +74,17 @@ impl<H: Hal> ProveRoundInfo<H> {
     }
 }
 
+/// Query openings of a set of Merkle trees: per tree (or per query), the opened rows and their
+/// authentication paths.
+pub type TreeOpenings<E> = Vec<Vec<(Vec<E>, Vec<Digest>)>>;
+
 pub fn fri_prove<H: Hal, F>(
     hal: &H,
     iop: &mut WriteIOP<H::Field>,
     coeffs: &H::Buffer<H::Elem>,
     inner: F,
 ) where
-    F: Fn(&[usize]) -> Vec<Vec<(Vec<H::Elem>, Vec<Digest>)>>,
+    F: Fn(&[usize]) -> TreeOpenings<H::Elem>,
 {
     scope!("fri_prove");
     let ext_size = H::ExtElem::EXT_SIZE;
@@ -130,8 +134,7 @@ pub fn fri_prove<H: Hal, F>(
         .zip(&round_groups)
         .map(|(round, groups)| (&round.merkle, groups.as_slice()))
         .collect();
-    let round_results: Vec<Vec<(Vec<H::Elem>, Vec<Digest>)>> =
-        MerkleTreeProver::batch_prove_many(hal, &round_jobs);
+    let round_results: TreeOpenings<H::Elem> = MerkleTreeProver::batch_prove_many(hal, &round_jobs);
 
     // Write to IOP in correct query-major order (matching verifier's read order)
     for q in 0..QUERIES {

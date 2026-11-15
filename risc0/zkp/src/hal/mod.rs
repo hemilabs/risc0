@@ -128,6 +128,13 @@ pub trait Hal {
     /// then. The default does nothing.
     fn prefill_elem(&self, _size: usize, _value: Self::Elem) {}
 
+    /// [Self::prefill_elem] from a caller that knows its next phase will still allocate about
+    /// `need` bytes before the buffer is taken (W7-R2): a HAL that sets aside memory may keep
+    /// it only within the headroom left after that phase. The default ignores `need`.
+    fn prefill_elem_within(&self, size: usize, value: Self::Elem, _need: usize) {
+        self.prefill_elem(size, value)
+    }
+
     fn alloc_extelem_zeroed(&self, name: &'static str, size: usize) -> Self::Buffer<Self::ExtElem> {
         let buffer = self.alloc_extelem(name, size);
         buffer.view_mut(|slice| {
@@ -223,6 +230,44 @@ pub trait Hal {
     ) {
         self.commit_coeffs_lde(coeffs, evaluated, witness, count);
         self.batch_bit_reverse(coeffs, count);
+    }
+
+    /// W7-R2: the caller owns `witness` and will not read it again after its next
+    /// `Prover::commit_group`, which may then commit it in place (the witness becomes the group's
+    /// coefficient buffer; see [Self::commit_coeffs_lde_in_place]). Only the buffer donated last
+    /// is remembered. The default ignores it (every commit allocates its own coefficients).
+    fn donate_to_commit(&self, _witness: &Self::Buffer<Self::Elem>) {}
+
+    /// W7-R2: whether `witness` is the buffer donated by [Self::donate_to_commit]; a match
+    /// consumes the donation. The default: never.
+    fn take_commit_donation(&self, _witness: &Self::Buffer<Self::Elem>) -> bool {
+        false
+    }
+
+    /// W7-R2: commit `io` in place: `io` holds the witness on entry and its zk-shifted
+    /// coefficients on exit, `evaluated` gets the INV_RATE LDE. With `bit_reversed` the
+    /// coefficients stay in bit-reversed order (as [Self::commit_coeffs_lde_bit_reversed]
+    /// leaves them), else natural order (as [Self::commit_coeffs_lde]). Saves the separate
+    /// coefficient buffer (the witness's size). The default runs the unfused steps
+    /// (`make_coeffs` + `PolyGroup::new`): inverse NTT with zk shift in place, expand + NTT,
+    /// bit reversal; every HAL computes the same values either way.
+    fn commit_coeffs_lde_in_place(
+        &self,
+        io: &Self::Buffer<Self::Elem>,
+        evaluated: &Self::Buffer<Self::Elem>,
+        count: usize,
+        bit_reversed: bool,
+    ) {
+        self.batch_interpolate_ntt_zk_shift(io, count);
+        self.batch_expand_into_evaluate_ntt(
+            evaluated,
+            io,
+            count,
+            crate::core::log2_ceil(crate::INV_RATE),
+        );
+        if !bit_reversed {
+            self.batch_bit_reverse(io, count);
+        }
     }
 
     /// `dst = interpolate_zk_shift(src)`, leaving `src` unchanged.
