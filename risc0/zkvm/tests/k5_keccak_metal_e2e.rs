@@ -19,6 +19,8 @@
 //! receipt verifies against the guest image (which checks the assumption against
 //! `KECCAK_CONTROL_ROOT`). Ignored by default (minutes per po2):
 //!
+//! `K5_SEGMENT_PO2` overrides the segment po2 (see `segment_po2`).
+//!
 //! `K5_E2E_PO2S=14,15,16,17,18 cargo test -p risc0-zkvm --release --features metal --test k5_keccak_metal_e2e -- --ignored --nocapture`
 
 #![cfg(feature = "prove")]
@@ -43,6 +45,29 @@ fn guest_inputs(po2: usize) -> Vec<KeccakState> {
 
 fn claim_digest(po2: usize) -> Digest {
     compute_keccak_digest(bytemuck::cast_slice(&guest_inputs(po2)))
+}
+
+/// The segment po2 for this run: `K5_SEGMENT_PO2` if set, else the worker's tier for the Metal
+/// working-set limit (zk-miner `metal_sizing`, notes/M8.md: below 6 GiB po2 18, below 12 GiB
+/// po2 19), else the executor's default. Without it a budget run proves the guest at the default
+/// segment po2, which does not fit a 4 GiB budget (item W7-V2: the 4 GiB k5 po2-17 failure was a
+/// po2-19 segment on the stream thread, not the keccak proof).
+fn segment_po2() -> Option<u32> {
+    if let Ok(v) = std::env::var("K5_SEGMENT_PO2") {
+        return Some(v.trim().parse().expect("K5_SEGMENT_PO2"));
+    }
+    #[cfg(feature = "metal")]
+    if std::env::var_os("RISC0_METAL_MAX_WORKING_SET_BYTES").is_some() {
+        let (limit, _) = risc0_zkp::hal::metal::device_memory()?;
+        const GIB: u64 = 1 << 30;
+        if limit < 6 * GIB {
+            return Some(18);
+        }
+        if limit < 12 * GIB {
+            return Some(19);
+        }
+    }
+    None
 }
 
 /// The host-side claim digest reproduces `tests/keccak.rs`'s constants.
@@ -77,14 +102,28 @@ fn keccak_e2e_po2_range() {
     let prover = get_prover_server(&ProverOpts::fast()).unwrap();
     for po2 in po2s {
         assert!(KECCAK_PO2_RANGE.contains(&po2), "po2 {po2}");
+        // This guest asks for one proof of the whole batch, so it cannot run under W7-V2's keccak
+        // po2 cap (risc0-zkvm `prove::keccak::headroom_max_po2`): po2 18 needs ~7084 MiB of
+        // working set (17 fits 4 GiB). Skipped, not failed, below that.
+        #[cfg(feature = "metal")]
+        if po2 == 18
+            && std::env::var("RISC0_KECCAK_PO2_HEADROOM_CAP").map_or(true, |v| v.trim() != "0")
+            && risc0_zkp::hal::metal::device_memory().is_some_and(|(limit, _)| limit < 7084 << 20)
+        {
+            println!("K5 e2e keccak po2 18: SKIPPED (the working-set limit is below ~7084 MiB)");
+            continue;
+        }
         let claim = claim_digest(po2);
-        let env = ExecutorEnv::builder()
+        let mut builder = ExecutorEnv::builder();
+        builder
             .write(&(claim, po2 as u32))
             .unwrap()
             .keccak_max_po2(po2 as u32)
-            .unwrap()
-            .build()
             .unwrap();
+        if let Some(seg) = segment_po2() {
+            builder.segment_limit_po2(seg);
+        }
+        let env = builder.build().unwrap();
         let t0 = std::time::Instant::now();
         let receipt = prover.prove(env, KECCAK_ELF).unwrap().receipt;
         let elapsed = t0.elapsed();

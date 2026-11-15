@@ -24,7 +24,15 @@ use super::{
 };
 use risc0_circuit_rv32im::prove::SegmentProver;
 
-#[cfg(all(feature = "metal", not(any(feature = "cuda", feature = "rocm"))))]
+// Gated like the plain-RefCell segment-prover slot below (item W7-V2): with `intel` (or `cuda`,
+// `rocm`) beside `metal`, `segment_prover()` returns that backend's prover, not the Metal one
+// `exec_stream` is written for (and lends to its thread), and the slot is the ManuallyDrop one.
+// Today the combination cannot be built at all (risc0-sys's build script rejects `metal` with
+// `cuda`, `rocm` or `intel`), so this only keeps the two gates from drifting apart.
+#[cfg(all(
+    feature = "metal",
+    not(any(feature = "cuda", feature = "rocm", feature = "intel"))
+))]
 pub(crate) mod exec_stream;
 
 thread_local! {
@@ -1384,7 +1392,9 @@ impl ProverImpl {
         // for the Groth16 wrap. Without this, the first keccak proof after the segments ran out of
         // memory on an RTX 5080 (16 GB) and on an RTX 4090 limited to 12 GB.
         if !session.pending_keccaks.is_empty() {
+            super::keccak::device_memory_at("keccak start");
             super::release_hal_buffers();
+            super::keccak::device_memory_at("keccak start, after release_hal_buffers");
         }
 
         let t_keccaks = std::time::Instant::now();
@@ -1740,8 +1750,20 @@ impl ProverServer for ProverImpl {
                 env.segment_limit_po2 = Some(po2.min(self.opts.max_segment_po2 as u32));
             }
         }
+        // Item W7-V2: a keccak max po2 whose proofs cannot fit the Metal working-set limit is
+        // capped (po2 18 below ~7 GiB; RISC0_KECCAK_PO2_HEADROOM_CAP=0 reverts). Not with a
+        // coprocessor callback: its proofs may run elsewhere, and it gets the caller's po2s.
+        #[cfg(feature = "metal")]
+        if env.coprocessor.is_none() {
+            if let Some(po2) = super::keccak::headroom_capped_max_po2(env.keccak_max_po2) {
+                env.keccak_max_po2 = Some(po2);
+            }
+        }
         // Item Z17: prove the segments while the guest executes (RISC0_METAL_EXEC_STREAM=0 reverts).
-        #[cfg(all(feature = "metal", not(any(feature = "cuda", feature = "rocm"))))]
+        #[cfg(all(
+            feature = "metal",
+            not(any(feature = "cuda", feature = "rocm", feature = "intel"))
+        ))]
         match exec_stream::eligible(&self.opts, &env) {
             Ok(()) => return self.prove_streamed(ctx, env, elf),
             Err(reason) => tracing::debug!("exec stream off: {reason}"),
