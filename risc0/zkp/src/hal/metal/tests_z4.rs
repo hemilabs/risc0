@@ -493,6 +493,7 @@ fn time_per_call(metal: &MetalHalSha256, reps: u32, mut f: impl FnMut()) -> f64 
 #[test]
 #[ignore = "timing run: cargo test ... tests_z4::z4_timings -- --ignored --nocapture"]
 fn z4_timings() {
+    crate::hal::metal::require_gpu_run();
     let mut rng = rng(900);
     let metal = MetalHalSha256::new();
     let reps = 20;

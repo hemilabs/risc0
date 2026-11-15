@@ -293,6 +293,7 @@ fn for_shapes(mut f: impl FnMut(usize, usize)) {
 
 #[test]
 fn ntt_expand_into_evaluate_lg_1_20() {
+    let _heavy = super::heavy_test_lock();
     for_shapes(|lg, cols| {
         let (lg_in, _) = expand_shape(lg);
         let input = vec![random_vec(cols << lg_in)];
@@ -304,6 +305,7 @@ fn ntt_expand_into_evaluate_lg_1_20() {
 
 #[test]
 fn ntt_interpolate_lg_1_20() {
+    let _heavy = super::heavy_test_lock();
     for_shapes(|lg, cols| {
         let io = vec![random_vec(cols << lg)];
         two_way("interpolate", lg, cols, &io, |r, i| {
@@ -314,6 +316,7 @@ fn ntt_interpolate_lg_1_20() {
 
 #[test]
 fn ntt_interpolate_zk_shift_lg_1_20() {
+    let _heavy = super::heavy_test_lock();
     for_shapes(|lg, cols| {
         let io = vec![random_vec(cols << lg)];
         two_way("interpolate_zk", lg, cols, &io, |r, i| {
@@ -322,9 +325,30 @@ fn ntt_interpolate_zk_shift_lg_1_20() {
     });
 }
 
+/// batch_interpolate_ntt_zk_shift_from over lg 1..20. 211 columns stop at lg 16: at lg 17..20
+/// this test alone peaked at 10.8 GB (source and destination on both HALs plus host copies), the
+/// largest of the suite. The full range is the ignored
+/// `ntt_interpolate_zk_shift_from_lg_1_20_full` (run it alone, under the heavy GPU lock); narrow
+/// columns still go to lg 20, and `ntt_large_po2_22` covers lg 22.
 #[test]
 fn ntt_interpolate_zk_shift_from_lg_1_20() {
+    zk_shift_from_range(16);
+}
+
+/// [ntt_interpolate_zk_shift_from_lg_1_20] with 211 columns up to lg 20 (10.8 GB).
+#[test]
+#[ignore]
+fn ntt_interpolate_zk_shift_from_lg_1_20_full() {
+    crate::hal::metal::require_gpu_run();
+    let _heavy = super::heavy_test_lock();
+    zk_shift_from_range(20);
+}
+
+fn zk_shift_from_range(max_lg_wide: usize) {
     for_shapes(|lg, cols| {
+        if cols == 211 && lg > max_lg_wide {
+            return;
+        }
         let io = vec![random_vec(cols << lg)];
         two_way("interpolate_zk_from", lg, cols, &io, |r, i| {
             let (dst, src) = r.interpolate_zk_from(&i[0], cols);
@@ -336,6 +360,7 @@ fn ntt_interpolate_zk_shift_from_lg_1_20() {
 
 #[test]
 fn ntt_zk_shift_lg_1_20() {
+    let _heavy = super::heavy_test_lock();
     for_shapes(|lg, cols| {
         let io = vec![random_vec(cols << lg)];
         two_way("zk_shift", lg, cols, &io, |r, i| {
@@ -346,6 +371,7 @@ fn ntt_zk_shift_lg_1_20() {
 
 #[test]
 fn ntt_bit_reverse_lg_1_20() {
+    let _heavy = super::heavy_test_lock();
     for_shapes(|lg, cols| {
         let io = vec![random_vec(cols << lg)];
         two_way("bit_reverse", lg, cols, &io, |r, i| {
@@ -359,6 +385,7 @@ fn ntt_bit_reverse_lg_1_20() {
 /// zero padding, no skip).
 #[test]
 fn ntt_expand_ratios_lg_1_20() {
+    let _heavy = super::heavy_test_lock();
     for e in [0usize, 1, 3, 5, 6, 7] {
         for cols in COLS {
             for lg in e.max(1)..=20 {
@@ -387,6 +414,8 @@ fn ntt_commit_coeffs_lde_lg_10_20() {
 #[test]
 #[ignore]
 fn ntt_commit_coeffs_lde_lg_10_20_full() {
+    crate::hal::metal::require_gpu_run();
+    let _heavy = super::heavy_test_lock();
     commit_coeffs_lde_range(20);
 }
 
@@ -445,6 +474,8 @@ fn batch_expand_into_evaluate_ntt_large() {
 /// The 13 CUDA shapes, including po2 22.
 #[test]
 fn commit_coeffs_lde() {
+    // 2.2 GB (W7-A1).
+    let _heavy = super::heavy_test_lock();
     testutil::commit_coeffs_lde(new_hal());
 }
 
@@ -489,6 +520,7 @@ fn time_ms(hal: &MetalHalSha256, reps: usize, mut f: impl FnMut()) -> f64 {
 #[test]
 #[ignore]
 fn ntt_timings() {
+    crate::hal::metal::require_gpu_run();
     let hal = new_hal();
     for (lg, cols) in [(16usize, 211usize), (20, 211), (20, 9), (21, 3)] {
         let n = cols << lg;

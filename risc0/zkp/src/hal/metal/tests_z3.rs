@@ -312,6 +312,7 @@ fn reps_for(perms: usize) -> usize {
 #[test]
 #[ignore]
 fn bench_fold_kernels() {
+    crate::hal::metal::require_gpu_run();
     let hal = MetalHalPoseidon2::new();
     let mut rng = rng(7);
     println!("fold n | pv | pv_m32 | pvs_w | pvs_w_m32 | pvs_q | pvs_q_m32 (us per dispatch)");
@@ -336,6 +337,7 @@ fn bench_fold_kernels() {
 #[test]
 #[ignore]
 fn bench_rows_kernels() {
+    crate::hal::metal::require_gpu_run();
     let hal = MetalHalPoseidon2::new();
     let mut rng = rng(8);
     for cols in [16usize, 211] {
@@ -377,6 +379,7 @@ fn bench_rows_kernels() {
 #[test]
 #[ignore]
 fn bench_fold_tree() {
+    crate::hal::metal::require_gpu_run();
     let d = Poseidon2Config::default();
     let mut rng = rng(9);
     let cfgs = [
@@ -422,6 +425,7 @@ fn bench_fold_tree() {
 #[test]
 #[ignore]
 fn bench_hal_entry_points() {
+    crate::hal::metal::require_gpu_run();
     let hal = MetalHalPoseidon2::new();
     let mut rng = rng(10);
     for (rows, cols) in [

@@ -234,6 +234,7 @@ fn fill_random(buf: &super::BufferImpl<Fp>, seed: u64) {
 #[test]
 #[ignore = "measurement: run alone with --release --ignored --nocapture"]
 fn z14_commit_ab() {
+    crate::hal::metal::require_gpu_run();
     use super::{tests_z13::ab_gpu, tests_z9::env_or};
     let _lock = super::gpu_test_lock();
     let pairs: usize = env_or("Z9_PAIRS", 7);
@@ -416,6 +417,7 @@ fn z14_commit_ab() {
 #[test]
 #[ignore = "measurement: run alone with --release --ignored --nocapture"]
 fn z14_tg_probe() {
+    crate::hal::metal::require_gpu_run();
     use super::{tests_z13::ab_gpu, tests_z9::env_or};
     let _lock = super::gpu_test_lock();
     let pairs: usize = env_or("Z9_PAIRS", 7);

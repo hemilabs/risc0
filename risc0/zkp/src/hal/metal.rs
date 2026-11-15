@@ -44,7 +44,21 @@ mod small;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_a1;
+#[cfg(test)]
+mod tests_r17;
+#[cfg(test)]
 mod tests_z1;
+#[cfg(test)]
+mod tests_z10;
+#[cfg(test)]
+mod tests_z13;
+#[cfg(test)]
+mod tests_z14;
+#[cfg(test)]
+mod tests_z15;
+#[cfg(test)]
+mod tests_z16;
 #[cfg(test)]
 mod tests_z2;
 #[cfg(test)]
@@ -58,19 +72,7 @@ mod tests_z7;
 #[cfg(test)]
 mod tests_z8b;
 #[cfg(test)]
-mod tests_r17;
-#[cfg(test)]
 mod tests_z9;
-#[cfg(test)]
-mod tests_z15;
-#[cfg(test)]
-mod tests_z10;
-#[cfg(test)]
-mod tests_z13;
-#[cfg(test)]
-mod tests_z14;
-#[cfg(test)]
-mod tests_z16;
 
 use std::{
     fmt::Debug,
@@ -93,6 +95,16 @@ use risc0_core::{
 };
 
 use self::runtime::Runtime;
+pub use self::runtime::{
+    drain_idle_pools, pool_counters, pool_report, register_idle_releaser, system_gpu_committed,
+    system_gpu_in_use, IdleReleaserHandle, PoolCounters, DEFAULT_POOL_STALE_BATCHES,
+    POOL_GLOBAL_ENV, POOL_STALE_BATCHES_ENV, POOL_TRACE_ENV, PRESSURE_CRITICAL, PRESSURE_DRAIN_ENV,
+    PRESSURE_NORMAL, PRESSURE_WARN, PURGE_ON_FREE_ENV, SYSTEM_CHECK_ENV, SYSTEM_CHECK_MIN_BYTES,
+};
+pub use self::runtime::{
+    profile_report, profile_take, register_pso_name, sync_trace_take, ProfileEntry, SyncRecord,
+    PROFILE_ENV, SYNC_TRACE_ENV,
+};
 pub use self::{
     buffer::BufferImpl,
     kernels::{MetalKernels, ZKP_ARCHIVE_ENV, ZKP_ARCHIVE_UNIT},
@@ -102,10 +114,6 @@ pub use self::{
         as_bytes, BudgetScope, Grid, KernelArg, BUDGET_SCOPE_ENV, DEFAULT_BATCH_DISPATCHES,
         MAX_SET_BYTES, MAX_WORKING_SET_ENV,
     },
-};
-pub use self::runtime::{
-    profile_report, profile_take, register_pso_name, sync_trace_take, ProfileEntry, SyncRecord,
-    PROFILE_ENV, SYNC_TRACE_ENV,
 };
 use super::{Buffer as _, Hal};
 use crate::{
@@ -278,6 +286,26 @@ pub fn exclusive() -> ReentrantMutexGuard<'static, ()> {
 pub(crate) fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Test-only lock taken by every test whose working set exceeds ~2 GiB (W7-A1, plan 8.7): the
+/// heavy tests run one at a time beside the light ones, so the suite passes under the default
+/// parallel harness without exhausting a 36 GB Mac. Take it before [gpu_test_lock] when a test
+/// needs both. Poison-tolerant.
+#[cfg(test)]
+pub(crate) fn heavy_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Ignored heavy tests and probes call this first: they must run alone under the machine's GPU
+/// admission lock (`/Users/user/zkminer/bin/gpu-run`, which exports `GPU_RUN_MODE`).
+#[cfg(test)]
+pub(crate) fn require_gpu_run() {
+    assert!(
+        std::env::var_os("GPU_RUN_MODE").is_some(),
+        "run under bin/gpu-run: this ignored test is heavy and needs the machine-wide GPU lock"
+    );
 }
 
 /// The zkp PSOs, built once per process.
@@ -704,7 +732,8 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
             return;
         }
         let max = self.rt.working_set_limit() / 8;
-        self.rt.prefill_reserve(bytes, value.as_u32_montgomery(), max);
+        self.rt
+            .prefill_reserve(bytes, value.as_u32_montgomery(), max);
     }
 
     fn alloc_extelem_zeroed(&self, name: &'static str, size: usize) -> Self::Buffer<Self::ExtElem> {
@@ -771,6 +800,8 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
         src: &Self::Buffer<Self::Elem>,
         count: usize,
     ) {
+        // W7-A1: the commit domain marks the pool's po2 epoch.
+        self.rt.note_domain(src.size() / count.max(1));
         self.ntt_batch_interpolate_zk_shift_from(dst, src, count);
     }
 
@@ -785,6 +816,8 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
         witness: &Self::Buffer<Self::Elem>,
         count: usize,
     ) {
+        // W7-A1: the commit domain marks the pool's po2 epoch.
+        self.rt.note_domain(witness.size() / count.max(1));
         self.ntt_commit_coeffs_lde(coeffs, evaluated, witness, count);
     }
 
@@ -945,6 +978,8 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
         witness: &Self::Buffer<Self::Elem>,
         count: usize,
     ) {
+        // W7-A1: the commit domain marks the pool's po2 epoch.
+        self.rt.note_domain(witness.size() / count.max(1));
         self.ntt_commit_coeffs_lde_impl(coeffs, evaluated, witness, count, false);
     }
 
