@@ -18,7 +18,7 @@ use std::{cell::Cell, rc::Rc, sync::Arc, time::Instant};
 
 use rand::Rng;
 use risc0_binfmt::{MemoryImage, Program};
-use risc0_core::field::Elem as _;
+use risc0_core::field::{baby_bear::P as BABY_BEAR_P, Elem as _};
 use risc0_zkp::{
     adapter::CircuitInfo as _,
     core::hash::poseidon2::Poseidon2HashSuite,
@@ -413,6 +413,336 @@ fn accum_matches_cpu() {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// P31-06: canonical LogUp finalize (upstream dfc7d5728) with prev[k] == 0
+// ---------------------------------------------------------------------------------------------
+
+/// Dispatches `finalizeZeroizeAccum` over `accum` (`rows` x `cols`, column-major) exactly as
+/// [MetalCircuitHal::step_accum_metal]'s step 4 does, and waits.
+fn finalize_metal(
+    hal: &MetalHalPoseidon2,
+    circuit_hal: &MetalCircuitHalPoseidon2,
+    accum: &BufferImpl<Val>,
+    rows: usize,
+    cols: usize,
+    last_cycle: usize,
+) {
+    let fin = FinalizeAccumParams {
+        rows: rows as u32,
+        cols: cols as u32,
+        last_cycle: last_cycle as u32,
+        user_accum_split: user_accum_split(),
+    };
+    hal.dispatch(
+        circuit_hal.ctx().pipeline("finalizeZeroizeAccum"),
+        &[accum.as_arg(), KernelArg::Bytes(as_bytes(&[fin]))],
+        Grid::Threads(rows as u64),
+        &[],
+    );
+    hal.sync();
+}
+
+/// `risc0_circuit_rv32im_cpu_accum` phase 3 of 3.1 (rv32im-sys kernels/cxx/ffi.cpp, after
+/// dfc7d5728: `cur.zeroize(); cur + prev[k]`) followed by the prover's `eltwise_zeroize` of the
+/// whole accum buffer (the CPU path's [CircuitAccumulator::step_accum_zeroizes] is false), on raw
+/// words. `canonical = false` models the pre-fix phase 3 (`cur + prev[k]` with `cur` possibly
+/// INVALID), which turns INVALID + 0 into the non-canonical 0x87fffffe that zeroize cannot clear.
+fn finalize_model(
+    pre: &[u32],
+    rows: usize,
+    cols: usize,
+    last_cycle: usize,
+    canonical: bool,
+) -> Vec<u32> {
+    const INVALID: u32 = 0xffff_ffff;
+    let add = |a: u32, b: u32| {
+        let x = a.wrapping_add(b);
+        if x >= BABY_BEAR_P {
+            x - BABY_BEAR_P
+        } else {
+            x
+        }
+    };
+    let split = user_accum_split() as usize;
+    let machine_columns = (cols - split) / 4;
+    let mut out = pre.to_vec();
+    for row in 0..last_cycle {
+        let back1 = (row + last_cycle - 1) % last_cycle;
+        let prev: [u32; 4] = std::array::from_fn(|k| pre[(cols - 4 + k) * rows + back1]);
+        for j in 0..machine_columns - 1 {
+            for (k, &p) in prev.iter().enumerate() {
+                let i = (split + j * 4 + k) * rows + row;
+                let cur = if canonical && pre[i] == INVALID {
+                    0
+                } else {
+                    pre[i]
+                };
+                out[i] = add(cur, p);
+            }
+        }
+    }
+    for w in out.iter_mut() {
+        if *w == INVALID {
+            *w = 0;
+        }
+    }
+    out
+}
+
+/// The finalized cells `(row, col)` whose pre-finalize value is INVALID (a machine cell the row's
+/// instruction did not write) and whose `prev[k]` (row back1's scanned column k) is 0: the cells
+/// dfc7d5728 fixed.
+fn invalid_plus_zero_cells(
+    pre: &[u32],
+    rows: usize,
+    cols: usize,
+    last_cycle: usize,
+) -> Vec<(usize, usize)> {
+    let split = user_accum_split() as usize;
+    let machine_columns = (cols - split) / 4;
+    let mut hits = Vec::new();
+    for row in 0..last_cycle {
+        let back1 = (row + last_cycle - 1) % last_cycle;
+        for k in 0..4 {
+            if pre[(cols - 4 + k) * rows + back1] != 0 {
+                continue;
+            }
+            for j in 0..machine_columns - 1 {
+                let col = split + j * 4 + k;
+                if pre[col * rows + row] == 0xffff_ffff {
+                    hits.push((row, col));
+                }
+            }
+        }
+    }
+    hits
+}
+
+/// The Metal accum path (perm, stepAccumA, GPU scans, as production) that keeps a copy of the
+/// accum buffer just before finalizeZeroizeAccum, then finalizes it like step 4.
+struct SnapshotBeforeFinalize<'a> {
+    circuit_hal: &'a MetalCircuitHalPoseidon2,
+    pre: std::cell::RefCell<Option<(Vec<Val>, usize)>>,
+}
+
+impl CircuitAccumulator<MetalHalPoseidon2> for SnapshotBeforeFinalize<'_> {
+    fn step_accum(
+        &self,
+        preflight: &PreflightTrace,
+        data: &MetaBuffer<MetalHalPoseidon2>,
+        accum: &MetaBuffer<MetalHalPoseidon2>,
+        global: &MetaBuffer<MetalHalPoseidon2>,
+        mix: &MetaBuffer<MetalHalPoseidon2>,
+    ) -> Result<()> {
+        let c = self.circuit_hal;
+        let hal = c.hal.as_ref();
+        c.ctx().require(Phase::Accum)?;
+        let n = preflight.cycles.len();
+        assert!(n > 0);
+        let fault = c.accum_steps(
+            preflight,
+            data,
+            accum,
+            global,
+            mix,
+            Some(DEFAULT_SORT_WIN),
+            ScanMode::Gpu,
+        )?;
+        hal.sync();
+        c.ctx().scratch().perm_busy = false;
+        if let Some(fault) = fault {
+            check_fault(fault.to_vec()[0])?;
+        }
+        *self.pre.borrow_mut() = Some((accum.buf.to_vec(), n));
+        finalize_metal(hal, c, &accum.buf, accum.rows, accum.cols, n);
+        Ok(())
+    }
+
+    fn step_accum_zeroizes(&self) -> bool {
+        true
+    }
+}
+
+fn assert_canonical(what: &str, words: &[u32]) {
+    if let Some(i) = words.iter().position(|&w| w >= BABY_BEAR_P) {
+        panic!(
+            "{what}: {} non-canonical words (>= P); first at {i}: {:#010x}",
+            words.iter().filter(|&&w| w >= BABY_BEAR_P).count(),
+            words[i]
+        );
+    }
+}
+
+/// P31-06 (PORT_PLAN 1.1 row 8): 3.1's canonical LogUp fix (dfc7d5728) in accum phase 3. A
+/// machine cell the row's instruction did not write is INVALID before finalize; with
+/// `prev[k] == 0`, `INVALID + prev[k]` was the non-canonical 0x87fffffe. misc.metal's
+/// `finalizeCell` counts INVALID as 0; this test makes sure the case is actually exercised.
+///
+/// 1. Real segments: the production-shaped Metal accum (snapshot before finalize) equals the CPU
+///    circuit HAL (3.1's C++ phase 3) word for word and every word is canonical. The Rust model
+///    of 3.1's phase 3 reproduces the CPU result from the same pre-finalize buffer. Row 0 has
+///    `prev == 0` (the LogUp total of the last row, 0 for an honest trace), but these segments
+///    have no unwritten finalized cell there, so the case is forced in part 2; the counts are
+///    printed.
+/// 2. Forced: the same pre-finalize buffer with `prev[k] == 0` forced on many rows (the
+///    scanned columns of their back1 rows zeroed, per k and all four) and many INVALID machine
+///    cells, `lastCycle == rows` and `< rows`: finalizeZeroizeAccum == the 3.1 model, canonical.
+#[test]
+fn finalize_canonical_with_zero_prev() {
+    let hal = Arc::new(MetalHalPoseidon2::new());
+    let circuit_hal = MetalCircuitHalPoseidon2::new(hal.clone()).unwrap();
+    let (mut real_invalid, mut real_hits) = (0, 0);
+    for (name, program, po2) in [
+        ("basic", testutil::kernel::basic(), 20),
+        ("riscv divu", riscv_test("divu"), 20),
+        ("simple_loop", testutil::kernel::simple_loop(60_000), 16),
+    ] {
+        let seg = segment(program, po2);
+        let r = reference(&seg);
+        let rows = r.rows;
+        let cols = REGCOUNT_ACCUM;
+
+        // 1. Real segment.
+        let mut wg = WitnessGenerator::new(
+            hal.as_ref(),
+            &circuit_hal,
+            r.preflight.clone(),
+            StepMode::Parallel,
+        )
+        .unwrap();
+        wg.data
+            .as_ref()
+            .unwrap()
+            .buf
+            .view_mut(|v| v.copy_from_slice(&r.data));
+        wg.global.buf.view_mut(|v| v.copy_from_slice(&r.global));
+        hal.sync();
+        let snap = SnapshotBeforeFinalize {
+            circuit_hal: &circuit_hal,
+            pre: Default::default(),
+        };
+        wg.accum(hal.as_ref(), &snap, &r.mix).unwrap();
+        hal.sync();
+        let metal = wg.accum.as_ref().unwrap().buf.to_vec();
+        let (pre, n) = snap.pre.take().unwrap();
+        let pre = words(&pre).to_vec();
+        let what = format!("{name} (po2 {}, {n} of {rows} rows)", seg.po2);
+        assert_accum_eq(&what, rows, &r.accum, &metal);
+        assert_canonical(&what, words(&metal));
+        let hits = invalid_plus_zero_cells(&pre, rows, cols, n);
+        let split = user_accum_split() as usize;
+        let machine_columns = (cols - split) / 4;
+        let fin_end = split + (machine_columns - 1) * 4;
+        let invalid_fin = (split..fin_end)
+            .map(|c| {
+                pre[c * rows..c * rows + n]
+                    .iter()
+                    .filter(|&&w| w == 0xffff_ffff)
+                    .count()
+            })
+            .sum::<usize>();
+        let row0_prev: Vec<u32> = (0..4).map(|k| pre[(cols - 4 + k) * rows + n - 1]).collect();
+        let model = finalize_model(&pre, rows, cols, n, true);
+        assert_eq!(
+            first_diff(words(&r.accum), &model, rows),
+            None,
+            "{what}: 3.1 phase-3 model vs CPU"
+        );
+        let old = finalize_model(&pre, rows, cols, n, false);
+        let old_bad = old.iter().filter(|&&w| w >= BABY_BEAR_P).count();
+        assert_eq!(
+            old_bad == 0,
+            hits.is_empty(),
+            "{what}: the pre-fix model leaves {old_bad} non-canonical words for {} INVALID + 0 \
+             cells",
+            hits.len()
+        );
+        tracing::info!(
+            "{what}: Metal == CPU == 3.1 model, canonical; {invalid_fin} INVALID finalized cells \
+             before finalize; row 0 prev {row0_prev:x?}; {} INVALID + prev 0 cells (pre-fix \
+             phase 3: {old_bad} words 0x87fffffe)",
+            hits.len()
+        );
+        real_invalid += invalid_fin;
+        real_hits += hits.len();
+
+        // 2. Forced prev[k] == 0 and INVALID cells, on the real pre-finalize buffer.
+        for last_cycle in [n, n - n / 4] {
+            let mut forced = pre.clone();
+            let mut rng = rand::rng();
+            for back1 in 0..last_cycle {
+                // Row back1 + 1 (mod lastCycle) reads these as its prev.
+                let zero_k: &[usize] = match back1 % 7 {
+                    0 => &[0, 1, 2, 3],
+                    1 => &[1],
+                    3 => &[0, 2],
+                    5 => &[3],
+                    _ => &[],
+                };
+                for &k in zero_k {
+                    forced[(cols - 4 + k) * rows + back1] = 0;
+                }
+            }
+            for row in 0..rows {
+                for j in 0..machine_columns - 1 {
+                    for k in 0..4 {
+                        let i = (split + j * 4 + k) * rows + row;
+                        match rng.random_range(0..8) {
+                            0 | 1 => forced[i] = 0xffff_ffff,
+                            2 => forced[i] = 0,
+                            3 => forced[i] = BABY_BEAR_P - 1,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            let hits = invalid_plus_zero_cells(&forced, rows, cols, last_cycle);
+            assert!(
+                hits.len() > rows,
+                "{what}: forced only {} cells",
+                hits.len()
+            );
+            let want = finalize_model(&forced, rows, cols, last_cycle, true);
+            let vals: Vec<Val> = forced.iter().map(|&w| Val::new_raw(w)).collect();
+            let buf = hal.copy_from_slice("accum_forced", &vals);
+            finalize_metal(&hal, &circuit_hal, &buf, rows, cols, last_cycle);
+            let got = buf.to_vec();
+            let got = words(&got);
+            if let Some((row, col, a, b)) = first_diff(&want, got, rows) {
+                panic!(
+                    "{what}, forced, lastCycle {last_cycle}: finalizeZeroizeAccum differs from the \
+                     3.1 phase-3 model in {} cells; first at row {row}, col {col}: want {a:#010x} \
+                     got {b:#010x}",
+                    count_diffs(&want, got)
+                );
+            }
+            assert_canonical(&format!("{what}, forced"), got);
+            for &(row, col) in &hits {
+                let i = col * rows + row;
+                assert_eq!(got[i], 0, "{what}, forced: INVALID + 0 at ({row}, {col})");
+            }
+            let old_bad = finalize_model(&forced, rows, cols, last_cycle, false)
+                .iter()
+                .filter(|&&w| w >= BABY_BEAR_P)
+                .count();
+            assert!(old_bad >= hits.len());
+            tracing::info!(
+                "{what}, forced, lastCycle {last_cycle}: {} INVALID + prev 0 cells all 0, Metal \
+                 == 3.1 model, canonical (pre-fix model: {old_bad} non-canonical words)",
+                hits.len()
+            );
+        }
+    }
+    // Real traces have prev == 0 on row 0 (the LogUp total), but no unwritten finalized cell on
+    // that row in these segments, so the INVALID + 0 case is the forced part's. The model's
+    // INVALID handling is checked against the C++ phase 3 only if the real buffers hold INVALID
+    // finalized cells at all.
+    eprintln!(
+        "[p31-06] finalize: real segments: {real_invalid} INVALID finalized cells before \
+         finalize, {real_hits} of them with prev[k] == 0"
+    );
+}
+
 /// A corrupt perm is reported through the fault word, not by reading out of bounds.
 #[test]
 fn bad_perm_faults() {
@@ -592,19 +922,26 @@ fn r17_accum_segment_stress() {
             postcard::take_from_bytes::<(u32, crate::execute::segment::Segment)>(&bytes).unwrap();
         let r = reference(&seg);
         let rows = r.rows;
-        let mut wg = WitnessGenerator::new(
-            hal.as_ref(),
-            &circuit_hal,
-            r.preflight.clone(),
-            StepMode::Parallel,
-        )
-        .unwrap();
-        {
-            let data = wg.data.as_ref().unwrap();
-            data.buf.view_mut(|v| v.copy_from_slice(&r.data));
+        // P31-06: a fresh generator holding the CPU witness for every rep. Since W7-R2,
+        // `WitnessGenerator::accum` drops `data` on unified-memory HALs
+        // (`RISC0_METAL_DROP_DATA_EARLY`), so one generator cannot accumulate twice.
+        let fresh_wg = || {
+            let wg = WitnessGenerator::new(
+                hal.as_ref(),
+                &circuit_hal,
+                r.preflight.clone(),
+                StepMode::Parallel,
+            )
+            .unwrap();
+            wg.data
+                .as_ref()
+                .unwrap()
+                .buf
+                .view_mut(|v| v.copy_from_slice(&r.data));
             wg.global.buf.view_mut(|v| v.copy_from_slice(&r.global));
-        }
-        hal.sync();
+            hal.sync();
+            wg
+        };
         let name = std::path::Path::new(path)
             .iter()
             .rev()
@@ -625,6 +962,7 @@ fn r17_accum_segment_stress() {
             let mut detail = vec![];
             let t = Instant::now();
             for rep in 0..reps {
+                let mut wg = fresh_wg();
                 wg.accum(hal.as_ref(), &WithVariant(&circuit_hal, variant), &r.mix)
                     .unwrap();
                 hal.sync();
