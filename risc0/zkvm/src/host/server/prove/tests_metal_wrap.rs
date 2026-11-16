@@ -44,7 +44,7 @@ use std::{
 use risc0_zkp::hal::{metal::MetalHalPoseidon2, Hal as _};
 use risc0_zkvm_methods::{multi_test::MultiTestSpec, MULTI_TEST_ELF, MULTI_TEST_ID};
 
-use crate::{get_prover_server, ExecutorEnv, InnerReceipt, ProverOpts};
+use crate::{get_prover_server, sha::Digestible, ExecutorEnv, InnerReceipt, ProverOpts};
 
 /// Peak of the device's `currentAllocatedSize` since the last [Sampler::phase].
 struct Sampler {
@@ -166,6 +166,11 @@ fn wrap_job(sampler: &Sampler, base: u64, budget: Option<u64>, po2: u32, cycles:
     let stark_peak = sampler.phase();
     let held = sampler.current();
     succinct.verify(MULTI_TEST_ID).unwrap();
+    // P31-14: bound to the release-3.1 recursion parameters (control root e6feef13...).
+    assert_eq!(
+        succinct.inner.succinct().unwrap().verifier_parameters,
+        crate::SuccinctReceiptVerifierParameters::default().digest()
+    );
 
     // Wrap: identity_p254 (CPU) + shrink_wrap (release, key load, prove).
     let opts = ProverOpts::groth16();
@@ -178,6 +183,17 @@ fn wrap_job(sampler: &Sampler, base: u64, budget: Option<u64>, po2: u32, cycles:
     let wrap_peak = sampler.phase();
     assert!(matches!(groth16.inner, InnerReceipt::Groth16(_)));
     groth16.verify(MULTI_TEST_ID).unwrap();
+    // P31-14: the release-3.1 Groth16 parameters (control root e6feef13..., BN254 identity
+    // de81d091..., the v0.2.0 key): selector e71e6620, not 3.0's 73c457ba.
+    let g16 = groth16.inner.groth16().unwrap();
+    assert_eq!(
+        g16.verifier_parameters,
+        risc0_zkp::digest!("e71e6620a834f4d8dc1998476b865a9a6437a14474f9442cf8664f9ec22a5eee")
+    );
+    assert_eq!(
+        groth16.claim().unwrap().digest(),
+        succinct.claim().unwrap().digest()
+    );
     let after_wrap = sampler.current();
 
     // The public release (a worker's call after a failed proof) on what is left.

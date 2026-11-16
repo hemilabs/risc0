@@ -230,7 +230,78 @@ fn keccak_union() {
 fn basic() {
     let _heavy = heavy_test_lock();
     // ensure that we got a succinct receipt.
-    prove_nothing_succinct().receipt.inner.succinct().unwrap();
+    let receipt = prove_nothing_succinct().receipt;
+    let succinct = receipt.inner.succinct().unwrap();
+    // P31-14: bound to the release-3.1 recursion parameters (control root e6feef13...).
+    assert_eq!(
+        succinct.verifier_parameters,
+        SuccinctReceiptVerifierParameters::default().digest()
+    );
+    assert_eq!(
+        succinct.verifier_parameters,
+        risc0_zkp::digest!("f57f355f816d73b9c94cf5c63baa6c70a45fff10cfe3f298a9c2508dc4a06ae8")
+    );
+}
+
+/// P31-14 (docs/metal-port/notes/P31-14.md): the release-3.1 verifier constants this tree's
+/// receipts are bound to. Each equals the stock crates.io `risc0-zkvm 3.1.0` value
+/// (`tools/stock_verify31`: `stock-verify31 consts`); none is the 3.0 value (control root
+/// a54dc85a..., BN254 identity c07a6514..., Groth16 selector 73c457ba, rv32im seal v2).
+#[test]
+fn p31_14_release_3_1_constants() {
+    use risc0_circuit_recursion::control_id::BN254_IDENTITY_CONTROL_ID;
+    use risc0_zkp::digest;
+
+    use crate::{
+        CompositeReceiptVerifierParameters, Groth16ReceiptVerifierParameters,
+        SegmentReceiptVerifierParameters, ALLOWED_CONTROL_ROOT,
+    };
+
+    let root = digest!("e6feef13db7aed4a731c7b0852de1f5c89b137726073f625d05333184d3a551d");
+    let identity = digest!("de81d091ba14062acb5023b3b36deee95624e3fd47475cb7ff64aed5f9eac20a");
+    assert_eq!(ALLOWED_CONTROL_ROOT, root);
+    assert_eq!(BN254_IDENTITY_CONTROL_ID, identity);
+
+    let g16 = Groth16ReceiptVerifierParameters::default();
+    assert_eq!(g16.control_root, root);
+    assert_eq!(g16.bn254_control_id, identity);
+    assert_eq!(
+        g16.digest(),
+        digest!("e71e6620a834f4d8dc1998476b865a9a6437a14474f9442cf8664f9ec22a5eee")
+    );
+    // The selector a Groth16 seal is routed by is the first 4 bytes of that digest.
+    assert_eq!(&g16.digest().as_bytes()[..4], &[0xe7, 0x1e, 0x66, 0x20]);
+
+    let succinct = SuccinctReceiptVerifierParameters::default();
+    assert_eq!(succinct.control_root, root);
+    assert_eq!(succinct.inner_control_root, None);
+    assert_eq!(
+        succinct.digest(),
+        digest!("f57f355f816d73b9c94cf5c63baa6c70a45fff10cfe3f298a9c2508dc4a06ae8")
+    );
+
+    let segment = SegmentReceiptVerifierParameters::default();
+    assert_eq!(segment.circuit_info.to_string(), "RV32IM:v2rev3___");
+    assert_eq!(segment.proof_system_info.to_string(), "RISC0_STARK:v1__");
+    assert_eq!(
+        segment.digest(),
+        digest!("82a577e4f396729254dab9bec78380025a6b87a454405d09052df25f6f319b22")
+    );
+    assert_eq!(risc0_circuit_rv32im::RV32IM_SEAL_VERSION, 3);
+    assert_eq!(
+        CompositeReceiptVerifierParameters::default().digest(),
+        digest!("845fdbd075885618df947dbd97d955440b1eb3b06cdd7146f1b87deed50a2023")
+    );
+
+    // The 3.0 values must be gone.
+    for old in [
+        digest!("a54dc85ac99f851c92d7c96d7318af41dbe7c0194edfcc37eb4d422a998c1f56"),
+        digest!("c07a65145c3cb48b6101962ea607a4dd93c753bb26975cb47feb00d3666e4404"),
+    ] {
+        assert_ne!(ALLOWED_CONTROL_ROOT, old);
+        assert_ne!(BN254_IDENTITY_CONTROL_ID, old);
+    }
+    assert_ne!(&g16.digest().as_bytes()[..4], &[0x73, 0xc4, 0x57, 0xba]);
 }
 
 #[test_log::test]
@@ -711,6 +782,23 @@ fn compress(#[case] from: ReceiptKind, #[case] into: ReceiptKind) {
             InnerReceipt::Fake { .. } => panic!("unexpected fake receipt"),
         },
     };
+    // P31-14: the release-3.1 labels on what the prover made.
+    match &receipt.inner {
+        InnerReceipt::Composite(c) => {
+            for s in &c.segments {
+                assert_eq!(s.seal[0], 3, "rv32im seal version");
+            }
+        }
+        InnerReceipt::Succinct(s) => assert_eq!(
+            s.verifier_parameters,
+            SuccinctReceiptVerifierParameters::default().digest()
+        ),
+        InnerReceipt::Groth16(g) => assert_eq!(
+            g.verifier_parameters,
+            risc0_zkp::digest!("e71e6620a834f4d8dc1998476b865a9a6437a14474f9442cf8664f9ec22a5eee")
+        ),
+        InnerReceipt::Fake(_) => unreachable!(),
+    }
     receipt.verify(MULTI_TEST_ID).unwrap();
 }
 
