@@ -353,3 +353,134 @@ fn r17_seal_repeat() {
     }
     assert!(bad.is_empty(), "R17AUDIT recursion seals differ: {bad:?}");
 }
+
+/// P31-10 A/B bench (ignored; heavy, run by hand): real lift/join/resolve proofs replayed from
+/// `C11_CAPTURES` (optional `C11_ONLY` filter), each round in the order zkvm makes them, with the
+/// program handed over as [get_zkr] hands it: `RISC0_METAL_REC_ZKR_CACHE` on (default) passes
+/// the same `Arc<Program>` to every proof of a program (the P31-10 cache); `0` builds a new one
+/// per proof from its words, as stock 3.1's `get_zkr` does ([Program::from_encoded] inside the
+/// timed region; the prover then re-checks the code against its ctrl caches). `P3110_REPS`
+/// rounds (default 7) after one warm round. Prints `P3110CAP <file> ...` and a `P3110BENCH`
+/// line with the per-round sum and the per-kind (lift/join) medians.
+#[test]
+#[ignore]
+fn p31_10_bench_zkr_cache() {
+    use std::time::Instant;
+    crate::prove::hal::metal::require_heavy_gpu_run("p31_10_bench_zkr_cache");
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
+    let _guard = crate::prove::hal::metal::global_state_test_lock();
+    let cache_on = std::env::var("RISC0_METAL_REC_ZKR_CACHE").as_deref() != Ok("0");
+    let reps: usize = std::env::var("P3110_REPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(7);
+    let dir = std::env::var("C11_CAPTURES").expect("C11_CAPTURES=<capture dir>");
+    let only = std::env::var("C11_ONLY").unwrap_or_default();
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "rcap"))
+        .filter(|p| only.is_empty() || p.to_string_lossy().contains(&only))
+        .collect();
+    files.sort();
+    let caps: Vec<_> = files
+        .iter()
+        .map(|p| {
+            let c = capture::read(p).unwrap();
+            // The program's words, as the zkr holds them (canonical).
+            let words: Vec<u32> = c.program.code.iter().map(|&e| u32::from(e)).collect();
+            (
+                p.file_name().unwrap().to_string_lossy().into_owned(),
+                c,
+                words,
+            )
+        })
+        .collect();
+    assert!(!caps.is_empty(), "no captures");
+    let mut provers: std::collections::HashMap<String, Box<dyn RecursionProver>> =
+        Default::default();
+    for (_, c, _) in &caps {
+        if !provers.contains_key(&c.hashfn) {
+            provers.insert(c.hashfn.clone(), metal_recursion_prover(&c.hashfn).unwrap());
+        }
+    }
+    let preflight = |c: &capture::Capture| {
+        let p = c.preflight()?;
+        if crate::prove::host_chains_backend() {
+            *p.host_chains.lock().unwrap() = crate::prove::witgen::host_chains(&c.program, &p);
+        }
+        crate::prove::stage_metal(&p);
+        Some(p)
+    };
+    let mut times: Vec<Vec<f64>> = vec![Vec::new(); caps.len()];
+    let mut rounds = Vec::new();
+    for rep in 0..=reps {
+        let mut sum = 0.0;
+        for (i, (_, c, words)) in caps.iter().enumerate() {
+            let pf = preflight(c);
+            let prover = &provers[&c.hashfn];
+            let t = Instant::now();
+            let fresh;
+            let program = if cache_on {
+                &c.program
+            } else {
+                fresh = Arc::new(Program::from_encoded(words, c.program.po2));
+                &fresh
+            };
+            let r = prover.prove_shared(program, c.input.clone(), pf).unwrap();
+            let ms = t.elapsed().as_secs_f64() * 1e3;
+            std::hint::black_box(r);
+            if rep > 0 {
+                times[i].push(ms);
+                sum += ms;
+            }
+        }
+        if rep > 0 {
+            rounds.push(sum);
+        }
+    }
+    let med = |v: &mut Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    };
+    let (mut lift, mut join) = (Vec::new(), Vec::new());
+    for (i, (name, c, _)) in caps.iter().enumerate() {
+        let t = &mut times[i];
+        let m = med(t);
+        println!(
+            "P3110CAP cache={cache_on} {name} rows={} median={m:.2} min={:.2} max={:.2}",
+            c.program.code_rows(),
+            t[0],
+            t[t.len() - 1]
+        );
+        // The 3.0 captures: lifts have 134164 rows, join/resolve ~259.6K (C11 note).
+        if c.hashfn == "poseidon2"
+            && c.program.code_rows() < 200_000
+            && c.program.code_rows() > 130_000
+        {
+            lift.extend(t.iter().copied());
+        } else if c.program.code_rows() > 250_000 {
+            join.extend(t.iter().copied());
+        }
+    }
+    let (lo, hi) = (
+        rounds.iter().cloned().fold(f64::MAX, f64::min),
+        rounds.iter().cloned().fold(0.0, f64::max),
+    );
+    let lm = if lift.is_empty() {
+        f64::NAN
+    } else {
+        med(&mut lift)
+    };
+    let jm = if join.is_empty() {
+        f64::NAN
+    } else {
+        med(&mut join)
+    };
+    println!(
+        "P3110BENCH cache={cache_on} n={} round_median={:.2} min={lo:.2} max={hi:.2} \
+         lift_median={lm:.2} join_median={jm:.2} reps={reps}",
+        caps.len(),
+        med(&mut rounds)
+    );
+}
