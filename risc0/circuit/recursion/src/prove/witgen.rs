@@ -218,17 +218,95 @@ pub(crate) fn with_noise_seed<R>(seed: u64, f: impl FnOnce() -> R) -> R {
     f()
 }
 
-/// The RNG for one noise fill: `rand::rng()` normally, a seeded `StdRng` under
-/// [with_noise_seed] (`stream` separates the data and accum fills).
-fn noise_rng(stream: u64) -> Box<dyn rand::RngCore> {
+/// The seed set by [with_noise_seed] on this thread, if any.
+fn noise_seed() -> Option<u64> {
+    NOISE_SEED.with(|s| s.get())
+}
+
+/// The seeded noise stream `stream` (1 = data, 2 = accum) under [with_noise_seed].
+fn seeded_noise_rng(seed: u64, stream: u64) -> rand::rngs::StdRng {
     use rand::SeedableRng as _;
-    match NOISE_SEED.with(|s| s.get()) {
-        Some(seed) => Box::new(rand::rngs::StdRng::seed_from_u64(
-            seed ^ stream.wrapping_mul(0x9e37_79b9_7f4a_7c15),
-        )),
-        None => Box::new(rand::rng()),
+    rand::rngs::StdRng::seed_from_u64(seed ^ stream.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+}
+
+/// The ZK noise of one fill: `n` independent `BabyBearElem::random` draws, in order (3.1 security
+/// fix `f68f86020`: one fresh value per noise cell, never a repeated value). The RNG is the
+/// stock prover's `rand::rng()` (the drawing thread's CSPRNG), or under [with_noise_seed]
+/// (`seed`) a `StdRng` for `stream`, so CPU and Metal provers given the same seed agree.
+pub(crate) fn draw_noise(seed: Option<u64>, stream: u64, n: usize) -> Vec<BabyBearElem> {
+    fn draw(rng: &mut impl rand::RngCore, n: usize) -> Vec<BabyBearElem> {
+        (0..n).map(|_| BabyBearElem::random(rng)).collect()
+    }
+    match seed {
+        Some(seed) => draw(&mut seeded_noise_rng(seed, stream), n),
+        None => draw(&mut rand::rng(), n),
     }
 }
+
+/// `RISC0_RECURSION_NOISE_OVERLAP=0` (read once): draw the ZK noise on the proving thread where
+/// it is used (as the stock prover does), instead of on a helper thread while the witness is
+/// generated (P31-09). Either way every cell gets its own independent value; only where the
+/// ~3.4 ms of draws run changes.
+static NOISE_OVERLAP: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("RISC0_RECURSION_NOISE_OVERLAP").as_deref() != Ok("0"));
+
+thread_local! {
+    /// Test override of [NOISE_OVERLAP] on this thread.
+    static NOISE_OVERLAP_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Whether the noise is drawn ahead on a helper thread ([NOISE_OVERLAP], or a test override).
+pub(crate) fn noise_overlap() -> bool {
+    NOISE_OVERLAP_OVERRIDE
+        .with(|c| c.get())
+        .unwrap_or(*NOISE_OVERLAP)
+}
+
+/// Run `f` with the noise overlap forced on or off on this thread (tests).
+#[allow(dead_code)]
+pub(crate) fn with_noise_overlap<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            NOISE_OVERLAP_OVERRIDE.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(NOISE_OVERLAP_OVERRIDE.with(|c| c.replace(Some(on))));
+    f()
+}
+
+/// Noise for the data and accum tails of one proof, drawn ahead on a helper thread (P31-09).
+struct EarlyNoise(std::thread::JoinHandle<(Vec<BabyBearElem>, Vec<BabyBearElem>)>);
+
+impl EarlyNoise {
+    /// Start drawing `ZK_CYCLES * data_size` (stream 1) and `ZK_CYCLES * accum_size` (stream 2)
+    /// values with this thread's noise seed. `None` when the overlap is off or no thread starts.
+    fn start() -> Option<Self> {
+        use risc0_zkp::ZK_CYCLES;
+        if !noise_overlap() {
+            return None;
+        }
+        let seed = noise_seed();
+        std::thread::Builder::new()
+            .name("rec-zk-noise".into())
+            .spawn(move || {
+                (
+                    draw_noise(seed, 1, ZK_CYCLES * CIRCUIT.data_size()),
+                    draw_noise(seed, 2, ZK_CYCLES * CIRCUIT.accum_size()),
+                )
+            })
+            .ok()
+            .map(Self)
+    }
+
+    fn join(self) -> Option<(Vec<BabyBearElem>, Vec<BabyBearElem>)> {
+        self.0.join().ok()
+    }
+}
+
+/// Noise draws that ran on the [EarlyNoise] helper thread (tests).
+pub(crate) static EARLY_NOISE_USED: AtomicUsize = AtomicUsize::new(0);
 
 /// When set, every witness generated with host chains is regenerated without them and compared
 /// (a test hook; see [crate::prove::set_host_chains_check]).
@@ -357,6 +435,8 @@ pub(crate) struct WitnessGenerator<H: Hal> {
     pub ctrl: H::Buffer<H::Elem>,
     pub data: H::Buffer<H::Elem>,
     pub accum: H::Buffer<H::Elem>,
+    /// The accum tail noise when it was drawn ahead ([EarlyNoise]); taken by `accum`.
+    accum_noise: Mutex<Option<Vec<BabyBearElem>>>,
 }
 
 impl<H> WitnessGenerator<H>
@@ -372,6 +452,9 @@ where
     ) -> Result<Self> {
         scope!("witgen");
 
+        // The noise does not depend on the witness: draw it while the witness is generated.
+        let early_noise = EarlyNoise::start();
+
         let total_cycles = 1 << zkr.po2;
 
         let global = vec![BabyBearElem::INVALID; CircuitImpl::OUTPUT_SIZE];
@@ -386,8 +469,9 @@ where
         };
 
         let work_cycles = zkr.code_rows() as u32;
-        // The HAL's row passes (HIP): rows >= work_cycles start as zero, the noise is a fill and
-        // the zeroize reads only rows < work_cycles (see `CircuitWitnessGenerator::init_rows`).
+        // The HAL's row passes (HIP, Metal opt-in): rows >= work_cycles start as zero and the
+        // zeroize reads only rows < work_cycles (see `CircuitWitnessGenerator::init_rows`). The
+        // noise tail is the same independent-value copy as on the generic path (no tail fill).
         // Not with a host-generated witness, whose upload writes the whole buffer.
         let row_passes =
             circuit_hal.has_row_passes() && preflight.host_witness.lock().unwrap().is_none();
@@ -576,18 +660,24 @@ where
         }
 
         // Add random noise to end of the data columns
+        let mut accum_noise = None;
         scope!("noise", {
             use risc0_zkp::ZK_CYCLES;
             // 3.1 security fix (f68f86020): an independent random value per noise cell, in every
-            // mode. The row-pass path no longer uses `fill_tail` (it repeated one value);
-            // `noise_rng` keeps the seeded test hook ([with_noise_seed]).
-            let mut rng = noise_rng(1);
-            let noise: Vec<BabyBearElem> = (0..ZK_CYCLES * CIRCUIT.data_size())
-                .map(|_| BabyBearElem::random(&mut rng))
-                .collect();
+            // mode (the generic passes and the HAL row passes alike; nothing fills the tail with
+            // one repeated value). `draw_noise` keeps the seeded test hook ([with_noise_seed]).
+            let data_noise = match early_noise.and_then(EarlyNoise::join) {
+                Some((data_noise, a)) => {
+                    EARLY_NOISE_USED.fetch_add(1, Ordering::Relaxed);
+                    accum_noise = Some(a);
+                    data_noise
+                }
+                None => draw_noise(noise_seed(), 1, ZK_CYCLES * CIRCUIT.data_size()),
+            };
+            assert_eq!(data_noise.len(), ZK_CYCLES * CIRCUIT.data_size());
             hal.eltwise_copy_elem_slice(
                 &data,
-                &noise,
+                &data_noise,
                 CIRCUIT.data_size(),      // from_rows
                 ZK_CYCLES,                // from_cols
                 0,                        // from_offset
@@ -614,6 +704,7 @@ where
             ctrl,
             data,
             accum,
+            accum_noise: Mutex::new(accum_noise),
         })
     }
 
@@ -630,11 +721,15 @@ where
         // Add random noise to end of accum
         scope!("noise", {
             use risc0_zkp::ZK_CYCLES;
-            let mut rng = noise_rng(2);
             let total_cycles = self.total_cycles as usize;
-            let noise: Vec<BabyBearElem> = (0..ZK_CYCLES * CIRCUIT.accum_size())
-                .map(|_| BabyBearElem::random(&mut rng))
-                .collect();
+            // Independent values per cell (f68f86020); drawn ahead with the data noise, or here.
+            let noise = self
+                .accum_noise
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .unwrap_or_else(|| draw_noise(noise_seed(), 2, ZK_CYCLES * CIRCUIT.accum_size()));
+            assert_eq!(noise.len(), ZK_CYCLES * CIRCUIT.accum_size());
             hal.eltwise_copy_elem_slice(
                 &self.accum,
                 &noise,
