@@ -87,7 +87,7 @@ pub(crate) fn parse_persist(v: &str) -> Option<Mode> {
 pub(crate) static TEST_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Force a [Mode] in this process (tests); `None` follows [PERSIST_ENV] again.
-#[cfg(test)]
+#[cfg(all(test, feature = "metal"))] // used by the Metal c16_tests only
 pub(crate) fn set_test_mode(m: Option<Mode>) {
     let v = match m {
         None => 0,
@@ -399,6 +399,7 @@ fn prewarm_p254_ctrl_impl(_po2: usize) -> anyhow::Result<P254Prewarm> {
 /// [prewarm_p254_ctrl], which checks the device headroom and C13's cap only before taking
 /// `risc0_zkp::hal::metal::exclusive()`. Default (unset or anything else): check before the lock
 /// and again once it is held (LEADS2 S5).
+#[cfg_attr(not(feature = "metal"), allow(dead_code))] // read only by the Metal prewarm
 pub(crate) const PREWARM_GATE_ENV: &str = "RISC0_METAL_P254_PREWARM_GATE";
 
 /// Whether [PREWARM_GATE_ENV] asks for the pre-W7-C1 check order (the gates before the lock only).
@@ -542,14 +543,14 @@ pub(crate) mod test_hooks {
 }
 
 /// Host bytes, number of groups, rebuilds and snapshots so far (tests and the bench).
-#[cfg(test)]
+#[cfg(all(test, feature = "metal"))] // used by the Metal c16_tests only
 pub(crate) fn stats() -> (usize, usize, usize, usize) {
     let s = state();
     (total_bytes(&s), s.entries.len(), s.restores, s.snapshots)
 }
 
 /// Drop every persisted group (tests).
-#[cfg(test)]
+#[cfg(all(test, feature = "metal"))] // used by the Metal c16_tests only
 pub(crate) fn clear() {
     state().entries.clear();
 }

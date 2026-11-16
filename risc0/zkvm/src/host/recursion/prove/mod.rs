@@ -574,7 +574,7 @@ pub fn test_zkr(
     let control_id = program.compute_control_id(suite.clone()).unwrap();
     let opts = ProverOpts::succinct().with_control_ids(vec![control_id]);
 
-    let mut prover = Prover::new(program, control_id, opts.clone());
+    let mut prover = Prover::new(program.into(), control_id, opts.clone());
     prover.add_input_digest(digest1, DigestKind::Poseidon2);
     prover.add_input_digest(digest2, DigestKind::Poseidon2);
 
