@@ -1008,6 +1008,12 @@ fn glob_paths(pattern: &str) -> Vec<PathBuf> {
 /// Only `kernels/metal` is an include directory (plus the shared `METAL_INCS` headers that
 /// KernelBuild writes to `$OUT_DIR/_sys_`): never `kernels/cuda`, whose `extern.h`/`context.h`
 /// would shadow the Metal ones.
+///
+/// P31-07: risc0 3.1's `kernels/cuda/step_exec.cu` is zirgen's monolith; C2 translates its
+/// 19-arm `__noinline__` split, which `split_step_exec_metal.py` writes to
+/// `$OUT_DIR/split/step_exec.cu` (never into `kernels/cuda`) before `cuda2metal_steps.py` runs
+/// with `--step-exec-src` pointing at it. The generator fails the build when zirgen's output no
+/// longer has the expected arms.
 fn build_metal_kernels() {
     const OUTPUT: &str = "metal_kernels_recursion";
     // Hand-written kernels (C1). `kernels/metal` is the include dir for context.h/extern.h (it is
@@ -1075,6 +1081,24 @@ fn build_metal_kernels() {
     let gen_dir = out_dir.join("metal");
 
     rerun_if_changed("kernels/cuda/cuda2metal_common.py");
+
+    // The step_exec split (P31-07), ahead of the steps translator.
+    const SPLITTER: &str = "kernels/cuda/split_step_exec_metal.py";
+    let split_step_exec = out_dir.join("split").join("step_exec.cu");
+    rerun_if_changed(SPLITTER);
+    let mut cmd = risc0_build_kernel::python_command();
+    cmd.arg(SPLITTER)
+        .arg("kernels/cuda/step_exec.cu")
+        .arg("-o")
+        .arg(&split_step_exec)
+        .arg("-q");
+    let status = cmd
+        .status()
+        .unwrap_or_else(|e| panic!("could not run {cmd:?}: {e}"));
+    if !status.success() {
+        panic!("{SPLITTER} failed ({status}): {cmd:?}");
+    }
+
     let mut files: Vec<PathBuf> = SOURCES.iter().map(PathBuf::from).collect();
     for (script, args, outputs, inputs) in TRANSLATORS {
         rerun_if_changed(script);
@@ -1090,6 +1114,9 @@ fn build_metal_kernels() {
             .arg(&gen_dir)
             .arg("-q")
             .args(args.iter());
+        if *script == "kernels/cuda/cuda2metal_steps.py" {
+            cmd.arg("--step-exec-src").arg(&split_step_exec);
+        }
         let status = cmd
             .status()
             .unwrap_or_else(|e| panic!("could not run {cmd:?}: {e}"));
