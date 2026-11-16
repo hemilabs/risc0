@@ -12,8 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Poseidon254 (BN254 Fr, x^8 S-box, 3 cells, 8 full + 42 partial rounds) Merkle hashing for the
+// Poseidon254 (BN254 Fr, x^7 S-box, 3 cells, 8 full + 42 partial rounds) Merkle hashing for the
 // recursion prover's `poseidon_254` hash suite (PLAN item Z10, docs/metal-port/notes/Z10.md).
+// risc0 3.1 (security fix, upstream 62e9e18a9 / 210a6b5d9) changed the S-box from x^8 to x^7
+// (gcd(7, r - 1) = 1, so x^7 is a permutation of Fr; x^8 is not, gcd(8, r - 1) = 8). Round
+// constants, matrices and round counts are unchanged. Item P31-11 (docs/metal-port/notes/P31-11.md)
+// moved every S-box here to x^7; there is deliberately no way back to x^8.
 //
 // Port of sys/kernels/zkp/cuda/supra/poseidon254.cuh (`_poseidon254_rows`, `_poseidon254_fold`):
 // one thread per hash, the sparse-matrix partial rounds and the constant table of
@@ -364,10 +368,13 @@ namespace ref {
 using bn254::Fr;
 
 inline Fr ldc(uint32_t i) { return Fr::from_limbs(&C[i][0]); }
+// x^7 = (x^4 * x^2) * x. bn254.h's Fr is fully reduced (every input and output < r), so the two
+// products need no bound argument beyond bn254.h's own.
 inline Fr sbox(Fr x) {
   Fr x2 = x.sqr();
   Fr x4 = x2.sqr();
-  return x4.sqr();
+  Fr x6 = x4 * x2;
+  return x6 * x;
 }
 
 // One full round with the 3 x 3 matrix at constant index `mat`; with `only0` only cell 0 of the
@@ -496,6 +503,18 @@ inline F mul(thread const F& a, thread const uint32_t* b) {
   return F{{t0, t1, t2, t3, t4, t5, t6, t7}};
 }
 inline F mul(thread const F& a, thread const F& b) { return mul(a, b.v); }
+// `mul` with the word loop not unrolled (one copy of its body; item P31-11, for the compact S-box:
+// unrolled, the two x^7 products made the compact kernels 43 % larger and 5 % slower,
+// notes/P31-11.md). Same arithmetic and bounds as `mul`.
+inline F mul_loop(thread const F& a, thread const F& b) {
+  uint32_t t0 = 0, t1 = 0, t2 = 0, t3 = 0, t4 = 0, t5 = 0, t6 = 0, t7 = 0, t8 = 0, t9 = 0;
+#pragma unroll 1
+  for (int i = 0; i < 8; i++) {
+    W64_MAC(a.v, b.v[i], t0, t1, t2, t3, t4, t5, t6, t7, t8, t9)
+    W64_REDUCE(t0, t1, t2, t3, t4, t5, t6, t7, t8, t9)
+  }
+  return F{{t0, t1, t2, t3, t4, t5, t6, t7}};
+}
 inline F sqr_cios(thread const F& a) { return mul(a, a.v); }
 
 // x0 * c0 + x1 * c1 + x2 * c2 (x < 2r, c constant-table elements < r) with one reduction per word:
@@ -742,18 +761,32 @@ inline F addk(thread const F& x, constant uint32_t* c) {
   return csub2r(s);
 }
 
-// x^8. LOOP: the three squarings in a loop (one copy of the squaring code).
+// x^7 (risc0 3.1; item P31-11). Callers pass x < 2r (addk / add / csub2r outputs).
+// - Unrolled (LOOP = false, `*_w64u`): x2 = sqr(x), x4 = sqr(x2), x6 = x4 * x2, x7 = x6 * x.
+// - LOOP (the default compact kernels and the 4-lane kernels): the addition chain
+//   x -> x^2 -> x^3 -> x^6 -> x^7 as two passes of y = sqr(y) * x, so one copy of the squaring code
+//   and one of the multiplication (the same 2 squarings + 2 products; no per-pass operand select
+//   and no conditional inside the loop), the product with its word loop not unrolled
+//   (`mul_loop`). Measured against the other forms in notes/P31-11.md: this one is the fastest
+//   (the straight 4-op chain is ~14 % slower, the unrolled product ~5 %, CIOS squaring ~4 %).
+// Bounds (r < 2^254, 4r < R = 2^256; see `mul` and `sqr_sos`): a square or product of two values
+// below 2r is below 4r^2 / R + r < 1.76 r < 2r, and the running T of `mul` / `mul_loop` (the same
+// CIOS) stays below a + r + 1 < 3r + 1 < 2^256 for a < 2r. Every operand of every step is below
+// 2r: x by the precondition, x2, x4, x3, x6 as square / product outputs. So x^7 < 2r, the same
+// output range as the old x^8, and no csub is needed before the callers' next addk / dot3k / mulk
+// (all take < 2r).
 template <bool SOS, bool LOOP> inline F sbox(thread const F& x) {
   if (LOOP) {
     F y = x;
 #pragma unroll 1
-    for (int i = 0; i < 3; i++)
-      y = sqr<SOS>(y);
+    for (int i = 0; i < 2; i++)
+      y = mul_loop(sqr<SOS>(y), x);
     return y;
   }
   F x2 = sqr<SOS>(x);
   F x4 = sqr<SOS>(x2);
-  return sqr<SOS>(x4);
+  F x6 = mul(x4, x2);
+  return mul(x6, x);
 }
 
 // Any 256-bit integer -> Montgomery (< 2r): RR (< r) is the inner operand, so T < 2r + 1.
