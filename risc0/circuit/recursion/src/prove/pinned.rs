@@ -238,17 +238,21 @@ impl PinnedTrace {
             num_cycles,
             num_iops,
         };
-        let raw = chains.filter(|hc| !hc.heads.is_empty()).map(|hc| RawHostChains {
-            heads: self.ptr(3),
-            num_heads: hc.heads.len() as u32,
-            cycles: self.ptr(4),
-            rows: self.ptr(5),
-            wom_idx: self.ptr(6),
-            wom_rows: self.ptr(7),
-            num_rows: hc.cycles.len() as u32,
-            data_cols: (hc.rows.len() / hc.cycles.len().max(1)) as u32,
-        });
-        let hc = raw.as_ref().map_or(std::ptr::null(), |r| r as *const RawHostChains);
+        let raw = chains
+            .filter(|hc| !hc.heads.is_empty())
+            .map(|hc| RawHostChains {
+                heads: self.ptr(3),
+                num_heads: hc.heads.len() as u32,
+                cycles: self.ptr(4),
+                rows: self.ptr(5),
+                wom_idx: self.ptr(6),
+                wom_rows: self.ptr(7),
+                num_rows: hc.cycles.len() as u32,
+                data_cols: (hc.rows.len() / hc.cycles.len().max(1)) as u32,
+            });
+        let hc = raw
+            .as_ref()
+            .map_or(std::ptr::null(), |r| r as *const RawHostChains);
         // Set first (unstage is a no-op for inputs that were not staged: a failed call waits
         // for its own copies).
         self.staged = true;

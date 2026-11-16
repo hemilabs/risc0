@@ -1,0 +1,21 @@
+# R1 Metal-vs-CPU check of the rv32im support kernels and headers (plan 4.2, item R1).
+# Standalone on purpose (D0 runner precedent): the empty [workspace] table keeps it out of the
+# risc0 workspace, and rv32im-sys has no Metal dev-dependency to run it as a crate test.
+#
+#   source /Users/user/zkminer/env.sh
+#   cargo build -p risc0-circuit-rv32im-sys --features metal          # builds the metallib
+#   cargo run --release --manifest-path risc0/circuit/rv32im-sys/kernels/metal/r1_check/Cargo.toml
+#
+# Pass `-- <path to metal_kernels_rv32im.metallib>` to pick the metallib; by default the newest
+# one under <repo>/target/*/build/risc0-circuit-rv32im-sys-*/out/ is used.
+[package]
+name = "risc0-rv32im-metal-r1-check"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+metal = "0.29"
+objc = "0.2"

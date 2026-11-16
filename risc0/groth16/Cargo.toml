@@ -75,6 +75,19 @@ intel = [
   "prove",
   "risc0-groth16-sys/intel",
 ]
+# Metal builds (macOS): the Metal GPU prover (src/prove/metal.rs, a stub until the Metal port's
+# groth16 items land) with the same in-process witness generation as intel; until then, and with
+# RISC0_GROTH16_METAL_PROVER=docker, RISC0_METAL=0 or RISC0_METAL_SKIP=groth16, the Docker prover.
+metal = [
+  "dep:circom-witnesscalc",
+  "dep:rayon",
+  "dep:risc0-groth16-sys",
+  "dep:sha2",
+  "dep:wtns-file",
+  "prove",
+  "risc0-groth16-sys/metal",
+  "risc0-zkp/metal",
+]
 prove = [
   "dep:cfg-if",
   "dep:risc0-core",

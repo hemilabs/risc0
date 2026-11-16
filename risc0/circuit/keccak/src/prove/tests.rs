@@ -27,8 +27,21 @@ use crate::{
     zirgen::circuit::*,
 };
 
+/// Under `metal`, the Metal unit tests' GPU lock (`hal::metal::tests::gpu_test_lock`, PLAN 8.7):
+/// these tests allocate Metal memory, which the working-set budget tests count process-wide.
+#[cfg(feature = "metal")]
+fn gpu_lock() -> Option<std::sync::MutexGuard<'static, ()>> {
+    Some(crate::prove::hal::metal::tests::gpu_test_lock())
+}
+
+#[cfg(not(feature = "metal"))]
+fn gpu_lock() -> Option<()> {
+    None
+}
+
 #[test]
 fn basic() {
+    let _gpu = gpu_lock();
     let po2 = 8; // 256
     let inputs = test_inputs(po2);
     let prover = keccak_prover().unwrap();
@@ -38,6 +51,7 @@ fn basic() {
 
 #[test]
 fn host_witness() {
+    let _gpu = gpu_lock();
     let po2 = 8;
     let inputs = test_inputs(po2);
     let prover = keccak_prover().unwrap();
@@ -50,6 +64,7 @@ fn host_witness() {
 
 #[test]
 fn fwd_rev_ab() {
+    let _gpu = gpu_lock();
     cfg_if! {
         if #[cfg(feature = "cuda")] {
             use risc0_zkp::hal::cuda::CudaHalPoseidon2;
@@ -61,6 +76,13 @@ fn fwd_rev_ab() {
             use crate::prove::hal::hip::HipCircuitHalPoseidon2;
             let hal = Rc::new(HipHalPoseidon2::new());
             let circuit_hal = HipCircuitHalPoseidon2::new(hal.clone());
+        } else if #[cfg(feature = "metal")] {
+            // The Metal HAL: GPU scatter, host witness into the shared buffers (Seq modes are
+            // the host path), GPU zeroize.
+            use risc0_zkp::hal::metal::MetalHalPoseidon2;
+            use crate::prove::hal::metal::MetalCircuitHalPoseidon2;
+            let hal = Rc::new(MetalHalPoseidon2::new());
+            let circuit_hal = MetalCircuitHalPoseidon2::new(hal.clone());
         } else {
             use risc0_zkp::{core::hash::sha::Sha256HashSuite, hal::cpu::CpuHal};
             use crate::prove::hal::cpu::CpuCircuitHal;

@@ -48,6 +48,15 @@ const CTRL_CACHE_CAP: usize = 4;
 type HostCtrlCache = Vec<(super::CtrlKey, Arc<Vec<BabyBearElem>>)>;
 static CTRL_CACHE: LazyLock<Mutex<HostCtrlCache>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
+/// The host ctrl cache, poison-tolerant (C10): every entry is inserted whole, so a panic on
+/// another thread while it held the lock cannot leave a torn entry, and a poisoned lock must not
+/// fail every later proof of the process.
+pub(crate) fn ctrl_cache() -> std::sync::MutexGuard<'static, HostCtrlCache> {
+    CTRL_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn ctrl_matches(ctrl: &[BabyBearElem], zkr: &Program, total_cycles: usize) -> bool {
     use rayon::prelude::*;
     let ctrl_size = zkr.code_size;
@@ -66,9 +75,7 @@ fn ctrl_matches(ctrl: &[BabyBearElem], zkr: &Program, total_cycles: usize) -> bo
 pub(crate) fn host_ctrl_for(zkr: &Program) -> Arc<Vec<BabyBearElem>> {
     let total_cycles = 1usize << zkr.po2;
     let key = super::ctrl_cache_key(zkr);
-    let hit = CTRL_CACHE
-        .lock()
-        .unwrap()
+    let hit = ctrl_cache()
         .iter()
         .find(|e| e.0 == key)
         .map(|e| e.1.clone());
@@ -93,7 +100,7 @@ pub(crate) fn host_ctrl_for(zkr: &Program) -> Arc<Vec<BabyBearElem>> {
             });
     }
     let v = Arc::new(v);
-    let mut cache = CTRL_CACHE.lock().unwrap();
+    let mut cache = ctrl_cache();
     cache.retain(|e| e.0 != key);
     if cache.len() >= CTRL_CACHE_CAP {
         cache.remove(0);
@@ -110,20 +117,34 @@ pub(crate) fn host_ctrl_for(zkr: &Program) -> Arc<Vec<BabyBearElem>> {
 /// i.e. it compares two independently computed witnesses (unlike the host
 /// shadow check, which only compares a buffer with its own upload source).
 fn prewitgen_check_due(key: super::CtrlKey) -> bool {
-    static CHECKED: LazyLock<Mutex<Vec<super::CtrlKey>>> = LazyLock::new(|| Mutex::new(Vec::new()));
     match std::env::var("RISC0_RECURSION_PREWITGEN_CHECK").as_deref() {
         Ok("0") => false,
         Ok("1") | Ok("always") => true,
-        Ok("once") => {
-            let mut c = CHECKED.lock().unwrap();
-            if c.contains(&key) {
-                false
-            } else {
-                c.push(key);
-                true
-            }
-        }
+        Ok("once") => first_prewitgen_check(key),
         _ => std::env::var_os("RISC0_RECURSION_SHADOW_CHECK").is_some(),
+    }
+}
+
+/// Programs already checked by `RISC0_RECURSION_PREWITGEN_CHECK=once` in this process.
+static PREWITGEN_CHECKED: LazyLock<Mutex<Vec<super::CtrlKey>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// The set of checked programs, poison-tolerant (C10): an entry is pushed whole, so a poisoned
+/// lock holds no torn state and must not fail every later proof of the process.
+pub(crate) fn prewitgen_checked() -> std::sync::MutexGuard<'static, Vec<super::CtrlKey>> {
+    PREWITGEN_CHECKED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// True the first time `key` is seen (`RISC0_RECURSION_PREWITGEN_CHECK=once`).
+pub(crate) fn first_prewitgen_check(key: super::CtrlKey) -> bool {
+    let mut c = prewitgen_checked();
+    if c.contains(&key) {
+        false
+    } else {
+        c.push(key);
+        true
     }
 }
 
@@ -151,18 +172,63 @@ pub(crate) struct HostChains {
     pub pinned: Option<[usize; 5]>,
 }
 
-#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "metal"))]
 fn pinned_ptr<T>(p: Option<&super::pinned::PinnedTrace>, i: usize) -> Option<*const T> {
     p.map(|p| p.ptr::<T>(i))
 }
 
-#[cfg(not(any(feature = "cuda", feature = "rocm")))]
+#[cfg(not(any(feature = "cuda", feature = "rocm", feature = "metal")))]
 fn pinned_ptr<T>(_p: Option<&()>, _i: usize) -> Option<*const T> {
     None
 }
 
-/// Chains at least this long run on the host.
+/// Chains at least this long run on the host (default; `RISC0_REC_HOST_CHAIN_MIN_LEN` overrides
+/// it, read once, for the C12 retune).
 const HOST_CHAIN_MIN_LEN: usize = 16;
+
+fn host_chain_min_len() -> usize {
+    static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("RISC0_REC_HOST_CHAIN_MIN_LEN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &usize| n >= 2)
+            .unwrap_or(HOST_CHAIN_MIN_LEN)
+    });
+    *N
+}
+
+thread_local! {
+    /// Test / validation hook ([with_noise_seed]): when set, the ZK noise of the witness and
+    /// accum tails comes from a `StdRng` seeded with it instead of `rand::rng()`, so two provers
+    /// (CPU and Metal) given the same input produce bit-identical seals.
+    static NOISE_SEED: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with deterministic ZK noise on this thread (seed `seed`); restores the previous state.
+/// Only for seal-equality validation: deterministic noise removes zero knowledge.
+#[allow(dead_code)] // used by the Metal seal check and tests
+pub(crate) fn with_noise_seed<R>(seed: u64, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<u64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            NOISE_SEED.with(|s| s.set(self.0));
+        }
+    }
+    let _restore = Restore(NOISE_SEED.with(|s| s.replace(Some(seed))));
+    f()
+}
+
+/// The RNG for one noise fill: `rand::rng()` normally, a seeded `StdRng` under
+/// [with_noise_seed] (`stream` separates the data and accum fills).
+fn noise_rng(stream: u64) -> Box<dyn rand::RngCore> {
+    use rand::SeedableRng as _;
+    match NOISE_SEED.with(|s| s.get()) {
+        Some(seed) => Box::new(rand::rngs::StdRng::seed_from_u64(
+            seed ^ stream.wrapping_mul(0x9e37_79b9_7f4a_7c15),
+        )),
+        None => Box::new(rand::rng()),
+    }
+}
 
 /// When set, every witness generated with host chains is regenerated without them and compared
 /// (a test hook; see [crate::prove::set_host_chains_check]).
@@ -205,7 +271,7 @@ pub(crate) fn try_host_chains_range(
     complete: bool,
 ) -> Result<(Option<HostChains>, usize)> {
     use risc0_circuit_recursion_sys::risc0_circuit_recursion_cpu_chains;
-    let min_len = HOST_CHAIN_MIN_LEN;
+    let min_len = host_chain_min_len();
     let n = cycles.len();
     let mut chains: Vec<u32> = Vec::new();
     let mut heads: Vec<u32> = Vec::new();
@@ -267,7 +333,6 @@ pub(crate) fn try_host_chains_range(
 }
 
 /// Concatenate the chains of two disjoint passes.
-#[cfg_attr(not(any(feature = "cuda", feature = "rocm")), allow(dead_code))]
 pub(crate) fn merge_host_chains(
     a: Option<HostChains>,
     b: Option<HostChains>,
@@ -343,11 +408,11 @@ where
             BabyBearElem::INVALID,
         );
 
-        #[cfg(any(feature = "cuda", feature = "rocm"))]
+        #[cfg(any(feature = "cuda", feature = "rocm", feature = "metal"))]
         let pinned_guard = preflight.pinned.lock().unwrap();
-        #[cfg(any(feature = "cuda", feature = "rocm"))]
+        #[cfg(any(feature = "cuda", feature = "rocm", feature = "metal"))]
         let pinned = pinned_guard.as_ref();
-        #[cfg(not(any(feature = "cuda", feature = "rocm")))]
+        #[cfg(not(any(feature = "cuda", feature = "rocm", feature = "metal")))]
         let pinned: Option<&()> = None;
         let raw_trace = RawPreflightTrace {
             wom: pinned_ptr(pinned, 0).unwrap_or(preflight.trace.wom.as_ptr()),
@@ -402,7 +467,7 @@ where
             // Long chains from `prepare`, or computed here (a few ms of host time that saves
             // ~20 ms of single-thread GPU time).
             let mut chains = preflight.host_chains.lock().unwrap().take();
-            if chains.is_none() && cfg!(any(feature = "cuda", feature = "rocm")) {
+            if chains.is_none() && super::host_chains_backend() {
                 chains = host_chains(zkr, preflight);
             } else if let Some(hc) = chains.as_mut() {
                 // Upload the chain rows from the page-locked copy, if there is one.
@@ -513,7 +578,10 @@ where
         // Add random noise to end of the data columns
         scope!("noise", {
             use risc0_zkp::ZK_CYCLES;
-            let mut rng = rand::rng();
+            // 3.1 security fix (f68f86020): an independent random value per noise cell, in every
+            // mode. The row-pass path no longer uses `fill_tail` (it repeated one value);
+            // `noise_rng` keeps the seeded test hook ([with_noise_seed]).
+            let mut rng = noise_rng(1);
             let noise: Vec<BabyBearElem> = (0..ZK_CYCLES * CIRCUIT.data_size())
                 .map(|_| BabyBearElem::random(&mut rng))
                 .collect();
@@ -562,7 +630,7 @@ where
         // Add random noise to end of accum
         scope!("noise", {
             use risc0_zkp::ZK_CYCLES;
-            let mut rng = rand::rng();
+            let mut rng = noise_rng(2);
             let total_cycles = self.total_cycles as usize;
             let noise: Vec<BabyBearElem> = (0..ZK_CYCLES * CIRCUIT.accum_size())
                 .map(|_| BabyBearElem::random(&mut rng))

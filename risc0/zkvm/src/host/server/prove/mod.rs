@@ -19,6 +19,18 @@ pub(crate) mod keccak;
 mod prover_impl;
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, feature = "metal"))]
+mod tests_c16;
+#[cfg(all(test, feature = "metal"))]
+mod tests_metal_wrap;
+#[cfg(all(test, feature = "metal"))]
+mod tests_z12;
+#[cfg(all(
+    test,
+    feature = "metal",
+    not(any(feature = "cuda", feature = "rocm", feature = "intel"))
+))]
+mod tests_z17;
 pub(crate) mod union_peak;
 
 use std::rc::Rc;
@@ -72,6 +84,13 @@ pub trait ProverServer: private::Sealed {
     }
 
     /// Prove the specified ELF binary using the specified [VerifierContext].
+    ///
+    /// On Metal, when this process proves the keccak requests (no coprocessor callback), the
+    /// session's keccak max po2 is lowered to the largest po2 whose keccak proof fits the
+    /// working-set limit (po2 18 needs ~7 GiB, so below that it becomes 17;
+    /// `RISC0_KECCAK_PO2_HEADROOM_CAP=0` keeps it). The guest sees the smaller batch capacity:
+    /// `sys_keccak` reports a full batch sooner, and a guest that ignores that report fails
+    /// execution. [ProverServer::prove_session] gets no cap: its session was executed already.
     fn prove_with_ctx(
         &self,
         env: ExecutorEnv<'_>,
@@ -106,6 +125,16 @@ pub trait ProverServer: private::Sealed {
     ) -> Result<SegmentReceipt>;
 
     /// Prove the specified keccak request
+    ///
+    /// The request is proved at `request.po2`, which may be smaller than the session's keccak
+    /// max po2 (`ExecutorEnvBuilder::keccak_max_po2`): since K10 the executor asks for the
+    /// smallest po2 in [risc0_circuit_keccak::KECCAK_PO2_RANGE] whose circuit holds the batch
+    /// (`RISC0_KECCAK_RIGHTSIZE_PO2=0` restores the max), so a [crate::CoprocessorCallback]
+    /// sees requests of several sizes. The lifted receipt's control ID is that po2's
+    /// `KECCAK_CONTROL_IDS` entry, under `KECCAK_CONTROL_ROOT` for every po2. On Metal, at a
+    /// small working-set budget, the provers this thread cached (segment, recursion) are
+    /// released first when they leave no room for the proof (`RISC0_KECCAK_SMALL_BUDGET_RELEASE=0`
+    /// keeps them).
     fn prove_keccak(&self, request: &crate::ProveKeccakRequest)
         -> Result<SuccinctReceipt<Unknown>>;
 
@@ -218,6 +247,15 @@ pub trait ProverServer: private::Sealed {
         // Let the Groth16 prover load its proving key while identity_p254 runs.
         if let Err(e) = risc0_groth16::prove::prestart_prover() {
             tracing::warn!("groth16 prover prestart failed (non-fatal): {e}");
+        }
+        // Metal (Z10): identity_p254 proves on the GPU with its own HAL (~1.4 GB pool at po2 18).
+        // Return this thread's segment / lift / join pools first, so that it does not sit beside
+        // them (the wrap's peak would be STARK pools + 1.4 GB). `shrink_wrap_with` below releases
+        // them anyway; the next session rebuilds them either way. `RISC0_METAL_WRAP_EARLY_RELEASE=0`
+        // keeps them until then (the pre-Z10 order).
+        #[cfg(feature = "metal")]
+        if std::env::var("RISC0_METAL_WRAP_EARLY_RELEASE").as_deref() != Ok("0") {
+            prover_impl::release_cached_provers();
         }
         let ident_receipt = self.identity_p254(receipt).unwrap();
         let ident_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -491,7 +529,16 @@ pub(crate) fn exclusive_gpu() -> impl Sized {
     risc0_zkp::hal::cuda::exclusive()
 }
 
-#[cfg(not(feature = "cuda"))]
+/// Metal: the process-wide GPU lock every `MetalHal` takes per encode/commit/wait (see
+/// `risc0_zkp::hal::metal::exclusive`). Held for the whole call, a HAL call from another thread
+/// blocks until it drops, so code under it must not wait for a thread that uses a HAL (e.g. the
+/// Metal warmup, see `prover_impl::start_metal_warmup`).
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+pub(crate) fn exclusive_gpu() -> impl Sized {
+    risc0_zkp::hal::metal::exclusive()
+}
+
+#[cfg(not(any(feature = "cuda", feature = "metal")))]
 pub(crate) fn exclusive_gpu() -> impl Sized {}
 
 /// Return the STARK HAL's cached device memory to the driver, around the Groth16 wrap.
@@ -510,11 +557,28 @@ pub(crate) fn exclusive_gpu() -> impl Sized {}
 /// nor the keccak eval_check allocates through it. Without this, a session's keccak proofs and its
 /// wrap, and the next session's segments, ran with the segments' idle buffers still cached and
 /// spilled into shared system memory on an Arc Pro B70 (32 GB), at 2-5x the time.
-pub(crate) fn release_hal_buffers() {
+///
+/// Public on Metal builds (`risc0_zkvm::release_hal_buffers`, item G8): a long-lived worker calls
+/// it after a proof that failed before its wrap (the wrap releases on success), so the segment
+/// prover's pool (2-10 GB of the owner's unified memory) is not held until the next proof. It
+/// releases the provers cached by **the calling thread** (call it on the thread that proved), and
+/// only while that thread is not proving (a prover in use is left alone). Other builds keep it
+/// crate-private.
+pub fn release_hal_buffers() {
     #[cfg(feature = "cuda")]
     risc0_zkp::hal::cuda::clear_buffer_pool();
     #[cfg(feature = "rocm")]
     risc0_zkp::hal::hip::clear_buffer_pool();
     #[cfg(feature = "intel")]
     risc0_zkp::hal::intel::release_idle_buffers();
+    // Metal has no process-wide pool: each `MetalHal` pools its own buffers (capped at half of
+    // `recommendedMaxWorkingSetSize`) and frees them when it drops. The long-lived HALs are the
+    // ones this thread's cached segment and recursion provers hold, so dropping those provers
+    // returns their pools (and live scratch) to the system; the next proof rebuilds them (the
+    // PSOs are process-wide and stay). On unified memory this memory is the owner's RAM: on a
+    // 16 GB Mac (a ~4-8 GB GPU budget, PLAN 9.1) the wrap and the keccak proofs must not run
+    // beside a segment prover's idle pool. Callers run this on the proving thread, with the
+    // segment pipeline drained (`shrink_wrap_with` runs it on the calling thread).
+    #[cfg(feature = "metal")]
+    prover_impl::release_cached_provers();
 }

@@ -67,18 +67,24 @@ pub trait KeccakProver {
     }
 
     fn verify(&self, seal: &Seal) -> Result<()> {
-        let hash_suite = Poseidon2HashSuite::new_suite();
-
-        // We don't have a `code' buffer to verify.
-        let check_code_fn = |_: u32, _: &Digest| Ok(());
-
-        Ok(risc0_zkp::verify::verify(
-            &CircuitImpl,
-            &hash_suite,
-            seal,
-            check_code_fn,
-        )?)
+        verify_seal(seal)
     }
+}
+
+/// Verify a keccak seal on the CPU ([KeccakProver::verify] without a prover: it uses no HAL, so it
+/// can run on any thread, e.g. beside the next proof).
+pub fn verify_seal(seal: &[u32]) -> Result<()> {
+    let hash_suite = Poseidon2HashSuite::new_suite();
+
+    // We don't have a `code' buffer to verify.
+    let check_code_fn = |_: u32, _: &Digest| Ok(());
+
+    Ok(risc0_zkp::verify::verify(
+        &CircuitImpl,
+        &hash_suite,
+        seal,
+        check_code_fn,
+    )?)
 }
 
 /// A keccak proof's witness, made on the CPU by [host_witness].
@@ -127,6 +133,21 @@ fn initial_global(po2: usize) -> Vec<Val> {
     global
 }
 
+/// Build the keccak Metal pipeline states (through the binary archive on disk, K5) so the first
+/// keccak proof does not pay for them (minutes cold, PLAN 9.1). Best effort: a failure is
+/// logged; `keccak_prover()` reports it again. Takes no GPU lock (safe on a background thread
+/// beside a running session).
+#[cfg(feature = "metal")]
+pub fn metal_warmup() {
+    if !risc0_zkp::hal::metal::enabled("keccak") {
+        return;
+    }
+    match self::hal::metal::warmup() {
+        Ok(report) => tracing::debug!("keccak Metal warmup: {report:?}"),
+        Err(e) => tracing::warn!("keccak Metal warmup failed: {e:#}"),
+    }
+}
+
 pub fn keccak_prover() -> Result<Box<dyn KeccakProver>> {
     cfg_if! {
         if #[cfg(feature = "cuda")] {
@@ -135,8 +156,12 @@ pub fn keccak_prover() -> Result<Box<dyn KeccakProver>> {
             self::hal::hip::keccak_prover()
         } else if #[cfg(feature = "intel")] {
             self::hal::intel::keccak_prover()
-        // } else if #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), target_os = "ios"))] {
-        //     self::metal::keccak_prover()
+        } else if #[cfg(feature = "metal")] {
+            if risc0_zkp::hal::metal::enabled("keccak") {
+                self::hal::metal::keccak_prover()
+            } else {
+                self::hal::cpu::keccak_prover()
+            }
         } else {
             self::hal::cpu::keccak_prover()
         }

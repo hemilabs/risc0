@@ -151,10 +151,7 @@ impl<H: Hal> PolyGroup<H> {
         if self.coeffs_host.is_some() {
             return;
         }
-        let coeffs = self
-            .coeffs
-            .take()
-            .expect("coeffs already released");
+        let coeffs = self.coeffs.take().expect("coeffs already released");
         let host: Vec<H::Elem> = coeffs.to_vec();
         // coeffs goes out of scope here -> device buffer freed (no other Rc refs).
         self.coeffs_host = Some(Rc::new(host));
@@ -196,6 +193,122 @@ impl<H: Hal> PolyGroup<H> {
     }
 }
 
+/// Host copy of a committed [PolyGroup] (C13): the coefficients and the whole Merkle tree.
+/// [PolyGroup::from_host] rebuilds the group on any HAL of the same type without hashing (the
+/// evaluated domain is re-expanded from the coefficients, as [PolyGroup::restore_evaluated]
+/// does). Used to keep a recursion program's committed ctrl group across the HALs that a
+/// long-lived prover drops between jobs.
+#[derive(Clone)]
+pub struct PolyGroupHost<E> {
+    coeffs: Vec<E>,
+    count: usize,
+    name: &'static str,
+    params: crate::merkle::MerkleTreeParams,
+    nodes: Vec<crate::core::digest::Digest>,
+    root: crate::core::digest::Digest,
+    top_nodes: Vec<crate::core::digest::Digest>,
+}
+
+impl<E> PolyGroupHost<E> {
+    /// Host bytes held.
+    pub fn bytes(&self) -> usize {
+        self.coeffs.len() * std::mem::size_of::<E>()
+            + (self.nodes.len() + self.top_nodes.len())
+                * std::mem::size_of::<crate::core::digest::Digest>()
+    }
+
+    /// The Merkle root of the group.
+    pub fn root(&self) -> &crate::core::digest::Digest {
+        &self.root
+    }
+
+    /// Whether two copies hold the same group (coefficients, every tree node, root, top layer).
+    pub fn same_as(&self, other: &Self) -> bool
+    where
+        E: PartialEq,
+    {
+        self.count == other.count
+            && self.params.row_size == other.params.row_size
+            && self.params.col_size == other.params.col_size
+            && self.params.top_size == other.params.top_size
+            && self.root == other.root
+            && self.coeffs == other.coeffs
+            && self.nodes == other.nodes
+            && self.top_nodes == other.top_nodes
+    }
+}
+
+impl<H: Hal> PolyGroup<H> {
+    /// Host bytes [Self::to_host] would copy (its [PolyGroupHost::bytes]), without copying.
+    pub fn host_bytes(&self) -> usize {
+        let coeffs = match (&self.coeffs, &self.coeffs_host) {
+            (Some(c), _) => c.size(),
+            (None, Some(h)) => h.len(),
+            (None, None) => 0,
+        };
+        coeffs * std::mem::size_of::<H::Elem>() + self.merkle.host_bytes()
+    }
+
+    /// Copy the group's coefficients and Merkle tree to the host ([PolyGroupHost]).
+    pub fn to_host(&self) -> PolyGroupHost<H::Elem> {
+        let coeffs = match (&self.coeffs, &self.coeffs_host) {
+            (Some(c), _) => c.to_vec(),
+            (None, Some(h)) => h.as_ref().clone(),
+            (None, None) => panic!("PolyGroup::to_host: no coefficients"),
+        };
+        let (params, nodes, root, top_nodes) = self.merkle.to_host();
+        PolyGroupHost {
+            coeffs,
+            count: self.count,
+            name: self.coeffs_name,
+            params,
+            nodes,
+            root,
+            top_nodes,
+        }
+    }
+
+    /// Rebuild a group [Self::to_host] copied, on `hal`: upload the coefficients and the tree,
+    /// and re-expand the evaluated domain from the coefficients (bit-reverse, expand + NTT,
+    /// bit-reverse back: what [Self::new] computed from them). No Merkle hashing.
+    pub fn from_host(hal: &H, host: &PolyGroupHost<H::Elem>) -> Self {
+        scope_with!("poly_group_from_host({})", host.name);
+        let count = host.count;
+        let coeffs = hal.copy_from_elem(host.name, &host.coeffs);
+        let size = host.coeffs.len() / count;
+        let domain = size * INV_RATE;
+        assert_eq!(host.params.row_size, domain);
+        assert_eq!(host.params.col_size, count);
+        let evaluated = hal.alloc_elem("evaluated", count * domain);
+        hal.batch_bit_reverse(&coeffs, count);
+        hal.batch_expand_into_evaluate_ntt(&evaluated, &coeffs, count, log2_ceil(INV_RATE));
+        hal.batch_bit_reverse(&coeffs, count);
+        let merkle = MerkleTreeProver::from_host(
+            hal,
+            &evaluated,
+            host.params,
+            &host.nodes,
+            host.root,
+            &host.top_nodes,
+        );
+        PolyGroup {
+            coeffs: Some(coeffs),
+            coeffs_host: None,
+            coeffs_name: host.name,
+            count,
+            evaluated: Some(evaluated),
+            evaluated_host: None,
+            merkle,
+        }
+    }
+}
+
+/// A GPU HAL whose buffers live in host-shared memory (Apple Metal): host spills of device buffers
+/// save nothing there. The CPU HAL also reports unified memory, but no GPU memory size.
+fn unified_memory_gpu<H: Hal>(hal: &H) -> bool {
+    hal.has_unified_memory() && hal.gpu_total_memory() != usize::MAX
+}
+
 impl<H: Hal> PolyGroup<H> {
     pub fn new(
         hal: &H,
@@ -204,7 +317,7 @@ impl<H: Hal> PolyGroup<H> {
         size: usize,
         name: &'static str,
     ) -> Self {
-        Self::new_impl(hal, coeffs, None, count, size, name)
+        Self::new_impl(hal, coeffs, None, false, count, size, name)
     }
 
     /// Build from coefficients (natural order) and their already-computed LDE, as
@@ -217,13 +330,30 @@ impl<H: Hal> PolyGroup<H> {
         size: usize,
         name: &'static str,
     ) -> Self {
-        Self::new_impl(hal, coeffs, Some(evaluated), count, size, name)
+        Self::new_impl(hal, coeffs, Some(evaluated), false, count, size, name)
     }
 
+    /// [Self::new_with_evaluated] for coefficients still in bit-reversed order, as
+    /// [`Hal::commit_coeffs_lde_bit_reversed`] leaves them (Z14): the Merkle hash bit-reverses
+    /// them.
+    pub fn new_with_evaluated_bit_reversed(
+        hal: &H,
+        coeffs: H::Buffer<H::Elem>,
+        evaluated: H::Buffer<H::Elem>,
+        count: usize,
+        size: usize,
+        name: &'static str,
+    ) -> Self {
+        Self::new_impl(hal, coeffs, Some(evaluated), true, count, size, name)
+    }
+
+    /// `coeffs_bit_reversed`: `coeffs` (with `pre_evaluated`) is still bit-reversed. Without
+    /// `pre_evaluated` it always is (the expand NTT reads that order).
     fn new_impl(
         hal: &H,
         coeffs: H::Buffer<H::Elem>,
         pre_evaluated: Option<H::Buffer<H::Elem>>,
+        coeffs_bit_reversed: bool,
         count: usize,
         size: usize,
         name: &'static str,
@@ -232,19 +362,31 @@ impl<H: Hal> PolyGroup<H> {
         assert_eq!(coeffs.size(), count * size);
         let domain = size * INV_RATE;
         let t0 = std::time::Instant::now();
-        let evaluated = match pre_evaluated {
+        // See the coeffs spill below.
+        let spill_enabled = size >= (1 << 22) && !unified_memory_gpu(hal);
+        let coeffs_bytes = coeffs.size() * std::mem::size_of::<H::Elem>();
+        let spill_threshold: usize = 512 << 20;
+        let spill = spill_enabled && coeffs_bytes >= spill_threshold;
+        // Z14: bit-reverse the coefficients inside the Merkle row hash when the HAL fuses the two
+        // (not when they go to the host before it).
+        let defer_bit_reverse =
+            !spill && hal.fuses_bit_reverse_into_hash(domain, count, log2_ceil(size));
+        let (evaluated, bit_reverse_pending) = match pre_evaluated {
             Some(e) => {
                 assert_eq!(e.size(), count * domain);
-                e
+                (e, coeffs_bit_reversed)
             }
             None => {
                 let evaluated = hal.alloc_elem("evaluated", count * domain);
                 hal.batch_expand_into_evaluate_ntt(&evaluated, &coeffs, count, log2_ceil(INV_RATE));
-                hal.batch_bit_reverse(&coeffs, count);
-                evaluated
+                (evaluated, true)
             }
         };
         let t_ntt = t0.elapsed();
+        let merkle_bit_reverse = bit_reverse_pending && defer_bit_reverse;
+        if bit_reverse_pending && !merkle_bit_reverse {
+            hal.batch_bit_reverse(&coeffs, count);
+        }
         let t_bitrev = t0.elapsed();
 
         // Spill coeffs to host BEFORE merkle alloc if large enough. At po2=22
@@ -256,10 +398,10 @@ impl<H: Hal> PolyGroup<H> {
         // PolyGroups plus witgen fit comfortably in 24 GB; spilling adds
         // H2D/D2H overhead and perturbs the driver mempool state in ways that
         // regress performance (and can OOM later stages via mempool churn).
-        let spill_enabled = size >= (1 << 22);
-        let coeffs_bytes = coeffs.size() * std::mem::size_of::<H::Elem>();
-        let spill_threshold: usize = 512 << 20;
-        let (coeffs_dev, coeffs_host) = if spill_enabled && coeffs_bytes >= spill_threshold {
+        // Unified-memory GPU HALs (Metal) skip it: the "host" copy would sit in the same physical
+        // memory as the device buffer and save nothing (same test as prover.rs's
+        // `unified_memory_gpu`, which gates the evaluated spill).
+        let (coeffs_dev, coeffs_host) = if spill {
             let host: Vec<H::Elem> = coeffs.to_vec();
             // Mark the underlying device buffer to bypass the reuse pool on
             // drop — we want the VRAM returned to the driver immediately so
@@ -275,7 +417,17 @@ impl<H: Hal> PolyGroup<H> {
             (Some(coeffs), None)
         };
 
-        let merkle = MerkleTreeProver::new(hal, &evaluated, domain, count, QUERIES);
+        let merkle = MerkleTreeProver::new_bit_reverse(
+            hal,
+            &evaluated,
+            domain,
+            count,
+            QUERIES,
+            coeffs_dev
+                .as_ref()
+                .filter(|_| merkle_bit_reverse)
+                .map(|c| (c, count)),
+        );
         let t_merkle = t0.elapsed();
         if std::env::var_os("RISC0_VERBOSE").is_some() {
             eprintln!(

@@ -10,7 +10,12 @@
 // as the serial evaluator's.
 //
 // Values live in a node-indexed array (18.1M x 32 B = 580 MB), allocated and pre-faulted once
-// at compile time (on the graph preload thread) and reused by every proof.
+// at compile time (on the graph preload thread) and reused by every proof. Metal item G15: for
+// small Macs (`resident = false` in [compile_with]), the array's pages are handed back to the
+// kernel between proofs (macOS `madvise(MADV_FREE_REUSABLE)`: out of the process' footprint, and
+// reclaimable under memory pressure) and taken back for each evaluation (`MADV_FREE_REUSE`; pages
+// the kernel did reclaim come back zero-filled and are faulted in again). The evaluation writes
+// every node before reading it, so the array's contents between proofs do not matter.
 
 use std::sync::{
     atomic::{AtomicU32, Ordering},
@@ -41,6 +46,8 @@ pub(crate) struct ParProgram {
     roots: Vec<u32>,
     cnt: Vec<AtomicU32>,
     values: Mutex<Vec<L>>,
+    /// Keep `values` in the footprint between proofs (else see the module comment).
+    resident: bool,
     pool: rayon::ThreadPool,
 }
 
@@ -56,11 +63,25 @@ fn find(p: &mut [u32], mut x: u32) -> u32 {
 /// ASAP levels per band.
 const BAND: u32 = 32;
 /// Evaluation threads (measured best on a 16-core host; more threads contend for memory).
+#[cfg(feature = "cuda")]
 const THREADS: usize = 12;
 
+#[cfg(feature = "cuda")]
 pub(crate) fn compile(nodes: &Nodes<U254, VecNodes>, signals: &[usize]) -> Option<ParProgram> {
+    compile_with(nodes, signals, THREADS, true)
+}
+
+/// [compile] with `nthr` evaluation threads (Metal sizes the pool from the host, PLAN 9.1).
+/// `resident = false` (Metal item G15, small Macs): the value array is reusable memory between
+/// evaluations (see the module comment).
+pub(crate) fn compile_with(
+    nodes: &Nodes<U254, VecNodes>,
+    signals: &[usize],
+    nthr: usize,
+    resident: bool,
+) -> Option<ParProgram> {
     let band = BAND;
-    let nthr = THREADS;
+    let nthr = nthr.max(1);
     let ni = compile_node_ins(nodes, signals)?;
     let n = nodes.nodes.len();
     let mut level = vec![0u32; n];
@@ -175,11 +196,9 @@ pub(crate) fn compile(nodes: &Nodes<U254, VecNodes>, signals: &[usize]) -> Optio
         .thread_name(|i| format!("g16-witness-{i}"))
         .build()
         .ok()?;
-    // Fault the value array in now (off the proving path): vec![0; n] is calloc'd, and the
-    // first evaluation would otherwise take ~150-200 ms of page faults.
-    let mut values = vec![[0u64; 4]; n];
-    for chunk in values.chunks_mut(128) {
-        unsafe { std::ptr::write_volatile(&mut chunk[0], [1, 0, 0, 0]) };
+    let mut values = faulted_values(n);
+    if !resident {
+        advise(&mut values, false);
     }
     Some(ParProgram {
         ni,
@@ -194,8 +213,58 @@ pub(crate) fn compile(nodes: &Nodes<U254, VecNodes>, signals: &[usize]) -> Optio
         roots,
         cnt,
         values: Mutex::new(values),
+        resident,
         pool,
     })
+}
+
+/// A value array of `n` nodes with its pages faulted in (off the proving path): vec![0; n] is
+/// calloc'd, and the first evaluation would otherwise take ~150-200 ms of page faults.
+fn faulted_values(n: usize) -> Vec<L> {
+    let mut values = vec![[0u64; 4]; n];
+    for chunk in values.chunks_mut(128) {
+        unsafe { std::ptr::write_volatile(&mut chunk[0], [1, 0, 0, 0]) };
+    }
+    values
+}
+
+/// Metal item G15: the whole pages of `v` handed back to the kernel (`reuse = false`:
+/// `MADV_FREE_REUSABLE`, they leave the footprint and may be reclaimed) or taken back
+/// (`MADV_FREE_REUSE`, before the next use). Contents are undefined after a hand-back. A no-op
+/// off macOS (where every program is resident).
+#[cfg(target_os = "macos")]
+fn advise(v: &mut [L], reuse: bool) {
+    use std::ffi::{c_int, c_void};
+    extern "C" {
+        fn madvise(addr: *mut c_void, len: usize, advice: c_int) -> c_int;
+        fn getpagesize() -> c_int;
+    }
+    const MADV_FREE_REUSABLE: c_int = 7;
+    const MADV_FREE_REUSE: c_int = 8;
+    // SAFETY: no arguments; returns the VM page size.
+    let page = unsafe { getpagesize() }.max(4096) as usize;
+    let start = (v.as_mut_ptr() as usize).next_multiple_of(page);
+    let end = (v.as_mut_ptr() as usize + std::mem::size_of_val(v)) / page * page;
+    if end > start {
+        let advice = if reuse {
+            MADV_FREE_REUSE
+        } else {
+            MADV_FREE_REUSABLE
+        };
+        // SAFETY: whole pages inside `v`'s live allocation, which this caller holds mutably;
+        // the advice changes only the pages' accounting and contents, which no one reads before
+        // writing.
+        unsafe { madvise(start as *mut c_void, end - start, advice) };
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn advise(_: &mut [L], _: bool) {}
+
+/// Whether the program keeps its value array in the footprint between evaluations.
+#[cfg(all(test, feature = "metal"))]
+pub(crate) fn is_resident(p: &ParProgram) -> bool {
+    p.resident
 }
 
 struct SyncPtr<T>(*mut T);
@@ -255,6 +324,9 @@ pub(crate) fn eval(p: &ParProgram, nodes: &Nodes<U254, VecNodes>, inputs: &[U254
         .iter()
         .all(|&(w, s)| (w as usize) < out.len() && (s as usize) < out.len()));
     let mut guard = p.values.lock().unwrap();
+    if !p.resident {
+        advise(&mut guard, true);
+    }
     let v = SyncPtr(guard.as_mut_ptr());
     let o = SyncPtr(out.as_mut_ptr());
     let run = |i: u32, v: &SyncPtr<L>, o: &SyncPtr<L>| unsafe {
@@ -315,6 +387,9 @@ pub(crate) fn eval(p: &ParProgram, nodes: &Nodes<U254, VecNodes>, inputs: &[U254
             })
         });
         debug_assert!(p.cnt.iter().all(|c| c.load(Ordering::Relaxed) == 0));
+    }
+    if !p.resident {
+        advise(&mut guard, false);
     }
     drop(guard);
     for &(w, src) in &p.out_dups {

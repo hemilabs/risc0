@@ -23,6 +23,13 @@
 
 // Defines instead of constexpr to appease CUDAs limitations around constants.
 // undef'd at the end of this file.
+// fpext.h provides mixed Fp/FpExt addition and subtraction: tells generated code that carries
+// its own fallback (rv32im cuda2metal.py's prelude) not to define a second set.
+#define R0_FPEXT_MIXED_ADDSUB 1
+#ifndef C2M_NO_FPEXT_MIXED_ADDSUB
+#define C2M_NO_FPEXT_MIXED_ADDSUB 1
+#endif
+
 #define BETA Fp(11)
 #define NBETA Fp(Fp::P - 11)
 
@@ -39,6 +46,16 @@ struct FpExt {
   /// Default constructor makes the zero elements
   constexpr FpExt() {}
 
+  /// Address-space qualified constructors, so that `threadgroup FpExt y[N]`, `device` and
+  /// program-scope `constant` objects can be declared (see fp.h). The `threadgroup` and `constant`
+  /// ones build `elems` in the member initializer from the raw words (a `constant` object can't be
+  /// assigned to, and a thread `Fp` can't copy-construct an `Fp` in another address space); the
+  /// `device` ones assign in the body (metal 32023.922 rejects the array member initializer for
+  /// a `device` object: "no viable constructor copying array element").
+  constexpr FpExt() threadgroup {}
+  constexpr FpExt() device {}
+  constexpr FpExt() constant {}
+
   /// Initialize from uint32_t
   explicit constexpr FpExt(uint32_t x) {
     elems[0] = x;
@@ -46,6 +63,12 @@ struct FpExt {
     elems[2] = 0;
     elems[3] = 0;
   }
+
+  explicit constexpr FpExt(uint32_t x) threadgroup : elems{x, 0u, 0u, 0u} {}
+  explicit constexpr FpExt(uint32_t x) device {
+    elems[0] = x;
+  }
+  explicit constexpr FpExt(uint32_t x) constant : elems{x, 0u, 0u, 0u} {}
 
   /// Convert from Fp to FpExt.
   explicit constexpr FpExt(Fp x) {
@@ -55,6 +78,12 @@ struct FpExt {
     elems[3] = 0;
   }
 
+  explicit constexpr FpExt(Fp x) threadgroup : elems{{x.asRaw(), true}, 0u, 0u, 0u} {}
+  explicit constexpr FpExt(Fp x) device {
+    elems[0] = x;
+  }
+  explicit constexpr FpExt(Fp x) constant : elems{{x.asRaw(), true}, 0u, 0u, 0u} {}
+
   /// Explicitly construct an FpExt from parts
   constexpr FpExt(Fp a, Fp b, Fp c, Fp d) {
     elems[0] = a;
@@ -63,6 +92,17 @@ struct FpExt {
     elems[3] = d;
   }
 
+  constexpr FpExt(Fp a, Fp b, Fp c, Fp d) threadgroup
+      : elems{{a.asRaw(), true}, {b.asRaw(), true}, {c.asRaw(), true}, {d.asRaw(), true}} {}
+  constexpr FpExt(Fp a, Fp b, Fp c, Fp d) device {
+    elems[0] = a;
+    elems[1] = b;
+    elems[2] = c;
+    elems[3] = d;
+  }
+  constexpr FpExt(Fp a, Fp b, Fp c, Fp d) constant
+      : elems{{a.asRaw(), true}, {b.asRaw(), true}, {c.asRaw(), true}, {d.asRaw(), true}} {}
+
   constexpr inline FpExt zeroize() {
     for (uint32_t i = 0; i < 4; i++) {
       elems[i].zeroize();
@@ -70,8 +110,23 @@ struct FpExt {
     return *this;
   }
 
-  // Implement the addition/subtraction overloads
+  // Implement the addition/subtraction overloads. Compound assignment modifies the object in
+  // place, so it is a member, one overload per address space the object can live in.
   constexpr FpExt operator+=(FpExt rhs) {
+    for (uint32_t i = 0; i < 4; i++) {
+      elems[i] += rhs.elems[i];
+    }
+    return *this;
+  }
+
+  constexpr FpExt operator+=(FpExt rhs) device {
+    for (uint32_t i = 0; i < 4; i++) {
+      elems[i] += rhs.elems[i];
+    }
+    return *this;
+  }
+
+  constexpr FpExt operator+=(FpExt rhs) threadgroup {
     for (uint32_t i = 0; i < 4; i++) {
       elems[i] += rhs.elems[i];
     }
@@ -85,22 +140,84 @@ struct FpExt {
     return *this;
   }
 
-  constexpr FpExt operator+(FpExt rhs) const {
-    FpExt result = *this;
-    result += rhs;
-    return result;
+  constexpr FpExt operator-=(FpExt rhs) device {
+    for (uint32_t i = 0; i < 4; i++) {
+      elems[i] -= rhs.elems[i];
+    }
+    return *this;
   }
 
-  constexpr FpExt operator-(FpExt rhs) const {
-    FpExt result = *this;
-    result -= rhs;
-    return result;
+  constexpr FpExt operator-=(FpExt rhs) threadgroup {
+    for (uint32_t i = 0; i < 4; i++) {
+      elems[i] -= rhs.elems[i];
+    }
+    return *this;
   }
 
-  constexpr FpExt operator-() const { return FpExt() - *this; }
+  // Binary, unary and comparison operators are by-value hidden friends (free functions found by
+  // argument-dependent lookup), so either operand may live in any address space (thread,
+  // threadgroup, device, constant): it is copied into a thread value first.
+  friend constexpr FpExt operator+(FpExt lhs, FpExt rhs) {
+    lhs += rhs;
+    return lhs;
+  }
+
+  friend constexpr FpExt operator-(FpExt lhs, FpExt rhs) {
+    lhs -= rhs;
+    return lhs;
+  }
+
+  friend constexpr FpExt operator-(FpExt x) { return FpExt() - x; }
+
+  // Mixed addition and subtraction with the subfield Fp (CUDA fpext.h has them; an Fp is the
+  // FpExt (x, 0, 0, 0), so only elems[0] changes). FpExt(Fp) stays explicit: with these
+  // overloads `ext + fp`, `fp + ext`, `ext - fp`, `fp - ext` are each matched by exactly one
+  // candidate (no implicit Fp -> FpExt or FpExt -> Fp conversion exists).
+  constexpr FpExt operator+=(Fp rhs) {
+    elems[0] += rhs;
+    return *this;
+  }
+
+  constexpr FpExt operator+=(Fp rhs) device {
+    elems[0] += rhs;
+    return *this;
+  }
+
+  constexpr FpExt operator+=(Fp rhs) threadgroup {
+    elems[0] += rhs;
+    return *this;
+  }
+
+  constexpr FpExt operator-=(Fp rhs) {
+    elems[0] -= rhs;
+    return *this;
+  }
+
+  constexpr FpExt operator-=(Fp rhs) device {
+    elems[0] -= rhs;
+    return *this;
+  }
+
+  constexpr FpExt operator-=(Fp rhs) threadgroup {
+    elems[0] -= rhs;
+    return *this;
+  }
+
+  friend constexpr FpExt operator+(FpExt lhs, Fp rhs) {
+    lhs += rhs;
+    return lhs;
+  }
+
+  friend constexpr FpExt operator+(Fp lhs, FpExt rhs) { return rhs + lhs; }
+
+  friend constexpr FpExt operator-(FpExt lhs, Fp rhs) {
+    lhs -= rhs;
+    return lhs;
+  }
+
+  friend constexpr FpExt operator-(Fp lhs, FpExt rhs) { return lhs + (-rhs); }
 
   // Implement the simple multiplication case by the subfield Fp
-  // Fp * FpExt is done as a free function due to C++'s operator overloading rules.
   constexpr FpExt operator*=(Fp rhs) {
     for (uint32_t i = 0; i < 4; i++) {
       elems[i] *= rhs;
@@ -108,19 +225,35 @@ struct FpExt {
     return *this;
   }
 
-  constexpr FpExt operator*(Fp rhs) const {
-    FpExt result = *this;
-    result *= rhs;
-    return result;
+  constexpr FpExt operator*=(Fp rhs) device {
+    for (uint32_t i = 0; i < 4; i++) {
+      elems[i] *= rhs;
+    }
+    return *this;
   }
+
+  constexpr FpExt operator*=(Fp rhs) threadgroup {
+    for (uint32_t i = 0; i < 4; i++) {
+      elems[i] *= rhs;
+    }
+    return *this;
+  }
+
+  friend constexpr FpExt operator*(FpExt lhs, Fp rhs) {
+    lhs *= rhs;
+    return lhs;
+  }
+
+  /// Overload for case where LHS is Fp
+  friend constexpr FpExt operator*(Fp lhs, FpExt rhs) { return rhs * lhs; }
 
   // Now we get to the interesting case of multiplication.  Basically, multiply out the polynomial
   // representations, and then reduce module x^4 - B, which means powers >= 4 get shifted back 4 and
   // multiplied by -beta.  We could write this as a double loops with some if's and hope it gets
   // unrolled properly, but it's small enough to just hand write.
-  constexpr FpExt operator*(FpExt rhs) const {
+  friend constexpr FpExt operator*(FpExt lhs, FpExt rhs) {
     // Rename the element arrays to something small for readability
-#define a elems
+#define a lhs.elems
 #define b rhs.elems
     return FpExt(a[0] * b[0] + NBETA * (a[1] * b[3] + a[2] * b[2] + a[3] * b[1]),
                  a[0] * b[1] + a[1] * b[0] + NBETA * (a[2] * b[3] + a[3] * b[2]),
@@ -135,48 +268,32 @@ struct FpExt {
     return *this;
   }
 
+  constexpr FpExt operator*=(FpExt rhs) device {
+    *this = FpExt(*this) * rhs;
+    return *this;
+  }
+
+  constexpr FpExt operator*=(FpExt rhs) threadgroup {
+    *this = FpExt(*this) * rhs;
+    return *this;
+  }
+
   // Equality
-  constexpr bool operator==(FpExt rhs) const {
+  friend constexpr bool operator==(FpExt lhs, FpExt rhs) {
     for (uint32_t i = 0; i < 4; i++) {
-      if (elems[i] != rhs.elems[i]) {
+      if (lhs.elems[i] != rhs.elems[i]) {
         return false;
       }
     }
     return true;
   }
 
-  constexpr bool operator!=(FpExt rhs) const { return !(*this == rhs); }
+  friend constexpr bool operator!=(FpExt lhs, FpExt rhs) { return !(lhs == rhs); }
 
   constexpr Fp constPart() const { return elems[0]; }
 
-  constexpr FpExt operator+=(FpExt rhs) device {
-    for (uint32_t i = 0; i < 4; i++) {
-      elems[i] += rhs.elems[i];
-    }
-    return *this;
-  }
-
-  constexpr FpExt operator+(FpExt rhs) device const { return FpExt(*this) + rhs; }
-
-  constexpr FpExt operator-(FpExt rhs) device const { return FpExt(*this) - rhs; }
-
-  constexpr FpExt operator-() device const { return -FpExt(*this); }
-
-  constexpr FpExt operator*(FpExt rhs) device const { return FpExt(*this) * rhs; }
-
-  constexpr FpExt operator*(Fp rhs) device const { return FpExt(*this) * rhs; }
-
-  constexpr bool operator==(FpExt rhs) device const { return FpExt(*this) == rhs; }
-
-  constexpr bool operator!=(FpExt rhs) device const { return FpExt(*this) != rhs; }
-
-  constexpr Fp constPart() device const { return FpExt(*this).constPart(); }
+  constexpr Fp constPart() device const { return elems[0]; }
 };
-
-/// Overload for case where LHS is Fp (RHS case is handled as a method)
-constexpr inline FpExt operator*(Fp a, FpExt b) {
-  return b * a;
-}
 
 /// Raise an FpExt to a power
 constexpr inline FpExt pow(FpExt x, size_t n) {

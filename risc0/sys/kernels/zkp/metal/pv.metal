@@ -1,0 +1,904 @@
+// Copyright 2026 RISC Zero, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Poseidon2 (BabyBear, width 24) row hashing and folding: Metal port of
+// sys/kernels/zkp/cuda/supra/pv.cuh (HIP C++ branch) and pv_small.cuh (pvs::w, pvs::q).
+// I/O is Montgomery-form u32 (the raw words of BabyBearElem / Digest), outputs canonical,
+// bit-identical to the CPU Poseidon2 (see pv.cuh's header for the value bounds that make the
+// lazy reductions exact; they are unchanged here).
+//
+// Arithmetic: the default instantiations (`W = true`) are pv.cuh's HIP C++ branch verbatim: signed
+// REDC (sredc) with int64 products in pv::, and the HIP `mred` (64-bit C++) in pvs::. The `_m32`
+// instantiations (`W = false`) compute the same values from 32-bit words (low word: 32-bit mul,
+// high word: mulhi; pv_small.cuh's PTX carry chains become hi + mulhi(m, p) + (lo != 0), because
+// lo + lo(m * p) is 0 mod 2^32 by the choice of m). D0's mul-bench suggested the 32-bit form; it
+// measured slower here (docs/metal-port/notes/Z3.md), so it is kept for A/B only.
+
+// Kernels and buffer bindings (Rust side: zkp/src/hal/metal/poseidon2.rs, same order):
+// Every name below also has an `_m32` instantiation with the same bindings; the pv_* kernels also
+// have a `_z9` one (Z9's reduction, the default; see sredc64h).
+//   pv_fold_k         (0 out: uint4[2n], 1 in: uint4[4n], 2 n)                       grid ceil(n/bs) x bs, bs = min(n, 128)
+//   pv_rows_k         (0 out: uint4[2 dim_x], 1 m: uint[dim_x * dim_y] column-major,
+//                      2 dim_x, 3 dim_y)                                              grid ceil(dim_x/bs) x bs, bs = min(dim_x, 128)
+//   pv_fold_tail_k    (0 nodes: fold-tree digests, 1 n0 <= 128)                       grid 1 x n0
+//   pvs_w_fold_k      (0 out: uint[8n], 1 in: uint[16n], 2 n)                         grid ceil(32n/128) x 128 (one SIMD group per hash)
+//   pvs_w_rows_k      (0 out: uint[8 dim_x], 1 m, 2 dim_x, 3 dim_y)                   grid ceil(32 dim_x/128) x 128
+//   pvs_q_fold_k      (0 out, 1 in, 2 n)                                              grid ceil(4n/128) x 128 (4 lanes per hash)
+//   pvs_q_rows_k      (0 out, 1 m, 2 dim_x, 3 dim_y)                                  grid ceil(4 dim_x/128) x 128
+// Scalars are `constant uint&` (KernelArg::Integer). The pvs kernels need a SIMD width of 32
+// and whole 128-thread groups (dispatch_thread_groups); the host checks the width.
+
+#include <metal_stdlib>
+
+using namespace metal;
+
+#define PV_P 0x78000001u
+#define PV_M0 0x77ffffffu // -p^-1 mod 2^32
+
+// ---- constant tables: pv_consts.h (PV_*) and pv_small_consts.h (PVS_*), Montgomery form ----
+constant uint32_t PV_RCF[192]={0x1ea64c58,0x57d1a303,0x57f31a70,0x10b3875a,0x3f65a0d,0x20fd6c7a,0x627e178,0x60440b17,0x305467ca,0x2689a1cf,0x405cdf37,0x627d0f25,0x21ea8b19,0x35bdeee2,0x44d298ad,0x475bbf71,0x44571b92,0x71c01acd,0x46d7e33d,0x352f3b01,0x6e3f4a43,0x613f5ab8,0x2b3e6344,0x63abdd2,0x4f8516fb,0x1d51becf,0x33efae7,0x166a5a28,0xc219ac0,0x3391add,0x62f7cf94,0x1ee11324,0x75a2eddc,0x10d4c634,0x60a9d999,0x6b207f87,0x64f471ef,0x75eff613,0x34d798ee,0xa01158f,0x2db1abb4,0x5746e342,0x442bc869,0x5da762e2,0x41704acd,0x84182d7,0x5150f812,0x72383d62,0x2e15c428,0x6c8ce0f2,0x180f5479,0x5dee4552,0x466ad7c,0x2c5618c0,0x233efb8e,0x5578c6c2,0xfa56ddf,0x19b89074,0x2ae42724,0xb939bb6,0x4b6c74ad,0x7355f17f,0x68c65d39,0x3306cad1,0x5d5512b6,0x31b5d340,0x6cb4dee,0x6e946509,0x643908a2,0x3513bf4b,0x1f171ec5,0xa53f661,0x57a9bd63,0x1e191133,0x72a34428,0x13f6e459,0x54674330,0x70b5432,0x419c76c1,0xd770f73,0x65227c0a,0xe07ed8b,0x770af03a,0x2aaffbef,0x1dc00a77,0x6693570f,0x1142820d,0x667ce209,0x690a530e,0x5a0d0c12,0x597b8134,0x74b5821e,0x625c0d00,0x152f8d49,0x7568d5e5,0x73bd894d,0x594162d4,0x4c0f9adb,0x70e6b20b,0x4f7d8b24,0x45dafd14,0x5075b598,0x6e2ba772,0x2c5ae6bf,0x743ac0f4,0x30d25c00,0x749677b9,0x427b3fed,0x42ef722f,0x19d949dc,0x3be348d9,0x1d009b85,0x50a19ae8,0x387a3d1a,0x28cdd854,0x212a10fe,0xa944079,0x1cf8e8f5,0x6c140176,0x2ba2042a,0x263f30e8,0x516a4b4,0x3e5d9b72,0x6dabfa2f,0x13743681,0x5115d074,0x3e1e7796,0x31acf14a,0x7b976f1,0x55f96814,0x3a60baca,0x65f518c8,0x3e7d0f3e,0x4e3293dc,0x3029a21b,0x100cf3ae,0x59a88c21,0x11bd5fdf,0x5dd9dabe,0x5a29da15,0x4380706f,0x25d5bfc0,0x2fe8a6ee,0x1ce32b1a,0x28aabfe2,0x3c7e625e,0x57fd7816,0x777741c3,0x1f9352a9,0x669a6422,0x55edc39e,0x6eccb7a4,0xbd3b8dc,0x55a5a92f,0x486ed336,0x37a21a86,0x89196ae,0x3db7c1c6,0x1b779b08,0x363cf9d8,0xbfd37d7,0x19a13e91,0x25d79694,0x3dcdb92b,0xf58a692,0x1363acfd,0x584adc0d,0x79cb942,0x1687928a,0x6ee06974,0x685c7833,0x12259252,0x910eadd,0x2fc27ada,0x70893495,0x62f12ab0,0x2eeee5ed,0x34ac353d,0x2d87af23,0x5e47a221,0x732fcc8d,0x42b405e6,0x254cba0a,0x3668765f,0x3ec91a02,0x4a47cb02,0x110d363,0x7356167f,0x577d1b31,0x135dc5f3,0xb6b3db5,0x687e0d2d};
+constant uint32_t PV_RCP[21]={0x30bcad52,0x5a931fb6,0xa38b12e,0x140e8795,0x6a65c304,0x725d7cbc,0x5474c47a,0x8034f38,0x6f7a4034,0x5f791b37,0x12a8eb2c,0x48c33cb2,0x6ebadae7,0xa45c11b,0x5f87cfd1,0x112b8b7b,0x12b450f5,0x280ef6ad,0x1f2d2997,0x160b824a,0x9c54da2};
+constant uint32_t PV_DH[24]={0x3e41b357,0x1033ed98,0x49cf6705,0x5281f318,0x3c4ec8ee,0x1967a15c,0x3ab8089a,0x68f1a534,0x11e010d5,0xd63d87e,0x50d79dd3,0x4a6bc505,0x6f46057c,0x437dd156,0x60b4b484,0x440c54cb,0x4a155e0a,0x6a059603,0x46382d00,0x1f9b9cab,0x1ce078ad,0x12d7bd14,0x5e4294b4,0x1b314dce};
+constant uint32_t PVS_RCF[8][32]={
+{0x1ea64c58,0x57d1a303,0x57f31a70,0x10b3875a,0x3f65a0d,0x20fd6c7a,0x627e178,0x60440b17,0x305467ca,0x2689a1cf,0x405cdf37,0x627d0f25,0x21ea8b19,0x35bdeee2,0x44d298ad,0x475bbf71,0x44571b92,0x71c01acd,0x46d7e33d,0x352f3b01,0x6e3f4a43,0x613f5ab8,0x2b3e6344,0x63abdd2,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x4f8516fb,0x1d51becf,0x33efae7,0x166a5a28,0xc219ac0,0x3391add,0x62f7cf94,0x1ee11324,0x75a2eddc,0x10d4c634,0x60a9d999,0x6b207f87,0x64f471ef,0x75eff613,0x34d798ee,0xa01158f,0x2db1abb4,0x5746e342,0x442bc869,0x5da762e2,0x41704acd,0x84182d7,0x5150f812,0x72383d62,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x2e15c428,0x6c8ce0f2,0x180f5479,0x5dee4552,0x466ad7c,0x2c5618c0,0x233efb8e,0x5578c6c2,0xfa56ddf,0x19b89074,0x2ae42724,0xb939bb6,0x4b6c74ad,0x7355f17f,0x68c65d39,0x3306cad1,0x5d5512b6,0x31b5d340,0x6cb4dee,0x6e946509,0x643908a2,0x3513bf4b,0x1f171ec5,0xa53f661,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x57a9bd63,0x1e191133,0x72a34428,0x13f6e459,0x54674330,0x70b5432,0x419c76c1,0xd770f73,0x65227c0a,0xe07ed8b,0x770af03a,0x2aaffbef,0x1dc00a77,0x6693570f,0x1142820d,0x667ce209,0x690a530e,0x5a0d0c12,0x597b8134,0x74b5821e,0x625c0d00,0x152f8d49,0x7568d5e5,0x73bd894d,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x594162d4,0x4c0f9adb,0x70e6b20b,0x4f7d8b24,0x45dafd14,0x5075b598,0x6e2ba772,0x2c5ae6bf,0x743ac0f4,0x30d25c00,0x749677b9,0x427b3fed,0x42ef722f,0x19d949dc,0x3be348d9,0x1d009b85,0x50a19ae8,0x387a3d1a,0x28cdd854,0x212a10fe,0xa944079,0x1cf8e8f5,0x6c140176,0x2ba2042a,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x263f30e8,0x516a4b4,0x3e5d9b72,0x6dabfa2f,0x13743681,0x5115d074,0x3e1e7796,0x31acf14a,0x7b976f1,0x55f96814,0x3a60baca,0x65f518c8,0x3e7d0f3e,0x4e3293dc,0x3029a21b,0x100cf3ae,0x59a88c21,0x11bd5fdf,0x5dd9dabe,0x5a29da15,0x4380706f,0x25d5bfc0,0x2fe8a6ee,0x1ce32b1a,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x28aabfe2,0x3c7e625e,0x57fd7816,0x777741c3,0x1f9352a9,0x669a6422,0x55edc39e,0x6eccb7a4,0xbd3b8dc,0x55a5a92f,0x486ed336,0x37a21a86,0x89196ae,0x3db7c1c6,0x1b779b08,0x363cf9d8,0xbfd37d7,0x19a13e91,0x25d79694,0x3dcdb92b,0xf58a692,0x1363acfd,0x584adc0d,0x79cb942,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x1687928a,0x6ee06974,0x685c7833,0x12259252,0x910eadd,0x2fc27ada,0x70893495,0x62f12ab0,0x2eeee5ed,0x34ac353d,0x2d87af23,0x5e47a221,0x732fcc8d,0x42b405e6,0x254cba0a,0x3668765f,0x3ec91a02,0x4a47cb02,0x110d363,0x7356167f,0x577d1b31,0x135dc5f3,0xb6b3db5,0x687e0d2d,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0}};
+constant uint32_t PVS_PW[21][32]={
+{0x0,0xffffffe,0xffffffe,0xffffffe,0xffffffe,0xffffffe,0xffffffe,0xffffffe,0xffffffe,0xffffffe,0xffffffe,0xffffffe,0xffffffe,0xffffffe,0xffffffe,0xffffffe,0xffffffe,0xffffffe,0xffffffe,0xffffffe,0xffffffe,0xffffffe,0xffffffe,0xffffffe,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x1033ed98,0x49cf6705,0x5281f318,0x3c4ec8ee,0x1967a15c,0x3ab8089a,0x68f1a534,0x11e010d5,0xd63d87e,0x50d79dd3,0x4a6bc505,0x6f46057c,0x437dd156,0x60b4b484,0x440c54cb,0x4a155e0a,0x6a059603,0x46382d00,0x1f9b9cab,0x1ce078ad,0x12d7bd14,0x5e4294b4,0x1b314dce,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x39b5b96e,0x21aec5ed,0x723c6d25,0x2ccc8db7,0x2554e1b8,0x64d039c6,0x1177519f,0x7590b848,0x6f1322dd,0x9b9ee29,0x566997ca,0x2ca63281,0x6d1fa13f,0x36da640a,0x74008ff0,0x551a2ab8,0x6ba60a76,0x350d8cf0,0x1db5383e,0x77ada1ed,0x435dbbeb,0x46b62c32,0x4446b395,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x1975702d,0x71ebfdc6,0x4cb3f57b,0x3bf08464,0x35a16a5b,0x5dba351f,0x5ff9a697,0x6f5e0745,0x28d35fbe,0x24f17eb4,0x68331553,0x5074e06b,0x1ae1589d,0x772b2416,0xab6b221,0x9b87703,0x534f8212,0x221c7254,0x69ebb6ce,0x36ee17a3,0x2abaa76e,0x15198a8a,0x45655c5e,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x1fd3394b,0x3c1ecc90,0x65a8a007,0x739a4088,0x724d52e7,0x4644c218,0x2d53d01a,0x60570cc4,0x5d674bdc,0xec0a95,0x3ffec733,0x4e724fea,0x5b215ee4,0x1ab1f2d4,0x4aa0f1fa,0x292df80d,0x5352cb1,0xbf2a79b,0x216f30fd,0xb89d745,0x5e481721,0x62e14ebb,0x1967637,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x1aac1a0b,0x48f4457d,0x41ef301d,0x18c4ad97,0x29dfb9cf,0x20acc29d,0x18d95a48,0x4da2f9c9,0x12839958,0x7b56604,0x2d0cadeb,0x76fb3426,0x466d937f,0x374ae284,0x3add5335,0x35318a0d,0x41502570,0x2732cb7b,0x1553ce60,0x13613f55,0xbe5d161,0x5246e26d,0x75481c7a,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x56c5bd14,0x48b05cac,0x507338ff,0x2ccd5af,0x162ea987,0x779873f8,0x54a957fa,0x71a94750,0x46b98879,0xdf2e59f,0x4bc3f4d8,0x6cdd26a9,0x37f496bb,0x58ffdb6f,0xffac36e,0x55d9b696,0x6b2d14b2,0x1ff931c,0xf5a5a8a,0x47320c13,0xe003300,0x6bb612a9,0x298bf03f,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x4149900e,0x70ec24b6,0x4e3dbf6a,0x52d5b95e,0x16073e2a,0x39a06e60,0x254e556e,0x54ab7939,0x2643f1d3,0x1054bafc,0x2e27b9e3,0x4a77575a,0x40a89f28,0x541f45de,0x6ad7e15b,0x53f9cfee,0x6c8b4887,0x1d263bdc,0x581ba18c,0x4bf336c8,0x7047a9f9,0x655b7b89,0x26aa8a15,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0xb3e3c0b,0x42d39a0,0x2a9be341,0x4160f10e,0x5210055c,0x29d4be8f,0x17f3a35d,0xec2c3d5,0x611ef96d,0x18c61c1d,0x2b16dc28,0x19478cdb,0x9064220,0x5d05cd3a,0x134ee243,0x73e182e7,0x268302d,0xb71313b,0x3d311cb9,0x51ac9e31,0x3caac3bb,0x2d426c2b,0x5f257b72,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x61de977f,0x3d7713a0,0x799b74b,0x5b010a30,0x673b8a73,0x5622714b,0x3a69af3d,0x5d100c4b,0x6f1663d2,0x5ad8dba5,0x64d8dd9e,0x2a4203ad,0x19f39a14,0x71db1e7e,0x6db1a9db,0x1dddfbdd,0x4cc7d996,0x1b4041b4,0x2ce7be3d,0x5e34fe43,0x62439ffc,0x2bb34b56,0x5675dc3d,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x3c3bbca5,0x4141259f,0x5b6c6b60,0x30d62b97,0x75b5f905,0x6dadcdbc,0x28e554fa,0x13be071a,0x28c0f089,0x68264d97,0x30273697,0x63eb6d,0x1d2897d8,0x113883d5,0x5c6bfd8,0x5ec2ea91,0x6548d023,0x151a9ff0,0x5f3c7e6c,0x70dc2cd,0x692f1725,0x40308d,0x5d33e097,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x2681f034,0x440b64c6,0x6c77bbe0,0x4c945e90,0x23943f6b,0x461b44c5,0x19573591,0x54ac8e00,0x5a4e5b70,0x341f2dd9,0x34f51361,0x65fb42d2,0x728759f5,0x1d314856,0x47fffa0f,0x3a87a803,0x13375253,0x5ad03ac5,0x68a5c838,0x1045384c,0x6e011ceb,0x23ed3c2d,0x3c6e72d5,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x5b15a34b,0x2c0e0475,0x5b144eb,0x398fa5d9,0x324e8736,0x7632fc7d,0x5c8a20b1,0x4394102c,0x3395aeca,0x2f5e342f,0x54a81008,0x76a80ebf,0x5f18e98d,0x3f2e2254,0x555b3d02,0x36cba974,0x146093b9,0x69cdf21e,0x6f0d77e2,0xf1dd612,0x7400cd95,0x403adcec,0x44ad092f,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x37f05566,0x66dafcfc,0x73870c84,0x57b63b0,0x4e201e3a,0x145bde93,0x161ca856,0x494b826a,0xd5aa068,0x2ec6e170,0x7318afb6,0x53f53a1e,0x56f9571,0x5976a4f,0x3a9104bb,0x3f586042,0x6d8c4773,0x68e6df0b,0xa7bd307,0x1a6d8862,0x12dc9902,0x6b1c0cd3,0x38fbb2c4,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x33c8edef,0x280c3ecc,0x54151e57,0x6b2045e1,0x199e3269,0x186a38d1,0x7266f0e3,0x4b16ea86,0x126ecb7e,0x5c00b8a4,0x41717c4e,0x53c7e2ae,0x66d6f938,0x32b07ece,0x3383ca32,0x4b6b8603,0x48abe71b,0x670495e7,0x3621ae8,0x72af32ed,0x5dca3453,0x1127effd,0x663ab4ec,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x51004fca,0x4394f35f,0x6af72f0a,0x70d25eae,0x6d82a791,0x4b668db,0x7095a1f4,0xae149dd,0x1c2c3883,0x2101db8a,0x672d6c95,0x10cf962b,0x2749c968,0x5bccec1b,0x8ea2c0d,0x72ccefe6,0x72062435,0x38e81b72,0x63236e07,0x1a3a9beb,0x5ef725f4,0xab077f,0x2ff83cff,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x4cb51d52,0x52eee4eb,0x1a91ecf2,0x1b408ba3,0xd5ccdb0,0x42831085,0x761d53d5,0x44ddb76,0x3de46a53,0x242c23cb,0x547f312,0x3fe9bdf1,0x465bd2ee,0x2ace8e35,0x4b24120d,0x3c6d976e,0x28825e73,0x12888798,0x6e3b4a32,0x572f31fb,0x4d2f5bb1,0x55df4621,0x4d534db0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x2ad0da59,0xf929d33,0x4e2793b7,0x1ba00850,0x6bf4d814,0x722f16ee,0x6fee5244,0x1e6b6b2e,0x5348e98d,0x51d1d2e1,0x6fb38d85,0x30049774,0x4d7d20e9,0x28a875d0,0x3968fddb,0x7217d443,0x40110aa3,0x625337f4,0x167963e0,0x2e6bf802,0x7538d388,0x75d972b2,0x2adc2771,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x34744061,0x4aa36dde,0x1afaed6,0x79c1707,0x6e1ef0eb,0x21a3fd24,0x3874c869,0x7458d3e4,0x670a8126,0x464273ba,0x4d0df84,0x49e304de,0x597d13ab,0x6961f7a7,0x23f89c4f,0x2a38660f,0x769062,0x4c8f11ea,0x3521d2be,0x2e87b19,0x59557053,0x48e17477,0x331fca2c,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x4a97fcc7,0x10689293,0x70737a4b,0x211663b1,0x422764a5,0x2a331dc3,0x3cc3f5b3,0x4101a97e,0x7417956f,0x5c0d5ac6,0x7587f662,0x18ba618d,0xc132de0,0x399719f3,0x187e4b9,0x29cad84d,0x70bcc4b6,0xebf8bb7,0x4310a76,0x7351fd8f,0x723e3c51,0x4105aae1,0x5ad4bc9a,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x779c3345,0x58b1a415,0x1dd1db61,0x3ddffa96,0x3ee3dfbd,0xab19b3a,0x4fe7be0f,0x3a56de40,0x3ef85137,0x3cf5ceb6,0x58e8e45b,0x224efb2f,0x227679e9,0x3bb753da,0x1d3e7ade,0x6eb090cc,0x17b55db3,0x5b6cc08b,0x102f2944,0x4d838012,0x1a7e4154,0x6ce322b2,0x224f03f1,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0}};
+constant uint32_t PVS_CR[21][32]={
+{0x0,0x7ffffcf,0x530c6209,0x60fd4814,0x1f210050,0x2ab93a2a,0x4812114a,0x11e19f45,0x31ca0959,0x6f4d2fca,0xec24237,0x75749bd5,0x4c3a3481,0x44f8c299,0x64229502,0x99f26f5,0x29ee6960,0x89723c0,0x5c5a165c,0x46b8478,0xb26d81e,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x7ffffcf,0x530c6209,0x60fd4814,0x1f210050,0x2ab93a2a,0x4812114a,0x11e19f45,0x31ca0959,0x6f4d2fca,0xec24237,0x75749bd5,0x4c3a3481,0x44f8c299,0x64229502,0x99f26f5,0x29ee6960,0x89723c0,0x5c5a165c,0x46b8478,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x0,0x7ffffcf,0x530c6209,0x60fd4814,0x1f210050,0x2ab93a2a,0x4812114a,0x11e19f45,0x31ca0959,0x6f4d2fca,0xec24237,0x75749bd5,0x4c3a3481,0x44f8c299,0x64229502,0x99f26f5,0x29ee6960,0x89723c0,0x5c5a165c,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x0,0x0,0x7ffffcf,0x530c6209,0x60fd4814,0x1f210050,0x2ab93a2a,0x4812114a,0x11e19f45,0x31ca0959,0x6f4d2fca,0xec24237,0x75749bd5,0x4c3a3481,0x44f8c299,0x64229502,0x99f26f5,0x29ee6960,0x89723c0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x0,0x0,0x0,0x7ffffcf,0x530c6209,0x60fd4814,0x1f210050,0x2ab93a2a,0x4812114a,0x11e19f45,0x31ca0959,0x6f4d2fca,0xec24237,0x75749bd5,0x4c3a3481,0x44f8c299,0x64229502,0x99f26f5,0x29ee6960,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x0,0x0,0x0,0x0,0x7ffffcf,0x530c6209,0x60fd4814,0x1f210050,0x2ab93a2a,0x4812114a,0x11e19f45,0x31ca0959,0x6f4d2fca,0xec24237,0x75749bd5,0x4c3a3481,0x44f8c299,0x64229502,0x99f26f5,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x7ffffcf,0x530c6209,0x60fd4814,0x1f210050,0x2ab93a2a,0x4812114a,0x11e19f45,0x31ca0959,0x6f4d2fca,0xec24237,0x75749bd5,0x4c3a3481,0x44f8c299,0x64229502,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x7ffffcf,0x530c6209,0x60fd4814,0x1f210050,0x2ab93a2a,0x4812114a,0x11e19f45,0x31ca0959,0x6f4d2fca,0xec24237,0x75749bd5,0x4c3a3481,0x44f8c299,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x7ffffcf,0x530c6209,0x60fd4814,0x1f210050,0x2ab93a2a,0x4812114a,0x11e19f45,0x31ca0959,0x6f4d2fca,0xec24237,0x75749bd5,0x4c3a3481,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x7ffffcf,0x530c6209,0x60fd4814,0x1f210050,0x2ab93a2a,0x4812114a,0x11e19f45,0x31ca0959,0x6f4d2fca,0xec24237,0x75749bd5,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x7ffffcf,0x530c6209,0x60fd4814,0x1f210050,0x2ab93a2a,0x4812114a,0x11e19f45,0x31ca0959,0x6f4d2fca,0xec24237,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x7ffffcf,0x530c6209,0x60fd4814,0x1f210050,0x2ab93a2a,0x4812114a,0x11e19f45,0x31ca0959,0x6f4d2fca,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x7ffffcf,0x530c6209,0x60fd4814,0x1f210050,0x2ab93a2a,0x4812114a,0x11e19f45,0x31ca0959,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x7ffffcf,0x530c6209,0x60fd4814,0x1f210050,0x2ab93a2a,0x4812114a,0x11e19f45,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x7ffffcf,0x530c6209,0x60fd4814,0x1f210050,0x2ab93a2a,0x4812114a,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x7ffffcf,0x530c6209,0x60fd4814,0x1f210050,0x2ab93a2a,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x7ffffcf,0x530c6209,0x60fd4814,0x1f210050,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x7ffffcf,0x530c6209,0x60fd4814,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x7ffffcf,0x530c6209,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x7ffffcf,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0}};
+constant uint32_t PVS_CRM[21][32]={
+{0x0,0x31,0xe4f39df7,0xff02b7ec,0x60deffb0,0x8546c5d6,0x67edeeb6,0x461e60bb,0x8635f6a7,0x40b2d036,0xb93dbdc9,0x628b642b,0x2bc5cb7f,0x73073d67,0x8bdd6afe,0xce60d90b,0xd61196a0,0xf768dc40,0xc3a5e9a4,0x3b947b88,0x4d927e2,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x31,0xe4f39df7,0xff02b7ec,0x60deffb0,0x8546c5d6,0x67edeeb6,0x461e60bb,0x8635f6a7,0x40b2d036,0xb93dbdc9,0x628b642b,0x2bc5cb7f,0x73073d67,0x8bdd6afe,0xce60d90b,0xd61196a0,0xf768dc40,0xc3a5e9a4,0x3b947b88,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x0,0x31,0xe4f39df7,0xff02b7ec,0x60deffb0,0x8546c5d6,0x67edeeb6,0x461e60bb,0x8635f6a7,0x40b2d036,0xb93dbdc9,0x628b642b,0x2bc5cb7f,0x73073d67,0x8bdd6afe,0xce60d90b,0xd61196a0,0xf768dc40,0xc3a5e9a4,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x0,0x0,0x31,0xe4f39df7,0xff02b7ec,0x60deffb0,0x8546c5d6,0x67edeeb6,0x461e60bb,0x8635f6a7,0x40b2d036,0xb93dbdc9,0x628b642b,0x2bc5cb7f,0x73073d67,0x8bdd6afe,0xce60d90b,0xd61196a0,0xf768dc40,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x0,0x0,0x0,0x31,0xe4f39df7,0xff02b7ec,0x60deffb0,0x8546c5d6,0x67edeeb6,0x461e60bb,0x8635f6a7,0x40b2d036,0xb93dbdc9,0x628b642b,0x2bc5cb7f,0x73073d67,0x8bdd6afe,0xce60d90b,0xd61196a0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x0,0x0,0x0,0x0,0x31,0xe4f39df7,0xff02b7ec,0x60deffb0,0x8546c5d6,0x67edeeb6,0x461e60bb,0x8635f6a7,0x40b2d036,0xb93dbdc9,0x628b642b,0x2bc5cb7f,0x73073d67,0x8bdd6afe,0xce60d90b,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x31,0xe4f39df7,0xff02b7ec,0x60deffb0,0x8546c5d6,0x67edeeb6,0x461e60bb,0x8635f6a7,0x40b2d036,0xb93dbdc9,0x628b642b,0x2bc5cb7f,0x73073d67,0x8bdd6afe,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x31,0xe4f39df7,0xff02b7ec,0x60deffb0,0x8546c5d6,0x67edeeb6,0x461e60bb,0x8635f6a7,0x40b2d036,0xb93dbdc9,0x628b642b,0x2bc5cb7f,0x73073d67,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x31,0xe4f39df7,0xff02b7ec,0x60deffb0,0x8546c5d6,0x67edeeb6,0x461e60bb,0x8635f6a7,0x40b2d036,0xb93dbdc9,0x628b642b,0x2bc5cb7f,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x31,0xe4f39df7,0xff02b7ec,0x60deffb0,0x8546c5d6,0x67edeeb6,0x461e60bb,0x8635f6a7,0x40b2d036,0xb93dbdc9,0x628b642b,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x31,0xe4f39df7,0xff02b7ec,0x60deffb0,0x8546c5d6,0x67edeeb6,0x461e60bb,0x8635f6a7,0x40b2d036,0xb93dbdc9,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x31,0xe4f39df7,0xff02b7ec,0x60deffb0,0x8546c5d6,0x67edeeb6,0x461e60bb,0x8635f6a7,0x40b2d036,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x31,0xe4f39df7,0xff02b7ec,0x60deffb0,0x8546c5d6,0x67edeeb6,0x461e60bb,0x8635f6a7,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x31,0xe4f39df7,0xff02b7ec,0x60deffb0,0x8546c5d6,0x67edeeb6,0x461e60bb,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x31,0xe4f39df7,0xff02b7ec,0x60deffb0,0x8546c5d6,0x67edeeb6,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x31,0xe4f39df7,0xff02b7ec,0x60deffb0,0x8546c5d6,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x31,0xe4f39df7,0xff02b7ec,0x60deffb0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x31,0xe4f39df7,0xff02b7ec,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x31,0xe4f39df7,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x31,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0},
+{0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0}};
+constant uint32_t PVS_DH[32]={0x3e41b357,0x1033ed98,0x49cf6705,0x5281f318,0x3c4ec8ee,0x1967a15c,0x3ab8089a,0x68f1a534,0x11e010d5,0xd63d87e,0x50d79dd3,0x4a6bc505,0x6f46057c,0x437dd156,0x60b4b484,0x440c54cb,0x4a155e0a,0x6a059603,0x46382d00,0x1f9b9cab,0x1ce078ad,0x12d7bd14,0x5e4294b4,0x1b314dce,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0};
+constant uint32_t PVS_DHM[32]={0x89be4ca9,0x2fcc1268,0xe3098fb,0xed7e0ce8,0x53b13712,0x6985ea4,0xf547f766,0xf70e5acc,0xc61fef2b,0x29c2782,0x9728622d,0xd943afb,0xb0b9fa84,0xc822eaa,0x7f4b4b7c,0xe3f3ab35,0x65eaa1f6,0xfdfa69fd,0xb9c7d300,0x8646355,0xfb1f8753,0x4d2842ec,0x1bd6b4c,0x74ceb232,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0};
+constant uint32_t PVS_E0[2]={0x4e41b355,0x89be4cab}; // mont(d_0 + 1), * M0
+
+// pv.cuh (HIP): PV_DH as even representatives in (-p, p), and 2^56 mod p (even).
+constant int PV_DHE[24] = {
+    -968772778,  271838616,   -774936828,  1384248088,  1011796206, 426221916,
+    985139354,   1760666932,  -1713368876, 224647294,   -656957998, -764689148,
+    1866859900,  1132319062,  1622455428,  -871607094,  1242914314, -234514942,
+    1178086656,  -1482974038, -1528792916, 316128532,   1581421748, 456216014};
+#define PV_C56 0x0dddddde
+
+// ============================== pv.cuh (thread per permutation) ==============================
+// Z9 / R17: every helper is always_inline, so no permutation state array is written after an
+// out-of-line call in the row loops (ir_scan.py tier B; R17.md). Measured: no speed change.
+#define PV_INLINE __attribute__((always_inline)) inline
+
+namespace pv {
+
+PV_INLINE uint red1(uint r) { // [0, 2p) -> [0, p)
+  return r >= PV_P ? r - PV_P : r;
+}
+
+PV_INLINE uint addm(uint a, uint b) {
+  return red1(a + b);
+}
+
+// (-p, p) -> [0, p).
+PV_INLINE uint canon(int r) {
+  uint u = uint(r);
+  return min(u, u + PV_P);
+}
+
+// A signed 64-bit value as its two words (value = 2^32 * hi + lo).
+struct I64 {
+  uint lo;
+  int hi;
+};
+
+// sredc(t) = (t - m*p) / 2^32, m = (int32)(t * p^-1 mod 2^32), p^-1 = 2^31 + 2^27 + 1.
+// t and m*p agree in the low word, so t - m*p = 2^32 * (hi(t) - hi(m*p)) with no borrow: the
+// 32-bit form below equals the HIP int64 expression whenever the latter is exact (pv.cuh bounds).
+PV_INLINE int sredc32(I64 t) {
+  uint lo = t.lo;
+  int m = int(lo + (lo << 27) + (lo << 31));
+  return int(uint(t.hi) - uint(mulhi(m, int(PV_P))));
+}
+
+// sredc() for even t: m = lo * (2^27 + 1).
+PV_INLINE int sredc_even32(I64 t) {
+  uint lo = t.lo;
+  int m = int(lo + (lo << 27));
+  return int(uint(t.hi) - uint(mulhi(m, int(PV_P))));
+}
+
+// The literal HIP code (int64): the default instantiations.
+PV_INLINE int sredc64(long t) {
+  uint lo = uint(t);
+  int m = int(lo + (lo << 27) + (lo << 31));
+  return int(ulong(t + long(m) * -long(PV_P)) >> 32);
+}
+
+PV_INLINE int sredc_even64(long t) {
+  uint lo = uint(t);
+  int m = int(lo + (lo << 27));
+  return int(ulong(t + long(m) * -long(PV_P)) >> 32);
+}
+
+// Z9 (`_z9` instantiations, the default): the product as one 32x32 -> 64 multiply (as the HIP
+// form), the reduction as hi(t) - mulhi(m, p) (as the m32 form; t and m*p agree in the low word,
+// see sredc32). Same value as sredc64. Measured 1.16-1.18x the HIP form's permutations/s on the
+// M5 Max: the 64-bit `t + m * -p` multiply-add is what costs (docs/metal-port/notes/Z9.md).
+PV_INLINE int sredc64h(long t) {
+  uint lo = uint(t);
+  int m = int(lo + (lo << 27) + (lo << 31));
+  return int(uint(ulong(t) >> 32) - uint(mulhi(m, int(PV_P))));
+}
+
+// V: 0 = `_m32` (32-bit words), 1 = pv.cuh's HIP int64 form, 2 = `_z9` (sredc64h in the full
+// rounds and the partial-round S-box; the partial-round linear layer keeps the HIP int64 form,
+// which measured faster there than the mulhi reduction).
+template <int V> PV_INLINE int smul(int a, int b) {
+  if (V == 2)
+    return sredc64h(long(a) * b);
+  if (V == 1)
+    return sredc64(long(a) * b);
+  return sredc32(I64{uint(a) * uint(b), mulhi(a, b)});
+}
+
+// y in [-p, p) -> y^7 in (-p, p).
+template <int V> PV_INLINE int ssbox(int y) {
+  int y2 = smul<V>(y, y);
+  int y3 = smul<V>(y2, y);
+  int y4 = smul<V>(y2, y2);
+  return smul<V>(y3, y4);
+}
+
+PV_INLINE void m4(thread uint& a, thread uint& b, thread uint& c, thread uint& d) {
+  uint t0 = addm(a, b), t1 = addm(c, d);
+  uint t2 = addm(addm(b, b), t1), t3 = addm(addm(d, d), t0);
+  uint t1_2 = addm(t1, t1), t0_2 = addm(t0, t0);
+  uint t4 = addm(addm(t1_2, t1_2), t3), t5 = addm(addm(t0_2, t0_2), t2);
+  a = addm(t3, t5);
+  b = t5;
+  c = addm(t2, t4);
+  d = t4;
+}
+
+// External (full-round) linear layer.
+PV_INLINE void m_ext(thread uint* x) {
+  uint s[4] = {0, 0, 0, 0};
+#pragma unroll
+  for (int g = 0; g < 6; g++) {
+    m4(x[4 * g], x[4 * g + 1], x[4 * g + 2], x[4 * g + 3]);
+#pragma unroll
+    for (int j = 0; j < 4; j++)
+      s[j] = g ? addm(s[j], x[4 * g + j]) : x[4 * g + j];
+  }
+#pragma unroll
+  for (int i = 0; i < 24; i++)
+    x[i] = addm(x[i], s[i & 3]);
+}
+
+template <int V> PV_INLINE void full_round(thread uint* x, int r) {
+  // The round constants first: one batch of loads rather than one address per constant.
+  uint rc[24];
+#pragma unroll
+  for (int i = 0; i < 24; i++)
+    rc[i] = PV_RCF[r * 24 + i];
+#pragma unroll
+  for (int i = 0; i < 24; i++)
+    x[i] = canon(ssbox<V>(int(x[i] + (rc[i] - PV_P))));
+  m_ext(x);
+}
+
+// The 21 partial rounds with int32 cells in (-p, p): e'_i = sum_j e_j + DH_i * e_i * 2^-32,
+// computed as sredc_even(E_i * e_i + a) with E_i == DH_i and a == S * 2^32 (mod p), both even.
+// S = sum_i e_i is kept as its wrapping low word lo and tb = sum (e_i >> 24) (pv.cuh ssum24; the
+// HIP v_perm/v_pk_add_u16 packing computes exactly this sum).
+template <int V> PV_INLINE void partial_rounds(thread uint* x) {
+  int e[24];
+#pragma unroll
+  for (int i = 0; i < 24; i++)
+    e[i] = int(x[i]);
+#pragma unroll 1
+  for (int r = 0; r < 21; r++) {
+    e[0] = ssbox<V>(int(canon(e[0]) + (PV_RCP[r] - PV_P)));
+    uint lo = 0;
+    int tb = 0;
+#pragma unroll
+    for (int i = 0; i < 24; i++) {
+      lo += uint(e[i]);
+      tb += e[i] >> 24;
+    }
+    // S = 2^24 * c + l with l = lo mod 2^24 and c = floor(S / 2^24): a = l * 2^32 + c * C56.
+    int c = tb + int((lo - (uint(tb) << 24)) >> 24);
+    if (V != 0) {
+      long a = long(ulong(lo & 0xffffffu) << 32) + long(c) * PV_C56;
+#pragma unroll
+      for (int i = 0; i < 24; i++)
+        e[i] = sredc_even64(long(PV_DHE[i]) * e[i] + a);
+    } else {
+      // a as words: lo(c * C56), hi(c * C56) + l.
+      const uint alo = uint(c) * uint(PV_C56);
+      const uint ahi = uint(mulhi(c, int(PV_C56))) + (lo & 0xffffffu);
+#pragma unroll
+      for (int i = 0; i < 24; i++) {
+        const int d = PV_DHE[i];
+        const uint plo = uint(d) * uint(e[i]);
+        const uint tlo = plo + alo;
+        const uint thi = uint(mulhi(d, e[i])) + ahi + (tlo < plo ? 1u : 0u);
+        e[i] = sredc_even32(I64{tlo, int(thi)});
+      }
+    }
+  }
+#pragma unroll
+  for (int i = 0; i < 24; i++)
+    x[i] = canon(e[i]);
+}
+
+template <int V> PV_INLINE void permute(thread uint* x) {
+  m_ext(x);
+  // One loop over the 8 full rounds, so their body is emitted once (half the code size).
+#pragma unroll 1
+  for (int r = 0; r < 8; r++) {
+    if (r == 4)
+      partial_rounds<V>(x);
+    full_round<V>(x, r);
+  }
+}
+
+// The fold of digest pair t: in[4t .. 4t+3] (two digests) -> out[2t], out[2t + 1].
+template <int V> PV_INLINE void fold_one(device uint4* out, const device uint4* in, uint t) {
+  uint x[24];
+#pragma unroll
+  for (int q = 0; q < 4; q++) {
+    uint4 v = in[4 * t + q];
+    x[4 * q] = v.x;
+    x[4 * q + 1] = v.y;
+    x[4 * q + 2] = v.z;
+    x[4 * q + 3] = v.w;
+  }
+#pragma unroll
+  for (int i = 16; i < 24; i++)
+    x[i] = 0;
+  permute<V>(x);
+  out[2 * t] = uint4(x[0], x[1], x[2], x[3]);
+  out[2 * t + 1] = uint4(x[4], x[5], x[6], x[7]);
+}
+
+} // namespace pv
+
+// out[i] = hash of the two digests in[2i], in[2i + 1] (n outputs). pv.cuh fold_k.
+template <int V>
+[[max_total_threads_per_threadgroup(128)]]
+kernel void pv_fold(device uint4* out [[buffer(0)]],
+                    const device uint4* in [[buffer(1)]],
+                    constant uint& n [[buffer(2)]],
+                    uint gid [[thread_position_in_grid]]) {
+  if (gid >= n)
+    return;
+  pv::fold_one<V>(out, in, gid);
+}
+
+template [[host_name("pv_fold_k_m32")]] kernel void
+pv_fold<0>(device uint4*, const device uint4*, constant uint&, uint);
+template [[host_name("pv_fold_k")]] kernel void
+pv_fold<1>(device uint4*, const device uint4*, constant uint&, uint);
+template [[host_name("pv_fold_k_z9")]] kernel void
+pv_fold<2>(device uint4*, const device uint4*, constant uint&, uint);
+
+// The top layers of a fold tree in one threadgroup of n0 <= 128 threads: layers n0, n0/2, ..., 1
+// (digests: layer of size n at [n, 2n), its inputs at [2n, 4n)). pv.cuh fold_tail_k (HIP).
+template <int V>
+[[max_total_threads_per_threadgroup(128)]]
+kernel void pv_fold_tail(device uint4* nodes [[buffer(0)]],
+                         constant uint& n0 [[buffer(1)]],
+                         uint t [[thread_position_in_threadgroup]]) {
+#pragma unroll 1
+  for (uint n = n0; n >= 1; n >>= 1) {
+    if (t < n)
+      pv::fold_one<V>(nodes + 2 * n, nodes + 4 * n, t);
+    threadgroup_barrier(mem_flags::mem_device);
+  }
+}
+
+template [[host_name("pv_fold_tail_k_m32")]] kernel void
+pv_fold_tail<0>(device uint4*, constant uint&, uint);
+template [[host_name("pv_fold_tail_k")]] kernel void
+pv_fold_tail<1>(device uint4*, constant uint&, uint);
+template [[host_name("pv_fold_tail_k_z9")]] kernel void
+pv_fold_tail<2>(device uint4*, constant uint&, uint);
+
+// out[r] = hash of row r of the column-major dim_x x dim_y matrix m (16 elements per absorb).
+// pv.cuh rows_k, generic (non-RDNA) branch; the column pointer is advanced instead of computing
+// (i + j) * dim_x, so offsets beyond 2^32 elements need no 64-bit multiply.
+template <int V>
+[[max_total_threads_per_threadgroup(128)]]
+kernel void pv_rows(device uint4* out [[buffer(0)]],
+                    const device uint* m [[buffer(1)]],
+                    constant uint& dim_x [[buffer(2)]],
+                    constant uint& dim_y [[buffer(3)]],
+                    uint gid [[thread_position_in_grid]]) {
+  if (gid >= dim_x)
+    return;
+  uint x[24];
+#pragma unroll
+  for (int i = 0; i < 24; i++)
+    x[i] = 0;
+  const uint stride = dim_x, cols = dim_y;
+  const device uint* p = m + gid;
+  uint i = 0;
+  do {
+#pragma unroll
+    for (int j = 0; j < 16; j++, i++) {
+      if (i < cols) {
+        x[j] = *p;
+        p += stride;
+      } else {
+        x[j] = 0u;
+      }
+    }
+    pv::permute<V>(x);
+  } while (i < cols);
+  out[2 * gid] = uint4(x[0], x[1], x[2], x[3]);
+  out[2 * gid + 1] = uint4(x[4], x[5], x[6], x[7]);
+}
+
+template [[host_name("pv_rows_k_m32")]] kernel void
+pv_rows<0>(device uint4*, const device uint*, constant uint&, constant uint&, uint);
+template [[host_name("pv_rows_k")]] kernel void
+pv_rows<1>(device uint4*, const device uint*, constant uint&, constant uint&, uint);
+template [[host_name("pv_rows_k_z9")]] kernel void
+pv_rows<2>(device uint4*, const device uint*, constant uint&, constant uint&, uint);
+
+// ---- Z14: pv_rows with a commit's side work folded in ----
+// Mirrored by `PvSideParams` in poseidon2.rs (32 bytes). Bit reversal: `cols` columns of 2^lg
+// words at column stride `stride` in `io`, in place (lg >= 10; cols = 0: none). Fills: `fill_n[k]`
+// uint4s of `fill[k]` set to the word `fill_v[k]` (fill_n[k] = 0: none).
+struct PvSideParams {
+  uint lg;
+  uint cols;
+  uint stride;
+  uint _pad;
+  uint fill_n0;
+  uint fill_v0;
+  uint fill_n1;
+  uint fill_v1;
+};
+
+// Two 32 x 32 tiles with rows padded to 33 words (the transposed reads hit distinct banks).
+#define PV_BR_PITCH 33u
+#define PV_BR_TILE (32u * PV_BR_PITCH)
+
+PV_INLINE uint pv_rev5(uint i) {
+  return reverse_bits(i) >> 27;
+}
+
+// Bit-reverse tile pair (t, rev(t)) of one column. A column of 2^lg words is a 32 x 2^(lg-10) x 32
+// array (hi, t, lo) at hi * 2^(lg-5) + t * 32 + lo; the bit reversal maps (hi, t, lo) to
+// (rev5(lo), rev(t), rev5(hi)): tile t, transposed with both coordinates reversed, goes to tile
+// rev(t), and back. Both tiles are staged in threadgroup memory (no private array: R17), 8 words
+// per thread and tile; one 128-thread group per pair. Ends with the threadgroup memory free.
+PV_INLINE void pv_br_pair(device uint* col, uint step, uint t, uint tr,
+                          threadgroup uint* x, uint tid) {
+  device uint* a = col + t * 32u;
+  device uint* b = col + tr * 32u;
+  threadgroup uint* xb = x + PV_BR_TILE;
+#pragma unroll
+  for (uint j = 0; j < 8; j++) {
+    const uint w = j * 128u + tid, r = w >> 5, c = w & 31u;
+    x[r * PV_BR_PITCH + c] = a[r * step + c];
+    xb[r * PV_BR_PITCH + c] = b[r * step + c];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+  // tile rev(t)[r][c] = tile t[rev5(c)][rev5(r)], and the other way round (for t == rev(t) both
+  // stores write the same values to the same words).
+#pragma unroll
+  for (uint j = 0; j < 8; j++) {
+    const uint w = j * 128u + tid, r = w >> 5, c = w & 31u;
+    const uint s = pv_rev5(c) * PV_BR_PITCH + pv_rev5(r);
+    b[r * step + c] = x[s];
+    a[r * step + c] = xb[s];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+// pv_rows, plus side work that touches neither `m` nor `out`, after the hash: threadgroup g
+// bit-reverses the tile pairs u = g, g + groups, ... of `io` (unit u = column u >> (lg - 10), tile
+// u & (2^(lg-10) - 1); a unit whose tile is above its reverse is the other half of a pair and
+// skipped), then the grid fills `fill0` / `fill1` (grid-stride). The memory-bound side work hides
+// under the ALU-bound hash (Z14). Launched as pv_rows with whole 128-thread groups (dim_x a
+// multiple of 128) and 2 * PV_BR_TILE words of threadgroup memory.
+template <int V>
+[[max_total_threads_per_threadgroup(128)]]
+kernel void pv_rows_side(device uint4* out [[buffer(0)]],
+                         const device uint* m [[buffer(1)]],
+                         constant uint& dim_x [[buffer(2)]],
+                         constant uint& dim_y [[buffer(3)]],
+                         device uint* io [[buffer(4)]],
+                         constant PvSideParams& sp [[buffer(5)]],
+                         device uint4* fill0 [[buffer(6)]],
+                         device uint4* fill1 [[buffer(7)]],
+                         threadgroup uint* xchg [[threadgroup(0)]],
+                         uint gid [[thread_position_in_grid]],
+                         uint tid [[thread_index_in_threadgroup]],
+                         uint g [[threadgroup_position_in_grid]],
+                         uint groups [[threadgroups_per_grid]]) {
+  if (gid < dim_x) {
+    uint x[24];
+#pragma unroll
+    for (int i = 0; i < 24; i++)
+      x[i] = 0;
+    const uint stride = dim_x, cols = dim_y;
+    const device uint* p = m + gid;
+    uint i = 0;
+    do {
+#pragma unroll
+      for (int j = 0; j < 16; j++, i++) {
+        if (i < cols) {
+          x[j] = *p;
+          p += stride;
+        } else {
+          x[j] = 0u;
+        }
+      }
+      pv::permute<V>(x);
+    } while (i < cols);
+    out[2 * gid] = uint4(x[0], x[1], x[2], x[3]);
+    out[2 * gid + 1] = uint4(x[4], x[5], x[6], x[7]);
+  }
+  if (sp.cols != 0u) {
+    const uint lgm = sp.lg - 10u;
+    const uint tiles = 1u << lgm;
+    const uint units = tiles * sp.cols;
+    const uint step = 1u << (sp.lg - 5u);
+#pragma unroll 1
+    for (uint u = g; u < units; u += groups) {
+      const uint t = u & (tiles - 1u);
+      const uint tr = lgm == 0u ? 0u : (reverse_bits(t) >> (32u - lgm));
+      if (t <= tr)
+        pv_br_pair(io + ulong(u >> lgm) * sp.stride, step, t, tr, xchg, tid);
+    }
+  }
+  const uint nt = groups * 128u;
+#pragma unroll 1
+  for (uint k = g * 128u + tid; k < sp.fill_n0; k += nt)
+    fill0[k] = uint4(sp.fill_v0);
+#pragma unroll 1
+  for (uint k = g * 128u + tid; k < sp.fill_n1; k += nt)
+    fill1[k] = uint4(sp.fill_v1);
+}
+
+template [[host_name("pv_rows_side_k_z9")]] kernel void
+pv_rows_side<2>(device uint4*, const device uint*, constant uint&, constant uint&, device uint*,
+                constant PvSideParams&, device uint4*, device uint4*, threadgroup uint*, uint, uint,
+                uint, uint);
+
+// =========================== pv_small.cuh (latency kernels, SIMD 32) ===========================
+namespace pvs {
+
+PV_INLINE uint red1(uint r) { return min(r, r - PV_P); } // [0, 2^32) ok
+PV_INLINE uint addm(uint a, uint b) { return red1(a + b); }
+
+// pv.cuh mred, HIP C++ branch (W): the high word of t + m*p mod 2^64, m = lo(t) * M0.
+PV_INLINE uint mred64(ulong t) {
+  uint m = uint(t) * PV_M0;
+  return uint((t + ulong(m) * PV_P) >> 32);
+}
+// The same from 32-bit words (!W; CUDA's PTX carry chain): lo + lo(m*p) is 0 mod 2^32, so its
+// carry is (lo != 0).
+PV_INLINE uint mred32(uint lo, uint hi) {
+  uint m = lo * PV_M0;
+  return hi + mulhi(m, PV_P) + (lo != 0u ? 1u : 0u);
+}
+template <bool W> PV_INLINE uint mmul_lazy(uint a, uint b) {
+  if (W)
+    return mred64(ulong(a) * b);
+  return mred32(a * b, mulhi(a, b));
+}
+template <bool W> PV_INLINE uint mmul(uint a, uint b) { return red1(mmul_lazy<W>(a, b)); }
+// x canonical -> x^7 canonical (bounds: pv.cuh)
+template <bool W> PV_INLINE uint sbox(uint x) {
+  uint x2 = mmul_lazy<W>(x, x);
+  uint x3 = mmul<W>(x2, x);
+  uint x4 = mmul_lazy<W>(x2, x2);
+  return mmul<W>(x3, x4);
+}
+PV_INLINE void m4(thread uint& a, thread uint& b, thread uint& c, thread uint& d) {
+  uint t0 = addm(a, b), t1 = addm(c, d);
+  uint t2 = addm(addm(b, b), t1), t3 = addm(addm(d, d), t0);
+  uint t1_2 = addm(t1, t1), t0_2 = addm(t0, t0);
+  uint t4 = addm(addm(t1_2, t1_2), t3), t5 = addm(addm(t0_2, t0_2), t2);
+  a = addm(t3, t5);
+  b = t5;
+  c = addm(t2, t4);
+  d = t4;
+}
+// a * c (Montgomery), c constant with cm = c * M0 mod 2^32. a < 2p, c < p: canonical output.
+template <bool W> PV_INLINE uint cmul(uint a, uint c, uint cm) {
+  uint m = a * cm;
+  if (W)
+    return red1(uint((ulong(a) * c + ulong(m) * PV_P) >> 32));
+  uint lo = a * c;
+  uint r = mulhi(a, c) + mulhi(m, PV_P) + (lo != 0u ? 1u : 0u);
+  return red1(r);
+}
+PV_INLINE uint shfl(uint v, uint src) {
+  return simd_shuffle(v, ushort(src));
+}
+PV_INLINE uint shx(uint v, uint m) {
+  return simd_shuffle_xor(v, ushort(m));
+}
+
+namespace w {
+
+// External layer, lane-parallel: m4 inside each group of 4 lanes, then the column sums of the
+// 6 groups gathered with parallel shuffles (lanes j, j+4, ..., j+20 only).
+PV_INLINE uint m_ext(uint x, uint lane) {
+  const uint base = lane & ~3u, j = lane & 3u;
+  uint a = shfl(x, base), b = shfl(x, base + 1), c = shfl(x, base + 2), d = shfl(x, base + 3);
+  m4(a, b, c, d);
+  uint m = j == 0 ? a : (j == 1 ? b : (j == 2 ? c : d));
+  uint s0 = shfl(m, j), s1 = shfl(m, j + 4), s2 = shfl(m, j + 8), s3 = shfl(m, j + 12),
+       s4 = shfl(m, j + 16), s5 = shfl(m, j + 20);
+  return addm(m, addm(addm(addm(s0, s1), addm(s2, s3)), addm(s4, s5)));
+}
+
+// Per-lane constants, loaded once per kernel.
+struct Lane {
+  uint rc[8], pw[21], cr[21], crm[21], dh, dhm, e0, e0m;
+};
+
+PV_INLINE void load(thread Lane& K, uint lane) {
+#pragma unroll
+  for (int r = 0; r < 8; r++)
+    K.rc[r] = PVS_RCF[r][lane];
+#pragma unroll
+  for (int r = 0; r < 21; r++) {
+    K.pw[r] = PVS_PW[r][lane];
+    K.cr[r] = PVS_CR[r][lane];
+    K.crm[r] = PVS_CRM[r][lane];
+  }
+  K.dh = PVS_DH[lane];
+  K.dhm = PVS_DHM[lane];
+  K.e0 = PVS_E0[0];
+  K.e0m = PVS_E0[1];
+}
+
+// x = this lane's cell (0 for lanes >= 24); returns the permuted cell (0 for lanes >= 24).
+template <bool W> PV_INLINE uint permute(uint x, uint lane, const thread Lane& K) {
+  const bool act = lane < 24;
+  x = m_ext(x, lane);
+#pragma unroll
+  for (int r = 0; r < 4; r++) {
+    x = act ? sbox<W>(addm(x, K.rc[r])) : 0u;
+    x = m_ext(x, lane);
+  }
+  // a_r = sum_{i>=1} d_i^r x_i, reduce-scattered so that lane r holds a_r (pw = 0 on lanes 0, >= 24)
+  uint v[32];
+#pragma unroll
+  for (int r = 0; r < 32; r++)
+    v[r] = r < 21 ? mmul<W>(K.pw[r < 21 ? r : 0], x) : 0u;
+#pragma unroll
+  for (uint m = 16, len = 16; m >= 1; m >>= 1, len >>= 1) {
+    const bool hi = (lane & m) != 0;
+#pragma unroll
+    for (uint j = 0; j < 16; j++) {
+      if (j < len) {
+        uint send = hi ? v[j] : v[j + len];
+        uint keep = hi ? v[j + len] : v[j];
+        v[j] = addm(keep, shx(send, m));
+      }
+    }
+  }
+  uint acc = v[0];
+  uint Tr = shfl(acc, 0); // T_0 = sum_{i>=1} x_i
+  uint x0 = shfl(x, 0);
+#pragma unroll
+  for (int r = 0; r < 21; r++) {
+    uint y = sbox<W>(addm(x0, PV_RCP[r]));
+    uint S = addm(y, Tr);                // sum of all cells after the sbox
+    x = addm(cmul<W>(x, K.dh, K.dhm), S);   // own cell: d_i x_i + S (lane 0 replaced below)
+    x0 = addm(cmul<W>(y, K.e0, K.e0m), Tr); // (d_0 + 1) y + T_r
+    acc = addm(acc, cmul<W>(S, K.cr[r], K.crm[r]));
+    Tr = shfl(acc, r + 1);               // T_{r+1} (unused after r == 20)
+  }
+  x = lane == 0 ? x0 : (act ? x : 0u);
+#pragma unroll
+  for (int r = 4; r < 8; r++) {
+    x = act ? sbox<W>(addm(x, K.rc[r])) : 0u;
+    x = m_ext(x, lane);
+  }
+  return act ? x : 0u;
+}
+
+} // namespace w
+
+namespace q {
+
+// value of cell 4m + k from lane k of this lane's group
+PV_INLINE uint grp(uint v, uint lane, uint k) {
+  return shfl(v, (lane & ~3u) | k);
+}
+PV_INLINE void m_ext(thread uint* y, uint lane) {
+  const uint l = lane & 3u;
+  uint s = 0;
+#pragma unroll
+  for (int m = 0; m < 6; m++) {
+    uint a = grp(y[m], lane, 0), b = grp(y[m], lane, 1), c = grp(y[m], lane, 2),
+         d = grp(y[m], lane, 3);
+    m4(a, b, c, d);
+    uint o = l == 0 ? a : (l == 1 ? b : (l == 2 ? c : d));
+    y[m] = o;
+    s = m ? addm(s, o) : o;
+  }
+#pragma unroll
+  for (int m = 0; m < 6; m++)
+    y[m] = addm(y[m], s);
+}
+template <bool W> PV_INLINE void full_round(thread uint* y, int r, uint lane) {
+  const uint l = lane & 3u;
+#pragma unroll
+  for (int m = 0; m < 6; m++)
+    y[m] = sbox<W>(addm(y[m], PV_RCF[r * 24 + 4 * m + l]));
+  m_ext(y, lane);
+}
+// pv.cuh's (CUDA) partial rounds (cells lazily in [0, 2p)), the 24-term sum split over the 4
+// lanes. The 64-bit sum is kept as two words; each xor-shuffle adds both with a carry.
+template <bool W> PV_INLINE void partial_rounds(thread uint* y, uint lane) {
+  const uint l = lane & 3u;
+#pragma unroll 1
+  for (int r = 0; r < 21; r++) {
+    if (l == 0)
+      y[0] = sbox<W>(addm(red1(y[0]), PV_RCP[r]));
+    uint lo = 0, hi = 0;
+#pragma unroll
+    for (int m = 0; m < 6; m++) {
+      lo += y[m];
+      hi += lo < y[m] ? 1u : 0u;
+    }
+#pragma unroll
+    for (uint k = 1; k <= 2; k <<= 1) {
+      uint olo = shx(lo, k), ohi = shx(hi, k);
+      uint nlo = lo + olo;
+      hi = hi + ohi + (nlo < lo ? 1u : 0u);
+      lo = nlo;
+    }
+    if (W) {
+      uint st = mred64((ulong(hi) << 32) | lo);
+      uint w = mred64(ulong(st) * 0x12f37bfbu);
+#pragma unroll
+      for (int m = 0; m < 6; m++)
+        y[m] = mred64(ulong(PV_DH[4 * m + l]) * y[m] + w);
+    } else {
+      uint st = mred32(lo, hi);
+      uint w = mred32(st * 0x12f37bfbu, mulhi(st, 0x12f37bfbu));
+#pragma unroll
+      for (int m = 0; m < 6; m++) {
+        const uint d = PV_DH[4 * m + l];
+        const uint plo = d * y[m];
+        const uint tlo = plo + w;
+        y[m] = mred32(tlo, mulhi(d, y[m]) + (tlo < plo ? 1u : 0u));
+      }
+    }
+  }
+#pragma unroll
+  for (int m = 0; m < 6; m++)
+    y[m] = red1(y[m]);
+}
+template <bool W> PV_INLINE void permute(thread uint* y, uint lane) {
+  m_ext(y, lane);
+#pragma unroll 1
+  for (int r = 0; r < 4; r++)
+    full_round<W>(y, r, lane);
+  partial_rounds<W>(y, lane);
+#pragma unroll 1
+  for (int r = 4; r < 8; r++)
+    full_round<W>(y, r, lane);
+}
+
+} // namespace q
+} // namespace pvs
+
+// out[h] = H(in[2h], in[2h + 1]) for h < n; one SIMD group per hash, 128-thread groups.
+// pv_small.cuh pvs::w::fold_k.
+template <bool W>
+[[max_total_threads_per_threadgroup(128)]]
+kernel void pvs_w_fold(device uint* out [[buffer(0)]],
+                         const device uint* in [[buffer(1)]],
+                         constant uint& n [[buffer(2)]],
+                         uint tg [[threadgroup_position_in_grid]],
+                         uint sg [[simdgroup_index_in_threadgroup]],
+                         uint sgs [[simdgroups_per_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+  const uint h = tg * sgs + sg;
+  if (h >= n)
+    return; // whole SIMD group
+  pvs::w::Lane K;
+  pvs::w::load(K, lane);
+  uint x = lane < 16 ? in[h * 16 + lane] : 0u;
+  x = pvs::w::permute<W>(x, lane, K);
+  if (lane < 8)
+    out[h * 8 + lane] = x;
+}
+
+// out[r] = hash of row r of the column-major dim_x x dim_y matrix m; one SIMD group per row.
+// pv_small.cuh pvs::w::rows_k. The host keeps dim_x * dim_y < 2^32.
+template <bool W>
+[[max_total_threads_per_threadgroup(128)]]
+kernel void pvs_w_rows(device uint* out [[buffer(0)]],
+                         const device uint* m [[buffer(1)]],
+                         constant uint& dim_x [[buffer(2)]],
+                         constant uint& dim_y [[buffer(3)]],
+                         uint tg [[threadgroup_position_in_grid]],
+                         uint sg [[simdgroup_index_in_threadgroup]],
+                         uint sgs [[simdgroups_per_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+  const uint row = tg * sgs + sg;
+  const uint rows = dim_x, cols = dim_y;
+  if (row >= rows)
+    return; // whole SIMD group
+  pvs::w::Lane K;
+  pvs::w::load(K, lane);
+  uint x = 0;
+  uint i = 0;
+  do {
+    if (lane < 16)
+      x = i + lane < cols ? m[(i + lane) * rows + row] : 0u;
+    x = pvs::w::permute<W>(x, lane, K);
+    i += 16;
+  } while (i < cols);
+  if (lane < 8)
+    out[row * 8 + lane] = x;
+}
+
+// out[i] = H(in[2i], in[2i + 1]); one 4-lane group per output, 128-thread groups (whole SIMD
+// groups stay converged for the shuffles). pv_small.cuh pvs::q::fold_k.
+template <bool W>
+[[max_total_threads_per_threadgroup(128)]]
+kernel void pvs_q_fold(device uint* out [[buffer(0)]],
+                         const device uint* in [[buffer(1)]],
+                         constant uint& n [[buffer(2)]],
+                         uint tg [[threadgroup_position_in_grid]],
+                         uint sg [[simdgroup_index_in_threadgroup]],
+                         uint sgs [[simdgroups_per_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+  const uint g = ((tg * sgs + sg) * 32 + lane) >> 2;
+  const uint l = lane & 3u;
+  const bool act = g < n;
+  const uint gg = act ? g : 0;
+  uint y[6];
+#pragma unroll
+  for (int m = 0; m < 4; m++)
+    y[m] = in[gg * 16 + 4 * m + l];
+  y[4] = 0;
+  y[5] = 0;
+  pvs::q::permute<W>(y, lane);
+  if (act) {
+    out[gg * 8 + l] = y[0];
+    out[gg * 8 + 4 + l] = y[1];
+  }
+}
+
+// out[r] = hash of row r (column-major dim_x x dim_y); one 4-lane group per row.
+// pv_small.cuh pvs::q::rows_k. The host keeps dim_x * dim_y < 2^32.
+template <bool W>
+[[max_total_threads_per_threadgroup(128)]]
+kernel void pvs_q_rows(device uint* out [[buffer(0)]],
+                         const device uint* mat [[buffer(1)]],
+                         constant uint& dim_x [[buffer(2)]],
+                         constant uint& dim_y [[buffer(3)]],
+                         uint tg [[threadgroup_position_in_grid]],
+                         uint sg [[simdgroup_index_in_threadgroup]],
+                         uint sgs [[simdgroups_per_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+  const uint g = ((tg * sgs + sg) * 32 + lane) >> 2;
+  const uint l = lane & 3u;
+  const uint rows = dim_x, cols = dim_y;
+  const bool act = g < rows;
+  const uint gg = act ? g : 0;
+  uint y[6] = {0, 0, 0, 0, 0, 0};
+  uint i = 0;
+  do {
+#pragma unroll
+    for (int m = 0; m < 4; m++) {
+      uint c = i + 4 * m + l;
+      y[m] = c < cols ? mat[c * rows + gg] : 0u;
+    }
+    pvs::q::permute<W>(y, lane);
+    i += 16;
+  } while (i < cols);
+  if (act) {
+    out[gg * 8 + l] = y[0];
+    out[gg * 8 + 4 + l] = y[1];
+  }
+}
+
+template [[host_name("pvs_w_fold_k")]] kernel void
+pvs_w_fold<true>(device uint*, const device uint*, constant uint&, uint, uint, uint, uint);
+template [[host_name("pvs_w_fold_k_m32")]] kernel void
+pvs_w_fold<false>(device uint*, const device uint*, constant uint&, uint, uint, uint, uint);
+
+template [[host_name("pvs_w_rows_k")]] kernel void
+pvs_w_rows<true>(device uint*, const device uint*, constant uint&, constant uint&, uint, uint, uint, uint);
+template [[host_name("pvs_w_rows_k_m32")]] kernel void
+pvs_w_rows<false>(device uint*, const device uint*, constant uint&, constant uint&, uint, uint, uint, uint);
+
+template [[host_name("pvs_q_fold_k")]] kernel void
+pvs_q_fold<true>(device uint*, const device uint*, constant uint&, uint, uint, uint, uint);
+template [[host_name("pvs_q_fold_k_m32")]] kernel void
+pvs_q_fold<false>(device uint*, const device uint*, constant uint&, uint, uint, uint, uint);
+
+template [[host_name("pvs_q_rows_k")]] kernel void
+pvs_q_rows<true>(device uint*, const device uint*, constant uint&, constant uint&, uint, uint, uint, uint);
+template [[host_name("pvs_q_rows_k_m32")]] kernel void
+pvs_q_rows<false>(device uint*, const device uint*, constant uint&, constant uint&, uint, uint, uint, uint);

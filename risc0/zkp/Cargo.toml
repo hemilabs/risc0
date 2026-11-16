@@ -11,6 +11,11 @@ repository = { workspace = true }
 name = "hash"
 harness = false
 
+[[bench]]
+name = "metal"
+harness = false
+required-features = ["metal"]
+
 [dependencies]
 anyhow = { version = "1.0", default-features = false }
 blake2 = { version = "0.10.6", default-features = false }
@@ -34,7 +39,7 @@ tracing = { version = "0.1", default-features = false, features = [
 ] }
 
 [target.'cfg(any(target_os="macos", target_os="ios"))'.dependencies]
-metal = { workspace = true }
+metal = { workspace = true, optional = true }
 
 [target.'cfg(not(target_os = "zkvm"))'.dependencies]
 ndarray = { version = "0.16", features = ["rayon"], optional = true }
@@ -60,7 +65,7 @@ cuda = ["dep:cust", "prove", "risc0-sys/cuda"]
 rocm = ["prove", "risc0-sys/rocm"]
 intel = ["prove", "risc0-sys/intel"]
 default = []
-metal = ["prove"]
+metal = ["prove", "dep:metal", "risc0-sys/metal"]
 metal_prefix_products = []
 prove = [
   "dep:ff",

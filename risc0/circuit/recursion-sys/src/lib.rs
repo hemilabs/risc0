@@ -12,6 +12,92 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(all(
+    feature = "metal",
+    any(feature = "cuda", feature = "rocm", feature = "intel")
+))]
+compile_error!(
+    "Feature 'metal' is mutually exclusive with 'cuda', 'rocm' and 'intel'. Enable only one GPU backend."
+);
+
+#[cfg(all(feature = "metal", not(any(target_os = "macos", target_os = "ios"))))]
+compile_error!("Feature 'metal' is only supported on macOS and iOS targets.");
+
+/// The unit's Metal kernels, compiled by build.rs into a metallib: the hand-written
+/// `kernels/metal/rec_kernels.metal` plus the step and eval_check kernels translated from
+/// `kernels/cuda` at build time.
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+pub const METAL_LIB: &[u8] = include_bytes!(env!("RECURSION_METAL_PATH"));
+
+/// Every kernel entry point in [METAL_LIB]; the HAL fails fast if one is missing.
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+pub const METAL_KERNEL_NAMES: &[&str] = &[
+    // kernels/metal/rec_kernels.metal (C1)
+    "injectWomBacks",
+    "fillOneExt",
+    "prefixProductsChunks",
+    "prefixProductsTotals",
+    "prefixProductsFixup",
+    "recInitRows",
+    "recFillTail",
+    "recZeroizeRows",
+    "markHostChains",
+    "scatterHostChains",
+    // kernels/metal/rec_sort.metal (C14: GPU WOM counting sort)
+    "recSortHist",
+    "recScanBlocks",
+    "recScanSums",
+    "recScanAdd",
+    "recSortScatter",
+    "recSortCheck",
+    "recCopyWords",
+    // $OUT_DIR/metal/step_*.metal (C2 `cuda2metal_steps.py --list-kernels`)
+    "parStepExec",
+    "parStepVerifyWom",
+    "parStepComputeAccum",
+    "parStepVerifyAccum",
+    // $OUT_DIR/metal/eval_check.metal (C3 `cuda2metal_eval.py --list-kernels`; monolith)
+    "eval_check",
+    // $OUT_DIR/metal/eval_check_split.metal (C3 `--split`; parts 0..5 in order)
+    "ec_part_0",
+    "ec_part_1",
+    "ec_part_2",
+    "ec_part_3",
+    "ec_part_4",
+    "ec_part_5",
+    // $OUT_DIR/metal/eval_check_split_lz.metal (C12 `--split-lz`; lazy Fp form, parts 0..5)
+    "ec_lz_part_0",
+    "ec_lz_part_1",
+    "ec_lz_part_2",
+    "ec_lz_part_3",
+    "ec_lz_part_4",
+    "ec_lz_part_5",
+    // $OUT_DIR/metal/eval_check_split_lz_u32.metal (C13 `--split-lz`; the C12 four-load form of
+    // the lazy split, RISC0_METAL_REC_LZ_UINT4=0)
+    "ec_lz32_part_0",
+    "ec_lz32_part_1",
+    "ec_lz32_part_2",
+    "ec_lz32_part_3",
+    "ec_lz32_part_4",
+    "ec_lz32_part_5",
+    // $OUT_DIR/metal/eval_check_split_rg.metal (C15 `--split-rg`; the Metal-only regrouped split
+    // in lazy Fp form, parts 0..13 in order)
+    "ec_rg_part_0",
+    "ec_rg_part_1",
+    "ec_rg_part_2",
+    "ec_rg_part_3",
+    "ec_rg_part_4",
+    "ec_rg_part_5",
+    "ec_rg_part_6",
+    "ec_rg_part_7",
+    "ec_rg_part_8",
+    "ec_rg_part_9",
+    "ec_rg_part_10",
+    "ec_rg_part_11",
+    "ec_rg_part_12",
+    "ec_rg_part_13",
+];
+
 use risc0_core::field::baby_bear::{BabyBearElem, BabyBearExtElem};
 
 #[repr(C)]

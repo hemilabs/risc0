@@ -54,7 +54,7 @@
 //! | client           | all except rv32im | std        | Enables the client API.                                                                                                                                      |
 //! | cuda             |                   | prove, std | Enables CUDA GPU acceleration for the prover. Requires CUDA toolkit to be installed.                                                                         |
 //! | disable-dev-mode | all except rv32im |            | Disables dev mode so that proving and verifying may not be faked. Used to prevent a misplaced `RISC0_DEV_MODE` from breaking security in production systems. |
-//! | metal            | macos             | prove, std | Deprecated - Metal GPU acceleration for the prover is now enabled by default on Apple Silicon.                                                               |
+//! | metal            | macos, ios        | prove, std | Enables Metal GPU acceleration for the prover (Apple GPUs). Requires the Metal toolchain (`xcrun metal`). Mutually exclusive with cuda, rocm and intel.     |
 //! | prove            | all except rv32im | std        | Enables the prover, incompatible within the zkvm guest.                                                                                                      |
 //! | std              | all               |            | Support for the Rust stdlib.                                                                                                                                 |
 //!
@@ -71,6 +71,17 @@
 //! [zkVM Tutorial]: https://dev.risczero.com/api/zkvm/tutorials/hello-world
 
 extern crate alloc;
+
+#[cfg(all(
+    feature = "metal",
+    any(feature = "cuda", feature = "rocm", feature = "intel")
+))]
+compile_error!(
+    "Feature 'metal' is mutually exclusive with 'cuda', 'rocm' and 'intel'. Enable only one GPU backend."
+);
+
+#[cfg(all(feature = "metal", not(any(target_os = "macos", target_os = "ios"))))]
+compile_error!("Feature 'metal' is only supported on macOS and iOS targets.");
 
 mod claim;
 pub mod guest;
@@ -113,6 +124,12 @@ pub use self::host::{
         },
     },
 };
+
+/// Metal builds: drop the provers (and their GPU buffer pools) this thread caches between
+/// proofs; see the function's docs.
+#[cfg(not(target_os = "zkvm"))]
+#[cfg(feature = "metal")]
+pub use self::host::server::prove::release_hal_buffers;
 
 #[cfg(not(target_os = "zkvm"))]
 #[cfg(feature = "bonsai")]

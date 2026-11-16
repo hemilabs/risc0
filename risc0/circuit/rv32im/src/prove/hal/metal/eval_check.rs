@@ -1,0 +1,2488 @@
+// Copyright 2026 RISC Zero, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! rv32im eval_check on the Metal HAL, and the rest of `CircuitHal`.
+//!
+//! R10 (PLAN 4.2): eval_check runs the baseline `eval_check` kernel (R6's translation of CUDA
+//! `eval_check_0..3.cu` + `eval_check_kernel.cu` by `cuda2metal.py eval`). The host side mirrors
+//! `hal/cuda.rs::eval_check` / `risc0_circuit_rv32im_cuda_eval_check`:
+//! - the 458 poly_mix powers are computed on the CPU (`map_pow(poly_mix, POLY_MIX_POWERS)`) and
+//!   copied into the HAL-owned `ScratchBuffers::poly_mix` buffer (CUDA copies them into
+//!   `__constant__` memory; 7328 B is above the 4 KB `set_bytes` limit, so here it is a
+//!   `const device FpExt*` binding);
+//! - one dispatch of `ceil(domain / 256)` threadgroups of 256 threads (CUDA `EVAL_CHECK_THREADS`),
+//!   then the batch is closed with a sync (end of a circuit phase, PLAN 2.6);
+//! - `eval_check_dep` stays the default no-op (one command queue, PLAN 2.0; a second queue is R14).
+//!
+//! R12 adds the evalfast kernels (`eval_check_ef.metal`: rv32im-sys
+//! `kernels/cuda/evalfast/regen.py --metal`, the CUDA evalfast chain after remat_lu.py converted
+//! by to_metal.py). The host mirrors `risc0_circuit_rv32im_cuda_eval_check` of
+//! `eval_check_ef.cu`, except that CUDA's one-thread `ef_prep`/`ef_prep_n` kernels are replaced by
+//! a CPU table builder ([ef_table], PLAN 4.2): the 627-entry poly_mix table (458 powers, 107
+//! products, 62 hoisted out/mix terms from the generated `rk_hoist`), its NBETA-folded copy and
+//! the 4 vanishing quotients go into one shared buffer; then `ef_eval_split` (even threadgroups:
+//! main chain into `check`, odd: LogUp chain into the scratch partials) and `ef_combine`
+//! (`check = (check + partial) * quotient`) in one batch. [EVAL_KERNEL_ENV] selects the kernel
+//! (`evalfast`, the default, `evalfast_r15e`, `evalfast_r12` or `baseline`); all are bit-exact
+//! with the CPU (tests).
+//!
+//! R15e (docs/metal-port/notes/R15e.md): evalfast reads its poly_mix table as `const device`
+//! memory instead of `constant` and computes the NBETA-folded rows from the pm rows instead of
+//! loading them (~25 % less split-kernel time at po2 20). `evalfast_r12` runs R12's form
+//! (`ef_eval_split_r12`, the same generated TU compiled with `-DEF_R12_FORM`) for A/B runs. The
+//! PSOs of the kernels that are not the default (`eval_check`, ~60 s cold, and
+//! `ef_eval_split_r12`) are built on first use ([lazy_pipeline]) instead of at library load.
+//!
+//! R18 (docs/metal-port/notes/R18.md): the kernel reads every table row as half of one 32-byte
+//! `ulong4` load of its aligned row pair instead of one 16-byte `uint4` load (same words), which
+//! more than halves the split-kernel time on the M5 Max. `evalfast_r15e` (`ef_eval_split_r15e`,
+//! the TU compiled with `-DEF_R15E_FORM`, lazy PSO) keeps the uint4 loads selectable. The table
+//! buffer must be 32-byte aligned (checked).
+//!
+//! R20 (docs/metal-port/notes/R20.md): `ef_eval_split_fc` is `ef_eval_split` with the
+//! evaluation domain as function constant 0 (the TU compiled with `-DEF_FC_FORM`, to_metal.py
+//! `ef_fc_domain`). Per job domain a PSO of it specialized with `MTLFunctionConstantValues`
+//! (constant folding only, so the same results) is built on a background thread through its own
+//! binary archive (zkp `archive::specialized_pipeline`, the key includes the value), and
+//! eval_check uses it once it is ready, the plain `ef_eval_split` until then (a cold
+//! specialization compiles for ~15 s and never blocks a segment). [EVAL_FC_ENV] selects the
+//! mode.
+//!
+//! R22 (docs/metal-port/notes/R22.md): the split kernels run a flat chain (to_metal.py): the
+//! generated chain functions are called one after another by poly_fp / rk_accblk instead of each
+//! calling the next, passing their Fp arguments through a `thread` array, so one chain frame is
+//! live at a time (native stack ~4 KB instead of ~19 KB) and the kernel is ~7 % faster on the M5
+//! Max. [EVAL_FLAT_ENV]=0 runs the nested-chain kernels of before R22 (`ef_eval_split_nest`,
+//! `ef_eval_split_fc_nest`). eval_regime.rs guards the compiler regime of the kernels.
+//!
+//! R23 (docs/metal-port/notes/R23.md): the flat chain issues its trace loads one window of
+//! statements ahead of their use (to_metal.py hoist(), the Metal form of ROCm's hoist_hip.py),
+//! ~3.5 % faster split kernels; [EVAL_HOIST_ENV]=0 runs R22's flat kernels
+//! (`ef_eval_split_nohoist`, `ef_eval_split_fc_nohoist`).
+//!
+//! The R7 CPU path (the `hal/cpu.rs` loop over `risc0_circuit_rv32im_cpu_poly_fp` on host views of
+//! the shared buffers) is kept as a debugging fallback, selected with
+//! `RISC0_METAL_RV32IM_CPU_PHASES=eval` (a comma list of `witgen,accum,eval`).
+
+use rayon::prelude::*;
+use risc0_circuit_rv32im_sys::{metal_evalfast as ef, risc0_circuit_rv32im_cpu_poly_fp};
+use risc0_core::{
+    field::{map_pow, Elem, ExtElem as _, RootsOfUnity as _},
+    scope,
+};
+use risc0_zkp::{
+    core::log2_ceil,
+    hal::{
+        metal::{as_bytes, BufferImpl, Grid, KernelArg, MetalHal, MetalHash},
+        AccumPreflight, Buffer as _, CircuitHal,
+    },
+    INV_RATE,
+};
+
+use super::{
+    count, cpu_phase, eval_regime, grow, host_slice, phase_mark, pipeline_host_stat,
+    MetalCircuitHal, Phase, CPU_PHASES_ENV,
+};
+use crate::{
+    prove::{GLOBAL_MIX, GLOBAL_OUT},
+    zirgen::{
+        circuit::{ExtVal, Val, REGISTER_GROUP_ACCUM, REGISTER_GROUP_CODE, REGISTER_GROUP_DATA},
+        info::{NUM_POLY_MIX_POWERS, POLY_MIX_POWERS},
+    },
+};
+
+/// Whether [CPU_PHASES_ENV] selects the CPU fallback for eval_check (read on every call).
+fn eval_on_cpu() -> bool {
+    cpu_phase("eval")
+}
+
+/// Threads per threadgroup: CUDA `EVAL_CHECK_THREADS` (eval_check_kernel.cu), which is also the
+/// `[[max_total_threads_per_threadgroup]]` of the translated kernel.
+const EVAL_CHECK_THREADS: u64 = 256;
+
+/// Selects the GPU eval_check kernel: `evalfast` (default), `evalfast_r15e` (evalfast with 16-byte
+/// table-row loads, the revert switch of R18's 32-byte row-pair loads), `evalfast_r12` (evalfast
+/// with R12's poly_mix table forms, the A/B switch of R15e's table change) or `baseline` (R10's
+/// translation of CUDA eval_check_0..3.cu, the oracle). Read on every call; unknown values are an
+/// error.
+pub(crate) const EVAL_KERNEL_ENV: &str = "RISC0_METAL_RV32IM_EVAL";
+
+/// The GPU eval_check kernels ([EVAL_KERNEL_ENV]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EvalKernel {
+    Baseline,
+    Evalfast,
+    /// evalfast compiled with `-DEF_R12_FORM` (`constant` table, NBETA rows loaded).
+    EvalfastR12,
+    /// evalfast compiled with `-DEF_R15E_FORM` (16-byte `uint4` table-row loads; R18's default
+    /// reads each row as half of a 32-byte row-pair load).
+    EvalfastR15e,
+}
+
+impl EvalKernel {
+    /// The default when [EVAL_KERNEL_ENV] is unset: evalfast (bit-exact with the baseline and the
+    /// CPU on every test, ~3x faster at po2 20; docs/metal-port/notes/R12.md).
+    pub(crate) const DEFAULT: Self = Self::Evalfast;
+
+    pub(crate) fn parse(v: &str) -> anyhow::Result<Self> {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "" => Ok(Self::DEFAULT),
+            "evalfast" | "fast" | "ef" => Ok(Self::Evalfast),
+            "evalfast_r12" | "evalfast-r12" | "r12" => Ok(Self::EvalfastR12),
+            "evalfast_r15e" | "evalfast-r15e" | "r15e" => Ok(Self::EvalfastR15e),
+            "baseline" | "base" => Ok(Self::Baseline),
+            _ => anyhow::bail!(
+                "{EVAL_KERNEL_ENV}={v:?}: expected `evalfast`, `evalfast_r15e`, `evalfast_r12` or \
+                 `baseline`"
+            ),
+        }
+    }
+
+    /// The kernel [EVAL_KERNEL_ENV] selects now.
+    pub(crate) fn current() -> anyhow::Result<Self> {
+        match std::env::var(EVAL_KERNEL_ENV) {
+            Ok(v) => Self::parse(&v),
+            Err(_) => Ok(Self::DEFAULT),
+        }
+    }
+}
+
+/// R20: `RISC0_METAL_RV32IM_EVAL_FC` selects how the evalfast split kernel uses its
+/// domain-specialized PSOs ([FcMode]): `0` / `off` never (the plain PSO, the revert knob),
+/// `1` / `on` / `background` (the default) builds them on a background thread and uses each once
+/// it is ready, `wait` builds the one a call needs before dispatching (benchmarks, tests). Read on
+/// every call; unknown values are an error.
+pub(crate) const EVAL_FC_ENV: &str = "RISC0_METAL_RV32IM_EVAL_FC";
+
+/// The modes of [EVAL_FC_ENV].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FcMode {
+    Off,
+    Background,
+    Wait,
+}
+
+impl FcMode {
+    /// The default when [EVAL_FC_ENV] is unset.
+    pub(crate) const DEFAULT: Self = Self::Background;
+
+    pub(crate) fn parse(v: &str) -> anyhow::Result<Self> {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "" => Ok(Self::DEFAULT),
+            "0" | "off" => Ok(Self::Off),
+            "1" | "on" | "background" => Ok(Self::Background),
+            "wait" | "sync" => Ok(Self::Wait),
+            _ => anyhow::bail!("{EVAL_FC_ENV}={v:?}: expected `0`, `1` or `wait`"),
+        }
+    }
+
+    pub(crate) fn current() -> anyhow::Result<Self> {
+        match std::env::var(EVAL_FC_ENV) {
+            Ok(v) => Self::parse(&v),
+            Err(_) => Ok(Self::DEFAULT),
+        }
+    }
+}
+
+/// The split kernel whose PSOs are specialized per domain (function constant 0 = the domain;
+/// same ABI as `ef_eval_split`). Never built unspecialized: Metal refuses a PSO of a function
+/// with function constants that was not created with constant values.
+pub(crate) const FC_KERNEL: &str = "ef_eval_split_fc";
+
+/// R22: `RISC0_METAL_RV32IM_EVAL_FLAT`: `1` (default) runs the flat-chain split kernels
+/// (`ef_eval_split`, `ef_eval_split_fc`), `0` the nested-chain ones of before R22
+/// (`ef_eval_split_nest`, lazy, and `ef_eval_split_fc_nest`; the revert knob). Read on every
+/// call; unknown values are an error.
+pub(crate) const EVAL_FLAT_ENV: &str = "RISC0_METAL_RV32IM_EVAL_FLAT";
+/// R22: the nested-chain plain split kernel (built on first use).
+pub(crate) const NEST_KERNEL: &str = "ef_eval_split_nest";
+/// R22: the nested-chain specialized split kernel.
+pub(crate) const FC_NEST_KERNEL: &str = "ef_eval_split_fc_nest";
+
+/// R23: `RISC0_METAL_RV32IM_EVAL_HOIST`: `1` (default) runs the flat split kernels with the trace
+/// loads issued ahead (`ef_eval_split`, `ef_eval_split_fc`), `0` R22's flat kernels without
+/// (`ef_eval_split_nohoist`, lazy, and `ef_eval_split_fc_nohoist`; the revert knob). Only read when
+/// [EVAL_FLAT_ENV] selects the flat chain (the nested kernels never hoist). Read on every call;
+/// unknown values are an error.
+pub(crate) const EVAL_HOIST_ENV: &str = "RISC0_METAL_RV32IM_EVAL_HOIST";
+/// R23: the flat plain split kernel without hoisted trace loads (built on first use).
+pub(crate) const NOHOIST_KERNEL: &str = "ef_eval_split_nohoist";
+/// R23: the flat specialized split kernel without hoisted trace loads.
+pub(crate) const FC_NOHOIST_KERNEL: &str = "ef_eval_split_fc_nohoist";
+
+/// The split-kernel form [EVAL_FLAT_ENV] and [EVAL_HOIST_ENV] select.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum ChainForm {
+    /// The flat chain with the trace loads issued ahead (R23, default).
+    Hoist,
+    /// The flat chain with every load at its use (R22).
+    Flat,
+    /// The nested chain (pre-R22).
+    Nest,
+}
+
+impl ChainForm {
+    /// The plain split kernel of this form.
+    pub(crate) fn plain_kernel(self) -> &'static str {
+        match self {
+            ChainForm::Hoist => "ef_eval_split",
+            ChainForm::Flat => NOHOIST_KERNEL,
+            ChainForm::Nest => NEST_KERNEL,
+        }
+    }
+}
+
+pub(crate) fn parse_hoist(v: &str) -> anyhow::Result<bool> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "" | "1" | "on" => Ok(true),
+        "0" | "off" => Ok(false),
+        _ => anyhow::bail!("{EVAL_HOIST_ENV}={v:?}: expected `1` or `0`"),
+    }
+}
+
+/// The form [EVAL_FLAT_ENV] and [EVAL_HOIST_ENV] select now.
+pub(crate) fn chain_form() -> anyhow::Result<ChainForm> {
+    if !flat_chain()? {
+        return Ok(ChainForm::Nest);
+    }
+    let hoist = std::env::var(EVAL_HOIST_ENV).map_or(Ok(true), |v| parse_hoist(&v))?;
+    Ok(if hoist {
+        ChainForm::Hoist
+    } else {
+        ChainForm::Flat
+    })
+}
+
+pub(crate) fn parse_flat(v: &str) -> anyhow::Result<bool> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "" | "1" | "on" | "flat" => Ok(true),
+        "0" | "off" | "nest" => Ok(false),
+        _ => anyhow::bail!("{EVAL_FLAT_ENV}={v:?}: expected `1` or `0`"),
+    }
+}
+
+/// Whether [EVAL_FLAT_ENV] selects the flat chain now.
+pub(crate) fn flat_chain() -> anyhow::Result<bool> {
+    std::env::var(EVAL_FLAT_ENV).map_or(Ok(true), |v| parse_flat(&v))
+}
+
+/// The specialized split kernel of the form: [FC_KERNEL] (hoisted flat chain), [FC_NOHOIST_KERNEL]
+/// or [FC_NEST_KERNEL].
+pub(crate) fn fc_kernel(form: ChainForm) -> &'static str {
+    match form {
+        ChainForm::Hoist => FC_KERNEL,
+        ChainForm::Flat => FC_NOHOIST_KERNEL,
+        ChainForm::Nest => FC_NEST_KERNEL,
+    }
+}
+
+/// The archive unit of the specialization of `domain` of the library archived under `unit`: one
+/// unit per domain, so the domains of one metallib do not prune each other's archives (zkp
+/// archive.rs keeps a few keys per unit). `<unit>_fc<domain>` is no other unit's prefix followed
+/// by `-` (the archive module's naming rule).
+pub(crate) fn fc_unit(unit: &str, domain: u32) -> String {
+    format!("{unit}_fc{domain}")
+}
+
+/// [fc_unit] of the default specialized kernel, `<unit>_fcnh<domain>` of the unhoisted flat one
+/// (R23) and `<unit>_fcnest<domain>` of the nested one (R22).
+pub(crate) fn fc_unit_of(unit: &str, domain: u32, form: ChainForm) -> String {
+    match form {
+        ChainForm::Hoist => fc_unit(unit, domain),
+        ChainForm::Flat => format!("{unit}_fcnh{domain}"),
+        ChainForm::Nest => format!("{unit}_fcnest{domain}"),
+    }
+}
+
+/// The build state of one domain's specialized PSO.
+enum FcState {
+    Building,
+    Ready(&'static metal::ComputePipelineState),
+    /// Logged once; the plain PSO is used for this domain for the rest of the process.
+    Failed,
+}
+
+/// Specialized PSO states by (domain, chain form) (one rv32im library per process), and the
+/// condition variable [FcMode::Wait] waits on.
+type FcStates = (
+    std::sync::Mutex<std::collections::HashMap<(u32, ChainForm), FcState>>,
+    std::sync::Condvar,
+);
+fn fc_states() -> &'static FcStates {
+    static S: std::sync::OnceLock<FcStates> = std::sync::OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
+/// Build (blocking) the PSO of [fc_kernel] specialized for `domain` from `kernels`'s library,
+/// through the binary archive of [fc_unit_of] (or none when `kernels` has no archive directory).
+fn build_fc(
+    kernels: &super::Rv32imKernels,
+    domain: u32,
+    form: ChainForm,
+) -> anyhow::Result<metal::ComputePipelineState> {
+    let name = fc_kernel(form);
+    let src = kernels
+        .source
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no kernel source for a specialized PSO"))?;
+    let lib = kernels.kernels.library();
+    let unit = fc_unit_of(src.unit, domain, form);
+    let (pso, r) = risc0_zkp::hal::metal::archive::specialized_pipeline(
+        src.archive_dir.clone(),
+        lib.device(),
+        lib,
+        src.bytes,
+        &unit,
+        name,
+        &[(0, domain)],
+    )?;
+    // R22: refuse a specialization the back end compiled into the slow regime (eval_regime.rs).
+    // W7-Z1: a PSO from the offline archive (`RISC0_METAL_AOT_DIR`) is read from that file (the
+    // runtime archive may not exist yet).
+    if eval_regime::settings().0 != eval_regime::GuardMode::Off {
+        let info = if r.aot_hits > 0 {
+            r.aot_path.as_deref()
+        } else {
+            r.path.as_deref()
+        }
+        .and_then(|p| eval_regime::archive_info(p, name));
+        let regime = eval_regime::Regime::of(info, eval_regime::settings().1);
+        if !eval_regime::fc_acceptable(kernels, name, domain, regime) {
+            anyhow::bail!("refused by the eval regime guard (slow compiler regime)");
+        }
+    }
+    tracing::info!(
+        "rv32im Metal: {name} for domain {domain} in {:.2} s (binary archive {}: {} hits, \
+         {} misses{})",
+        r.elapsed.as_secs_f64(),
+        match (&r.aot_path, r.aot_hits) {
+            (Some(p), 1..) => format!("offline {}", p.display()),
+            _ => r
+                .path
+                .as_deref()
+                .map_or("off".into(), |p| p.display().to_string()),
+        },
+        r.hits,
+        r.misses,
+        if r.errors.is_empty() {
+            String::new()
+        } else {
+            format!(", {} errors, first: {}", r.errors.len(), r.errors[0])
+        }
+    );
+    Ok(pso)
+}
+
+/// Record the outcome of a domain's build and wake [FcMode::Wait] callers.
+fn fc_finish(domain: u32, form: ChainForm, res: anyhow::Result<metal::ComputePipelineState>) {
+    let state = match res {
+        Ok(pso) => FcState::Ready(Box::leak(Box::new(pso))),
+        Err(e) => {
+            tracing::warn!(
+                "rv32im Metal: no {} PSO specialized for domain {domain} ({e:#}); the plain PSO \
+                 stays in use",
+                fc_kernel(form)
+            );
+            FcState::Failed
+        }
+    };
+    let (states, cv) = fc_states();
+    states.lock().unwrap().insert((domain, form), state);
+    cv.notify_all();
+}
+
+/// Whether `domain` is that of a segment po2 in `MIN_CYCLES_PO2..=MAX_CYCLES_PO2`: only those
+/// get specialized PSOs (bounds the archives to one per segment po2; smaller domains, e.g. unit
+/// tests', always use the plain PSO).
+pub(crate) fn fc_domain_in_range(domain: u32) -> bool {
+    (risc0_zkp::MIN_CYCLES_PO2..=risc0_zkp::MAX_CYCLES_PO2)
+        .any(|po2| (1usize << po2) * INV_RATE == domain as usize)
+}
+
+/// R20: once per process, on a background thread, load the specialized PSOs whose archives a
+/// previous process wrote (archive hits only, ~30 ms each with a warm OS shader cache; nothing
+/// is compiled), for the domains of segment po2 `MIN_CYCLES_PO2..=MAX_CYCLES_PO2`, most
+/// recently used first, so the first segment of a job already runs specialized. Nothing to do when [EVAL_FC_ENV] is `0` or there is no archive directory.
+pub(crate) fn fc_prewarm(kernels: &'static super::Rv32imKernels) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if FcMode::current().map_or(true, |m| m == FcMode::Off) {
+            return;
+        }
+        let Some(src) = kernels.source.as_ref() else {
+            return;
+        };
+        let Some(dir) = src.archive_dir.clone() else {
+            return;
+        };
+        // R22: the specializations of the chain form in use at library load.
+        let form = chain_form().unwrap_or(ChainForm::Hoist);
+        let spawned = std::thread::Builder::new()
+            .name("rv32im-fc-prewarm".into())
+            .spawn(move || {
+                let lib = kernels.kernels.library();
+                let device = lib.device();
+                // The cached domains, most recently used first (with a cold OS shader cache
+                // even an archive hit takes seconds, so the likely ones go first).
+                let mut cached: Vec<(std::time::SystemTime, u32)> = (risc0_zkp::MIN_CYCLES_PO2
+                    ..=risc0_zkp::MAX_CYCLES_PO2)
+                    .filter_map(|po2| {
+                        let domain = ((1usize << po2) * INV_RATE) as u32;
+                        let base = risc0_zkp::hal::metal::archive::specialized_archive_base(
+                            &dir,
+                            device,
+                            src.bytes,
+                            &fc_unit_of(src.unit, domain, form),
+                            fc_kernel(form),
+                            &[(0, domain)],
+                        )?;
+                        Some((risc0_zkp::hal::metal::archive::archive_used(&base)?, domain))
+                    })
+                    .collect();
+                cached.sort_by(|a, b| b.cmp(a));
+                for (_, domain) in cached {
+                    {
+                        let mut map = fc_states().0.lock().unwrap();
+                        if map.contains_key(&(domain, form)) {
+                            continue;
+                        }
+                        map.insert((domain, form), FcState::Building);
+                    }
+                    let res = metal::objc::rc::autoreleasepool(|| build_fc(kernels, domain, form));
+                    fc_finish(domain, form, res);
+                }
+            });
+        if let Err(e) = spawned {
+            tracing::warn!("rv32im Metal: cannot start the {FC_KERNEL} prewarm: {e}");
+        }
+    });
+}
+
+/// Z16 (R20 open issue 3): build or load the [fc_kernel] PSO (of the chain form [chain_form]
+/// selects now) specialized for the domain of segment po2 `po2` now, ahead of the first segment
+/// of that size, so a short job does not run on the plain PSO while the generic [fc_prewarm] (most recently used domains first) or the first
+/// segment's own background build is still going. A worker calls it at startup with its
+/// configured segment po2. It loads the rv32im (and zkp) PSOs first if they are not loaded yet.
+///
+/// - `wait = false`: returns at once; the loading and the build run on a background thread
+///   (with a cold OS shader cache even an archive hit takes ~6.6 s for this kernel: the
+///   specialization of the function itself, Z16 note). Returns whether the PSO was already ready.
+/// - `wait = true`: blocks until the PSO is ready or its build failed; returns whether it is
+///   ready. Do not call it with `wait` from a thread that holds `risc0_zkp::hal::metal::exclusive`
+///   while another thread proves.
+///
+/// Returns false without doing anything when [EVAL_FC_ENV] is `0`, `po2` is outside
+/// `MIN_CYCLES_PO2..=MAX_CYCLES_PO2`, or the metallib cannot be loaded (logged).
+pub(crate) fn prewarm_segment_po2(po2: usize, wait: bool) -> bool {
+    let mode = match FcMode::current() {
+        Ok(FcMode::Off) => return false,
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("rv32im Metal: segment po2 {po2} prewarm skipped: {e:#}");
+            return false;
+        }
+    };
+    if !(risc0_zkp::MIN_CYCLES_PO2..=risc0_zkp::MAX_CYCLES_PO2).contains(&po2) {
+        return false;
+    }
+    // R22 / R23: the specialization of the chain form the prover will use.
+    let form = match chain_form() {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!("rv32im Metal: segment po2 {po2} prewarm skipped: {e:#}");
+            return false;
+        }
+    };
+    let domain = ((1usize << po2) * INV_RATE) as u32;
+    let run = move |m: FcMode| -> bool {
+        let hal = risc0_zkp::hal::metal::MetalHalPoseidon2::new();
+        match super::Rv32imKernels::get(&hal) {
+            Ok(kernels) => fc_pipeline(kernels, domain, m, form).is_some(),
+            Err(e) => {
+                tracing::warn!("rv32im Metal: segment po2 {po2} prewarm: {e:#}");
+                false
+            }
+        }
+    };
+    if wait {
+        return run(FcMode::Wait);
+    }
+    let ready = fc_ready(domain, form);
+    if !ready {
+        // Background unless the process asked for `wait` builds everywhere.
+        let m = if mode == FcMode::Wait {
+            FcMode::Wait
+        } else {
+            FcMode::Background
+        };
+        if let Err(e) = std::thread::Builder::new()
+            .name(format!("rv32im-fc-po2-{po2}"))
+            .spawn(move || {
+                run(m);
+            })
+        {
+            tracing::warn!("rv32im Metal: cannot start the segment po2 {po2} prewarm: {e}");
+        }
+    }
+    ready
+}
+
+/// Whether the specialized PSO of `domain` and chain form `form` is built and ready (no side
+/// effects).
+pub(crate) fn fc_ready(domain: u32, form: ChainForm) -> bool {
+    matches!(
+        fc_states().0.lock().unwrap().get(&(domain, form)),
+        Some(FcState::Ready(_))
+    )
+}
+
+/// The [fc_kernel] PSO (of the chain form) specialized for `domain` if it is ready. Otherwise (first call for this
+/// domain) starts its build: on a background thread for [FcMode::Background] (None until it is
+/// ready), or waits for it for [FcMode::Wait]. None for [FcMode::Off], after a failed build, or
+/// when `kernels` has no source (test-loaded libraries).
+pub(crate) fn fc_pipeline(
+    kernels: &'static super::Rv32imKernels,
+    domain: u32,
+    mode: FcMode,
+    form: ChainForm,
+) -> Option<&'static metal::ComputePipelineState> {
+    if mode == FcMode::Off || kernels.source.is_none() || !fc_domain_in_range(domain) {
+        return None;
+    }
+    let (states, cv) = fc_states();
+    let mut map = states.lock().unwrap();
+    let key = (domain, form);
+    match map.get(&key) {
+        Some(FcState::Ready(pso)) => return Some(pso),
+        Some(FcState::Failed) => return None,
+        Some(FcState::Building) => {}
+        None => {
+            map.insert(key, FcState::Building);
+            let spawned = std::thread::Builder::new()
+                .name(format!("rv32im-fc{domain}"))
+                .spawn(move || {
+                    let res = metal::objc::rc::autoreleasepool(|| build_fc(kernels, domain, form));
+                    fc_finish(domain, form, res);
+                });
+            if let Err(e) = spawned {
+                map.insert(key, FcState::Failed);
+                tracing::warn!("rv32im Metal: cannot start the {FC_KERNEL} specialization: {e}");
+                return None;
+            }
+        }
+    }
+    if mode != FcMode::Wait {
+        return None;
+    }
+    loop {
+        match map.get(&key) {
+            Some(FcState::Ready(pso)) => return Some(pso),
+            Some(FcState::Building) => map = cv.wait(map).unwrap(),
+            _ => return None,
+        }
+    }
+}
+
+/// W7-Z1: once per chain form, the warning that the eval regime guard's fallback `name` runs
+/// in place of that form's plain split kernel ([ChainForm::plain_kernel]).
+fn log_fallback_use(name: &str, form: ChainForm) {
+    static LOGGED: std::sync::Mutex<Vec<ChainForm>> = std::sync::Mutex::new(Vec::new());
+    let mut logged = LOGGED.lock().unwrap();
+    if logged.contains(&form) {
+        return;
+    }
+    logged.push(form);
+    tracing::warn!("{}", fallback_use_message(name, form));
+}
+
+/// The text of [log_fallback_use].
+pub(crate) fn fallback_use_message(name: &str, form: ChainForm) -> String {
+    format!(
+        "rv32im Metal eval regime guard: eval_check runs the fallback {name} in place of {} \
+         (chain form {form:?})",
+        form.plain_kernel()
+    )
+}
+
+/// evalfast threadgroup size: `EF_THREADS` of eval_check_ef.metal (its
+/// `[[max_total_threads_per_threadgroup]]`, CUDA's default 128). R15e: 64 is within noise of 128,
+/// 256 and 1024 are slower (notes/R15e.md).
+const EF_THREADS: u64 = 128;
+
+/// The PSO of an rv32im kernel that is not in `METAL_KERNEL_NAMES` (so not built when the
+/// library loads): built from `lib` on first use and kept for the process (R15e: the baseline
+/// `eval_check` PSO takes ~60 s cold and is not needed unless [EVAL_KERNEL_ENV] selects it).
+/// One library per process (`Rv32imKernels` is process-wide), so the cache is keyed by name.
+/// Errors are returned, not cached.
+pub(crate) fn lazy_pipeline(
+    lib: &metal::LibraryRef,
+    name: &'static str,
+) -> anyhow::Result<&'static metal::ComputePipelineState> {
+    use std::{
+        collections::HashMap,
+        sync::{Mutex, OnceLock},
+    };
+    static PSOS: OnceLock<Mutex<HashMap<&'static str, &'static metal::ComputePipelineState>>> =
+        OnceLock::new();
+    // Held while a PSO builds, so two threads never build the same one.
+    let mut psos = PSOS.get_or_init(Default::default).lock().unwrap();
+    if let Some(pso) = psos.get(name) {
+        return Ok(pso);
+    }
+    let t = std::time::Instant::now();
+    let function = lib
+        .get_function(name, None)
+        .map_err(|e| anyhow::anyhow!("rv32im metallib function {name}: {e}"))?;
+    let pso = lib
+        .device()
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(|e| anyhow::anyhow!("compute pipeline for {name}: {e}"))?;
+    tracing::info!(
+        "rv32im Metal: built the {name} PSO on first use in {:?}",
+        t.elapsed()
+    );
+    let pso: &'static metal::ComputePipelineState = Box::leak(Box::new(pso));
+    psos.insert(name, pso);
+    Ok(pso)
+}
+/// The pipelines of one evalfast build and the threadgroup size its `ef_eval_split` was compiled
+/// for (`EF_THREADS`).
+pub(crate) struct EfKernels<'a> {
+    pub split: &'a metal::ComputePipelineStateRef,
+    pub combine: &'a metal::ComputePipelineStateRef,
+    pub threads: u64,
+}
+
+/// ef_combine's threadgroup size (its `[[max_total_threads_per_threadgroup]]`).
+const EF_COMBINE_THREADS: u64 = 256;
+/// Entries of the evalfast table buffer: pm (EF_NPM), pmn (EF_NPM), the quotients (1).
+pub(crate) const EF_TABLE_LEN: usize = 2 * ef::EF_NPM + 1;
+
+const _: () = assert!(ef::EF_NPC == NUM_POLY_MIX_POWERS);
+const _: () = assert!(ef::EF_NPM == 627);
+
+/// The evalfast table buffer contents (CUDA `ef_prep` + `ef_prep_n` on the host; the kernel reads
+/// each FpExt as 4 raw words, which is the in-memory form of [ExtVal]):
+/// - `[0, EF_NPM)` pm: the poly_mix powers, `RK_QN` products `pm[RK_QA[i]] * pm[RK_QB[i]]` and the
+///   `RK_HN` terms of the generated `rk_hoist` over `out` / `mix`;
+/// - `[EF_NPM, 2 EF_NPM)` pmn: `(pm.1, pm.2, pm.3) * (P - 11), 0` (NBETA-folded rows);
+/// - `2 EF_NPM`: the vanishing quotients `1 / ((3 rou^c)^(2^po2) - 1)`, `c = 0..4`.
+pub(crate) fn ef_table(
+    poly_mix_pows: &[ExtVal],
+    out: &[Val],
+    mix: &[Val],
+    rou: Val,
+    po2: usize,
+) -> Vec<ExtVal> {
+    assert_eq!(poly_mix_pows.len(), ef::EF_NPC);
+    let mut tab = vec![ExtVal::ZERO; EF_TABLE_LEN];
+    tab[..ef::EF_NPC].copy_from_slice(poly_mix_pows);
+    for i in 0..ef::RK_QN {
+        tab[ef::EF_NPC + i] =
+            poly_mix_pows[ef::RK_QA[i] as usize] * poly_mix_pows[ef::RK_QB[i] as usize];
+    }
+    let (head, hoisted) = tab.split_at_mut(ef::EF_NPC + ef::RK_QN);
+    ef::rk_hoist(head, out, mix, &mut hoisted[..ef::RK_HN]);
+    let nbeta = Val::new(risc0_core::field::baby_bear::P - 11);
+    for i in 0..ef::EF_NPM {
+        let e = tab[i].elems();
+        tab[ef::EF_NPM + i] = ExtVal::new(e[1] * nbeta, e[2] * nbeta, e[3] * nbeta, Val::ZERO);
+    }
+    let q: Vec<Val> = (0..4)
+        .map(|c| {
+            let x = Val::new(3) * rou.pow(c);
+            (x.pow(1 << po2) - Val::ONE).inv()
+        })
+        .collect();
+    tab[2 * ef::EF_NPM] = ExtVal::new(q[0], q[1], q[2], q[3]);
+    tab
+}
+
+// The baseline kernel's `poly_mix` table has `kNumPolyMixPows` entries (eval_check.cuh), and
+// evalfast is generated for the same count (EF_NPC); a circuit change must regenerate both.
+const _: () = assert!(NUM_POLY_MIX_POWERS == 458);
+const _: () = assert!(std::mem::size_of::<ExtVal>() == 4 * std::mem::size_of::<u32>());
+const _: () = assert!(std::mem::size_of::<Val>() == std::mem::size_of::<u32>());
+
+impl<MH: MetalHash> MetalCircuitHal<MH> {
+    /// eval_check on the GPU with the kernel [EVAL_KERNEL_ENV] selects (evalfast by default).
+    pub(crate) fn eval_check_metal(
+        &self,
+        check: &BufferImpl<Val>,
+        groups: &[&BufferImpl<Val>],
+        globals: &[&BufferImpl<Val>],
+        poly_mix: ExtVal,
+        po2: usize,
+        steps: usize,
+    ) -> anyhow::Result<()> {
+        match EvalKernel::current()? {
+            EvalKernel::Evalfast => {
+                self.eval_check_evalfast(check, groups, globals, poly_mix, po2, steps)
+            }
+            EvalKernel::EvalfastR12 => {
+                self.eval_check_evalfast_r12(check, groups, globals, poly_mix, po2, steps)
+            }
+            EvalKernel::EvalfastR15e => {
+                self.eval_check_evalfast_r15e(check, groups, globals, poly_mix, po2, steps)
+            }
+            EvalKernel::Baseline => {
+                self.eval_check_baseline(check, groups, globals, poly_mix, po2, steps)
+            }
+        }
+    }
+
+    /// eval_check on the GPU: the evalfast kernels (eval_check_ef.metal, R12). ABI:
+    /// `ef_eval_split`: `0 check, 1 data, 2 accum, 3 mix, 4 out, 5 tab` ([ef_table]),
+    /// `6 scratch` (4 * domain LogUp partials), `7 domain` (`constant uint&`), threadgroups of
+    /// [EF_THREADS], two per row block (even: main chain, odd: LogUp); `ef_combine`:
+    /// `0 check, 1 scratch, 2 tab, 3 domain`, one thread per row.
+    pub(crate) fn eval_check_evalfast(
+        &self,
+        check: &BufferImpl<Val>,
+        groups: &[&BufferImpl<Val>],
+        globals: &[&BufferImpl<Val>],
+        poly_mix: ExtVal,
+        po2: usize,
+        steps: usize,
+    ) -> anyhow::Result<()> {
+        scope!("metal_eval_check_evalfast");
+        self.ctx.require(Phase::EvalCheck)?;
+        // R20: the domain-specialized split PSO once it is built ([EVAL_FC_ENV]).
+        let domain = steps * INV_RATE;
+        // R22 / R23: the hoisted flat chain (default), R22's flat one or the nested one
+        // ([EVAL_FLAT_ENV], [EVAL_HOIST_ENV]).
+        let form = chain_form()?;
+        let fc = match u32::try_from(domain) {
+            Ok(d) => fc_pipeline(self.ctx.kernels(), d, FcMode::current()?, form),
+            Err(_) => None,
+        };
+        // R22: the regime guard's fallback replaces the plain PSO if that one is slow. R23: it
+        // covers both flat forms (the guard reads the hoisted kernel's regime; the unhoisted
+        // revert kernel has the same flat shape), so the revert knob stays guarded as in R22.
+        let fallback = if form != ChainForm::Nest {
+            eval_regime::fallback_split()
+        } else {
+            None
+        };
+        let plain = match (fc.is_some() || fallback.is_some(), form) {
+            (true, _) => None,
+            (false, ChainForm::Hoist) => Some(self.ctx.pipeline("ef_eval_split")),
+            (false, _) => Some(lazy_pipeline(self.ctx.library(), form.plain_kernel())?),
+        };
+        // W7-Z1 (R23 verify r2): name the kernel the fallback replaces in this form (the
+        // guard's own start-up log names the hoisted `ef_eval_split` it measured; under
+        // `RISC0_METAL_RV32IM_EVAL_HOIST=0` the replaced kernel is `ef_eval_split_nohoist`).
+        if let (false, Some((name, _))) = (fc.is_some(), fallback) {
+            log_fallback_use(name, form);
+        }
+        tracing::debug!(
+            "eval_check (Metal evalfast): {}",
+            match (fc.is_some(), fallback) {
+                (true, _) => format!("{} specialized for the domain", fc_kernel(form)),
+                (false, Some((name, _))) => format!(
+                    "the eval regime guard's fallback ({name}) instead of {}",
+                    form.plain_kernel()
+                ),
+                (false, None) => format!("plain {}", form.plain_kernel()),
+            }
+        );
+        let k = EfKernels {
+            split: fc
+                .or(fallback.map(|(_, pso)| pso))
+                .or(plain)
+                .expect("a split PSO"),
+            combine: self.ctx.pipeline("ef_combine"),
+            threads: EF_THREADS,
+        };
+        self.eval_check_ef_with(&k, check, groups, globals, poly_mix, po2, steps, None)
+    }
+
+    /// [Self::eval_check_evalfast] with R12's table forms (`ef_eval_split_r12`, built on first
+    /// use; same ABI and results).
+    pub(crate) fn eval_check_evalfast_r12(
+        &self,
+        check: &BufferImpl<Val>,
+        groups: &[&BufferImpl<Val>],
+        globals: &[&BufferImpl<Val>],
+        poly_mix: ExtVal,
+        po2: usize,
+        steps: usize,
+    ) -> anyhow::Result<()> {
+        scope!("metal_eval_check_evalfast_r12");
+        self.ctx.require(Phase::EvalCheck)?;
+        let k = EfKernels {
+            split: lazy_pipeline(self.ctx.library(), "ef_eval_split_r12")?,
+            combine: self.ctx.pipeline("ef_combine"),
+            threads: EF_THREADS,
+        };
+        self.eval_check_ef_with(&k, check, groups, globals, poly_mix, po2, steps, None)
+    }
+
+    /// [Self::eval_check_evalfast] in R15e's form (`ef_eval_split_r15e`: 16-byte table-row loads,
+    /// built on first use; same ABI and results).
+    pub(crate) fn eval_check_evalfast_r15e(
+        &self,
+        check: &BufferImpl<Val>,
+        groups: &[&BufferImpl<Val>],
+        globals: &[&BufferImpl<Val>],
+        poly_mix: ExtVal,
+        po2: usize,
+        steps: usize,
+    ) -> anyhow::Result<()> {
+        scope!("metal_eval_check_evalfast_r15e");
+        self.ctx.require(Phase::EvalCheck)?;
+        let k = EfKernels {
+            split: lazy_pipeline(self.ctx.library(), "ef_eval_split_r15e")?,
+            combine: self.ctx.pipeline("ef_combine"),
+            threads: EF_THREADS,
+        };
+        self.eval_check_ef_with(&k, check, groups, globals, poly_mix, po2, steps, None)
+    }
+
+    /// [Self::eval_check_evalfast] with the given pipelines. With `times`, each dispatch is
+    /// committed and waited for on its own and its wall time (encode + GPU + wait) is stored as
+    /// `[split, combine]` (benchmarks only).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn eval_check_ef_with(
+        &self,
+        k: &EfKernels<'_>,
+        check: &BufferImpl<Val>,
+        groups: &[&BufferImpl<Val>],
+        globals: &[&BufferImpl<Val>],
+        poly_mix: ExtVal,
+        po2: usize,
+        steps: usize,
+        mut times: Option<&mut [std::time::Duration; 2]>,
+    ) -> anyhow::Result<()> {
+        let accum = groups[REGISTER_GROUP_ACCUM];
+        let data = groups[REGISTER_GROUP_DATA];
+        let mix = globals[GLOBAL_MIX];
+        let out = globals[GLOBAL_OUT];
+
+        const EXP_PO2: usize = log2_ceil(INV_RATE);
+        let domain = steps * INV_RATE;
+        anyhow::ensure!(
+            check.size() == ExtVal::EXT_SIZE * domain,
+            "eval_check: check has {} elements, expected {}",
+            check.size(),
+            ExtVal::EXT_SIZE * domain
+        );
+        anyhow::ensure!(
+            domain <= u32::MAX as usize,
+            "eval_check: domain {domain} does not fit u32"
+        );
+        tracing::debug!(
+            "eval_check (Metal evalfast): steps {steps}, domain {domain}, po2 {po2}, data {}, \
+             accum {}, mix {}, out {}",
+            data.size(),
+            accum.size(),
+            mix.size(),
+            out.size()
+        );
+        let (split, combine, threads) = (k.split, k.combine, k.threads);
+        anyhow::ensure!(
+            split.max_total_threads_per_threadgroup() >= threads
+                && combine.max_total_threads_per_threadgroup() >= EF_COMBINE_THREADS,
+            "eval_check: evalfast PSO thread limits {} / {} below {threads} / \
+             {EF_COMBINE_THREADS}",
+            split.max_total_threads_per_threadgroup(),
+            combine.max_total_threads_per_threadgroup()
+        );
+
+        // Wait for the GPU work before (the accum commit), so the host views below are current
+        // (view() would wait the same way); timed separately from the host-only work after it.
+        let tw = std::time::Instant::now();
+        self.hal.try_sync()?;
+        let th = std::time::Instant::now();
+        pipeline_host_stat(1, th - tw);
+
+        // The table (CUDA ef_prep on one GPU thread): built on the CPU from the powers and the
+        // host views of out / mix.
+        let poly_mix_pows = map_pow(poly_mix, POLY_MIX_POWERS);
+        assert_eq!(poly_mix_pows.len(), NUM_POLY_MIX_POWERS);
+        let mut out_h = Vec::new();
+        let mut mix_h = Vec::new();
+        out.view(|v| out_h.extend_from_slice(v));
+        mix.view(|v| mix_h.extend_from_slice(v));
+        let tab = ef_table(
+            &poly_mix_pows,
+            &out_h,
+            &mix_h,
+            Val::ROU_FWD[po2 + EXP_PO2],
+            po2,
+        );
+        let (tab_buf, scratch) = {
+            let mut s = self.ctx.scratch();
+            (
+                grow(&self.hal, &mut s.poly_mix, "poly_mix", EF_TABLE_LEN),
+                grow(
+                    &self.hal,
+                    &mut s.scratch,
+                    "scratch",
+                    ExtVal::EXT_SIZE * domain,
+                ),
+            )
+        };
+        // view_mut flushes and waits if a batch is open, so a previous eval_check that read this
+        // buffer has finished before it is overwritten.
+        tab_buf.view_mut(|dst| dst[..EF_TABLE_LEN].copy_from_slice(&tab));
+        // R18: the kernel reads the table as 32-byte row pairs (`ulong4`), so it must be bound
+        // at a 32-byte aligned address (pool buffers are page-aligned and bound at offset 0).
+        anyhow::ensure!(
+            tab_buf.as_device_ptr() % 32 == 0,
+            "eval_check: evalfast table at GPU address {:#x} is not 32-byte aligned",
+            tab_buf.as_device_ptr()
+        );
+        pipeline_host_stat(0, th.elapsed());
+
+        let rows = (domain as u64).div_ceil(threads);
+        if times.is_some() {
+            self.hal.try_sync()?;
+        }
+        let t0 = std::time::Instant::now();
+        self.hal.dispatch(
+            split,
+            &[
+                check.as_arg(),
+                data.as_arg(),
+                accum.as_arg(),
+                mix.as_arg(),
+                out.as_arg(),
+                tab_buf.as_arg(),
+                scratch.as_arg(),
+                KernelArg::Integer(domain as u32),
+            ],
+            Grid::Groups {
+                groups: metal::MTLSize::new(rows * 2, 1, 1),
+                threads: metal::MTLSize::new(threads, 1, 1),
+            },
+            &[],
+        );
+        if let Some(t) = times.as_deref_mut() {
+            self.hal.try_sync()?;
+            t[0] = t0.elapsed();
+        }
+        let t1 = std::time::Instant::now();
+        self.hal.dispatch(
+            combine,
+            &[
+                check.as_arg(),
+                scratch.as_arg(),
+                tab_buf.as_arg(),
+                KernelArg::Integer(domain as u32),
+            ],
+            Grid::Groups {
+                groups: metal::MTLSize::new((domain as u64).div_ceil(EF_COMBINE_THREADS), 1, 1),
+                threads: metal::MTLSize::new(EF_COMBINE_THREADS, 1, 1),
+            },
+            &[],
+        );
+        // End of the phase: close the batch and surface a command-buffer error (PLAN 2.6, 2.9).
+        // (R14 measured committing without the wait, with and without a wait in
+        // eval_check_dep: no difference, notes/R14.md.)
+        self.hal.try_sync()?;
+        if let Some(t) = times {
+            t[1] = t1.elapsed();
+        }
+        tracing::debug!(
+            "eval_check (Metal evalfast) done: currentAllocatedSize {} B, process peak {} B",
+            self.hal.allocated_size(),
+            self.hal.peak_allocated_size()
+        );
+        Ok(())
+    }
+
+    /// eval_check on the GPU: the baseline `eval_check` kernel (R6 ABI, eval_check.metal):
+    /// `0 check, 1 ctrl, 2 data, 3 accum, 4 mix, 5 out` (buffers), `6 rou` (`constant Fp&`),
+    /// `7 po2`, `8 domain` (`constant uint&`), `9 poly_mix` (`const device FpExt*`, 458 entries).
+    pub(crate) fn eval_check_baseline(
+        &self,
+        check: &BufferImpl<Val>,
+        groups: &[&BufferImpl<Val>],
+        globals: &[&BufferImpl<Val>],
+        poly_mix: ExtVal,
+        po2: usize,
+        steps: usize,
+    ) -> anyhow::Result<()> {
+        scope!("metal_eval_check_baseline");
+        self.ctx.require(Phase::EvalCheck)?;
+
+        let accum = groups[REGISTER_GROUP_ACCUM];
+        let ctrl = groups[REGISTER_GROUP_CODE];
+        let data = groups[REGISTER_GROUP_DATA];
+        let mix = globals[GLOBAL_MIX];
+        let out = globals[GLOBAL_OUT];
+
+        const EXP_PO2: usize = log2_ceil(INV_RATE);
+        let domain = steps * INV_RATE;
+        anyhow::ensure!(
+            check.size() == ExtVal::EXT_SIZE * domain,
+            "eval_check: check has {} elements, expected {}",
+            check.size(),
+            ExtVal::EXT_SIZE * domain
+        );
+        anyhow::ensure!(
+            domain <= u32::MAX as usize,
+            "eval_check: domain {domain} does not fit u32"
+        );
+        let rou = Val::ROU_FWD[po2 + EXP_PO2];
+        tracing::debug!(
+            "eval_check (Metal): steps {steps}, domain {domain}, po2 {po2}, check {}, ctrl {}, \
+             data {}, accum {}, mix {}, out {}",
+            check.size(),
+            ctrl.size(),
+            data.size(),
+            accum.size(),
+            mix.size(),
+            out.size()
+        );
+
+        let poly_mix_pows = map_pow(poly_mix, POLY_MIX_POWERS);
+        assert_eq!(poly_mix_pows.len(), NUM_POLY_MIX_POWERS);
+        let pm_buf = {
+            let mut s = self.ctx.scratch();
+            grow(&self.hal, &mut s.poly_mix, "poly_mix", NUM_POLY_MIX_POWERS)
+        };
+        // view_mut flushes and waits if a batch is open, so a previous eval_check that read this
+        // buffer has finished before it is overwritten.
+        pm_buf.view_mut(|dst| dst[..NUM_POLY_MIX_POWERS].copy_from_slice(&poly_mix_pows));
+
+        let rou = [rou];
+        let args = [
+            check.as_arg(),
+            ctrl.as_arg(),
+            data.as_arg(),
+            accum.as_arg(),
+            mix.as_arg(),
+            out.as_arg(),
+            KernelArg::Bytes(as_bytes(&rou)),
+            KernelArg::Integer(po2 as u32),
+            KernelArg::Integer(domain as u32),
+            pm_buf.as_arg(),
+        ];
+        let groups_x = (domain as u64).div_ceil(EVAL_CHECK_THREADS);
+        let pso = lazy_pipeline(self.ctx.library(), "eval_check")?;
+        self.hal.dispatch(
+            pso,
+            &args,
+            Grid::Groups {
+                groups: metal::MTLSize::new(groups_x, 1, 1),
+                threads: metal::MTLSize::new(EVAL_CHECK_THREADS, 1, 1),
+            },
+            &[],
+        );
+        // End of the phase: close the batch and surface a command-buffer error (PLAN 2.6, 2.9).
+        self.hal.try_sync()?;
+        tracing::debug!(
+            "eval_check (Metal) done: currentAllocatedSize {} B, process peak {} B",
+            self.hal.allocated_size(),
+            self.hal.peak_allocated_size()
+        );
+        Ok(())
+    }
+
+    /// eval_check on the CPU circuit kernels over host views of the Metal buffers (R7's
+    /// delegation; the loop of `hal/cpu.rs`). Debugging fallback, see [CPU_PHASES_ENV].
+    pub(crate) fn eval_check_cpu(
+        &self,
+        check: &BufferImpl<Val>,
+        groups: &[&BufferImpl<Val>],
+        globals: &[&BufferImpl<Val>],
+        poly_mix: ExtVal,
+        po2: usize,
+        steps: usize,
+    ) -> anyhow::Result<()> {
+        scope!("metal_eval_check(cpu)");
+        self.sync()?;
+
+        const EXP_PO2: usize = log2_ceil(INV_RATE);
+        let domain = steps * INV_RATE;
+        tracing::debug!("eval_check: domain {domain} (CPU kernels over Metal buffers)");
+        let poly_mix_pows = map_pow(poly_mix, POLY_MIX_POWERS);
+
+        // SAFETY: synced, and nothing is encoded until this call returns.
+        let (data, accum, mix, out) = unsafe {
+            (
+                host_slice(groups[REGISTER_GROUP_DATA]),
+                host_slice(groups[REGISTER_GROUP_ACCUM]),
+                host_slice(globals[GLOBAL_MIX]),
+                host_slice(globals[GLOBAL_OUT]),
+            )
+        };
+        assert_eq!(check.size(), ExtVal::EXT_SIZE * domain);
+        let check_ptr = check.as_mut_ptr() as usize;
+        let poly_mix_pows = poly_mix_pows.as_slice();
+        let args: &[&[Val]] = &[accum, data, out, mix];
+
+        (0..domain).into_par_iter().for_each(|cycle| {
+            let args: Vec<*const Val> = args.iter().map(|x| (*x).as_ptr()).collect();
+            let mut tot = ExtVal::ZERO;
+            unsafe {
+                risc0_circuit_rv32im_cpu_poly_fp(
+                    cycle,
+                    domain,
+                    poly_mix_pows.as_ptr(),
+                    args.as_ptr(),
+                    &mut tot,
+                )
+            };
+            let x = Val::ROU_FWD[po2 + EXP_PO2].pow(cycle);
+            // The 3 is the coset shift of the evaluation domain (as hal/cpu.rs).
+            let y = (Val::new(3) * x).pow(1 << po2);
+            let ret = tot * (y - Val::new(1)).inv();
+            let check = check_ptr as *mut Val;
+            for i in 0..ExtVal::EXT_SIZE {
+                // SAFETY: in bounds (asserted above); each cycle writes disjoint cells.
+                unsafe { *check.add(i * domain + cycle) = ret.elems()[i] };
+            }
+        });
+        Ok(())
+    }
+}
+
+impl<MH: MetalHash> CircuitHal<MetalHal<MH>> for MetalCircuitHal<MH> {
+    fn eval_check(
+        &self,
+        check: &BufferImpl<Val>,
+        groups: &[&BufferImpl<Val>],
+        globals: &[&BufferImpl<Val>],
+        poly_mix: ExtVal,
+        po2: usize,
+        steps: usize,
+    ) {
+        count(Phase::EvalCheck);
+        phase_mark(&self.hal, "eval_check start");
+        let res = if eval_on_cpu() {
+            self.eval_check_cpu(check, groups, globals, poly_mix, po2, steps)
+        } else {
+            self.eval_check_metal(check, groups, globals, poly_mix, po2, steps)
+        };
+        phase_mark(&self.hal, "eval_check end");
+        // CircuitHal::eval_check cannot return an error (CUDA's ffi_wrap panics the same way).
+        if let Err(e) = res {
+            panic!(
+                "rv32im Metal eval_check: {e:#} (set {CPU_PHASES_ENV}=eval to run it on the CPU)"
+            );
+        }
+    }
+
+    fn accumulate(
+        &self,
+        _preflight: &AccumPreflight,
+        _ctrl: &BufferImpl<Val>,
+        _io: &BufferImpl<Val>,
+        _data: &BufferImpl<Val>,
+        _mix: &BufferImpl<Val>,
+        _accum: &BufferImpl<Val>,
+        _steps: usize,
+    ) {
+        // As hal/cuda.rs: rv32im accumulates in CircuitAccumulator::step_accum (PLAN 8.4).
+    }
+}
+
+#[cfg(test)]
+mod ef_tests {
+    //! R12: the evalfast kernels against the baseline kernel and the CPU (random canonical
+    //! inputs; `Val::random` is uniform in [0, P)), the table builder and the kernel selection.
+    //! The tests call `eval_check_evalfast` / `eval_check_baseline` directly and never set
+    //! [EVAL_KERNEL_ENV], so they need no process-wide test lock (PLAN 8.7).
+
+    use std::sync::Arc;
+
+    use risc0_core::field::baby_bear::BabyBear;
+    use risc0_zkp::{
+        adapter::CircuitInfo as _,
+        core::hash::sha::Sha256HashSuite,
+        hal::{cpu::CpuHal, metal::MetalHalSha256, Hal},
+    };
+    use test_log::test;
+
+    use super::*;
+    use crate::{
+        prove::hal::cpu::CpuCircuitHal,
+        zirgen::{taps::TAPSET, CircuitImpl},
+    };
+
+    fn random_vals(n: usize) -> Vec<Val> {
+        let mut rng = rand::rng();
+        (0..n).map(|_| Val::random(&mut rng)).collect()
+    }
+
+    /// R19: value distributions of [Inputs::seeded].
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Dist {
+        /// Uniform canonical values.
+        Uniform,
+        /// Uniform in `[P / 2, P)`.
+        High,
+        /// Edge values: mostly `P - 1` / `P - 2`, some 0, 1 and uniform values.
+        Extreme,
+    }
+
+    struct Inputs {
+        code: Vec<Val>,
+        data: Vec<Val>,
+        accum: Vec<Val>,
+        mix: Vec<Val>,
+        out: Vec<Val>,
+        poly_mix: ExtVal,
+    }
+
+    impl Inputs {
+        fn random(po2: usize) -> Self {
+            let domain = (1 << po2) * INV_RATE;
+            Self {
+                code: random_vals(TAPSET.group_size(REGISTER_GROUP_CODE) * domain),
+                data: random_vals(TAPSET.group_size(REGISTER_GROUP_DATA) * domain),
+                accum: random_vals(TAPSET.group_size(REGISTER_GROUP_ACCUM) * domain),
+                mix: random_vals(CircuitImpl::MIX_SIZE),
+                out: random_vals(CircuitImpl::OUTPUT_SIZE),
+                poly_mix: ExtVal::random(&mut rand::rng()),
+            }
+        }
+
+        /// R19: inputs from a seeded generator (reproducible mismatches). [Dist] picks the
+        /// value distribution of the trace, mix and out values.
+        fn seeded(po2: usize, seed: u64, dist: Dist) -> Self {
+            use rand::{rngs::StdRng, Rng, SeedableRng};
+            const P: u32 = risc0_core::field::baby_bear::P;
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut vals = |n: usize| -> Vec<Val> {
+                (0..n)
+                    .map(|_| match dist {
+                        Dist::Uniform => Val::random(&mut rng),
+                        Dist::High => Val::new(rng.random_range(P / 2..P)),
+                        Dist::Extreme => match rng.random_range(0..8u32) {
+                            0..=3 => Val::new(P - 1),
+                            4 => Val::new(P - 2),
+                            5 => Val::ZERO,
+                            6 => Val::ONE,
+                            _ => Val::random(&mut rng),
+                        },
+                    })
+                    .collect()
+            };
+            let domain = (1 << po2) * INV_RATE;
+            let code = vals(TAPSET.group_size(REGISTER_GROUP_CODE) * domain);
+            let data = vals(TAPSET.group_size(REGISTER_GROUP_DATA) * domain);
+            let accum = vals(TAPSET.group_size(REGISTER_GROUP_ACCUM) * domain);
+            let mix = vals(CircuitImpl::MIX_SIZE);
+            let out = vals(CircuitImpl::OUTPUT_SIZE);
+            Self {
+                code,
+                data,
+                accum,
+                mix,
+                out,
+                poly_mix: ExtVal::random(&mut rng),
+            }
+        }
+
+        fn bytes(&self) -> usize {
+            4 * (self.code.len()
+                + self.data.len()
+                + self.accum.len()
+                + self.mix.len()
+                + self.out.len())
+        }
+    }
+
+    /// `check` from `CpuCircuitHal::eval_check` (the reference of R10's tests).
+    fn cpu_check(inp: &Inputs, po2: usize) -> Vec<Val> {
+        let steps = 1 << po2;
+        let hal: CpuHal<BabyBear> = CpuHal::new(Sha256HashSuite::new_suite());
+        let check = hal.alloc_elem("check", ExtVal::EXT_SIZE * steps * INV_RATE);
+        let [code, data, accum, mix, out] = [&inp.code, &inp.data, &inp.accum, &inp.mix, &inp.out]
+            .map(|b| hal.copy_from_elem("in", b));
+        CpuCircuitHal.eval_check(
+            &check,
+            &[&accum, &code, &data],
+            &[&mix, &out],
+            inp.poly_mix,
+            po2,
+            steps,
+        );
+        check.to_vec()
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Which {
+        Evalfast,
+        /// R20: evalfast with the split PSO specialized for the domain ([fc_test_pso]).
+        EvalfastFc,
+        /// R22: the nested-chain split kernels (plain, and specialized for the domain).
+        EvalfastNest,
+        EvalfastFcNest,
+        /// R23: the flat kernels without hoisted trace loads (plain, and specialized).
+        EvalfastNoHoist,
+        EvalfastFcNoHoist,
+        EvalfastR12,
+        EvalfastR15e,
+        Baseline,
+    }
+
+    /// R20: the process library's [FC_KERNEL] PSO specialized for `domain`, built without a
+    /// binary archive (the OS shader cache makes repeats cheap) and kept for the process.
+    fn fc_test_pso(
+        c: &MetalCircuitHal<risc0_zkp::hal::metal::MetalHashSha256>,
+        name: &'static str,
+        domain: u32,
+    ) -> &'static metal::ComputePipelineState {
+        use std::{
+            collections::HashMap,
+            sync::{Mutex, OnceLock},
+        };
+        static PSOS: OnceLock<Mutex<HashMap<(&str, u32), &'static metal::ComputePipelineState>>> =
+            OnceLock::new();
+        let psos = PSOS.get_or_init(Default::default);
+        if let Some(p) = psos.lock().unwrap().get(&(name, domain)) {
+            return p;
+        }
+        let lib = c.ctx.library();
+        let t = std::time::Instant::now();
+        let (pso, _) = risc0_zkp::hal::metal::archive::specialized_pipeline(
+            None,
+            lib.device(),
+            lib,
+            &[],
+            "unused",
+            name,
+            &[(0, domain)],
+        )
+        .unwrap();
+        println!(
+            "R20 {name} specialized for domain {domain}: PSO in {:?}",
+            t.elapsed()
+        );
+        psos.lock()
+            .unwrap()
+            .entry((name, domain))
+            .or_insert_with(|| Box::leak(Box::new(pso)))
+    }
+
+    /// Runs one GPU eval_check `reps` times over the same Metal buffers; returns every `check`,
+    /// the GPU wall time of each run and the peak `currentAllocatedSize` during the runs.
+    fn gpu_checks(
+        c: &MetalCircuitHal<risc0_zkp::hal::metal::MetalHashSha256>,
+        inp: &Inputs,
+        po2: usize,
+        which: Which,
+        reps: usize,
+    ) -> (Vec<Vec<Val>>, Vec<std::time::Duration>, u64) {
+        let hal = &c.hal;
+        let steps = 1 << po2;
+        let domain = steps * INV_RATE;
+        let [code, data, accum, mix, out] = [&inp.code, &inp.data, &inp.accum, &inp.mix, &inp.out]
+            .map(|b| hal.copy_from_elem("in", b));
+        let groups = [&accum, &code, &data];
+        let globals = [&mix, &out];
+        let mut res = Vec::new();
+        let mut times = Vec::new();
+        hal.sync();
+        let mut peak = 0;
+        for _ in 0..reps {
+            // A fresh check buffer filled with garbage, so a row the kernel skips shows up.
+            let check = hal.alloc_elem("check", ExtVal::EXT_SIZE * domain);
+            check.view_mut(|v| v.fill(Val::new_raw(0x7fff_ffff)));
+            let t = std::time::Instant::now();
+            match which {
+                Which::Evalfast => {
+                    c.eval_check_evalfast(&check, &groups, &globals, inp.poly_mix, po2, steps)
+                }
+                Which::EvalfastFc
+                | Which::EvalfastFcNest
+                | Which::EvalfastNest
+                | Which::EvalfastNoHoist
+                | Which::EvalfastFcNoHoist => {
+                    let split = match which {
+                        Which::EvalfastFc => fc_test_pso(c, FC_KERNEL, domain as u32),
+                        Which::EvalfastFcNest => fc_test_pso(c, FC_NEST_KERNEL, domain as u32),
+                        Which::EvalfastFcNoHoist => {
+                            fc_test_pso(c, FC_NOHOIST_KERNEL, domain as u32)
+                        }
+                        Which::EvalfastNoHoist => {
+                            lazy_pipeline(c.ctx.library(), NOHOIST_KERNEL).unwrap()
+                        }
+                        _ => lazy_pipeline(c.ctx.library(), NEST_KERNEL).unwrap(),
+                    };
+                    let k = EfKernels {
+                        split,
+                        combine: c.ctx.pipeline("ef_combine"),
+                        threads: EF_THREADS,
+                    };
+                    c.eval_check_ef_with(
+                        &k,
+                        &check,
+                        &groups,
+                        &globals,
+                        inp.poly_mix,
+                        po2,
+                        steps,
+                        None,
+                    )
+                }
+                Which::EvalfastR12 => {
+                    c.eval_check_evalfast_r12(&check, &groups, &globals, inp.poly_mix, po2, steps)
+                }
+                Which::EvalfastR15e => {
+                    c.eval_check_evalfast_r15e(&check, &groups, &globals, inp.poly_mix, po2, steps)
+                }
+                Which::Baseline => {
+                    c.eval_check_baseline(&check, &groups, &globals, inp.poly_mix, po2, steps)
+                }
+            }
+            .unwrap();
+            times.push(t.elapsed());
+            peak = peak.max(hal.peak_allocated_size().max(hal.allocated_size()));
+            res.push(check.to_vec());
+        }
+        (res, times, peak)
+    }
+
+    fn mismatches(a: &[Val], b: &[Val]) -> usize {
+        assert_eq!(a.len(), b.len());
+        a.iter().zip(b).filter(|(x, y)| x != y).count()
+    }
+
+    /// evalfast == evalfast_r15e == evalfast_r12 == baseline == CPU, bit for bit over all
+    /// `4 * domain` elements, `reps` evalfast runs on the same buffers each equal.
+    fn evalfast_matches(po2: usize, reps: usize) {
+        evalfast_matches_on(&Inputs::random(po2), po2, reps, "uniform");
+    }
+
+    fn evalfast_matches_on(inp: &Inputs, po2: usize, reps: usize, kind: &str) {
+        let t = std::time::Instant::now();
+        let cpu = cpu_check(inp, po2);
+        let cpu_time = t.elapsed();
+        let hal = Arc::new(MetalHalSha256::new());
+        let c = MetalCircuitHal::new(hal.clone()).unwrap();
+        let (fast, fast_t, fast_peak) = gpu_checks(&c, inp, po2, Which::Evalfast, reps);
+        let (base, base_t, base_peak) = gpu_checks(&c, inp, po2, Which::Baseline, 1);
+        let (r12, r12_t, _) = gpu_checks(&c, inp, po2, Which::EvalfastR12, 1);
+        let (r15e, r15e_t, _) = gpu_checks(&c, inp, po2, Which::EvalfastR15e, 1);
+        let (fc, fc_t, _) = gpu_checks(&c, inp, po2, Which::EvalfastFc, 2);
+        // R22: the nested-chain kernels (the revert switch) too.
+        let (nest, nest_t, _) = gpu_checks(&c, inp, po2, Which::EvalfastNest, 1);
+        let (fcn, fcn_t, _) = gpu_checks(&c, inp, po2, Which::EvalfastFcNest, 1);
+        // R23: R22's flat kernels without hoisted loads (the revert switch).
+        let (nh, _, _) = gpu_checks(&c, inp, po2, Which::EvalfastNoHoist, 1);
+        let (fcnh, _, _) = gpu_checks(&c, inp, po2, Which::EvalfastFcNoHoist, 1);
+        for (what, r) in [
+            ("nested", &nest[0]),
+            ("nested specialized", &fcn[0]),
+            ("unhoisted", &nh[0]),
+            ("unhoisted specialized", &fcnh[0]),
+        ] {
+            let n = mismatches(&cpu, r);
+            assert_eq!(
+                n,
+                0,
+                "po2 {po2}: evalfast ({what}) vs CPU: {n} of {} differ",
+                cpu.len()
+            );
+        }
+        for (i, f) in fc.iter().enumerate() {
+            let n = mismatches(&cpu, f);
+            assert_eq!(
+                n,
+                0,
+                "po2 {po2} rep {i}: evalfast (specialized PSO) vs CPU: {n} of {} differ",
+                cpu.len()
+            );
+        }
+        let n = mismatches(&cpu, &r15e[0]);
+        assert_eq!(
+            n,
+            0,
+            "po2 {po2}: evalfast_r15e vs CPU: {n} of {} differ",
+            cpu.len()
+        );
+        let n = mismatches(&cpu, &r12[0]);
+        assert_eq!(
+            n,
+            0,
+            "po2 {po2}: evalfast_r12 vs CPU: {n} of {} differ",
+            cpu.len()
+        );
+        for (i, f) in fast.iter().enumerate() {
+            let n = mismatches(&cpu, f);
+            assert_eq!(
+                n,
+                0,
+                "po2 {po2} rep {i}: evalfast vs CPU: {n} of {} differ",
+                cpu.len()
+            );
+        }
+        let n = mismatches(&cpu, &base[0]);
+        assert_eq!(
+            n,
+            0,
+            "po2 {po2}: baseline vs CPU: {n} of {} differ",
+            cpu.len()
+        );
+        println!(
+            "R12 eval_check po2 {po2} ({kind} inputs): {} elements bit-exact (evalfast x{reps} == \
+             evalfast specialized x2 == nested == nested specialized == evalfast_r15e == \
+             evalfast_r12 == baseline == CPU); evalfast {fast_t:?}, specialized {fc_t:?}, \
+             nested {nest_t:?}, nested specialized {fcn_t:?}, \
+             evalfast_r15e {r15e_t:?}, \
+             evalfast_r12 {r12_t:?}, baseline {base_t:?}, \
+             CPU HAL {cpu_time:?}; inputs {} B, peak \
+             currentAllocatedSize evalfast {fast_peak} B / baseline {base_peak} B",
+            cpu.len(),
+            inp.bytes(),
+        );
+    }
+
+    #[test]
+    fn evalfast_matches_cpu_po2_4() {
+        evalfast_matches(4, 3);
+    }
+
+    #[test]
+    fn evalfast_matches_cpu_po2_10() {
+        evalfast_matches(10, 3);
+    }
+
+    #[test]
+    fn evalfast_matches_cpu_po2_16() {
+        evalfast_matches(16, 3);
+    }
+
+    /// R19: edge-value inputs ([Dist::Extreme]: mostly `P - 1` / `P - 2`, some 0 and 1) at two
+    /// seeds; every element must match the CPU. It does not replace
+    /// `evalfast_seeds_match_baseline`: R19's over-bound dual-accumulator transform passed these
+    /// inputs (notes/R19.md).
+    #[test]
+    fn evalfast_matches_cpu_extreme_po2_12() {
+        for seed in [19, 1919] {
+            evalfast_matches_on(&Inputs::seeded(12, seed, Dist::Extreme), 12, 2, "extreme");
+        }
+    }
+
+    /// po2 20: ~5.3 GB of inputs and a ~1 min CPU reference (run explicitly; R12 note).
+    #[test]
+    #[ignore]
+    fn evalfast_matches_cpu_po2_20() {
+        evalfast_matches(20, 2);
+    }
+
+    /// R19: evalfast against the baseline kernel on `R19_EF_SEEDS` (default 8) seeded uniform
+    /// inputs at po2 `R19_EF_PO2` (default 18). A lazy-reduction bound broken by a generator
+    /// change shows up on only some rows of some inputs (R19's dual-accumulator transform: wrong
+    /// on 4 of 6 seeds at po2 18, 1 of 5 at po2 16, 1 of 16 at po2 10), so run this after any
+    /// change to the evalfast generator or its helpers.
+    #[test]
+    #[ignore]
+    fn evalfast_seeds_match_baseline() {
+        let po2 = env_usize("R19_EF_PO2", 18);
+        let seeds = env_usize("R19_EF_SEEDS", 8) as u64;
+        let hal = Arc::new(MetalHalSha256::new());
+        let c = MetalCircuitHal::new(hal.clone()).unwrap();
+        let mut bad = Vec::new();
+        for seed in 1..=seeds {
+            let inp = Inputs::seeded(po2, seed, Dist::Uniform);
+            let (base, _, _) = gpu_checks(&c, &inp, po2, Which::Baseline, 1);
+            let (fast, fast_t, _) = gpu_checks(&c, &inp, po2, Which::Evalfast, 1);
+            let n = mismatches(&base[0], &fast[0]);
+            println!("R19 evalfast seed {seed} po2 {po2}: {n} elements differ; {fast_t:?}");
+            if n > 0 {
+                bad.push((seed, n));
+            }
+            // R20: the domain-specialized PSO too.
+            let (fc, fc_t, _) = gpu_checks(&c, &inp, po2, Which::EvalfastFc, 1);
+            let n = mismatches(&base[0], &fc[0]);
+            println!(
+                "R20 evalfast specialized seed {seed} po2 {po2}: {n} elements differ; {fc_t:?}"
+            );
+            if n > 0 {
+                bad.push((seed, n));
+            }
+            // R22: the nested-chain forms; R23: the unhoisted flat ones.
+            for which in [
+                Which::EvalfastNest,
+                Which::EvalfastFcNest,
+                Which::EvalfastNoHoist,
+                Which::EvalfastFcNoHoist,
+            ] {
+                let (r, t, _) = gpu_checks(&c, &inp, po2, which, 1);
+                let n = mismatches(&base[0], &r[0]);
+                println!(
+                    "R22 evalfast {which:?} seed {seed} po2 {po2}: {n} elements differ; {t:?}"
+                );
+                if n > 0 {
+                    bad.push((seed, n));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "evalfast differs from the baseline: (seed, elements) {bad:?}"
+        );
+    }
+
+    /// Repeated evalfast runs on one random po2 `R12_EF_PO2` (default 18) input against the
+    /// baseline, `R12_EF_REPS` times (default 20): the nondeterminism check R11 asked for (its
+    /// witgen kernel failed most repeated calls on big inputs). Also prints the GPU times.
+    #[test]
+    #[ignore]
+    fn evalfast_repeat_bit_exact() {
+        let po2: usize = std::env::var("R12_EF_PO2").map_or(18, |v| v.parse().unwrap());
+        let reps: usize = std::env::var("R12_EF_REPS").map_or(20, |v| v.parse().unwrap());
+        let inp = Inputs::random(po2);
+        let hal = Arc::new(MetalHalSha256::new());
+        let c = MetalCircuitHal::new(hal.clone()).unwrap();
+        // R17 audit: `R12_BASE_REPS` (default 2) baseline runs, each compared with the first.
+        let base_reps: usize = std::env::var("R12_BASE_REPS").map_or(2, |v| v.parse().unwrap());
+        let (base, base_t, _) = gpu_checks(&c, &inp, po2, Which::Baseline, base_reps.max(2));
+        let base_bad: Vec<(usize, usize)> = base
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (i, mismatches(&base[0], b)))
+            .filter(|(_, n)| *n > 0)
+            .collect();
+        println!(
+            "R17AUDIT rv32im eval_check baseline po2 {po2}: {}/{} runs differ from run 0 {base_bad:?}",
+            base_bad.len(),
+            base.len()
+        );
+        assert!(base_bad.is_empty(), "baseline not deterministic");
+        let (fast, fast_t, peak) = gpu_checks(&c, &inp, po2, Which::Evalfast, reps);
+        let bad: Vec<(usize, usize)> = fast
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (i, mismatches(&base[0], f)))
+            .filter(|(_, n)| *n > 0)
+            .collect();
+        println!(
+            "R12 evalfast repeat po2 {po2}: {} of {reps} runs differ from the baseline {bad:?}; \
+             evalfast {fast_t:?}; baseline {base_t:?}; peak {peak} B",
+            bad.len()
+        );
+        assert!(bad.is_empty());
+    }
+
+    /// The table builder: products, NBETA-folded rows and quotients as CUDA ef_prep/ef_prep_n
+    /// compute them; the hoisted terms are checked end to end by the kernel tests.
+    #[test]
+    fn ef_table_layout() {
+        let pm = map_pow(ExtVal::random(&mut rand::rng()), POLY_MIX_POWERS);
+        let out = random_vals(CircuitImpl::OUTPUT_SIZE);
+        let mix = random_vals(CircuitImpl::MIX_SIZE);
+        let po2 = 7;
+        let rou = Val::ROU_FWD[po2 + 2];
+        let tab = ef_table(&pm, &out, &mix, rou, po2);
+        assert_eq!(tab.len(), EF_TABLE_LEN);
+        assert_eq!(&tab[..ef::EF_NPC], &pm[..]);
+        for i in 0..ef::RK_QN {
+            let (a, b) = (ef::RK_QA[i] as usize, ef::RK_QB[i] as usize);
+            assert_eq!(tab[ef::EF_NPC + i], pm[a] * pm[b]);
+        }
+        let nbeta = Val::ZERO - Val::new(11);
+        for i in 0..ef::EF_NPM {
+            let e = tab[i].elems();
+            let n = tab[ef::EF_NPM + i].elems();
+            assert_eq!(n, &[e[1] * nbeta, e[2] * nbeta, e[3] * nbeta, Val::ZERO]);
+        }
+        let q = tab[2 * ef::EF_NPM].elems();
+        for (cyc, qc) in q.iter().enumerate() {
+            // hal/cpu.rs: 1 / ((3 * rou^cycle)^(2^po2) - 1) depends on cycle mod 4 only.
+            for k in [0usize, 4, 8, 400] {
+                let y = (Val::new(3) * rou.pow(cyc + k)).pow(1 << po2);
+                assert_eq!(*qc, (y - Val::ONE).inv(), "cycle {}", cyc + k);
+            }
+        }
+        // rk_hoist reads out and mix: other values change the hoisted terms (and only them).
+        for (out2, mix2) in [
+            (random_vals(out.len()), mix.clone()),
+            (out.clone(), random_vals(mix.len())),
+        ] {
+            let tab2 = ef_table(&pm, &out2, &mix2, rou, po2);
+            let hoisted = ef::EF_NPC + ef::RK_QN..ef::EF_NPM;
+            assert_ne!(&tab[hoisted.clone()], &tab2[hoisted.clone()]);
+            assert_eq!(&tab[..hoisted.start], &tab2[..hoisted.start]);
+        }
+    }
+
+    /// PSO creation time per eval_check kernel (`R12_PSO_KERNELS`, default the three), on a fresh
+    /// library from `METAL_LIB`. Cold when run with `MTL_SHADER_CACHE_SIZE=0` (K5's method: this
+    /// process neither reads nor writes the OS shader cache), warm otherwise.
+    #[test]
+    #[ignore]
+    fn eval_check_pso_times() {
+        let names = std::env::var("R12_PSO_KERNELS")
+            .unwrap_or_else(|_| "ef_combine,ef_eval_split,eval_check".into());
+        let device = metal::Device::system_default().unwrap();
+        let lib = device
+            .new_library_with_data(risc0_circuit_rv32im_sys::METAL_LIB)
+            .unwrap();
+        for name in names.split(',') {
+            let f = lib.get_function(name, None).unwrap();
+            let t = std::time::Instant::now();
+            let pso = device.new_compute_pipeline_state_with_function(&f).unwrap();
+            println!(
+                "R12 PSO {name}: {:?} (MTL_SHADER_CACHE_SIZE={:?}); maxTotalThreadsPerThreadgroup \
+                 {}, threadExecutionWidth {}, staticThreadgroupMemoryLength {}",
+                t.elapsed(),
+                std::env::var("MTL_SHADER_CACHE_SIZE").ok(),
+                pso.max_total_threads_per_threadgroup(),
+                pso.thread_execution_width(),
+                pso.static_threadgroup_memory_length()
+            );
+        }
+    }
+
+    fn env_usize(name: &str, default: usize) -> usize {
+        std::env::var(name).map_or(default, |v| v.parse().unwrap())
+    }
+
+    fn median_min_max(v: &[f64]) -> (f64, f64, f64) {
+        let mut s = v.to_vec();
+        s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        (s[s.len() / 2], s[0], s[s.len() - 1])
+    }
+
+    fn load_average() -> String {
+        std::process::Command::new("sysctl")
+            .args(["-n", "vm.loadavg"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default()
+    }
+
+    /// R15e: interleaved A/B of evalfast builds on one random input. `R15E_VARIANTS` is a comma
+    /// list of `name=path[:threads[:split kernel]]` (`path` = `builtin` for the embedded
+    /// METAL_LIB; `threads` is the `EF_THREADS` the build was compiled with, default 128; the
+    /// split kernel defaults to `ef_eval_split`, e.g. `r12=builtin:128:ef_eval_split_r12`; R20:
+    /// a 4th field `fc` specializes the split kernel for the domain, e.g.
+    /// `fc=builtin:128:ef_eval_split_fc:fc`),
+    /// `R15E_PO2` (default 20),
+    /// `R15E_PAIRS` rounds (default 7; each round runs every variant once, in list order).
+    /// Every run is compared bit for bit with the first run of the embedded kernel, and that one
+    /// with the CPU when `R15E_CPU=1`. Prints the PSO properties and the median / min / max wall
+    /// time (encode + GPU + wait) of each dispatch.
+    #[test]
+    #[ignore]
+    fn ef_variant_bench() {
+        let po2 = env_usize("R15E_PO2", 20);
+        let pairs = env_usize("R15E_PAIRS", 7);
+        let spec = std::env::var("R15E_VARIANTS").unwrap_or_else(|_| "builtin=builtin".into());
+        let hal = Arc::new(MetalHalSha256::new());
+        let c = MetalCircuitHal::new(hal.clone()).unwrap();
+        let mut vars = Vec::new();
+        for item in spec.split(',') {
+            let (name, rest) = item.split_once('=').expect("name=path[:threads[:kernel]]");
+            let mut parts = rest.split(':');
+            let path = parts.next().unwrap();
+            let threads = parts
+                .next()
+                .map_or(EF_THREADS, |t| t.parse::<u64>().unwrap());
+            let split = parts.next().unwrap_or("ef_eval_split").to_string();
+            // R20: a 4th field `fc` builds the split kernel (e.g. `ef_eval_split_fc`) specialized
+            // for the bench's domain.
+            let fc = parts.next() == Some("fc");
+            let bytes = if path == "builtin" {
+                risc0_circuit_rv32im_sys::METAL_LIB.to_vec()
+            } else {
+                std::fs::read(path).unwrap_or_else(|e| panic!("{path}: {e}"))
+            };
+            let t = std::time::Instant::now();
+            // A function-constant kernel has no plain PSO (R20): only its specialized one.
+            let names: &[&str] = if fc {
+                &["ef_combine"]
+            } else {
+                &[split.as_str(), "ef_combine"]
+            };
+            let lib = hal.try_load_library(&bytes, names).unwrap();
+            let fc_pso = fc.then(|| {
+                let domain = ((1usize << po2) * INV_RATE) as u32;
+                // R23: `R15E_FC_ARCHIVE=<dir>` keeps each arm's specialized PSO in a binary
+                // archive there (keyed by the metallib bytes), so repeated sessions skip the
+                // 12-20 s compile per arm.
+                let dir = std::env::var_os("R15E_FC_ARCHIVE").map(std::path::PathBuf::from);
+                let unit = format!("r15e_{name}");
+                let (p, _) = risc0_zkp::hal::metal::archive::specialized_pipeline(
+                    dir.clone(),
+                    &hal.device,
+                    &lib.library,
+                    if dir.is_some() { &bytes } else { &[] },
+                    if dir.is_some() { &unit } else { "unused" },
+                    &split,
+                    &[(0, domain)],
+                )
+                .unwrap();
+                p
+            });
+            let pso = fc_pso.as_deref().unwrap_or_else(|| lib.pipeline(&split));
+            println!(
+                "R15E variant {name}: {path} threads {threads}{}; PSOs {:?}; {split} \
+                 maxTotalThreadsPerThreadgroup {} threadExecutionWidth {} \
+                 staticThreadgroupMemoryLength {}",
+                if fc {
+                    " (specialized for the domain)"
+                } else {
+                    ""
+                },
+                t.elapsed(),
+                pso.max_total_threads_per_threadgroup(),
+                pso.thread_execution_width(),
+                pso.static_threadgroup_memory_length()
+            );
+            vars.push((name.to_string(), lib, threads, split, fc_pso));
+        }
+        // R23: `R15E_PSO_ONLY=1` stops after building the PSOs (no inputs, no GPU buffers): a
+        // light run that fills the OS shader cache, so the timed run does not hold the GPU
+        // lock through 20-60 s compiles per specialized arm.
+        if std::env::var("R15E_PSO_ONLY").as_deref() == Ok("1") {
+            return;
+        }
+        // R19: `R15E_INPUT=seeded|high|extreme` draws the inputs from a seeded generator
+        // (`R15E_SEED`, default 19) with that distribution ([Dist]) instead of `rand::rng()`.
+        let dist = match std::env::var("R15E_INPUT").as_deref() {
+            Ok("seeded") => Some(Dist::Uniform),
+            Ok("high") => Some(Dist::High),
+            Ok("extreme") => Some(Dist::Extreme),
+            _ => None,
+        };
+        let inp = match dist {
+            Some(dist) => {
+                let seed = env_usize("R15E_SEED", 19) as u64;
+                println!("R15E inputs: {dist:?}, seed {seed}");
+                Inputs::seeded(po2, seed, dist)
+            }
+            None => Inputs::random(po2),
+        };
+        let steps = 1 << po2;
+        let domain = steps * INV_RATE;
+        let [code, data, accum, mix, out] = [&inp.code, &inp.data, &inp.accum, &inp.mix, &inp.out]
+            .map(|b| hal.copy_from_elem("in", b));
+        let groups = [&accum, &code, &data];
+        let globals = [&mix, &out];
+        let check = hal.alloc_elem("check", ExtVal::EXT_SIZE * domain);
+        c.eval_check_evalfast(&check, &groups, &globals, inp.poly_mix, po2, steps)
+            .unwrap();
+        let reference = check.to_vec();
+        if std::env::var("R15E_CPU").as_deref() == Ok("1") {
+            let cpu = cpu_check(&inp, po2);
+            assert_eq!(mismatches(&cpu, &reference), 0, "embedded evalfast vs CPU");
+            println!(
+                "R15E po2 {po2}: embedded evalfast == CPU ({} elements)",
+                cpu.len()
+            );
+        }
+        let load0 = load_average();
+        let mut times = vec![(Vec::new(), Vec::new()); vars.len()];
+        let mut bad = vec![0usize; vars.len()];
+        // R18: odd rounds run the list in reverse (A B .. B A), so no variant always runs first.
+        let order: Vec<Vec<usize>> = (0..pairs)
+            .map(|r| {
+                let mut o: Vec<usize> = (0..vars.len()).collect();
+                if r % 2 == 1 {
+                    o.reverse();
+                }
+                o
+            })
+            .collect();
+        for o in &order {
+            for &i in o {
+                let (_, lib, threads, split, fc_pso) = &vars[i];
+                check.view_mut(|v| v.fill(Val::new_raw(0x7fff_ffff)));
+                let k = EfKernels {
+                    split: fc_pso.as_deref().unwrap_or_else(|| lib.pipeline(split)),
+                    combine: lib.pipeline("ef_combine"),
+                    threads: *threads,
+                };
+                let mut t = [std::time::Duration::ZERO; 2];
+                c.eval_check_ef_with(
+                    &k,
+                    &check,
+                    &groups,
+                    &globals,
+                    inp.poly_mix,
+                    po2,
+                    steps,
+                    Some(&mut t),
+                )
+                .unwrap();
+                times[i].0.push(t[0].as_secs_f64() * 1e3);
+                times[i].1.push(t[1].as_secs_f64() * 1e3);
+                let mut n = 0;
+                check.view(|v| n = mismatches(&reference, v));
+                if n != 0 {
+                    bad[i] += 1;
+                    // R18: `R15E_SHOW_MISMATCH=n` prints the first n differing elements.
+                    let show = env_usize("R15E_SHOW_MISMATCH", 0);
+                    if show > 0 {
+                        check.view(|v| {
+                            let diffs: Vec<String> = v
+                                .iter()
+                                .zip(&reference)
+                                .enumerate()
+                                .filter(|(_, (x, y))| x != y)
+                                .take(show)
+                                .map(|(j, (x, y))| format!("{j}: {x:?} (ref {y:?})"))
+                                .collect();
+                            println!("R15E {} mismatch: {n} elements; {diffs:?}", vars[i].0);
+                        });
+                    }
+                }
+            }
+        }
+        // R20: `R15E_ROUNDS=1` prints every round's split times (variant list order), for
+        // per-round paired statistics.
+        if std::env::var("R15E_ROUNDS").as_deref() == Ok("1") {
+            for r in 0..pairs {
+                let row: Vec<String> = times.iter().map(|t| format!("{:.2}", t.0[r])).collect();
+                println!("R15E round {r}: {}", row.join(" "));
+            }
+        }
+        println!(
+            "R15E po2 {po2}, {pairs} rounds, load average before {load0} / after {}",
+            load_average()
+        );
+        for (i, (name, _, _, _, _)) in vars.iter().enumerate() {
+            // R18: per-round split delta against the first variant (the A arm), and in how many
+            // rounds this variant was faster.
+            let d: Vec<f64> = (0..pairs).map(|r| times[i].0[r] - times[0].0[r]).collect();
+            let (dm, dmin, dmax) = median_min_max(&d);
+            let faster = d.iter().filter(|&&x| x < 0.0).count();
+            println!(
+                "R15E {name:>12}: split minus A per round {dm:+8.1} ms [{dmin:+.1}, {dmax:+.1}], \
+                 faster in {faster}/{pairs}"
+            );
+            let (s, smin, smax) = median_min_max(&times[i].0);
+            let (cm, cmin, cmax) = median_min_max(&times[i].1);
+            let tot: Vec<f64> = times[i]
+                .0
+                .iter()
+                .zip(&times[i].1)
+                .map(|(a, b)| a + b)
+                .collect();
+            let (tm, tmin, tmax) = median_min_max(&tot);
+            println!(
+                "R15E {name:>12}: split {s:8.1} ms [{smin:.1}, {smax:.1}]  combine {cm:6.2} ms \
+                 [{cmin:.2}, {cmax:.2}]  total {tm:8.1} ms [{tmin:.1}, {tmax:.1}]  mismatching \
+                 runs {}/{pairs}",
+                bad[i]
+            );
+        }
+        // R15E_ALLOW_MISMATCH=1: measurement-only builds (e.g. one phase skipped).
+        if std::env::var("R15E_ALLOW_MISMATCH").as_deref() != Ok("1") {
+            assert!(bad.iter().all(|&b| b == 0), "a variant differs: {bad:?}");
+        }
+    }
+
+    /// R15e: the non-default eval_check PSOs are not built when the library loads, and
+    /// [lazy_pipeline] builds each once.
+    #[test]
+    fn non_default_eval_psos_are_lazy() {
+        let hal = Arc::new(MetalHalSha256::new());
+        let c = MetalCircuitHal::new(hal).unwrap();
+        let k = &c.ctx.kernels.kernels;
+        for name in [
+            "eval_check",
+            "ef_eval_split_r12",
+            "ef_eval_split_r15e",
+            FC_KERNEL,
+            NEST_KERNEL,
+            FC_NEST_KERNEL,
+            NOHOIST_KERNEL,
+            FC_NOHOIST_KERNEL,
+        ] {
+            assert!(k.get(name).is_none(), "{name} built at load");
+            assert!(
+                c.ctx.library().function_names().iter().any(|f| f == name),
+                "{name} missing from the metallib"
+            );
+        }
+        assert!(k.get("ef_eval_split").is_some() && k.get("ef_combine").is_some());
+        let lib = c.ctx.library();
+        let a = lazy_pipeline(lib, "ef_combine").unwrap() as *const _;
+        let b = lazy_pipeline(lib, "ef_combine").unwrap() as *const _;
+        assert_eq!(a, b, "built twice");
+        assert!(lazy_pipeline(lib, "r15e_not_a_kernel").is_err());
+    }
+
+    /// R20: a specialized PSO through a binary archive of its own: the first build compiles
+    /// into a new archive file whose key includes the constant (another value has another
+    /// file), the second loads it as a hit, and both give the CPU's results.
+    #[test]
+    fn fc_archive_roundtrip() {
+        use risc0_zkp::hal::metal::archive;
+        let po2 = 6;
+        let domain = ((1usize << po2) * INV_RATE) as u32;
+        let dir = std::env::temp_dir().join(format!("risc0-r20-fc-archive-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hal = Arc::new(MetalHalSha256::new());
+        let c = MetalCircuitHal::new(hal.clone()).unwrap();
+        let lib = c.ctx.library();
+        let bytes = risc0_circuit_rv32im_sys::METAL_LIB;
+        let unit = fc_unit("rv32im_test", domain);
+        let base = archive::specialized_archive_base(
+            &dir,
+            &hal.device,
+            bytes,
+            &unit,
+            FC_KERNEL,
+            &[(0, domain)],
+        )
+        .unwrap();
+        let other = archive::specialized_archive_base(
+            &dir,
+            &hal.device,
+            bytes,
+            &unit,
+            FC_KERNEL,
+            &[(0, 2 * domain)],
+        )
+        .unwrap();
+        assert_ne!(base, other, "the key must include the constant value");
+        assert!(archive::archive_used(&base).is_none());
+        let build = || {
+            archive::specialized_pipeline(
+                Some(dir.clone()),
+                &hal.device,
+                lib,
+                bytes,
+                &unit,
+                FC_KERNEL,
+                &[(0, domain)],
+            )
+            .unwrap()
+        };
+        let (p1, r1) = build();
+        assert_eq!((r1.hits, r1.misses, r1.saved), (0, 1, true), "{r1:?}");
+        assert!(archive::archive_used(&base).is_some());
+        let (p2, r2) = build();
+        assert_eq!((r2.hits, r2.misses, r2.saved), (1, 0, false), "{r2:?}");
+        assert!(r2.loaded && r2.errors.is_empty(), "{r2:?}");
+
+        let inp = Inputs::random(po2);
+        let cpu = cpu_check(&inp, po2);
+        let steps = 1 << po2;
+        let [code, data, accum, mix, out] = [&inp.code, &inp.data, &inp.accum, &inp.mix, &inp.out]
+            .map(|b| hal.copy_from_elem("in", b));
+        for pso in [&p1, &p2] {
+            let check = hal.alloc_elem("check", ExtVal::EXT_SIZE * steps * INV_RATE);
+            check.view_mut(|v| v.fill(Val::new_raw(0x7fff_ffff)));
+            let k = EfKernels {
+                split: pso,
+                combine: c.ctx.pipeline("ef_combine"),
+                threads: EF_THREADS,
+            };
+            c.eval_check_ef_with(
+                &k,
+                &check,
+                &[&accum, &code, &data],
+                &[&mix, &out],
+                inp.poly_mix,
+                po2,
+                steps,
+                None,
+            )
+            .unwrap();
+            assert_eq!(mismatches(&cpu, &check.to_vec()), 0);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W7-Z1 (f): a specialized PSO from an offline archive (`RISC0_METAL_AOT_DIR`; a runtime
+    /// archive of this machine stands in for the `build_archive.py --fc` file, which the W7-Z1
+    /// note tests by hand): the file of the unit and constant serves the PSO (an AOT hit, no
+    /// compile), and its PSO gives the CPU's results; the same file under another constant's
+    /// unit is opened but misses cleanly (no error) and the PSO is built without it.
+    #[test]
+    fn w7z1_fc_aot_archive() {
+        use risc0_zkp::hal::metal::archive;
+        let po2 = 6;
+        let domain = ((1usize << po2) * INV_RATE) as u32;
+        let hal = Arc::new(MetalHalSha256::new());
+        let (Some(arch), Some(os)) = (
+            archive::gpu_architecture(&hal.device),
+            archive::aot_os_keys().into_iter().next(),
+        ) else {
+            return;
+        };
+        let tmp = |n: &str| {
+            let d = std::env::temp_dir().join(format!("risc0-w7z1-{n}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        };
+        let (rt, aot) = (tmp("fc-rt"), tmp("fc-aot"));
+        let c = MetalCircuitHal::new(hal.clone()).unwrap();
+        let lib = c.ctx.library();
+        let bytes = risc0_circuit_rv32im_sys::METAL_LIB;
+        let unit = fc_unit("rv32im_w7z1", domain);
+        let build = |dir: Option<std::path::PathBuf>, aot: Option<std::path::PathBuf>, d: u32| {
+            archive::specialized_pipeline_in(
+                dir,
+                aot,
+                &hal.device,
+                lib,
+                bytes,
+                &fc_unit("rv32im_w7z1", d),
+                FC_KERNEL,
+                &[(0, d)],
+            )
+            .unwrap()
+        };
+        let (_, r0) = build(Some(rt.clone()), None, domain);
+        assert!(r0.saved, "{r0:?}");
+        let content = std::fs::read(r0.path.as_ref().unwrap()).unwrap();
+        let stem = archive::aot_stem(&unit, bytes, &arch, &os);
+        let placed = aot.join(archive::aot_file_name(&stem, &content));
+        std::fs::write(&placed, &content).unwrap();
+
+        let (pso, r) = build(None, Some(aot.clone()), domain);
+        assert!(r.errors.is_empty(), "{r:?}");
+        assert_eq!((r.aot_hits, r.hits, r.misses), (1, 1, 0), "{r:?}");
+        assert_eq!(r.aot_path.as_deref(), Some(placed.as_path()));
+
+        let inp = Inputs::random(po2);
+        let cpu = cpu_check(&inp, po2);
+        let steps = 1 << po2;
+        let [code, data, accum, mix, out] = [&inp.code, &inp.data, &inp.accum, &inp.mix, &inp.out]
+            .map(|b| hal.copy_from_elem("in", b));
+        let check = hal.alloc_elem("check", ExtVal::EXT_SIZE * steps * INV_RATE);
+        check.view_mut(|v| v.fill(Val::new_raw(0x7fff_ffff)));
+        let k = EfKernels {
+            split: &pso,
+            combine: c.ctx.pipeline("ef_combine"),
+            threads: EF_THREADS,
+        };
+        c.eval_check_ef_with(
+            &k,
+            &check,
+            &[&accum, &code, &data],
+            &[&mix, &out],
+            inp.poly_mix,
+            po2,
+            steps,
+            None,
+        )
+        .unwrap();
+        assert_eq!(mismatches(&cpu, &check.to_vec()), 0);
+
+        // The domain's binary under the unit of another domain: found, opened, a clean miss.
+        let other = 2 * domain;
+        let stem = archive::aot_stem(&fc_unit("rv32im_w7z1", other), bytes, &arch, &os);
+        std::fs::remove_file(&placed).unwrap();
+        std::fs::write(aot.join(archive::aot_file_name(&stem, &content)), &content).unwrap();
+        let (_, r) = build(None, Some(aot.clone()), other);
+        assert!(r.aot_path.is_some() && r.errors.is_empty(), "{r:?}");
+        assert_eq!((r.aot_hits, r.misses), (0, 1), "{r:?}");
+        for d in [rt, aot] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// W7-Z1 (`--ignored`, manual; no GPU work beyond loading the library): writes the inputs of
+    /// `tools/metal_aot/build_all.py` for this crate into `W7Z1_DUMP`: the embedded metallib as
+    /// `rv32im.metallib` and one JSON line per archive unit (`unit`, `metallib`, `names`, `fc`) appended to
+    /// `units.jsonl`.
+    #[test]
+    #[ignore]
+    fn w7z1_dump_aot_inputs() {
+        let dir = std::path::PathBuf::from(std::env::var("W7Z1_DUMP").expect("W7Z1_DUMP"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lib: &[u8] = risc0_circuit_rv32im_sys::METAL_LIB;
+        std::fs::write(dir.join("rv32im.metallib"), lib).unwrap();
+        let mut lines = String::new();
+        let mut unit = |unit: &str, names: &[&str], fc: Option<String>| {
+            let names: Vec<String> = names.iter().map(|n| format!("\"{n}\"")).collect();
+            lines.push_str(&format!(
+                "{{\"unit\": \"{unit}\", \"metallib\": \"rv32im.metallib\", \"names\": [{}], \"fc\": {}}}\n",
+                names.join(", "),
+                fc.map_or("null".to_string(), |f| format!("\"{f}\""))
+            ));
+        };
+        let device = metal::Device::system_default().unwrap();
+        let available = device.new_library_with_data(lib).unwrap().function_names();
+        // What `Rv32imKernels::get` builds: the listed kernels and every expected one present.
+        let mut names: Vec<&str> = super::super::METAL_KERNEL_NAMES.to_vec();
+        for (_, list) in super::super::EXPECTED_KERNELS {
+            for n in *list {
+                if available.iter().any(|a| a == n) && !names.contains(n) {
+                    names.push(n);
+                }
+            }
+        }
+        unit(super::super::ARCHIVE_UNIT, &names, None);
+        // The default chain form's specializations for segment po2 16..=20 (domains 2^18..2^22).
+        for po2 in 16..=20usize {
+            let domain = ((1usize << po2) * INV_RATE) as u32;
+            unit(
+                &fc_unit(super::super::ARCHIVE_UNIT, domain),
+                &[FC_KERNEL],
+                Some(format!("0={domain}")),
+            );
+        }
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("units.jsonl"))
+            .unwrap()
+            .write_all(lines.as_bytes())
+            .unwrap();
+    }
+
+    /// W7-Z1 (R23 verify r2): the guard-fallback message names the plain kernel of the form in
+    /// use, not always the hoisted `ef_eval_split`.
+    #[test]
+    fn w7z1_fallback_message_names_the_replaced_kernel() {
+        let m = fallback_use_message(NEST_KERNEL, ChainForm::Flat);
+        assert!(m.contains(&format!("in place of {NOHOIST_KERNEL}")), "{m}");
+        let m = fallback_use_message(NEST_KERNEL, ChainForm::Hoist);
+        assert!(m.contains("in place of ef_eval_split "), "{m}");
+    }
+
+    /// Z16: the segment-po2 prewarm ignores po2s that are not segment po2s (no build, nothing
+    /// ready) and reports an unknown domain as not ready.
+    #[test]
+    fn z16_prewarm_po2_out_of_range() {
+        for po2 in [0, 4, 12, 25, 40] {
+            assert!(!prewarm_segment_po2(po2, false), "{po2}");
+            assert!(!prewarm_segment_po2(po2, true), "{po2}");
+        }
+        assert!(!fc_ready(12345, ChainForm::Hoist));
+    }
+
+    /// Z16: `prewarm_segment_po2(po2, true)` leaves the specialized PSO of that po2 ready, and a
+    /// later call (either mode) reports it ready at once. Ignored: it builds through the user's
+    /// archive cache (a cold specialization compiles for 20-30 s).
+    /// `cargo test --release -p risc0-circuit-rv32im --features metal --lib -- --ignored z16_prewarm_po2_ready`
+    #[test]
+    #[ignore]
+    fn z16_prewarm_po2_ready() {
+        if FcMode::current().unwrap() == FcMode::Off {
+            return;
+        }
+        let po2 = std::env::var("Z16_PO2")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20usize);
+        let t = std::time::Instant::now();
+        assert!(prewarm_segment_po2(po2, true));
+        eprintln!("Z16 prewarm po2 {po2}: {:.3} s", t.elapsed().as_secs_f64());
+        assert!(fc_ready(
+            ((1usize << po2) * INV_RATE) as u32,
+            chain_form().unwrap()
+        ));
+        assert!(prewarm_segment_po2(po2, false));
+        assert!(prewarm_segment_po2(po2, true));
+    }
+
+    /// Z16 cold-start probe: one process builds the zkp and rv32im PSOs (`warmup`, what a worker
+    /// does at start) and prints the wall time. Run it as its own process per sample, e.g. with
+    /// `MTL_SHADER_CACHE_SIZE=0` for a cold OS shader cache.
+    /// `.. --ignored --exact prove::hal::metal::eval_check::ef_tests::z16_probe_warmup`
+    #[test]
+    #[ignore]
+    fn z16_probe_warmup() {
+        let t = std::time::Instant::now();
+        super::super::warmup().unwrap();
+        println!(
+            "Z16PROBE rv32im+zkp warmup {:.3} s",
+            t.elapsed().as_secs_f64()
+        );
+    }
+
+    /// R22: the regime guard reads the OS driver's compile of each candidate split kernel from a
+    /// binary archive (eval_regime.rs). Fails when the default kernels (plain, and specialized for
+    /// po2 20, flat and nested chain) are not in the fast regime, i.e. after a toolchain / OS /
+    /// generator change that costs ~2.4x eval_check time; also checks that the field still
+    /// separates the regimes (R15e's form is slow today) and that the fallback PSOs built
+    /// through archives are CPU-exact.
+    #[test]
+    fn eval_regime_guard_kernels() {
+        use risc0_zkp::hal::metal::archive;
+
+        use super::eval_regime::{archive_info, Regime, FALLBACK_KERNELS, PLAIN_KERNEL, STACK_MAX};
+        let dir = std::env::temp_dir().join(format!("risc0-r22-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hal = Arc::new(MetalHalSha256::new());
+        let c = MetalCircuitHal::new(hal.clone()).unwrap();
+        let lib = c.ctx.library();
+        let bytes = risc0_circuit_rv32im_sys::METAL_LIB;
+        let domain = 4u32 << 20;
+        /// (kernel, function constants, expected in the fast regime)
+        type Case<'a> = (&'a str, &'a [(usize, u32)], bool);
+        // R23: the unhoisted flat kernels (the HOIST=0 revert) last, so indices 2 / 4 stay the
+        // fallbacks.
+        let cases: [Case; 7] = [
+            (PLAIN_KERNEL, &[], true),
+            (FC_KERNEL, &[(0, domain)], true),
+            (NEST_KERNEL, &[], true),
+            (FC_NEST_KERNEL, &[(0, domain)], true),
+            (FALLBACK_KERNELS[1].0, &[], false),
+            (NOHOIST_KERNEL, &[], true),
+            (FC_NOHOIST_KERNEL, &[(0, domain)], true),
+        ];
+        assert_eq!(FALLBACK_KERNELS[0].0, NEST_KERNEL);
+        let built: Vec<_> = std::thread::scope(|s| {
+            let hs: Vec<_> = cases
+                .iter()
+                .map(|&(name, fc, _)| {
+                    let (dir, hal, c) = (dir.clone(), &hal, &c);
+                    s.spawn(move || {
+                        let t = std::time::Instant::now();
+                        // The plain kernel's archive is the process library's own (production
+                        // path; compiling it into a fresh archive takes ~20 s).
+                        if name == PLAIN_KERNEL {
+                            let own = c
+                                .ctx
+                                .kernels()
+                                .kernels
+                                .archive_report()
+                                .and_then(|r| r.path.as_deref())
+                                .and_then(|p| archive_info(p, name));
+                            if own.is_some() {
+                                println!("R22 {name} (process archive): {own:?}");
+                                return (None, own);
+                            }
+                        }
+                        let (pso, r) = metal::objc::rc::autoreleasepool(|| {
+                            archive::specialized_pipeline(
+                                Some(dir),
+                                &hal.device,
+                                lib,
+                                bytes,
+                                &format!("rv32im_r22test_{name}"),
+                                name,
+                                fc,
+                            )
+                        })
+                        .unwrap();
+                        let path = r.path.clone().expect("archive written");
+                        let info = archive_info(&path, name);
+                        println!("R22 {name} {fc:?}: {info:?} ({:?})", t.elapsed());
+                        (Some(pso), info)
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for ((name, _, fast), (_, info)) in cases.iter().zip(&built) {
+            let regime = Regime::of(*info, STACK_MAX);
+            if *fast {
+                assert!(
+                    matches!(regime, Regime::Fast(_)),
+                    "{name}: {regime:?}: the default eval kernel is no longer in the fast \
+                     compiler regime (native stack <= {STACK_MAX} B); eval_check will be ~2.4x \
+                     slower. See docs/metal-port/notes/R22.md"
+                );
+            } else {
+                assert!(
+                    matches!(regime, Regime::Slow(_)),
+                    "{name}: {regime:?}: R15e's form is no longer slow: the stack field may no \
+                     longer separate the regimes (recalibrate, notes/R22.md)"
+                );
+            }
+        }
+        // The archive-built fallback PSOs (nest, r15e) compute the same check as the CPU.
+        let po2 = 10;
+        let inp = Inputs::random(po2);
+        let cpu = cpu_check(&inp, po2);
+        let steps = 1 << po2;
+        let [code, data, accum, mix, out] = [&inp.code, &inp.data, &inp.accum, &inp.mix, &inp.out]
+            .map(|b| hal.copy_from_elem("in", b));
+        for i in [2, 4] {
+            let check = hal.alloc_elem("check", ExtVal::EXT_SIZE * steps * INV_RATE);
+            check.view_mut(|v| v.fill(Val::new_raw(0x7fff_ffff)));
+            let k = EfKernels {
+                split: built[i].0.as_ref().unwrap(),
+                combine: c.ctx.pipeline("ef_combine"),
+                threads: EF_THREADS,
+            };
+            c.eval_check_ef_with(
+                &k,
+                &check,
+                &[&accum, &code, &data],
+                &[&mix, &out],
+                inp.poly_mix,
+                po2,
+                steps,
+                None,
+            )
+            .unwrap();
+            assert_eq!(mismatches(&cpu, &check.to_vec()), 0, "{}", cases[i].0);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn eval_fc_parsing() {
+        assert_eq!(FcMode::parse("").unwrap(), FcMode::DEFAULT);
+        assert_eq!(FcMode::parse("0").unwrap(), FcMode::Off);
+        assert_eq!(FcMode::parse(" OFF ").unwrap(), FcMode::Off);
+        assert_eq!(FcMode::parse("1").unwrap(), FcMode::Background);
+        assert_eq!(FcMode::parse("background").unwrap(), FcMode::Background);
+        assert_eq!(FcMode::parse("wait").unwrap(), FcMode::Wait);
+        assert!(FcMode::parse("2").is_err());
+        assert_eq!(fc_unit("rv32im", 4 << 20), "rv32im_fc4194304");
+        let d = 4 << 20;
+        assert_eq!(
+            fc_unit_of("rv32im", d, ChainForm::Hoist),
+            "rv32im_fc4194304"
+        );
+        assert_eq!(
+            fc_unit_of("rv32im", d, ChainForm::Flat),
+            "rv32im_fcnh4194304"
+        );
+        assert_eq!(
+            fc_unit_of("rv32im", d, ChainForm::Nest),
+            "rv32im_fcnest4194304"
+        );
+        assert!(parse_flat("").unwrap() && parse_flat("1").unwrap());
+        assert!(!parse_flat("0").unwrap() && !parse_flat(" nest ").unwrap());
+        assert!(parse_flat("2").is_err());
+        assert!(parse_hoist("").unwrap() && parse_hoist("1").unwrap());
+        assert!(!parse_hoist("0").unwrap() && !parse_hoist(" OFF ").unwrap());
+        assert!(parse_hoist("2").is_err());
+        assert_eq!(
+            [ChainForm::Hoist, ChainForm::Flat, ChainForm::Nest].map(fc_kernel),
+            [FC_KERNEL, FC_NOHOIST_KERNEL, FC_NEST_KERNEL]
+        );
+        assert_eq!(
+            [ChainForm::Hoist, ChainForm::Flat, ChainForm::Nest].map(ChainForm::plain_kernel),
+            ["ef_eval_split", NOHOIST_KERNEL, NEST_KERNEL]
+        );
+        assert!(fc_domain_in_range(4 << 20) && fc_domain_in_range(4 << 13));
+        assert!(!fc_domain_in_range(4 << 12) && !fc_domain_in_range(4 << 25));
+        assert!(!fc_domain_in_range((4 << 20) + 4));
+    }
+
+    #[test]
+    fn eval_kernel_parsing() {
+        assert_eq!(EvalKernel::parse("").unwrap(), EvalKernel::DEFAULT);
+        assert_eq!(EvalKernel::parse("evalfast").unwrap(), EvalKernel::Evalfast);
+        assert_eq!(
+            EvalKernel::parse("evalfast_r12").unwrap(),
+            EvalKernel::EvalfastR12
+        );
+        assert_eq!(
+            EvalKernel::parse("evalfast_r15e").unwrap(),
+            EvalKernel::EvalfastR15e
+        );
+        assert_eq!(
+            EvalKernel::parse(" Baseline ").unwrap(),
+            EvalKernel::Baseline
+        );
+        assert!(EvalKernel::parse("fastest").is_err());
+    }
+}

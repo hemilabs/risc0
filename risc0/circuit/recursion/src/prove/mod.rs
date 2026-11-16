@@ -16,10 +16,17 @@
 //!
 //! This module contains the recursion [Prover].
 
+mod ctrl_persist;
 mod hal;
 mod p2fast;
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 mod pinned;
+/// Metal: the trace staged in a shared buffer (C14, `hal/metal/staging.rs`). Only without CUDA and
+/// ROCm, whose `pinned.rs` defines the same module.
+#[cfg(all(feature = "metal", not(any(feature = "cuda", feature = "rocm"))))]
+mod pinned {
+    pub(crate) use super::hal::metal::staging::MetalStaged as PinnedTrace;
+}
 mod preflight;
 mod program;
 mod witgen;
@@ -58,6 +65,7 @@ use crate::{
     taps::TAPSET, CircuitImpl, REGISTER_GROUP_ACCUM, REGISTER_GROUP_CTRL, REGISTER_GROUP_DATA,
 };
 
+pub use self::ctrl_persist::{prewarm_p254_ctrl, P254Prewarm};
 pub use self::preflight::{InputStream, Preflight};
 pub use self::program::Program;
 
@@ -123,10 +131,65 @@ pub fn cuda_warmup() {
     let _ = risc0_sys::ffi_wrap(|| unsafe { risc0_circuit_recursion_cuda_warmup_eval_check() });
 }
 
+/// Build the recursion Metal pipeline states (base kernels and the eval_check variant selected by
+/// `RISC0_METAL_REC_KERNELS`) and the zkp ones, so the first lift does not pay for them (tens of
+/// seconds cold, PLAN 9.1). Blocking: run it on a background thread ([start_metal_warmup]). Best
+/// effort: a failure is logged, and `recursion_prover` reports it again. Safe to run while another
+/// thread proves: the recursion PSOs are built without the GPU lock.
+#[cfg(feature = "metal")]
+pub fn metal_warmup() {
+    if !risc0_zkp::hal::metal::enabled("recursion") {
+        return;
+    }
+    if let Err(e) = self::hal::metal::warmup() {
+        tracing::warn!("recursion Metal warmup failed: {e:#}");
+    }
+}
+
+/// Run [metal_warmup] on a detached background thread, once per process. Never join it from a
+/// thread holding `risc0_zkp::hal::metal::exclusive()` (the warmup takes that lock briefly).
+#[cfg(feature = "metal")]
+pub fn start_metal_warmup() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        if !risc0_zkp::hal::metal::enabled("recursion") {
+            return;
+        }
+        if let Err(e) = std::thread::Builder::new()
+            .name("recursion-metal-warmup".into())
+            .spawn(metal_warmup)
+        {
+            tracing::warn!("recursion Metal warmup thread not started: {e}");
+        }
+    });
+}
+
+/// Whether this build's recursion prover runs host-executed witgen chains (the cfg alias for the
+/// CUDA/ROCm/Metal host-chain paths): CUDA and ROCm always, Metal unless the Metal recursion
+/// prover is disabled at run time (`RISC0_METAL=0` / `RISC0_METAL_SKIP=recursion`), in which case
+/// the CPU prover runs and would ignore them.
+pub(crate) fn host_chains_backend() -> bool {
+    cfg_if! {
+        if #[cfg(any(feature = "cuda", feature = "rocm"))] {
+            true
+        } else if #[cfg(feature = "metal")] {
+            static ON: LazyLock<bool> =
+                LazyLock::new(|| risc0_zkp::hal::metal::enabled("recursion"));
+            *ON
+        } else {
+            false
+        }
+    }
+}
+
 /// Drop this thread's cached recursion provers, and with them the device buffers they keep
 /// between proofs (each program's committed ctrl group). The next proof rebuilds them.
 pub fn release_cached_provers() {
     PROVER_CACHE.with(|cache| cache.borrow_mut().clear());
+    // Metal (W7-C1): the pooled prepare() staging buffers (~80 MB) go too, so they do not sit
+    // beside the Groth16 wrap.
+    #[cfg(all(feature = "metal", not(any(feature = "cuda", feature = "rocm"))))]
+    hal::metal::staging::drain_pool();
 }
 
 /// Test hook: while on, each recursion witness generated with host-executed chains is
@@ -149,6 +212,28 @@ pub(crate) fn host_prep_enabled() -> bool {
     *ON
 }
 
+/// Metal (C14): stage a prepared preflight's witgen inputs (trace and host chains) in a shared
+/// Metal buffer, off the GPU thread (`hal/metal/staging.rs`; on by default since W7-C1,
+/// `RISC0_METAL_REC_STAGE=0` = off).
+#[cfg(all(feature = "metal", not(any(feature = "cuda", feature = "rocm"))))]
+pub(crate) fn stage_metal(preflight: &Preflight) {
+    if !host_chains_backend() || !hal::metal::staging::stage_enabled() {
+        return;
+    }
+    let t0 = std::time::Instant::now();
+    let staged = {
+        let chains = preflight.host_chains.lock().unwrap();
+        let t = &preflight.trace;
+        pinned::PinnedTrace::new(&t.wom, &t.cycles, &t.iops, chains.as_ref())
+    };
+    tracing::debug!(
+        "recursion Metal staging: staged={} {:.1}ms",
+        staged.is_some(),
+        t0.elapsed().as_secs_f64() * 1e3
+    );
+    *preflight.pinned.lock().unwrap() = staged;
+}
+
 fn preflight_is_streaming(p: &Preflight) -> bool {
     p.is_streaming()
 }
@@ -159,10 +244,14 @@ pub fn recursion_prover(hashfn: &str) -> Result<Box<dyn RecursionProver>> {
             self::hal::cuda::recursion_prover(hashfn)
         } else if #[cfg(feature = "rocm")] {
             self::hal::hip::recursion_prover(hashfn)
-        // } else if #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), target_os = "ios"))] {
-        // self::hal::metal::recursion_prover(hashfn)
         } else if #[cfg(feature = "intel")] {
             self::hal::intel::recursion_prover(hashfn)
+        } else if #[cfg(feature = "metal")] {
+            if risc0_zkp::hal::metal::enabled("recursion") {
+                self::hal::metal::recursion_prover(hashfn)
+            } else {
+                self::hal::cpu::recursion_prover(hashfn)
+            }
         } else {
             self::hal::cpu::recursion_prover(hashfn)
         }
@@ -226,6 +315,8 @@ impl Prover {
     pub fn prewarm(&self) -> Result<()> {
         #[cfg(feature = "cuda")]
         let _gpu = risc0_zkp::hal::cuda::exclusive();
+        #[cfg(feature = "metal")]
+        let _gpu = risc0_zkp::hal::metal::exclusive();
         let hashfn = self.hashfn.clone();
         PROVER_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
@@ -252,10 +343,7 @@ impl Prover {
         // Execute the host chains of the trace prefix on a background thread while the
         // preflight continues (from the point where a streaming preflight has consumed its whole
         // prefix, else at 3/5 of the rows); the rest after.
-        #[cfg(any(feature = "cuda", feature = "rocm"))]
-        let split = host_prep_enabled();
-        #[cfg(not(any(feature = "cuda", feature = "rocm")))]
-        let split = false;
+        let split = host_chains_backend() && host_prep_enabled();
         let streaming = preflight_is_streaming(&preflight);
         let split_row = self.program.code_rows() * 3 / 5;
         type EarlyChains = std::thread::JoinHandle<Result<(Option<witgen::HostChains>, usize)>>;
@@ -284,9 +372,6 @@ impl Prover {
                 }
             }
         }
-        // Read only where host chains run (CUDA and ROCm); the repository builds with -Dwarnings.
-        #[cfg(not(any(feature = "cuda", feature = "rocm")))]
-        let _ = early_at;
         tracing::debug!(
             "recursion preflight: rows={} {:.1}ms prefix_words={} consumed={} past_prefix_at={:.1}ms \
              stream_wait={:.1}ms",
@@ -313,8 +398,9 @@ impl Prover {
                 );
             }
         }
-        #[cfg(any(feature = "cuda", feature = "rocm"))]
-        if let Some(h) = early.take() {
+        if !host_chains_backend() {
+            // The CPU/Intel provers run every chain themselves.
+        } else if let Some(h) = early.take() {
             let t0 = std::time::Instant::now();
             // A panic on the early thread falls back like its error does.
             let first = h
@@ -390,6 +476,9 @@ impl Prover {
                 );
             }
         }
+        // Metal (C14): the same inputs in a shared Metal buffer the witgen binds in place.
+        #[cfg(all(feature = "metal", not(any(feature = "cuda", feature = "rocm"))))]
+        stage_metal(&preflight);
         self.prepared_preflight = Some(preflight);
         Ok(())
     }
@@ -421,9 +510,11 @@ impl Prover {
     /// program and input.
     pub fn run(&mut self) -> Result<RecursionReceipt> {
         // Exclusive use of the GPU against other threads for this proof; the cached prover's HAL
-        // doesn't hold it (see `risc0_zkp::hal::cuda::singleton`).
+        // doesn't hold it (see `risc0_zkp::hal::cuda::singleton` / `metal::singleton`).
         #[cfg(feature = "cuda")]
         let _gpu = risc0_zkp::hal::cuda::exclusive();
+        #[cfg(feature = "metal")]
+        let _gpu = risc0_zkp::hal::metal::exclusive();
         let hashfn = self.hashfn.clone();
         // Take input instead of cloning to avoid copying ~4-8MB of seal data per call.
         let input = std::mem::take(&mut self.input);
@@ -463,6 +554,17 @@ where
     // the `Arc` keeps the program (immutable behind the `Arc`) alive, so pointer equality means
     // identical code and the ~24 MB compare can be skipped.
     cached_ctrl_program: RefCell<HashMap<CtrlKey, Arc<Program>>>,
+}
+
+/// Where a proof's committed ctrl group came from ([RecursionProverImpl::commit_ctrl]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CtrlSource {
+    /// This prover's device cache.
+    Cached,
+    /// Rebuilt from the host copy of an earlier prover (C13).
+    Restored,
+    /// Committed.
+    Committed,
 }
 
 /// Programs whose ctrl the device caches keep at once; more clears them (each holds a
@@ -541,14 +643,10 @@ where
             .borrow_mut()
             .entry(ctrl_key)
             .or_insert_with(|| ctrl.clone());
-        let mut cache = self.cached_ctrl_group.borrow_mut();
-        if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(ctrl_key) {
+        if !self.cached_ctrl_group.borrow().contains_key(&ctrl_key) {
             let mut prover = risc0_zkp::prove::Prover::new(self.hal.as_ref(), TAPSET);
             prover.set_po2(program.po2);
-            prover.commit_group(REGISTER_GROUP_CTRL, &ctrl);
-            if let Some(group) = prover.get_group(REGISTER_GROUP_CTRL).cloned() {
-                e.insert(group);
-            }
+            self.commit_ctrl(&mut prover, ctrl_key, &ctrl, Some(program));
         }
         tracing::debug!(
             "recursion prewarm: po2={} rows={} {:.1}ms",
@@ -637,21 +735,9 @@ where
                 // Cache ctrl PolyGroup to skip iNTT/expand/merkle on repeated proofs
                 // with the same program (`ctrl_key`, whose entries `claim_ctrl_caches`
                 // checked belong to exactly this program).
+                // C13: or rebuilt from the host copy a previous prover of this process kept.
                 let t0 = std::time::Instant::now();
-                let ctrl_cached;
-                {
-                    let mut cache = self.cached_ctrl_group.borrow_mut();
-                    if let Some(cached) = cache.get(&ctrl_key) {
-                        prover.commit_cached_group(REGISTER_GROUP_CTRL, cached.clone());
-                        ctrl_cached = true;
-                    } else {
-                        prover.commit_group(REGISTER_GROUP_CTRL, &witgen.ctrl);
-                        if let Some(group) = prover.get_group(REGISTER_GROUP_CTRL).cloned() {
-                            cache.insert(ctrl_key, group);
-                        }
-                        ctrl_cached = false;
-                    }
-                }
+                let ctrl_cached = self.commit_ctrl(&mut prover, ctrl_key, &witgen.ctrl, shared);
                 let ctrl_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
                 let t0 = std::time::Instant::now();
@@ -671,7 +757,7 @@ where
                 let accum_commit_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
                 if *VERBOSE {
-                    eprintln!("[recursion_prove] preflight={preflight_ms:.1}ms(cached={preflight_was_cached}) witgen={witgen_ms:.1}ms ctrl={ctrl_ms:.1}ms(cached={ctrl_cached}) data_commit={data_commit_ms:.1}ms accum={accum_ms:.1}ms accum_commit={accum_commit_ms:.1}ms");
+                    eprintln!("[recursion_prove] preflight={preflight_ms:.1}ms(cached={preflight_was_cached}) witgen={witgen_ms:.1}ms ctrl={ctrl_ms:.1}ms({ctrl_cached:?}) data_commit={data_commit_ms:.1}ms accum={accum_ms:.1}ms accum_commit={accum_commit_ms:.1}ms");
                 }
 
                 mix
@@ -745,12 +831,63 @@ where
             self.cached_ctrl_group.borrow_mut().clear();
             self.cached_ctrl_program.borrow_mut().clear();
         }
-        codes.insert(key, Arc::new(program.code.clone()));
+        let code = ctrl_persist::code_for(key, program, shared)
+            .unwrap_or_else(|| Arc::new(program.code.clone()));
+        codes.insert(key, code);
         if let Some(arc) = shared {
             self.cached_ctrl_program
                 .borrow_mut()
                 .insert(key, arc.clone());
         }
+    }
+
+    /// Commit `key`'s ctrl group to `prover`: the device-cached group, else (C13) the group
+    /// rebuilt from the host copy a previous prover of this process kept, else a fresh commit
+    /// of `ctrl` (cached on the device, and kept on the host when [ctrl_persist] has room).
+    /// Returns where the group came from. `claim_ctrl_caches(key, ..)` must have run.
+    fn commit_ctrl(
+        &self,
+        prover: &mut risc0_zkp::prove::Prover<'_, H>,
+        key: CtrlKey,
+        ctrl: &H::Buffer<H::Elem>,
+        shared: Option<&Arc<Program>>,
+    ) -> CtrlSource {
+        let mut cache = self.cached_ctrl_group.borrow_mut();
+        if let Some(cached) = cache.get(&key) {
+            prover.commit_cached_group(REGISTER_GROUP_CTRL, cached.clone());
+            return CtrlSource::Cached;
+        }
+        let persist = ctrl_persist::enabled()
+            && self.hal.has_unified_memory()
+            && self.hal.gpu_total_memory() != usize::MAX;
+        let code = self.cached_ctrl_code.borrow().get(&key).cloned();
+        let hashfn = self.hal.get_hash_suite().name.clone();
+        if let (true, Some(code)) = (persist, code.as_ref()) {
+            if let Some(host) = ctrl_persist::lookup(&hashfn, key, code) {
+                let t0 = std::time::Instant::now();
+                let group = PolyGroup::from_host(self.hal.as_ref(), &host);
+                // Wait for the rebuild's expand NTT (the time a commit would also have waited).
+                let _ = group.evaluated.as_ref().map(|e| e.get_at(0));
+                ctrl_persist::record_restore(&hashfn, key, t0.elapsed().as_secs_f64() * 1e3);
+                prover.commit_cached_group(REGISTER_GROUP_CTRL, group.clone());
+                cache.insert(key, group);
+                return CtrlSource::Restored;
+            }
+        }
+        let t0 = std::time::Instant::now();
+        prover.commit_group(REGISTER_GROUP_CTRL, ctrl);
+        let commit_ms = t0.elapsed().as_secs_f64() * 1e3;
+        if let Some(group) = prover.get_group(REGISTER_GROUP_CTRL).cloned() {
+            if let (true, Some(code)) = (persist && ctrl_persist::wants(&hashfn), code) {
+                let cap = ctrl_persist::cap_bytes(self.hal.gpu_total_memory());
+                let bytes = group.host_bytes() + code.len() * std::mem::size_of::<BabyBearElem>();
+                if ctrl_persist::would_keep(&hashfn, key, bytes, cap) {
+                    ctrl_persist::store(&hashfn, key, code, shared, &group, commit_ms, cap);
+                }
+            }
+            cache.insert(key, group);
+        }
+        CtrlSource::Committed
     }
 
     fn preflight(&self, program: &Program, input: VecDeque<u32>) -> Result<Preflight> {

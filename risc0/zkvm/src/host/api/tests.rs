@@ -386,6 +386,14 @@ mod keccak_po2 {
     };
 
     pub const KECCAK_TEST_PO2: u32 = 15;
+    /// The po2 the request is proved at: one permutation fits the smallest keccak po2 (K10), or
+    /// the max with RISC0_KECCAK_RIGHTSIZE_PO2=0.
+    fn keccak_proved_po2() -> usize {
+        match std::env::var("RISC0_KECCAK_RIGHTSIZE_PO2") {
+            Ok(v) if v.trim() == "0" => KECCAK_TEST_PO2 as usize,
+            _ => 14,
+        }
+    }
     struct Coprocessor {
         pub(crate) receipt: Option<SuccinctReceipt<Unknown>>,
     }
@@ -398,7 +406,7 @@ mod keccak_po2 {
 
     impl CoprocessorCallback for Coprocessor {
         fn prove_keccak(&mut self, proof_request: ProveKeccakRequest) -> Result<()> {
-            assert_eq!(proof_request.po2, KECCAK_TEST_PO2 as usize);
+            assert_eq!(proof_request.po2, keccak_proved_po2());
             let client = TestClient::new();
             let receipt = client.prove_keccak(proof_request);
             self.receipt = Some(receipt);
@@ -423,6 +431,23 @@ mod keccak_po2 {
             .unwrap();
 
         let _session = client.execute(env, Asset::Inline(MULTI_TEST_ELF.into()));
+
+        // The smaller-po2 receipt the coprocessor got is lifted by that po2's keccak program and
+        // verifies against the keccak control root, as a max-po2 one does.
+        let receipt = coprocessor
+            .borrow_mut()
+            .receipt
+            .take()
+            .expect("no keccak receipt");
+        assert_eq!(
+            receipt.control_id,
+            risc0_circuit_keccak::KECCAK_CONTROL_IDS
+                [keccak_proved_po2() - risc0_circuit_keccak::KECCAK_PO2_RANGE.start()]
+        );
+        let ctx = crate::VerifierContext::default().with_succinct_verifier_parameters(
+            crate::SuccinctReceiptVerifierParameters::for_keccak(),
+        );
+        receipt.verify_integrity_with_context(&ctx).unwrap();
     }
 }
 

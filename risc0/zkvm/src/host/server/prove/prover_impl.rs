@@ -19,17 +19,39 @@ use anyhow::{anyhow, bail, ensure, Context, Result};
 static VERBOSE: LazyLock<bool> = LazyLock::new(|| std::env::var("RISC0_VERBOSE").is_ok());
 
 use super::{
-    keccak::{prove_keccak, prove_keccak_with},
+    keccak::{prove_and_lift_keccaks, prove_keccak, prove_keccak_with, reuse_keccak_prover},
     ProverServer,
 };
 use risc0_circuit_rv32im::prove::SegmentProver;
+
+// Gated like the plain-RefCell segment-prover slot below (item W7-V2): with `intel` (or `cuda`,
+// `rocm`) beside `metal`, `segment_prover()` returns that backend's prover, not the Metal one
+// `exec_stream` is written for (and lends to its thread), and the slot is the ManuallyDrop one.
+// Today the combination cannot be built at all (risc0-sys's build script rejects `metal` with
+// `cuda`, `rocm` or `intel`), so this only keeps the two gates from drifting apart.
+#[cfg(all(
+    feature = "metal",
+    not(any(feature = "cuda", feature = "rocm", feature = "intel"))
+))]
+pub(crate) mod exec_stream;
 
 thread_local! {
     // ManuallyDrop prevents TLS cleanup from dropping CUDA buffers after the CUDA
     // context is already destroyed (which causes a panic/abort on process exit).
     // GPU memory is reclaimed by CUDA context teardown regardless.
+    #[cfg(not(all(feature = "metal", not(any(feature = "cuda", feature = "rocm", feature = "intel")))))]
     static CACHED_SEGMENT_PROVER: std::mem::ManuallyDrop<RefCell<Option<Box<dyn SegmentProver>>>> =
         std::mem::ManuallyDrop::new(RefCell::new(None));
+    // On Metal the prover is dropped when its thread exits (item Z17, docs/metal-port/notes/
+    // Z17.md "Test memory"). Its MetalHal pool (up to half of recommendedMaxWorkingSetSize, ~9.4
+    // GiB at po2 20) is ordinary unified memory with no context to outlive, and the recursion
+    // provers' cache already drops this way. With ManuallyDrop every thread that proved and
+    // exited without `release_hal_buffers` leaked its pool until process exit: libtest runs each
+    // test on a fresh thread, so the host::server::prove:: suite grew to ~37 GB in one process
+    // (more than a 36 GB Mac's RAM) at any --test-threads.
+    #[cfg(all(feature = "metal", not(any(feature = "cuda", feature = "rocm", feature = "intel"))))]
+    static CACHED_SEGMENT_PROVER: RefCell<Option<Box<dyn SegmentProver>>> =
+        const { RefCell::new(None) };
 }
 
 /// Completes, and discards, whatever segment the cached prover still has pending when dropped.
@@ -47,7 +69,7 @@ impl Drop for DrainSegmentProverOnExit {
 
 /// Drop this thread's cached segment prover and the device buffers it keeps between segments
 /// (see `release_cached_provers`). Only between sessions: the prover must be idle.
-#[cfg(any(feature = "rocm", feature = "intel"))]
+#[cfg(any(feature = "rocm", feature = "intel", feature = "metal"))]
 fn release_cached_segment_prover() {
     CACHED_SEGMENT_PROVER.with(|cell| {
         if let Ok(mut borrow) = cell.try_borrow_mut() {
@@ -63,10 +85,113 @@ fn release_cached_segment_prover() {
 /// slower. On an Arc B580 (12 GB, Windows) at po2=20 the next session's segments took 106 s
 /// instead of 28 (54-65 s with this alone; the rest was the HAL's pool, see `pool_max_bytes` in
 /// risc0-zkp's Intel HAL). Rebuilt by the next session, in device memory.
-#[cfg(any(feature = "rocm", feature = "intel"))]
+///
+/// On Metal this is also how `release_hal_buffers` returns pooled memory: the pools belong to the
+/// HALs these provers hold (see there).
+#[cfg(any(feature = "rocm", feature = "intel", feature = "metal"))]
 pub(crate) fn release_cached_provers() {
     release_cached_segment_prover();
     risc0_circuit_recursion::prove::release_cached_provers();
+}
+
+/// Revert knob for item Z12 (docs/metal-port/notes/Z12.md): `0` keeps the segment prover cached
+/// through recursion (the pre-Z12 behaviour), `1` always releases it, unset (or anything else)
+/// decides from the working-set budget and, since item C16, also releases it when a Groth16 wrap
+/// follows in the same call; `budget` decides from the budget only (the pre-C16 auto mode). See
+/// `release_segment_prover_before_recursion`.
+#[cfg(feature = "metal")]
+pub(crate) const RELEASE_SEG_BEFORE_REC_ENV: &str = "RISC0_METAL_RELEASE_SEG_BEFORE_REC";
+
+/// What lift/join adds to the device's allocation when recursion starts with no segment prover
+/// cached: Z12 measured a recursion-phase peak of 1700-1720 MiB (BusyLoop and the worker's
+/// memory-merkle, segment po2 17-19, 4 and 8 GiB budgets; the lift/join programs are po2 <= 18
+/// whatever the segment po2 is), rounded up.
+#[cfg(feature = "metal")]
+const REC_PEAK_BYTES: u64 = 2 << 30;
+
+#[cfg(all(feature = "metal", test))]
+thread_local! {
+    /// Test hook: overrides [RELEASE_SEG_BEFORE_REC_ENV] on this thread (the process environment
+    /// is shared with the tests running in parallel).
+    pub(crate) static RELEASE_SEG_MODE: std::cell::RefCell<Option<&'static str>> =
+        const { std::cell::RefCell::new(None) };
+    /// Test hook: releases made by `release_segment_prover_before_recursion` on this thread.
+    pub(crate) static SEG_RELEASES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The Z12 decision: `Some(reason)` to release the segment prover before recursion. `mode` is
+/// [RELEASE_SEG_BEFORE_REC_ENV]'s value; `memory` is `(working-set limit, device allocation now)`.
+#[cfg(feature = "metal")]
+pub(crate) fn seg_release_reason(mode: &str, memory: Option<(u64, u64)>) -> Option<String> {
+    match mode.trim() {
+        "0" => None,
+        "1" => Some("forced".to_string()),
+        _ => {
+            let (limit, allocated) = memory?;
+            (allocated.saturating_add(REC_PEAK_BYTES) > limit).then(|| {
+                format!(
+                    "{} MiB allocated + {} MiB for recursion > {} MiB working-set limit",
+                    allocated >> 20,
+                    REC_PEAK_BYTES >> 20,
+                    limit >> 20
+                )
+            })
+        }
+    }
+}
+
+/// Item Z12: before lift/join, drop this thread's cached segment prover (its HAL's pool and the
+/// buffers it keeps between segments) when the working-set budget cannot hold it beside
+/// recursion: when what is allocated now plus recursion's own peak would exceed the limit.
+///
+/// Before Z12 the segment prover stayed cached until the Groth16 wrap's `release_hal_buffers`, so
+/// the recursion phase's peak was the segment prover's held memory plus recursion's own (4 GiB
+/// budget, po2 17: 3801 MiB instead of ~1.9 GB). Under an explicit budget the allocator drains
+/// every pool before refusing, so the sum only costs drains; on a real Mac it is real memory.
+/// At the default budget both fit and nothing changes. After a release the next proof rebuilds the
+/// prover (the PSOs are process-wide and stay); in the worker the wrap releases it after every
+/// proof anyway. Runs on the proving thread (the cache is per thread); a prover in use is left
+/// alone (`release_cached_segment_prover`).
+///
+/// Item C16 (c): in auto mode it also releases when this call goes on to a Groth16 wrap
+/// (`wrap_follows`). The wrap drops the segment prover anyway (`succinct_to_groth16`'s release
+/// before identity_p254, then `release_hal_buffers`), and dropping it there, beside the recursion
+/// provers, cost identity_p254 50-80 ms at the default budget (notes/C16.md), against ~20-30 ms
+/// here; recursion also runs ~20 ms faster without the segment pool beside it (BASELINES 5c.3).
+/// Nothing that outlives the call changes: the next session rebuilds the prover either way.
+/// `RISC0_METAL_RELEASE_SEG_BEFORE_REC=budget` keeps the pre-C16 auto mode.
+#[cfg(feature = "metal")]
+fn release_segment_prover_before_recursion(wrap_follows: bool) {
+    #[cfg(test)]
+    let forced = RELEASE_SEG_MODE.with(|m| *m.borrow());
+    #[cfg(not(test))]
+    let forced: Option<&str> = None;
+    let mode = match forced {
+        Some(m) => m.to_string(),
+        None => std::env::var(RELEASE_SEG_BEFORE_REC_ENV).unwrap_or_default(),
+    };
+    let auto = !matches!(mode.trim(), "0" | "1" | "budget");
+    // Only auto mode asks the device (one `MTLDevice` query, microseconds).
+    let memory = match mode.trim() {
+        "0" | "1" => None,
+        _ => risc0_zkp::hal::metal::device_memory(),
+    };
+    let reason = if auto && wrap_follows {
+        Some("a Groth16 wrap follows".to_string())
+    } else {
+        seg_release_reason(&mode, memory)
+    };
+    let Some(reason) = reason else {
+        return;
+    };
+    let t = std::time::Instant::now();
+    release_cached_segment_prover();
+    #[cfg(test)]
+    SEG_RELEASES.with(|n| n.set(n.get() + 1));
+    tracing::debug!(
+        "released the segment prover before recursion ({reason}) in {:.1} ms",
+        t.elapsed().as_secs_f64() * 1e3
+    );
 }
 
 fn with_segment_prover<R>(f: impl FnOnce(&dyn SegmentProver) -> Result<R>) -> Result<R> {
@@ -138,6 +263,50 @@ fn join_cuda_rec_warmup() {
     }
 }
 
+/// Metal: build the pipeline states (zkp + rv32im metallibs) on a background thread, once per
+/// process, started by [ProverImpl::new] so it overlaps guest execution. Only rv32im has a Metal
+/// warmup today (`risc0_circuit_rv32im::prove::metal_warmup`); recursion and keccak gain theirs
+/// with their Metal items (the keccak eval_check PSOs are ~94 s cold, PLAN 9.1).
+///
+/// The thread is never joined. `MetalHal::new` takes the GPU lock that a session holds for its
+/// whole run (`exclusive_gpu`), so a session joining it could deadlock; nothing needs to: the
+/// zkp PSOs are built once under that lock and the rv32im PSOs in a `OnceLock` whose
+/// initialization takes no lock, so a session that starts first just builds them itself (and the
+/// warmup then finds them built) and one that starts later waits for the warmup's build.
+#[cfg(feature = "metal")]
+fn start_metal_warmup() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        if !risc0_zkp::hal::metal::enabled("rv32im") {
+            return;
+        }
+        if let Err(e) = std::thread::Builder::new()
+            .name("metal-warmup".into())
+            .spawn(risc0_circuit_rv32im::prove::metal_warmup)
+        {
+            tracing::warn!("metal warmup thread not started: {e}");
+        }
+    });
+}
+
+/// The multi-GPU recursion worker (ROCm): the succinct receipt and, for Groth16, its
+/// identity_p254 receipt.
+type RecursionWorker = std::thread::JoinHandle<
+    Result<(
+        SuccinctReceipt<ReceiptClaim>,
+        Option<SuccinctReceipt<ReceiptClaim>>,
+    )>,
+>;
+
+/// What the segment loop hands [ProverImpl::prove_session_tail] besides the segment receipts.
+#[derive(Default)]
+struct SessionTail {
+    recursion_tx: Option<mpsc::Sender<SegmentReceipt>>,
+    recursion_worker: Option<RecursionWorker>,
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    rec_pipe: Option<rec_pipe::RecPipe>,
+}
+
 /// An implementation of a Prover that runs locally.
 pub struct ProverImpl {
     opts: ProverOpts,
@@ -163,9 +332,12 @@ impl ProverImpl {
         // the warmup threads make the first HIP call.
         #[cfg(feature = "rocm")]
         risc0_zkp::hal::hip::auto_configure_hw_queues();
+        #[cfg(feature = "metal")]
+        start_metal_warmup();
         // Parse the Groth16 witness graph (and build its parallel schedule) while the guest
-        // executes instead of beside the STARK.
-        #[cfg(feature = "cuda")]
+        // executes instead of beside the STARK. (Metal: only when the Metal Groth16 prover is
+        // enabled; `preload_graph_background` checks.)
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         if opts.receipt_kind == ReceiptKind::Groth16 {
             risc0_groth16::prove::preload_graph_background();
         }
@@ -610,8 +782,14 @@ impl ProverImpl {
             risc0_groth16::prove::prestart_key();
         }
         // Preload circom graph on background thread so the ~728ms file read + parse
-        // overlaps with segment proving and recursion.  Only needed for Groth16.
-        #[cfg(any(feature = "cuda", feature = "rocm", feature = "intel"))]
+        // overlaps with segment proving and recursion.  Only needed for Groth16. (Metal: the
+        // thread does no GPU work, so the session's GPU lock does not block it; it is not joined.)
+        #[cfg(any(
+            feature = "cuda",
+            feature = "rocm",
+            feature = "intel",
+            feature = "metal"
+        ))]
         let _graph_preload = if self.opts.receipt_kind == ReceiptKind::Groth16 {
             Some(std::thread::spawn(|| {
                 if let Err(e) = risc0_groth16::prove::preload_graph() {
@@ -715,7 +893,7 @@ impl ProverImpl {
         #[cfg(not(feature = "rocm"))]
         let multi_gpu_active = false;
 
-        let (mut recursion_tx, recursion_worker) = if multi_gpu_active {
+        let (recursion_tx, recursion_worker) = if multi_gpu_active {
             let (tx, rx) = mpsc::channel::<SegmentReceipt>();
             let max_po2 = self.opts.max_segment_po2;
             let want_groth16 = self.opts.receipt_kind == ReceiptKind::Groth16;
@@ -1142,6 +1320,40 @@ impl ProverImpl {
             }
         } // !early_seal
 
+        self.prove_session_tail(
+            ctx,
+            session,
+            segments,
+            skip_verify,
+            SessionTail {
+                recursion_tx,
+                recursion_worker,
+                #[cfg(any(feature = "cuda", feature = "rocm"))]
+                rec_pipe,
+            },
+        )
+    }
+
+    /// Everything after the segment proofs: the journal and assumptions merged into the last
+    /// segment's claim, the keccak proofs, the composite receipt and, per the receipt kind, the
+    /// recursion and the Groth16 wrap. Shared by the segment loop above and the executor stream
+    /// (item Z17, `exec_stream`), which proves the segments while the guest executes. Called with
+    /// the session's GPU lock held.
+    fn prove_session_tail(
+        &self,
+        ctx: &VerifierContext,
+        session: &Session,
+        mut segments: Vec<SegmentReceipt>,
+        skip_verify: bool,
+        tail: SessionTail,
+    ) -> Result<ProveInfo> {
+        #[allow(unused_mut)]
+        let SessionTail {
+            mut recursion_tx,
+            recursion_worker,
+            #[cfg(any(feature = "cuda", feature = "rocm"))]
+            mut rec_pipe,
+        } = tail;
         let (assumptions, session_assumption_receipts): (Vec<_>, Vec<_>) =
             session.assumptions.iter().cloned().unzip();
 
@@ -1186,62 +1398,91 @@ impl ProverImpl {
         // for the Groth16 wrap. Without this, the first keccak proof after the segments ran out of
         // memory on an RTX 5080 (16 GB) and on an RTX 4090 limited to 12 GB.
         if !session.pending_keccaks.is_empty() {
+            super::keccak::device_memory_at("keccak start");
             super::release_hal_buffers();
+            super::keccak::device_memory_at("keccak start, after release_hal_buffers");
         }
 
         let t_keccaks = std::time::Instant::now();
-        std::thread::scope(|scope| -> Result<()> {
-            // On Intel and AMD GPUs a keccak proof's witness is made on the CPU, about half of
-            // the proof's time: make each on a thread, a proof ahead of the GPU, so the two
-            // overlap. (On CUDA the GPU makes it.) Returning early drops `witnesses`, which ends
-            // the thread.
-            let witnesses = (cfg!(any(feature = "intel", feature = "rocm"))
-                && session.pending_keccaks.len() > 1)
-                .then(|| {
-                    let (tx, rx) = mpsc::sync_channel(1);
-                    let requests = &session.pending_keccaks;
-                    scope.spawn(move || {
-                        for request in requests {
-                            let witness = risc0_circuit_keccak::prove::host_witness(
-                                &request.input,
-                                request.po2,
-                            );
-                            if tx.send(witness).is_err() {
-                                break;
-                            }
-                        }
-                    });
-                    rx
-                });
-            for (i, proof_request) in session.pending_keccaks.iter().enumerate() {
-                let t_keccak = std::time::Instant::now();
-                let witness = match &witnesses {
-                    Some(rx) => Some(
-                        rx.recv()
-                            .map_err(|_| anyhow!("the keccak witness thread ended early"))?
-                            .context("keccak witness")?,
-                    ),
-                    None => None,
-                };
-                let wait_ms = t_keccak.elapsed().as_secs_f64() * 1000.0;
-                let receipt = prove_keccak_with(proof_request, witness).context("prove keccak")?;
-                let prove_ms = t_keccak.elapsed().as_secs_f64() * 1000.0;
+        // K10: on Metal, one keccak prover proves all the requests and is dropped before the
+        // lifts (`prove_and_lift_keccaks`). The per-request loop below stays for the other
+        // backends (unmeasured there; on Intel and AMD it overlaps host witnesses), and
+        // `RISC0_KECCAK_REUSE_HAL=0` restores it on Metal.
+        let two_phase = cfg!(feature = "metal") && reuse_keccak_prover();
+        if two_phase {
+            prove_and_lift_keccaks(&session.pending_keccaks, |i, receipt| {
                 receipt.verify_integrity_with_context(&keccak_ctx)?;
                 tracing::debug!("adding keccak assumption: {}", receipt.claim.digest());
                 let t_insert = std::time::Instant::now();
                 keccak_receipts.insert(receipt)?;
                 if *VERBOSE {
                     eprintln!(
-                        "[keccak] {i}: po2={} witness wait={wait_ms:.1}ms \
-                         prove+lift={prove_ms:.1}ms insert={:.1}ms total={:.1}ms",
-                        proof_request.po2,
+                        "[keccak] {i}: po2={} insert={:.1}ms",
+                        session.pending_keccaks[i].po2,
                         t_insert.elapsed().as_secs_f64() * 1000.0,
-                        t_keccak.elapsed().as_secs_f64() * 1000.0,
                     );
                 }
-            }
-            Ok(())
-        })?;
+                Ok(())
+            })
+            .context("prove keccak")?;
+        } else {
+            std::thread::scope(|scope| -> Result<()> {
+                // On Intel and AMD GPUs a keccak proof's witness is made on the CPU, about half of
+                // the proof's time: make each on a thread, a proof ahead of the GPU, so the two
+                // overlap. (On CUDA the GPU makes it.) Metal is excluded: its prover makes the witness
+                // itself (`HOST_WITNESS = false`, `prove_host_witness` returns None), so a host
+                // witness would be dropped after a wasted CPU witgen while holding ~1.15 GB per
+                // witness at po2 18. The thread uses no HAL. Returning early drops `witnesses`, which
+                // ends the thread.
+                let witnesses = (cfg!(any(feature = "intel", feature = "rocm"))
+                    && session.pending_keccaks.len() > 1)
+                    .then(|| {
+                        let (tx, rx) = mpsc::sync_channel(1);
+                        let requests = &session.pending_keccaks;
+                        scope.spawn(move || {
+                            for request in requests {
+                                let witness = risc0_circuit_keccak::prove::host_witness(
+                                    &request.input,
+                                    request.po2,
+                                );
+                                if tx.send(witness).is_err() {
+                                    break;
+                                }
+                            }
+                        });
+                        rx
+                    });
+                for (i, proof_request) in session.pending_keccaks.iter().enumerate() {
+                    let t_keccak = std::time::Instant::now();
+                    let witness = match &witnesses {
+                        Some(rx) => Some(
+                            rx.recv()
+                                .map_err(|_| anyhow!("the keccak witness thread ended early"))?
+                                .context("keccak witness")?,
+                        ),
+                        None => None,
+                    };
+                    let wait_ms = t_keccak.elapsed().as_secs_f64() * 1000.0;
+                    let receipt =
+                        prove_keccak_with(proof_request, witness).context("prove keccak")?;
+                    let prove_ms = t_keccak.elapsed().as_secs_f64() * 1000.0;
+                    receipt.verify_integrity_with_context(&keccak_ctx)?;
+                    tracing::debug!("adding keccak assumption: {}", receipt.claim.digest());
+                    let t_insert = std::time::Instant::now();
+                    keccak_receipts.insert(receipt)?;
+                    if *VERBOSE {
+                        eprintln!(
+                            "[keccak] {i}: po2={} witness wait={wait_ms:.1}ms \
+                         prove+lift={prove_ms:.1}ms insert={:.1}ms total={:.1}ms",
+                            proof_request.po2,
+                            t_insert.elapsed().as_secs_f64() * 1000.0,
+                            t_keccak.elapsed().as_secs_f64() * 1000.0,
+                        );
+                    }
+                }
+                Ok(())
+            })?;
+        }
 
         // NOTE: Calling keccak_receipts.root() proves the union tree.
         let t_root = std::time::Instant::now();
@@ -1335,6 +1576,12 @@ impl ProverImpl {
         } else {
             match session.povw_job_id.is_some() {
                 true => {
+                    // The PoVW path folds through the generic `Compress`, not
+                    // `composite_to_succinct` below, so it releases here.
+                    #[cfg(feature = "metal")]
+                    release_segment_prover_before_recursion(
+                        self.opts.receipt_kind == ReceiptKind::Groth16,
+                    );
                     let work_receipt = self.composite_to_succinct_povw(&composite_receipt)?;
                     let unwrapped = self.unwrap_povw(&work_receipt)?;
                     (unwrapped, Some(work_receipt), None)
@@ -1488,7 +1735,13 @@ impl ProverServer for ProverImpl {
         // the executor default: on the 32 GB Arc Pro B70, po2=21 ran out of device memory in long
         // sessions and after a Groth16 wrap in the same process (an Ethereum block, a STARK
         // proof after the Groth16 prover cached its key), where po2=20 did not.
-        #[cfg(any(feature = "intel", feature = "cuda"))]
+        //
+        // Metal honours the RISC0_SUCCINCT_SEGMENT_PO2 override but never bumps on its own: the
+        // minimum target is a 16 GB Mac with a ~4-8 GB GPU budget that must keep segments at
+        // po2 <= 18-19 (PLAN 9.1), and even the high end gains little while the recursion
+        // prover is still the CPU one. The segment size there is the caller's (zk-miner sizes
+        // it from `recommendedMaxWorkingSetSize`); see docs/metal-port/notes/M3.md.
+        #[cfg(any(feature = "intel", feature = "cuda", feature = "metal"))]
         if self.opts.receipt_kind != ReceiptKind::Composite && env.segment_limit_po2.is_none() {
             let po2 = std::env::var("RISC0_SUCCINCT_SEGMENT_PO2")
                 .or_else(|_| std::env::var("RISC0_INTEL_SUCCINCT_SEGMENT_PO2"))
@@ -1502,6 +1755,24 @@ impl ProverServer for ProverImpl {
             if let Some(po2) = po2 {
                 env.segment_limit_po2 = Some(po2.min(self.opts.max_segment_po2 as u32));
             }
+        }
+        // Item W7-V2: a keccak max po2 whose proofs cannot fit the Metal working-set limit is
+        // capped (po2 18 below ~7 GiB; RISC0_KECCAK_PO2_HEADROOM_CAP=0 reverts). Not with a
+        // coprocessor callback: its proofs may run elsewhere, and it gets the caller's po2s.
+        #[cfg(feature = "metal")]
+        if env.coprocessor.is_none() {
+            if let Some(po2) = super::keccak::headroom_capped_max_po2(env.keccak_max_po2) {
+                env.keccak_max_po2 = Some(po2);
+            }
+        }
+        // Item Z17: prove the segments while the guest executes (RISC0_METAL_EXEC_STREAM=0 reverts).
+        #[cfg(all(
+            feature = "metal",
+            not(any(feature = "cuda", feature = "rocm", feature = "intel"))
+        ))]
+        match exec_stream::eligible(&self.opts, &env) {
+            Ok(()) => return self.prove_streamed(ctx, env, elf),
+            Err(reason) => tracing::debug!("exec stream off: {reason}"),
         }
         let session = ExecutorImpl::from_elf(env, elf)?.run()?;
         self.prove_session(ctx, &session)
@@ -1774,6 +2045,11 @@ impl ProverServer for ProverImpl {
         use crate::host::recursion::prove::{
             join_with_opts, lift_with_opts, make_succinct_receipt, Prover as RecursionProverJob,
         };
+
+        // C16: this prover's options say whether a Groth16 wrap follows (`prove_session`, and
+        // `compress` with the options the prover was made with).
+        #[cfg(feature = "metal")]
+        release_segment_prover_before_recursion(self.opts.receipt_kind == ReceiptKind::Groth16);
 
         let t_pipeline = std::time::Instant::now();
         let segments = &composite_receipt.segments;

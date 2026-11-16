@@ -15,7 +15,7 @@
 use crate::host::client::env::ProveKeccakRequest;
 use anyhow::{bail, Result};
 use risc0_binfmt::ByteAddr;
-use risc0_circuit_keccak::{max_keccak_inputs, KeccakState, KECCAK_DEFAULT_PO2};
+use risc0_circuit_keccak::{max_keccak_inputs, KeccakState, KECCAK_DEFAULT_PO2, KECCAK_PO2_RANGE};
 use risc0_circuit_rv32im::execute::MAX_IO_BYTES;
 use risc0_zkvm_platform::syscall::{
     keccak_mode::{KECCAK_PERMUTE, KECCAK_PROVE},
@@ -23,6 +23,30 @@ use risc0_zkvm_platform::syscall::{
 };
 
 use super::{Syscall, SyscallContext, SyscallKind};
+
+/// `RISC0_KECCAK_RIGHTSIZE_PO2=0` proves every keccak request at the session's keccak max po2
+/// (the pre-K10 behaviour); unset (or anything else), at the smallest po2 that holds its inputs
+/// ([request_po2]).
+pub(crate) const KECCAK_RIGHTSIZE_ENV: &str = "RISC0_KECCAK_RIGHTSIZE_PO2";
+
+/// The po2 a keccak request of `inputs` permutations is proved at (K10, LEADS #51): the smallest
+/// po2 of [KECCAK_PO2_RANGE] whose circuit holds them (`max_keccak_inputs`, the same capacity the
+/// batch-full signal to the guest uses), never above `max_po2`. The claim digest does not depend
+/// on the po2, and the lift's control ID is one of `KECCAK_CONTROL_IDS`, all under
+/// `KECCAK_CONTROL_ROOT`, so a smaller proof verifies exactly as a full-size one; it is up to
+/// 2^(max_po2 - 14) times smaller (po2 17: ~0.8 s of prove + lift for a full one, ~0.13 s at 14).
+pub(crate) fn request_po2(inputs: usize, max_po2: usize, rightsize: bool) -> usize {
+    if !rightsize {
+        return max_po2;
+    }
+    (*KECCAK_PO2_RANGE.start()..max_po2)
+        .find(|&po2| max_keccak_inputs(po2) >= inputs)
+        .unwrap_or(max_po2)
+}
+
+fn rightsize_enabled() -> bool {
+    !std::env::var(KECCAK_RIGHTSIZE_ENV).is_ok_and(|v| v.trim() == "0")
+}
 
 #[derive(Clone, Default)]
 pub(crate) struct SysKeccak {
@@ -105,11 +129,12 @@ impl SysKeccak {
         let claim = ctx.load_digest_from_register(REG_A4)?;
         let control_root = ctx.load_digest_from_register(REG_A5)?;
 
+        let po2 = request_po2(self.inputs.len(), self.max_po2, rightsize_enabled());
         let proof_request = ProveKeccakRequest {
             claim_digest: claim,
             control_root,
-            input: self.inputs.clone(),
-            po2: self.max_po2,
+            input: std::mem::take(&mut self.inputs),
+            po2,
         };
 
         if let Some(coprocessor) = &ctx.syscall_table().coprocessor {
@@ -123,11 +148,40 @@ impl SysKeccak {
 
         let metric = &mut ctx.syscall_table().metrics.borrow_mut()[SyscallKind::ProveKeccak];
         metric.count += 1;
-        metric.size += 1 << self.max_po2 as u64;
-
-        // reset
-        self.inputs.clear();
+        metric.size += 1 << po2 as u64;
 
         Ok((0, 0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use risc0_circuit_keccak::{max_keccak_inputs, KECCAK_PO2_RANGE};
+
+    use super::request_po2;
+
+    #[test]
+    fn request_po2_is_smallest_that_fits() {
+        // Off: always the max.
+        assert_eq!(request_po2(0, 17, false), 17);
+        assert_eq!(request_po2(1, 15, false), 15);
+        // Empty and tiny batches: the smallest po2 of the range.
+        assert_eq!(request_po2(0, 17, true), 14);
+        assert_eq!(request_po2(1, 18, true), 14);
+        for max_po2 in KECCAK_PO2_RANGE {
+            for po2 in *KECCAK_PO2_RANGE.start()..=max_po2 {
+                let full = max_keccak_inputs(po2);
+                // A full batch of po2 stays at po2 ...
+                assert_eq!(request_po2(full, max_po2, true), po2, "{max_po2} {po2}");
+                // ... one more permutation needs the next po2 (or the max, its batch limit).
+                let next = request_po2(full + 1, max_po2, true);
+                assert_eq!(next, (po2 + 1).min(max_po2), "{max_po2} {po2}");
+                // Never above the max, and always holds the inputs at or below the max's capacity.
+                for n in [full / 2, full] {
+                    let got = request_po2(n, max_po2, true);
+                    assert!(got <= max_po2 && max_keccak_inputs(got) >= n);
+                }
+            }
+        }
     }
 }

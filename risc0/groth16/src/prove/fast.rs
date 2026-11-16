@@ -22,6 +22,7 @@
 //!  * starts the image's gnark `prover` early (it spends ~1 s loading the
 //!    constraint system and proving key) and feeds it the witness through a
 //!    named pipe in the mounted work directory.
+//!
 //! The prover, proving key and circuit are the pinned image's, so proofs are
 //! unchanged. If the rzup component is missing, the caller falls back to the
 //! plain Docker path.
@@ -104,20 +105,69 @@ pub(crate) fn graph_path() -> Result<PathBuf> {
     Ok(super::component::component_dir()?.join("stark_verify_graph.bin"))
 }
 
-fn build_program() -> Result<Program> {
-    let t0 = std::time::Instant::now();
-    let bytes = std::fs::read(graph_path()?).context("failed to read the witness graph")?;
-    let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&bytes));
+/// Whether the graph build uses the item G13 shortcuts (default on; `RISC0_G16_GRAPH_MEMO=0`
+/// reverts to the pre-G13 build): one inverse per distinct constant instead of one per Div node
+/// (the rzup graph has 3.55M Div-by-constant nodes over 2,134 constants: ~4.1 s of inversions),
+/// the SHA-256 check overlapped with the parse, and the per-node translation in parallel. The
+/// program is identical either way.
+pub(crate) fn memo_enabled() -> bool {
+    std::env::var("RISC0_G16_GRAPH_MEMO").as_deref() != Ok("0")
+}
+
+/// SHA-256 of `bytes`, checked against [GRAPH_SHA256].
+pub(crate) fn check_graph_digest(bytes: &[u8]) -> Result<()> {
+    let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(bytes));
     if !digest.starts_with(GRAPH_SHA256) {
         bail!("unexpected witness graph (sha256 {digest}); expected rzup risc0-groth16 0.2.0");
     }
-    let (nodes_box, signals, input_mapping) = deserialize_witnesscalc_graph_from_bytes(&bytes)
-        .map_err(|e| anyhow!("failed to parse the witness graph: {e:?}"))?;
-    let nodes = nodes_box
-        .as_any()
-        .downcast_ref::<Nodes<U254, VecNodes>>()
-        .ok_or_else(|| anyhow!("unexpected witness graph node type"))?;
-    // The seal is the only input signal ("iop"), K_SEAL_ELEMS long.
+    Ok(())
+}
+
+/// Read the witness graph, check its digest (in parallel with the parse when `overlap`) and
+/// parse it. Returns the parsed graph and the read / parse times.
+#[allow(clippy::type_complexity)]
+pub(crate) fn read_graph(
+    overlap: bool,
+) -> Result<(
+    Box<dyn circom_witnesscalc::graph::NodesInterface>,
+    Vec<usize>,
+    circom_witnesscalc::InputSignalsInfo,
+    [std::time::Duration; 2],
+)> {
+    let t0 = std::time::Instant::now();
+    let bytes = std::fs::read(graph_path()?).context("failed to read the witness graph")?;
+    let t_read = t0.elapsed();
+    let parse = |bytes: &[u8]| {
+        deserialize_witnesscalc_graph_from_bytes(bytes)
+            .map_err(|e| anyhow!("failed to parse the witness graph: {e:?}"))
+    };
+    let parsed = if overlap {
+        std::thread::scope(|sc| {
+            let digest = sc.spawn(|| check_graph_digest(&bytes));
+            let parsed = parse(&bytes);
+            digest
+                .join()
+                .unwrap_or_else(|_| Err(anyhow!("witness graph digest thread panicked")))?;
+            parsed
+        })?
+    } else {
+        check_graph_digest(&bytes)?;
+        parse(&bytes)?
+    };
+    let (nodes, signals, input_mapping) = parsed;
+    Ok((
+        nodes,
+        signals,
+        input_mapping,
+        [t_read, t0.elapsed() - t_read],
+    ))
+}
+
+/// The seal's input signal: (offset, length), checked (the seal is the only input, "iop",
+/// K_SEAL_ELEMS long).
+pub(crate) fn seal_input(
+    input_mapping: &circom_witnesscalc::InputSignalsInfo,
+) -> Result<(usize, usize)> {
     if input_mapping.len() != 1 {
         bail!(
             "witness graph has {} input signals, expected 1",
@@ -128,30 +178,75 @@ fn build_program() -> Result<Program> {
     if input_len != K_SEAL_ELEMS {
         bail!("witness graph input has {input_len} elements, expected {K_SEAL_ELEMS}");
     }
+    Ok((input_offset, input_len))
+}
+
+fn build_program() -> Result<Program> {
+    let t0 = std::time::Instant::now();
+    let memo = memo_enabled();
+    let (nodes_box, signals, input_mapping, [t_read, t_parse]) = read_graph(memo)?;
+    let nodes = nodes_box
+        .as_any()
+        .downcast_ref::<Nodes<U254, VecNodes>>()
+        .ok_or_else(|| anyhow!("unexpected witness graph node type"))?;
+    let (input_offset, input_len) = seal_input(&input_mapping)?;
+    let t1 = std::time::Instant::now();
     let n = nodes.nodes.len();
-    let all: Vec<Node> = (0..n).map(|i| nodes.nodes.get(i).unwrap()).collect();
     let consts: Vec<Fr> = nodes.constants.iter().map(to_fr).collect();
     // Division by a constant becomes multiplication by its inverse.
-    let prog = all
-        .iter()
-        .map(|nd| match *nd {
-            Node::Input(_) | Node::Constant(_) | Node::Unknown => Op::Leaf,
-            Node::Op(Operation::Mul, a, b) => Op::Mul(a, b),
-            Node::Op(Operation::Add, a, b) => Op::Add(a, b),
-            Node::Op(Operation::Sub, a, b) => Op::Sub(a, b),
-            Node::Op(Operation::Div, a, b) => match all[b] {
-                Node::Constant(c) => Op::MulC(a, consts[c].inverse().unwrap_or(Fr::zero())),
-                _ => Op::Gen,
-            },
+    let translate = |nd: &Node, inv: &dyn Fn(usize) -> Fr, all: &dyn Fn(usize) -> Node| match *nd {
+        Node::Input(_) | Node::Constant(_) | Node::Unknown => Op::Leaf,
+        Node::Op(Operation::Mul, a, b) => Op::Mul(a, b),
+        Node::Op(Operation::Add, a, b) => Op::Add(a, b),
+        Node::Op(Operation::Sub, a, b) => Op::Sub(a, b),
+        Node::Op(Operation::Div, a, b) => match all(b) {
+            Node::Constant(c) => Op::MulC(a, inv(c)),
             _ => Op::Gen,
-        })
-        .collect();
+        },
+        _ => Op::Gen,
+    };
+    let (all, prog): (Vec<Node>, Vec<Op>) = if memo {
+        // One inverse per distinct constant (2,134 for the rzup graph).
+        let inverses: Vec<Fr> = consts
+            .par_iter()
+            .map(|c| c.inverse().unwrap_or(Fr::zero()))
+            .collect();
+        let all: Vec<Node> = (0..n)
+            .into_par_iter()
+            .map(|i| nodes.nodes.get(i).unwrap())
+            .collect();
+        let prog = all
+            .par_iter()
+            .map(|nd| translate(nd, &|c| inverses[c], &|b| all[b]))
+            .collect();
+        (all, prog)
+    } else {
+        let all: Vec<Node> = (0..n).map(|i| nodes.nodes.get(i).unwrap()).collect();
+        let prog = all
+            .iter()
+            .map(|nd| {
+                translate(nd, &|c| consts[c].inverse().unwrap_or(Fr::zero()), &|b| {
+                    all[b]
+                })
+            })
+            .collect();
+        (all, prog)
+    };
     let prime = nodes.ff.prime;
     let ff = nodes.ff.clone();
-    tracing::debug!(
-        "groth16 witness graph prepared in {:.1} ms ({n} nodes)",
-        t0.elapsed().as_secs_f64() * 1000.0
+    let msg = format!(
+        "groth16 witness graph prepared in {:.1} ms (read {:.1}, digest + parse {:.1}, program \
+         {:.1}; {n} nodes, {} constants, memo {memo})",
+        t0.elapsed().as_secs_f64() * 1000.0,
+        t_read.as_secs_f64() * 1000.0,
+        t_parse.as_secs_f64() * 1000.0,
+        t1.elapsed().as_secs_f64() * 1000.0,
+        consts.len(),
     );
+    tracing::debug!("{msg}");
+    if std::env::var_os("RISC0_VERBOSE").is_some() {
+        eprintln!("[groth16] {msg}");
+    }
     Ok(Program {
         nodes: all,
         prog,
@@ -179,7 +274,7 @@ pub(crate) fn preload() -> Result<()> {
 
 /// Seal words -> circuit input values (same as seal_to_json + the C++
 /// generator's JSON parsing).
-fn seal_inputs(seal_bytes: &[u8]) -> Result<Vec<U254>> {
+pub(crate) fn seal_inputs(seal_bytes: &[u8]) -> Result<Vec<U254>> {
     if seal_bytes.len() != K_SEAL_WORDS * 4 {
         bail!(
             "identity_p254 seal has {} bytes, expected {}",

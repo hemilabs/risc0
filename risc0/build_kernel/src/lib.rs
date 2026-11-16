@@ -20,12 +20,27 @@ use std::{
 
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
-use tempfile::tempdir_in;
 
-const METAL_INCS: &[(&str, &str)] = &[
+/// Shared MSL headers, written to `<OUT_DIR>/_sys_` and put first on the include path of every
+/// Metal compile.
+pub const METAL_INCS: &[(&str, &str)] = &[
     ("fp.h", include_str!("../kernels/metal/fp.h")),
     ("fpext.h", include_str!("../kernels/metal/fpext.h")),
+    (
+        "cuda2metal.h",
+        include_str!("../kernels/metal/cuda2metal.h"),
+    ),
+    (
+        "sppark_compat.h",
+        include_str!("../kernels/metal/sppark_compat.h"),
+    ),
 ];
+
+/// The MSL language version used when no `-std=` flag is given.
+pub const METAL_DEFAULT_STD: &str = "-std=metal3.2";
+
+/// The optimization level used when no `-O` flag is given.
+pub const METAL_DEFAULT_OPT: &str = "-O2";
 
 #[derive(Eq, PartialEq, Hash)]
 #[non_exhaustive]
@@ -301,82 +316,114 @@ impl KernelBuild {
         build.compile(output);
     }
 
-    fn compile_metal(&mut self, output: &str) {
-        let target = env::var("TARGET").unwrap();
-        let sdk_name = if target.ends_with("ios") {
-            "iphoneos"
-        } else if target.ends_with("ios-sim") {
-            "iphonesimulator"
-        } else if target.ends_with("darwin") {
-            "macosx"
-        } else {
-            panic!("unsupported target: {target}")
-        };
-
-        self.cached_compile(
-            output,
-            "metallib",
-            METAL_INCS,
-            &[],
-            &[sdk_name.to_string()],
-            |out_dir, out_path, sys_inc_dir, _flags| {
-                let files: Vec<_> = self.files.iter().map(|x| x.as_path()).collect();
-
-                let air_paths: Vec<_> = files
-                    .into_par_iter()
-                    .map(|src| {
-                        let air_path = out_dir.join(src).with_extension("").with_extension("air");
-                        if let Some(parent) = air_path.parent() {
-                            fs::create_dir_all(parent).unwrap();
-                        }
-                        let mut cmd = Command::new("xcrun");
-                        cmd.args(["--sdk", sdk_name]);
-                        cmd.arg("metal");
-                        cmd.arg("-o").arg(&air_path);
-                        cmd.arg("-c").arg(src);
-                        cmd.arg("-I").arg(sys_inc_dir);
-                        cmd.arg("-Wno-unused-variable");
-                        for inc_dir in self.inc_dirs.iter() {
-                            cmd.arg("-I").arg(inc_dir);
-                        }
-                        println!("Running: {cmd:?}");
-                        let status = cmd.status().unwrap();
-                        if !status.success() {
-                            panic!("Could not build metal kernels");
-                        }
-                        air_path
-                    })
-                    .collect();
-
-                let result = Command::new("xcrun")
-                    .args(["--sdk", sdk_name])
-                    .arg("metallib")
-                    .args(air_paths)
-                    .arg("-o")
-                    .arg(out_path)
-                    .status()
-                    .unwrap();
-                if !result.success() {
-                    panic!("Could not build metal kernels");
-                }
-            },
-        );
+    /// The flags every `metal` invocation of [`KernelBuild::compile`] gets: those added with
+    /// [`KernelBuild::flag`], preceded by `-std=metal3.2` unless one of them is a `-std=` flag,
+    /// and by `-O2` unless one of them is an `-O` flag; with `RISC0_METAL_DEBUG_SOURCES=1`,
+    /// followed by `-frecord-sources -gline-tables-only` (sources and line tables for GPU
+    /// debugging and profiling).
+    pub fn metal_flags(&self) -> Vec<String> {
+        let mut flags = Vec::new();
+        if !self.flags.iter().any(|f| f.starts_with("-std=")) {
+            flags.push(METAL_DEFAULT_STD.to_string());
+        }
+        if !self.flags.iter().any(|f| f.starts_with("-O")) {
+            flags.push(METAL_DEFAULT_OPT.to_string());
+        }
+        flags.extend(self.flags.iter().cloned());
+        if env::var("RISC0_METAL_DEBUG_SOURCES").is_ok_and(|v| v == "1") {
+            flags.push("-frecord-sources".to_string());
+            flags.push("-gline-tables-only".to_string());
+        }
+        flags
     }
 
-    fn cached_compile<F: Fn(&Path, &Path, &Path, &[String])>(
-        &self,
-        output: &str,
-        extension: &str,
-        assets: &[(&str, &str)],
-        flags: &[String],
-        tags: &[String],
-        inner: F,
-    ) {
+    /// Every file a Metal compile of this build may read besides the shared headers: the
+    /// sources, every file under each include directory (recursively, as
+    /// [`kernel_source_files`] lists them) and every dependency (a file, or every file under a
+    /// directory).
+    pub fn metal_input_files(&self) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        files.extend(self.files.iter().cloned());
+        for dir in self.inc_dirs.iter() {
+            files.extend(kernel_source_files(dir));
+        }
+        for dep in self.deps.iter() {
+            if dep.is_dir() {
+                files.extend(kernel_source_files(dep));
+            } else {
+                files.push(dep.clone());
+            }
+        }
+        files
+    }
+
+    /// The cache key of a Metal compile of this build for SDK `sdk` with the compiler
+    /// identified by `toolchain` (its `--version` output): SHA-256 (hex) over the effective
+    /// flags ([`KernelBuild::metal_flags`]), the SDK, the toolchain, the shared headers
+    /// ([`METAL_INCS`]) and, by path and contents, the sources, every file under each include
+    /// directory and every dependency (directories recursively). `OUT_DIR` in a path or flag is
+    /// replaced by a placeholder, so generated sources key the same in every build directory.
+    pub fn metal_cache_key(&self, sdk: &str, toolchain: &str) -> String {
+        let out_dir = env::var("OUT_DIR").unwrap_or_default();
+        let normalize = |s: &str| {
+            let s = s.replace('\\', "/");
+            if out_dir.is_empty() {
+                s
+            } else {
+                s.replace(&out_dir.replace('\\', "/"), "<OUT_DIR>")
+            }
+        };
+        let mut hasher = Sha256::new();
+        let mut add = |label: &str, contents: Option<&[u8]>| {
+            hasher.update((label.len() as u64).to_le_bytes());
+            hasher.update(label.as_bytes());
+            match contents {
+                Some(c) => {
+                    hasher.update((c.len() as u64).to_le_bytes());
+                    hasher.update(c);
+                }
+                None => hasher.update(u64::MAX.to_le_bytes()),
+            }
+        };
+        add("kind", Some(b"metal"));
+        add("sdk", Some(sdk.as_bytes()));
+        add("toolchain", Some(toolchain.as_bytes()));
+        for flag in self.metal_flags() {
+            add("flag", Some(normalize(&flag).as_bytes()));
+        }
+        for (name, contents) in METAL_INCS {
+            add(&format!("sys/{name}"), Some(contents.as_bytes()));
+        }
+        // A file that can't be read hashes as missing; the compile itself reports it.
+        let mut add_file = |label: String, path: &Path| {
+            add(&label, fs::read(path).ok().as_deref());
+        };
+        for src in self.files.iter() {
+            add_file(format!("src/{}", normalize(&src.to_string_lossy())), src);
+        }
+        for (i, dir) in self.inc_dirs.iter().enumerate() {
+            for file in kernel_source_files(dir) {
+                let rel = file.strip_prefix(dir).unwrap_or(&file).to_string_lossy();
+                add_file(format!("inc{i}/{}", normalize(&rel)), &file);
+            }
+        }
+        for (i, dep) in self.deps.iter().enumerate() {
+            if dep.is_dir() {
+                for file in kernel_source_files(dep) {
+                    let rel = file.strip_prefix(dep).unwrap_or(&file).to_string_lossy();
+                    add_file(format!("dep{i}/{}", normalize(&rel)), &file);
+                }
+            } else {
+                add_file(format!("dep{i}"), dep);
+            }
+        }
+        hex::encode(hasher.finalize())
+    }
+
+    fn compile_metal(&mut self, output: &str) {
         let out_dir = env::var("OUT_DIR").map(PathBuf::from).unwrap();
         if env::var("RISC0_SKIP_BUILD_KERNELS").is_ok() {
-            let out_path = out_dir
-                .join("skip-".to_string() + output)
-                .with_extension(extension);
+            let out_path = out_dir.join(format!("skip-{output}.metallib"));
             fs::OpenOptions::new()
                 .create(true)
                 .truncate(true)
@@ -387,48 +434,251 @@ impl KernelBuild {
             return;
         }
 
-        let out_path = out_dir.join(output).with_extension(extension);
+        println!("cargo:rerun-if-env-changed=RISC0_METAL_DEBUG_SOURCES");
+        // Track each file, also those under include and dependency directories.
+        for file in self.metal_input_files() {
+            rerun_if_changed(file);
+        }
+
+        let sdk_name = metal_sdk_name();
+        let toolchain = find_metal_toolchain();
+
         let sys_inc_dir = out_dir.join("_sys_");
-
-        let cache_dir = risc0_cache();
-        if !cache_dir.is_dir() {
-            fs::create_dir_all(&cache_dir).unwrap();
-        }
-
-        let temp_dir = tempdir_in(&cache_dir).unwrap();
-        let mut hasher = Hasher::new();
-        for flag in flags {
-            hasher.add_flag(flag);
-        }
-        for tag in tags {
-            hasher.add_flag(tag);
-        }
-        for src in self.files.iter() {
-            hasher.add_file(src);
-        }
-        for (name, contents) in assets {
+        fs::create_dir_all(&sys_inc_dir).unwrap();
+        for (name, contents) in METAL_INCS {
             let path = sys_inc_dir.join(name);
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).unwrap();
+            // Leave an unchanged header alone, so its mtime doesn't trigger rebuilds.
+            if fs::read(&path).ok().as_deref() != Some(contents.as_bytes()) {
+                fs::write(&path, contents).unwrap();
             }
-            fs::write(&path, contents).unwrap();
-            hasher.add_file(path);
         }
-        for dep in self.deps.iter() {
-            hasher.add_file(dep);
-        }
-        let digest = hasher.finalize();
-        let cache_path = cache_dir.join(digest).with_extension(extension);
-        if !cache_path.is_file() {
-            let tmp_dir = temp_dir.path();
-            let tmp_path = tmp_dir.join(output).with_extension(extension);
-            inner(tmp_dir, &tmp_path, &sys_inc_dir, flags);
-            fs::rename(tmp_path, &cache_path).unwrap();
-        }
-        fs::copy(cache_path, &out_path).unwrap();
+
+        let flags = self.metal_flags();
+        let key = self.metal_cache_key(&sdk_name, &toolchain.version);
+        let out_path = out_dir.join(output).with_extension("metallib");
+        let air_dir = out_dir.join(output);
+        let cache_dir = risc0_cache();
+        fs::create_dir_all(&cache_dir).unwrap();
+
+        cached_compile(
+            &cache_dir,
+            output,
+            "metallib",
+            &key,
+            &out_path,
+            |tmp_path| {
+                let air_paths: Vec<_> = self
+                    .files
+                    .par_iter()
+                    .map(|src| {
+                        let air_path = air_dir.join(metal_air_rel_path(src, &out_dir));
+                        if let Some(parent) = air_path.parent() {
+                            fs::create_dir_all(parent).unwrap();
+                        }
+                        let mut cmd = toolchain.metal_command();
+                        cmd.arg("-o").arg(&air_path);
+                        cmd.arg("-c").arg(src);
+                        cmd.args(&flags);
+                        cmd.arg("-I").arg(&sys_inc_dir);
+                        cmd.arg("-Wno-unused-variable");
+                        for inc_dir in self.inc_dirs.iter() {
+                            cmd.arg("-I").arg(inc_dir);
+                        }
+                        println!("Running: {cmd:?}");
+                        let status = cmd.status().unwrap();
+                        if !status.success() {
+                            panic!("Could not build metal kernels: {cmd:?} failed with {status}");
+                        }
+                        air_path
+                    })
+                    .collect();
+
+                let mut cmd = toolchain.metallib_command();
+                cmd.args(&air_paths).arg("-o").arg(tmp_path);
+                println!("Running: {cmd:?}");
+                let status = cmd.status().unwrap();
+                if !status.success() {
+                    panic!("Could not build metal kernels: {cmd:?} failed with {status}");
+                }
+            },
+        );
 
         println!("cargo:{}={}", output, out_path.display());
     }
+}
+
+/// Where the `.air` file of Metal source `src` goes, relative to `<OUT_DIR>/<output>/`: `src`
+/// relative to `OUT_DIR` (generated sources), else relative to the crate (`CARGO_MANIFEST_DIR`),
+/// else, for any other absolute path, its components without the root, with the extension
+/// `.air`. So every `.air` lands under `<OUT_DIR>/<output>/` (joining an absolute path would
+/// replace the base and write it beside the source), and distinct sources get distinct paths.
+pub fn metal_air_rel_path(src: &Path, out_dir: &Path) -> PathBuf {
+    let manifest_dir = env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from);
+    let rel = src
+        .strip_prefix(out_dir)
+        .ok()
+        .or_else(|| {
+            manifest_dir
+                .as_deref()
+                .and_then(|dir| src.strip_prefix(dir).ok())
+        })
+        .unwrap_or(src);
+    let rel: PathBuf = rel
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(part) => Some(PathBuf::from(part)),
+            std::path::Component::ParentDir => Some(PathBuf::from("_up_")),
+            _ => None,
+        })
+        .collect();
+    rel.with_extension("air")
+}
+
+/// The Apple SDK for the build's `TARGET` (`macosx` when `TARGET` is unset).
+fn metal_sdk_name() -> String {
+    let target = env::var("TARGET").unwrap_or_default();
+    if target.is_empty() || target.ends_with("darwin") {
+        "macosx"
+    } else if target.ends_with("ios-sim") {
+        "iphonesimulator"
+    } else if target.ends_with("ios") {
+        "iphoneos"
+    } else {
+        panic!("unsupported target for Metal kernels: {target}")
+    }
+    .to_string()
+}
+
+/// The Metal shader compiler and linker [`find_metal_toolchain`] found.
+#[derive(Clone, Debug)]
+pub struct MetalToolchain {
+    /// The SDK the tools run against (`xcrun --sdk`).
+    pub sdk: String,
+    /// Absolute path of `metal`.
+    pub metal: PathBuf,
+    /// Absolute path of `metallib`.
+    pub metallib: PathBuf,
+    /// The compiler build (first line of `metal --version`) and the SDK version (which sets the
+    /// deployment target recorded in each `.air`), part of the cache key.
+    pub version: String,
+}
+
+impl MetalToolchain {
+    fn xcrun(&self, tool: &Path) -> Command {
+        // Through xcrun, so the tool runs with the SDK's settings (SDKROOT, hence the deployment
+        // target recorded in the `.air`), exactly as `xcrun --sdk <sdk> metal` would.
+        let mut cmd = Command::new("xcrun");
+        cmd.args(["--sdk", &self.sdk]).arg(tool);
+        cmd
+    }
+
+    /// A command running `metal` (add the arguments).
+    pub fn metal_command(&self) -> Command {
+        self.xcrun(&self.metal)
+    }
+
+    /// A command running `metallib` (add the arguments).
+    pub fn metallib_command(&self) -> Command {
+        self.xcrun(&self.metallib)
+    }
+}
+
+const METAL_TOOLCHAIN_HINT: &str = "run `source /Users/user/zkminer/env.sh` first (it mounts the \
+     Metal toolchain and puts it on PATH), or set METAL_TC to a Metal.xctoolchain directory";
+
+/// Find the Metal shader compiler: `$METAL_TC/usr/bin/metal` when `METAL_TC` is set, else what
+/// `xcrun --sdk <sdk> --find metal` finds (xcrun falls back to PATH), else `metal` on PATH; and
+/// `metallib` beside it (else via xcrun). Panics with a hint to source the toolchain
+/// environment when there is none.
+pub fn find_metal_toolchain() -> MetalToolchain {
+    println!("cargo:rerun-if-env-changed=METAL_TC");
+    let sdk = metal_sdk_name();
+    let xcrun_find = |tool: &str| -> Option<PathBuf> {
+        let out = Command::new("xcrun")
+            .args(["--sdk", &sdk, "--find", tool])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+        path.is_file().then_some(path)
+    };
+    let on_path = |tool: &str| -> Option<PathBuf> {
+        env::split_paths(&env::var_os("PATH")?)
+            .map(|dir| dir.join(tool))
+            .find(|p| p.is_file())
+    };
+
+    let metal_tc = env::var_os("METAL_TC").filter(|v| !v.is_empty());
+    let metal = match &metal_tc {
+        Some(tc) => {
+            let metal = Path::new(tc).join("usr/bin/metal");
+            if !metal.is_file() {
+                panic!(
+                    "METAL_TC={} has no usr/bin/metal: {METAL_TOOLCHAIN_HINT}",
+                    Path::new(tc).display()
+                );
+            }
+            metal
+        }
+        None => xcrun_find("metal")
+            .or_else(|| on_path("metal"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "Could not find the Metal shader compiler (`xcrun --sdk {sdk} --find metal` \
+                     failed and there is no `metal` on PATH): {METAL_TOOLCHAIN_HINT}"
+                )
+            }),
+    };
+    let metallib = metal
+        .parent()
+        .map(|dir| dir.join("metallib"))
+        .filter(|p| p.is_file())
+        .or_else(|| xcrun_find("metallib"))
+        .or_else(|| on_path("metallib"))
+        .unwrap_or_else(|| {
+            panic!(
+                "Could not find `metallib` next to {}: {METAL_TOOLCHAIN_HINT}",
+                metal.display()
+            )
+        });
+
+    let mut toolchain = MetalToolchain {
+        sdk,
+        metal,
+        metallib,
+        version: String::new(),
+    };
+    let out = toolchain
+        .metal_command()
+        .arg("--version")
+        .output()
+        .unwrap_or_else(|e| panic!("could not run xcrun: {e}: {METAL_TOOLCHAIN_HINT}"));
+    if !out.status.success() {
+        panic!(
+            "`{} --version` failed ({}): {}\n{METAL_TOOLCHAIN_HINT}",
+            toolchain.metal.display(),
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    // The first line names the compiler build (`Apple metal version 32023.922 (...)`); the
+    // others (install directory) vary with where the toolchain is mounted.
+    let compiler = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let sdk_version = Command::new("xcrun")
+        .args(["--sdk", &toolchain.sdk, "--show-sdk-version"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    toolchain.version = format!("{compiler}; sdk {} {sdk_version}", toolchain.sdk);
+    toolchain
 }
 
 fn risc0_cache() -> PathBuf {
@@ -436,29 +686,6 @@ fn risc0_cache() -> PathBuf {
         .unwrap()
         .cache_dir()
         .into()
-}
-
-struct Hasher {
-    sha: Sha256,
-}
-
-impl Hasher {
-    pub fn new() -> Self {
-        Self { sha: Sha256::new() }
-    }
-
-    pub fn add_flag(&mut self, flag: &str) {
-        self.sha.update(flag);
-    }
-
-    pub fn add_file<P: AsRef<Path>>(&mut self, path: P) {
-        let bytes = fs::read(path).unwrap();
-        self.sha.update(bytes);
-    }
-
-    pub fn finalize(self) -> String {
-        hex::encode(self.sha.finalize())
-    }
 }
 
 fn rerun_if_changed<P: AsRef<Path>>(path: P) {

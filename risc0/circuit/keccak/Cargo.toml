@@ -31,6 +31,9 @@ risc0-sys = { workspace = true, optional = true }
 rayon = { version = "1.10", optional = true }
 liblzma = { version = "0.4", optional = true, features = ["static"] }
 
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+metal = { workspace = true, optional = true }
+
 [dev-dependencies]
 clap = { version = "4.5", features = ["derive"] }
 rand = "0.9.1"
@@ -63,6 +66,12 @@ intel = [
   "risc0-sys/intel",
   "risc0-zkp/intel",
   "std",
+]
+metal = [
+  "prove",
+  "dep:metal",
+  "risc0-circuit-keccak-sys/metal",
+  "risc0-zkp/metal",
 ]
 default = ["prove"]
 # Enables ZKR registration to actually generate proofs.

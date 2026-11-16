@@ -14,23 +14,43 @@
 
 //! # Groth16 Prover
 
-#[cfg(any(feature = "rocm", feature = "intel"))]
+#[cfg(any(feature = "rocm", feature = "intel", feature = "metal"))]
 mod component;
 #[cfg(feature = "cuda")]
 mod cuda;
 #[cfg(not(any(feature = "cuda", feature = "rocm")))]
 mod docker;
-#[cfg(all(feature = "intel", not(any(feature = "cuda", feature = "rocm"))))]
+#[cfg(all(
+    any(feature = "intel", feature = "metal"),
+    not(any(feature = "cuda", feature = "rocm"))
+))]
 mod fast;
 #[cfg(feature = "rocm")]
 mod hip;
 #[cfg(all(feature = "intel", not(any(feature = "cuda", feature = "rocm"))))]
 mod intel;
+#[cfg(all(
+    feature = "metal",
+    not(any(feature = "cuda", feature = "rocm", feature = "intel"))
+))]
+mod metal;
+#[cfg(all(
+    feature = "metal",
+    not(any(feature = "cuda", feature = "rocm", feature = "intel"))
+))]
+mod metal_witness;
 mod seal_format;
 mod seal_to_json;
-#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[cfg(any(
+    feature = "cuda",
+    feature = "rocm",
+    all(feature = "metal", not(feature = "intel"))
+))]
 mod witness_fast;
-#[cfg(feature = "cuda")]
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal", not(any(feature = "rocm", feature = "intel")))
+))]
 mod witness_par;
 
 use anyhow::Result;
@@ -50,6 +70,14 @@ pub fn preload_graph() -> Result<()> {
             self::hip::preload_graph()
         } else if #[cfg(feature = "intel")] {
             self::fast::preload()
+        } else if #[cfg(feature = "metal")] {
+            if self::metal::enabled() {
+                self::metal::preload_graph()
+            } else if self::docker::fast_enabled() {
+                self::fast::preload()
+            } else {
+                Ok(())
+            }
         } else {
             Ok(()) // docker mode doesn't use local graph
         }
@@ -65,11 +93,20 @@ pub fn preload_graph_background() {
             let _ = self::cuda::preload_graph();
         });
     }
+    #[cfg(all(
+        feature = "metal",
+        not(any(feature = "cuda", feature = "rocm", feature = "intel"))
+    ))]
+    if self::metal::enabled() {
+        std::thread::spawn(|| {
+            let _ = self::metal::preload_graph();
+        });
+    }
 }
 
 /// Start the Groth16 prover ahead of [shrink_wrap] so that it loads its
-/// proving key while the caller finishes `identity_p254` (intel builds with
-/// the rzup `risc0-groth16` component installed; otherwise a no-op).
+/// proving key while the caller finishes `identity_p254` (intel and metal builds
+/// with the rzup `risc0-groth16` component installed; otherwise a no-op).
 pub fn prestart_prover() -> Result<()> {
     cfg_if::cfg_if! {
         if #[cfg(all(feature = "intel", not(any(feature = "cuda", feature = "rocm"))))] {
@@ -79,6 +116,16 @@ pub fn prestart_prover() -> Result<()> {
             }
             // Only check that the graph exists here: building the witness
             // program (~1 s) stays on the preload thread, off this path.
+            if self::docker::fast_enabled()
+                && self::fast::graph_path().map(|p| p.exists()).unwrap_or(false)
+            {
+                self::fast::prestart()?;
+            }
+            Ok(())
+        } else if #[cfg(feature = "metal")] {
+            if self::metal::enabled() {
+                return self::metal::prestart();
+            }
             if self::docker::fast_enabled()
                 && self::fast::graph_path().map(|p| p.exists()).unwrap_or(false)
             {
@@ -97,12 +144,26 @@ pub fn prestart_prover() -> Result<()> {
 pub fn prestart_key() {
     #[cfg(feature = "cuda")]
     self::cuda::prestart_key();
+    #[cfg(all(
+        feature = "metal",
+        not(any(feature = "cuda", feature = "rocm", feature = "intel"))
+    ))]
+    if self::metal::enabled() {
+        self::metal::prestart_key();
+    }
 }
 
 /// Release a pending [prestart_key] loader (no-op if none is waiting).
 pub fn prestart_key_go() {
     #[cfg(feature = "cuda")]
     self::cuda::prestart_key_go();
+    #[cfg(all(
+        feature = "metal",
+        not(any(feature = "cuda", feature = "rocm", feature = "intel"))
+    ))]
+    if self::metal::enabled() {
+        self::metal::prestart_key_go();
+    }
 }
 
 /// Preload the SRS and Groth16 prover into C++ static cache.
@@ -116,6 +177,12 @@ pub fn preload_srs() -> Result<()> {
         } else if #[cfg(feature = "intel")] {
             if self::intel::enabled() {
                 self::intel::preload_srs()
+            } else {
+                Ok(())
+            }
+        } else if #[cfg(feature = "metal")] {
+            if self::metal::enabled() {
+                self::metal::preload_srs()
             } else {
                 Ok(())
             }
@@ -147,6 +214,12 @@ pub fn release_srs() -> Result<()> {
             } else {
                 Ok(())
             }
+        } else if #[cfg(feature = "metal")] {
+            if self::metal::enabled() {
+                self::metal::release_srs()
+            } else {
+                Ok(())
+            }
         } else {
             // Docker mode holds nothing.
             Ok(())
@@ -161,16 +234,30 @@ pub fn release_srs() -> Result<()> {
 pub fn invalidate_caches() {
     #[cfg(feature = "cuda")]
     self::cuda::invalidate_caches();
+    #[cfg(all(
+        feature = "metal",
+        not(any(feature = "cuda", feature = "rocm", feature = "intel"))
+    ))]
+    if self::metal::enabled() {
+        self::metal::invalidate_caches();
+    }
 }
 
 /// Like [shrink_wrap], but runs `pre_gpu` on the calling thread while the witness is computed on
-/// a helper thread (CUDA; elsewhere `pre_gpu` runs first). `pre_gpu` has returned before the GPU
+/// a helper thread (CUDA and the Metal GPU prover; elsewhere `pre_gpu` runs first). `pre_gpu` has returned before the GPU
 /// part of the wrap starts. Used to overlap releasing the STARK HAL's buffer pool (thread-local,
 /// ~35 ms of frees) with the CPU-only witness generation.
 pub fn shrink_wrap_with(identity_p254_seal_bytes: &[u8], pre_gpu: impl FnOnce()) -> Result<Seal> {
     cfg_if::cfg_if! {
         if #[cfg(feature = "cuda")] {
             self::cuda::shrink_wrap_with(identity_p254_seal_bytes, pre_gpu)
+        } else if #[cfg(all(feature = "metal", not(any(feature = "rocm", feature = "intel"))))] {
+            if self::metal::enabled() {
+                self::metal::shrink_wrap_with(identity_p254_seal_bytes, pre_gpu)
+            } else {
+                pre_gpu();
+                shrink_wrap(identity_p254_seal_bytes)
+            }
         } else {
             pre_gpu();
             shrink_wrap(identity_p254_seal_bytes)
@@ -188,6 +275,12 @@ pub fn shrink_wrap(identity_p254_seal_bytes: &[u8]) -> Result<Seal> {
         } else if #[cfg(feature = "intel")] {
             if self::intel::enabled() {
                 self::intel::shrink_wrap(identity_p254_seal_bytes)
+            } else {
+                self::docker::shrink_wrap(identity_p254_seal_bytes)
+            }
+        } else if #[cfg(feature = "metal")] {
+            if self::metal::enabled() {
+                self::metal::shrink_wrap(identity_p254_seal_bytes)
             } else {
                 self::docker::shrink_wrap(identity_p254_seal_bytes)
             }

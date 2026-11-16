@@ -93,10 +93,14 @@ pub fn segment_prover() -> Result<Box<dyn SegmentProver>> {
             self::hal::cuda::segment_prover()
         } else if #[cfg(feature = "rocm")] {
             self::hal::hip::segment_prover()
-        // } else if #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), target_os = "ios"))] {
-        // self::hal::metal::segment_prover(hashfn)
         } else if #[cfg(feature = "intel")] {
             self::hal::intel::segment_prover()
+        } else if #[cfg(feature = "metal")] {
+            if risc0_zkp::hal::metal::enabled("rv32im") {
+                self::hal::metal::segment_prover()
+            } else {
+                self::hal::cpu::segment_prover()
+            }
         } else {
             self::hal::cpu::segment_prover()
         }
@@ -122,6 +126,32 @@ pub fn rocm_prime_host_alloc() {
             risc0_sys::hip::hipHostFree(p);
         }
     });
+}
+
+/// Build the Metal pipeline states (zkp and rv32im metallibs) so the first segment doesn't pay
+/// for them. Best effort: a failure is logged; `segment_prover()` reports it again.
+#[cfg(feature = "metal")]
+pub fn metal_warmup() {
+    if !risc0_zkp::hal::metal::enabled("rv32im") {
+        return;
+    }
+    if let Err(e) = self::hal::metal::warmup() {
+        tracing::warn!("rv32im Metal warmup failed: {e:#}");
+    }
+}
+
+/// Z16: build or load the Metal eval_check PSO specialized for segment po2 `po2` (R20) now, so the
+/// first segments of that size already use it; a worker calls this at startup with its segment
+/// po2. `wait = false` returns at once (the work runs on a background thread) and reports whether
+/// the PSO was already ready; `wait = true` blocks until it is ready (true) or failed. No-op
+/// (false) when Metal is disabled for rv32im, `RISC0_METAL_RV32IM_EVAL_FC=0`, or `po2` is not a
+/// segment po2.
+#[cfg(feature = "metal")]
+pub fn metal_prewarm_segment_po2(po2: usize, wait: bool) -> bool {
+    if !risc0_zkp::hal::metal::enabled("rv32im") {
+        return false;
+    }
+    self::hal::metal::prewarm_segment_po2(po2, wait)
 }
 
 /// Trigger HIP module loading so the first kernel launch doesn't stall.

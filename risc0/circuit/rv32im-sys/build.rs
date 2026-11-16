@@ -233,6 +233,14 @@ mod stamp {
 #[cfg(all(feature = "cuda", feature = "rocm"))]
 compile_error!("Features 'cuda' and 'rocm' are mutually exclusive. Enable only one GPU backend.");
 
+#[cfg(all(
+    feature = "metal",
+    any(feature = "cuda", feature = "rocm", feature = "intel")
+))]
+compile_error!(
+    "Feature 'metal' is mutually exclusive with 'cuda', 'rocm' and 'intel'. Enable only one GPU backend."
+);
+
 fn main() {
     let cuda = env::var("CARGO_FEATURE_CUDA").is_ok();
     let rocm = env::var("CARGO_FEATURE_ROCM").is_ok();
@@ -261,6 +269,10 @@ fn main() {
 
         if env::var("CARGO_FEATURE_INTEL").is_ok() {
             build_intel_kernels();
+        }
+
+        if metal_enabled() {
+            build_metal_kernels();
         }
     });
 }
@@ -593,7 +605,7 @@ fn build_rocm_kernels() {
             String::new()
         }
     );
-    let include_cuda2hip = format!("{}/util/cuda2hip.hpp", &sppark_root);
+    let include_cuda2hip = format!("{sppark_root}/util/cuda2hip.hpp");
     println!("cargo:rerun-if-env-changed=RISC0_HIP_EVAL_CHECK");
     let evalfast = env::var("RISC0_HIP_EVAL_CHECK").as_deref() != Ok("combined");
     let mut eval_check_flags: Vec<&str> = vec![
@@ -1104,6 +1116,7 @@ fn intel_xs_options() -> String {
 /// - IGC `DisableRecompilation=1`: mandatory with the above. Otherwise IGC's
 ///   retry heuristic picks a recompiled kernel with ~2.5 MB of private memory
 ///   per thread that runs ~2x slower than baseline.
+///
 /// Only the mono eval_check is affected; multipass, witgen, accum and
 /// recursion keep the original arithmetic.
 fn intel_eval_fast_enabled() -> bool {
@@ -1277,7 +1290,7 @@ fn compute_mono_hash(cxx_root: &str, icpx_version: &str) -> String {
         let mut scripts: Vec<PathBuf> = std::fs::read_dir("kernels/intel/evalfast")
             .expect("kernels/intel/evalfast")
             .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().map_or(false, |x| x == "py"))
+            .filter(|p| p.extension().is_some_and(|x| x == "py"))
             .collect();
         scripts.sort();
         in_tree.extend(scripts);
@@ -2009,7 +2022,7 @@ fn build_intel_kernels() {
         witgen_amalg.push_str("// Auto-generated SYCL witgen amalgamation\n");
         witgen_amalg.push_str("#include \"steps.h\"\n");
         witgen_amalg.push_str("#include \"witgen.h\"\n");
-        witgen_amalg.push_str("\n");
+        witgen_amalg.push('\n');
         witgen_amalg.push_str("namespace risc0::circuit::rv32im_v2::intel {\n");
 
         // Read steps.cpp, extract body, inject noinline
@@ -2094,7 +2107,7 @@ fn build_intel_kernels() {
             .arg("-Wno-unused-variable")
             .arg("-Wno-sign-compare")
             .arg("-Wno-unused-but-set-variable")
-            .arg(format!("-Ikernels/intel"))
+            .arg("-Ikernels/intel")
             .arg(format!("-I{cxx_root}"))
             .arg("-Ikernels/cxx")
             .arg(risc0_build_kernel::intel_sycl_targets_arg());
@@ -2148,4 +2161,696 @@ fn build_intel_kernels() {
     if intel_lib.exists() {
         println!("cargo:rustc-link-search=native={}", intel_lib.display());
     }
+}
+
+/// The `metal` feature on macOS/iOS: run the Metal generators and compile the hand-written
+/// `kernels/metal/*.metal` plus the generated sources into `metal_kernels_rv32im.metallib`, and
+/// point `RV32IM_METAL_PATH` at it for `src/lib.rs` (`METAL_LIB`).
+///
+/// Layout of the generated files (plan 2.0 "Translator language", 2.8):
+/// - `kernels/metal/{defs,types,layout}.metal.inc` are translations of the zirgen
+///   `kernels/cuda/{defs.cu.inc,types.cuh.inc,layout.cu.inc}` by `cuda2metal.py incs`. They are
+///   checked in next to the CUDA ones (witgen.h includes them under
+///   `RV32IM_METAL_INCLUDE_GENERATED`), and every build re-translates them with `--check`, so a
+///   regenerated circuit without regenerated Metal includes fails the build instead of drifting.
+/// - Everything else generated (kernel translation units) goes to `$OUT_DIR/metal`
+///   ([`metal_gen_dir`]), is never checked in, and is listed in `generated` below.
+///
+/// R4 (accum_tu), R5 (witgen_tu) and R6 (eval_check) each own exactly one delimited block
+/// below and edit nothing else in this file; a block runs its generator into `gen_dir` (with
+/// [`run_metal_generator`]; the generator must not rewrite an unchanged output, see
+/// [`write_if_changed`]), pushes the resulting `.metal` paths onto `generated`, may push extra
+/// compiler flags onto `flags`, and prints `rerun-if-changed` for its generator's inputs. Blocks
+/// do nothing when `skip` is set (RISC0_SKIP_BUILD_KERNELS: KernelBuild writes an empty
+/// metallib and nothing needs python or the generated files).
+///
+/// Every generator command run here is listed in `$OUT_DIR/metal_generators.txt`
+/// (`RV32IM_METAL_GENERATORS`), so `tests/metal_generators.rs` can re-run each with `--check`
+/// against this build's outputs. `RISC0_METAL_BUILD_TIMINGS=1` reports the seconds of each
+/// generator and of each translation unit's `metal` compile as cargo warnings (R16).
+fn build_metal_kernels() {
+    const OUTPUT: &str = "metal_kernels_rv32im";
+    const SOURCES: &[&str] = &["kernels/metal/misc.metal"];
+
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let skip = env::var("RISC0_SKIP_BUILD_KERNELS").is_ok();
+    let gen_dir = metal_gen_dir();
+    // Generated `.metal` translation units (absolute paths under `gen_dir`), compiled after
+    // SOURCES into the same metallib.
+    let mut generated: Vec<PathBuf> = Vec::new();
+    // Extra compiler flags for every source of the metallib (they are part of its cache key).
+    #[allow(unused_mut)] // pushed to by the R4/R5/R6 blocks below
+    let mut flags: Vec<String> = Vec::new();
+
+    if !skip {
+        // Drift gate for the checked-in .metal.inc files (fast: ~0.2 s).
+        for input in METAL_INCS_INPUTS {
+            rerun_if_changed(input);
+        }
+        run_metal_generator(
+            CUDA2METAL,
+            &["incs", "-o", "kernels/metal", "--check"],
+            "kernels/metal/*.metal.inc are out of date: run \
+             `python3 kernels/cuda/cuda2metal.py incs -o kernels/metal` in rv32im-sys",
+        );
+
+        // witgen.h + the three .metal.inc compiled on their own, with the layout facts that
+        // hand-written Metal code (misc.metal, the host) hard-codes asserted.
+        write_if_changed(&gen_dir.join("rv32im_incs.metal"), METAL_INCS_CHECK_TU);
+        generated.push(gen_dir.join("rv32im_incs.metal"));
+    }
+
+    // ---- BEGIN R4 accum_tu (metal) ----
+    // stepAccumA: `accum_tu_gen.py --metal` translates the step_TopAccum call graph of steps.cu
+    // (cuda2metal.py passes) into gen_dir/accum_tu.metal, rewritten only when it changed. Its
+    // rewrite counts are pinned in the script, so a reshaped steps.cu fails here. Inline
+    // strategy: RISC0_METAL_ACCUM_INLINE=always (default; [[clang::always_inline]], CUDA's
+    // __forceinline__ TU) or noinline (fallback). See docs/metal-port/notes/R4.md for the
+    // compile/PSO times of both.
+    if !skip {
+        const ACCUM_TU_GEN: &str = "kernels/cuda/accum_tu_gen.py";
+        for input in [
+            ACCUM_TU_GEN,
+            CUDA2METAL,
+            "kernels/cuda/steps.cu",
+            "kernels/cuda/types.cuh.inc",
+        ] {
+            rerun_if_changed(input);
+        }
+        println!("cargo:rerun-if-env-changed=RISC0_METAL_ACCUM_INLINE");
+        let inline = env::var("RISC0_METAL_ACCUM_INLINE").unwrap_or_else(|_| "always".into());
+        assert!(
+            inline == "always" || inline == "noinline",
+            "RISC0_METAL_ACCUM_INLINE must be `always` or `noinline`, not `{inline}`"
+        );
+        let gen_dir_arg = gen_dir.to_str().unwrap().to_string();
+        run_metal_generator(
+            ACCUM_TU_GEN,
+            &[
+                "--metal",
+                "-o",
+                gen_dir_arg.as_str(),
+                "--inline",
+                inline.as_str(),
+            ],
+            "accum_tu_gen.py --metal failed: if steps.cu was regenerated, re-run \
+             `python3 kernels/cuda/accum_tu_gen.py --metal -o <dir> --no-pin` in rv32im-sys, \
+             review the rewrite counts and update PINNED_METAL",
+        );
+        generated.push(gen_dir.join("accum_tu.metal"));
+    }
+    // ---- END R4 accum_tu (metal) ----
+
+    // ---- BEGIN R5 witgen_tu (metal) ----
+    // `witgen_tu_gen.py --metal` -> gen_dir/witgen_tu.metal: step_Top's call graph (noinline,
+    // cuda2metal.py passes with pinned rewrite counts, map/reduce unrolled: R17, no loop in the
+    // graph) + par_stepExecW, fwd_stepExec, rev_stepExec, and gen_dir/witgen_fpext.h (the shared
+    // fpext.h with its 4-element loops unrolled, every function always_inline and the value
+    // constructors built in place, which witgen_tu.metal includes instead of it) and
+    // gen_dir/witgen_fp.h (R17b: the shared fp.h, every function always_inline). The generator
+    // rewrites the file only when it changed and fails when steps.cu or ffi.cu's extern section changed shape (pins) or
+    // the graph would contain a loop (docs/metal-port/notes/R17.md).
+    if !skip {
+        const WITGEN_TU_GEN: &str = "kernels/cuda/witgen_tu_gen.py";
+        for input in [
+            WITGEN_TU_GEN,
+            CUDA2METAL,
+            "kernels/cuda/steps.cu",
+            "kernels/cuda/ffi.cu",
+            "kernels/cuda/types.cuh.inc",
+        ] {
+            rerun_if_changed(input);
+        }
+        // R17 fix round 1: gen_dir/witgen_fpext.h is derived from the shared fpext.h exactly as
+        // KernelBuild stages it into _sys_ (outside gen_dir: not part of the cache key itself).
+        let fpext_src = out_dir.join("witgen_fpext_src.h");
+        let (_, fpext) = risc0_build_kernel::METAL_INCS
+            .iter()
+            .find(|(name, _)| *name == "fpext.h")
+            .expect("risc0-build-kernel stages fpext.h");
+        write_if_changed(&fpext_src, fpext);
+        // R17b: gen_dir/witgen_fp.h (every function always_inline) from the staged fp.h.
+        let fp_src = out_dir.join("witgen_fp_src.h");
+        let (_, fp) = risc0_build_kernel::METAL_INCS
+            .iter()
+            .find(|(name, _)| *name == "fp.h")
+            .expect("risc0-build-kernel stages fp.h");
+        write_if_changed(&fp_src, fp);
+        let gen_dir_str = gen_dir.to_str().unwrap();
+        run_metal_generator(
+            WITGEN_TU_GEN,
+            &[
+                "--metal",
+                "-o",
+                gen_dir_str,
+                "--fpext-src",
+                fpext_src.to_str().unwrap(),
+                "--fp-src",
+                fp_src.to_str().unwrap(),
+            ],
+            "witgen_tu_gen.py --metal failed: see its message (re-pin PINNED_METAL / re-port \
+             METAL_EXTERNS in kernels/cuda/witgen_tu_gen.py after a steps.cu or ffi.cu change)",
+        );
+        generated.push(gen_dir.join("witgen_tu.metal"));
+    }
+    // ---- END R5 witgen_tu (metal) ----
+
+    // ---- BEGIN R6 eval_check (metal) ----
+    // R6: the baseline eval_check (phase-1 oracle): `cuda2metal.py eval` translates
+    // eval_check.cuh + eval_check_0..3.cu + the eval_check kernel of eval_check_kernel.cu into
+    // gen_dir/eval_check.metal (rewritten only when its text changes) and fails when its pinned
+    // rewrite counts change. Kernel `eval_check`, buffers 0..9 = check, ctrl, data, accum, mix,
+    // out, rou, po2, domain, poly_mix (kNumPolyMixPows FpExt).
+    if !skip {
+        const R6_EVAL_INPUTS: &[&str] = &[
+            CUDA2METAL,
+            "kernels/cuda/eval_check.cuh",
+            "kernels/cuda/eval_check_0.cu",
+            "kernels/cuda/eval_check_1.cu",
+            "kernels/cuda/eval_check_2.cu",
+            "kernels/cuda/eval_check_3.cu",
+            "kernels/cuda/eval_check_kernel.cu",
+        ];
+        for input in R6_EVAL_INPUTS {
+            rerun_if_changed(input);
+        }
+        let gen = gen_dir.to_str().expect("OUT_DIR is not UTF-8");
+        run_metal_generator(
+            CUDA2METAL,
+            &["eval", "-o", gen],
+            "cuda2metal.py eval failed: if the eval_check sources were regenerated, review \
+             `python3 kernels/cuda/cuda2metal.py eval -o <dir> --compile --no-pin` and update \
+             PINNED_EVAL",
+        );
+        generated.push(gen_dir.join("eval_check.metal"));
+    }
+    // ---- END R6 eval_check (metal) ----
+
+    // ---- BEGIN R12 evalfast (metal) ----
+    // R12: the evalfast eval_check. `regen.py --metal gen_dir` runs the evalfast chain (Intel
+    // pipeline, to_cuda.py, the CUDA post-passes up to remat_lu.py = HIP_LAST) and to_metal.py
+    // into gen_dir/eval_check_ef.metal (kernels ef_eval_split + ef_combine) and
+    // gen_dir/ef_tables.rs (the host half of the poly_mix table, included by src/lib.rs as
+    // `metal_evalfast`). Both are rewritten only when their text changes; a pin mismatch fails
+    // the build. ~9 s, only when an input changes. RISC0_METAL_EF_WIDE=0 compiles the 32-bit
+    // lo/hi accumulator forms (-DEF_NO_WIDE) instead of the default 64-bit ones (A/B, R15).
+    let ef_tables = gen_dir.join("ef_tables.rs");
+    if !skip {
+        for input in R12_EVALFAST_INPUTS {
+            rerun_if_changed(input);
+        }
+        for pattern in [
+            "kernels/cuda/evalfast/*.py",
+            "kernels/intel/*.py",
+            "kernels/intel/evalfast/*.py",
+            "kernels/cxx/rust_poly_fp_*.cpp",
+        ] {
+            for path in glob_paths(pattern) {
+                rerun_if_changed(path);
+            }
+        }
+        let gen = gen_dir.to_str().expect("OUT_DIR is not UTF-8");
+        run_metal_generator(
+            "kernels/cuda/evalfast/regen.py",
+            &["--metal", gen],
+            "regen.py --metal failed: if the generated circuit or an evalfast pass changed, re-run \
+             `python3 kernels/cuda/evalfast/regen.py --metal <dir>` in rv32im-sys, check the new \
+             kernel bit-exact (rv32im hal::metal eval_check evalfast tests) and update the EXPECT \
+             pins (TO_METAL_EXPECT, to_metal.py COUNTS)",
+        );
+        generated.push(gen_dir.join("eval_check_ef.metal"));
+        // R15e: R12's table forms (`constant` table, loaded NBETA rows) as a second TU with the
+        // split kernel named ef_eval_split_r12, for the runtime A/B switch
+        // RISC0_METAL_RV32IM_EVAL=evalfast_r12 (its PSO is built only when selected).
+        write_if_changed(&gen_dir.join("eval_check_ef_r12.metal"), R15E_EF_R12_TU);
+        generated.push(gen_dir.join("eval_check_ef_r12.metal"));
+        // R18: R15e's form (16-byte uint4 table-row loads instead of the 32-byte row-pair
+        // loads) as a third TU, split kernel ef_eval_split_r15e, for the runtime revert switch
+        // RISC0_METAL_RV32IM_EVAL=evalfast_r15e (its PSO is built only when selected).
+        write_if_changed(&gen_dir.join("eval_check_ef_r15e.metal"), R18_EF_R15E_TU);
+        generated.push(gen_dir.join("eval_check_ef_r15e.metal"));
+        // R20: the split kernel with the domain as function constant 0 as a fourth TU, kernel
+        // ef_eval_split_fc; the host builds one PSO per job domain (MTLFunctionConstantValues)
+        // in the background and uses it once ready (RISC0_METAL_RV32IM_EVAL_FC).
+        write_if_changed(&gen_dir.join("eval_check_ef_fc.metal"), R20_EF_FC_TU);
+        generated.push(gen_dir.join("eval_check_ef_fc.metal"));
+        // R22: the flat chain is the default form of the TUs above; the nested form (pre-R22) of
+        // the plain and the specialized split kernel, ef_eval_split_nest / ef_eval_split_fc_nest,
+        // for the runtime revert switch RISC0_METAL_RV32IM_EVAL_FLAT=0 (lazy PSOs).
+        write_if_changed(&gen_dir.join("eval_check_ef_nest.metal"), R22_EF_NEST_TU);
+        generated.push(gen_dir.join("eval_check_ef_nest.metal"));
+        write_if_changed(
+            &gen_dir.join("eval_check_ef_fc_nest.metal"),
+            R22_EF_FC_NEST_TU,
+        );
+        generated.push(gen_dir.join("eval_check_ef_fc_nest.metal"));
+        // R23: the TUs above issue their trace loads ahead of use (to_metal.py hoist()); the
+        // flat chain without that (R22's kernels), ef_eval_split_nohoist /
+        // ef_eval_split_fc_nohoist, for the runtime revert switch RISC0_METAL_RV32IM_EVAL_HOIST=0
+        // (lazy PSOs).
+        write_if_changed(
+            &gen_dir.join("eval_check_ef_nohoist.metal"),
+            R23_EF_NOHOIST_TU,
+        );
+        generated.push(gen_dir.join("eval_check_ef_nohoist.metal"));
+        write_if_changed(
+            &gen_dir.join("eval_check_ef_fc_nohoist.metal"),
+            R23_EF_FC_NOHOIST_TU,
+        );
+        generated.push(gen_dir.join("eval_check_ef_fc_nohoist.metal"));
+        println!("cargo:rerun-if-env-changed=RISC0_METAL_EF_WIDE");
+        match env::var("RISC0_METAL_EF_WIDE").as_deref() {
+            Err(_) | Ok("1") => {}
+            Ok("0") => flags.push("-DEF_NO_WIDE".into()),
+            Ok(v) => panic!("RISC0_METAL_EF_WIDE must be 0 or 1, not `{v}`"),
+        }
+    } else {
+        // No generator run: tables that compile (src/lib.rs includes them) but are never used,
+        // since the metallib is empty.
+        write_if_changed(&ef_tables, R12_EF_TABLES_STUB);
+    }
+    println!(
+        "cargo:rustc-env=RV32IM_METAL_EF_TABLES={}",
+        ef_tables.display()
+    );
+    // ---- END R12 evalfast (metal) ----
+
+    // Outside gen_dir: every file under gen_dir is part of the metallib cache key.
+    let generators_list = out_dir.join("metal_generators.txt");
+    write_if_changed(&generators_list, &metal_generator_list());
+    println!(
+        "cargo:rustc-env=RV32IM_METAL_GENERATORS={}",
+        generators_list.display()
+    );
+
+    // The include dirs put the hand-written headers (witgen.h, buffers.h, ...), the checked-in
+    // .metal.inc files and the generated headers on the `-I` path and into the metallib cache
+    // key, so editing one rebuilds.
+    let mut build = KernelBuild::new(KernelType::Metal);
+    build
+        .files(SOURCES)
+        .files(&generated)
+        .include("kernels/metal")
+        .include(&gen_dir);
+    for flag in flags.iter() {
+        build.flag(flag);
+    }
+    let compile_start = (std::time::SystemTime::now(), std::time::Instant::now());
+    build.compile(OUTPUT);
+    if !skip && metal_build_timings() {
+        let sources: Vec<PathBuf> = SOURCES
+            .iter()
+            .map(PathBuf::from)
+            .chain(generated.iter().cloned())
+            .collect();
+        report_metal_compile_times(&out_dir, OUTPUT, &sources, compile_start);
+    }
+
+    // KernelBuild writes `skip-<output>` (empty) under RISC0_SKIP_BUILD_KERNELS.
+    let name = if skip {
+        format!("skip-{OUTPUT}")
+    } else {
+        OUTPUT.to_string()
+    };
+    let metallib = out_dir.join(name).with_extension("metallib");
+    println!("cargo:rustc-env=RV32IM_METAL_PATH={}", metallib.display());
+
+    // ---- BEGIN R22 eval regime guard (metal) ----
+    // R21/R22: the evalfast split kernel's speed follows the native per-thread stack the Apple
+    // back end gives it (fast ~18-21 KB, slow 32-40 KB: ~2.4x eval_check time). Translate it
+    // offline (tools/metal_audit/agx_size.py, metal-tt) and warn, or fail, when it lands in the
+    // slow regime, so a toolchain or generator change cannot flip it unnoticed.
+    if !skip {
+        r22_regime_guard(&out_dir, &metallib);
+    }
+    // ---- END R22 eval regime guard (metal) ----
+}
+
+/// R22: `RISC0_METAL_EF_STACK_GUARD` = `warn` (default: cargo warnings), `fail` (panic) or `0`
+/// (skip); `RISC0_METAL_EF_STACK_MAX` = the limit in bytes (default [R22_STACK_MAX]);
+/// `RISC0_METAL_EF_STACK_GUARD_ARCH` = metal-tt's `-arch` (default `applegpu_g17s`, the M5
+/// family the limit was calibrated on).
+const R22_STACK_MAX: u64 = 24576;
+/// R22: the domain the build-time check specializes `ef_eval_split_fc` for (po2 20).
+const R22_FC_DOMAIN: u32 = 4 << 20;
+
+/// R22: run agx_size.py's stack guard on `ef_eval_split` (from `metallib`) and on
+/// `ef_eval_split_fc` specialized for [R22_FC_DOMAIN] (from its own `.air`, when this build
+/// compiled it: metal-tt cannot specialize a function of a multi-module metallib). The result is
+/// kept in `$OUT_DIR/r22_regime_guard.txt` under the metallib's digest, so an unchanged
+/// metallib is not translated again (~30 s).
+fn r22_regime_guard(out_dir: &Path, metallib: &Path) {
+    use sha2::Digest as _;
+    for var in [
+        "RISC0_METAL_EF_STACK_GUARD",
+        "RISC0_METAL_EF_STACK_MAX",
+        "RISC0_METAL_EF_STACK_GUARD_ARCH",
+    ] {
+        println!("cargo:rerun-if-env-changed={var}");
+    }
+    let mode = env::var("RISC0_METAL_EF_STACK_GUARD").unwrap_or_else(|_| "warn".into());
+    let fail = match mode.trim() {
+        "0" | "off" => return,
+        "" | "warn" => false,
+        "1" | "fail" => true,
+        v => panic!("RISC0_METAL_EF_STACK_GUARD must be warn, fail or 0, not `{v}`"),
+    };
+    let limit: u64 = env::var("RISC0_METAL_EF_STACK_MAX")
+        .map(|v| {
+            v.trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("RISC0_METAL_EF_STACK_MAX must be bytes, not `{v}`"))
+        })
+        .unwrap_or(R22_STACK_MAX);
+    let arch =
+        env::var("RISC0_METAL_EF_STACK_GUARD_ARCH").unwrap_or_else(|_| "applegpu_g17s".into());
+    let tool = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
+        .join("../../../tools/metal_audit/agx_size.py");
+    let say = |msg: &str| {
+        if fail {
+            panic!("rv32im eval regime guard (RISC0_METAL_EF_STACK_GUARD=fail): {msg}");
+        }
+        for line in msg.lines() {
+            println!("cargo:warning=rv32im eval regime guard: {line}");
+        }
+    };
+    if !tool.exists() {
+        // A packaged crate has no tools/ directory: nothing to check with.
+        return;
+    }
+    rerun_if_changed(&tool);
+    let Ok(bytes) = std::fs::read(metallib) else {
+        return say(&format!("cannot read {}", metallib.display()));
+    };
+    let key = format!(
+        "{} limit={limit} arch={arch}",
+        hex_digest(&sha2::Sha256::digest(&bytes))
+    );
+    let record = out_dir.join("r22_regime_guard.txt");
+    let fc_air = out_dir
+        .join("metal_kernels_rv32im")
+        .join("metal")
+        .join("eval_check_ef_fc.air");
+    let cached = std::fs::read_to_string(&record)
+        .ok()
+        .and_then(|s| s.strip_prefix(&format!("{key}\n")).map(str::to_string));
+    let report = cached.unwrap_or_else(|| {
+        let run = |lib: &Path, func: &str| -> (bool, String) {
+            let mut cmd = risc0_build_kernel::python_command();
+            cmd.env("PYTHONDONTWRITEBYTECODE", "1")
+                .arg(&tool)
+                .args(["--arch", &arch, "--guard-stack", &limit.to_string()])
+                .arg(lib)
+                .arg(func);
+            match cmd.output() {
+                Ok(o) => (
+                    o.status.code() == Some(2),
+                    format!(
+                        "{}{}",
+                        String::from_utf8_lossy(&o.stdout),
+                        String::from_utf8_lossy(&o.stderr)
+                    ),
+                ),
+                Err(e) => (false, format!("could not run {cmd:?}: {e}\n")),
+            }
+        };
+        let fc_spec = format!("ef_eval_split_fc@0={R22_FC_DOMAIN}");
+        let (plain, fc) = std::thread::scope(|s| {
+            let fc = s.spawn(|| fc_air.exists().then(|| run(&fc_air, &fc_spec)));
+            (run(metallib, "ef_eval_split"), fc.join().unwrap())
+        });
+        let mut report = format!("plain slow={}\n{}", plain.0, plain.1);
+        match fc {
+            Some((slow, out)) => report += &format!("fc slow={slow}\n{out}"),
+            None => report += "fc not checked (metallib from the kernel cache: no .air)\n",
+        }
+        let _ = std::fs::write(&record, format!("{key}\n{report}"));
+        report
+    });
+    let slow = report.contains(" slow=true");
+    // Anything but a clean pass (e.g. metal-tt missing, metadata not understood) is reported
+    // as a warning; only a measured slow-regime stack fails under `fail`.
+    let clean = report
+        .lines()
+        .all(|l| !l.contains("REGIME GUARD") && !l.contains("could not run") && !l.contains("ERR"));
+    if slow {
+        say(&format!(
+            "the evalfast split kernel compiled into the SLOW stack regime (limit {limit} B; \
+             expect eval_check ~2.4x slower; docs/metal-port/notes/R22.md):\n{report}"
+        ));
+    } else if !clean {
+        println!(
+            "cargo:warning=rv32im eval regime guard: check incomplete (not failing): {}",
+            report.replace('\n', " | ")
+        );
+    } else if metal_build_timings() {
+        println!(
+            "cargo:warning=rv32im eval regime guard: ok: {}",
+            report.replace('\n', " | ")
+        );
+    }
+}
+
+fn hex_digest(d: &[u8]) -> String {
+    d.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// R2's CUDA-to-Metal translator (relative to the crate root, the build script's cwd).
+const CUDA2METAL: &str = "kernels/cuda/cuda2metal.py";
+
+/// What `cuda2metal.py incs` reads: the translator and the zirgen includes it translates.
+const METAL_INCS_INPUTS: &[&str] = &[
+    CUDA2METAL,
+    "kernels/cuda/defs.cu.inc",
+    "kernels/cuda/types.cuh.inc",
+    "kernels/cuda/layout.cu.inc",
+];
+
+/// `$OUT_DIR/metal/rv32im_incs.metal`: compiles witgen.h with the generated includes and
+/// nothing else (the layout tables are `constant constexpr`, so their initializers are
+/// evaluated here), and pins the layout constants that are hard-coded elsewhere. `.elems[0]`:
+/// r0::array's `operator[]` is not constexpr.
+const METAL_INCS_CHECK_TU: &str = r#"// GENERATED by rv32im-sys/build.rs (build_metal_kernels) -- do not edit.
+// witgen.h + defs/types/layout.metal.inc on their own.
+#define RV32IM_METAL_INCLUDE_GENERATED 1
+#include "witgen.h"
+
+namespace rv32im_metal {
+// misc.metal's finalizeZeroizeAccum takes it as FinalizeAccumParams::userAccumSplit (CUDA:
+// kUserAccumSplit = kLayout_TopAccum.columns[0].col).
+static_assert(kLayout_TopAccum.columns.elems[0].col == 23, "kUserAccumSplit changed");
+static_assert(kRegCountAccum == 103 && kRegCountCode == 1 && kRegCountData == 211 &&
+                  kRegCountGlobal == 90 && kRegCountMix == 36,
+              "rv32im register counts changed: update the Metal HAL buffer sizes");
+} // namespace rv32im_metal
+"#;
+
+/// R12: the evalfast chain's fixed inputs (globbed ones are in build_metal_kernels).
+const R12_EVALFAST_INPUTS: &[&str] = &["kernels/intel/eval_check.cpp"];
+
+/// R12: `ef_tables.rs` under RISC0_SKIP_BUILD_KERNELS (the metallib is empty then).
+/// R15e: `$OUT_DIR/metal/eval_check_ef_r12.metal`, eval_check_ef.metal with R12's poly_mix
+/// table forms (`-DEF_R12_FORM`: `constant` table, NBETA-folded rows loaded) and the split
+/// kernel named `ef_eval_split_r12` (ef_combine comes from the main TU).
+const R15E_EF_R12_TU: &str = "// GENERATED by rv32im-sys/build.rs (R15e) -- do not edit.\n\
+// eval_check_ef.metal in R12's table form, kernel ef_eval_split_r12 (RISC0_METAL_RV32IM_EVAL=evalfast_r12).\n\
+#define EF_R12_FORM 1\n\
+#include \"eval_check_ef.metal\"\n";
+
+/// R18: `$OUT_DIR/metal/eval_check_ef_r15e.metal`, eval_check_ef.metal in R15e's form
+/// (`-DEF_R15E_FORM`: 16-byte `uint4` table-row loads) with the split kernel named
+/// `ef_eval_split_r15e` (ef_combine comes from the main TU).
+const R18_EF_R15E_TU: &str = "// GENERATED by rv32im-sys/build.rs (R18) -- do not edit.\n\
+// eval_check_ef.metal in R15e's form, kernel ef_eval_split_r15e (RISC0_METAL_RV32IM_EVAL=evalfast_r15e).\n\
+#define EF_R15E_FORM 1\n\
+#include \"eval_check_ef.metal\"\n";
+
+/// R20: `$OUT_DIR/metal/eval_check_ef_fc.metal`, eval_check_ef.metal with the evaluation domain
+/// as function constant 0 (`-DEF_FC_FORM`) and the split kernel named `ef_eval_split_fc` (ef_combine
+/// comes from the main TU).
+const R20_EF_FC_TU: &str = "// GENERATED by rv32im-sys/build.rs (R20) -- do not edit.\n\
+// eval_check_ef.metal with the domain as function constant 0, kernel ef_eval_split_fc (RISC0_METAL_RV32IM_EVAL_FC).\n\
+#define EF_FC_FORM 1\n\
+#include \"eval_check_ef.metal\"\n";
+
+/// R22: `$OUT_DIR/metal/eval_check_ef_nest.metal`, eval_check_ef.metal with the nested chain
+/// calls (the pre-R22 form), split kernel `ef_eval_split_nest`.
+const R22_EF_NEST_TU: &str = "// GENERATED by rv32im-sys/build.rs (R22) -- do not edit.\n\
+// eval_check_ef.metal with the nested chain, kernel ef_eval_split_nest (RISC0_METAL_RV32IM_EVAL_FLAT=0).\n\
+#define EF_NEST_FORM 1\n\
+#include \"eval_check_ef.metal\"\n";
+
+/// R22: `$OUT_DIR/metal/eval_check_ef_fc_nest.metal`, R20's specialized kernel with the nested
+/// chain calls, `ef_eval_split_fc_nest`.
+const R22_EF_FC_NEST_TU: &str = "// GENERATED by rv32im-sys/build.rs (R22) -- do not edit.\n\
+// eval_check_ef.metal with the domain as function constant 0 and the nested chain, kernel ef_eval_split_fc_nest.\n\
+#define EF_FC_FORM 1\n\
+#define EF_NEST_FORM 1\n\
+#include \"eval_check_ef.metal\"\n";
+
+/// R23: `$OUT_DIR/metal/eval_check_ef_nohoist.metal`, eval_check_ef.metal with every trace load
+/// at its use (R22's flat kernel), split kernel `ef_eval_split_nohoist`.
+const R23_EF_NOHOIST_TU: &str = "// GENERATED by rv32im-sys/build.rs (R23) -- do not edit.\n\
+// eval_check_ef.metal without the hoisted trace loads, kernel ef_eval_split_nohoist (RISC0_METAL_RV32IM_EVAL_HOIST=0).\n\
+#define EF_NO_HOIST 1\n\
+#include \"eval_check_ef.metal\"\n";
+
+/// R23: `$OUT_DIR/metal/eval_check_ef_fc_nohoist.metal`, R20's specialized kernel without the
+/// hoisted trace loads, `ef_eval_split_fc_nohoist`.
+const R23_EF_FC_NOHOIST_TU: &str = "// GENERATED by rv32im-sys/build.rs (R23) -- do not edit.\n\
+// eval_check_ef.metal with the domain as function constant 0, without the hoisted trace loads, kernel ef_eval_split_fc_nohoist.\n\
+#define EF_FC_FORM 1\n\
+#define EF_NO_HOIST 1\n\
+#include \"eval_check_ef.metal\"\n";
+
+const R12_EF_TABLES_STUB: &str = r#"// GENERATED by rv32im-sys/build.rs (RISC0_SKIP_BUILD_KERNELS stub) -- do not edit.
+use risc0_core::field::baby_bear::{Elem, ExtElem};
+pub const EF_NPC: usize = 458;
+pub const RK_QN: usize = 107;
+pub const RK_HN: usize = 62;
+pub const EF_NPM: usize = EF_NPC + RK_QN + RK_HN;
+pub const RK_QA: [u16; RK_QN] = [0; RK_QN];
+pub const RK_QB: [u16; RK_QN] = [0; RK_QN];
+pub fn rk_hoist(_poly_mix: &[ExtElem], _out: &[Elem], _mix: &[Elem], _tab: &mut [ExtElem]) {
+    unimplemented!("rv32im-sys was built with RISC0_SKIP_BUILD_KERNELS")
+}
+"#;
+
+/// Where the Metal generators write: `$OUT_DIR/metal` (created).
+fn metal_gen_dir() -> PathBuf {
+    let dir = PathBuf::from(env::var("OUT_DIR").unwrap()).join("metal");
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// The generator commands [`run_metal_generator`] ran (script, then arguments), in order.
+static METAL_GENERATORS: std::sync::Mutex<Vec<Vec<String>>> = std::sync::Mutex::new(Vec::new());
+
+/// `metal_generators.txt`: one generator command per line (crate-relative script, then its
+/// arguments), tab-separated. Empty under RISC0_SKIP_BUILD_KERNELS.
+fn metal_generator_list() -> String {
+    let cmds = METAL_GENERATORS.lock().unwrap_or_else(|e| e.into_inner());
+    cmds.iter().map(|c| c.join("\t") + "\n").collect()
+}
+
+/// Whether to report Metal build timings (`RISC0_METAL_BUILD_TIMINGS=1`).
+fn metal_build_timings() -> bool {
+    println!("cargo:rerun-if-env-changed=RISC0_METAL_BUILD_TIMINGS");
+    env::var("RISC0_METAL_BUILD_TIMINGS").is_ok_and(|v| v == "1")
+}
+
+/// Runs `python <script> <args>` (risc0_build_kernel::python_command, RISC0_PYTHON) from the
+/// crate root and panics with `hint` when it fails.
+fn run_metal_generator<S: AsRef<std::ffi::OsStr>>(script: &str, args: &[S], hint: &str) {
+    let mut cmd = risc0_build_kernel::python_command();
+    // No __pycache__ in the source tree (the scripts import each other).
+    cmd.env("PYTHONDONTWRITEBYTECODE", "1");
+    cmd.arg(script).args(args);
+    METAL_GENERATORS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(
+            std::iter::once(script.to_string())
+                .chain(
+                    args.iter()
+                        .map(|a| a.as_ref().to_string_lossy().into_owned()),
+                )
+                .collect(),
+        );
+    let start = std::time::Instant::now();
+    let output = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("could not run {cmd:?}: {e}"));
+    if !output.status.success() {
+        panic!(
+            "{cmd:?} failed with {}\n{}{}\n{hint}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    if metal_build_timings() {
+        let out_dir = env::var("OUT_DIR").unwrap();
+        let args: Vec<String> = args
+            .iter()
+            .map(|a| a.as_ref().to_string_lossy().replace(&out_dir, "$OUT_DIR"))
+            .collect();
+        println!(
+            "cargo:warning=rv32im metal timing: generator {script} {}: {:.1} s",
+            args.join(" "),
+            start.elapsed().as_secs_f64()
+        );
+    }
+}
+
+/// RISC0_METAL_BUILD_TIMINGS=1: one cargo warning per translation unit with the seconds from the
+/// start of the metallib compile until its `.air` was written, then the total (compiles + link).
+/// KernelBuild compiles the TUs concurrently (one rayon task each), so with at least as many
+/// threads as TUs (the default pool has one per core) each figure is that TU's compile time; on
+/// a cache hit (`~/Library/Caches/risc0`) nothing is compiled and that is reported instead.
+fn report_metal_compile_times(
+    out_dir: &Path,
+    output: &str,
+    sources: &[PathBuf],
+    (start, timer): (std::time::SystemTime, std::time::Instant),
+) {
+    let total = timer.elapsed().as_secs_f64();
+    let mut lines = Vec::new();
+    for src in sources {
+        let air = out_dir
+            .join(output)
+            .join(risc0_build_kernel::metal_air_rel_path(src, out_dir));
+        let done = std::fs::metadata(&air)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(start).ok());
+        let name = src.file_name().unwrap_or_default().to_string_lossy();
+        let nlines = std::fs::read(src)
+            .map(|b| b.iter().filter(|&&c| c == b'\n').count())
+            .unwrap_or(0);
+        lines.push(match done {
+            Some(d) => format!("compile {name} ({nlines} lines): {:.1} s", d.as_secs_f64()),
+            None => format!("compile {name}: not compiled"),
+        });
+    }
+    let compiled = lines
+        .iter()
+        .filter(|l| !l.ends_with("not compiled"))
+        .count();
+    if compiled > 0 {
+        for line in lines {
+            println!("cargo:warning=rv32im metal timing: {line}");
+        }
+    }
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    if compiled == 0 {
+        println!(
+            "cargo:warning=rv32im metal timing: {output}.metallib reused from the kernel cache \
+             ({total:.1} s; inputs unchanged, no TU compiled)"
+        );
+    } else {
+        println!(
+            "cargo:warning=rv32im metal timing: {output}.metallib: {compiled} of {} TUs compiled \
+             concurrently ({threads} cores), {total:.1} s in total incl. the metallib link",
+            sources.len()
+        );
+    }
+}
+
+/// Writes `contents` to `path` unless it already holds exactly that: KernelBuild prints
+/// `rerun-if-changed` for every source, so rewriting an unchanged generated file (new mtime)
+/// would rerun this build script on every cargo invocation.
+fn write_if_changed(path: &Path, contents: &str) {
+    if std::fs::read(path).ok().as_deref() != Some(contents.as_bytes()) {
+        std::fs::write(path, contents).unwrap();
+    }
+}
+
+/// Whether to build the Metal kernels: the `metal` feature on a macOS/iOS target (on any other
+/// target the guard in src/lib.rs rejects the feature).
+fn metal_enabled() -> bool {
+    env::var("CARGO_FEATURE_METAL").is_ok()
+        && env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "macos" || os == "ios")
 }

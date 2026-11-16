@@ -44,6 +44,9 @@ public:
   static constant uint32_t INVALID = 0xfffffffful;
 
 private:
+  // FpExt's address-space qualified constructors build their elements from raw words.
+  friend struct FpExt;
+
   // The actual value, always < P.
   uint32_t val;
 
@@ -80,13 +83,26 @@ private:
 
   // A private constructor that take the 'internal' form.
   constexpr Fp(uint32_t val, bool ignore) : val(val) {}
+  constexpr Fp(uint32_t val, bool ignore) threadgroup : val(val) {}
+  constexpr Fp(uint32_t val, bool ignore) device : val(val) {}
+  constexpr Fp(uint32_t val, bool ignore) constant : val(val) {}
 
 public:
   /// Default constructor, sets value to 0.
   constexpr Fp() : val(0) {}
 
+  /// Address-space qualified default constructors, so that `threadgroup Fp x[N]`, `device` and
+  /// program-scope `constant` objects can be declared (MSL needs a constructor qualified with the
+  /// object's address space; the unqualified one only constructs `thread` objects).
+  constexpr Fp() threadgroup : val(0) {}
+  constexpr Fp() device : val(0) {}
+  constexpr Fp() constant : val(0) {}
+
   /// Construct an FP from a uint32_t, wrap if needed
   constexpr Fp(uint32_t val) : val(encode(val)) {}
+  constexpr Fp(uint32_t val) threadgroup : val(encode(val)) {}
+  constexpr Fp(uint32_t val) device : val(encode(val)) {}
+  constexpr Fp(uint32_t val) constant : val(encode(val)) {}
 
   /// Construct an Fp from an already-encoded raw value
   static constexpr Fp fromRaw(uint32_t val) { return Fp(val, true); }
@@ -117,22 +133,32 @@ public:
 
   constexpr void operator=(uint32_t rhs) device { val = encode(rhs); }
 
-  constexpr Fp operator+(Fp rhs) const { return Fp(add(val, rhs.val), true); }
+  // Binary, unary and comparison operators are by-value hidden friends (free functions found by
+  // argument-dependent lookup), so either operand may live in any address space (thread,
+  // threadgroup, device, constant): it is copied into a thread value first. Member operators
+  // would need one overload per address space of the left operand.
+  friend constexpr Fp operator+(Fp lhs, Fp rhs) { return Fp(add(lhs.val, rhs.val), true); }
 
-  constexpr Fp operator-() const { return Fp(sub(0, val), true); }
+  friend constexpr Fp operator-(Fp x) { return Fp(sub(0, x.val), true); }
 
-  constexpr Fp operator-(Fp rhs) const { return Fp(sub(val, rhs.val), true); }
+  friend constexpr Fp operator-(Fp lhs, Fp rhs) { return Fp(sub(lhs.val, rhs.val), true); }
 
-  constexpr Fp operator*(Fp rhs) const { return Fp(mul(val, rhs.val), true); }
+  friend constexpr Fp operator*(Fp lhs, Fp rhs) { return Fp(mul(lhs.val, rhs.val), true); }
 
-  constexpr Fp operator+(Fp rhs) device const { return Fp(add(val, rhs.val), true); }
+  friend constexpr bool operator==(Fp lhs, Fp rhs) { return lhs.val == rhs.val; }
 
-  constexpr Fp operator-() device const { return Fp(sub(0, val), true); }
+  friend constexpr bool operator!=(Fp lhs, Fp rhs) { return lhs.val != rhs.val; }
 
-  constexpr Fp operator-(Fp rhs) device const { return Fp(sub(val, rhs.val), true); }
+  friend constexpr bool operator<(Fp lhs, Fp rhs) { return decode(lhs.val) < decode(rhs.val); }
 
-  constexpr Fp operator*(Fp rhs) device const { return Fp(mul(val, rhs.val), true); }
+  friend constexpr bool operator<=(Fp lhs, Fp rhs) { return decode(lhs.val) <= decode(rhs.val); }
 
+  friend constexpr bool operator>(Fp lhs, Fp rhs) { return decode(lhs.val) > decode(rhs.val); }
+
+  friend constexpr bool operator>=(Fp lhs, Fp rhs) { return decode(lhs.val) >= decode(rhs.val); }
+
+  // Compound assignment modifies the object in place, so it stays a member, one overload per
+  // address space the object can live in.
   constexpr Fp operator+=(Fp rhs) {
     val = add(val, rhs.val);
     return *this;
@@ -143,7 +169,22 @@ public:
     return *this;
   }
 
+  constexpr Fp operator+=(Fp rhs) threadgroup {
+    val = add(val, rhs.val);
+    return *this;
+  }
+
   constexpr Fp operator-=(Fp rhs) {
+    val = sub(val, rhs.val);
+    return *this;
+  }
+
+  constexpr Fp operator-=(Fp rhs) device {
+    val = sub(val, rhs.val);
+    return *this;
+  }
+
+  constexpr Fp operator-=(Fp rhs) threadgroup {
     val = sub(val, rhs.val);
     return *this;
   }
@@ -153,29 +194,15 @@ public:
     return *this;
   }
 
-  constexpr bool operator==(Fp rhs) const { return val == rhs.val; }
+  constexpr Fp operator*=(Fp rhs) device {
+    val = mul(val, rhs.val);
+    return *this;
+  }
 
-  constexpr bool operator!=(Fp rhs) const { return val != rhs.val; }
-
-  constexpr bool operator<(Fp rhs) const { return decode(val) < decode(rhs.val); }
-
-  constexpr bool operator<=(Fp rhs) const { return decode(val) <= decode(rhs.val); }
-
-  constexpr bool operator>(Fp rhs) const { return decode(val) > decode(rhs.val); }
-
-  constexpr bool operator>=(Fp rhs) const { return decode(val) >= decode(rhs.val); }
-
-  constexpr bool operator==(Fp rhs) device const { return val == rhs.val; }
-
-  constexpr bool operator!=(Fp rhs) device const { return val != rhs.val; }
-
-  constexpr bool operator<(Fp rhs) device const { return decode(val) < decode(rhs.val); }
-
-  constexpr bool operator<=(Fp rhs) device const { return decode(val) <= decode(rhs.val); }
-
-  constexpr bool operator>(Fp rhs) device const { return decode(val) > decode(rhs.val); }
-
-  constexpr bool operator>=(Fp rhs) device const { return decode(val) >= decode(rhs.val); }
+  constexpr Fp operator*=(Fp rhs) threadgroup {
+    val = mul(val, rhs.val);
+    return *this;
+  }
 
   // Post-inc/dec
   constexpr Fp operator++(int) {

@@ -23,7 +23,7 @@ tracing = { version = "0.1", default-features = false, features = [
 ] }
 
 [target.'cfg(any(target_os="macos", target_os="ios"))'.dependencies]
-metal = { workspace = true }
+metal = { workspace = true, optional = true }
 
 [target.'cfg(not(target_os = "zkvm"))'.dependencies]
 bytemuck = "1.12"
@@ -65,7 +65,13 @@ intel = [
   "std",
 ]
 default = ["prove", "test"]
-metal = ["prove"]
+metal = [
+  "prove",
+  "dep:metal",
+  "risc0-circuit-recursion-sys/metal",
+  "risc0-zkp/metal",
+  "std",
+]
 prove = [
   "dep:cfg-if",
   "dep:lazy-regex",

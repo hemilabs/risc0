@@ -12,76 +12,383 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Metal HAL (plan `docs/metal-port/PLAN.md` sections 2.6, 2.7, 2.9).
+//!
+//! * PSOs for every zkp kernel are built once per process ([MetalHal::new]); circuit metallibs are
+//!   loaded with [MetalHal::load_library].
+//! * GPU work is batched: [MetalHal::dispatch] / [MetalHal::launch] / [MetalHal::blit_fill] only
+//!   encode; [MetalHal::flush] commits, [MetalHal::sync] commits and waits. Host access to a
+//!   [BufferImpl] (`view`, `view_mut`, `get_at`, `to_vec`) syncs first. Raw pointers
+//!   ([BufferImpl::as_ptr]) are not synchronised; `RISC0_METAL_DEBUG=1` asserts they are not
+//!   taken on a buffer an unsynced batch uses.
+//! * Buffers come from a size-keyed pool; a dropped buffer is reused only after every batch that
+//!   may use it completed.
+//! * [exclusive] / [singleton] are taken per call (around every encode, commit and wait), never
+//!   stored in a HAL.
+//! * A [BufferImpl] may only be used (bound to a dispatch, read, dropped) through the HAL that
+//!   allocated it: host reads sync, and pool returns wait for, only that HAL's batches. Binding a
+//!   buffer of HAL A into a dispatch on HAL B can give stale reads and early pool reuse.
+
+pub mod archive;
+mod buffer;
+mod eval;
+mod kernels;
+mod mdiv;
+mod mix;
+mod ntt;
+mod poseidon2;
+mod poseidon254;
+mod query;
+mod runtime;
+mod small;
+#[cfg(test)]
+mod tests;
+#[cfg(test)]
+mod tests_a1;
+#[cfg(test)]
+mod tests_r17;
+#[cfg(test)]
+mod tests_z1;
+#[cfg(test)]
+mod tests_z10;
+#[cfg(test)]
+mod tests_z13;
+#[cfg(test)]
+mod tests_z14;
+#[cfg(test)]
+mod tests_z15;
+#[cfg(test)]
+mod tests_z16;
+#[cfg(test)]
+mod tests_z2;
+#[cfg(test)]
+mod tests_z3;
+#[cfg(test)]
+mod tests_z4;
+#[cfg(test)]
+mod tests_z5;
+#[cfg(test)]
+mod tests_z7;
+#[cfg(test)]
+mod tests_z8b;
+#[cfg(test)]
+mod tests_z9;
+
 use std::{
-    collections::HashMap, ffi::c_void, fmt::Debug, marker::PhantomData, mem, slice, sync::OnceLock,
+    fmt::Debug,
+    sync::{Arc, OnceLock},
 };
 
+use anyhow::Result;
 use metal::{
-    Buffer as MetalBuffer, CommandQueue, ComputeCommandEncoderRef, ComputePipelineDescriptor,
-    Device, MTLArgumentBuffersTier, MTLResourceOptions, MTLSize,
+    Buffer as MtlBuffer, BufferRef, CommandQueue, ComputeCommandEncoderRef,
+    ComputePipelineDescriptor, ComputePipelineDescriptorRef, ComputePipelineState,
+    ComputePipelineStateRef, Device, MTLSize,
 };
 use parking_lot::{ReentrantMutex, ReentrantMutexGuard};
-use rayon::prelude::*;
 use risc0_core::{
     field::{
         baby_bear::{BabyBear, BabyBearElem, BabyBearExtElem},
-        Elem, ExtElem, RootsOfUnity,
+        ExtElem,
     },
     scope,
 };
 
-use super::{tracker, Buffer, Hal};
+use self::runtime::Runtime;
+pub use self::runtime::{
+    drain_idle_pools, pool_counters, pool_report, register_idle_releaser, system_gpu_committed,
+    system_gpu_in_use, IdleReleaserHandle, PoolCounters, DEFAULT_POOL_STALE_BATCHES,
+    POOL_GLOBAL_ENV, POOL_STALE_BATCHES_ENV, POOL_TRACE_ENV, PRESSURE_CRITICAL, PRESSURE_DRAIN_ENV,
+    PRESSURE_NORMAL, PRESSURE_WARN, PURGE_ON_FREE_ENV, SYSTEM_CHECK_ENV, SYSTEM_CHECK_MIN_BYTES,
+};
+pub use self::runtime::{
+    profile_report, profile_take, register_pso_name, sync_trace_take, ProfileEntry, SyncRecord,
+    PROFILE_ENV, SYNC_TRACE_ENV,
+};
+pub use self::{
+    buffer::BufferImpl,
+    kernels::{MetalKernels, ZKP_ARCHIVE_ENV, ZKP_ARCHIVE_UNIT},
+    poseidon2::{MetalHashPoseidon2, Poseidon2Config, Poseidon2Kernels},
+    poseidon254::{MetalHashPoseidon254, Poseidon254Config, Poseidon254Kernels},
+    runtime::{
+        as_bytes, BudgetScope, Grid, KernelArg, BUDGET_SCOPE_ENV, DEFAULT_BATCH_DISPATCHES,
+        MAX_SET_BYTES, MAX_WORKING_SET_ENV,
+    },
+};
+use super::{Buffer as _, Hal};
 use crate::{
     core::{
         digest::Digest,
-        hash::{
-            poseidon2::{self, Poseidon2HashSuite},
-            sha::Sha256HashSuite,
-            HashSuite,
-        },
-        log2_ceil,
+        hash::{sha::Sha256HashSuite, HashSuite},
     },
     FRI_FOLD,
 };
 
 const METAL_LIB: &[u8] = include_bytes!(env!("ZKP_METAL_PATH"));
 
-const KERNEL_NAMES: &[&str] = &[
-    "batch_expand",
+/// Every kernel of the zkp metallib (one group per `sys/kernels/zkp/metal/*.metal` file, in the
+/// order of `sys/build.rs`); a PSO is built for each when the first HAL is created. The legacy
+/// kernels (`multi_ntt_*`, `multi_poly_eval`, `batch_expand`, `zk_shift`, `multi_bit_reverse`,
+/// `poseidon2_*`) and `eltwise_zeroize_fpext` were retired in Z7.
+pub const KERNEL_NAMES: &[&str] = &[
+    // eltwise.metal
     "eltwise_add_fp",
     "eltwise_copy_fp",
     "eltwise_mul_factor_fp",
     "eltwise_sum_fpext",
     "eltwise_zeroize_fp",
-    "eltwise_zeroize_fpext",
+    // fri.metal
     "fri_fold",
-    "gather_sample",
+    // mix.metal (Z4)
     "mix_poly_coeffs",
-    "multi_bit_reverse",
-    "multi_ntt_fwd_step",
-    "multi_ntt_rev_step",
-    "multi_poly_eval",
-    "poseidon2_fold",
-    "poseidon2_rows",
+    "mix_poly_coeffs_v1",
+    "mix_poly_coeffs_v2",
+    "mix_poly_coeffs_v2_dcids",
+    "mix_poly_coeffs_fused",
+    // sha.metal
     "sha_fold",
     "sha_rows",
-    "zk_shift",
+    // misc.metal (Z1)
+    "combos_sub",
+    "eltwise_copy_fp_region",
+    "fill_u32",
+    "gather_sample",
+    "scatter",
+    "scatter_bits",
+    // ntt_x.metal (Z2; also `ntt::NTT_X_KERNELS`)
+    "bit_rev_permutation_batched",
+    "bit_rev_z_batched_64",
+    "ct_x_1",
+    "ct_x_8",
+    "ct_x_8_coalesced",
+    "gs_x_1",
+    "gs_x_8",
+    "gs_x_8_coalesced",
+    "nttx_zk_shift_batched",
+    // pv.metal (Z3)
+    "pv_fold_k",
+    "pv_fold_k_m32",
+    "pv_fold_tail_k",
+    "pv_fold_tail_k_m32",
+    "pv_rows_k",
+    "pv_rows_k_m32",
+    "pvs_q_fold_k",
+    "pvs_q_fold_k_m32",
+    "pvs_q_rows_k",
+    "pvs_q_rows_k_m32",
+    "pvs_w_fold_k",
+    "pvs_w_fold_k_m32",
+    "pvs_w_rows_k",
+    "pvs_w_rows_k_m32",
+    // eval.metal (Z4)
+    "batch_evaluate_any",
+    "eu2_pows",
+    "eu2_main",
+    "eu2_main_lz",
+    "eu2_reduce",
+    // mdiv.metal (Z5)
+    "mdiv_agg0_e8",
+    "mdiv_agg0_e16",
+    "mdiv_apply_e8",
+    "mdiv_apply_e16",
+    "mdiv_scan_32",
+    "mdiv_scan_64",
+    "mdiv_scan_128",
+    "mdiv_scan_256",
+    "mdiv_scan_512",
+    "mdiv_scan_1024",
+    "mdiv_final",
+    // pv.metal `_z9` instantiations (Z9)
+    "pv_fold_k_z9",
+    "pv_fold_tail_k_z9",
+    "pv_rows_k_z9",
+    // pv.metal: the row hash with a commit's side work (bit reversal, fills) folded in (Z14)
+    "pv_rows_side_k_z9",
+    // poseidon254.metal (Z10)
+    "p254_fold_ref",
+    "p254_fold_w64",
+    "p254_fold_w64c",
+    "p254_rows_ref",
+    "p254_rows_w64",
+    "p254_rows_w64c",
+    // poseidon254.metal: the unrolled pre-C16 `w64` and the 4-lane kernels (C16)
+    "p254_fold_w64u",
+    "p254_rows_w64u",
+    "p254_fold4_w64",
+    "p254_rows4_w64",
 ];
 
-// The GPU becomes unstable as the number of concurrent provers grow.
-fn singleton() -> &'static ReentrantMutex<()> {
+/// `RISC0_METAL_PREFILL=0` turns [MetalHal]'s `Hal::prefill_elem` off (Z14).
+fn prefill_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RISC0_METAL_PREFILL").map_or(true, |v| v.trim() != "0"))
+}
+
+/// How many bytes `Hal::prefill_elem` may set aside (W7-R2).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PrefillCap {
+    /// Z14: an eighth of the working-set limit, kept across po2 changes.
+    Limit8,
+    /// W7-R2 (default): the headroom after the caller's next phase; released on a po2 change.
+    Headroom,
+}
+
+/// `RISC0_METAL_PREFILL_CAP=limit8` restores Z14's cap (default `headroom`).
+fn prefill_cap_mode() -> PrefillCap {
+    static MODE: OnceLock<PrefillCap> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        match std::env::var("RISC0_METAL_PREFILL_CAP")
+            .as_deref()
+            .map(str::trim)
+        {
+            Ok("limit8") => PrefillCap::Limit8,
+            _ => PrefillCap::Headroom,
+        }
+    })
+}
+
+/// `RISC0_METAL_PREFILL_LOG=1`: one line per `prefill_elem` decision (measurement).
+fn prefill_log() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RISC0_METAL_PREFILL_LOG").is_ok_and(|v| v.trim() == "1"))
+}
+
+const MIB: f64 = (1u64 << 20) as f64;
+
+/// Whether the Metal backend may be used for `unit` (one of `zkp`, `rv32im`, `recursion`,
+/// `keccak`, `groth16`): false if `RISC0_METAL=0`, or if the comma-separated list in
+/// `RISC0_METAL_SKIP` names the unit. Callers fall back to the CPU prover (groth16: Docker).
+pub fn enabled(unit: &str) -> bool {
+    if std::env::var("RISC0_METAL").is_ok_and(|v| v.trim() == "0") {
+        return false;
+    }
+    match std::env::var("RISC0_METAL_SKIP") {
+        Ok(skip) => !skip
+            .split(',')
+            .any(|name| name.trim().eq_ignore_ascii_case(unit)),
+        Err(_) => true,
+    }
+}
+
+/// The name of the system default Metal device, or `None` if there is none.
+pub fn device_name() -> Option<String> {
+    Device::system_default().map(|device| device.name().to_string())
+}
+
+/// The working-set limit and the device's `currentAllocatedSize` in bytes, without making a HAL
+/// (item Z12): `RISC0_METAL_MAX_WORKING_SET_BYTES` when set and smaller, else
+/// `recommendedMaxWorkingSetSize` (what [MetalHal::working_set_limit] reports for a HAL whose
+/// budget was not overridden), and every Metal allocation of this process on the device. `None`
+/// without a Metal device.
+pub fn device_memory() -> Option<(u64, u64)> {
+    let device = Device::system_default()?;
+    let recommended = device.recommended_max_working_set_size();
+    let limit = match runtime::env_working_set_limit() {
+        Some(budget) => budget.min(recommended),
+        None => recommended,
+    };
+    Some((limit, device.current_allocated_size()))
+}
+
+/// The process-wide GPU lock (the GPU becomes unstable as the number of concurrent provers grows).
+///
+/// Taken per call: around every encode, commit and wait of every `MetalHal`, and by code that
+/// wants a whole proving call to run without interleaving with other threads (`exclusive`). It is
+/// never stored in a HAL, so HALs cached per thread do not block other threads.
+pub fn singleton() -> &'static ReentrantMutex<()> {
     static ONCE: OnceLock<ReentrantMutex<()>> = OnceLock::new();
     ONCE.get_or_init(|| ReentrantMutex::new(()))
 }
 
-pub trait MetalHash {
+/// Exclusive use of the GPU against other threads for as long as the guard lives. Reentrant.
+///
+/// Reentrant only on the owning thread: while a thread holds this guard, a HAL call made from
+/// another thread (e.g. a rayon worker spawned by `rayon::join` / `par_iter` under the guard)
+/// blocks until the guard drops, which deadlocks if the holder waits for that worker. Do not
+/// call the HAL from rayon workers while holding `exclusive()`.
+pub fn exclusive() -> ReentrantMutexGuard<'static, ()> {
+    singleton().lock()
+}
+
+/// Test-only lock for tests that read or change process-wide state (other HALs' pools, the
+/// device-wide allocation total, working-set budgets, the peak counter): plan 8.7. Poison-tolerant,
+/// so one failing test does not fail every later one.
+#[cfg(test)]
+pub(crate) fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Test-only lock taken by every test whose working set exceeds ~2 GiB (W7-A1, plan 8.7): the
+/// heavy tests run one at a time beside the light ones, so the suite passes under the default
+/// parallel harness without exhausting a 36 GB Mac. Take it before [gpu_test_lock] when a test
+/// needs both. Poison-tolerant.
+#[cfg(test)]
+pub(crate) fn heavy_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Ignored heavy tests and probes call this first: they must run alone under the machine's GPU
+/// admission lock (`/Users/user/zkminer/bin/gpu-run`, which exports `GPU_RUN_MODE`).
+#[cfg(test)]
+pub(crate) fn require_gpu_run() {
+    assert!(
+        std::env::var_os("GPU_RUN_MODE").is_some(),
+        "run under bin/gpu-run: this ignored test is heavy and needs the machine-wide GPU lock"
+    );
+}
+
+/// The zkp PSOs, built once per process.
+fn zkp_kernels(device: &Device) -> &'static MetalKernels {
+    static ONCE: OnceLock<MetalKernels> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        MetalKernels::new_zkp(device, METAL_LIB, KERNEL_NAMES)
+            .unwrap_or_else(|e| panic!("zkp metallib: {e:#}"))
+    })
+}
+
+/// Anything `dispatch_with_resources` accepts as a kernel: a PSO, or (deprecated) a pipeline
+/// descriptor, for which a PSO is built on every call.
+pub trait PipelineSource {
+    fn with_pso(&self, device: &Device, f: &mut dyn FnMut(&ComputePipelineStateRef));
+}
+
+impl PipelineSource for ComputePipelineStateRef {
+    fn with_pso(&self, _device: &Device, f: &mut dyn FnMut(&ComputePipelineStateRef)) {
+        f(self)
+    }
+}
+
+impl PipelineSource for ComputePipelineState {
+    fn with_pso(&self, device: &Device, f: &mut dyn FnMut(&ComputePipelineStateRef)) {
+        (**self).with_pso(device, f)
+    }
+}
+
+impl PipelineSource for ComputePipelineDescriptor {
+    fn with_pso(&self, device: &Device, f: &mut dyn FnMut(&ComputePipelineStateRef)) {
+        (**self).with_pso(device, f)
+    }
+}
+
+impl PipelineSource for ComputePipelineDescriptorRef {
+    fn with_pso(&self, device: &Device, f: &mut dyn FnMut(&ComputePipelineStateRef)) {
+        let pso = device
+            .new_compute_pipeline_state(self)
+            .unwrap_or_else(|e| panic!("compute pipeline: {e}"));
+        f(&pso)
+    }
+}
+
+pub trait MetalHash: Sized {
     /// Create a hash implementation
     fn new(hal: &MetalHal<Self>) -> Self;
 
-    /// Run the hash_fold function
+    /// Run the hash_fold function (encode only)
     fn hash_fold(&self, hal: &MetalHal<Self>, io: &BufferImpl<Digest>, output_size: usize);
 
-    /// Run the hash_rows function
+    /// Run the hash_rows function (encode only)
     fn hash_rows(
         &self,
         hal: &MetalHal<Self>,
@@ -89,8 +396,42 @@ pub trait MetalHash {
         matrix: &BufferImpl<BabyBearElem>,
     );
 
+    /// Fold a whole tree of `2^layers` leaves stored at `io[2^layers..2^(layers+1)]`, every level
+    /// encoded into the same batch (encode only; dependent levels are ordered by the serial
+    /// encoder and hazard tracking).
+    fn hash_fold_tree(&self, hal: &MetalHal<Self>, io: &BufferImpl<Digest>, layers: usize) {
+        for i in (0..layers).rev() {
+            self.hash_fold(hal, io, 1 << i);
+        }
+    }
+
     /// Return the HashSuite
     fn get_hash_suite(&self) -> &HashSuite<BabyBear>;
+
+    /// Z14: whether this hash's row kernel encodes the fills of `Hal::prefill_elem` buffers
+    /// (else `prefill_elem` sets nothing aside).
+    fn carries_fills(&self) -> bool {
+        false
+    }
+
+    /// Z14: whether [Self::hash_rows_bit_reverse] fuses for a `rows`-row matrix and `cols`
+    /// columns of `2^lg` coefficients.
+    fn fuses_bit_reverse(&self, _rows: usize, _cols: usize, _lg: usize) -> bool {
+        false
+    }
+
+    /// Z14: encode `hash_rows` with the in-place bit reversal of the `count` columns of `coeffs`
+    /// folded into the hash kernel; false (nothing encoded) when it does not fuse that shape.
+    fn hash_rows_bit_reverse(
+        &self,
+        _hal: &MetalHal<Self>,
+        _output: &BufferImpl<Digest>,
+        _matrix: &BufferImpl<BabyBearElem>,
+        _coeffs: &BufferImpl<BabyBearElem>,
+        _count: usize,
+    ) -> bool {
+        false
+    }
 }
 
 pub struct MetalHashSha256 {
@@ -105,11 +446,13 @@ impl MetalHash for MetalHashSha256 {
     }
 
     fn hash_fold(&self, hal: &MetalHal<Self>, io: &BufferImpl<Digest>, output_size: usize) {
+        let n = u32::try_from(output_size).expect("hash_fold: too many outputs");
         let args = &[
             io.as_arg_with_offset(output_size),
             io.as_arg_with_offset(output_size * 2),
+            KernelArg::Integer(n),
         ];
-        hal.dispatch_by_name("sha_fold", args, output_size as u64);
+        hal.launch("sha_fold", output_size as u64, args);
     }
 
     fn hash_rows(
@@ -119,68 +462,20 @@ impl MetalHash for MetalHashSha256 {
         matrix: &BufferImpl<BabyBearElem>,
     ) {
         let row_size = output.size();
-        let col_size = matrix.size() / output.size();
-        assert_eq!(matrix.size(), col_size * row_size);
-        let args = &[
-            output.as_arg(),
-            matrix.as_arg(),
-            KernelArg::Integer(row_size as u32),
-            KernelArg::Integer(col_size as u32),
-        ];
-        hal.dispatch_by_name("sha_rows", args, row_size as u64);
-    }
-
-    fn get_hash_suite(&self) -> &HashSuite<BabyBear> {
-        &self.suite
-    }
-}
-
-pub struct MetalHashPoseidon2 {
-    suite: HashSuite<BabyBear>,
-    round_constants: BufferImpl<BabyBearElem>,
-    m_int_diag: BufferImpl<BabyBearElem>,
-}
-
-impl MetalHash for MetalHashPoseidon2 {
-    fn new(hal: &MetalHal<Self>) -> Self {
-        let round_constants =
-            hal.copy_from_elem("round_constants", poseidon2::consts::ROUND_CONSTANTS);
-        let m_int_diag = hal.copy_from_elem("m_int_diag", poseidon2::consts::M_INT_DIAG_HZN);
-        MetalHashPoseidon2 {
-            suite: Poseidon2HashSuite::new_suite(),
-            round_constants,
-            m_int_diag,
+        if row_size == 0 {
+            return;
         }
-    }
-
-    fn hash_fold(&self, hal: &MetalHal<Self>, io: &BufferImpl<Digest>, output_size: usize) {
-        let args = &[
-            self.round_constants.as_arg(),
-            self.m_int_diag.as_arg(),
-            io.as_arg_with_offset(output_size),
-            io.as_arg_with_offset(output_size * 2),
-        ];
-        hal.dispatch_by_name("poseidon2_fold", args, output_size as u64);
-    }
-
-    fn hash_rows(
-        &self,
-        hal: &MetalHal<Self>,
-        output: &BufferImpl<Digest>,
-        matrix: &BufferImpl<BabyBearElem>,
-    ) {
-        let row_size = output.size();
-        let col_size = matrix.size() / output.size();
+        let col_size = matrix.size() / row_size;
         assert_eq!(matrix.size(), col_size * row_size);
+        let rows = u32::try_from(row_size).expect("hash_rows: too many rows");
+        let cols = u32::try_from(col_size).expect("hash_rows: too many columns");
         let args = &[
-            self.round_constants.as_arg(),
-            self.m_int_diag.as_arg(),
             output.as_arg(),
             matrix.as_arg(),
-            KernelArg::Integer(row_size as u32),
-            KernelArg::Integer(col_size as u32),
+            KernelArg::Integer(rows),
+            KernelArg::Integer(cols),
         ];
-        hal.dispatch_by_name("poseidon2_rows", args, row_size as u64);
+        hal.launch("sha_rows", row_size as u64, args);
     }
 
     fn get_hash_suite(&self) -> &HashSuite<BabyBear> {
@@ -188,189 +483,40 @@ impl MetalHash for MetalHashPoseidon2 {
     }
 }
 
-#[derive(Debug)]
-pub struct MetalHal<Hash: MetalHash + ?Sized> {
+pub struct MetalHal<MH: MetalHash> {
     pub device: Device,
     pub cmd_queue: CommandQueue,
-    kernels: HashMap<String, ComputePipelineDescriptor>,
-    hash: Option<Box<Hash>>,
-    _lock: ReentrantMutexGuard<'static, ()>,
+    rt: Arc<Runtime>,
+    kernels: &'static MetalKernels,
+    hash: Option<Box<MH>>,
+    ntt: ntt::NttState,
+    r2: R2State,
+}
+
+/// W7-R2 bookkeeping of a [MetalHal] (it keeps to the HAL's own API over its runtime).
+#[derive(Default)]
+struct R2State {
+    /// The commit domain (rows) last seen by [MetalHal::note_commit_domain].
+    domain: std::sync::atomic::AtomicU64,
+    /// (bytes, word) of each Z14 set-aside this HAL made since the last po2 change. It may list
+    /// more than the runtime still holds (a buffer since taken, or released by a drain):
+    /// releasing such an entry finds nothing and does nothing.
+    prefill_keys: std::sync::Mutex<Vec<(u64, u32)>>,
+    /// The buffer given up to its next commit ([Hal::donate_to_commit]).
+    donation: std::sync::Mutex<Option<BufferImpl<BabyBearElem>>>,
+}
+
+impl<MH: MetalHash> Debug for MetalHal<MH> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetalHal")
+            .field("device", &self.device.name())
+            .finish_non_exhaustive()
+    }
 }
 
 pub type MetalHalSha256 = MetalHal<MetalHashSha256>;
 pub type MetalHalPoseidon2 = MetalHal<MetalHashPoseidon2>;
-
-#[derive(Clone, Debug)]
-struct TrackedBuffer(MetalBuffer);
-
-impl TrackedBuffer {
-    pub fn new(buffer: MetalBuffer) -> Self {
-        tracker().lock().unwrap().alloc(buffer.length() as usize);
-        Self(buffer)
-    }
-}
-
-impl Drop for TrackedBuffer {
-    fn drop(&mut self) {
-        tracker().lock().unwrap().free(self.0.length() as usize);
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct BufferImpl<T> {
-    name: &'static str,
-    cmd_queue: CommandQueue,
-    buffer: TrackedBuffer,
-    offset: usize,
-    size: usize,
-    marker: PhantomData<T>,
-}
-
-pub enum KernelArg<'a> {
-    Null,
-    Buffer {
-        buffer: &'a MetalBuffer,
-        offset: u64,
-    },
-    Integer(u32),
-}
-
-impl<T> BufferImpl<T> {
-    pub fn new(name: &'static str, device: &Device, cmd_queue: CommandQueue, size: usize) -> Self {
-        let bytes_len = size * mem::size_of::<T>();
-        // TODO: detect if device supports shared mode
-        let options = MTLResourceOptions::StorageModeShared;
-        let buffer = device.new_buffer(bytes_len as u64, options);
-        Self {
-            name,
-            cmd_queue,
-            buffer: TrackedBuffer::new(buffer),
-            offset: 0,
-            size,
-            marker: PhantomData,
-        }
-    }
-
-    pub fn copy_from(
-        name: &'static str,
-        device: &Device,
-        cmd_queue: CommandQueue,
-        slice: &[T],
-    ) -> Self {
-        let bytes_len = mem::size_of_val(slice);
-        // TODO: detect if device supports shared mode
-        let options = MTLResourceOptions::StorageModeShared;
-        let buffer =
-            device.new_buffer_with_data(slice.as_ptr() as *const c_void, bytes_len as u64, options);
-        Self {
-            name,
-            cmd_queue,
-            buffer: TrackedBuffer::new(buffer),
-            offset: 0,
-            size: slice.len(),
-            marker: PhantomData,
-        }
-    }
-
-    pub fn as_arg(&self) -> KernelArg<'_> {
-        let offset = self.offset * mem::size_of::<T>();
-        KernelArg::Buffer {
-            buffer: &self.buffer.0,
-            offset: offset as u64,
-        }
-    }
-
-    pub fn as_arg_with_offset(&self, offset: usize) -> KernelArg<'_> {
-        let offset = (self.offset + offset) * mem::size_of::<T>();
-        KernelArg::Buffer {
-            buffer: &self.buffer.0,
-            offset: offset as u64,
-        }
-    }
-
-    // fn sync(&self) {
-    //     let cmd_buffer = self.cmd_queue.new_command_buffer();
-    //     let blit_encoder = cmd_buffer.new_blit_command_encoder();
-    //     blit_encoder.synchronize_resource(&self.buffer.0);
-    //     blit_encoder.end_encoding();
-    //     cmd_buffer.commit();
-    //     cmd_buffer.wait_until_completed();
-    // }
-
-    pub fn as_device_ptr(&self) -> *mut c_void {
-        self.buffer.0.gpu_address() as *mut c_void
-    }
-
-    pub fn as_ptr(&self) -> *mut c_void {
-        self.buffer.0.contents()
-    }
-
-    pub fn as_buf(&self) -> MetalBuffer {
-        self.buffer.0.clone()
-    }
-}
-
-impl<T: Clone> Buffer<T> for BufferImpl<T> {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-
-    fn size(&self) -> usize {
-        self.size
-    }
-
-    fn slice(&self, offset: usize, size: usize) -> BufferImpl<T> {
-        assert!(offset + size <= self.size());
-        BufferImpl {
-            name: self.name,
-            cmd_queue: self.cmd_queue.clone(),
-            buffer: self.buffer.clone(),
-            offset: self.offset + offset,
-            size,
-            marker: PhantomData,
-        }
-    }
-
-    fn get_at(&self, idx: usize) -> T {
-        // TODO: detect if device supports synchronize_resource
-        // self.sync();
-        let ptr = self.buffer.0.contents() as *const T;
-        let len = self.buffer.0.length() as usize / mem::size_of::<T>();
-        let slice = unsafe { slice::from_raw_parts(ptr, len) };
-        slice[self.offset + idx].clone()
-    }
-
-    fn view<F: FnOnce(&[T])>(&self, f: F) {
-        // TODO: detect if device supports synchronize_resource
-        // self.sync();
-        let ptr = self.buffer.0.contents() as *const T;
-        let len = self.buffer.0.length() as usize / mem::size_of::<T>();
-        let slice = unsafe { slice::from_raw_parts(ptr, len) };
-        f(&slice[self.offset..self.offset + self.size]);
-    }
-
-    fn view_mut<F: FnOnce(&mut [T])>(&self, f: F) {
-        // TODO: detect if device supports synchronize_resource
-        // self.sync();
-        let ptr = self.buffer.0.contents() as *mut T;
-        let len = self.buffer.0.length() as usize / mem::size_of::<T>();
-        let slice = unsafe { slice::from_raw_parts_mut(ptr, len) };
-        f(&mut slice[self.offset..self.offset + self.size]);
-        // TODO: detect if device supports did_modify_range
-        // let offset = self.offset * mem::size_of::<T>();
-        // let size = self.size * mem::size_of::<T>();
-        // self.buffer
-        //     .0
-        //     .did_modify_range(NSRange::new(offset as u64, size as u64));
-    }
-
-    fn to_vec(&self) -> Vec<T> {
-        let ptr = self.buffer.0.contents() as *const T;
-        let len = self.buffer.0.length() as usize / mem::size_of::<T>();
-        let slice = unsafe { slice::from_raw_parts(ptr, len) };
-        Vec::from(slice)
-    }
-}
+pub type MetalHalPoseidon254 = MetalHal<MetalHashPoseidon254>;
 
 impl<MH: MetalHash> Default for MetalHal<MH> {
     fn default() -> Self {
@@ -379,105 +525,253 @@ impl<MH: MetalHash> Default for MetalHal<MH> {
 }
 
 impl<MH: MetalHash> MetalHal<MH> {
+    /// A HAL on the system default device, with its own command queue and batch. The zkp PSOs are
+    /// built on the first call in the process and shared afterwards. No lock is kept.
     pub fn new() -> Self {
-        let lock = singleton().lock();
-        let device = Device::system_default().expect("no device found");
-        assert_eq!(
-            device.argument_buffers_support(),
-            MTLArgumentBuffersTier::Tier2
-        );
-        let library = device.new_library_with_data(METAL_LIB).unwrap();
-        let cmd_queue = device.new_command_queue();
-        let mut kernels = HashMap::new();
-        for name in KERNEL_NAMES {
-            let function = library.get_function(name, None).unwrap();
-            let pipeline = ComputePipelineDescriptor::new();
-            pipeline.set_compute_function(Some(&function));
-            kernels.insert(name.to_string(), pipeline);
-        }
+        let _lock = exclusive();
+        let device = Device::system_default().expect("no Metal device found");
+        let kernels = zkp_kernels(&device);
+        let rt = Arc::new(Runtime::new(device.clone()));
+        let cmd_queue = rt.queue.clone();
         let mut hal = Self {
             device,
             cmd_queue,
+            rt,
             kernels,
             hash: None,
-            _lock: lock,
+            ntt: ntt::NttState::new(),
+            r2: R2State::default(),
         };
         hal.hash = Some(Box::new(MH::new(&hal)));
         hal
     }
 
-    pub fn dispatch_by_name(&self, name: &str, args: &[KernelArg], count: u64) {
-        let kernel = self.kernels.get(name).unwrap();
-        self.dispatch(kernel, args, count, None);
+    fn hash(&self) -> &MH {
+        self.hash.as_ref().unwrap()
     }
 
+    /// Load a circuit metallib and build a PSO for each of `names`; panics on a missing name.
+    pub fn load_library(&self, bytes: &[u8], names: &[&str]) -> MetalKernels {
+        self.try_load_library(bytes, names)
+            .unwrap_or_else(|e| panic!("{e:#}"))
+    }
+
+    /// [Self::load_library], returning the error instead of panicking.
+    pub fn try_load_library(&self, bytes: &[u8], names: &[&str]) -> Result<MetalKernels> {
+        MetalKernels::new(&self.device, bytes, names)
+    }
+
+    /// The PSO of a zkp kernel.
+    pub fn pipeline(&self, name: &str) -> &ComputePipelineState {
+        self.kernels.pipeline(name)
+    }
+
+    /// Encode one dispatch into the open batch. Argument `i` binds index `i`; `tg_bytes[i]` sets
+    /// threadgroup memory index `i` (rounded up to 16; the total, with the PSO's static usage,
+    /// must fit the device's 32 KB). Empty grids are skipped.
     pub fn dispatch(
         &self,
-        kernel: &ComputePipelineDescriptor,
+        pso: &ComputePipelineStateRef,
         args: &[KernelArg],
-        count: u64,
-        opts: Option<(MTLSize, MTLSize)>,
+        grid: Grid,
+        tg_bytes: &[u64],
     ) {
-        self.dispatch_with_resources(kernel, args, count, opts, |_| {});
+        self.rt.dispatch(pso, args, grid, tg_bytes, None);
     }
 
-    pub fn dispatch_with_resources<F: Fn(&ComputeCommandEncoderRef)>(
+    /// 1-D dispatch of a zkp kernel over `count` threads.
+    pub fn launch(&self, name: &str, count: u64, args: &[KernelArg]) {
+        self.dispatch(self.pipeline(name), args, Grid::Threads(count), &[]);
+    }
+
+    /// Encode a blit fill of `len` bytes at `offset` with `byte`.
+    pub fn blit_fill(&self, buf: &BufferRef, offset: u64, len: u64, byte: u8) {
+        self.rt.blit_fill(buf, offset, len, byte);
+    }
+
+    /// A GPU-only (`StorageModePrivate`) buffer, not pooled. Panics if allocation fails after
+    /// draining the pool.
+    pub fn alloc_private(&self, bytes: u64) -> MtlBuffer {
+        self.rt
+            .alloc_private(bytes)
+            .unwrap_or_else(|e| panic!("{e:#}"))
+    }
+
+    /// A pooled shared buffer of `size` elements of any `T`.
+    pub fn alloc_buffer<T>(&self, name: &'static str, size: usize) -> BufferImpl<T> {
+        BufferImpl::new(&self.rt, name, size)
+    }
+
+    /// A pooled shared buffer initialised from `slice`.
+    pub fn copy_from_slice<T>(&self, name: &'static str, slice: &[T]) -> BufferImpl<T> {
+        BufferImpl::copy_from(&self.rt, name, slice)
+    }
+
+    /// End encoding and commit the open batch, without waiting.
+    pub fn flush(&self) {
+        self.rt.flush();
+    }
+
+    /// Flush and wait for all committed work; panics if a command buffer reported an error.
+    pub fn sync(&self) {
+        self.rt.sync();
+    }
+
+    /// [Self::sync], returning a command-buffer error instead of panicking (plan 2.9).
+    pub fn try_sync(&self) -> Result<()> {
+        self.rt.try_sync()
+    }
+
+    /// Escape hatch: run `f` on the open batch's compute encoder (counts as one dispatch). `f`
+    /// must not call back into this HAL, and buffers it binds are not tracked by the debug check.
+    /// Document every use.
+    pub fn with_encoder(&self, f: impl FnOnce(&ComputeCommandEncoderRef)) {
+        self.rt.with_compute(|enc, bound, _| {
+            f(enc);
+            // `f` may have changed any encoder state.
+            *bound = Default::default();
+        });
+    }
+
+    /// Commit a batch after this many dispatches (default [DEFAULT_BATCH_DISPATCHES]).
+    pub fn set_batch_limit(&self, dispatches: usize) {
+        self.rt.set_batch_limit(dispatches);
+    }
+
+    /// W7-A1: a commit over `rows` rows marks the pool's po2 epoch. W7-R2: a new po2 also
+    /// releases the Z14 set-aside buffers, which were for the previous po2's sizes (not with
+    /// `RISC0_METAL_PREFILL_CAP=limit8`).
+    fn note_commit_domain(&self, rows: usize) {
+        self.rt.note_domain(rows);
+        let changed = self
+            .r2
+            .domain
+            .swap(rows as u64, std::sync::atomic::Ordering::Relaxed)
+            != rows as u64;
+        if changed && prefill_cap_mode() == PrefillCap::Headroom {
+            let released = self.prefill_release();
+            if released > 0 && prefill_log() {
+                eprintln!(
+                    "[prefill] po2 change: released {:.0} MiB of set-aside buffers",
+                    released as f64 / MIB
+                );
+            }
+        }
+    }
+
+    /// W7-R2: release the Z14 set-aside buffers this HAL made (they were for a po2 that did not
+    /// come back); returns the bytes released. Each is freed, not pooled (as a drain does): a fill
+    /// encoded in a row hash may still be in flight, and the command buffers that bind it keep it
+    /// alive until they complete.
+    fn prefill_release(&self) -> u64 {
+        let keys = std::mem::take(&mut *self.r2.prefill_keys.lock().unwrap());
+        let mut released = 0;
+        for (len, word) in keys {
+            if let Some((buf, _filled)) = self.rt.prefill_take(len, word) {
+                let raw = buffer::RawBuffer::from_pooled(&self.rt, "prefill_release", buf, len);
+                let out = BufferImpl::<u32>::from_raw(raw, (len / 4) as usize);
+                out.set_bypass_pool();
+                released += len;
+            }
+        }
+        released
+    }
+
+    /// The working-set limit in bytes: `RISC0_METAL_MAX_WORKING_SET_BYTES` (or
+    /// [Self::set_working_set_limit]) when set and smaller, else `recommendedMaxWorkingSetSize`.
+    /// `gpu_total_memory` reports it.
+    pub fn working_set_limit(&self) -> u64 {
+        self.rt.working_set_limit()
+    }
+
+    /// Set (`Some`) or clear (`None`) an explicit working-set budget for this HAL, overriding
+    /// `RISC0_METAL_MAX_WORKING_SET_BYTES`: allocations that would take the device's
+    /// `currentAllocatedSize` above it fail early (after draining the pool).
+    pub fn set_working_set_limit(&self, bytes: Option<u64>) {
+        self.rt.set_working_set_limit(bytes);
+    }
+
+    /// What an explicit budget is checked against ([BUDGET_SCOPE_ENV], default
+    /// [BudgetScope::Device]).
+    pub fn budget_scope(&self) -> BudgetScope {
+        self.rt.budget_scope()
+    }
+
+    /// Override [BUDGET_SCOPE_ENV] for this HAL.
+    pub fn set_budget_scope(&self, scope: BudgetScope) {
+        self.rt.set_budget_scope(scope);
+    }
+
+    /// Bytes this HAL allocated and has not freed (live and pooled shared buffers, plus private
+    /// buffers until the HAL drops): what a [BudgetScope::Hal] budget is checked against.
+    pub fn owned_allocated_size(&self) -> u64 {
+        self.rt.owned_bytes()
+    }
+
+    /// The device's `currentAllocatedSize` (all Metal memory of this process on the device).
+    pub fn allocated_size(&self) -> u64 {
+        self.rt.allocated_size()
+    }
+
+    /// Highest `currentAllocatedSize` observed after any Metal allocation in this process since
+    /// the last [Self::reset_peak_allocated_size] (process-wide, covers every HAL).
+    pub fn peak_allocated_size(&self) -> u64 {
+        Runtime::peak_allocated()
+    }
+
+    /// Restart [Self::peak_allocated_size] from the current allocation level.
+    pub fn reset_peak_allocated_size(&self) {
+        self.rt.reset_peak_allocated();
+    }
+
+    /// Turn the `RISC0_METAL_DEBUG` host-access check on or off for this HAL.
+    pub fn set_debug(&self, on: bool) {
+        self.rt.set_debug(on);
+    }
+
+    /// `RISC0_METAL_DEBUG=1`: panic if `buf` is bound in a batch of this HAL that has not been
+    /// observed complete. For buffers the caller owns and binds as [KernelArg::Buffer] (e.g. the
+    /// recursion witgen's prepare()-staged shared buffers, C14), which the HAL's own host
+    /// accessors never see. A no-op without debug mode.
+    pub fn debug_check_host_access(&self, buf: &BufferRef, name: &str, what: &str) {
+        self.rt.check_host_access(buf, name, what);
+    }
+
+    /// Source-compatible: dispatch a zkp kernel by name over `count` threads (encode only).
+    pub fn dispatch_by_name(&self, name: &str, args: &[KernelArg], count: u64) {
+        self.launch(name, count, args);
+    }
+
+    /// Source-compatible with the pre-batch HAL: encodes `callback` (e.g. `use_resource`) and the
+    /// dispatch, then syncs before returning. `opts` = (threadgroups, threads per threadgroup);
+    /// `None` dispatches `count` threads.
+    ///
+    /// `callback` runs while this HAL's internal state lock is held: it must only call methods
+    /// on the encoder (e.g. `use_resource`) and must not call back into this HAL (flush, sync,
+    /// dispatch, alloc, host reads), or it deadlocks.
+    #[deprecated(note = "use dispatch(); this syncs on every call")]
+    pub fn dispatch_with_resources<K, F>(
         &self,
-        kernel: &ComputePipelineDescriptor,
+        kernel: &K,
         args: &[KernelArg],
         count: u64,
         opts: Option<(MTLSize, MTLSize)>,
         callback: F,
-    ) {
-        let cmd_buffer = self.cmd_queue.new_command_buffer();
-        let cmd_encoder = cmd_buffer.new_compute_command_encoder();
-
-        callback(cmd_encoder);
-
-        let pipeline_state = self
-            .device
-            .new_compute_pipeline_state_with_function(kernel.compute_function().unwrap())
-            .unwrap();
-
-        cmd_encoder.set_compute_pipeline_state(&pipeline_state);
-        for (index, arg) in args.iter().enumerate() {
-            match arg {
-                KernelArg::Buffer { buffer, offset } => {
-                    cmd_encoder.set_buffer(index as u64, Some(buffer), *offset);
-                }
-                KernelArg::Integer(value) => {
-                    cmd_encoder.set_bytes(
-                        index as u64,
-                        mem::size_of_val(value) as u64,
-                        value.to_le_bytes().as_ptr() as *const c_void,
-                    );
-                }
-                KernelArg::Null => {
-                    cmd_encoder.set_buffer(index as u64, None, 0);
-                }
-            }
-        }
-
-        match opts {
-            Some((thread_groups_count, threads_per_threadgroup)) => {
-                cmd_encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
-            }
-            None => {
-                let threads_per_grid = MTLSize::new(count, 1, 1);
-                let threads_per_threadgroup =
-                    MTLSize::new(pipeline_state.max_total_threads_per_threadgroup(), 1, 1);
-                cmd_encoder.dispatch_threads(threads_per_grid, threads_per_threadgroup);
-            }
+    ) where
+        K: PipelineSource + ?Sized,
+        F: Fn(&ComputeCommandEncoderRef),
+    {
+        let grid = match opts {
+            Some((groups, threads)) => Grid::Groups { groups, threads },
+            None => Grid::Threads(count),
         };
-
-        cmd_encoder.end_encoding();
-
-        cmd_buffer.commit();
-        cmd_buffer.wait_until_completed();
+        kernel.with_pso(&self.device, &mut |pso| {
+            self.rt.dispatch(pso, args, grid, &[], Some(&callback));
+        });
+        self.sync();
     }
 }
 
-#[allow(unused_variables)]
 impl<MH: MetalHash> Hal for MetalHal<MH> {
     type Elem = BabyBearElem;
     type ExtElem = BabyBearExtElem;
@@ -485,15 +779,93 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
     type Buffer<T: Clone + Debug + PartialEq> = BufferImpl<T>;
 
     fn alloc_elem(&self, name: &'static str, size: usize) -> Self::Buffer<Self::Elem> {
-        BufferImpl::new(name, &self.device, self.cmd_queue.clone(), size)
+        self.alloc_buffer(name, size)
+    }
+
+    fn alloc_elem_init(
+        &self,
+        name: &'static str,
+        size: usize,
+        value: Self::Elem,
+    ) -> Self::Buffer<Self::Elem> {
+        // Z14: a buffer `prefill_elem` set aside (its fill encoded in a row hash, or encoded now).
+        let word = value.as_u32_montgomery();
+        let bytes = (size * std::mem::size_of::<Self::Elem>()) as u64;
+        if let Some((buf, filled)) = self.rt.prefill_take(bytes, word) {
+            let raw = buffer::RawBuffer::from_pooled(&self.rt, name, buf, bytes);
+            let out = BufferImpl::from_raw(raw, size);
+            if !filled {
+                self.fill_u32(&out, word);
+            }
+            return out;
+        }
+        self.small_alloc_elem_init(name, size, value)
+    }
+
+    /// Z14: set aside a pooled buffer of `size` elements (one just freed, never a new
+    /// allocation) for an upcoming `alloc_elem_init(.., size, value)`; its fill rides on the next
+    /// commit row hash (`pv_rows_side_k_z9`) instead of a blit. Off with
+    /// `RISC0_METAL_PREFILL=0` and with a hash that does not carry fills. How many bytes may be
+    /// set aside: see [Self::prefill_elem_within] (`need` 0 here).
+    fn prefill_elem(&self, size: usize, value: Self::Elem) {
+        self.prefill_elem_within(size, value, 0);
+    }
+
+    /// W7-R2: the set-aside bytes (with this buffer's) stay within the headroom left after the
+    /// caller's next phase, `free_size - need`, so set-aside memory (which the pool's LRU cap
+    /// does not release; only a drain does) never stands in for memory that phase needs. The
+    /// bound is conservative: `free_size` already excludes what is set aside. Set-asides go when
+    /// the commit domain (po2) changes. `RISC0_METAL_PREFILL_CAP=limit8`: Z14's cap of an eighth
+    /// of the working-set limit, kept across po2 changes.
+    fn prefill_elem_within(&self, size: usize, value: Self::Elem, need: usize) {
+        let bytes = (size * std::mem::size_of::<Self::Elem>()) as u64;
+        if !prefill_enabled()
+            || !self.hash().carries_fills()
+            || bytes == 0
+            || !bytes.is_multiple_of(16)
+        {
+            return;
+        }
+        let (max, free) = match prefill_cap_mode() {
+            PrefillCap::Limit8 => (self.rt.working_set_limit() / 8, 0),
+            PrefillCap::Headroom => {
+                let free = self.rt.free_size();
+                (free.saturating_sub(need as u64), free)
+            }
+        };
+        let word = value.as_u32_montgomery();
+        let kept = self.rt.prefill_reserve(bytes, word, max);
+        if kept {
+            let mut keys = self.r2.prefill_keys.lock().unwrap();
+            if !keys.contains(&(bytes, word)) {
+                keys.push((bytes, word));
+            }
+        }
+        if prefill_log() {
+            eprintln!(
+                "[prefill] {:.0} MiB word {:#x}: {} (need {:.0} MiB, free {:.0} MiB, cap {:.0} MiB, \
+                 allocated {:.0} MiB)",
+                bytes as f64 / MIB,
+                value.as_u32_montgomery(),
+                if kept { "set aside" } else { "not set aside" },
+                need as f64 / MIB,
+                free as f64 / MIB,
+                max as f64 / MIB,
+                self.rt.allocated_size() as f64 / MIB,
+            );
+        }
+    }
+
+    fn alloc_extelem_zeroed(&self, name: &'static str, size: usize) -> Self::Buffer<Self::ExtElem> {
+        self.small_alloc_extelem_zeroed(name, size)
     }
 
     fn copy_from_elem(&self, name: &'static str, slice: &[Self::Elem]) -> Self::Buffer<Self::Elem> {
-        BufferImpl::copy_from(name, &self.device, self.cmd_queue.clone(), slice)
+        self.copy_from_slice(name, slice)
     }
 
     fn alloc_extelem(&self, name: &'static str, size: usize) -> Self::Buffer<Self::ExtElem> {
-        BufferImpl::new(name, &self.device, self.cmd_queue.clone(), size)
+        self.alloc_buffer(name, size)
     }
 
     fn copy_from_extelem(
@@ -501,36 +873,27 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
         name: &'static str,
         slice: &[Self::ExtElem],
     ) -> Self::Buffer<Self::ExtElem> {
-        BufferImpl::copy_from(name, &self.device, self.cmd_queue.clone(), slice)
+        self.copy_from_slice(name, slice)
     }
 
     fn alloc_digest(&self, name: &'static str, size: usize) -> Self::Buffer<Digest> {
-        BufferImpl::new(name, &self.device, self.cmd_queue.clone(), size)
+        self.alloc_buffer(name, size)
     }
 
     fn copy_from_digest(&self, name: &'static str, slice: &[Digest]) -> Self::Buffer<Digest> {
-        BufferImpl::copy_from(name, &self.device, self.cmd_queue.clone(), slice)
+        self.copy_from_slice(name, slice)
     }
 
     fn alloc_u32(&self, name: &'static str, size: usize) -> Self::Buffer<u32> {
-        BufferImpl::new(name, &self.device, self.cmd_queue.clone(), size)
+        self.alloc_buffer(name, size)
     }
 
     fn copy_from_u32(&self, name: &'static str, slice: &[u32]) -> Self::Buffer<u32> {
-        BufferImpl::copy_from(name, &self.device, self.cmd_queue.clone(), slice)
+        self.copy_from_slice(name, slice)
     }
 
     fn batch_bit_reverse(&self, io: &Self::Buffer<Self::Elem>, count: usize) {
-        let row_size = io.size() / count;
-        assert_eq!(row_size * count, io.size());
-        let bits = log2_ceil(row_size);
-        assert_eq!(row_size, 1 << bits);
-        tracing::debug!(
-            "io: {}, count: {count}, row_size: {row_size}, bits: {bits}",
-            io.size()
-        );
-        let args = &[io.as_arg(), KernelArg::Integer(bits as u32)];
-        self.dispatch_by_name("multi_bit_reverse", args, row_size as u64 * count as u64);
+        self.ntt_batch_bit_reverse(io, count);
     }
 
     fn batch_expand_into_evaluate_ntt(
@@ -538,84 +901,44 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
         output: &Self::Buffer<Self::Elem>,
         input: &Self::Buffer<Self::Elem>,
         count: usize,
-        expand_bits: usize,
+        _expand_bits: usize,
     ) {
-        scope!("batch_expand", {
-            tracing::debug!(
-                "output: {}, input: {}, count: {count}",
-                output.size(),
-                input.size()
-            );
-            let out_size = output.size() / count;
-            let in_size = input.size() / count;
-            let expand_bits = log2_ceil(out_size / in_size);
-            assert_eq!(output.size(), out_size * count);
-            assert_eq!(input.size(), in_size * count);
-            assert_eq!(out_size, in_size * (1 << expand_bits));
-            let args = &[
-                output.as_arg(),
-                input.as_arg(),
-                KernelArg::Integer(count as u32),
-                KernelArg::Integer(out_size as u32),
-                KernelArg::Integer(in_size as u32),
-                KernelArg::Integer(expand_bits as u32),
-            ];
-            self.dispatch_by_name("batch_expand", args, out_size as u64);
-        });
-
-        scope!("batch_evaluate_ntt", {
-            tracing::debug!(
-                "output: {}, count: {count}, expand_bits: {expand_bits}",
-                output.size()
-            );
-            let row_size = output.size() / count;
-            assert_eq!(row_size * count, output.size());
-            let n_bits = log2_ceil(row_size);
-            assert_eq!(row_size, 1 << n_bits);
-            assert!(n_bits >= expand_bits);
-            assert!(n_bits < Self::Elem::MAX_ROU_PO2);
-            let rou = self.copy_from_elem("rou", Self::Elem::ROU_FWD);
-            let kernel = self.kernels.get("multi_ntt_fwd_step").unwrap();
-            for s_bits in 1 + expand_bits..=n_bits {
-                let args = &[
-                    output.as_arg(),
-                    rou.as_arg(),
-                    KernelArg::Integer(n_bits as u32),
-                    KernelArg::Integer(s_bits as u32),
-                    KernelArg::Integer(count as u32),
-                ];
-                let params = compute_launch_params(n_bits as u32, s_bits as u32, count as u32);
-                self.dispatch(kernel, args, count as u64, Some(params));
-            }
-        });
+        self.ntt_batch_expand_into_evaluate(output, input, count);
     }
 
     fn batch_interpolate_ntt(&self, io: &Self::Buffer<Self::Elem>, count: usize) {
-        scope!("batch_interpolate_ntt");
-        tracing::debug!("io: {}, count: {count}", io.size());
-        let row_size = io.size() / count;
-        assert_eq!(row_size * count, io.size());
-        let n_bits = log2_ceil(row_size);
-        assert_eq!(row_size, 1 << n_bits);
-        assert!(n_bits < Self::Elem::MAX_ROU_PO2);
+        self.ntt_batch_interpolate(io, count);
+    }
 
-        let rou = self.copy_from_elem("rou", Self::Elem::ROU_REV);
-        let kernel = self.kernels.get("multi_ntt_rev_step").unwrap();
-        for s_bits in (1..=n_bits).rev() {
-            let args = &[
-                io.as_arg(),
-                rou.as_arg(),
-                KernelArg::Integer(n_bits as u32),
-                KernelArg::Integer(s_bits as u32),
-                KernelArg::Integer(count as u32),
-            ];
-            let params = compute_launch_params(n_bits as u32, s_bits as u32, count as u32);
-            self.dispatch(kernel, args, count as u64, Some(params));
-        }
+    fn batch_interpolate_ntt_zk_shift(&self, io: &Self::Buffer<Self::Elem>, count: usize) {
+        self.ntt_batch_interpolate_zk_shift(io, count);
+    }
 
-        let norm = self.copy_from_elem("norm", &[Self::Elem::new(row_size as u32).inv()]);
-        let args = &[io.as_arg(), norm.as_arg()];
-        self.dispatch_by_name("eltwise_mul_factor_fp", args, io.size() as u64);
+    fn batch_interpolate_ntt_zk_shift_from(
+        &self,
+        dst: &Self::Buffer<Self::Elem>,
+        src: &Self::Buffer<Self::Elem>,
+        count: usize,
+    ) {
+        // W7-A1: the commit domain marks the pool's po2 epoch.
+        self.note_commit_domain(src.size() / count.max(1));
+        self.ntt_batch_interpolate_zk_shift_from(dst, src, count);
+    }
+
+    fn has_commit_coeffs_lde(&self, po2: usize) -> bool {
+        self.ntt_has_commit_coeffs_lde(po2)
+    }
+
+    fn commit_coeffs_lde(
+        &self,
+        coeffs: &Self::Buffer<Self::Elem>,
+        evaluated: &Self::Buffer<Self::Elem>,
+        witness: &Self::Buffer<Self::Elem>,
+        count: usize,
+    ) {
+        // W7-A1: the commit domain marks the pool's po2 epoch.
+        self.note_commit_domain(witness.size() / count.max(1));
+        self.ntt_commit_coeffs_lde(coeffs, evaluated, witness, count);
     }
 
     fn batch_evaluate_any(
@@ -627,22 +950,7 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
         out: &Self::Buffer<Self::ExtElem>,
     ) {
         scope!("batch_evaluate_any");
-        let po2 = log2_ceil(coeffs.size() / poly_count);
-        let count = 1 << po2;
-        assert_eq!(poly_count * count, coeffs.size());
-        let eval_count = which.size();
-        assert_eq!(xs.size(), eval_count);
-        assert_eq!(out.size(), eval_count);
-        let args = &[
-            out.as_arg(),
-            coeffs.as_arg(),
-            which.as_arg(),
-            xs.as_arg(),
-            KernelArg::Integer(count as u32),
-        ];
-        let kernel = self.kernels.get("multi_poly_eval").unwrap();
-        let params = simple_launch_params(out.size() as u32 * 256, 256);
-        self.dispatch(kernel, args, count as u64, Some(params));
+        eval::batch_evaluate_any(self, coeffs, poly_count, which, xs, out, None);
     }
 
     fn eltwise_add_elem(
@@ -655,7 +963,7 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
         assert_eq!(output.size(), input2.size());
         let count = output.size() as u64;
         let args = &[output.as_arg(), input1.as_arg(), input2.as_arg()];
-        self.dispatch_by_name("eltwise_add_fp", args, count);
+        self.launch("eltwise_add_fp", count, args);
     }
 
     fn eltwise_sum_extelem(
@@ -663,17 +971,7 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
         output: &Self::Buffer<Self::Elem>,
         input: &Self::Buffer<Self::ExtElem>,
     ) {
-        let count = output.size() / Self::ExtElem::EXT_SIZE;
-        let to_add = input.size() / count;
-        assert_eq!(output.size(), count * Self::ExtElem::EXT_SIZE);
-        assert_eq!(input.size(), count * to_add);
-        let args = &[
-            output.as_arg(),
-            input.as_arg(),
-            KernelArg::Integer(count as u32),
-            KernelArg::Integer(to_add as u32),
-        ];
-        self.dispatch_by_name("eltwise_sum_fpext", args, count as u64);
+        self.small_eltwise_sum_extelem(output, input);
     }
 
     fn eltwise_copy_elem(
@@ -684,7 +982,7 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
         assert_eq!(output.size(), input.size());
         let count = output.size() as u64;
         let args = &[output.as_arg(), input.as_arg()];
-        self.dispatch_by_name("eltwise_copy_fp", args, count);
+        self.launch("eltwise_copy_fp", count, args);
     }
 
     fn fri_fold(
@@ -696,14 +994,15 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
         let count = output.size() / Self::ExtElem::EXT_SIZE;
         assert_eq!(output.size(), count * Self::ExtElem::EXT_SIZE);
         assert_eq!(input.size(), output.size() * FRI_FOLD);
-        let mix = self.copy_from_extelem("mix", &[*mix]);
+        let count32 = u32::try_from(count).expect("fri_fold: too many outputs");
+        let mix = [*mix];
         let args = &[
             output.as_arg(),
             input.as_arg(),
-            mix.as_arg(),
-            KernelArg::Integer(count as u32),
+            KernelArg::Bytes(as_bytes(&mix)),
+            KernelArg::Integer(count32),
         ];
-        self.dispatch_by_name("fri_fold", args, count as u64);
+        self.launch("fri_fold", count as u64, args);
     }
 
     fn mix_poly_coeffs(
@@ -723,35 +1022,134 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
             combos.size(),
         );
 
-        let mix_start = self.copy_from_extelem("mix_start", &[*mix_start]);
-        let mix = self.copy_from_extelem("mix", &[*mix]);
-        let args = &[
-            output.as_arg(),
-            input.as_arg(),
-            combos.as_arg(),
-            mix_start.as_arg(),
-            mix.as_arg(),
-            KernelArg::Integer(input_size as u32),
-            KernelArg::Integer(count as u32),
-        ];
-        self.dispatch_by_name("mix_poly_coeffs", args, count as u64);
+        eval::mix_poly_coeffs(
+            self, output, mix_start, mix, input, combos, input_size, count, None,
+        );
+    }
+
+    fn has_mix_poly_coeffs_fused(&self) -> bool {
+        mix::mix_fused_enabled()
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn mix_poly_coeffs_fused(
+        &self,
+        out: &Self::Buffer<Self::ExtElem>,
+        mix: &Self::ExtElem,
+        inputs: &[(&Self::Buffer<Self::Elem>, &[u32])],
+        count: usize,
+    ) {
+        mix::mix_poly_coeffs_fused(self, out, mix, inputs, count, !mix::mix_fused_enabled());
     }
 
     fn hash_fold(&self, io: &Self::Buffer<Digest>, input_size: usize, output_size: usize) {
+        // The CPU HAL's checks: the kernels read io[input_size..2 * input_size].
+        assert!(
+            io.size() >= 2 * input_size,
+            "hash_fold: io holds {} digests, input_size {input_size} needs {}",
+            io.size(),
+            2 * input_size
+        );
         assert_eq!(input_size, 2 * output_size);
-        self.hash.as_ref().unwrap().hash_fold(self, io, output_size);
+        self.hash().hash_fold(self, io, output_size);
+        self.flush();
+    }
+
+    fn hash_fold_tree(&self, io: &Self::Buffer<Digest>, layers: usize) {
+        assert!(
+            layers < usize::BITS as usize - 1 && io.size() >= 2 << layers,
+            "hash_fold_tree: {} digests for {layers} layers",
+            io.size()
+        );
+        self.hash().hash_fold_tree(self, io, layers);
+        self.flush();
     }
 
     fn hash_rows(&self, output: &Self::Buffer<Digest>, matrix: &Self::Buffer<Self::Elem>) {
-        self.hash.as_ref().unwrap().hash_rows(self, output, matrix);
+        self.hash().hash_rows(self, output, matrix);
+        self.flush();
+    }
+
+    fn fuses_bit_reverse_into_hash(&self, rows: usize, cols: usize, lg: usize) -> bool {
+        self.hash().fuses_bit_reverse(rows, cols, lg)
+    }
+
+    fn hash_rows_bit_reverse(
+        &self,
+        output: &Self::Buffer<Digest>,
+        matrix: &Self::Buffer<Self::Elem>,
+        coeffs: &Self::Buffer<Self::Elem>,
+        count: usize,
+    ) {
+        if !self
+            .hash()
+            .hash_rows_bit_reverse(self, output, matrix, coeffs, count)
+        {
+            self.hash().hash_rows(self, output, matrix);
+            self.ntt_batch_bit_reverse(coeffs, count);
+        }
+        self.flush();
+    }
+
+    fn commit_coeffs_lde_bit_reversed(
+        &self,
+        coeffs: &Self::Buffer<Self::Elem>,
+        evaluated: &Self::Buffer<Self::Elem>,
+        witness: &Self::Buffer<Self::Elem>,
+        count: usize,
+    ) {
+        // W7-A1: the commit domain marks the pool's po2 epoch.
+        self.note_commit_domain(witness.size() / count.max(1));
+        self.ntt_commit_coeffs_lde_impl(coeffs, evaluated, witness, count, false);
+    }
+
+    /// W7-R2: remembers a handle to `witness` (it stays allocated until it is committed or
+    /// another buffer is donated).
+    fn donate_to_commit(&self, witness: &Self::Buffer<Self::Elem>) {
+        *self.r2.donation.lock().unwrap() = Some(witness.clone());
+    }
+
+    /// W7-R2: the same view (GPU address and size) of the donated buffer.
+    fn take_commit_donation(&self, witness: &Self::Buffer<Self::Elem>) -> bool {
+        let mut slot = self.r2.donation.lock().unwrap();
+        let hit = slot.as_ref().is_some_and(|d| {
+            d.as_device_ptr() == witness.as_device_ptr() && d.size() == witness.size()
+        });
+        if hit {
+            *slot = None;
+        }
+        hit
+    }
+
+    /// W7-R2: Z13's chunked commit with the witness as its own coefficient buffer: each chunk's
+    /// inverse NTT runs in place (as `batch_interpolate_ntt` does) before its CT pass reads it.
+    fn commit_coeffs_lde_in_place(
+        &self,
+        io: &Self::Buffer<Self::Elem>,
+        evaluated: &Self::Buffer<Self::Elem>,
+        count: usize,
+        bit_reversed: bool,
+    ) {
+        self.note_commit_domain(io.size() / count.max(1));
+        let lg = crate::core::log2_ceil(io.size() / count.max(1));
+        if self.ntt_has_commit_coeffs_lde(lg) {
+            self.ntt_commit_coeffs_lde_impl(io, evaluated, io, count, !bit_reversed);
+        } else {
+            self.batch_interpolate_ntt_zk_shift(io, count);
+            self.batch_expand_into_evaluate_ntt(
+                evaluated,
+                io,
+                count,
+                crate::core::log2_ceil(crate::INV_RATE),
+            );
+            if !bit_reversed {
+                self.batch_bit_reverse(io, count);
+            }
+        }
     }
 
     fn zk_shift(&self, io: &Self::Buffer<Self::Elem>, poly_count: usize) {
-        let bits = log2_ceil(io.size() / poly_count);
-        let count = io.size();
-        assert_eq!(io.size(), poly_count * (1 << bits));
-        let args = &[io.as_arg(), KernelArg::Integer(bits as u32)];
-        self.dispatch_by_name("zk_shift", args, count as u64);
+        self.ntt_zk_shift(io, poly_count);
     }
 
     fn gather_sample(
@@ -762,66 +1160,90 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
         size: usize,
         stride: usize,
     ) {
+        // The CPU HAL panics on these; the kernel reads src[gid * stride + idx] (64-bit index math)
+        // with no bounds check.
+        assert!(
+            dst.size() >= size,
+            "gather_sample: dst holds {} elements, size {size}",
+            dst.size()
+        );
+        if size == 0 {
+            return;
+        }
+        let last = (size - 1)
+            .checked_mul(stride)
+            .and_then(|o| o.checked_add(idx))
+            .expect("gather_sample: index overflow");
+        assert!(
+            last < src.size(),
+            "gather_sample: reads src[{last}] of {} elements (idx {idx}, size {size}, stride \
+             {stride})",
+            src.size()
+        );
+        // The kernel computes the src index in 64 bits (Z8a), so `last` is bounded only by
+        // src.size(); idx and stride are still passed as 32-bit kernel arguments.
+        assert!(
+            idx <= u32::MAX as usize && (size == 1 || stride <= u32::MAX as usize),
+            "gather_sample: idx {idx} / stride {stride} exceed the kernel's 32-bit arguments"
+        );
         let args = &[
             dst.as_arg(),
             src.as_arg(),
             KernelArg::Integer(idx as u32),
             KernelArg::Integer(stride as u32),
         ];
-        self.dispatch_by_name("gather_sample", args, size as u64);
+        self.launch("gather_sample", size as u64, args);
     }
 
     fn has_unified_memory(&self) -> bool {
         self.device.has_unified_memory()
     }
 
+    fn batch_get_digest_at(&self, buf: &Self::Buffer<Digest>, indices: &[usize]) -> Vec<Digest> {
+        query::batch_get_digest_at(buf, indices)
+    }
+
+    fn gather_multi(
+        &self,
+        jobs: &[super::GatherJob<'_, Self>],
+    ) -> Option<Vec<(Vec<Self::Elem>, Vec<Digest>)>> {
+        if !query::query_par_enabled() {
+            return None;
+        }
+        let jobs: Vec<query::HostGather<'_, BabyBearElem>> = jobs
+            .iter()
+            .map(|j| query::HostGather {
+                matrix: j.matrix,
+                col_size: j.col_size,
+                row_size: j.row_size,
+                rows: j.rows,
+                nodes: j.nodes,
+                node_indices: j.node_indices,
+            })
+            .collect();
+        Some(query::gather_multi(&jobs))
+    }
+
+    fn trim_device_memory(&self) {
+        let released = self.rt.drain_pool();
+        tracing::debug!(
+            "trim_device_memory: released {:.2} GiB of pooled Metal buffers",
+            released as f64 / (1u64 << 30) as f64
+        );
+    }
+
+    fn gpu_total_memory(&self) -> usize {
+        self.rt.working_set_limit() as usize
+    }
+
+    fn gpu_free_memory(&self) -> usize {
+        self.rt.free_size() as usize
+    }
+
     fn get_hash_suite(&self) -> &HashSuite<Self::Field> {
-        self.hash.as_ref().unwrap().get_hash_suite()
+        self.hash().get_hash_suite()
     }
 
-    #[cfg(feature = "metal_prefix_products")]
-    fn prefix_products(&self, io: &Self::Buffer<Self::ExtElem>) {
-        let block_size = 256;
-        let grain_size = 16;
-        let threadgroup_size = block_size * grain_size;
-        let io_size = io.size() as u64;
-        let threadgroups = (io_size + threadgroup_size - 1) / threadgroup_size;
-        let threadgroups_per_grid = MTLSize::new(threadgroups, 1, 1);
-        let threads_per_threadgroup = MTLSize::new(block_size, 1, 1);
-        let params = Params::ThreadGroups(threadgroups_per_grid, threads_per_threadgroup);
-
-        let partial_products = self.alloc_extelem("partial_products", block_size as usize);
-
-        let kernel = self.kernels.get("reduce").unwrap();
-        let args = &[partial_products.as_arg(), io.as_arg()];
-        self.dispatch(kernel, args, 0, Some(params.clone()));
-
-        // partial_products.view(|view| {
-        //     println!("partial_products");
-        //     let items: Vec<_> = view.iter().enumerate().collect();
-        //     for (i, x) in items {
-        //         println!("{i}: {x:?}");
-        //     }
-        // });
-
-        let kernel = self.kernels.get("prefix_products_single").unwrap();
-        let args = &[partial_products.as_arg(), partial_products.as_arg()];
-        self.dispatch(kernel, args, 0, Some(params.clone()));
-
-        // partial_products.view(|view| {
-        //     println!("partial_products");
-        //     let items: Vec<_> = view.iter().enumerate().collect();
-        //     for (i, x) in items {
-        //         println!("{i}: {x:?}");
-        //     }
-        // });
-
-        let kernel = self.kernels.get("prefix_products").unwrap();
-        let args = &[io.as_arg(), partial_products.as_arg()];
-        self.dispatch(kernel, args, 0, Some(params));
-    }
-
-    #[cfg(not(feature = "metal_prefix_products"))]
     fn prefix_products(&self, io: &Self::Buffer<Self::ExtElem>) {
         io.view_mut(|io| {
             for i in 1..io.len() {
@@ -831,11 +1253,7 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
     }
 
     fn eltwise_zeroize_elem(&self, elems: &Self::Buffer<Self::Elem>) {
-        elems.view_mut(|slice| {
-            slice.par_iter_mut().for_each(|elem| {
-                *elem = elem.valid_or_zero();
-            });
-        })
+        self.small_eltwise_zeroize_elem(elems);
     }
 
     fn scatter(
@@ -845,13 +1263,32 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
         offsets: &[u32],
         values: &[Self::Elem],
     ) {
-        into.view_mut(|into| {
-            for cycle in 0..index.len() - 1 {
-                for idx in index[cycle]..index[cycle + 1] {
-                    into[offsets[idx as usize] as usize] = values[idx as usize];
-                }
-            }
-        });
+        self.small_scatter(into, index, offsets, values);
+    }
+
+    fn scatter_bits(&self, into: &Self::Buffer<Self::Elem>, bit_data: &[u32], cycles: u32) {
+        self.small_scatter_bits(into, bit_data, cycles);
+    }
+
+    fn combos_prepare(
+        &self,
+        combos: &Self::Buffer<Self::ExtElem>,
+        coeff_u: &[Self::ExtElem],
+        combo_count: usize,
+        cycles: usize,
+        reg_sizes: &[u32],
+        reg_combo_ids: &[u32],
+        mix: &Self::ExtElem,
+    ) {
+        self.small_combos_prepare(
+            combos,
+            coeff_u,
+            combo_count,
+            cycles,
+            reg_sizes,
+            reg_combo_ids,
+            mix,
+        );
     }
 
     fn eltwise_copy_elem_slice(
@@ -865,168 +1302,225 @@ impl<MH: MetalHash> Hal for MetalHal<MH> {
         into_offset: usize,
         into_stride: usize,
     ) {
-        into.view_mut(|into| {
-            for row in 0..from_rows {
-                for col in 0..from_cols {
-                    into[into_offset + row * into_stride + col] =
-                        from[from_offset + row * from_stride + col];
-                }
-            }
-        });
+        self.small_eltwise_copy_elem_slice(
+            into,
+            from,
+            from_rows,
+            from_cols,
+            from_offset,
+            from_stride,
+            into_offset,
+            into_stride,
+        );
     }
-}
 
-fn simple_launch_params(count: u32, threads_per_group: u32) -> (MTLSize, MTLSize) {
-    let groups = count.div_ceil(threads_per_group);
-    (
-        MTLSize::new(groups.into(), 1, 1),
-        MTLSize::new(threads_per_group.into(), 1, 1),
-    )
-}
-
-fn compute_launch_params(n_bits: u32, s_bits: u32, c_size: u32) -> (MTLSize, MTLSize) {
-    let s_size = 1 << (s_bits - 1);
-    let g_size = 1 << (n_bits - s_bits);
-
-    let mut grid = MTLSize::new(1, 1, 1);
-    let mut block = MTLSize::new(1, 1, 1);
-
-    let mut threads = 128;
-    // First thread over S
-    block.width = threads.min(s_size);
-    threads /= block.width;
-    // Next thread over G
-    block.height = threads.min(g_size);
-    // Don't bother threading over C
-    let mut grids = 32;
-    // First grid over S
-    grid.width = grids.min(s_size / block.width);
-    grids /= grid.width;
-    // Next grid over G
-    grid.height = grids.min(g_size / block.height);
-    grids /= grid.height;
-    // Next grid over C
-    grid.depth = grids.min(c_size as u64);
-    (grid, block)
+    fn combos_divide(
+        &self,
+        combos: &Self::Buffer<Self::ExtElem>,
+        chunks: Vec<(usize, Vec<Self::ExtElem>)>,
+        cycles: usize,
+    ) {
+        scope!("combos_divide");
+        let remainders = self.mdiv_combos_divide(combos, &chunks, cycles);
+        super::report_nonzero_remainders(&chunks, &remainders);
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use test_log::test;
+mod tests_r2 {
+    //! W7-R2 (small-Mac tier memory): the in-place commit (`Hal::commit_coeffs_lde_in_place`)
+    //! against the CPU prover's commit, the commit donation, and the Z14 prefill set-aside's
+    //! headroom cap and its release on a po2 change.
 
-    use super::{MetalHalPoseidon2, MetalHalSha256};
-    use crate::hal::testutil;
+    use risc0_core::field::{baby_bear::BabyBearElem as Fp, Elem as _};
 
-    #[test]
-    fn batch_bit_reverse() {
-        testutil::batch_bit_reverse(MetalHalSha256::new());
+    use super::{poseidon2::Poseidon2Config, MetalHalPoseidon2, MetalHashPoseidon2};
+    use crate::{
+        core::hash::poseidon2::Poseidon2HashSuite,
+        hal::{cpu::CpuHal, Buffer as _, Hal},
+        prove::poly_group::PolyGroup,
+        INV_RATE,
+    };
+
+    fn random_vec(seed: u64, n: usize) -> Vec<Fp> {
+        let mut state = seed | 1;
+        (0..n)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                Fp::new((state % (risc0_core::field::baby_bear::P as u64)) as u32)
+            })
+            .collect()
     }
 
-    #[test]
-    fn batch_evaluate_any() {
-        testutil::batch_evaluate_any(MetalHalSha256::new());
+    fn set_fuse(hal: &MetalHalPoseidon2, on: bool) {
+        let hash: &MetalHashPoseidon2 = hal.hash();
+        hash.set_config(Poseidon2Config {
+            commit_fuse: on,
+            ..hash.config()
+        });
     }
 
-    #[test]
-    fn batch_expand_into_evaluate_ntt() {
-        testutil::batch_expand_into_evaluate_ntt(MetalHalSha256::new());
+    type Group = (Vec<Fp>, Vec<Fp>, crate::core::digest::Digest);
+
+    fn summary<H: Hal<Elem = Fp>>(g: &PolyGroup<H>) -> Group {
+        (
+            g.coeffs.as_ref().unwrap().to_vec(),
+            g.evaluated.as_ref().unwrap().to_vec(),
+            *g.merkle.root(),
+        )
     }
 
-    #[test]
-    fn batch_interpolate_ntt() {
-        testutil::batch_interpolate_ntt(MetalHalSha256::new());
+    /// The group an in-place commit of `witness` builds on `hal` (what
+    /// `Prover::commit_group_in_place` does).
+    fn in_place<H: Hal<Elem = Fp>>(hal: &H, witness_in: &[Fp], cols: usize, size: usize) -> Group {
+        let io = hal.copy_from_elem("accum", witness_in);
+        let evaluated = hal.alloc_elem("evaluated", io.size() * INV_RATE);
+        let bit_reversed =
+            hal.fuses_bit_reverse_into_hash(size * INV_RATE, cols, crate::core::log2_ceil(size));
+        hal.commit_coeffs_lde_in_place(&io, &evaluated, cols, bit_reversed);
+        let g = if bit_reversed {
+            PolyGroup::new_with_evaluated_bit_reversed(hal, io, evaluated, cols, size, "r2")
+        } else {
+            PolyGroup::new_with_evaluated(hal, io, evaluated, cols, size, "r2")
+        };
+        summary(&g)
     }
 
+    /// Coefficients, evaluated domain and Merkle root of an in-place commit, on Metal (Z13's chunked
+    /// commit and the unfused fallback below its range, Z14's deferred bit reversal on and off) and
+    /// with the trait default on the CPU, equal the CPU prover's commit (`make_coeffs` +
+    /// `PolyGroup::new`) bit for bit, po2 10..20.
     #[test]
-    #[should_panic]
-    fn check_req() {
-        testutil::check_req(MetalHalSha256::new());
-    }
-
-    #[test]
-    fn eltwise_add_fp() {
-        testutil::eltwise_add_elem(MetalHalSha256::new());
-    }
-
-    #[test]
-    fn eltwise_copy_fp() {
-        testutil::eltwise_copy_elem(MetalHalSha256::new());
-    }
-
-    #[test]
-    fn eltwise_sum_extelem() {
-        testutil::eltwise_sum_extelem(MetalHalSha256::new());
-    }
-
-    #[test]
-    fn fri_fold() {
-        testutil::fri_fold(MetalHalSha256::new());
-    }
-
-    #[test]
-    fn mix_poly_coeffs() {
-        testutil::mix_poly_coeffs(MetalHalSha256::new());
-    }
-
-    #[test]
-    fn hash_fold_sha256() {
-        testutil::hash_fold(MetalHalSha256::new());
-    }
-
-    #[test]
-    fn hash_rows_sha256() {
-        testutil::hash_rows(MetalHalSha256::new());
-    }
-
-    #[test]
-    fn hash_fold_poseidon2() {
-        testutil::hash_fold(MetalHalPoseidon2::new());
-    }
-
-    #[test]
-    fn hash_rows_poseidon2() {
-        testutil::hash_rows(MetalHalPoseidon2::new());
-    }
-
-    #[test]
-    fn slice() {
-        testutil::slice(MetalHalSha256::new());
-    }
-
-    #[test]
-    fn zk_shift() {
-        testutil::zk_shift(MetalHalSha256::new());
-    }
-
-    #[test]
-    fn gather_sample() {
-        testutil::gather_sample(MetalHalSha256::new());
-    }
-
-    #[test]
-    fn prefix_products() {
-        use crate::hal::{cpu::CpuHal, dual::DualHal, Hal as _};
-        use risc0_core::field::baby_bear::BabyBearExtElem;
-        use std::rc::Rc;
-
-        fn test(size: usize) {
-            let hal_gpu = MetalHalSha256::new();
-            let hal_cpu = CpuHal::new(hal_gpu.get_hash_suite().clone());
-            let hal = DualHal::new(Rc::new(hal_cpu), Rc::new(hal_gpu));
-
-            use risc0_core::field::Elem as _;
-            let mut rng = rand::rng();
-            let io: Vec<_> = (0..size)
-                .map(|_| BabyBearExtElem::random(&mut rng))
-                .collect();
-            let io = hal.copy_from_extelem("io", io.as_slice());
-
-            hal.prefix_products(&io);
+    fn r2_commit_in_place_matches_cpu() {
+        let cpu = CpuHal::new(Poseidon2HashSuite::new_suite());
+        let hal = MetalHalPoseidon2::new();
+        for (po2, cols) in [
+            (4, 3),
+            (10, 1),
+            (11, 5),
+            (12, 16),
+            (13, 17),
+            (14, 103),
+            (16, 3),
+            (18, 16),
+            (19, 2),
+            (20, 4),
+        ] {
+            let size = 1usize << po2;
+            let witness_in = random_vec(po2 as u64 * 131 + cols as u64, size * cols);
+            let want = {
+                let w = cpu.copy_from_elem("witness", &witness_in);
+                let coeffs = cpu.alloc_elem("coeffs", w.size());
+                cpu.batch_interpolate_ntt_zk_shift_from(&coeffs, &w, cols);
+                summary(&PolyGroup::new(&cpu, coeffs, cols, size, "ref"))
+            };
+            assert!(
+                in_place(&cpu, &witness_in, cols, size) == want,
+                "cpu default: po2 {po2} cols {cols}"
+            );
+            for fuse in [true, false] {
+                set_fuse(&hal, fuse);
+                let got = in_place(&hal, &witness_in, cols, size);
+                assert!(got.0 == want.0, "coeffs: po2 {po2} cols {cols} fuse {fuse}");
+                assert!(
+                    got.1 == want.1,
+                    "evaluated: po2 {po2} cols {cols} fuse {fuse}"
+                );
+                assert_eq!(got.2, want.2, "root: po2 {po2} cols {cols} fuse {fuse}");
+            }
+            set_fuse(&hal, true);
         }
+    }
 
-        for i in 15..=20 {
-            println!("po2: {i}");
-            test(1 << i);
+    /// The headroom cap (`RISC0_METAL_PREFILL_CAP`, default): a buffer is set aside only while the
+    /// working-set headroom after the caller's next phase (`free_size - need`) covers it; a change of
+    /// the commit domain (po2) releases the set-aside buffers; the same domain keeps them.
+    #[test]
+    fn r2_prefill_headroom_and_po2_release() {
+        // Sets budgets and reads the device-wide allocation level.
+        let _lock = super::gpu_test_lock();
+        if !super::prefill_enabled() || super::prefill_cap_mode() != super::PrefillCap::Headroom {
+            eprintln!("r2_prefill_headroom_and_po2_release: prefill off or limit8 cap, skipped");
+            return;
         }
+        let hal = MetalHalPoseidon2::new();
+        set_fuse(&hal, true);
+        let n = 1usize << 18;
+        let bytes = (n * 4) as u64;
+        let pooled = |seed| {
+            let b = hal.copy_from_elem("dirty", &random_vec(seed, n));
+            hal.sync();
+            drop(b);
+        };
+        hal.note_commit_domain(1 << 12);
+
+        // Headroom: none left after `need` -> nothing set aside (the buffer stays pooled).
+        pooled(1);
+        hal.prefill_elem_within(n, Fp::INVALID, usize::MAX / 2);
+        assert_eq!(hal.rt.prefill_stats(), (0, 0), "no headroom");
+        // With headroom for it -> set aside.
+        hal.prefill_elem_within(n, Fp::INVALID, 0);
+        assert_eq!(hal.rt.prefill_stats(), (1, 0), "headroom");
+        assert_eq!(
+            *hal.r2.prefill_keys.lock().unwrap(),
+            vec![(bytes, Fp::INVALID.as_u32_montgomery())]
+        );
+
+        // Same domain again: kept.
+        hal.note_commit_domain(1 << 12);
+        assert_eq!(hal.rt.prefill_stats(), (1, 0), "same po2 keeps");
+        // A new domain: released (freed, not pooled: the device allocation drops by its size), and
+        // the next alloc_elem_init is an ordinary (filled) allocation.
+        hal.sync();
+        let before = hal.rt.allocated_size();
+        hal.note_commit_domain(1 << 13);
+        assert_eq!(hal.rt.prefill_stats(), (0, 0), "po2 change releases");
+        assert!(hal.r2.prefill_keys.lock().unwrap().is_empty());
+        assert!(
+            hal.rt.allocated_size() + bytes <= before,
+            "released buffer freed: {} -> {}",
+            before,
+            hal.rt.allocated_size()
+        );
+        // A key whose buffer is gone (taken, or released by a drain) releases nothing.
+        hal.r2.prefill_keys.lock().unwrap().push((bytes, 7));
+        assert_eq!(hal.prefill_release(), 0);
+        let got = hal.alloc_elem_init("data", n, Fp::INVALID);
+        assert!(got
+            .to_vec()
+            .iter()
+            .all(|x| x.as_u32_montgomery() == Fp::INVALID.as_u32_montgomery()));
+        drop(got);
+
+        // A budget that leaves no headroom at all refuses even with need 0.
+        pooled(2);
+        hal.set_working_set_limit(Some(16));
+        hal.prefill_elem(n, Fp::ZERO);
+        hal.set_working_set_limit(None);
+        assert_eq!(hal.rt.prefill_stats(), (0, 0), "budget");
+        hal.trim_device_memory();
+    }
+
+    /// `Hal::donate_to_commit`: only the donated view matches, once; a later donation replaces it.
+    #[test]
+    fn r2_commit_donation() {
+        let hal = MetalHalPoseidon2::new();
+        let a = hal.alloc_elem("a", 1 << 10);
+        let b = hal.alloc_elem("b", 1 << 10);
+        assert!(!hal.take_commit_donation(&a), "nothing donated");
+        hal.donate_to_commit(&a);
+        assert!(!hal.take_commit_donation(&b), "other buffer");
+        assert!(!hal.take_commit_donation(&a.slice(0, 1 << 9)), "other view");
+        assert!(
+            hal.take_commit_donation(&a.clone()),
+            "donated buffer (any handle)"
+        );
+        assert!(!hal.take_commit_donation(&a), "consumed");
+        hal.donate_to_commit(&a);
+        hal.donate_to_commit(&b);
+        assert!(!hal.take_commit_donation(&a), "replaced");
+        assert!(hal.take_commit_donation(&b));
     }
 }

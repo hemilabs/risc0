@@ -14,9 +14,20 @@
 
 #include "fp.h"
 #include "fpext.h"
-#include "sha256.h"
 
 using namespace metal;
+
+// Elementwise kernels (ports of sys/kernels/zkp/cuda/eltwise.cu). 1-D, dispatched with
+// MetalHal::launch (dispatch_threads, so the grid is exact; kernels that take a `count` still
+// bounds-check as plan 2.4 asks).
+//
+// Buffer indices:
+//   eltwise_add_fp        0 out, 1 in1, 2 in2
+//   eltwise_mul_factor_fp 0 io, 1 factor (set_bytes Fp; no Hal caller since Z7, kept as the
+//                         KernelArg::Bytes plumbing kernel of hal::metal::tests)
+//   eltwise_copy_fp       0 out, 1 in
+//   eltwise_sum_fpext     0 out, 1 in, 2 to_add, 3 count          (CUDA argument order)
+//   eltwise_zeroize_fp    0 elems, 1 count
 
 kernel void eltwise_add_fp(device Fp* out,
                            const device Fp* in1,
@@ -26,11 +37,11 @@ kernel void eltwise_add_fp(device Fp* out,
 }
 
 kernel void eltwise_mul_factor_fp(device Fp* io,
-                                  const device Fp& factor,
+                                  constant Fp& factor,
                                   uint gid [[thread_position_in_grid]]) {
-  io[gid] = io[gid] * factor;
+  Fp f = factor;
+  io[gid] = io[gid] * f;
 }
-
 
 kernel void eltwise_copy_fp(device Fp* out,
                             const device Fp* in,
@@ -38,28 +49,35 @@ kernel void eltwise_copy_fp(device Fp* out,
   out[gid] = in[gid];
 }
 
+// eltwise.cu:57 eltwise_sum_fpext(out, in, to_add, count).
 kernel void eltwise_sum_fpext(device Fp* out,
                               const device FpExt* in,
-                              const device uint32_t& count,
-                              const device uint32_t& to_add,
+                              constant uint32_t& to_add,
+                              constant uint32_t& count,
                               uint gid [[thread_position_in_grid]]) {
+  if (gid >= count) {
+    return;
+  }
   FpExt tot;
-  for (size_t i = 0; i < to_add; i++) {
-    tot += in[count * i + gid];
+  // 64-bit input index, as CUDA (`size_t i`): count * to_add FpExt may exceed 2^32 elements.
+  for (uint32_t i = 0; i < to_add; i++) {
+    tot += in[ulong(count) * i + gid];
   }
-  for (uint32_t i = 0; i < 4; i++) {
-    out[gid + i * count] = tot.elems[i];
-  }
+  out[gid + 0 * count] = tot.elems[0];
+  out[gid + 1 * count] = tot.elems[1];
+  out[gid + 2 * count] = tot.elems[2];
+  out[gid + 3 * count] = tot.elems[3];
 }
 
-kernel void eltwise_zeroize_fp(uint gid [[thread_position_in_grid]],
-                               device Fp* elems) {
+// eltwise.cu:72: write only the INVALID cells (a read-mostly pass with the same result).
+kernel void eltwise_zeroize_fp(device Fp* elems,
+                               constant uint32_t& count,
+                               uint gid [[thread_position_in_grid]]) {
+  if (gid >= count) {
+    return;
+  }
   Fp val = elems[gid];
-  elems[gid] = val.zeroize();
-}
-
-kernel void eltwise_zeroize_fpext(uint gid [[thread_position_in_grid]],
-                               device FpExt* elems) {
-  FpExt val = elems[gid];
-  elems[gid] = val.zeroize();
+  if (val.asRaw() == Fp::INVALID) {
+    elems[gid] = Fp(0);
+  }
 }

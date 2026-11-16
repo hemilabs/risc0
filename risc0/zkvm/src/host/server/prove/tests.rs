@@ -32,6 +32,120 @@ use crate::{
     SimpleSegmentRef, SuccinctReceiptVerifierParameters, VerifierContext,
 };
 
+/// Held by every test whose peak process footprint alone is above ~2.5 GB (W7-V1, LEADS2 S1; the
+/// per-test table is in `docs/metal-port/notes/W7-V1.md`), so the default parallel harness runs
+/// at most one of them at a time beside the small tests. Without it the whole lib suite peaked at
+/// ~41 GB on a 36 GB Mac; with it ~16 GB (the one-thread floor is ~15.8 GB).
+///
+/// It is an exclusive `flock` on a file named after this process, not a static: every open of
+/// the file is its own lock owner, so two threads of the process exclude each other, while other
+/// processes are not affected. `host::recursion::tests` cannot name this private module and keeps
+/// a copy of this function; the two copies lock the same file. Released when dropped (also when
+/// the test panics). Not reentrant: a test takes it once, in its own body, never in a helper.
+pub(crate) struct HeavyTestLock(#[allow(dead_code)] std::fs::File);
+
+pub(crate) fn heavy_test_lock() -> HeavyTestLock {
+    let path =
+        std::env::temp_dir().join(format!("risc0-zkvm-heavy-test-{}.lock", std::process::id()));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .unwrap_or_else(|e| panic!("heavy test lock {}: {e}", path.display()));
+    file.lock()
+        .unwrap_or_else(|e| panic!("heavy test lock {}: {e}", path.display()));
+    HeavyTestLock(file)
+}
+
+/// [heavy_test_lock] excludes another thread of this process (a second open of the file is a
+/// second lock owner) and is free again once dropped.
+#[test]
+fn heavy_test_lock_excludes_threads() {
+    let path =
+        std::env::temp_dir().join(format!("risc0-zkvm-heavy-test-{}.lock", std::process::id()));
+    let try_other = || {
+        let path = path.clone();
+        std::thread::spawn(move || {
+            let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            match file.try_lock() {
+                Ok(()) => true,
+                Err(std::fs::TryLockError::WouldBlock) => false,
+                Err(e) => panic!("{e}"),
+            }
+        })
+        .join()
+        .unwrap()
+    };
+    let held = heavy_test_lock();
+    assert!(
+        !try_other(),
+        "a second thread took the held heavy test lock"
+    );
+    drop(held);
+    // Another test may take it in between; wait until it is free.
+    let t = std::time::Instant::now();
+    while !try_other() {
+        assert!(
+            t.elapsed().as_secs() < 600,
+            "the heavy test lock was never free"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// For an `#[ignore]`d measurement test that needs the machine to itself (po2 20 sessions, a
+/// process-wide working-set budget): fail unless it runs under `gpu-run`'s heavy (or huge) lock,
+/// which exports `GPU_RUN_MODE`. Outside this machine set `GPU_RUN_MODE=heavy` to confirm that
+/// nothing else is using the GPU or most of the RAM.
+#[cfg_attr(not(feature = "metal"), allow(dead_code))]
+pub(crate) fn require_gpu_run_heavy(test: &str) {
+    match std::env::var("GPU_RUN_MODE").as_deref() {
+        Ok("heavy") | Ok("huge") => {}
+        other => panic!(
+            "{test} is a heavy measurement test: run it alone under `gpu-run` (heavy lock, which \
+             sets GPU_RUN_MODE=heavy); GPU_RUN_MODE is {other:?}"
+        ),
+    }
+}
+
+/// A segment po2 for tests that prove a long guest with the default prover, so they fit the
+/// Metal working-set limit (`RISC0_METAL_MAX_WORKING_SET_BYTES`, or the device's
+/// `recommendedMaxWorkingSetSize`): zk-miner M8's tier table, < 6 GiB -> 18, < 12 GiB -> 19,
+/// else 20 (the default segment size). `None` (the default po2) without Metal.
+pub(crate) fn segment_po2_for_budget() -> Option<u32> {
+    #[cfg(feature = "metal")]
+    {
+        const GIB: u64 = 1 << 30;
+        let (limit, _) = risc0_zkp::hal::metal::device_memory()?;
+        Some(match limit {
+            l if l < 6 * GIB => 18,
+            l if l < 12 * GIB => 19,
+            _ => 20,
+        })
+    }
+    #[cfg(not(feature = "metal"))]
+    None
+}
+
+/// For the two largest tests (po2 20 sessions, ~11 GB alone): free the Groth16 key and prover
+/// that an earlier wrap test of this process left cached on the GPU, so they do not stack under
+/// this test's segment pool. Every test that wraps holds [heavy_test_lock], as the caller does,
+/// so none is using them; the next wrap reloads them.
+fn release_cached_groth16() {
+    #[cfg(feature = "metal")]
+    risc0_groth16::prove::release_srs().unwrap();
+}
+
+/// An [ExecutorEnv] builder with [segment_po2_for_budget] applied.
+fn budget_env_builder<'a>() -> crate::ExecutorEnvBuilder<'a> {
+    let mut builder = ExecutorEnv::builder();
+    if let Some(po2) = segment_po2_for_budget() {
+        builder.segment_limit_po2(po2);
+    }
+    builder
+}
+
 #[allow(dead_code)]
 fn prove_nothing(kind: ReceiptKind) -> ProveInfo {
     match kind {
@@ -98,7 +212,9 @@ fn prove_elf_succinct(env: ExecutorEnv, elf: &[u8]) -> Result<Receipt> {
 
 #[test_log::test]
 fn keccak_union() {
-    let env = ExecutorEnv::builder()
+    let _heavy = heavy_test_lock();
+    release_cached_groth16();
+    let env = budget_env_builder()
         .write(&MultiTestSpec::KeccakUnion(3))
         .unwrap()
         .build()
@@ -112,12 +228,14 @@ fn keccak_union() {
 
 #[test_log::test]
 fn basic() {
+    let _heavy = heavy_test_lock();
     // ensure that we got a succinct receipt.
     prove_nothing_succinct().receipt.inner.succinct().unwrap();
 }
 
 #[test_log::test]
 fn verifier_parameters_mismatch() {
+    let _heavy = heavy_test_lock();
     let receipt = prove_nothing_succinct().receipt;
 
     // Construct a different set of verifier parameters. Doesn't really matter in what way it is
@@ -228,11 +346,9 @@ fn sha_iter() {
         data: Vec::from([0u8; 32]),
         num_iter: 1500,
     };
-    let env = ExecutorEnv::builder()
-        .write(&input)
-        .unwrap()
-        .build()
-        .unwrap();
+    let _heavy = heavy_test_lock();
+    release_cached_groth16();
+    let env = budget_env_builder().write(&input).unwrap().build().unwrap();
     let receipt = prove_elf(env, MULTI_TEST_ELF).unwrap();
     let digest = Digest::try_from(receipt.journal.bytes).unwrap();
     assert_eq!(
@@ -565,8 +681,14 @@ fn sys_input() {
 #[case(ReceiptKind::Groth16, ReceiptKind::Succinct)]
 #[case(ReceiptKind::Groth16, ReceiptKind::Groth16)]
 #[test_log::test]
-#[cfg(any(feature = "cuda", feature = "rocm", feature = "docker"))]
+#[cfg(any(
+    feature = "cuda",
+    feature = "rocm",
+    feature = "metal",
+    feature = "docker"
+))]
 fn compress(#[case] from: ReceiptKind, #[case] into: ReceiptKind) {
+    let _heavy = heavy_test_lock();
     let from_receipt = prove_nothing(from).receipt;
     let opts = ProverOpts::default().with_receipt_kind(into);
     let prover = get_prover_server(&opts).unwrap();
@@ -597,8 +719,14 @@ fn compress(#[case] from: ReceiptKind, #[case] into: ReceiptKind) {
 #[case(ReceiptKind::Groth16, ReceiptKind::Succinct)]
 #[case(ReceiptKind::Groth16, ReceiptKind::Groth16)]
 #[test_log::test]
-#[cfg(any(feature = "cuda", feature = "rocm", feature = "docker"))]
+#[cfg(any(
+    feature = "cuda",
+    feature = "rocm",
+    feature = "metal",
+    feature = "docker"
+))]
 fn fake_compress(#[case] from: ReceiptKind, #[case] into: ReceiptKind) {
+    let _heavy = heavy_test_lock();
     use crate::{DevModeProver, FakeReceipt, ProverServer as _};
 
     let from_receipt = prove_nothing(from).receipt;
@@ -618,8 +746,9 @@ fn fake_compress(#[case] from: ReceiptKind, #[case] into: ReceiptKind) {
 }
 
 #[test_log::test]
-#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "metal"))]
 fn shrink_wrap() {
+    let _heavy = heavy_test_lock();
     // Perform many proofs in parallel. The initial implementation of the
     // groth16 prover on CUDA had issues with this. Ensure that we got a groth16
     // receipt.
@@ -639,8 +768,14 @@ fn shrink_wrap() {
 #[case(ReceiptKind::Succinct)]
 #[case(ReceiptKind::Groth16)]
 #[test_log::test]
-#[cfg(any(feature = "cuda", feature = "rocm", feature = "docker"))]
+#[cfg(any(
+    feature = "cuda",
+    feature = "rocm",
+    feature = "metal",
+    feature = "docker"
+))]
 fn verify_in_guest(#[case] kind: ReceiptKind) {
+    let _heavy = heavy_test_lock();
     use risc0_zkvm_methods::VERIFY_ELF;
 
     let receipt = prove_nothing(kind).receipt;
@@ -664,6 +799,7 @@ fn verify_in_guest(#[case] kind: ReceiptKind) {
 
 #[test]
 fn succinct_receipt_binds_control_id() {
+    let _heavy = heavy_test_lock();
     let mut receipt = prove_nothing_succinct().receipt;
     let InnerReceipt::Succinct(ref mut succinct_receipt) = receipt.inner else {
         panic!("what?!")
@@ -872,6 +1008,7 @@ mod sys_verify {
 
     #[test_log::test]
     fn sys_verify_assumption() {
+        let _heavy = heavy_test_lock();
         let test_circuit_receipt = prove_test_recursion_circuit();
         let test_circuit_assumption = Assumption {
             claim: test_circuit_receipt.claim.digest(),
@@ -921,6 +1058,7 @@ mod sys_verify {
 
     #[test_log::test]
     fn sys_verify_with_povw() -> Result<()> {
+        let _heavy = super::heavy_test_lock();
         let spec = MultiTestSpec::SysVerify(vec![(
             HELLO_COMMIT_ID.into(),
             hello_commit_receipt().journal.bytes.clone(),
@@ -1050,6 +1188,7 @@ fn povw_nonce_default_assignment() -> Result<()> {
 
 #[test_log::test]
 fn povw_prove_work_receipt() -> Result<()> {
+    let _heavy = heavy_test_lock();
     let segment_limit_po2 = 16; // 64k cycles
     let cycles = 1 << segment_limit_po2;
     let povw_job_id: PovwJobId = rand::random();
@@ -1131,5 +1270,177 @@ mod soundness {
 
         let security = soundness::toy_model_security::<CpuHal<BabyBear>>(taps, coeffs_size);
         assert_eq!(security, 97.14198);
+    }
+}
+
+/// Metal orchestration (docs/metal-port/notes/M3.md): a composite proof, the pooled memory
+/// `release_hal_buffers` returns, and the composite -> succinct round trip, with the wall time and
+/// the peak of the device's `currentAllocatedSize` (sampled every 2 ms) of each phase.
+/// `RISC0_M3_PO2` (default 18) and `RISC0_M3_CYCLES` (default 2^19) size the guest.
+#[cfg(feature = "metal")]
+mod metal {
+    use std::{
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            mpsc, Arc,
+        },
+        thread::JoinHandle,
+        time::{Duration, Instant},
+    };
+
+    use risc0_zkp::hal::{metal::MetalHalPoseidon2, Hal as _};
+    use risc0_zkvm_methods::{multi_test::MultiTestSpec, MULTI_TEST_ELF, MULTI_TEST_ID};
+
+    use super::super::{get_prover_server, release_hal_buffers};
+    use crate::{ExecutorEnv, InnerReceipt, ProverOpts};
+
+    /// The device's currentAllocatedSize, from a HAL made on the sampler thread (not under any
+    /// session's GPU lock: `MetalHal::new` takes it). Reading it takes no lock.
+    fn allocated(hal: &MetalHalPoseidon2) -> usize {
+        hal.gpu_total_memory() - hal.gpu_free_memory()
+    }
+
+    struct Sampler {
+        stop: Arc<AtomicBool>,
+        peak: Arc<AtomicUsize>,
+        now: Arc<AtomicUsize>,
+        handle: Option<JoinHandle<()>>,
+    }
+
+    impl Sampler {
+        fn start() -> Self {
+            let stop = Arc::new(AtomicBool::new(false));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let now = Arc::new(AtomicUsize::new(0));
+            let (tx, rx) = mpsc::channel();
+            let handle = {
+                let (stop, peak, now) = (stop.clone(), peak.clone(), now.clone());
+                std::thread::spawn(move || {
+                    let hal = MetalHalPoseidon2::new();
+                    tx.send(()).unwrap();
+                    loop {
+                        let a = allocated(&hal);
+                        now.store(a, Ordering::Relaxed);
+                        peak.fetch_max(a, Ordering::Relaxed);
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                })
+            };
+            rx.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+            Self {
+                stop,
+                peak,
+                now,
+                handle: Some(handle),
+            }
+        }
+
+        /// Restart the peak at the current value (a new phase).
+        fn phase(&self) {
+            std::thread::sleep(Duration::from_millis(10));
+            self.peak
+                .store(self.now.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+
+        fn current(&self) -> usize {
+            std::thread::sleep(Duration::from_millis(10));
+            self.now.load(Ordering::Relaxed)
+        }
+
+        fn peak(&self) -> usize {
+            std::thread::sleep(Duration::from_millis(10));
+            self.peak.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Drop for Sampler {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    fn mib(bytes: usize) -> f64 {
+        bytes as f64 / (1u64 << 20) as f64
+    }
+
+    fn env_or(name: &str, default: u64) -> u64 {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    }
+
+    #[test_log::test]
+    fn metal_composite_succinct_round_trip() {
+        let _heavy = super::heavy_test_lock();
+        let po2 = env_or("RISC0_M3_PO2", 18) as u32;
+        let cycles = env_or("RISC0_M3_CYCLES", 1 << 19);
+        let sampler = Sampler::start();
+        let base = sampler.current();
+
+        // Composite.
+        sampler.phase();
+        let opts = ProverOpts::composite();
+        let env = ExecutorEnv::builder()
+            .write(&MultiTestSpec::BusyLoop { cycles })
+            .unwrap()
+            .segment_limit_po2(po2)
+            .build()
+            .unwrap();
+        let t0 = Instant::now();
+        let info = get_prover_server(&opts)
+            .unwrap()
+            .prove(env, MULTI_TEST_ELF)
+            .unwrap();
+        let composite_s = t0.elapsed().as_secs_f64();
+        let composite_peak = sampler.peak();
+        let composite = info.receipt;
+        let segments = composite.inner.composite().unwrap().segments.len();
+        composite.verify(MULTI_TEST_ID).unwrap();
+
+        // What the cached segment prover's HAL holds between sessions, and what releasing it
+        // returns (this thread proved, so its cache is the one released).
+        let held = sampler.current();
+        release_hal_buffers();
+        let released = sampler.current();
+        assert!(
+            released <= held,
+            "release_hal_buffers grew the allocation: {held} -> {released}"
+        );
+
+        // Composite -> succinct, verified.
+        sampler.phase();
+        let sopts = ProverOpts::succinct();
+        let t1 = Instant::now();
+        let succinct = get_prover_server(&sopts)
+            .unwrap()
+            .compress(&sopts, &composite)
+            .unwrap();
+        let succinct_s = t1.elapsed().as_secs_f64();
+        let succinct_peak = sampler.peak();
+        assert!(matches!(succinct.inner, InnerReceipt::Succinct(_)));
+        succinct.verify(MULTI_TEST_ID).unwrap();
+        assert_eq!(succinct.journal.bytes, composite.journal.bytes);
+
+        eprintln!(
+            "[M3] po2={po2} cycles={cycles} segments={segments} \
+             baseline={:.1} MiB | composite: wall={composite_s:.2}s peak={:.1} MiB \
+             (+{:.1} over baseline) | held after session={:.1} MiB, after \
+             release_hal_buffers={:.1} MiB | succinct (compress): wall={succinct_s:.2}s \
+             peak={:.1} MiB",
+            mib(base),
+            mib(composite_peak),
+            mib(composite_peak.saturating_sub(base)),
+            mib(held),
+            mib(released),
+            mib(succinct_peak),
+        );
     }
 }

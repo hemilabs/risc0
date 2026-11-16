@@ -20,8 +20,24 @@ use std::{
 
 use risc0_build_kernel::{KernelBuild, KernelType};
 
+// The Metal eval_check translator (item K3, docs/metal-port/PLAN.md 8.2): its own file so that
+// K3 never edits this one.
+#[path = "build_metal_eval.rs"]
+mod build_metal_eval;
+// The Metal witgen translator (item K6, docs/metal-port/PLAN.md 8.2), likewise.
+#[path = "build_metal_witgen.rs"]
+mod build_metal_witgen;
+
 #[cfg(all(feature = "cuda", feature = "rocm"))]
 compile_error!("Features 'cuda' and 'rocm' are mutually exclusive. Enable only one GPU backend.");
+
+#[cfg(all(
+    feature = "metal",
+    any(feature = "cuda", feature = "rocm", feature = "intel")
+))]
+compile_error!(
+    "Feature 'metal' is mutually exclusive with 'cuda', 'rocm' and 'intel'. Enable only one GPU backend."
+);
 
 fn main() {
     let cuda = env::var("CARGO_FEATURE_CUDA").is_ok();
@@ -52,6 +68,10 @@ fn main() {
 
         if env::var("CARGO_FEATURE_INTEL").is_ok() {
             build_intel_kernels();
+        }
+
+        if metal_enabled() {
+            build_metal_kernels();
         }
     });
 }
@@ -851,4 +871,61 @@ fn rerun_if_include_roots_changed(roots: &[&str]) {
             rerun_if_changed(file);
         }
     }
+}
+
+/// The `metal` feature on macOS/iOS: compile the hand-written `kernels/metal/*.metal` and the
+/// generated sources (`build_metal_eval`, into `$OUT_DIR/metal`) into
+/// `metal_kernels_keccak.metallib`, and point `KECCAK_METAL_PATH` at it for `src/lib.rs`
+/// (`METAL_LIB`). `kernels/metal` is on the include path (and hashed into the build cache key) for
+/// the unit's own headers; the shared ones (`fp.h`, `fpext.h`, `cuda2metal.h`, `sppark_compat.h`)
+/// come from `risc0_build_kernel::METAL_INCS`. Every kernel entry point must be listed in
+/// `METAL_KERNEL_NAMES` (src/lib.rs); the HAL fails at load if one is missing.
+fn build_metal_kernels() {
+    const OUTPUT: &str = "metal_kernels_keccak";
+
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let kernel_dir = std::path::absolute("kernels/metal").unwrap();
+    rerun_if_changed(&kernel_dir);
+    // The translators read kernels/cuda (eval_check_<n>.cu, steps_<n>.cu, ...) by directory
+    // listing: track the directory, so an added or removed source also re-runs them (they emit
+    // rerun-if-changed only for the files that existed).
+    rerun_if_changed(std::path::absolute("kernels/cuda").unwrap());
+
+    let mut sources = glob_paths("kernels/metal/*.metal");
+    sources.sort();
+    if env::var("RISC0_SKIP_BUILD_KERNELS").is_err() {
+        let gen_dir = out_dir.join("metal");
+        std::fs::create_dir_all(&gen_dir).unwrap();
+        sources.extend(build_metal_eval::metal_eval_sources(&kernel_dir, &gen_dir));
+    } else {
+        build_metal_eval::write_skip_consts(&out_dir);
+    }
+    // Witgen arm kernels (K6); also writes the HAL's constants under RISC0_SKIP_BUILD_KERNELS.
+    sources.extend(build_metal_witgen::metal_witgen_sources(
+        &kernel_dir,
+        &out_dir.join("metal"),
+    ));
+
+    KernelBuild::new(KernelType::Metal)
+        .files(&sources)
+        .include(&kernel_dir)
+        .flag("-std=metal3.2")
+        .flag("-O2")
+        .compile(OUTPUT);
+
+    // KernelBuild writes `skip-<output>` (empty) under RISC0_SKIP_BUILD_KERNELS.
+    let name = if env::var("RISC0_SKIP_BUILD_KERNELS").is_ok() {
+        format!("skip-{OUTPUT}")
+    } else {
+        OUTPUT.to_string()
+    };
+    let metallib = out_dir.join(name).with_extension("metallib");
+    println!("cargo:rustc-env=KECCAK_METAL_PATH={}", metallib.display());
+}
+
+/// Whether to build the Metal kernels: the `metal` feature on a macOS/iOS target (on any other
+/// target the guard in src/lib.rs rejects the feature).
+fn metal_enabled() -> bool {
+    env::var("CARGO_FEATURE_METAL").is_ok()
+        && env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "macos" || os == "ios")
 }

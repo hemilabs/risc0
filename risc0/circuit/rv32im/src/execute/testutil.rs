@@ -216,6 +216,7 @@ mod consts {
 
 use consts::*;
 
+#[derive(Default)]
 pub struct Assembler {
     text: Vec<u32>,
     data: BTreeMap<u32, u32>,
@@ -224,10 +225,7 @@ pub struct Assembler {
 #[allow(dead_code)]
 impl Assembler {
     pub fn new() -> Self {
-        Self {
-            text: vec![],
-            data: BTreeMap::new(),
-        }
+        Self::default()
     }
 
     pub fn program(&self) -> Program {
