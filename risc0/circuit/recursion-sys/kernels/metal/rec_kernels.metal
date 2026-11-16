@@ -203,6 +203,9 @@ kernel void recInitRows(device uint32_t* buf [[buffer(0)]],
 }
 
 // `value` (a raw Fp word) in the last `zk` rows of every column.
+// NOT the ZK noise (P31-09): one repeated value is the bug risc0 3.1 fixed (f68f86020). No prover
+// path dispatches it; the recursion witgen copies independent random values into the noise tail
+// in every mode. Kept only as the C1 port of ffi.cu's kernel (c1_metal_kernels checks it).
 kernel void recFillTail(device uint32_t* buf [[buffer(0)]],
                         constant RecRowParams& p [[buffer(1)]],
                         uint t [[thread_position_in_grid]]) {

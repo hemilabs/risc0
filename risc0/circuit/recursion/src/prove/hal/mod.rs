@@ -64,8 +64,9 @@ pub(crate) trait CircuitWitnessGenerator<H: Hal> {
         anyhow::bail!("upload_host_witness not supported by this HAL")
     }
 
-    /// Whether this HAL has the witness buffer passes below (`init_rows`, `fill_tail`,
-    /// `zeroize_rows`); without them the witgen uses the generic HAL passes.
+    /// Whether this HAL has the witness buffer passes below (`init_rows`, `zeroize_rows`); without
+    /// them the witgen uses the generic HAL passes. The ZK noise tail is never a row pass: it is
+    /// always the copy of independent random values in `WitnessGenerator::new` (3.1 `f68f86020`).
     fn has_row_passes(&self) -> bool {
         false
     }
@@ -78,6 +79,9 @@ pub(crate) trait CircuitWitnessGenerator<H: Hal> {
     }
 
     /// `value` in the last `zk` rows of every column.
+    ///
+    /// NOT for the ZK noise: it repeats one value, which is the bug 3.1 (`f68f86020`) fixed. No
+    /// prover path calls it (P31-09); the Metal HAL does not implement it.
     // Set aside with the fork's row-pass witgen fast path (v3.1.0 uses independent-random
     // tail blinding instead); kept for re-application. See the v3.1.0 rebase decision log.
     #[allow(dead_code)]

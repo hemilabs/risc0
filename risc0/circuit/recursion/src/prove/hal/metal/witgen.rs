@@ -1394,10 +1394,14 @@ impl<MH: MetalHash> CircuitWitnessGenerator<MetalHal<MH>> for MetalCircuitHal<MH
         }
     }
 
-    /// C11 row passes (CUDA/HIP `recInitRows`/`recFillTail`/`recZeroizeRows`, C1's kernels):
-    /// on under [ROW_PASSES_ENV]. The generic path fills all of `data` with INVALID and zeroizes
-    /// all of it; the row passes write zero (not INVALID) past the live rows and zeroize only
-    /// the live rows. Validated by `RISC0_HIP_REC_ZCHECK=1` (prove/witgen.rs) and `c11_tests`.
+    /// C11 row passes (CUDA/HIP `recInitRows`/`recZeroizeRows`, C1's kernels): on under
+    /// [ROW_PASSES_ENV]. The generic path fills all of `data` with INVALID and zeroizes all of
+    /// it; the row passes write zero (not INVALID) past the live rows and zeroize only the live
+    /// rows. Validated by `RISC0_HIP_REC_ZCHECK=1` (prove/witgen.rs) and `c11_tests`.
+    ///
+    /// No `fill_tail` (P31-09): the ZK noise tail is the generic copy of independent random
+    /// values in both modes. `recFillTail` repeats one value (the bug 3.1 `f68f86020` fixed), so
+    /// this HAL keeps the trait's default, which fails.
     fn has_row_passes(&self) -> bool {
         row_passes_enabled()
     }
@@ -1415,31 +1419,6 @@ impl<MH: MetalHash> CircuitWitnessGenerator<MetalHal<MH>> for MetalCircuitHal<MH
             self.kernels().pipeline("recInitRows"),
             &[buf.as_arg(), KernelArg::Bytes(bytemuck::bytes_of(&p))],
             Grid::Threads(quads),
-            &[],
-        );
-        Ok(())
-    }
-
-    fn fill_tail(
-        &self,
-        buf: &BufferImpl<BabyBearElem>,
-        rows: usize,
-        zk: usize,
-        value: BabyBearElem,
-    ) -> Result<()> {
-        let (log_rows, cols) = row_shape(buf, rows)?;
-        ensure!(zk <= rows, "fill_tail: {zk} rows of {rows}");
-        let p = RecRowParams {
-            log_rows,
-            cols,
-            zk: zk as u32,
-            value: value.as_u32_montgomery(),
-            ..Default::default()
-        };
-        self.hal.dispatch(
-            self.kernels().pipeline("recFillTail"),
-            &[buf.as_arg(), KernelArg::Bytes(bytemuck::bytes_of(&p))],
-            Grid::Threads(zk as u64 * cols as u64),
             &[],
         );
         Ok(())

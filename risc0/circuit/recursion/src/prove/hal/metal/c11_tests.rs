@@ -423,7 +423,8 @@ fn c11_row_passes_seal_matches_cpu_po2_18() {
 }
 
 /// The row passes against the generic INVALID fill + zeroize on a raw buffer, including live
-/// counts that are not multiples of 4 and the tail fill.
+/// counts that are not multiples of 4, with the ZK tail written as on the prover (P31-09): a copy
+/// of independent values (`eltwise_copy_elem_slice`), never a fill.
 #[test]
 fn c11_row_passes_match_generic() {
     use crate::prove::hal::CircuitWitnessGenerator as _;
@@ -456,14 +457,16 @@ fn c11_row_passes_match_generic() {
         });
         let before: Vec<u32> = buf.to_vec().iter().map(|e| e.as_u32_montgomery()).collect();
         let zk = 4usize.min(rows - live);
-        c.fill_tail(&buf, rows, zk, BabyBearElem::new(9)).unwrap();
+        let tail: Vec<BabyBearElem> = (0..zk * cols)
+            .map(|i| BabyBearElem::new(9 + i as u32))
+            .collect();
+        hal.eltwise_copy_elem_slice(&buf, &tail, cols, zk, 0, zk, rows - zk, rows);
         c.zeroize_rows(&buf, rows, live).unwrap();
         let after: Vec<u32> = buf.to_vec().iter().map(|e| e.as_u32_montgomery()).collect();
-        let nine = BabyBearElem::new(9).as_u32_montgomery();
         for i in 0..rows * cols {
-            let r = i % rows;
+            let (col, r) = (i / rows, i % rows);
             let want = if r >= rows - zk {
-                nine
+                tail[col * zk + r - (rows - zk)].as_u32_montgomery()
             } else if r < live && before[i] == inv {
                 0
             } else {
@@ -473,4 +476,286 @@ fn c11_row_passes_match_generic() {
         }
     }
     assert!(c.init_rows(&hal.alloc_elem("odd", 3 * 6), 6, 1).is_err());
+    // The Metal HAL has no tail fill (P31-09): the trait default refuses.
+    let buf = hal.alloc_elem("fill", rows * cols);
+    assert!(c.fill_tail(&buf, rows, 4, BabyBearElem::new(9)).is_err());
+}
+
+// ---------------------------------------------------------------------------------------------
+// P31-09: independent recursion ZK noise (3.1 `f68f86020`) in every Metal path.
+
+mod p31_09 {
+    use std::collections::HashSet;
+
+    use test_log::test;
+
+    use risc0_zkp::{
+        adapter::{CircuitInfo as _, TapsProvider as _},
+        core::hash::poseidon2::Poseidon2HashSuite,
+        field::{
+            baby_bear::{BabyBear, BabyBearElem, BabyBearExtElem},
+            Elem as _,
+        },
+        hal::{cpu::CpuHal, Buffer as _, Hal},
+        ZK_CYCLES,
+    };
+
+    use super::*;
+    use crate::{
+        prove::{
+            hal::{cpu::CpuCircuitHal, CircuitAccumulator, CircuitWitnessGenerator},
+            witgen::{self as wg, WitnessGenerator},
+        },
+        CircuitImpl, CIRCUIT,
+    };
+
+    const PO2: usize = 16;
+
+    fn preflight(program: &Program) -> Preflight {
+        let mut pf = Preflight::new(test_input());
+        for (cycle, row) in program.code_by_row().enumerate() {
+            pf.step(cycle, row).unwrap();
+        }
+        pf
+    }
+
+    /// `data` and `accum` (raw words) after the witgen and the accum of one proof, as the
+    /// prover leaves them before committing the accum (noise in, zeroized).
+    fn witness<H, C>(hal: &H, c: &C, program: &Program) -> (Vec<u32>, Vec<u32>)
+    where
+        H: Hal<Field = BabyBear, Elem = BabyBearElem, ExtElem = BabyBearExtElem>,
+        C: CircuitWitnessGenerator<H> + CircuitAccumulator<H>,
+    {
+        let pf = preflight(program);
+        let w = WitnessGenerator::new(hal, c, program, &pf, None).unwrap();
+        let mix: Vec<BabyBearElem> = (0..CircuitImpl::MIX_SIZE as u32)
+            .map(|i| BabyBearElem::new(i * 7919 + 3))
+            .collect();
+        w.accum(hal, c, &mix).unwrap();
+        let raw = |v: Vec<BabyBearElem>| v.iter().map(|e| e.as_u32_montgomery()).collect();
+        (raw(w.data.to_vec()), raw(w.accum.to_vec()))
+    }
+
+    fn metal_witness(row_passes: bool, program: &Program) -> (Vec<u32>, Vec<u32>) {
+        let hal = Arc::new(MetalHalPoseidon2::new());
+        let c = MetalCircuitHal::new(hal.clone()).unwrap();
+        witgen::with_row_passes(row_passes, || witness(hal.as_ref(), &c, program))
+    }
+
+    fn cpu_witness(program: &Program) -> (Vec<u32>, Vec<u32>) {
+        let hal: CpuHal<BabyBear> = CpuHal::new(Poseidon2HashSuite::new_suite());
+        witness(&hal, &CpuCircuitHal, program)
+    }
+
+    /// The last ZK_CYCLES rows of every one of `cols` columns, column by column.
+    fn tail(v: &[u32], cols: usize) -> Vec<u32> {
+        let rows = 1usize << PO2;
+        assert_eq!(v.len(), cols * rows);
+        (0..cols)
+            .flat_map(|c| {
+                v[c * rows + rows - ZK_CYCLES..(c + 1) * rows]
+                    .iter()
+                    .copied()
+            })
+            .collect()
+    }
+
+    /// `v` holds `ZK_CYCLES * cols` noise cells with independent values: as many distinct values
+    /// as uniform draws give (n(n-1)/2p expected colliding pairs: ~4 for the 131072 data cells),
+    /// no INVALID, and every column has more than one value. A repeated noise value (the bug
+    /// 3.1 fixed) gives 1 distinct value.
+    fn assert_independent(what: &str, v: &[u32], cols: usize) -> usize {
+        let n = v.len();
+        assert_eq!(n, ZK_CYCLES * cols, "{what}: noise cell count");
+        let inv = BabyBearElem::INVALID.as_u32_montgomery();
+        assert!(v.iter().all(|&x| x != inv), "{what}: INVALID in the noise");
+        let distinct = v.iter().collect::<HashSet<_>>().len();
+        let p = 2013265921f64;
+        let expect = n as f64 * (n as f64 - 1.0) / (2.0 * p);
+        let bound = (8.0 * expect).ceil() as usize + 16;
+        assert!(distinct > 1, "{what}: one repeated noise value");
+        assert!(
+            n - distinct <= bound,
+            "{what}: {n} cells, only {distinct} distinct (expected ~{expect:.1} collisions)"
+        );
+        for c in 0..cols {
+            let col = &v[c * ZK_CYCLES..(c + 1) * ZK_CYCLES];
+            let d = col.iter().collect::<HashSet<_>>().len();
+            assert!(
+                d + 2 >= ZK_CYCLES,
+                "{what}: column {c} has {d} distinct values"
+            );
+        }
+        eprintln!(
+            "P31-09 {what}: {n} noise cells ({cols} cols x {ZK_CYCLES} rows), {distinct} distinct \
+             ({} repeats, ~{expect:.2} expected)",
+            n - distinct
+        );
+        distinct
+    }
+
+    /// The distinctness check is not vacuous: 3.0's noise (one value repeated over the tail) and a
+    /// per-column repeat fail it. Host only.
+    #[test]
+    fn p31_09_repeated_noise_is_caught() {
+        let cols = 12;
+        let n = ZK_CYCLES * cols;
+        let x = BabyBearElem::new(1234).as_u32_montgomery();
+        let one = std::panic::catch_unwind(|| assert_independent("repeated", &vec![x; n], cols));
+        assert!(one.is_err(), "one repeated value must fail");
+        let per_col: Vec<u32> = (0..n).map(|i| (i / ZK_CYCLES) as u32 + 1).collect();
+        let col = std::panic::catch_unwind(|| assert_independent("per column", &per_col, cols));
+        assert!(col.is_err(), "a repeated value per column must fail");
+        let ok: Vec<u32> = (0..n as u32).map(|i| i * 3 + 1).collect();
+        assert_eq!(assert_independent("distinct", &ok, cols), n);
+    }
+
+    /// Unseeded Metal proofs (default noise, `rand::rng()`): the data and accum noise rows hold
+    /// independent values, the two tails share none beyond chance, and two proofs differ.
+    fn noise_rows_independent(row_passes: bool) {
+        let _heavy = crate::prove::hal::metal::heavy_test_lock();
+        let _guard = global_state_test_lock();
+        let program = get_zkr("test_recursion_circuit.zkr", PO2).unwrap();
+        let mode = if row_passes { "row passes" } else { "generic" };
+        let (d, a) = metal_witness(row_passes, &program);
+        let (dt, at) = (
+            tail(&d, CIRCUIT.data_size()),
+            tail(&a, CIRCUIT.accum_size()),
+        );
+        let nd = assert_independent(&format!("{mode} data"), &dt, CIRCUIT.data_size());
+        let na = assert_independent(&format!("{mode} accum"), &at, CIRCUIT.accum_size());
+        let both: HashSet<_> = dt.iter().chain(at.iter()).collect();
+        assert!(
+            both.len() + 16 >= nd + na,
+            "{mode}: data and accum noise overlap"
+        );
+        // Fresh noise per proof.
+        let (d2, a2) = metal_witness(row_passes, &program);
+        let (dt2, at2) = (
+            tail(&d2, CIRCUIT.data_size()),
+            tail(&a2, CIRCUIT.accum_size()),
+        );
+        let same = dt.iter().zip(&dt2).filter(|(x, y)| x == y).count()
+            + at.iter().zip(&at2).filter(|(x, y)| x == y).count();
+        assert!(same < 16, "{mode}: two proofs share {same} noise cells");
+        // Everything but the noise is the same witness.
+        let rows = 1usize << PO2;
+        let live = |i: usize| i % rows < rows - ZK_CYCLES;
+        assert!(d
+            .iter()
+            .zip(&d2)
+            .enumerate()
+            .all(|(i, (x, y))| !live(i) || x == y));
+        assert!(a
+            .iter()
+            .zip(&a2)
+            .enumerate()
+            .all(|(i, (x, y))| !live(i) || x == y));
+    }
+
+    #[test]
+    fn p31_09_noise_rows_independent_generic() {
+        noise_rows_independent(false);
+    }
+
+    #[test]
+    fn p31_09_noise_rows_independent_row_passes() {
+        noise_rows_independent(true);
+    }
+
+    /// The stream [crate::prove::witgen::with_noise_seed] must give, recomputed here from
+    /// the stock `BabyBearElem::random` (n draws in order from the seeded `StdRng`).
+    fn seeded_stream(seed: u64, stream: u64, n: usize) -> Vec<u32> {
+        use rand::SeedableRng as _;
+        let mut rng =
+            rand::rngs::StdRng::seed_from_u64(seed ^ stream.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        (0..n)
+            .map(|_| BabyBearElem::random(&mut rng).as_u32_montgomery())
+            .collect()
+    }
+
+    /// Under a noise seed (RISC0_HIP_REC_ZCHECK style, on the whole proof witness): Metal with the
+    /// row passes == Metal generic == CPU HAL, for `data` and `accum` element for element, with
+    /// the noise drawn ahead (default) or in place; the tails hold the seeded stream in the
+    /// layout `noise[col * ZK_CYCLES + r]` -> row `rows - ZK_CYCLES + r` (the stock 3.1 copy).
+    #[test]
+    fn p31_09_seeded_noise_row_passes_eq_generic_eq_cpu() {
+        let _heavy = crate::prove::hal::metal::heavy_test_lock();
+        let _guard = global_state_test_lock();
+        let program = get_zkr("test_recursion_circuit.zkr", PO2).unwrap();
+        let seed = 0x5eed_0931;
+        let run = |f: &dyn Fn() -> (Vec<u32>, Vec<u32>), overlap: bool| {
+            wg::with_noise_overlap(overlap, || with_noise_seed(seed, f))
+        };
+        let early0 = wg::EARLY_NOISE_USED.load(std::sync::atomic::Ordering::Relaxed);
+        let generic = run(&|| metal_witness(false, &program), true);
+        let rowp = run(&|| metal_witness(true, &program), true);
+        let cpu = run(&|| cpu_witness(&program), true);
+        let early1 = wg::EARLY_NOISE_USED.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(early1 - early0, 3, "noise drawn ahead on the helper thread");
+        let inplace = run(&|| metal_witness(true, &program), false);
+        let cpu_inplace = run(&|| cpu_witness(&program), false);
+        assert_eq!(
+            wg::EARLY_NOISE_USED.load(std::sync::atomic::Ordering::Relaxed),
+            early1,
+            "overlap off draws in place"
+        );
+        let first_diff = |a: &[u32], b: &[u32]| a.iter().zip(b).position(|(x, y)| x != y);
+        for (name, other) in [
+            ("row passes", &rowp),
+            ("cpu", &cpu),
+            ("row passes, in place", &inplace),
+            ("cpu, in place", &cpu_inplace),
+        ] {
+            assert_eq!(
+                first_diff(&generic.0, &other.0),
+                None,
+                "data: generic vs {name}"
+            );
+            assert_eq!(
+                first_diff(&generic.1, &other.1),
+                None,
+                "accum: generic vs {name}"
+            );
+        }
+        let (dt, at) = (
+            tail(&generic.0, CIRCUIT.data_size()),
+            tail(&generic.1, CIRCUIT.accum_size()),
+        );
+        assert_eq!(dt, seeded_stream(seed, 1, ZK_CYCLES * CIRCUIT.data_size()));
+        assert_eq!(at, seeded_stream(seed, 2, ZK_CYCLES * CIRCUIT.accum_size()));
+        assert_independent("seeded data", &dt, CIRCUIT.data_size());
+        assert_independent("seeded accum", &at, CIRCUIT.accum_size());
+        // A different seed gives different noise.
+        let other = wg::with_noise_overlap(true, || {
+            with_noise_seed(seed + 1, || metal_witness(false, &program))
+        });
+        assert_ne!(tail(&other.0, CIRCUIT.data_size()), dt);
+        eprintln!("P31-09 seeded: Metal row passes == Metal generic == CPU (data + accum), drawn ahead and in place");
+    }
+
+    /// C9 seal equality (Metal == CPU under `with_noise_seed`) with the row passes forced off
+    /// (the `c11_row_passes_seal_matches_cpu_*` tests force them on).
+    #[test]
+    fn p31_09_seal_matches_cpu_row_passes_off_po2_16() {
+        let _heavy = crate::prove::hal::metal::heavy_test_lock();
+        witgen::with_row_passes(false, || super::seal_matches_cpu("poseidon2", 16));
+    }
+
+    #[test]
+    fn p31_09_seal_matches_cpu_row_passes_off_po2_18() {
+        let _heavy = crate::prove::hal::metal::heavy_test_lock();
+        witgen::with_row_passes(false, || super::seal_matches_cpu("poseidon2", 18));
+    }
+
+    /// The same with the noise drawn in place (`RISC0_RECURSION_NOISE_OVERLAP=0`), both modes.
+    #[test]
+    fn p31_09_seal_matches_cpu_noise_in_place() {
+        let _heavy = crate::prove::hal::metal::heavy_test_lock();
+        for rp in [false, true] {
+            wg::with_noise_overlap(false, || {
+                witgen::with_row_passes(rp, || super::seal_matches_cpu("poseidon2", 16))
+            });
+        }
+    }
 }
