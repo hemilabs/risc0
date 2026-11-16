@@ -96,22 +96,22 @@ OUT = os.path.join(SYS, 'kernels', 'cuda', 'eval_check_ef.cu')
 OUT_HIP = os.path.join(SYS, 'kernels', 'cuda', 'eval_check_ef_hip.cu')
 HIP_LAST = 'remat_lu.py'
 # wmma_hip.py (after to_hip.py): the poly_mix chains on the gfx12 matrix units.
-WMMA_EXPECT = ('wmma_hip: 136 of 282 chains, 4672 of 4948 Fp links on the matrix units (wmin 6, 1 x 24 '
+WMMA_EXPECT = ('wmma_hip: 132 of 259 chains, 4744 of 5031 Fp links on the matrix units (wmin 6, 1 x 24 '
                'slots, group 48), 0 chains without a free region')
 # hoist_hip.py (after wmma_hip.py): the trace loads issued one window of statements ahead of their uses.
-HOIST_EXPECT = 'hoist_hip: 22 functions, 3844 trace loads issued one window ahead (window 8)'
+HOIST_EXPECT = 'hoist_hip: 22 functions, 3841 trace loads issued one window ahead (window 8)'
 # args_hip.py (last): 32-bit cycle/steps; the kernel pointers from ef_ptrs instead of call arguments.
 ARGS_EXPECT = 'args_hip: 32-bit cycle/steps, 101 signatures and 20 calls without 95 pointer arguments'
 # inline_hip.py (last): the chain functions inlined into ef_eval_split, one opaque row index each.
 INLINE_EXPECT = 'inline_hip: 21 chain functions inlined, 22 opaque row indices'
 # smem_hip.py (last): on gfx11 each phase's 32 most accessed slab words in LDS.
-SMEM_EXPECT = ('smem_hip: 22 functions; gfx11 LDS words: main 32 of 85 (539 of 751 accesses), LogUp 32 of 104 '
-               '(96 of 268)')
+SMEM_EXPECT = ('smem_hip: 22 functions; gfx11 LDS words: main 32 of 84 (539 of 767 accesses), LogUp 32 of 84 '
+               '(104 of 236)')
 # pmlag_hip.py (last): the scalar links' constants loaded <= 4 links ahead, the FpExt-term links' and
 # chained closures' constant rows not before the accumulator they depend on; in the gfx12 variant the
 # plain links (outside the WMMA chains) only.
-PMLAG_EXPECT = ('pmlag_hip: 22 functions, 5034 links and 157 closures with lagged constants (W 4)')
-PMLAG_GFX12_EXPECT = ('pmlag_hip: 22 functions, 364 plain links and 157 closures with lagged constants (W 4)')
+PMLAG_EXPECT = ('pmlag_hip: 22 functions, 5127 links and 157 closures with lagged constants (W 4)')
+PMLAG_GFX12_EXPECT = ('pmlag_hip: 22 functions, 382 plain links and 157 closures with lagged constants (W 4)')
 # opq_hip.py (both variants; the barriers are empty outside gfx11)
 OPQ_EXPECT = 'opq_hip: EF_OPQ64 at 5 multiply-accumulate sites (gfx11)'
 # The gfx12 variant (archsel_hip.py): 12 WMMA staging slots per wave (7.5 KB of LDS per block) and
@@ -120,10 +120,10 @@ WMMA_GFX12_SLOTS = 12
 SMEM_GFX12_WORDS = 16
 # ... and 31 LogUp words: the 15 past ef_sm's 16 rows in the WMMA staging array (unused by LogUp blocks).
 SMEM_GFX12_LU_WORDS = 31
-WMMA_GFX12_EXPECT = ('wmma_hip: 136 of 282 chains, 4672 of 4948 Fp links on the matrix units (wmin 6, 1 x 12 slots, group 60), 0 chains without a free region')
+WMMA_GFX12_EXPECT = ('wmma_hip: 132 of 259 chains, 4744 of 5031 Fp links on the matrix units (wmin 6, 1 x 12 slots, group 60), 0 chains without a free region')
 HOIST_GFX12_EXPECT = HOIST_EXPECT
-SMEM_GFX12_EXPECT = ('smem_hip: 22 functions; gfx11 LDS words: main 16 of 85 (334 of 751 accesses), LogUp 31 of 104 (93 of 268)')
-ARCHSEL_EXPECT = ('archsel_hip: 3496 runs of 9531 lines selected by __GFX12__')
+SMEM_GFX12_EXPECT = ('smem_hip: 22 functions; gfx11 LDS words: main 16 of 84 (337 of 767 accesses), LogUp 31 of 84 (101 of 236)')
+ARCHSEL_EXPECT = ('archsel_hip: 3503 runs of 9695 lines selected by __GFX12__')
 NS = 'namespace risc0::circuit::rv32im_v2 {'
 
 # mksub.py cut points: function, body lines, cut line, live values passed to the tail (+ input
