@@ -379,13 +379,25 @@ fn z9_ntt_split_sweep() {
             test_hooks::gs_steps(tlg)
         };
         let mut splits = vec![base.clone()];
+        let mut refused = 0usize;
         for parts in 1..=3 {
             for c in compositions(tlg, parts, lo) {
                 if c != base && !(ct && c[0] <= 2) {
+                    // P31-T1: skip what set_split refuses (W7-T1's measured rules) instead of
+                    // panicking on the first refused split.
+                    if test_hooks::split_violation(ct, tlg, &c).is_some() {
+                        refused += 1;
+                        continue;
+                    }
                     splits.push(c);
                 }
             }
         }
+        println!(
+            "Z9AB   {} lg {tlg}: {} splits, {refused} skipped (test_hooks::split_violation)",
+            if ct { "CT" } else { "GS" },
+            splits.len()
+        );
         let mut variants: Vec<(String, Box<dyn FnMut() + '_>)> = splits
             .into_iter()
             .map(|split| {
