@@ -83,11 +83,18 @@ A final residual scan refuses output that still contains CUDA-only constructs.
 `eval` (item R6) translates the baseline eval_check -- eval_check.cuh, eval_check_0..3.cu (poly_fp
 + the 20 noinline rv32im_v2_* chain functions) and the eval_check kernel of eval_check_kernel.cu
 -- into one OUTDIR/eval_check.metal (written only when its text changes; build.rs runs it into
-$OUT_DIR/metal), with counts pinned in PINNED_EVAL. Its passes (EVAL_PASSES) add:
+$OUT_DIR/metal), with counts pinned in PINNED_EVAL. Before the passes, the chain check
+(eval_chain_noinline) pairs every `rv32im_v2_N` definition of eval_check_0..3.cu with exactly one
+`extern __device__` prototype in eval_check.cuh (one-line 3.1 form or multi-line 3.0 form; a
+missing, duplicate or unparsed prototype is an error) and puts `__noinline__` on each definition
+whose prototype lacks it (3.1's header has none; the fork's 3.0 header had it on all 20), so the
+chain keeps the 20 out-of-line arms R6/R10 validated (count `eval.noinline_injected`). The CUDA
+header is never edited. Its passes (EVAL_PASSES) add:
 
-  poly_mix       `__constant__ FpExt poly_mix[N];` (host-filled, no initializer) -> a
+  poly_mix       `[extern] __constant__ FpExt poly_mix[N];` (host-filled, no initializer) -> a
                  `const FpExt* poly_mix` parameter on every function that uses it directly or
-                 through a call, `, poly_mix` at their call sites; the kernel binds it last.
+                 through a call, `, poly_mix` at their call sites; the kernel binds it last. N
+                 is resolved (a literal or a `constexpr` of the input) and static_asserted.
   fpext_index    `e[i]` on a by-value FpExt (CUDA FpExt::operator[]) -> `e.elems[i]`.
   fpp (calls)    an Fp** argument that is a local `Fp* a[N] = {p, q, ...};` is passed as
                  `p, q, ...` (`a[k]` elsewhere -> `(elem k)`, the array goes); the caller's own
@@ -1088,6 +1095,106 @@ def pass_fpp(s, counts):
 # ------------------------------------------------------------------------------------------------
 
 POLY_MIX = 'poly_mix'
+# `[extern] __constant__ FpExt NAME[N]` followed by `;` (host-filled) or `=`/`{` (refused)
+POLY_MIX_DECL_RE = r'(?:\bextern\s+)?\b__constant__\s+FpExt\s+%s\s*\[([^\]]*)\]\s*([=;{])'
+
+
+def resolve_size(m, n):
+    """The integer value of an array size n: a decimal literal, or the name of exactly one
+    `constexpr <type> n = <literal>;` in the (masked) text m. None if it is neither."""
+    n = n.strip()
+    if re.fullmatch(r'\d+[uUlL]*', n):
+        return int(re.match(r'\d+', n).group(0))
+    if not re.fullmatch(r'[A-Za-z_]\w*', n):
+        return None
+    hits = re.findall(r'\bconstexpr\s+[\w:]+\s+%s\s*=\s*(\d+)[uUlL]*\s*;' % re.escape(n), m)
+    return int(hits[0]) if len(hits) == 1 else None
+
+
+def eval_poly_mix_pows(src, name=POLY_MIX):
+    """kNumPolyMixPows as eval mode sees it: the size of the one poly_mix declaration of the
+    combined eval input, resolved to an integer. Raises TranslateError otherwise."""
+    m = mask(src)
+    decls = list(re.finditer(POLY_MIX_DECL_RE % name, m))
+    if len(decls) != 1:
+        raise TranslateError('eval input: expected one `__constant__ FpExt %s[N]` declaration '
+                             '(eval_check.cuh), found %d' % (name, len(decls)))
+    v = resolve_size(m, decls[0].group(1))
+    if v is None or v <= 0:
+        raise TranslateError('eval input: cannot resolve the size %r of %s at %s to a positive '
+                             'integer (a literal or one `constexpr` of the input)'
+                             % (decls[0].group(1).strip(), name, where(src, decls[0].start())))
+    return v
+
+
+# The rv32im_v2_N chain: prototypes in eval_check.cuh, definitions in eval_check_0..3.cu.
+EVAL_CHAIN_PROTO_RE = re.compile(
+    r'\bextern\s+__device__\s+(__noinline__\s+)?FpExt\s+(rv32im_v2_\d+)\s*\(')
+EVAL_CHAIN_DEF_RE = re.compile(
+    r'(?m)^[ \t]*__device__\s+(__noinline__\s+)?FpExt\s+(rv32im_v2_\d+)\s*\(')
+EVAL_CHAIN_ANY_RE = re.compile(r'\b(rv32im_v2_\d+)\s*\(')
+
+
+def eval_chain_noinline(texts, counts):
+    """texts: {source name: CUDA text} of EVAL_SOURCES (eval_check.cuh, eval_check_0..3.cu).
+    Pairs each rv32im_v2_N definition with exactly one prototype in eval_check.cuh and returns
+    texts with `__noinline__` put on every definition whose prototype (and definition) lacks it.
+    The 3.0 fork header carries `__noinline__` on all 20 prototypes (nothing to inject), 3.1's
+    upstream header on none (20 injected). Refuses: a definition without a prototype, a
+    prototype without a definition, a duplicate, a chain name in the header that is not a
+    parsed prototype, or a chain that is not rv32im_v2_0..N-1."""
+    cuh = texts['eval_check.cuh']
+    cm = mask(cuh)
+    protos = {}
+    for mo in EVAL_CHAIN_PROTO_RE.finditer(cm):
+        if mo.group(2) in protos:
+            raise TranslateError('eval_check.cuh: duplicate prototype of %s at %s'
+                                 % (mo.group(2), where(cuh, mo.start())))
+        protos[mo.group(2)] = bool(mo.group(1))
+    named = [mo.group(1) for mo in EVAL_CHAIN_ANY_RE.finditer(cm)]
+    if len(named) != len(protos):
+        raise TranslateError('eval_check.cuh: %d rv32im_v2_* names but %d parsed `extern '
+                             '__device__ [__noinline__] FpExt rv32im_v2_N(` prototypes: the header '
+                             'form changed' % (len(named), len(protos)))
+    defs = {}
+    for name in EVAL_SOURCES:
+        if not name.startswith('eval_check_') or not name[len('eval_check_'):-3].isdigit():
+            continue
+        text = texts[name]
+        tm = mask(text)
+        for mo in EVAL_CHAIN_DEF_RE.finditer(tm):
+            po = mo.end() - 1
+            after = tm[match_close(tm, po) + 1:].lstrip()
+            if not after.startswith('{'):
+                continue  # a declaration, not a definition
+            f = mo.group(2)
+            if f in defs:
+                raise TranslateError('%s: duplicate definition of %s (also in %s)'
+                                     % (name, f, defs[f][0]))
+            defs[f] = (name, mo.start(), mo.start(1) if mo.group(1) else None)
+    missing = sorted(set(defs) - set(protos), key=lambda f: int(f.split('_')[-1]))
+    if missing:
+        raise TranslateError('eval_check.cuh: no prototype for %s (defined in %s): the chain '
+                             'cannot be marked noinline' % (', '.join(missing),
+                                                            defs[missing[0]][0]))
+    orphan = sorted(set(protos) - set(defs), key=lambda f: int(f.split('_')[-1]))
+    if orphan:
+        raise TranslateError('eval_check.cuh: prototype without a definition in '
+                             'eval_check_0..3.cu: %s' % ', '.join(orphan))
+    if sorted(int(f.split('_')[-1]) for f in defs) != list(range(len(defs))) or not defs:
+        raise TranslateError('eval chain is not rv32im_v2_0..N-1: %s' % sorted(defs))
+    edits = {}
+    for f, (name, start, ni) in defs.items():
+        if protos[f] or ni is not None:
+            continue
+        text = texts[name]
+        at = text.index('__device__', start) + len('__device__')
+        edits.setdefault(name, []).append((at, at, ' __noinline__'))
+        counts.add('eval.noinline_injected')
+    out = dict(texts)
+    for name, e in edits.items():
+        out[name] = apply_edits(texts[name], e)
+    return out
 
 
 def pass_poly_mix(s, counts, name=POLY_MIX):
@@ -1098,7 +1205,7 @@ def pass_poly_mix(s, counts, name=POLY_MIX):
     as its last buffer binding. A function that already has a `poly_mix` parameter is left
     alone."""
     m = mask(s)
-    decls = list(re.finditer(r'\b__constant__\s+FpExt\s+%s\s*\[([^\]]*)\]\s*([=;{])' % name, m))
+    decls = list(re.finditer(POLY_MIX_DECL_RE % name, m))
     if not decls:
         return s
     edits = []
@@ -1107,10 +1214,13 @@ def pass_poly_mix(s, counts, name=POLY_MIX):
             raise TranslateError('__constant__ FpExt %s at %s has an initializer: it is a '
                                  'constant table, not a host-filled symbol' % (name, where(s, d.start())))
         n = d.group(1).strip()
+        v = resolve_size(m, n)
+        cond = '(%s) == %d' % (n, v) if v is not None else '(%s) > 0' % n
+        # the match starts at a leading `extern` (3.1's one-line header form), so none is left
         edits.append((d.start(), d.end(), '// cuda2metal: __constant__ FpExt %s[%s] -> a '
                       '`const device FpExt* %s` parameter (a kernel buffer of %s entries)\n'
-                      'static_assert((%s) > 0, "%s: kernel buffer size");'
-                      % (name, n, name, n, n, name)))
+                      'static_assert(%s, "%s: kernel buffer size");'
+                      % (name, n, name, n, cond, name)))
         counts.add('poly_mix.decl')
     funcs = find_functions(m)
     info = []
@@ -1645,11 +1755,14 @@ EVAL_KERNEL_ANCHOR = '__launch_bounds__(EVAL_CHECK_THREADS)\n__global__ void eva
 # Rewrite counts of `eval` for the checked-in sources (see PINNED_STEPS).
 # 21 functions (poly_fp + rv32im_v2_0..19), each with a prototype in eval_check.cuh and a
 # definition: poly_mix.param = 2 * 21 + the kernel; poly_mix.call = 20 chain calls + the kernel's
-# poly_fp call; fpext_index = the kernel's ret[0..3].
+# poly_fp call; fpext_index = the kernel's ret[0..3]. qual.noinline = the 20 chain arms, which
+# 3.1's header does not mark: eval.noinline_injected = 20 says all 20 come from the translator
+# (on the definitions). The fork's 3.0 header form gives qual.noinline 20 and no injection.
 PINNED_EVAL = {
     'eval_check': {
         'aspace.device': 182,
         'aspace.thread': 74,
+        'eval.noinline_injected': 20,
         'fpext_index': 4,
         'include': 14,
         'kernel': 1,
@@ -1679,14 +1792,21 @@ def eval_kernel_source(text):
             '} // namespace %s\n' % (CUDA_NS, text[d0:d1], text[e0:bc + 1], CUDA_NS))
 
 
-def eval_input(cuda_dir=HERE, srcs=None):
-    """The combined CUDA input of eval mode. srcs overrides file texts by name (selftest)."""
+def eval_input(cuda_dir=HERE, srcs=None, counts=None):
+    """The combined CUDA input of eval mode, the chain marked noinline (eval_chain_noinline).
+    srcs overrides file texts by name (selftest)."""
     srcs = srcs or {}
-    parts = []
+    counts = Counts() if counts is None else counts
+    texts = {}
     for name in EVAL_SOURCES:
         text = srcs.get(name)
         if text is None:
             text = read(os.path.join(cuda_dir, name))
+        texts[name] = text
+    texts = eval_chain_noinline(texts, counts)
+    parts = []
+    for name in EVAL_SOURCES:
+        text = texts[name]
         if name == 'eval_check_kernel.cu':
             text = eval_kernel_source(text)
         elif name == 'eval_check.cuh':
@@ -1698,15 +1818,19 @@ def eval_input(cuda_dir=HERE, srcs=None):
 
 def translate_eval(cuda_dir=HERE, srcs=None):
     """-> (eval_check.metal text, counts)."""
-    src = eval_input(cuda_dir, srcs)
-    out, c = translate(src, passes=EVAL_PASSES, include_map=EVAL_INCLUDE_MAP, metal_ns=EVAL_NS)
+    c = Counts()
+    src = eval_input(cuda_dir, srcs, c)
+    npows = eval_poly_mix_pows(src)
+    out, c = translate(src, passes=EVAL_PASSES, include_map=EVAL_INCLUDE_MAP, metal_ns=EVAL_NS,
+                       counts=c)
     head = (banner(', '.join(EVAL_SOURCES)) +
             '// Baseline rv32im eval_check (phase-1 oracle, Metal port item R6): poly_fp and the\n'
             '// 20 noinline rv32im_v2_* chain functions in namespace %s, kernel `eval_check`\n'
             '// at global scope. CUDA\'s `__constant__ FpExt poly_mix[%s]` is the kernel\'s last\n'
-            '// buffer (`const device FpExt*`, kNumPolyMixPows entries) threaded through the chain.\n'
+            '// buffer (`const device FpExt*`, kNumPolyMixPows = %d entries, static_asserted)\n'
+            '// threaded through the chain.\n'
             '#include <metal_stdlib>\n#include "fp.h"\n#include "fpext.h"\n\n'
-            % (EVAL_NS, 'kNumPolyMixPows') + LB_PRELUDE + '\n')
+            % (EVAL_NS, 'kNumPolyMixPows', npows) + LB_PRELUDE + '\n')
     return head + out, c
 
 
@@ -1880,7 +2004,8 @@ def _selftest_cases():
     # Fp** -> explicit pointers: poly_fp's signature and its args[] casts (eval_check_ef.cu).
     p0 = ef.index('__device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, '
                   'Fp** args) {')
-    p1 = ef.index('  FpExt x203 = FpExt(0);', p0)
+    # the first FpExt accumulator after the casts (x203 on 3.0, x204 on 3.1)
+    p1 = re.compile(r'(?m)^  FpExt x\d+ = FpExt\(0\);').search(ef, p0).start()
     pf = (ef[p0:p1] + '  return FpExt(x33[0]) + x34[0] + FpExt(poly_mix[0]);\n}\n'
           + '__device__ FpExt poly_fp(size_t cycle, size_t steps, FpExt* poly_mix, Fp** args);\n')
     cases.append(dict(name='fpp', pass_='fpp', ctx='bare', src=pf,
@@ -1933,24 +2058,62 @@ def _selftest_eval_cases():
                       expect=dict(PINNED_EVAL['eval_check']), global_scope=True,
                       kernels=['eval_check']))
     # rv32im_v2_0 (the last link of the chain: no further call) with its prototype and the
-    # poly_mix declaration: poly_mix threading on a definition + prototype, chain aspaces.
+    # poly_mix declaration, in the checked-in (3.1, one-line, no __noinline__, `extern
+    # __constant__`) header form and in the fork's 3.0 form (multi-line, __noinline__ on the
+    # prototype, plain `__constant__`): chain check + noinline injection, poly_mix threading on a
+    # definition + prototype with the size resolved from the header, chain aspaces.
     e3 = read(os.path.join(HERE, 'eval_check_3.cu'))
     cuh = read(os.path.join(HERE, 'eval_check.cuh'))
     f0 = _extract_function(e3, r'__device__ FpExt rv32im_v2_0\(')
-    p0 = cuh.index('extern __device__ __noinline__ FpExt rv32im_v2_0(')
-    p1 = cuh.index(';', p0) + 1
-    src = ('namespace %s {\n%s\nconstexpr size_t INV_RATE = 4;\nconstexpr size_t kNumPolyMixPows = '
-           '458;\n__constant__ FpExt poly_mix[kNumPolyMixPows];\n%s\n} // namespace %s\n'
-           % (CUDA_NS, cuh[p0:p1], f0, CUDA_NS))
-    cases.append(dict(name='eval_chain_v2_0', pass_='poly_mix/eval_aspace', ctx='eval', src=src,
-                      topts=EVAL_TOPTS, global_scope=True,
-                      expect={'poly_mix.decl': 1, 'poly_mix.param': 2, 'poly_mix.call': 0,
-                              'qual.noinline': 1, 'aspace.thread': 2, 'aspace.device': 4}))
+    for form, h, inj in (('v31', cuh, 1), ('v30', _legacy_eval_cuh(cuh), 0)):
+        src, c = _eval_chain_v2_0_input(h, f0)
+        cases.append(dict(name='eval_chain_v2_0_' + form, pass_='chain/poly_mix/eval_aspace',
+                          ctx='eval', src=src, topts=dict(EVAL_TOPTS, counts=c),
+                          global_scope=True,
+                          expect={'poly_mix.decl': 1, 'poly_mix.param': 2, 'poly_mix.call': 0,
+                                  'qual.noinline': 1, 'eval.noinline_injected': inj,
+                                  'aspace.thread': 2, 'aspace.device': 4}))
     cases.append(dict(name='fpp_call', pass_='fpp call sites', ctx='eval', src=FPP_CALL_PROBE,
                       topts=EVAL_TOPTS, global_scope=True, kernels=['c2m_fpp_kernel'],
                       expect={'fpp': 3, 'fpp.call': 2, 'fpp.array': 1, 'fpext_index': 1,
                               'kernel': 1}))
     return cases
+
+
+def _legacy_eval_cuh(cuh):
+    """The fork's 3.0 eval_check.cuh form, made from a 3.1-form header: each chain prototype
+    `extern __device__ __noinline__ FpExt rv32im_v2_N(a,\n    b, ...);` over several lines (as
+    clang-format wrote it), the other prototypes multi-line too, and a plain (non-extern)
+    `__constant__ FpExt poly_mix[...]`."""
+    def proto(mo):
+        args = [a.strip() for a in mo.group(3).split(',')]
+        nl = ',\n' + ' ' * len('extern __device__ __noinline__ FpExt %s(' % mo.group(2))
+        q = '__noinline__ ' if mo.group(2).startswith('rv32im_v2_') else ''
+        return 'extern __device__ %sFpExt %s(%s);' % (q, mo.group(2), nl.join(args))
+    out, n = re.subn(r'(?m)^extern __device__ (FpExt) (\w+)\(([^;]*)\);', proto, cuh)
+    out, k = re.subn(r'(?m)^extern (__constant__ FpExt poly_mix\[)', r'\1', out)
+    if n < 2 or k != 1:
+        raise TranslateError('selftest: eval_check.cuh is not in the one-line 3.1 form '
+                             '(%d prototypes, %d extern __constant__)' % (n, k))
+    return out
+
+
+def _eval_chain_v2_0_input(cuh, f0):
+    """(CUDA text, Counts) of the eval_chain_v2_0 cases: the rv32im_v2_0 prototype and the
+    INV_RATE / kNumPolyMixPows / poly_mix lines of cuh with the definition f0, after the chain
+    check (eval_chain_noinline on a one-function chain)."""
+    m = mask(cuh)
+    mo = next(mo for mo in EVAL_CHAIN_PROTO_RE.finditer(m) if mo.group(2) == 'rv32im_v2_0')
+    p0, p1 = mo.start(), m.index(';', mo.start()) + 1
+    d0 = m.index('constexpr size_t INV_RATE')
+    d1 = m.index(';', re.search(POLY_MIX_DECL_RE % POLY_MIX, m).start()) + 1
+    c = Counts()
+    texts = {'eval_check.cuh': cuh[p0:p1] + '\n' + cuh[d0:d1] + '\n', 'eval_check_0.cu': f0}
+    texts.update({n: '' for n in EVAL_SOURCES if n not in texts})
+    texts = eval_chain_noinline(texts, c)
+    src = ('namespace %s {\n%s%s\n} // namespace %s\n'
+           % (CUDA_NS, texts['eval_check.cuh'], texts['eval_check_0.cu'], CUDA_NS))
+    return src, c
 
 
 def _selftest_negative():
@@ -2032,9 +2195,10 @@ def _selftest(headers, work):
     # structured binding from steps.cu
     steps_src = read(os.path.join(HERE, 'steps.cu'))
     mut = steps_src.replace('assert(0 && "Reached unreachable mux arm");', ';', 1)
-    mut = mut.replace('auto [x6, x7] = INVOKE_EXTERN(ctx, nextPagingIdx);',
-                      'auto c2mx = INVOKE_EXTERN(ctx, nextPagingIdx); auto x6 = c2mx[0], '
-                      'x7 = c2mx[1];', 1)
+    # (`ctx, nextPagingIdx` on 3.0, `ctx,nextPagingIdx` on 3.1)
+    mut = re.sub(r'auto \[x6, x7\] = INVOKE_EXTERN\(ctx, ?nextPagingIdx\);',
+                 'auto c2mx = INVOKE_EXTERN(ctx, nextPagingIdx); auto x6 = c2mx[0], '
+                 'x7 = c2mx[1];', mut, count=1)
     bad = check_pins(translate_steps(src=mut)[2])
     want = {'steps.cu assert: pinned 134, got 133', 'steps.cu sbind: pinned 6, got 5'}
     if set(bad) != want:
@@ -2044,24 +2208,69 @@ def _selftest(headers, work):
     else:
         print('  OK     pins catch a changed input (%s)' % '; '.join(bad))
 
-    # 2c. eval mode pins (R6), and their sensitivity: drop one __noinline__ from eval_check.cuh
+    # 2c. eval mode pins (R6), and their sensitivity to the header form
     bad = check_pins({'eval_check': translate_eval()[1]}, PINNED_EVAL)
     print('  pins   eval_check: %s' % ('OK' if not bad else 'MISMATCH'))
     for b in bad:
         fails.append('pin: ' + b)
         print('    ' + b)
     cuh = read(os.path.join(HERE, 'eval_check.cuh'))
-    mut = cuh.replace('extern __device__ __noinline__ FpExt rv32im_v2_0(',
-                      'extern __device__ FpExt rv32im_v2_0(', 1)
-    bad = check_pins({'eval_check': translate_eval(srcs={'eval_check.cuh': mut})[1]},
-                     PINNED_EVAL)
-    want = ['eval_check qual.noinline: pinned 20, got 19']
-    if bad != want:
-        fails.append('eval pin check on a mutated eval_check.cuh reported %r, expected %r'
-                     % (bad, want))
-        print('  FAIL   eval pins catch a changed input: %r' % bad)
-    else:
-        print('  OK     eval pins catch a changed input (%s)' % bad[0])
+    legacy = _legacy_eval_cuh(cuh)
+    # (a) one prototype already marked: injection covers the other 19, qual.noinline stays 20
+    mut = cuh.replace('extern __device__ FpExt rv32im_v2_0(',
+                      'extern __device__ __noinline__ FpExt rv32im_v2_0(', 1)
+    # (b) the fork's 3.0 form: all 20 marked on the prototypes, nothing injected
+    # (c) the 3.0 form with one __noinline__ dropped: that arm is injected, still 20
+    mut30 = legacy.replace('extern __device__ __noinline__ FpExt rv32im_v2_0(',
+                           'extern __device__ FpExt rv32im_v2_0(', 1)
+    for what, h, want in (
+            ('one prototype marked', mut,
+             ['eval_check eval.noinline_injected: pinned 20, got 19']),
+            ('3.0 header form', legacy,
+             ['eval_check eval.noinline_injected: pinned 20, got 0']),
+            ('3.0 form, one __noinline__ dropped', mut30,
+             ['eval_check eval.noinline_injected: pinned 20, got 1'])):
+        try:
+            c = translate_eval(srcs={'eval_check.cuh': h})[1]
+            bad = check_pins({'eval_check': c}, PINNED_EVAL)
+        except TranslateError as e:
+            bad = ['error: %s' % e]
+        if bad != want:
+            fails.append('eval pins on %s reported %r, expected %r' % (what, bad, want))
+            print('  FAIL   eval pins, %s: %r' % (what, bad))
+        else:
+            print('  OK     eval pins, %s (%s; qual.noinline 20)' % (what, bad[0]))
+    # (d) refusals of a malformed chain/header: the translator fails loudly
+    e2 = read(os.path.join(HERE, 'eval_check_2.cu'))
+    proto7 = re.search(r'(?m)^extern __device__ FpExt rv32im_v2_7\(.*\n', cuh).group(0)
+    for what, srcs, needle in (
+            ('missing prototype (3.1 form)', {'eval_check.cuh': cuh.replace(proto7, '', 1)},
+             'no prototype for rv32im_v2_7'),
+            ('missing prototype (3.0 form)',
+             {'eval_check.cuh': re.sub(r'extern __device__ __noinline__ FpExt rv32im_v2_7\('
+                                       r'[^;]*;\n', '', legacy, 1)},
+             'no prototype for rv32im_v2_7'),
+            ('duplicate prototype', {'eval_check.cuh': cuh.replace(proto7, proto7 * 2, 1)},
+             'duplicate prototype of rv32im_v2_7'),
+            ('unparsed prototype form', {'eval_check.cuh': cuh.replace(
+                proto7, proto7.replace('extern __device__ ', '__device__ extern ', 1), 1)},
+             'the header form changed'),
+            ('prototype without a definition', {'eval_check_2.cu': e2.replace(
+                'FpExt rv32im_v2_1(uint32_t', 'FpExt rv32im_v2_1_gone(uint32_t', 1)},
+             'prototype without a definition'),
+            ('poly_mix size not resolvable', {'eval_check.cuh': cuh.replace(
+                'constexpr size_t kNumPolyMixPows', 'constexpr size_t kNumPolyMixPowsX', 1)},
+             'cannot resolve the size')):
+        try:
+            translate_eval(srcs=srcs)
+            fails.append('eval refusal "%s": translated without error' % what)
+            print('  FAIL   eval refuse %s' % what)
+        except TranslateError as e:
+            if needle not in str(e):
+                fails.append('eval refusal "%s": wrong error: %s' % (what, e))
+                print('  FAIL   eval refuse %s: %s' % (what, e))
+            else:
+                print('  OK     eval refuse %s' % what)
 
     # 3. one snippet per pass: translate, check counts and residuals, compile
     incs = [work, headers, BK_METAL]
