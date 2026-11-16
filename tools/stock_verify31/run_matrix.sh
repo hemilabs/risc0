@@ -50,7 +50,10 @@ if grep -A3 '^name = "risc0' $HERE/Cargo.lock | grep '^source' | grep -v 'regist
 fi
 $V consts | tee $OUT/logs/stock_consts.log
 
-# 2. Producers (outside the GPU lock).
+# 2. Producers (outside the GPU lock). The producer's Cargo.lock is not committed; seed it from the
+# tree's so it resolves the tree's pinned versions (a fresh resolve picks newer crates, e.g. a `cc`
+# whose deprecations fail risc0-build-kernel under the tree's -Dwarnings).
+[[ -f $HERE/produce/Cargo.lock ]] || cp $TREE/Cargo.lock $HERE/produce/Cargo.lock
 (cd $HERE/produce && CARGO_TARGET_DIR=$OUT/target-prod31 cargo build --release -q)
 PRODS=(31:$OUT/target-prod31/release/p31-14-produce:v0.2.0)
 if [[ -n ${FROZEN30:-} ]]; then

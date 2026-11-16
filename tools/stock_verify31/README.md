@@ -41,7 +41,8 @@ case, verifying each with that tree's verifier first:
 
 `wrap-timing <elf> <input> <reps>` makes one succinct receipt and wraps it `<reps>` times in one
 process (the identity_p254 / shrink_wrap timing of P31-14). Its `Cargo.lock` is not committed: it
-follows the tree it is built against.
+follows the tree it is built against. Seed it with the tree's `Cargo.lock` before a manual build
+(`run_matrix.sh` does); a fresh resolve picks newer crates that fail the tree's `-Dwarnings`.
 
 It prints the device allocation each stage leaves and, before the wrap, the headroom the Groth16 key
 load will see. Diagnostics: `P14_TRACE_ALLOC=1` (every allocation change >= 1 MiB),
