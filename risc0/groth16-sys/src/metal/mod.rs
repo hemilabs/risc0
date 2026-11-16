@@ -414,6 +414,9 @@ pub(crate) mod test_lock {
 mod bn254_tests;
 
 #[cfg(test)]
+mod tests_tierz;
+
+#[cfg(test)]
 mod tests {
     use std::path::Path;
 

@@ -836,8 +836,88 @@ pub(crate) mod test_hooks {
         super::gs_steps(lg)
     }
 
+    /// W7-T1: why a pass split is invalid for a forward (`ct`) or inverse NTT of `2^lg`, or
+    /// `None` if it is valid. The rules are measured, not derived: `split_tests::
+    /// split_rules_match_gpu` ran every split of lg 11..=22 into 2 and 3 passes against sppark's
+    /// split (W7-T1: 1630 splits, 1254 wrong, one column; P31-T1 re-ran it on 3.1 and checked
+    /// the accepted splits at 3 and 211 columns: notes/P31-T1.md). With more than one pass:
+    /// - at most 3 passes (a 4-pass sweep at lg 14-16 faulted the GPU: kIOGPUCommandBuffer
+    ///   CallbackErrorPageFault);
+    /// - every pass has 1..=10 iterations (radix 11 reads past the 1024-entry plus-one twiddle
+    ///   row unless the pass is the first CT / last GS one; Z13's fix is not in the tree);
+    /// - the passes sum to `lg`;
+    /// - CT: the first pass has >= 6 iterations and every later pass >= 4;
+    /// - GS (the mirror): the last pass has >= 6 iterations and every earlier pass >= 4.
+    ///
+    /// The rules refuse no split the sweep found exact at lg >= 13; they are conservative at
+    /// lg 11-12 (e.g. CT [8, 3] at lg 11 and [2, 10] at lg 12 are exact but refused). Z13's
+    /// "GS pass longer than the levels left after it" guess was wrong (it refuses sppark's own
+    /// lg 29 GS split [10, 10, 9]).
+    pub(crate) fn split_violation(ct: bool, lg: usize, v: &[usize]) -> Option<String> {
+        let check = std::env::var("RISC0_METAL_NTT_SPLIT_CHECK").as_deref() != Ok("0");
+        split_violation_with(ct, lg, v, check)
+    }
+
+    /// `split_violation` with the knob passed in: `check = false` is
+    /// `RISC0_METAL_NTT_SPLIT_CHECK=0` (only the 1..=10 and sum checks). Tests call this, so no
+    /// test has to set the process-wide variable.
+    pub(crate) fn split_violation_with(
+        ct: bool,
+        lg: usize,
+        v: &[usize],
+        check: bool,
+    ) -> Option<String> {
+        if v.is_empty() {
+            return Some("empty split".into());
+        }
+        if let Some(&i) = v.iter().find(|&&i| !(1..=10).contains(&i)) {
+            return Some(format!(
+                "a pass of {i} iterations (every pass needs 1..=10; radix 11 needs the \
+                 plus-one twiddle fix that is not in the tree)"
+            ));
+        }
+        let sum: usize = v.iter().sum();
+        if sum != lg {
+            return Some(format!("the passes sum to {sum}, not lg {lg}"));
+        }
+        if v.len() == 1 || !check {
+            return None;
+        }
+        if v.len() > 3 {
+            return Some(format!(
+                "{} passes (at most 3 are supported: sppark never uses more, and a 4-pass sweep \
+                 caused a GPU address fault)",
+                v.len()
+            ));
+        }
+        // GS runs the CT pass structure in reverse.
+        let w: Vec<usize> = if ct {
+            v.to_vec()
+        } else {
+            v.iter().rev().copied().collect()
+        };
+        let (first, rest) = (
+            if ct { "first" } else { "last" },
+            if ct { "later" } else { "earlier" },
+        );
+        if w[0] < 6 {
+            return Some(format!(
+                "the {first} pass has {} iterations; a multi-pass {} needs >= 6",
+                w[0],
+                if ct { "CT" } else { "GS" }
+            ));
+        }
+        if let Some(&i) = w[1..].iter().find(|&&i| i < 4) {
+            return Some(format!(
+                "a {rest} pass has {i} iterations; every pass but the {first} needs >= 4"
+            ));
+        }
+        None
+    }
+
     /// Override (Some) or reset (None) the pass split of `hal`'s forward (`ct`) or inverse NTTs
-    /// of `2^lg`. Every pass must have 1..=10 iterations and they must sum to `lg`.
+    /// of `2^lg`. Panics on a split `split_violation` refuses (`RISC0_METAL_NTT_SPLIT_CHECK=0`:
+    /// only the 1..=10 and sum checks, as before W7-T1).
     pub(crate) fn set_split<MH: MetalHash>(
         hal: &MetalHal<MH>,
         ct: bool,
@@ -847,7 +927,12 @@ pub(crate) mod test_hooks {
         let mut m = hal.ntt.split.lock().unwrap();
         match split {
             Some(v) => {
-                assert!(v.iter().all(|&i| (1..=10).contains(&i)) && v.iter().sum::<usize>() == lg);
+                if let Some(why) = split_violation(ct, lg, &v) {
+                    panic!(
+                        "invalid NTT pass split {v:?} for {} lg {lg}: {why}",
+                        if ct { "CT" } else { "GS" }
+                    );
+                }
                 m.insert((ct, lg), v);
             }
             None => {
@@ -934,5 +1019,271 @@ pub(crate) mod test_hooks {
         cols: usize,
     ) {
         hal.bitrev_batched((io, 0), lg, cols);
+    }
+}
+
+/// W7-T1: pass-split validity (`test_hooks::split_violation`).
+#[cfg(test)]
+mod split_tests {
+    use super::{test_hooks as th, *};
+
+    fn bad(ct: bool, lg: usize, v: &[usize]) -> bool {
+        th::split_violation(ct, lg, v).is_some()
+    }
+
+    /// The splits Z13 measured wrong are refused; sppark's default splits and the measured
+    /// fast splits (`z13_measured_ct_splits_are_exact`, `z13_split_ab`) are accepted. No GPU.
+    #[test]
+    fn known_bad_splits_are_refused() {
+        // Pure: the knob is passed to split_violation_with, so no process-wide env is touched
+        // (W7-T1 r2; r1 set RISC0_METAL_NTT_SPLIT_CHECK under the GPU test lock).
+        // Z13: CT lg 22 [5, 6, 11], [11, 8, 3]; GS [10, 6, 5], [11, 5, 5], [11, 6, 5].
+        assert!(bad(true, 22, &[5, 6, 11]));
+        assert!(bad(true, 22, &[11, 8, 3]));
+        assert!(bad(true, 22, &[5, 9, 8]));
+        assert!(bad(false, 21, &[10, 6, 5]));
+        assert!(bad(false, 21, &[11, 5, 5]));
+        assert!(bad(false, 22, &[11, 6, 5]));
+        assert!(bad(true, 22, &[11, 11]));
+        // W7-T1 sweep: a later CT pass (earlier GS pass) below 4 iterations.
+        assert!(bad(true, 22, &[10, 9, 3]));
+        assert!(bad(true, 22, &[10, 3, 9]));
+        assert!(bad(false, 22, &[3, 10, 9]));
+        assert!(bad(false, 20, &[10, 5, 5]));
+        assert!(bad(true, 22, &[6, 6, 6, 4]));
+        assert!(bad(true, 20, &[10, 9]));
+        assert!(bad(false, 20, &[]));
+        for lg in 1..=30 {
+            assert!(!bad(true, lg, &ct_steps(lg)), "sppark CT lg {lg}");
+            assert!(!bad(false, lg, &gs_steps(lg)), "sppark GS lg {lg}");
+        }
+        for (lg, v) in [
+            (17usize, vec![10usize, 7]),
+            (18, vec![10, 8]),
+            (19, vec![9, 6, 4]),
+            (20, vec![9, 7, 4]),
+            (21, vec![10, 7, 4]),
+            (22, vec![10, 8, 4]),
+            (22, vec![10, 7, 5]),
+            (22, vec![9, 9, 4]),
+        ] {
+            assert!(!bad(true, lg, &v), "measured CT {lg} {v:?}");
+        }
+        for v in [vec![10usize, 10], vec![4, 7, 9], vec![4, 6, 10]] {
+            assert!(!bad(false, 20, &v), "measured GS {v:?}");
+        }
+        // The old (pre-W7-T1) check accepts what the new one refuses.
+        let old = th::split_violation_with(true, 22, &[5, 6, 11], false).is_some()
+            && th::split_violation_with(true, 22, &[5, 9, 8], false).is_none()
+            && th::split_violation_with(true, 22, &[5, 9, 8], true).is_some();
+        assert!(
+            old,
+            "RISC0_METAL_NTT_SPLIT_CHECK=0 keeps only the 1..=10 and sum checks"
+        );
+    }
+
+    /// `set_split` panics on a refused split.
+    #[test]
+    #[should_panic(expected = "invalid NTT pass split [5, 6, 11] for CT lg 22")]
+    fn set_split_panics_on_bad_split() {
+        let _lock = super::super::gpu_test_lock();
+        let hal = super::super::MetalHalPoseidon2::new();
+        th::set_split(&hal, true, 22, Some(vec![5, 6, 11]));
+    }
+
+    /// Every composition of lg into 2..=`NTT_SWEEP_PARTS` (default 3) passes of 1..=10
+    /// iterations, CT and GS, lg `NTT_SWEEP_LGS` (default 11..=22), one column, against
+    /// sppark's split: prints the wrong splits per transform and fails if the rule accepts a
+    /// wrong one (it may refuse exact ones: it is conservative at lg 11-12).
+    ///
+    /// P31-T1: then every split the rule accepts runs again with `NTT_SWEEP_COLS` (default
+    /// `3,211`) columns, against sppark's split at the same column count (W7-T1 swept one column
+    /// only). A (cols, lg) whose buffers exceed `NTT_SWEEP_COL_MAX_ELEMS` elements each (default
+    /// 2^28, 1 GiB; three such buffers are live; the default run peaked at 7.7 GB footprint) is
+    /// skipped and printed; 211 columns at lg 21-22 need `NTT_SWEEP_COL_MAX_ELEMS=1073741824`
+    /// (with `NTT_SWEEP_ONE_COL=0 NTT_SWEEP_LGS=21,22 NTT_SWEEP_COLS=211` that peaked at 21.4 GB
+    /// footprint: run it as `gpu-run --huge`). `NTT_SWEEP_ONE_COL=0` skips the one-column
+    /// exhaustive pass (the accepted set then comes from the rule). Fails if an accepted split is
+    /// wrong at any column count.
+    #[test]
+    #[ignore = "exhaustive GPU sweep (heavy: 7.7 GB footprint, ~20 s)"]
+    fn split_rules_match_gpu() {
+        super::super::require_gpu_run();
+        let _lock = super::super::gpu_test_lock();
+        let hal = super::super::MetalHalPoseidon2::new();
+        let env_list = |key: &str, default: Vec<usize>| -> Vec<usize> {
+            std::env::var(key)
+                .map(|v| v.split(',').map(|x| x.trim().parse().unwrap()).collect())
+                .unwrap_or(default)
+        };
+        let parts: usize = std::env::var("NTT_SWEEP_PARTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
+        let lgs = env_list("NTT_SWEEP_LGS", (11..=22).collect());
+        let col_counts = env_list("NTT_SWEEP_COLS", vec![3, 211]);
+        let max_elems: usize = std::env::var("NTT_SWEEP_COL_MAX_ELEMS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1 << 28);
+        // NTT_SWEEP_ONE_COL=0: skip the exhaustive one-column pass and take the accepted set from
+        // the rule alone (refused splits never run; a refused GS split at lg 21 once caused a GPU
+        // address fault, P31-T1).
+        let one_col = std::env::var("NTT_SWEEP_ONE_COL").as_deref() != Ok("0");
+        fn comps(lg: usize, k: usize, out: &mut Vec<Vec<usize>>, cur: &mut Vec<usize>) {
+            if k == 0 {
+                if lg == 0 {
+                    out.push(cur.clone());
+                }
+                return;
+            }
+            for i in 1..=10.min(lg) {
+                cur.push(i);
+                comps(lg - i, k - 1, out, cur);
+                cur.pop();
+            }
+        }
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut random = |len: usize| -> Vec<Fp> {
+            (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    Fp::new((state % (risc0_core::field::baby_bear::P as u64)) as u32)
+                })
+                .collect()
+        };
+        // `cols` columns of 2^lg, column-major (stride 2^lg), with the split currently set.
+        let run_into =
+            |ct: bool, lg: usize, cols: usize, gin: &BufferImpl<Fp>, out: &BufferImpl<Fp>| {
+                let n = 1usize << lg;
+                if ct {
+                    hal.ct_x(cols, (gin, 0), n, 0, (out, 0), n, lg, false);
+                } else {
+                    hal.gs_x(cols, (gin, 0), n, (out, 0), n, lg, None);
+                }
+                hal.flush();
+            };
+        let name = |ct: bool| if ct { "CT" } else { "GS" };
+        let (mut mispredicted, mut tested, mut wrong, mut conservative) =
+            (vec![], 0usize, 0usize, 0usize);
+        // (ct, lg) -> the splits the rule accepts.
+        let mut accepted: Vec<(bool, usize, Vec<Vec<usize>>)> = vec![];
+        for &lg in &lgs {
+            let n = 1usize << lg;
+            let gin = hal.copy_from_slice("in", &random(if one_col { n } else { 1 }));
+            let run = |ct: bool| -> Vec<Fp> {
+                let out = hal.alloc_buffer::<Fp>("out", n);
+                run_into(ct, lg, 1, &gin, &out);
+                out.to_vec()
+            };
+            for ct in [true, false] {
+                let want = if one_col { run(ct) } else { vec![] };
+                let mut all = vec![];
+                for k in 2..=parts {
+                    comps(lg, k, &mut all, &mut vec![]);
+                }
+                let mut bad_here = vec![];
+                let mut acc_here = vec![];
+                if !one_col {
+                    acc_here = all.into_iter().filter(|v| !bad(ct, lg, v)).collect();
+                    accepted.push((ct, lg, acc_here));
+                    continue;
+                }
+                for v in all {
+                    hal.ntt.split.lock().unwrap().insert((ct, lg), v.clone());
+                    let ok = run(ct) == want;
+                    hal.ntt.split.lock().unwrap().remove(&(ct, lg));
+                    tested += 1;
+                    if !ok {
+                        wrong += 1;
+                        bad_here.push(v.clone());
+                    }
+                    let refused = bad(ct, lg, &v);
+                    if !refused {
+                        acc_here.push(v.clone());
+                    }
+                    if ok && refused {
+                        conservative += 1;
+                    }
+                    if !ok && !refused {
+                        mispredicted.push(format!(
+                            "{} lg {lg} {v:?} cols 1: gpu WRONG rule accepts",
+                            name(ct)
+                        ));
+                    }
+                }
+                println!(
+                    "NTTSPLIT {} lg {lg}: {} wrong splits {:?}",
+                    name(ct),
+                    bad_here.len(),
+                    bad_here
+                );
+                accepted.push((ct, lg, acc_here));
+            }
+        }
+        println!(
+            "NTTSPLIT tested {tested}, wrong {wrong}, refused although exact {conservative}, \
+             accepted although WRONG {}: {mispredicted:#?}",
+            mispredicted.len()
+        );
+        // P31-T1: the accepted set at more columns.
+        let n_acc: usize = accepted.iter().map(|(_, _, a)| a.len()).sum();
+        let mut col_wrong = vec![];
+        for &cols in &col_counts {
+            let (mut col_tested, mut skipped) = (0usize, vec![]);
+            for &lg in &lgs {
+                let total = cols << lg;
+                if total > max_elems {
+                    skipped.push(lg);
+                    continue;
+                }
+                let gin = hal.copy_from_slice("in", &random(total));
+                let want = hal.alloc_buffer::<Fp>("want", total);
+                let out = hal.alloc_buffer::<Fp>("out", total);
+                for ct in [true, false] {
+                    let Some((_, _, acc)) = accepted.iter().find(|(c, l, _)| *c == ct && *l == lg)
+                    else {
+                        continue;
+                    };
+                    run_into(ct, lg, cols, &gin, &want);
+                    let mut bad_here = vec![];
+                    for v in acc {
+                        hal.ntt.split.lock().unwrap().insert((ct, lg), v.clone());
+                        run_into(ct, lg, cols, &gin, &out);
+                        hal.ntt.split.lock().unwrap().remove(&(ct, lg));
+                        let mut ok = false;
+                        out.view(|o| want.view(|w| ok = o == w));
+                        col_tested += 1;
+                        if !ok {
+                            bad_here.push(v.clone());
+                            col_wrong.push(format!("{} lg {lg} {v:?} cols {cols}", name(ct)));
+                        }
+                    }
+                    println!(
+                        "NTTSPLIT cols {cols} {} lg {lg}: {} accepted splits, {} wrong {:?}",
+                        name(ct),
+                        acc.len(),
+                        bad_here.len(),
+                        bad_here
+                    );
+                }
+            }
+            println!(
+                "NTTSPLIT cols {cols}: tested {col_tested} accepted splits (of {n_acc} at 1 \
+                 column), wrong {}, lgs skipped over NTT_SWEEP_COL_MAX_ELEMS {max_elems}: \
+                 {skipped:?}",
+                col_wrong
+                    .iter()
+                    .filter(|s| s.ends_with(&format!(" cols {cols}")))
+                    .count()
+            );
+        }
+        assert!(mispredicted.is_empty(), "the rule accepts wrong splits");
+        assert!(
+            col_wrong.is_empty(),
+            "accepted splits are wrong at more columns: {col_wrong:#?}"
+        );
     }
 }

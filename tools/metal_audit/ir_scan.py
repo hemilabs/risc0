@@ -25,11 +25,25 @@ For every function the scanner finds natural loops (dominator-based back edges) 
           pointer into X, e.g. `lhs *= rhs` in `operator*(FpExt lhs, Fp rhs) { lhs *= rhs;
           return lhs; }`), and reads X afterwards (S/param); or such a function writes a local
           aggregate X, calls, writes X again and reads it (S/local)
+  tier Z: (W7-T1, UNVALIDATED HEURISTIC, informational) Z13's reported shape: in a function with no
+          user call (fully inlined), a conditional branch B whose condition is not derived from an
+          induction variable of a loop around B (so it survives unrolling: a runtime guard such as
+          `if (bz != 0)`) guards a region G (the blocks only reachable through one edge of B)
+          containing a whole loop L (in AIR the #pragma unroll loops are still loops, with an
+          llvm.loop unroll hint; the back end unrolls them) that stores into an alloca'd private
+          array X (>= 2 scalar leaves); the other edge of B bypasses G, and X is loaded at or after
+          a block both paths reach (the merge). Z13 saw `if (MODE == 2 && bz != 0) { for m: v[m] =
+          mul(v[m], t); ... }` on a `uint v[16]` fail 7/20-19/20 in a prototype that no longer
+          exists. NO GPU FAILURE OF THIS SHAPE HAS BEEN REPRODUCED: the W7-T1 rebuild
+          (docs/metal-port/r17/z13, tests_r17 `r17_shape_probe_z13`) and all its variants are 0/n
+          once the CPU reference has the kernel's semantics (the first rebuild's "k = n" was a
+          reference bug, fix round 1). A tier-Z finding is a place to look, not a demonstrated
+          defect; run_stress.sh reports it and does not gate on it.
 Plus, per function, the number of loops that contain a user call ("call loops"); a user call is a call
 to anything but llvm.* / air.* intrinsics. "Dominates" is per instruction (block dominance, or
 earlier in the same block), so the arms of an if/else do not combine into a shape.
 
-usage: ir_scan.py [--json out.json] [--tiers ABCS] [--fail-tiers AB] <dir-or-.ll>...
+usage: ir_scan.py [--json out.json] [--tiers ABCSZ] [--fail-tiers ASZ] <dir-or-.ll>...
   --fail-tiers T: exit status 1 if any finding of a tier in T is reported (a test gate).
 Pure stdlib; run with python3 -I.
 """
@@ -788,6 +802,127 @@ def analyse(f, md=None):
     return findings, ncall_loops
 
 
+UNROLL_HINTS = ('unroll.enable', 'unroll.full', 'unroll.count')
+
+
+def guarded_update(f, md, types):
+    """tier Z (Z13's shape): see the module docstring."""
+    if any(user_call(x) for b in f.blocks for x in f.insts[b]):
+        return []
+    allocas = {}
+    for b in f.blocks:
+        for x in f.insts[b]:
+            v = lhs(x)
+            if v and ' = alloca ' in x:
+                t = x.split(' = alloca ', 1)[1].split(',')[0].strip()
+                if leaves(t, types) >= 2 or re.match(r'^\[\d+ x ', t):
+                    allocas[v] = t
+    if not allocas:
+        return []
+    d = derive(f, list(allocas))
+    dt = DomTree(f)
+    loops = natural_loops(f)
+    loop_hints = {h: loop_md(f, body, md) for h, body in loops.items()}
+    unroll_loops = [body for h, body in loops.items()
+                    if any(any(k in hnt for k in UNROLL_HINTS) for hnt in loop_hints[h])]
+    defs = {}
+    for b in f.blocks:
+        for x in f.insts[b]:
+            v = lhs(x)
+            if v:
+                defs[v] = (b, x)
+    # values derived from the header phis of each loop (the induction variables, folded by unrolling)
+    iv_of = {}
+    for h, body in loops.items():
+        seeds = {lhs(x) for x in f.insts[h] if ' = phi ' in x}
+        seeds.discard(None)
+        der = set(seeds)
+        changed = True
+        while changed:
+            changed = False
+            for v, (b, x) in defs.items():
+                if v in der or b not in body:
+                    continue
+                if any(t in der for t in VAL_RE.findall(x.split(' = ', 1)[1])):
+                    der.add(v)
+                    changed = True
+        iv_of[h] = der
+    stores, loads = defaultdict(list), defaultdict(list)
+    for b in f.blocks:
+        for i, x in enumerate(f.insts[b]):
+            if x.startswith('store '):
+                parts = split_type_list(x[len('store '):].split(', align')[0].split(', !')[0])
+                if len(parts) >= 2:
+                    pt = [t for t in VAL_RE.findall(parts[1]) if t in d]
+                    if pt:
+                        stores[d[pt[-1]]].append((b, i, x, pt[-1]))
+            elif ' = load ' in x:
+                for t in VAL_RE.findall(x.split(' = load ', 1)[1]):
+                    if t in d:
+                        loads[d[t]].append((b, i))
+                        break
+            elif 'llvm.memcpy' in x or 'llvm.memmove' in x:
+                toks = VAL_RE.findall(x.split('(', 1)[1] if '(' in x else '')
+                if len(toks) > 1 and toks[1] in d:
+                    loads[d[toks[1]]].append((b, i))
+    preds = dt.preds
+    out = []
+    seen = set()
+    for b in f.blocks:
+        term = f.insts[b][-1] if f.insts[b] else ''
+        m = re.match(r'br i1 (%[\w.$-]+), label (%[\w.$-]+), label (%[\w.$-]+)', term)
+        if not m:
+            continue
+        cond, s1, s2 = m.groups()
+        if any(cond in iv_of[h] for h, body in loops.items() if b in body):
+            continue
+        for g0, other in ((s1, s2), (s2, s1)):
+            if g0 == other or [p for p in preds[g0] if p in dt.pre] != [b]:
+                continue
+            region = {x for x in f.blocks if dt.dom(g0, x)}
+            if other in region:
+                continue
+            reach_g = set()
+            for x in region:
+                reach_g |= dt.reach_blocks(x)
+            merges = (reach_g - region) & (dt.reach_blocks(b) | {other}) & ({other} | dt.reach_blocks(other))
+            if not merges:
+                continue
+            after = set(merges)
+            for x in merges:
+                after |= dt.reach_blocks(x)
+            for x, sts in stores.items():
+                if x not in allocas or x in seen:
+                    continue
+                for sb, si, sl, ptr in sts:
+                    if sb not in region:
+                        continue
+                    # The store must be in a loop that lies entirely inside the guarded region
+                    # (Z13's description: a guarded loop over v[]; a single guarded store is not
+                    # matched. Unvalidated: no variant of the shape fails on the GPU, W7-T1 r1).
+                    inner = [body for h, body in loops.items() if sb in body and body <= region]
+                    if not inner:
+                        continue
+                    in_unroll = any(body in unroll_loops for body in inner)
+                    ld = [(lb, li) for lb, li in loads.get(x, []) if lb in after - region]
+                    if not ld:
+                        continue
+                    seen.add(x)
+                    out.append({
+                        'loop_md': sorted({h for hs in (loop_hints[h] for h, body in loops.items()
+                                                        if sb in body) for h in hs}),
+                        'loop_blocks': min(len(body) for body in inner), 'tier': 'Z', 'fn': f.name,
+                        'loop': '-', 'alloca': x,
+                        'type': allocas[x], 'init': 'guard ' + cond + ' in ' + b,
+                        'store_after_call': False, 'var_index': None,  # not computed for tier Z
+                        'read_after_loop': True, 'calls': [], 'store': sl,
+                        'n_stores': len(sts), 'shape': 'guarded-loop-update(%s)' % (
+                            'unroll hint' if in_unroll else 'no unroll hint'),
+                    })
+                    break
+    return out
+
+
 def demangle(names):
     if not names:
         return {}
@@ -818,6 +953,7 @@ def scan_file(path):
         fd, n = analyse(f, md)
         call_loops += n
         fd += straight_line(f, md, types, init_fns, {x['alloca'] for x in fd}, writers, defined)
+        fd += guarded_update(f, md, types)
         for d in fd:
             m = DBG_RE.search(d['store'])
             d['src'] = loc_of(md, int(m.group(1)), cache) if m else None
@@ -828,7 +964,7 @@ def scan_file(path):
 
 def main(argv):
     js = None
-    tiers = 'ABCS'
+    tiers = 'ABCSZ'
     fail = ''
     paths = []
     it = iter(argv)
@@ -855,13 +991,13 @@ def main(argv):
         for d in fd:
             d['file'] = path
         allf += fd
-        cnt = {t: sum(1 for d in fd if d['tier'] == t) for t in 'ABCS'}
+        cnt = {t: sum(1 for d in fd if d['tier'] == t) for t in 'ABCSZ'}
         summary.append((path, nf, ncl, cnt))
     dm = demangle(sorted({d['fn'] for d in allf} | {c for d in allf for c in d['calls']}))
-    print('%-70s %6s %6s %4s %4s %4s %4s' % ('file', 'fns', 'cloops', 'A', 'B', 'C', 'S'))
+    print('%-70s %6s %6s %4s %4s %4s %4s %4s' % ('file', 'fns', 'cloops', 'A', 'B', 'C', 'S', 'Z'))
     for path, nf, ncl, cnt in summary:
-        print('%-70s %6d %6d %4d %4d %4d %4d' % (os.path.relpath(path)[-70:], nf, ncl, cnt['A'],
-                                                 cnt['B'], cnt['C'], cnt['S']))
+        print('%-70s %6d %6d %4d %4d %4d %4d %4d' % (os.path.relpath(path)[-70:], nf, ncl, cnt['A'],
+                                                     cnt['B'], cnt['C'], cnt['S'], cnt['Z']))
     for d in allf:
         if d['tier'] not in tiers:
             continue
@@ -872,6 +1008,8 @@ def main(argv):
                   d['alloca'], d['type'], d['init'], d['var_index'], d['n_stores'], ','.join(d['loop_md']) or '-',
                   ' shape=' + d['shape'] if d.get('shape') else '',
                   ', '.join(dm.get(c, c)[:80] for c in d['calls'][:4]), d['store']))
+    tot = {t: sum(c[t] for _p, _n, _c, c in summary) for t in 'ABCSZ'}
+    print('\nir_scan totals: files=%d %s' % (len(summary), ' '.join('%s=%d' % (t, tot[t]) for t in 'ABCSZ')))
     if js:
         with open(js, 'w') as fh:
             json.dump(allf, fh, indent=1, default=str)
