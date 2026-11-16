@@ -17,10 +17,10 @@
 //! R10 (PLAN 4.2): eval_check runs the baseline `eval_check` kernel (R6's translation of CUDA
 //! `eval_check_0..3.cu` + `eval_check_kernel.cu` by `cuda2metal.py eval`). The host side mirrors
 //! `hal/cuda.rs::eval_check` / `risc0_circuit_rv32im_cuda_eval_check`:
-//! - the 458 poly_mix powers are computed on the CPU (`map_pow(poly_mix, POLY_MIX_POWERS)`) and
-//!   copied into the HAL-owned `ScratchBuffers::poly_mix` buffer (CUDA copies them into
-//!   `__constant__` memory; 7328 B is above the 4 KB `set_bytes` limit, so here it is a
-//!   `const device FpExt*` binding);
+//! - the `NUM_POLY_MIX_POWERS` poly_mix powers (484 on the 3.1 circuit, 458 on 3.0) are computed
+//!   on the CPU (`map_pow(poly_mix, POLY_MIX_POWERS)`) and copied into the HAL-owned
+//!   `ScratchBuffers::poly_mix` buffer (CUDA copies them into `__constant__` memory; 7744 B is
+//!   above the 4 KB `set_bytes` limit, so here it is a `const device FpExt*` binding);
 //! - one dispatch of `ceil(domain / 256)` threadgroups of 256 threads (CUDA `EVAL_CHECK_THREADS`),
 //!   then the batch is closed with a sync (end of a circuit phase, PLAN 2.6);
 //! - `eval_check_dep` stays the default no-op (one command queue, PLAN 2.0; a second queue is R14).
@@ -29,8 +29,10 @@
 //! `kernels/cuda/evalfast/regen.py --metal`, the CUDA evalfast chain after remat_lu.py converted
 //! by to_metal.py). The host mirrors `risc0_circuit_rv32im_cuda_eval_check` of
 //! `eval_check_ef.cu`, except that CUDA's one-thread `ef_prep`/`ef_prep_n` kernels are replaced by
-//! a CPU table builder ([ef_table], PLAN 4.2): the 627-entry poly_mix table (458 powers, 107
-//! products, 62 hoisted out/mix terms from the generated `rk_hoist`), its NBETA-folded copy and
+//! a CPU table builder ([ef_table], PLAN 4.2): the `EF_NPM`-entry poly_mix table (`EF_NPC` powers,
+//! `RK_QN` products, `RK_HN` hoisted out/mix terms from the generated `rk_hoist`; all from the
+//! generated `ef_tables.rs`: 642 = 484 + 109 + 49 on the 3.1 circuit, 627 = 458 + 107 + 62 on 3.0),
+//! its NBETA-folded copy and
 //! the 4 vanishing quotients go into one shared buffer; then `ef_eval_split` (even threadgroups:
 //! main chain into `check`, odd: LogUp chain into the scratch partials) and `ef_combine`
 //! (`check = (check + partial) * quotient`) in one batch. [EVAL_KERNEL_ENV] selects the kernel
@@ -670,7 +672,11 @@ const EF_COMBINE_THREADS: u64 = 256;
 pub(crate) const EF_TABLE_LEN: usize = 2 * ef::EF_NPM + 1;
 
 const _: () = assert!(ef::EF_NPC == NUM_POLY_MIX_POWERS);
-const _: () = assert!(ef::EF_NPM == 627);
+const _: () = assert!(ef::EF_NPM == ef::EF_NPC + ef::RK_QN + ef::RK_HN);
+// The table size the 3.1 circuit's kernels were validated with (P31-03: 484 powers + 109 products
+// + 49 hoisted terms). A literal on purpose: a regenerated circuit must fail here until its
+// evalfast kernels have been re-checked bit-exact (docs/metal-port/notes/P31-03.md).
+const _: () = assert!(ef::EF_NPM == 642);
 
 /// The evalfast table buffer contents (CUDA `ef_prep` + `ef_prep_n` on the host; the kernel reads
 /// each FpExt as 4 raw words, which is the in-memory form of [ExtVal]):
@@ -710,8 +716,10 @@ pub(crate) fn ef_table(
 }
 
 // The baseline kernel's `poly_mix` table has `kNumPolyMixPows` entries (eval_check.cuh), and
-// evalfast is generated for the same count (EF_NPC); a circuit change must regenerate both.
-const _: () = assert!(NUM_POLY_MIX_POWERS == 458);
+// evalfast is generated for the same count (EF_NPC; to_metal.py checks it against
+// kNumPolyMixPows and the kernel static_asserts it); a circuit change must regenerate both. 484 is
+// the 3.1 circuit (458 on 3.0), kept as a literal tripwire like the EF_NPM one above.
+const _: () = assert!(NUM_POLY_MIX_POWERS == 484);
 const _: () = assert!(std::mem::size_of::<ExtVal>() == 4 * std::mem::size_of::<u32>());
 const _: () = assert!(std::mem::size_of::<Val>() == std::mem::size_of::<u32>());
 
@@ -1005,7 +1013,7 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
 
     /// eval_check on the GPU: the baseline `eval_check` kernel (R6 ABI, eval_check.metal):
     /// `0 check, 1 ctrl, 2 data, 3 accum, 4 mix, 5 out` (buffers), `6 rou` (`constant Fp&`),
-    /// `7 po2`, `8 domain` (`constant uint&`), `9 poly_mix` (`const device FpExt*`, 458 entries).
+    /// `7 po2`, `8 domain` (`constant uint&`), `9 poly_mix` (`const device FpExt*`, `NUM_POLY_MIX_POWERS` entries).
     pub(crate) fn eval_check_baseline(
         &self,
         check: &BufferImpl<Val>,
@@ -1582,18 +1590,29 @@ mod ef_tests {
     /// inputs at po2 `R19_EF_PO2` (default 18). A lazy-reduction bound broken by a generator
     /// change shows up on only some rows of some inputs (R19's dual-accumulator transform: wrong
     /// on 4 of 6 seeds at po2 18, 1 of 5 at po2 16, 1 of 16 at po2 10), so run this after any
-    /// change to the evalfast generator or its helpers.
+    /// change to the evalfast generator or its helpers. P31-03: also the R15e and R12 forms, and
+    /// with `R19_EF_CPU=1` the baseline against the CPU on every seed (so every form is checked
+    /// CPU-equal, not only baseline-equal).
     #[test]
     #[ignore]
     fn evalfast_seeds_match_baseline() {
         let po2 = env_usize("R19_EF_PO2", 18);
         let seeds = env_usize("R19_EF_SEEDS", 8) as u64;
+        let with_cpu = std::env::var("R19_EF_CPU").as_deref() == Ok("1");
         let hal = Arc::new(MetalHalSha256::new());
         let c = MetalCircuitHal::new(hal.clone()).unwrap();
         let mut bad = Vec::new();
         for seed in 1..=seeds {
             let inp = Inputs::seeded(po2, seed, Dist::Uniform);
             let (base, _, _) = gpu_checks(&c, &inp, po2, Which::Baseline, 1);
+            if with_cpu {
+                let cpu = cpu_check(&inp, po2);
+                let n = mismatches(&cpu, &base[0]);
+                println!("P31-03 baseline vs CPU seed {seed} po2 {po2}: {n} elements differ");
+                if n > 0 {
+                    bad.push((seed, n));
+                }
+            }
             let (fast, fast_t, _) = gpu_checks(&c, &inp, po2, Which::Evalfast, 1);
             let n = mismatches(&base[0], &fast[0]);
             println!("R19 evalfast seed {seed} po2 {po2}: {n} elements differ; {fast_t:?}");
@@ -1609,12 +1628,15 @@ mod ef_tests {
             if n > 0 {
                 bad.push((seed, n));
             }
-            // R22: the nested-chain forms; R23: the unhoisted flat ones.
+            // R22: the nested-chain forms; R23: the unhoisted flat ones; P31-03: R15e's and R12's
+            // forms (the RISC0_METAL_RV32IM_EVAL revert kernels).
             for which in [
                 Which::EvalfastNest,
                 Which::EvalfastFcNest,
                 Which::EvalfastNoHoist,
                 Which::EvalfastFcNoHoist,
+                Which::EvalfastR15e,
+                Which::EvalfastR12,
             ] {
                 let (r, t, _) = gpu_checks(&c, &inp, po2, which, 1);
                 let n = mismatches(&base[0], &r[0]);

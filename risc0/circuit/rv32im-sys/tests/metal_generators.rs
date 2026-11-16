@@ -47,8 +47,15 @@ fn python() -> Command {
 }
 
 fn run<S: AsRef<std::ffi::OsStr>>(args: &[S]) -> Output {
+    run_env(args, &[])
+}
+
+fn run_env<S: AsRef<std::ffi::OsStr>>(args: &[S], env: &[(&str, &str)]) -> Output {
     let mut cmd = python();
     cmd.args(args);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
     cmd.output()
         .unwrap_or_else(|e| panic!("could not run {cmd:?}: {e}"))
 }
@@ -62,11 +69,18 @@ fn text(out: &Output) -> String {
 }
 
 fn run_ok<S: AsRef<std::ffi::OsStr> + std::fmt::Debug>(args: &[S]) -> String {
-    let out = run(args);
+    run_ok_env(args, &[])
+}
+
+fn run_ok_env<S: AsRef<std::ffi::OsStr> + std::fmt::Debug>(
+    args: &[S],
+    env: &[(&str, &str)],
+) -> String {
+    let out = run_env(args, env);
     let log = text(&out);
     assert!(
         out.status.success(),
-        "{args:?} failed ({}):\n{log}",
+        "{args:?} {env:?} failed ({}):\n{log}",
         out.status
     );
     log
@@ -115,14 +129,117 @@ fn generator_ci_checks() {
         log.contains("--metal translation matches PINNED_METAL"),
         "{log}"
     );
-    // to_metal.py's pin is checked in this mode too (TO_METAL_EXPECT).
-    run_ok(&["kernels/cuda/evalfast/regen.py", "--check"]);
+    // to_metal.py's pin is checked in this mode too (TO_METAL_EXPECT). REGEN_CUDA_ONLY=1
+    // (P31-03): on release-3.1 hemilabs regenerated the CUDA evalfast kernel (eval_check_ef.cu)
+    // for the new circuit but not the ROCm one, so the HIP chain (wmma_hip.py and its pins)
+    // fails on the 3.1 circuit ("wmma_hip: x1024 ... has other uses") and the committed
+    // eval_check_ef_hip.cu is still 3.0's. The variable skips only that chain; the CUDA output
+    // is still compared, and the Metal pins (TO_METAL_EXPECT, to_metal.py COUNTS) are checked
+    // before it in every mode (regen.py runs metal_convert first). Drop it once the HIP chain is
+    // regenerated upstream.
+    let log = run_ok_env(
+        &["kernels/cuda/evalfast/regen.py", "--check"],
+        &[("REGEN_CUDA_ONLY", "1")],
+    );
+    assert!(
+        log.contains("regen: kernels/cuda/eval_check_ef.cu is up to date"),
+        "{log}"
+    );
     // R17: witgen_tu_gen.py --check also translates --metal in memory (pins, no-loop check).
     let log = run_ok(&["kernels/cuda/witgen_tu_gen.py", "--check"]);
     assert!(
         log.contains("--metal translates") && log.contains("map lowering unroll"),
         "{log}"
     );
+}
+
+/// P31-03: to_metal.py takes the table sizes (EF_NPC, RK_QN, RK_HN) from the chain, refuses a
+/// chain whose EF_NPC differs from the circuit's kNumPolyMixPows (eval_check.cuh) or whose
+/// EF_NPM disagrees with RK_QN / RK_HN, and the output's static_assert catches a kNumPolyMixPows
+/// that differs from EF_NPC (its prelude compiled with `xcrun metal -fsyntax-only`).
+#[test]
+fn to_metal_table_sizes_derived() {
+    let script = r#"
+import os, re, subprocess, sys, tempfile
+sys.dont_write_bytecode = True
+sys.path.insert(0, 'kernels/cuda/evalfast')
+import regen, to_metal
+got = {}
+def keep(hip, out_dir, check):
+    got['hip'] = hip
+regen.metal_main = keep
+sys.argv = ['regen.py', '--metal', 'unused']
+regen.main()
+hip = got['hip']
+npows = to_metal.circuit_poly_mix_pows()
+npc, qn, hn = to_metal.table_sizes(hip, npows)
+metal, rust = to_metal.convert(hip, stats=[])
+assert '#define EF_NPC %du\n#define EF_NPM (EF_NPC + %du + %du)\n' % (npc, qn, hn) in metal
+assert 'constant constexpr uint32_t kNumPolyMixPows = %du;' % npows in metal
+assert 'pub const EF_NPC: usize = %d;' % npc in rust
+assert 'pub const RK_QN: usize = %d;' % qn in rust and 'pub const RK_HN: usize = %d;' % hn in rust
+assert '@' not in metal[:metal.index('namespace rv32im_metal_ef')]
+def refused(text, npows, what):
+    try:
+        to_metal.convert(text, stats=[], npows=npows)
+    except SystemExit as e:
+        assert e.code not in (None, 0) and what in str(e.code), e.code
+        print('refused:', e.code)
+    else:
+        raise AssertionError('to_metal accepted ' + what)
+refused(hip, npows - 1, 'kNumPolyMixPows')
+bad = hip.replace('#define EF_NPM (EF_NPC + %du + %du)' % (qn, hn), '#define EF_NPM (EF_NPC + %du + %du)' % (qn, hn + 1), 1)
+assert bad != hip
+refused(bad, npows, 'EF_NPM adds')
+bad = hip.replace('#define EF_NPC %du\n' % npc, '#define EF_NPC %du\n' % (npc + 1), 1)
+assert bad != hip
+# a chain generated for another circuit (stale EF_NPC): refused against this circuit's count
+refused(bad, npows, 'kNumPolyMixPows')
+# the prelude (through the anonymous namespace holding kNumPolyMixPows) compiles, and fails
+# its static_assert when kNumPolyMixPows differs from EF_NPC
+end = metal.index('} // namespace\n', metal.index('kNumPolyMixPows = ')) + len('} // namespace\n')
+pre = metal[:end]
+inc = os.path.join(to_metal.HERE, '..', '..', '..', '..', '..', 'build_kernel', 'kernels', 'metal')
+def syntax(text):
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, 'p.metal')
+        open(f, 'w').write(text)
+        return subprocess.run(['xcrun', '-sdk', 'macosx', 'metal', '-std=metal3.2', '-fsyntax-only',
+                               '-I', inc, f], capture_output=True, text=True)
+r = syntax(pre)
+assert r.returncode == 0, r.stderr
+r = syntax(pre.replace('kNumPolyMixPows = %du;' % npows, 'kNumPolyMixPows = %du;' % (npows + 1)))
+assert r.returncode != 0 and 'poly_mix power count' in r.stderr, r.stderr
+print('table sizes derived: EF_NPC %d (kNumPolyMixPows %d), RK_QN %d, RK_HN %d' % (npc, npows, qn, hn))
+"#;
+    let log = run_ok(&["-c", script]);
+    assert!(log.contains("table sizes derived"), "{log}");
+    assert_eq!(log.matches("refused:").count(), 3, "{log}");
+}
+
+/// P31-03: the `ef_tables.rs` stub build.rs writes under RISC0_SKIP_BUILD_KERNELS has the sizes
+/// of the generated one (P31-02 open issue).
+#[test]
+fn ef_tables_stub_matches_generated() {
+    if skipped_build() {
+        eprintln!("RISC0_SKIP_BUILD_KERNELS build: ef_tables.rs is the stub itself");
+        return;
+    }
+    let generated = std::fs::read_to_string(env!("RV32IM_METAL_EF_TABLES")).unwrap();
+    let build_rs = std::fs::read_to_string(crate_dir().join("build.rs")).unwrap();
+    let stub_start = build_rs
+        .find("const R12_EF_TABLES_STUB: &str")
+        .expect("R12_EF_TABLES_STUB in build.rs");
+    let stub = &build_rs[stub_start..];
+    for name in ["EF_NPC", "RK_QN", "RK_HN"] {
+        let line = |text: &str| -> String {
+            let key = format!("pub const {name}: usize = ");
+            let i = text.find(&key).unwrap_or_else(|| panic!("{key} missing"));
+            let rest = &text[i + key.len()..];
+            rest[..rest.find(';').unwrap()].to_string()
+        };
+        assert_eq!(line(stub), line(&generated), "{name}: stub vs generated");
+    }
 }
 
 /// `witgen_tu_gen.py --check` fails when the Metal translation no longer matches PINNED_METAL,
