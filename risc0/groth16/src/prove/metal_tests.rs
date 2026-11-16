@@ -21,6 +21,9 @@
 //! The fixture (`tests/data/identity_p254_seal.{bin,json}`) is the seal of
 //! `identity_p254(prove_nothing_succinct())` from risc0-zkvm's tests (multi_test `DoNothing`),
 //! with the claim digest and the default Groth16 verifier parameters it must verify against.
+//! Item P31-12 regenerated it with the 3.1 CPU prover (no GPU feature; control root e6feef13...,
+//! BN254 identity control id de81d091..., Poseidon254 x^7), for the v0.2.0 key; see
+//! docs/metal-port/notes/P31-12.md for how.
 //! Needs the rzup `risc0-groth16` component (`RISC0_GROTH16_DIR` or rzup's directory); skips
 //! without it. Under a `RISC0_METAL_MAX_WORKING_SET_BYTES` budget too small for the prover, the
 //! wrap must fail with the clean budget error (and the test passes, saying so).
@@ -397,7 +400,8 @@ fn wrap_after_stark_peak_is_not_stark_plus_key() {
         mib(peak),
         mib(key)
     );
-    // G10: the prover (3.9 GB with the default memory switches) is now smaller than the pools.
+    // G10: the prover (4.1 GB with the default memory switches and the v0.2.0 key, P31-12) is now
+    // smaller than the pools.
     assert!(key > 1 << 30, "the prover is not cached ({key} bytes)");
     assert!(
         peak < before + key.max(STARK_POOL_BYTES) + key.min(STARK_POOL_BYTES) / 2,

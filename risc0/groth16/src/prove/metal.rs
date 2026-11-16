@@ -72,7 +72,40 @@ fn is_unavailable(err: &anyhow::Error) -> bool {
 
 fn preload(dir: &Path) -> Result<()> {
     let setup = SetupParams::new(dir).context("failed to create groth16 setup params")?;
+    check_key(&setup)?;
     risc0_groth16_sys::metal_preload(&setup).context("failed to load the groth16 proving key")
+}
+
+/// Item P31-12: the proving key in the resolved component ([component_dir]: rzup's
+/// `risc0-groth16` 0.2.0, or `RISC0_GROTH16_DIR`) must be the one [crate::verifying_key] verifies
+/// with (the v0.2.0 ceremony), so that a directory holding another ceremony's key (such as
+/// v0.1.0's, which the 3.1 verifier rejects) is a clear error before anything is loaded, not a
+/// wrap that fails verification. Reads the zkey header (a few KB) once per key file.
+fn check_key(setup: &SetupParams) -> Result<()> {
+    static CHECKED: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+    let mut checked = CHECKED.lock().unwrap_or_else(|e| e.into_inner());
+    if checked.as_deref() == Some(setup.srs_path.as_path()) {
+        return Ok(());
+    }
+    let header = risc0_groth16_sys::metal::srs::read_zkey_header(setup.srs_path.as_path())
+        .context("failed to read the groth16 proving key header")?;
+    let vk = header.vk.to_ark()?;
+    let want = crate::verifying_key().0;
+    if vk.alpha_g1 != want.alpha_g1
+        || vk.beta_g2 != want.beta_g2
+        || vk.gamma_g2 != want.gamma_g2
+        || vk.delta_g2 != want.delta_g2
+        || vk.ic != want.gamma_abc_g1
+    {
+        return Err(anyhow!(
+            "the groth16 proving key {} does not match this verifier's key: install the \
+             risc0-groth16 0.2.0 component (rzup install risc0-groth16 0.2.0), or point \
+             RISC0_GROTH16_DIR at it",
+            setup.srs_path.as_path().display()
+        ));
+    }
+    *checked = Some(setup.srs_path.as_path().to_path_buf());
+    Ok(())
 }
 
 /// Load the witness graph (in-process witness generation) and compile it for this process's
@@ -171,6 +204,7 @@ fn early_key_load(dir: &Path) -> Result<()> {
     let t0 = std::time::Instant::now();
     let verbose = std::env::var_os("RISC0_VERBOSE").is_some();
     let setup = SetupParams::new(dir).context("failed to create groth16 setup params")?;
+    check_key(&setup)?;
     let planned = risc0_groth16_sys::metal_planned_bytes(&setup)?;
     let limit = risc0_groth16_sys::effective_working_set_limit()
         .ok_or_else(|| anyhow!("no Metal device"))?;
@@ -589,6 +623,29 @@ mod tests {
         let err = shrink_wrap_with(&[0u8; 12], || calls.set(calls.get() + 1)).unwrap_err();
         assert_eq!(calls.get(), 1);
         assert!(format!("{err:#}").contains("seal has 12 bytes"), "{err:#}");
+    }
+
+    /// Item P31-12: the resolved component's key is the 3.1 verifier's (v0.2.0); another
+    /// ceremony's key (v0.1.0, 3.0's, when it is installed beside it) is a clear error.
+    #[test]
+    fn key_of_another_ceremony_is_a_clear_error() {
+        let Ok(dir) = component_dir() else {
+            eprintln!("skipped: no risc0-groth16 component");
+            return;
+        };
+        check_key(&SetupParams::new(&dir).unwrap()).unwrap();
+        let old = dir.with_file_name("v0.1.0-risc0-groth16");
+        if !old.join("stark_verify_final.zkey").is_file() {
+            eprintln!("skipped the old-key half: nothing at {}", old.display());
+            return;
+        }
+        let err = check_key(&SetupParams::new(&old).unwrap()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("does not match this verifier's key"),
+            "{err:#}"
+        );
+        // The check is per key file: the right one still passes.
+        check_key(&SetupParams::new(&dir).unwrap()).unwrap();
     }
 
     #[test]
