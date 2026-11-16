@@ -17,7 +17,9 @@
 //! `encode_rows` / `encode_fold`) and through the `Hal` entry points, at sizes around every
 //! threadgroup / partial-block boundary and at the exact shapes of a po2-18 recursion proof
 //! (identity_p254). `bench_*` (ignored) are the measurements recorded in
-//! docs/metal-port/notes/Z10.md.
+//! docs/metal-port/notes/Z10.md. `p31_x7_test_vectors_metal` (item P31-11) checks risc0 3.1's
+//! x^7 S-box: 3.1's Poseidon254 test vectors through the Metal kernels, and that none of them is
+//! the old x^8 result (docs/metal-port/notes/P31-11.md).
 
 use std::time::Instant;
 
@@ -140,6 +142,108 @@ fn metal_fold_with(
 
 fn first_diff<T: PartialEq>(a: &[T], b: &[T]) -> Option<usize> {
     a.iter().zip(b).position(|(x, y)| x != y)
+}
+
+/// P31-11: digests of 3.1's Poseidon254 test vector inputs (`core::hash::poseidon_254`'s
+/// `p254_test_vectors`): hash of [1, 2, 3, 4, 5], then hash_pair(d1, d1), hash_pair(d1, d2).
+/// Computed by an independent reference (scratch `p254_ref.py`: the `ref::mix` structure in
+/// canonical arithmetic, constants parsed from poseidon254.metal) that also reproduces both
+/// published vector sets: x^7 -> (76, 1489312893, 1416259846) = 3.1, x^8 -> (5, 328085114,
+/// 726238606) = 3.0. The x^7 set is also checked against the CPU suite below.
+const X7_DIGESTS: [[u32; 8]; 3] = [
+    [
+        0x76a24453, 0x5a9cfcee, 0x303db941, 0x0202a194, 0xabcd34b6, 0x39d161dd, 0xfde8b9ab,
+        0x0587a19a,
+    ],
+    [
+        0x0cd833a8, 0xbde6e8de, 0xfc144f18, 0x42f6c140, 0x32f864eb, 0xbda7c53a, 0x593746fa,
+        0x1a0c1cda,
+    ],
+    [
+        0x9cd2b47f, 0x274acd90, 0x5ea49bdf, 0xe273c992, 0x9bd64e15, 0x5724fe34, 0xa9862257,
+        0x176d1583,
+    ],
+];
+/// The same digests with the pre-3.1 x^8 S-box (negative control).
+const X8_DIGESTS: [[u32; 8]; 3] = [
+    [
+        0x013bb7f1, 0x6b6341ad, 0x0cadd49b, 0xc9564f23, 0x16c11ee7, 0xeae9cda3, 0xa2f538f1,
+        0x1f4f7356,
+    ],
+    [
+        0xc4ae75a8, 0x56dd87e1, 0x74f6e1b0, 0xcc84079d, 0x9fe939af, 0x8c2e656e, 0xaef437f2,
+        0x29c2ac57,
+    ],
+    [
+        0x8d1aa5be, 0x6b1385c4, 0x8f51c455, 0x68c8cd4d, 0xeca7342c, 0x4b5918d7, 0x64183e44,
+        0x09c6edde,
+    ],
+];
+/// 3.1's (x^7) and 3.0's (x^8) published `p254_test_vectors` outputs.
+const X7_OUTPUTS: [u32; 3] = [76, 1489312893, 1416259846];
+const X8_OUTPUTS: [u32; 3] = [5, 328085114, 726238606];
+
+/// hash_pair(a, b) on Metal (one fold of n = 1: io = [_, out, a, b]).
+fn metal_pair(hal: &MetalHalPoseidon254, c: &Poseidon254Config, a: &Digest, b: &Digest) -> Digest {
+    let io = [Digest::default(), Digest::default(), *a, *b];
+    metal_fold_with(hal, c, &io, 1)[1]
+}
+
+/// P31-11 (security, risc0 3.1): 3.1's Poseidon254 test vectors with every hash on the Metal
+/// kernels (rows for `hash_elem_slice`, fold for `hash_pair`; the Fiat-Shamir rng is the CPU's),
+/// for every arithmetic variant and both lane forms. Each digest must equal the CPU suite's and
+/// the x^7 reference, and must NOT equal the x^8 result; the outputs must be 3.1's, not 3.0's.
+#[test]
+fn p31_x7_test_vectors_metal() {
+    let hal = MetalHalPoseidon254::new();
+    let suite = Poseidon254HashSuite::new_suite();
+    let x7: Vec<Digest> = X7_DIGESTS.iter().map(|w| Digest::from(*w)).collect();
+    let x8: Vec<Digest> = X8_DIGESTS.iter().map(|w| Digest::from(*w)).collect();
+    for k in ALL {
+        // lanes 0: one thread per hash; MAX: the 4-lane kernels (`Ref` ignores it).
+        for lanes in [0, u32::MAX] {
+            let c = Poseidon254Config {
+                kernels: k,
+                lanes,
+                ..Default::default()
+            };
+            let mut input: Vec<BabyBearElem> = (1..6u32).map(BabyBearElem::from).collect();
+            let d1 = metal_rows_with(&hal, &c, &input, 1)[0];
+            let d2 = metal_pair(&hal, &c, &d1, &d1);
+            let d3 = metal_pair(&hal, &c, &d1, &d2);
+            let cpu = [
+                *suite.hashfn.hash_elem_slice(&input),
+                *suite.hashfn.hash_pair(&d1, &d1),
+                *suite.hashfn.hash_pair(&d1, &d2),
+            ];
+            for (i, d) in [d1, d2, d3].iter().enumerate() {
+                assert_eq!(*d, cpu[i], "{k:?} lanes {lanes}: digest {} != CPU", i + 1);
+                assert_eq!(
+                    *d,
+                    x7[i],
+                    "{k:?} lanes {lanes}: digest {} != x^7 ref",
+                    i + 1
+                );
+                assert_ne!(*d, x8[i], "{k:?} lanes {lanes}: digest {} is x^8", i + 1);
+            }
+            let mut rng = suite.rng.new_rng();
+            rng.mix(&d3);
+            let mut out = vec![rng.random_bits(7), rng.random_elem().as_u32()];
+            for _ in 0..23 {
+                input.push(rng.random_elem());
+            }
+            let d4 = metal_rows_with(&hal, &c, &input, 1)[0];
+            assert_eq!(
+                d4,
+                *suite.hashfn.hash_elem_slice(&input),
+                "{k:?} lanes {lanes}: d4"
+            );
+            rng.mix(&d4);
+            out.push(rng.random_elem().as_u32());
+            assert_eq!(out, X7_OUTPUTS, "{k:?} lanes {lanes}: 3.1 vectors");
+            assert_ne!(out, X8_OUTPUTS, "{k:?} lanes {lanes}: 3.0 (x^8) vectors");
+        }
+    }
 }
 
 /// The zkp TU's `bn254.h` is a byte copy of groth16's (G2) header.
