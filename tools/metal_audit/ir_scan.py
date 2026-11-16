@@ -39,15 +39,30 @@ For every function the scanner finds natural loops (dominator-based back edges) 
           once the CPU reference has the kernel's semantics (the first rebuild's "k = n" was a
           reference bug, fix round 1). A tier-Z finding is a place to look, not a demonstrated
           defect; run_stress.sh reports it and does not gate on it.
+  tier P: (P31-16, R18 section 4's deterministic miscompile) in a non-kernel (outlined) function,
+          two or more DISTINCT vector loads (>= 16 bytes) from device/constant memory, at least one
+          of them >= 32 bytes (e.g. `load <4 x i64>` of a `ulong4` table row pair), feed, through
+          any SSA arithmetic, the stores into one private aggregate alloca (>= 4 scalar leaves;
+          R18: `const uint32_t X[4][4]` built from the rows b and n); `read_in_loop` says whether
+          the alloca is also loaded inside a loop (R18's exact shape: X is read in the j loop).
+          R18 measured b and n both from pair loads (`r18_pmnld`) wrong on every run. On 3.1
+          (P31-16) the one-pair-load-plus-one-uint4-load variants R18 found correct are wrong
+          too in some chain forms, while a semantically identical variant passes, so the tier is
+          deliberately wider than R18's shape: one pair load whose second row is computed from
+          the first (the shipped form) is the only reviewed table-row shape. Deterministic, not
+          rate-dependent like tier A/S, so a GPU stress does not cover it; the scan does.
 Plus, per function, the number of loops that contain a user call ("call loops"); a user call is a call
 to anything but llvm.* / air.* intrinsics. "Dominates" is per instruction (block dominance, or
 earlier in the same block), so the arms of an if/else do not combine into a shape.
 
-usage: ir_scan.py [--json out.json] [--tiers ABCSZ] [--fail-tiers ASZ] <dir-or-.ll>...
+usage: ir_scan.py [--json out.json] [--tiers ABCSPZ] [--fail-tiers ASPZ] [--jobs N] <dir-or-.ll>...
   --fail-tiers T: exit status 1 if any finding of a tier in T is reported (a test gate).
+  --jobs N (or IR_SCAN_JOBS): scan N files in parallel processes (default 1; the -O0 IR of the
+          rv32im/recursion TUs is ~3 GB of text, ~2-3 GB of Python memory per large file).
 Pure stdlib; run with python3 -I.
 """
 import json
+import multiprocessing
 import os
 import re
 import subprocess
@@ -59,6 +74,7 @@ LABEL_RE = re.compile(r'^([\w.$-]+):')
 VAL_RE = re.compile(r'%[\w.$-]+')
 CALL_RE = re.compile(r'\b(?:tail |musttail |notail )?call\b.*?@("?[\w.$-]+"?)\(')
 DBG_RE = re.compile(r'!dbg !(\d+)')
+TIERS = 'ABCSZP'  # totals order (P31-16: P appended, so parsers of the 3.0 line keep working)
 
 
 def parse_metadata(lines):
@@ -923,6 +939,102 @@ def guarded_update(f, md, types):
     return out
 
 
+WIDE_LOAD_RE = re.compile(r'^(%[\w.$-]+) = load <(\d+) x i(\d+)>, <\d+ x i\d+> addrspace\((\d+)\)\*')
+
+
+def kernel_names(lines):
+    """Names in the module's !air.kernel list (the kernels; everything else is a helper)."""
+    nodes = []
+    for ln in lines:
+        if ln.startswith('!air.kernel = '):
+            nodes = [int(x) for x in re.findall(r'!(\d+)', ln.split('=', 1)[1])]
+    out = set()
+    if not nodes:
+        return out
+    want = {'!%d = ' % n for n in nodes}
+    for ln in lines:
+        if ln[:12].split(' = ')[0] + ' = ' in want:
+            m = re.search(r'\)\* @("?[\w.$-]+"?), ', ln) or re.search(r'@("?[\w.$-]+"?)', ln)
+            if m:
+                out.add(m.group(1).strip('"'))
+    return out
+
+
+def pair_load_matrix(f, types, kernels):
+    """tier P (R18 section 4): see the module docstring."""
+    if f.name in kernels:
+        return []
+    insts = [(b, x) for b in f.blocks for x in f.insts[b]]
+    src = {}  # value -> frozenset of vector-load ids (>= 16 bytes) feeding it
+    wide = set()  # the >= 32-byte ones
+    for b, x in insts:
+        m = WIDE_LOAD_RE.match(x)
+        if m and int(m.group(2)) * int(m.group(3)) >= 128 and m.group(4) != '0':
+            src[m.group(1)] = frozenset([m.group(1)])
+            if int(m.group(2)) * int(m.group(3)) >= 256:
+                wide.add(m.group(1))
+    if len(src) < 2 or not wide:
+        return []
+    allocas = {}
+    for b, x in insts:
+        v = lhs(x)
+        if v and ' = alloca ' in x:
+            t = x.split(' = alloca ', 1)[1].split(',')[0].strip()
+            if leaves(t, types) >= 4:
+                allocas[v] = t
+    if not allocas:
+        return []
+    # forward taint over SSA operands (phi included; fixpoint for loop-carried values)
+    changed = True
+    while changed:
+        changed = False
+        for b, x in insts:
+            v = lhs(x)
+            if not v or ' = alloca ' in x:
+                continue
+            acc = src.get(v, frozenset())
+            new = acc
+            for t in VAL_RE.findall(x.split(' = ', 1)[1]):
+                if t in src and t != v:
+                    new = new | src[t]
+            if new != acc:
+                src[v] = new
+                changed = True
+    d = derive(f, list(allocas))
+    feeds = defaultdict(set)
+    first = {}
+    for b, x in insts:
+        if not x.startswith('store '):
+            continue
+        parts = split_type_list(x[len('store '):].split(', align')[0])
+        if len(parts) < 2:
+            continue
+        vt, pt = VAL_RE.findall(parts[0]), VAL_RE.findall(parts[1])
+        if not vt or not pt or pt[-1] not in d:
+            continue
+        a = d[pt[-1]]
+        if vt[-1] in src:
+            feeds[a] |= src[vt[-1]]
+            first.setdefault(a, x)
+    loops = natural_loops(f) if feeds else {}
+    in_loop = set(blk for body in loops.values() for blk in body)
+    out = []
+    for a, ls in feeds.items():
+        if len(ls) < 2 or not ls & wide:
+            continue
+        rd = any(bb in in_loop and x.split(' = ', 1)[-1].startswith('load ') and
+                 any(t in d and d[t] == a for t in VAL_RE.findall(x.split(' = ', 1)[1]))
+                 for bb, x in insts if lhs(x))
+        out.append({
+            'loop_md': [], 'loop_blocks': 0, 'tier': 'P', 'fn': f.name, 'loop': '-',
+            'alloca': a, 'type': allocas[a], 'init': '%d vector loads (%d >= 32 B): %s' % (len(ls), len(ls & wide), ','.join(sorted(ls)[:6])),
+            'store_after_call': False, 'var_index': None, 'read_after_loop': rd,
+            'calls': [], 'store': first[a], 'n_stores': 0,
+            'shape': 'pair-loads-into-private-matrix(read_in_loop=%s)' % rd,
+        })
+    return out
+
+
 def demangle(names):
     if not names:
         return {}
@@ -947,6 +1059,7 @@ def scan_file(path):
     types = parse_types(lines)
     init_fns = init_functions(fns)
     writers, defined = writer_functions(fns)
+    kernels = kernel_names(lines)
     out = []
     call_loops = 0
     for f in fns:
@@ -954,6 +1067,7 @@ def scan_file(path):
         call_loops += n
         fd += straight_line(f, md, types, init_fns, {x['alloca'] for x in fd}, writers, defined)
         fd += guarded_update(f, md, types)
+        fd += pair_load_matrix(f, types, kernels)
         for d in fd:
             m = DBG_RE.search(d['store'])
             d['src'] = loc_of(md, int(m.group(1)), cache) if m else None
@@ -962,10 +1076,18 @@ def scan_file(path):
     return out, len(fns), call_loops
 
 
+def _scan_one(path):
+    fd, nf, ncl = scan_file(path)
+    for d in fd:
+        d['file'] = path
+    return path, fd, nf, ncl
+
+
 def main(argv):
     js = None
-    tiers = 'ABCSZ'
+    tiers = 'ABCSPZ'
     fail = ''
+    jobs = int(os.environ.get('IR_SCAN_JOBS', '1') or 1)
     paths = []
     it = iter(argv)
     for a in it:
@@ -975,6 +1097,8 @@ def main(argv):
             tiers = next(it)
         elif a == '--fail-tiers':
             fail = next(it)
+        elif a == '--jobs':
+            jobs = int(next(it))
         else:
             paths.append(a)
     files = []
@@ -986,18 +1110,24 @@ def main(argv):
             files.append(p)
     allf = []
     summary = []
-    for path in sorted(files):
-        fd, nf, ncl = scan_file(path)
-        for d in fd:
-            d['file'] = path
+    if jobs > 1 and len(files) > 1:
+        # largest first, so the long -O0 files do not start last
+        order = sorted(files, key=lambda p: -os.path.getsize(p))
+        with multiprocessing.Pool(min(jobs, len(files))) as pool:
+            res = {r[0]: r for r in pool.imap_unordered(_scan_one, order)}
+        results = [res[p] for p in sorted(files)]
+    else:
+        results = (_scan_one(p) for p in sorted(files))
+    for path, fd, nf, ncl in results:
         allf += fd
-        cnt = {t: sum(1 for d in fd if d['tier'] == t) for t in 'ABCSZ'}
+        cnt = {t: sum(1 for d in fd if d['tier'] == t) for t in TIERS}
         summary.append((path, nf, ncl, cnt))
     dm = demangle(sorted({d['fn'] for d in allf} | {c for d in allf for c in d['calls']}))
-    print('%-70s %6s %6s %4s %4s %4s %4s %4s' % ('file', 'fns', 'cloops', 'A', 'B', 'C', 'S', 'Z'))
+    # P31-16: tier P is the last column, so the A/B/C/S/Z columns keep their positions ($4..$8).
+    print('%-70s %6s %6s %4s %4s %4s %4s %4s %4s' % ('file', 'fns', 'cloops', 'A', 'B', 'C', 'S', 'Z', 'P'))
     for path, nf, ncl, cnt in summary:
-        print('%-70s %6d %6d %4d %4d %4d %4d %4d' % (os.path.relpath(path)[-70:], nf, ncl, cnt['A'],
-                                                     cnt['B'], cnt['C'], cnt['S'], cnt['Z']))
+        print('%-70s %6d %6d %4d %4d %4d %4d %4d %4d' % (os.path.relpath(path)[-70:], nf, ncl, cnt['A'],
+                                                         cnt['B'], cnt['C'], cnt['S'], cnt['Z'], cnt['P']))
     for d in allf:
         if d['tier'] not in tiers:
             continue
@@ -1008,8 +1138,8 @@ def main(argv):
                   d['alloca'], d['type'], d['init'], d['var_index'], d['n_stores'], ','.join(d['loop_md']) or '-',
                   ' shape=' + d['shape'] if d.get('shape') else '',
                   ', '.join(dm.get(c, c)[:80] for c in d['calls'][:4]), d['store']))
-    tot = {t: sum(c[t] for _p, _n, _c, c in summary) for t in 'ABCSZ'}
-    print('\nir_scan totals: files=%d %s' % (len(summary), ' '.join('%s=%d' % (t, tot[t]) for t in 'ABCSZ')))
+    tot = {t: sum(c[t] for _p, _n, _c, c in summary) for t in TIERS}
+    print('\nir_scan totals: files=%d %s' % (len(summary), ' '.join('%s=%d' % (t, tot[t]) for t in TIERS)))
     if js:
         with open(js, 'w') as fh:
             json.dump(allf, fh, indent=1, default=str)
