@@ -793,6 +793,30 @@ fn captured_witgen(h: &Harness, pf: &PreflightResults, mode: StepMode, pre: PreD
     cap.2.into_inner().unwrap()
 }
 
+/// The production path of the Metal circuit HAL (P31-05): [WitnessGenerator::new] with
+/// `h.circuit` itself, so its `generate_witness` picks the GPU kernel or, under
+/// `RISC0_METAL_RV32IM_CPU_PHASES=witgen`, the CPU kernel over the shared buffers. Outputs are
+/// (data, global) after WitnessGenerator's zeroize, as [Harness::cpu]; `data_in`/`pf_out` are
+/// not observed here (empty).
+fn hal_witgen(h: &Harness, pf: &PreflightResults, mode: StepMode) -> Captured {
+    match WitnessGenerator::new(h.hal.as_ref(), &h.circuit, pf.clone(), mode) {
+        Ok(w) => Captured {
+            data_in: vec![],
+            data_out: w.data.as_ref().unwrap().to_vec(),
+            global_out: w.global.to_vec(),
+            pf_out: vec![],
+            result: Ok(()),
+        },
+        Err(e) => Captured {
+            data_in: vec![],
+            data_out: vec![],
+            global_out: vec![],
+            pf_out: vec![],
+            result: Err(format!("{e:#}")),
+        },
+    }
+}
+
 /// Rows (sorted, deduplicated) where two column-major matrices differ.
 fn diff_rows(a: &[Val], b: &[Val], rows: usize) -> Vec<usize> {
     let mut out: Vec<usize> = a
@@ -810,8 +834,10 @@ fn diff_rows(a: &[Val], b: &[Val], rows: usize) -> Vec<usize> {
 /// Reproducer of the kernel nondeterminism (notes/R8.md): a segment dumped by a zkvm harness (`postcard` of `risc0_zkvm::Segment`, whose
 /// encoding starts with the index and this crate's [crate::execute::segment::Segment]), named by
 /// `RISC0_METAL_WITGEN_SEGMENT`, through the CPU witgen once and the Metal witgen
-/// `RISC0_METAL_WITGEN_REPS` times per mode of `RISC0_METAL_WITGEN_MODES` (`par,single,fwd,rev`,
-/// default `par`), with the input and output of every call compared. Skipped when unset.
+/// `RISC0_METAL_WITGEN_REPS` times per mode of `RISC0_METAL_WITGEN_MODES`
+/// (`par,single,auto,fwd,rev,hal`, default `par`), with the input and output of every call
+/// compared. `hal` goes through the circuit HAL's dispatch, so it is the only mode that
+/// `RISC0_METAL_RV32IM_CPU_PHASES=witgen` affects. Skipped when unset.
 #[test]
 fn witgen_segment_file() {
     let Ok(path) = std::env::var("RISC0_METAL_WITGEN_SEGMENT") else {
@@ -838,30 +864,45 @@ fn witgen_segment_file() {
     let mut good_pf: Option<Vec<u8>> = None;
     let mut failures = 0;
     for mode_name in modes.split(',') {
-        let (mode, pre) = match mode_name.trim() {
+        // `hal`: the circuit HAL's own generate_witness (the production dispatch, which
+        // `RISC0_METAL_RV32IM_CPU_PHASES=witgen` routes to the CPU kernel), outputs after zeroize;
+        // every other mode calls the Metal kernel directly.
+        let (mode, pre, via_hal) = match mode_name.trim() {
             // `par` keeps its R8/R17 meaning (the snapshot); `auto` is the production default.
-            "par" => (StepMode::Parallel, PreData::Snapshot),
-            "single" => (StepMode::Parallel, PreData::Single),
-            "auto" => (StepMode::Parallel, PreData::Auto),
-            "fwd" => (StepMode::SeqForward, PreData::Auto),
-            "rev" => (StepMode::SeqReverse, PreData::Auto),
+            "par" => (StepMode::Parallel, PreData::Snapshot, false),
+            "single" => (StepMode::Parallel, PreData::Single, false),
+            "auto" => (StepMode::Parallel, PreData::Auto, false),
+            "fwd" => (StepMode::SeqForward, PreData::Auto, false),
+            "rev" => (StepMode::SeqReverse, PreData::Auto, false),
+            "hal" => (StepMode::Parallel, PreData::Auto, true),
             other => panic!("unknown mode {other}"),
         };
         for rep in 0..reps() {
             let t = Instant::now();
-            let c = captured_witgen(&h, &pf, mode, pre);
+            let c = if via_hal {
+                hal_witgen(&h, &pf, mode)
+            } else {
+                captured_witgen(&h, &pf, mode, pre)
+            };
             let ms = t.elapsed().as_secs_f64() * 1e3;
-            let input_rows = match &first_in {
-                None => {
+            let input_rows = match (&first_in, via_hal) {
+                (_, true) => vec![],
+                (None, false) => {
                     first_in = Some(c.data_in.clone());
                     vec![]
                 }
-                Some(first) => diff_rows(first, &c.data_in, rows),
+                (Some(first), false) => diff_rows(first, &c.data_in, rows),
             };
             let global: Vec<Val> = c.global_out.iter().map(|v| v.valid_or_zero()).collect();
             let out_rows = diff_rows(&cpu_data, &c.data_out, rows);
-            let global_bad = first_diff("global", &cpu_global, &global, 1);
+            // `hal` returns no buffers when witgen failed.
+            let complete = c.data_out.len() == cpu_data.len() && global.len() == cpu_global.len();
+            let global_bad = match complete {
+                true => first_diff("global", &cpu_global, &global, 1),
+                false => 1,
+            };
             let pf_same = match (&good_pf, c.result.is_ok() && out_rows.is_empty()) {
+                _ if via_hal => "not observed (hal)".to_string(),
                 (None, true) => {
                     good_pf = Some(c.pf_out.clone());
                     "ref".to_string()
@@ -872,9 +913,11 @@ fn witgen_segment_file() {
                 }
                 (None, false) => "no ref yet".to_string(),
             };
-            let ok = c.result.is_ok() && out_rows.is_empty() && global_bad == 0;
+            let ok = c.result.is_ok() && complete && out_rows.is_empty() && global_bad == 0;
             if !ok {
                 failures += 1;
+            }
+            if !ok && complete {
                 first_diff(
                     &format!("{mode_name} rep={rep} data"),
                     &cpu_data,
