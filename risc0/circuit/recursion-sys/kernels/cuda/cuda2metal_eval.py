@@ -446,28 +446,35 @@ def rules():
 # eval_check_split.py's) output changed shape: run with --no-pin, review the output and its
 # compile, update. `select.*` describe the branch selection, `tally.*` count constructs that pass
 # through unchanged, `host.*` the commented-out CUDA host code.
+# 3.1 re-pin (P31-08): BIT_AND_ELEM's canonical decomposition adds two constraints (top_a/top_b)
+# to the macro-op sum gated by x320: +12 ops, +2 poly_mix terms. Hence everywhere +2 Fp*mix
+# products (fp_mul, lz2_prod), +2 RecLz accumulations (lz_add_call), +2 mix reads (monolith),
+# +4 lazy-Fp REDCs (lz2_fin), and the HIP-only bodies of the split sources grew by 24 (split) /
+# 28 (regrouped) lines (select.dropped_lines). 3.0 values in the comments.
 PINNED = {
     'eval_check': {
         'include_fp': 1, 'disable': 2, 'qual.device': 1, 'poly_mix_def': 1, 'ptr_param': 5,
-        'kernels': 1, 'tally.poly_mix_read': 1228, 'tally.data_read': 669,
-        'tally.fp_mul': 4679,
+        'kernels': 1, 'tally.poly_mix_read': 1230, 'tally.data_read': 669,  # 3.0: 1228
+        'tally.fp_mul': 4681,  # 3.0: 4679
     },
     'eval_check_split': {
-        # 59 directives (#if/#ifdef/#elif/#else/#endif) resolved, 14164 HIP-only lines dropped.
-        'select.directives': 59, 'select.dropped_lines': 14164,
+        # 59 directives (#if/#ifdef/#elif/#else/#endif) resolved, 14188 HIP-only lines dropped
+        # (3.0: 14164).
+        'select.directives': 59, 'select.dropped_lines': 14188,
         'include_fp': 1, 'disable': 6, 'constexpr': 2, 'inv_rate': 1,
         # 6 RecLz helpers + 6 parts + poly_fp_part + ec_part_body.
         'qual.force': 14,
-        'poly_mix_def': 7, 'poly_mix_call': 7, 'lz_add_def': 1, 'lz_add_call': 1060,
+        'poly_mix_def': 7, 'poly_mix_call': 7, 'lz_add_def': 1, 'lz_add_call': 1062,  # 3.0: 1060
         'lz_mix_ptr': 1, 'thread_ref': 3, 'thread_u32_ptr': 5,
         # 40 in the parts/dispatcher/body + 15 in the commented CUDA host code.
         'ptr_param': 55, 'check_param': 2, 'body_def': 1, 'gid': 1, 'ext_index': 4,
         'host.lines': 51, 'kernels': 6, 'tally.poly_mix_read': 172,
-        'tally.data_read': 1371, 'tally.fp_mul': 4855,
+        'tally.data_read': 1371, 'tally.fp_mul': 4857,  # 3.0: 4855
     },
     'eval_check_split_lz': {
         # ec_lazyfp.py 'lz2' on the six parts (C12): products made lazy / REDCs emitted.
-        'lz.parts': 6, 'lz.kernels': 6, 'lz.header': 1, 'lz.lz2_prod': 4855, 'lz.lz2_fin': 2557,
+        # 3.0: lz2_prod 4855, lz2_fin 2557.
+        'lz.parts': 6, 'lz.kernels': 6, 'lz.header': 1, 'lz.lz2_prod': 4857, 'lz.lz2_fin': 2561,
         'lz.uint4_add': 1,  # C13: rec_lz_add's mix read as one uint4 load (no &poly_mix[k])
         'tally.poly_mix_read': 171, 'tally.data_read': 1371, 'tally.fp_mul': 0,
     },
@@ -475,20 +482,21 @@ PINNED = {
         # The regrouped split (C15, ec_regroup_metal.py): 14 parts, the same rules and selection.
         # Fewer HIP-only lines than the CUDA split: its per-part HIP variants are keyed by the
         # 6-part numbering (they never reach Metal either way).
-        'select.directives': 59, 'select.dropped_lines': 6582,
+        'select.directives': 59, 'select.dropped_lines': 6610,  # 3.0: 6582
         'include_fp': 1, 'disable': 6, 'constexpr': 2, 'inv_rate': 1,
         # 6 RecLz helpers + 14 parts + poly_fp_part + ec_part_body.
         'qual.force': 22,
-        'poly_mix_def': 15, 'poly_mix_call': 15, 'lz_add_def': 1, 'lz_add_call': 1074,
+        'poly_mix_def': 15, 'poly_mix_call': 15, 'lz_add_def': 1, 'lz_add_call': 1076,  # 3.0: 1074
         'lz_mix_ptr': 1, 'thread_ref': 3, 'thread_u32_ptr': 5,
         # 80 in the parts/dispatcher/body + 15 in the commented CUDA host code.
         'ptr_param': 95, 'check_param': 2, 'body_def': 1, 'gid': 1, 'ext_index': 4,
         'host.lines': 51, 'kernels': 14, 'tally.poly_mix_read': 184,
-        'tally.data_read': 1829, 'tally.fp_mul': 5047,
+        'tally.data_read': 1829, 'tally.fp_mul': 5049,  # 3.0: 5047
     },
     'eval_check_split_rg_lz': {
         # The lazy Fp form ('lz2', uint4 mix loads) of RG, kernels ec_rg_part_0..13.
-        'lz.parts': 14, 'lz.kernels': 14, 'lz.header': 1, 'lz.lz2_prod': 5047, 'lz.lz2_fin': 2673,
+        # 3.0: lz2_prod 5047, lz2_fin 2673.
+        'lz.parts': 14, 'lz.kernels': 14, 'lz.header': 1, 'lz.lz2_prod': 5049, 'lz.lz2_fin': 2677,
         'lz.uint4_add': 1, 'rg.kernels': 14, 'rg.header': 1,
         'tally.poly_mix_read': 183, 'tally.data_read': 1829, 'tally.fp_mul': 0,
     },
