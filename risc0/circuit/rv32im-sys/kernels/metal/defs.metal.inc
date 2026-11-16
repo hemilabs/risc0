@@ -3,6 +3,6 @@ SET_FIELD(BabyBear);
 constant constexpr size_t kRegCountAccum = 103;
 constant constexpr size_t kRegCountCode = 1;
 constant constexpr size_t kRegCountData = 211;
-constant constexpr size_t kRegCountGlobal = 90;
+constant constexpr size_t kRegCountGlobal = 91;
 constant constexpr size_t kRegCountMix = 36;
 constant constexpr size_t kRegCountTest = 211;

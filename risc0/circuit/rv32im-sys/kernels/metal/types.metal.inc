@@ -1462,11 +1462,11 @@ struct Control0Layout {
 };
 using MemoryArgLayout8LayoutArray = r0::array<MemoryArgLayout,8>;
 using CycleArgLayout4LayoutArray = r0::array<CycleArgLayout,4>;
-using ArgU16Layout4LayoutArray = r0::array<ArgU16Layout,4>;
+using ArgU16Layout10LayoutArray = r0::array<ArgU16Layout,10>;
 struct _Arguments_ECall0OutputLayout {
   MemoryArgLayout8LayoutArray memoryArg;
   CycleArgLayout4LayoutArray cycleArg;
-  ArgU16Layout4LayoutArray argU16;
+  ArgU16Layout10LayoutArray argU16;
   ArgU8Layout4LayoutArray argU8;
 };
 using NondetRegLayout6LayoutArray = r0::array<NondetRegLayout,6>;
@@ -1490,10 +1490,16 @@ struct ECall0OutputArm0Layout {
   ArgU16Layout _extra7;
   ArgU16Layout _extra8;
   ArgU16Layout _extra9;
-  ArgU8Layout _extra10;
-  ArgU8Layout _extra11;
-  ArgU8Layout _extra12;
-  ArgU8Layout _extra13;
+  ArgU16Layout _extra10;
+  ArgU16Layout _extra11;
+  ArgU16Layout _extra12;
+  ArgU16Layout _extra13;
+  ArgU16Layout _extra14;
+  ArgU16Layout _extra15;
+  ArgU8Layout _extra16;
+  ArgU8Layout _extra17;
+  ArgU8Layout _extra18;
+  ArgU8Layout _extra19;
 };
 struct ECallTerminateLayout {
   MemoryReadLayout a0;
@@ -1511,10 +1517,16 @@ struct ECall0OutputArm1Layout {
   ArgU16Layout _extra7;
   ArgU16Layout _extra8;
   ArgU16Layout _extra9;
-  ArgU8Layout _extra10;
-  ArgU8Layout _extra11;
-  ArgU8Layout _extra12;
-  ArgU8Layout _extra13;
+  ArgU16Layout _extra10;
+  ArgU16Layout _extra11;
+  ArgU16Layout _extra12;
+  ArgU16Layout _extra13;
+  ArgU16Layout _extra14;
+  ArgU16Layout _extra15;
+  ArgU8Layout _extra16;
+  ArgU8Layout _extra17;
+  ArgU8Layout _extra18;
+  ArgU8Layout _extra19;
 };
 using NondetRegLayout4LayoutArray = r0::array<NondetRegLayout,4>;
 struct OneHot_4_Layout {
@@ -1541,10 +1553,16 @@ struct ECallHostReadSetupLayout {
 };
 struct ECall0OutputArm2Layout {
   ECallHostReadSetupLayout _super;
-  ArgU8Layout _extra0;
-  ArgU8Layout _extra1;
-  ArgU8Layout _extra2;
-  ArgU8Layout _extra3;
+  ArgU16Layout _extra0;
+  ArgU16Layout _extra1;
+  ArgU16Layout _extra2;
+  ArgU16Layout _extra3;
+  ArgU16Layout _extra4;
+  ArgU16Layout _extra5;
+  ArgU8Layout _extra6;
+  ArgU8Layout _extra7;
+  ArgU8Layout _extra8;
+  ArgU8Layout _extra9;
 };
 struct ECallHostWriteLayout {
   MemoryReadLayout fd;
@@ -1558,10 +1576,16 @@ struct ECall0OutputArm3Layout {
   ECallHostWriteLayout _super;
   ArgU16Layout _extra0;
   ArgU16Layout _extra1;
-  ArgU8Layout _extra2;
-  ArgU8Layout _extra3;
-  ArgU8Layout _extra4;
-  ArgU8Layout _extra5;
+  ArgU16Layout _extra2;
+  ArgU16Layout _extra3;
+  ArgU16Layout _extra4;
+  ArgU16Layout _extra5;
+  ArgU16Layout _extra6;
+  ArgU16Layout _extra7;
+  ArgU8Layout _extra8;
+  ArgU8Layout _extra9;
+  ArgU8Layout _extra10;
+  ArgU8Layout _extra11;
 };
 struct MemoryWriteUnconstrainedLayout {
   MemoryIOLayout io;
@@ -1591,10 +1615,18 @@ struct ECall0OutputArm4Layout {
   ArgU16Layout _extra6;
   ArgU16Layout _extra7;
   ArgU16Layout _extra8;
+  ArgU16Layout _extra9;
+  ArgU16Layout _extra10;
+  ArgU16Layout _extra11;
+  ArgU16Layout _extra12;
+  ArgU16Layout _extra13;
+  ArgU16Layout _extra14;
 };
 struct ECallHostReadWords__0_SuperLayout {
   NondetRegLayout addr;
-  MemoryWriteUnconstrainedLayout _0;
+  MemoryWriteUnconstrainedLayout writeVal;
+  NondetU16RegLayout _0;
+  NondetU16RegLayout _1;
 };
 using ECallHostReadWords__0_SuperLayout4LayoutArray = r0::array<ECallHostReadWords__0_SuperLayout,4>;
 struct ECallHostReadWordsLayout {
@@ -1606,12 +1638,10 @@ struct ECallHostReadWordsLayout {
 };
 struct ECall0OutputArm5Layout {
   ECallHostReadWordsLayout _super;
-  ArgU16Layout _extra0;
-  ArgU16Layout _extra1;
+  ArgU8Layout _extra0;
+  ArgU8Layout _extra1;
   ArgU8Layout _extra2;
   ArgU8Layout _extra3;
-  ArgU8Layout _extra4;
-  ArgU8Layout _extra5;
 };
 struct ECall0OutputArm6Layout {
   MemoryArgLayout _extra0;
@@ -1630,10 +1660,16 @@ struct ECall0OutputArm6Layout {
   ArgU16Layout _extra13;
   ArgU16Layout _extra14;
   ArgU16Layout _extra15;
-  ArgU8Layout _extra16;
-  ArgU8Layout _extra17;
-  ArgU8Layout _extra18;
-  ArgU8Layout _extra19;
+  ArgU16Layout _extra16;
+  ArgU16Layout _extra17;
+  ArgU16Layout _extra18;
+  ArgU16Layout _extra19;
+  ArgU16Layout _extra20;
+  ArgU16Layout _extra21;
+  ArgU8Layout _extra22;
+  ArgU8Layout _extra23;
+  ArgU8Layout _extra24;
+  ArgU8Layout _extra25;
 };
 struct ECall0OutputArm7Layout {
   MemoryArgLayout _extra0;
@@ -1652,10 +1688,16 @@ struct ECall0OutputArm7Layout {
   ArgU16Layout _extra13;
   ArgU16Layout _extra14;
   ArgU16Layout _extra15;
-  ArgU8Layout _extra16;
-  ArgU8Layout _extra17;
-  ArgU8Layout _extra18;
-  ArgU8Layout _extra19;
+  ArgU16Layout _extra16;
+  ArgU16Layout _extra17;
+  ArgU16Layout _extra18;
+  ArgU16Layout _extra19;
+  ArgU16Layout _extra20;
+  ArgU16Layout _extra21;
+  ArgU8Layout _extra22;
+  ArgU8Layout _extra23;
+  ArgU8Layout _extra24;
+  ArgU8Layout _extra25;
 };
 struct ECall0OutputLayout {
   ECall0OutputArm0Layout arm0;
@@ -2468,6 +2510,7 @@ struct BigIntStateLayout {
 using MemoryArgLayout12LayoutArray = r0::array<MemoryArgLayout,12>;
 using CycleArgLayout6LayoutArray = r0::array<CycleArgLayout,6>;
 using ArgU8Layout18LayoutArray = r0::array<ArgU8Layout,18>;
+using ArgU16Layout4LayoutArray = r0::array<ArgU16Layout,4>;
 struct _Arguments_BigInt0StateLayout {
   MemoryArgLayout12LayoutArray memoryArg;
   CycleArgLayout6LayoutArray cycleArg;
@@ -2953,6 +2996,7 @@ struct _globalLayout {
   NondetRegLayout termA0low;
   NondetRegLayout termA1high;
   NondetRegLayout termA1low;
+  NondetRegLayout totalCycles;
 };
 struct _mixLayout {
   _accumLayout randomness;
