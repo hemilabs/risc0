@@ -126,7 +126,7 @@ PMLAG_GFX12_EXPECT = ('pmlag_hip: 22 functions, 364 plain links and 157 closures
 OPQ_EXPECT = 'opq_hip: EF_OPQ64 at 5 multiply-accumulate sites (gfx11)'
 # to_metal.py (on the HIP_LAST output, regen.py --metal): the Metal kernel and its host tables.
 TO_METAL_EXPECT = ('to_metal: 106 signatures and 20 calls take EfCtx instead of 117 pointer arguments, 5 pointer '
-                   'locals, 5357 table-helper calls, 62 hoisted terms and 107 products on the host')
+                   'locals, 5450 table-helper calls, 49 hoisted terms and 109 products on the host')
 # Files regen.py --metal DIR writes (the Metal build's OUT_DIR; never committed, PLAN 2.0).
 METAL_OUT = 'eval_check_ef.metal'
 METAL_RS_OUT = 'ef_tables.rs'

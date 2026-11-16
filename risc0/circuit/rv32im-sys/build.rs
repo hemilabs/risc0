@@ -2645,8 +2645,12 @@ static_assert(kRegCountAccum == 103 && kRegCountCode == 1 && kRegCountData == 21
 } // namespace rv32im_metal
 "#;
 
-/// R12: the evalfast chain's fixed inputs (globbed ones are in build_metal_kernels).
-const R12_EVALFAST_INPUTS: &[&str] = &["kernels/intel/eval_check.cpp"];
+/// R12: the evalfast chain's fixed inputs (globbed ones are in build_metal_kernels);
+/// eval_check.cuh because to_metal.py reads the circuit's kNumPolyMixPows from it (P31-03).
+const R12_EVALFAST_INPUTS: &[&str] = &[
+    "kernels/intel/eval_check.cpp",
+    "kernels/cuda/eval_check.cuh",
+];
 
 /// R12: `ef_tables.rs` under RISC0_SKIP_BUILD_KERNELS (the metallib is empty then).
 /// R15e: `$OUT_DIR/metal/eval_check_ef_r12.metal`, eval_check_ef.metal with R12's poly_mix
