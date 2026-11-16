@@ -899,20 +899,35 @@ pub(crate) mod tests {
 
     use super::*;
 
-    /// The rzup component directory (`RISC0_GROTH16_DIR`, else the default rzup layout), if its
-    /// files are present. Tests that need it print why they skip.
+    /// The rzup `risc0-groth16` component version whose proving key matches the 3.1 verifier's
+    /// key (the v0.2.0 ceremony); risc0-groth16's `prove::component` resolves the same one.
+    pub(crate) const COMPONENT_VERSION: &str = "0.2.0";
+
+    /// The rzup component directory, if its files are present: `RISC0_GROTH16_DIR`, else rzup's
+    /// layout `$RISC0_HOME` (else `~/.risc0`) `/extensions/v0.2.0-risc0-groth16`, as
+    /// risc0-groth16's resolver falls back to (this crate does not depend on rzup). Never an
+    /// older component. Tests that need it print why they skip.
     pub(crate) fn component_dir() -> Option<PathBuf> {
-        let dir = std::env::var_os("RISC0_GROTH16_DIR")
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .map(|h| PathBuf::from(h).join(".risc0/extensions/v0.1.0-risc0-groth16"))
-            })?;
+        let dir = match std::env::var_os("RISC0_GROTH16_DIR") {
+            Some(dir) => PathBuf::from(dir),
+            None => {
+                let home = std::env::var_os("RISC0_HOME")
+                    .map(PathBuf::from)
+                    .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".risc0")));
+                let Some(home) = home else {
+                    eprintln!("skipped: no home directory to find the risc0-groth16 component in");
+                    return None;
+                };
+                home.join("extensions")
+                    .join(format!("v{COMPONENT_VERSION}-risc0-groth16"))
+            }
+        };
         if dir.join("stark_verify_final.zkey").is_file() {
             Some(dir)
         } else {
             eprintln!(
-                "skipped: no risc0-groth16 component at {} (rzup install risc0-groth16)",
+                "skipped: no risc0-groth16 component at {} (rzup install risc0-groth16 \
+                 {COMPONENT_VERSION}, or set RISC0_GROTH16_DIR)",
                 dir.display()
             );
             None

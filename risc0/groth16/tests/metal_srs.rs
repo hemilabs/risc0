@@ -26,18 +26,23 @@ use ark_bn254::Bn254;
 use ark_serialize::CanonicalDeserialize;
 use risc0_groth16_sys::metal::srs;
 
+/// The rzup component the 3.1 verifier's key comes from: `RISC0_GROTH16_DIR`, else rzup's layout
+/// `$RISC0_HOME` (else `~/.risc0`) `/extensions/v0.2.0-risc0-groth16`, as risc0-groth16's resolver
+/// falls back to. Never an older component (its key would not match [risc0_vk]).
 fn component_dir() -> Option<PathBuf> {
-    let dir = std::env::var_os("RISC0_GROTH16_DIR")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(|h| PathBuf::from(h).join(".risc0/extensions/v0.1.0-risc0-groth16"))
-        })?;
+    let dir = match std::env::var_os("RISC0_GROTH16_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => std::env::var_os("RISC0_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".risc0")))?
+            .join("extensions/v0.2.0-risc0-groth16"),
+    };
     if dir.join("stark_verify_final.zkey").is_file() {
         Some(dir)
     } else {
         eprintln!(
-            "skipped: no risc0-groth16 component at {} (rzup install risc0-groth16)",
+            "skipped: no risc0-groth16 component at {} (rzup install risc0-groth16 0.2.0, or set \
+             RISC0_GROTH16_DIR)",
             dir.display()
         );
         None

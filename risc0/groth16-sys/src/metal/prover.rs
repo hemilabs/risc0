@@ -55,15 +55,18 @@
 //! 44 % zeros and 29 % ones, so the MSMs make 22.4M bucket additions instead of 84.5M
 //! (-540 ms of GPU time per proof). Same results, bit for bit.
 //!
-//! Memory (rzup component: 5,635,930 witness elements, domain 2^23; device allocation 3890 MiB
-//! with the item G10 [MemOptions], 5624 MiB without): key points 2232 MiB (mapped from the zkey
-//! without a copy: file-backed pages, outside the process' physical footprint), coefficients
-//! 309 MiB compact (1375 MiB full), a, b 512 MiB (c lives in the MSM scratch's `sorted` buffer
-//! during the NTT phase, and a, b hold the regenerated fuzz and the MSM pieces once MSM H's sort
-//! has consumed h; without `alias` a, b, c 768 MiB + fuzz 172 MiB + pieces 240 MiB), witness
-//! 172 MiB, NTT tables 128 MiB, MSM scratch 536 MiB. Everything is allocated at construction
-//! (nothing during a proof), after one budget check of the whole footprint
-//! ([super::check_working_set]); the smallest working-set budget that builds it is ~3.84 GiB.
+//! Memory (rzup `risc0-groth16` 0.2.0, the 3.1 ceremony: 6,257,165 witness elements, domain
+//! 2^23; item P31-12): device allocation 4142 MiB with the item G10 [MemOptions] (4012 MiB with
+//! [MemOptions::split_h], which [SplitH::Auto] takes when 4142 MiB do not fit, e.g. under a
+//! 4 GiB budget): key points 2421 MiB (mapped from the zkey without a copy: file-backed pages,
+//! outside the process' physical footprint), coefficients 343 MiB compact (1518 MiB full), a, b
+//! 512 MiB (c lives in the MSM scratch's `sorted` buffer during the NTT phase, and a, b hold the
+//! regenerated fuzz and the MSM pieces once MSM H's sort has consumed h; without `alias` a, b, c
+//! 768 MiB + fuzz + pieces), witness 191 MiB, NTT tables 128 MiB, MSM scratch ~542 MiB (~412 MiB
+//! split). Everything is allocated at construction (nothing during a proof), after one budget
+//! check of the whole footprint ([super::check_working_set]); planned 4169.0 MiB unsplit and
+//! 4038.9 MiB split, so the smallest working-set budget that builds it is ~3.95 GiB. (The 3.0
+//! key, v0.1.0: 5,635,930 elements, 3890-3900 MiB, ~3.84 GiB.)
 
 use std::{
     fs::File,
@@ -428,7 +431,7 @@ impl Tuning {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemOptions {
     /// `compact`: the compact coefficients ([CompactCoeffs], disk cached): ~0.3 GB instead of
-    /// the 1.44 GB `coeff_t` array.
+    /// the 1.6 GB `coeff_t` array (v0.2.0 key).
     pub compact: bool,
     /// `mmap`: the zkey's points (and the compact cache file) as no-copy buffers over read-only
     /// file mappings (page cache, not anonymous memory; no copy at load).
@@ -436,8 +439,40 @@ pub struct MemOptions {
     /// `alias`: no persistent fuzz (regenerated per proof into a, b once MSM H's sort has
     /// consumed h) and the third polynomial c in the MSM scratch's `sorted` buffer during the NTT
     /// phase, and the MSM piece buffer in a, b (free once MSM H's sort has consumed h): -668 MiB
-    /// at the rzup sizes.
+    /// at the v0.1.0 key's sizes.
     pub alias: bool,
+    /// `split_h` (item P31-12): MSM H as two MSMs over the halves of the domain, so that the MSM
+    /// scratch is sized for `max(witness length, n / 2)` scalars instead of `n` (-130 MiB of
+    /// device allocation with the v0.2.0 key; +2.5 ms of GPU time per proof, profiled). See
+    /// [SplitH]; the results are the same group elements.
+    pub split_h: SplitH,
+}
+
+/// When [MemOptions::split_h] splits MSM H. `RISC0_G16_METAL_SPLIT_H=on|auto|off` (default
+/// `auto`); `RISC0_G16_METAL_G10_OFF=split_h` is `off`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SplitH {
+    /// Never (one MSM over the whole domain).
+    Off,
+    /// Only when the unsplit footprint does not fit the working-set room (the limit,
+    /// `RISC0_METAL_MAX_WORKING_SET_BYTES` or the device's recommended working set, minus what is
+    /// allocated) and the split one is smaller: the v0.2.0 key's prover plans 4169.0 MiB unsplit,
+    /// above a 4 GiB budget, and 4038.9 MiB split. Above that, the (slightly) faster unsplit
+    /// layout.
+    Auto,
+    /// Always (tests, A/B).
+    On,
+}
+
+impl SplitH {
+    fn parse(v: &str) -> Option<Self> {
+        match v {
+            "on" | "1" => Some(Self::On),
+            "auto" => Some(Self::Auto),
+            "off" | "0" => Some(Self::Off),
+            _ => None,
+        }
+    }
 }
 
 impl Default for MemOptions {
@@ -448,13 +483,14 @@ impl Default for MemOptions {
 
 impl MemOptions {
     /// Switch names for `RISC0_G16_METAL_G10_OFF`.
-    pub const NAMES: &'static [&'static str] = &["compact", "mmap", "alias"];
+    pub const NAMES: &'static [&'static str] = &["compact", "mmap", "alias", "split_h"];
 
     pub fn all() -> Self {
         Self {
             compact: true,
             mmap: true,
             alias: true,
+            split_h: SplitH::Auto,
         }
     }
 
@@ -464,21 +500,25 @@ impl MemOptions {
             compact: false,
             mmap: false,
             alias: false,
+            split_h: SplitH::Off,
         }
     }
 
-    /// Turn the switch `name` on or off; false for an unknown name.
+    /// Turn the switch `name` on or off; false for an unknown name. `split_h` on is
+    /// [SplitH::Auto].
     pub fn set(&mut self, name: &str, on: bool) -> bool {
         match name {
             "compact" => self.compact = on,
             "mmap" => self.mmap = on,
             "alias" => self.alias = on,
+            "split_h" => self.split_h = if on { SplitH::Auto } else { SplitH::Off },
             _ => return false,
         }
         true
     }
 
-    /// Like [Tuning::parse]: "base" (= none), "all", "-name", "+name", comma separated.
+    /// Like [Tuning::parse]: "base" (= none), "all", "-name", "+name", comma separated; also
+    /// "split_h=on|auto|off".
     pub fn parse(spec: &str) -> Option<Self> {
         let mut t = Self::all();
         for item in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -486,6 +526,10 @@ impl MemOptions {
                 "base" => t = Self::none(),
                 "all" => t = Self::all(),
                 _ => {
+                    if let Some(v) = item.strip_prefix("split_h=") {
+                        t.split_h = SplitH::parse(v)?;
+                        continue;
+                    }
                     let (on, name) = match item.as_bytes()[0] {
                         b'-' => (false, &item[1..]),
                         b'+' => (true, &item[1..]),
@@ -511,6 +555,12 @@ impl MemOptions {
                 if !t.set(name, false) {
                     eprintln!("[groth16-metal] RISC0_G16_METAL_G10_OFF: unknown switch {name}");
                 }
+            }
+        }
+        if let Ok(v) = std::env::var("RISC0_G16_METAL_SPLIT_H") {
+            match SplitH::parse(v.trim()) {
+                Some(s) => t.split_h = s,
+                None => eprintln!("[groth16-metal] RISC0_G16_METAL_SPLIT_H={v}: not on|auto|off"),
             }
         }
         t
@@ -583,6 +633,9 @@ pub struct BuildStats {
     pub planned_bytes: u64,
     /// The memory switches the prover was built with (item G10).
     pub mem: MemOptions,
+    /// Whether MSM H is split ([MemOptions::split_h], decided at the build under
+    /// [SplitH::Auto]).
+    pub split_h: bool,
     /// Process physical footprint (`proc_pid_rusage`) before loading and once built.
     pub footprint_before: u64,
     pub footprint_after: u64,
@@ -742,6 +795,8 @@ pub struct MetalProver {
     abc: Buffer,
     /// c lives in the MSM scratch's `sorted` buffer (else at `2 n` in `abc`).
     c_in_scratch: bool,
+    /// MSM H runs as two MSMs over the domain's halves ([MemOptions::split_h]).
+    split_h: bool,
     /// Blocks of the ChaCha fuzz (`fuzz_blocks(wn)`).
     fuzz_blocks: u64,
     mem: MemOptions,
@@ -749,7 +804,7 @@ pub struct MetalProver {
     witness: Buffer,
     /// witness_into_poly's fault word.
     fault: Buffer,
-    /// The MSMs' window sums: H, A, B1, C (G1), then B2 (G2).
+    /// The MSMs' window sums: H, A, B1, C (G1), then B2 (G2), then H's second half (G1).
     wsums: Buffer,
     scratch: MsmScratch,
     wn: usize,
@@ -776,6 +831,8 @@ enum Slot {
     B1,
     C,
     B2,
+    /// MSM H's second half ([MemOptions::split_h]).
+    H2,
 }
 
 impl MetalProver {
@@ -824,9 +881,11 @@ impl MetalProver {
             fuzz_late,
             polys,
             pieces_lent,
+            split_h,
             planned_bytes,
-        } = layout(srs_path, coeffs_path, mem)?;
+        } = layout(srs_path, coeffs_path, mem, working_set_room(device))?;
         stats.planned_bytes = planned_bytes;
+        stats.split_h = split_h;
         check_working_set(
             device,
             "the Groth16 prover (proving key, coefficients and scratch)",
@@ -915,6 +974,7 @@ impl MetalProver {
             fuzz,
             abc,
             c_in_scratch,
+            split_h,
             fuzz_blocks,
             mem,
             witness,
@@ -932,6 +992,11 @@ impl MetalProver {
     /// The memory switches this prover was built with.
     pub fn mem_options(&self) -> MemOptions {
         self.mem
+    }
+
+    /// Whether this prover splits MSM H ([MemOptions::split_h]).
+    pub fn split_h(&self) -> bool {
+        self.split_h
     }
 
     /// The coefficients (full or compact).
@@ -1110,33 +1175,68 @@ impl MetalProver {
         let out = |slot: Slot| MsmBuf::at(wsums, slot_offset(cfg, slot));
         let deep =
             opts.profile && std::env::var("RISC0_G16_METAL_PROFILE_MSM").as_deref() == Ok("1");
-        // Item G15: H's scalars are dense; b (abc at n) is free once the NTT stage has made h.
-        scratch.set_dense(
-            opts.tune.hdense,
-            opts.tune.htr.then_some((abc as &BufferRef, fr(nn))),
-        );
-        sort_stage(
-            &mut run,
-            msm,
-            scratch,
-            "sort_h",
-            1,
-            MsmBuf::new(abc),
-            n as u32,
-            deep,
-        );
-        let h_pts = pts(&srs.h);
-        msm_stage::<G1>(
-            &mut run,
-            msm,
-            scratch,
-            "msm_h",
-            1,
-            h_pts,
-            0,
-            out(Slot::H),
-            deep,
-        );
+        // MSM H over h (abc at 0), or (item P31-12 `split_h`) over its two halves, each sorted
+        // into the scratch in turn (the second sort waits for the first MSM: same queue). The
+        // first half's MSM writes its pieces over a (the lent piece buffer), where the second
+        // half of h still is, so that half is first copied to the second half of b (free since
+        // the NTT stage; the first half's transposed scalars take b's first half), and the H
+        // MSMs keep their pieces inside a (no G12 `lent_groups`, which would spread them over b;
+        // [layout] checks that they fit).
+        let h_parts: &[(u64, u64, &str, &str, Slot)] = if self.split_h {
+            run.copy_new(
+                "copy_h2",
+                1,
+                (abc, fr(nn / 2)),
+                (abc, fr(3 * nn / 2)),
+                fr(nn / 2),
+            );
+            scratch.set_tune(MsmTune {
+                lent_groups: false,
+                ..opts.tune.msm()
+            });
+            &[
+                (0, 0, "sort_h", "msm_h", Slot::H),
+                (3 * nn / 2, nn / 2, "sort_h2", "msm_h2", Slot::H2),
+            ]
+        } else {
+            &[(0, 0, "sort_h", "msm_h", Slot::H)]
+        };
+        let h_len = nn / h_parts.len() as u64;
+        for &(at, start, sort_label, msm_label, slot) in h_parts {
+            // Item G15: H's scalars are dense; b (abc at n) is free once the NTT stage has made
+            // h. (`set_dense` applies to one sort.)
+            scratch.set_dense(
+                opts.tune.hdense,
+                opts.tune.htr.then_some((abc as &BufferRef, fr(nn))),
+            );
+            sort_stage(
+                &mut run,
+                msm,
+                scratch,
+                sort_label,
+                1,
+                MsmBuf::at(abc, fr(at)),
+                h_len as u32,
+                deep,
+            );
+            let h_pts = pts(&srs.h);
+            let h_pts = MsmBuf::at(
+                h_pts.buf,
+                h_pts.offset + start * std::mem::size_of::<srs::G1AffineRaw>() as u64,
+            );
+            msm_stage::<G1>(
+                &mut run,
+                msm,
+                scratch,
+                msm_label,
+                1,
+                h_pts,
+                0,
+                out(slot),
+                deep,
+            );
+        }
+        scratch.set_tune(opts.tune.msm());
         if fuzzed && fuzz_now.is_none() {
             // Item G10 alias: sort_h has consumed h, so a, b are free: regenerate the fuzz there
             // (same kernel and state as the build-time fuzz) and add it to the witness.
@@ -1225,7 +1325,10 @@ impl MetalProver {
         );
 
         let t = Instant::now();
-        let h = self.window_sum::<G1>(Slot::H);
+        let mut h = self.window_sum::<G1>(Slot::H);
+        if self.split_h {
+            h += self.window_sum::<G1>(Slot::H2);
+        }
         let msm_a = self.window_sum::<G1>(Slot::A);
         let msm_b1 = self.window_sum::<G1>(Slot::B1);
         let msm_c = self.window_sum::<G1>(Slot::C);
@@ -1419,11 +1522,13 @@ struct Layout {
     fuzz_late: bool,
     polys: u64,
     pieces_lent: bool,
+    /// MSM H runs as two MSMs over the domain's halves ([MemOptions::split_h]).
+    split_h: bool,
     /// The whole footprint, checked against the working-set budget before loading.
     planned_bytes: u64,
 }
 
-fn layout(srs_path: &Path, coeffs_path: &Path, mem: MemOptions) -> Result<Layout> {
+fn layout(srs_path: &Path, coeffs_path: &Path, mem: MemOptions, room: u64) -> Result<Layout> {
     // Sizes first (a few KB of reads), so that an over-budget machine fails before loading.
     let header = srs::read_zkey_header(srs_path)?;
     let wn = header.witness_len();
@@ -1438,51 +1543,82 @@ fn layout(srs_path: &Path, coeffs_path: &Path, mem: MemOptions) -> Result<Layout
         "groth16-metal: witness length {wn} / domain {n} out of range"
     );
     let coeffs_bytes = planned_coeff_bytes(coeffs_path, mem.compact)?;
-    let cap = wn.max(n) as u32;
     let cfg = msm_config_from_env();
     let fuzz_blocks = small::fuzz_blocks(wn as u64);
     let fuzz_len = 2 * fuzz_blocks;
     let wsum_bytes = wsum_bytes(cfg);
     let ntt_bytes = ((n as u64 / 2).max(1) + 4096 + 2 * (n as u64 >> 12).max(1)) * FR_BYTES;
-    let scratch_sizes = MsmScratch::sizes_for(cap, cfg);
-    // Item G10 aliasing: c in the scratch's `sorted` buffer (index 4 of the sizes) and the
-    // fuzz regenerated per proof at the start of a, b, when they fit.
-    let c_in_scratch = mem.alias && scratch_sizes[4] >= n as u64 * FR_BYTES;
-    let fuzz_late = mem.alias && fuzz_len <= 2 * n as u64;
-    let polys = if c_in_scratch { 2 } else { 3 };
-    // ... and the MSM piece buffer in a, b (free from MSM H's sort to the end of the proof).
-    let pieces_lent = mem.alias && scratch_sizes[5] <= polys * n as u64 * FR_BYTES;
-    let own = (polys * n as u64 + wn as u64 + if fuzz_late { 0 } else { fuzz_len }) * FR_BYTES
-        + wsum_bytes
-        + 16;
-    let planned_bytes =
-        header.points_bytes() + coeffs_bytes + own + ntt_bytes + scratch_sizes.iter().sum::<u64>()
-            - if pieces_lent { scratch_sizes[5] } else { 0 }
-            + PLAN_SLACK;
-    Ok(Layout {
-        wn,
-        n,
-        lg,
-        cap,
-        cfg,
-        fuzz_blocks,
-        fuzz_len,
-        wsum_bytes,
-        ntt_bytes,
-        c_in_scratch,
-        fuzz_late,
-        polys,
-        pieces_lent,
-        planned_bytes,
+    let fixed = header.points_bytes() + coeffs_bytes + ntt_bytes + wsum_bytes + 16 + PLAN_SLACK;
+    // The MSM scratch holds `cap` scalars: every MSM's (H over the domain, the witness MSMs over
+    // wn), or with `split_h` (item P31-12) H's halves.
+    let plan = |split_h: bool| {
+        let cap = wn.max(if split_h { n / 2 } else { n }) as u32;
+        let scratch_sizes = MsmScratch::sizes_for(cap, cfg);
+        // Item G10 aliasing: c in the scratch's `sorted` buffer (index 4 of the sizes) and the
+        // fuzz regenerated per proof at the start of a, b, when they fit.
+        let c_in_scratch = mem.alias && scratch_sizes[4] >= n as u64 * FR_BYTES;
+        let fuzz_late = mem.alias && fuzz_len <= 2 * n as u64;
+        let polys = if c_in_scratch { 2 } else { 3 };
+        // ... and the MSM piece buffer in a, b (free from MSM H's sort to the end of the proof).
+        let pieces_lent = mem.alias && scratch_sizes[5] <= polys * n as u64 * FR_BYTES;
+        // The split encoding keeps the H MSMs' pieces inside a (see [MetalProver::prove_from]).
+        if split_h && pieces_lent && scratch_sizes[5] > n as u64 * FR_BYTES {
+            return None;
+        }
+        let own = (polys * n as u64 + wn as u64 + if fuzz_late { 0 } else { fuzz_len }) * FR_BYTES;
+        let planned_bytes = fixed + own + scratch_sizes.iter().sum::<u64>()
+            - if pieces_lent { scratch_sizes[5] } else { 0 };
+        Some(Layout {
+            wn,
+            n,
+            lg,
+            cap,
+            cfg,
+            fuzz_blocks,
+            fuzz_len,
+            wsum_bytes,
+            ntt_bytes,
+            c_in_scratch,
+            fuzz_late,
+            polys,
+            pieces_lent,
+            split_h,
+            planned_bytes,
+        })
+    };
+    let whole = plan(false).expect("unsplit layout");
+    Ok(match mem.split_h {
+        SplitH::Off => whole,
+        SplitH::On => plan(true).unwrap_or(whole),
+        SplitH::Auto if whole.planned_bytes <= room => whole,
+        SplitH::Auto => match plan(true) {
+            Some(split) if split.planned_bytes < whole.planned_bytes => split,
+            _ => whole,
+        },
     })
+}
+
+/// The working-set room [SplitH::Auto] plans for: the limit (the explicit budget, else the
+/// device's recommended working set) minus what the device has allocated.
+fn working_set_room(device: &DeviceRef) -> u64 {
+    super::working_set_limit(device)
+        .unwrap_or_else(|| device.recommended_max_working_set_size())
+        .saturating_sub(device.current_allocated_size())
 }
 
 /// The device footprint a [MetalProver] for `setup` would allocate with the memory switches
 /// `mem` (what [MetalProver::new_with] checks against the working-set budget), without loading
 /// anything. Item G13: the early key load decides with it whether the key fits beside the work
-/// still to come.
+/// still to come. ([SplitH::Auto] decides with the room left now.)
 pub fn planned_bytes(setup: &SetupParams, mem: MemOptions) -> Result<u64> {
-    Ok(layout(setup.srs_path.as_path(), setup.pcoeffs_path.as_path(), mem)?.planned_bytes)
+    let room = metal::Device::system_default().map_or(u64::MAX, |d| working_set_room(&d));
+    Ok(layout(
+        setup.srs_path.as_path(),
+        setup.pcoeffs_path.as_path(),
+        mem,
+        room,
+    )?
+    .planned_bytes)
 }
 
 /// Bytes the coefficients will take on the GPU, from the file header (before loading): the
@@ -1594,7 +1730,7 @@ fn ms(t: Instant) -> f64 {
 
 /// Bytes of the window-sum buffer: 4 G1 MSMs and one G2 MSM.
 fn wsum_bytes(cfg: MsmConfig) -> u64 {
-    cfg.nwins() as u64 * (4 * G1::XYZZ_BYTES + G2::XYZZ_BYTES)
+    cfg.nwins() as u64 * (5 * G1::XYZZ_BYTES + G2::XYZZ_BYTES)
 }
 
 fn slot_offset(cfg: MsmConfig, slot: Slot) -> u64 {
@@ -1605,6 +1741,7 @@ fn slot_offset(cfg: MsmConfig, slot: Slot) -> u64 {
         Slot::B1 => 2 * g1,
         Slot::C => 3 * g1,
         Slot::B2 => 4 * g1,
+        Slot::H2 => 4 * g1 + cfg.nwins() as u64 * G2::XYZZ_BYTES,
     }
 }
 
@@ -1787,6 +1924,26 @@ impl<'q> Run<'q> {
     /// Start a new command buffer (group 0) whose first command zero-fills `len` bytes of `buf`.
     fn fill_new(&mut self, buf: &BufferRef, len: u64) {
         self.open("zero", 0, Some((buf, len)));
+    }
+
+    /// Start a new command buffer (group `group`) whose first command copies `len` bytes from
+    /// `src` to `dst` (buffer, offset); the following stages of the group share it.
+    fn copy_new(
+        &mut self,
+        label: &str,
+        group: u32,
+        src: (&BufferRef, u64),
+        dst: (&BufferRef, u64),
+        len: u64,
+    ) {
+        self.close();
+        let cb = self.queue.new_command_buffer().to_owned();
+        let blit = cb.new_blit_command_encoder();
+        blit.copy_from_buffer(src.0, src.1, dst.0, dst.1, len);
+        blit.end_encoding();
+        let enc = cb.new_compute_command_encoder().to_owned();
+        self.labels.push(label.to_string());
+        self.cur = Some((cb, enc, group));
     }
 
     fn stage(&mut self, label: &str, group: u32, f: impl FnOnce(&ComputeCommandEncoderRef)) {

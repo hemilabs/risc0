@@ -24,27 +24,12 @@ use ark_ff::Zero;
 
 use super::*;
 
-/// The rzup component directory (`RISC0_GROTH16_DIR`, else the default rzup layout), if its
-/// files are present.
+/// The rzup component directory (v0.2.0, see [srs::tests::component_dir]), if present.
 fn component_dir() -> Option<PathBuf> {
-    let dir = std::env::var_os("RISC0_GROTH16_DIR")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(|h| PathBuf::from(h).join(".risc0/extensions/v0.1.0-risc0-groth16"))
-        })?;
-    if dir.join("stark_verify_final.zkey").is_file() {
-        Some(dir)
-    } else {
-        eprintln!(
-            "skipped: no risc0-groth16 component at {} (rzup install risc0-groth16)",
-            dir.display()
-        );
-        None
-    }
+    super::super::srs::tests::component_dir()
 }
 
-/// The tests that build a [MetalProver] (5.6 GB each with the rzup key) run alone (PLAN 8.7):
+/// The tests that build a [MetalProver] (3.9-5.9 GiB each with the v0.2.0 key) run alone (PLAN 8.7):
 /// two builds never coexist, and no kernel test is refused under a budget because of one.
 fn prover_test_lock() -> std::sync::RwLockWriteGuard<'static, ()> {
     super::super::test_lock::exclusive()
@@ -443,14 +428,15 @@ fn random_witness(prover: &MetalProver, seed: u64) -> Vec<u8> {
 fn report_build(name: &str, p: &MetalProver) {
     let st = &p.build_stats;
     eprintln!(
-        "G10BUILD {name}: srs {:?} coeffs {:?} validate {:?} gpu setup {:?} total {:?}; planned \
-         {:.1} MiB, allocated {:.1} -> {:.1} MiB (+{:.1}), footprint {:.1} -> {:.1} MiB (+{:.1}), \
+        "G10BUILD {name}: srs {:?} coeffs {:?} validate {:?} gpu setup {:?} total {:?}; split_h \
+         {}; planned {:.1} MiB, allocated {:.1} -> {:.1} MiB (+{:.1}), footprint {:.1} -> {:.1} MiB (+{:.1}), \
          coefficients {:.1} MiB",
         st.srs_load,
         st.coeffs_load,
         st.coeffs_validate,
         st.gpu_setup,
         st.total,
+        st.split_h,
         mib(st.planned_bytes),
         mib(st.allocated_before),
         mib(st.allocated_after),
@@ -628,11 +614,124 @@ fn g14_nofuzz_bit_exact() {
     }
 }
 
+/// Item P31-12: `split_h` (MSM H over the domain's two halves, a smaller MSM scratch) gives the
+/// same pre-blinding values and, with fixed r and s, the same proof as one MSM over the domain,
+/// for a witness-like and a random witness; the fuzz check holds on the split prover; and
+/// [SplitH::Auto] splits exactly when the unsplit footprint exceeds the room.
+#[test]
+fn p31_12_split_h_bit_exact() {
+    assert_eq!(MemOptions::all().split_h, SplitH::Auto);
+    assert_eq!(MemOptions::none().split_h, SplitH::Off);
+    assert_eq!(MemOptions::parse("split_h=on").unwrap().split_h, SplitH::On);
+    assert_eq!(
+        MemOptions::parse("base,split_h=auto").unwrap().split_h,
+        SplitH::Auto
+    );
+    assert_eq!(MemOptions::parse("-split_h").unwrap().split_h, SplitH::Off);
+    assert_eq!(MemOptions::parse("split_h=maybe"), None);
+
+    let _lock = prover_test_lock();
+    let Some(dir) = component_dir() else {
+        return;
+    };
+    let setup = SetupParams::new(&dir).unwrap();
+    let lay = |split_h: SplitH, room: u64| {
+        let mem = MemOptions {
+            split_h,
+            ..MemOptions::all()
+        };
+        layout(
+            setup.srs_path.as_path(),
+            setup.pcoeffs_path.as_path(),
+            mem,
+            room,
+        )
+        .unwrap()
+    };
+    let whole = lay(SplitH::Off, 0);
+    let split = lay(SplitH::On, u64::MAX);
+    assert!(!whole.split_h && split.split_h);
+    assert!(split.planned_bytes < whole.planned_bytes);
+    assert_eq!(split.polys, whole.polys);
+    assert!(!lay(SplitH::Auto, whole.planned_bytes).split_h);
+    assert!(lay(SplitH::Auto, whole.planned_bytes - 1).split_h);
+    eprintln!(
+        "P31-12 layout: wn {} n {}; whole cap {} planned {:.1} MiB (c in scratch {}, pieces lent \
+         {}); split cap {} planned {:.1} MiB (c in scratch {}, pieces lent {})",
+        whole.wn,
+        whole.n,
+        whole.cap,
+        mib(whole.planned_bytes),
+        whole.c_in_scratch,
+        whole.pieces_lent,
+        split.cap,
+        mib(split.planned_bytes),
+        split.c_in_scratch,
+        split.pieces_lent
+    );
+
+    let mut reference: Vec<Proof> = vec![];
+    for split_h in [SplitH::Off, SplitH::On] {
+        let mem = MemOptions {
+            split_h,
+            ..MemOptions::all()
+        };
+        let mut prover = match MetalProver::new_with(&setup, mem) {
+            Ok(p) => p,
+            Err(e) if super::super::working_set_budget().is_some() => {
+                let msg = format!("{e:#}");
+                assert!(msg.contains("working-set budget exceeded"), "{msg}");
+                eprintln!("P31-12 {split_h:?}: refused under the budget: {msg}");
+                continue;
+            }
+            Err(e) => panic!("{split_h:?}: {e:#}"),
+        };
+        report_build(&format!("split_h={split_h:?}"), &prover);
+        assert_eq!(prover.split_h(), split_h == SplitH::On);
+        assert_eq!(prover.build_stats.split_h, prover.split_h());
+        let mut proofs = vec![];
+        for (what, w) in [
+            ("witness-like", witness_like(&prover, 0x3112)),
+            ("random", random_witness(&prover, 0x3113)),
+        ] {
+            let p = prover
+                .prove_with_blinding(&w, &ProveOptions::default(), Fr::from(3u64), Fr::from(5u64))
+                .unwrap();
+            assert_eq!(
+                p.stats.gpu_ms.iter().any(|(k, _)| k.contains("msm_h2")),
+                prover.split_h(),
+                "{what}"
+            );
+            eprintln!(
+                "P31-12 {split_h:?} {what}: gpu {:.1} ms",
+                p.stats.gpu_total_ms()
+            );
+            proofs.push(p);
+        }
+        if prover.split_h() {
+            let (a, b1, c, b2) = prover.fuzz_check().unwrap();
+            assert!(
+                a.is_zero() && b1.is_zero() && c.is_zero() && b2.is_zero(),
+                "fuzz check (split)"
+            );
+        }
+        if reference.is_empty() {
+            reference = proofs;
+        } else {
+            for (p, r) in proofs.iter().zip(&reference) {
+                assert_eq!(p.pre_blinding, r.pre_blinding);
+                assert_eq!((p.a, p.b, p.c), (r.a, r.b, r.c));
+            }
+        }
+    }
+}
+
 /// G10: interleaved A/B of memory layouts on the real key (benchmark, ignored). `G10_VARIANTS`
 /// = [MemOptions::parse] specs separated by `;` (default "base;all"); every variant's prover is
 /// built once and kept (they coexist: ~10 GB for two), then `G10_REPS` rounds (default 7) prove
-/// with each in turn. `G10_PROFILE=1`: one command buffer per stage. Pre-blinding values must
-/// equal the first variant's.
+/// with each in turn. `G10_PROFILE=1`: one command buffer per stage. `G10_WITNESS=<file>`: a
+/// real witness (as `G9_WITNESS`) instead of random values. Pre-blinding values must equal the
+/// first variant's.
 #[test]
 #[ignore]
 fn g10_bench() {
@@ -653,7 +752,14 @@ fn g10_bench() {
             (s.to_string(), p)
         })
         .collect();
-    let witness = random_witness(&provers[0].1, 9);
+    let witness = match std::env::var("G10_WITNESS") {
+        Ok(path) => {
+            let w = std::fs::read(&path).expect("G10_WITNESS");
+            assert_eq!(w.len(), provers[0].1.witness_len() * 32, "G10_WITNESS size");
+            w
+        }
+        Err(_) => random_witness(&provers[0].1, 9),
+    };
     let opts = ProveOptions {
         profile,
         ..Default::default()
