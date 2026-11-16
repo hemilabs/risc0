@@ -19,6 +19,9 @@
 //!   the CPU. Under `--features witgen_debug` the same holds through `SegmentProver::prove`.
 //! - [seal_matches_cpu_large] (ignored, slow, huge class): the same at po2 20 (simple_loop) and on
 //!   dumped real-guest segments (`R11_SEGMENTS`).
+//! - P31-06 (release-3.1): [rv32im_3_1_constants], [assert_seal_v3] on every seal these tests
+//!   make (seal version 3, the `totalCycles` global == 2^po2), and
+//!   [total_cycles_tamper_rejected_metal] (3.1's `totalCycles` check against the Metal prover).
 //! - [prove_po2_sweep] (ignored, measurement): Metal wall time and the peak GPU memory of each
 //!   prover phase ([super::PHASE_MARKS]) per po2 of `R11_PO2S`, optionally against the CPU prover.
 //!   Over a `RISC0_METAL_MAX_WORKING_SET_BYTES` budget the failing allocation is reported.
@@ -64,13 +67,21 @@
 
 use std::{
     panic::{catch_unwind, AssertUnwindSafe},
-    sync::atomic::Ordering,
+    sync::{atomic::Ordering, Arc},
     time::Instant,
 };
 
 use risc0_binfmt::{MemoryImage, Program};
 use risc0_core::field::Elem as _;
-use risc0_zkp::hal::metal::MetalHalPoseidon2;
+use risc0_zkp::{
+    adapter::{CircuitInfo as _, ProtocolInfo},
+    core::hash::poseidon2::Poseidon2HashSuite,
+    hal::{
+        metal::{BufferImpl, MetalHalPoseidon2},
+        AccumPreflight, Buffer as _, CircuitHal,
+    },
+    verify::VerificationError,
+};
 use test_log::test;
 
 use super::{PHASE_MARKS, PHASE_MARKS_ON};
@@ -80,9 +91,18 @@ use crate::{
         testutil::{self, NullSyscall, DEFAULT_SESSION_LIMIT},
         DEFAULT_SEGMENT_LIMIT_PO2,
     },
-    prove::{hal::cpu, PreflightResults, SegmentProver},
-    zirgen::circuit::ExtVal,
-    MAX_INSN_CYCLES,
+    prove::{
+        hal::{
+            cpu, metal::MetalCircuitHalPoseidon2, CircuitAccumulator, CircuitWitnessGenerator,
+            MetaBuffer, PreflightTrace, SegmentProverImpl, StepMode,
+        },
+        PreflightResults, SegmentProver,
+    },
+    zirgen::{
+        circuit::{ExtVal, Val, LAYOUT_GLOBAL, REGCOUNT_GLOBAL},
+        CircuitImpl,
+    },
+    MAX_INSN_CYCLES, RV32IM_SEAL_VERSION,
 };
 
 fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
@@ -188,6 +208,11 @@ fn seal_matches_cpu() {
             crate::verify(&seal_cpu).unwrap();
             crate::verify(&seal_metal)
                 .unwrap_or_else(|e| panic!("{name} segment {}: Metal seal: {e:?}", segment.index));
+            assert_seal_v3(
+                &format!("{name} segment {}", segment.index),
+                &seal_metal,
+                segment.po2,
+            );
             let diff = seal_cpu.iter().zip(&seal_metal).position(|(a, b)| a != b);
             assert!(
                 seal_cpu.len() == seal_metal.len() && diff.is_none(),
@@ -224,6 +249,226 @@ fn seal_matches_cpu() {
         "[r11] seal_matches_cpu ({}): {checked} segments",
         phases_label()
     );
+}
+
+/// P31-06: why `seal` is not a 3.1 rv32im seal of a 2^po2-row trace (None if it is): the
+/// version word is [RV32IM_SEAL_VERSION] (3) and the `totalCycles` global in the seal's outputs
+/// is 2^po2 (what 3.1's `verify` requires, here read directly from the seal).
+fn seal_v3_error(seal: &[u32], po2: u32) -> Option<String> {
+    if seal.len() < 1 + CircuitImpl::OUTPUT_SIZE {
+        return Some(format!("seal too short ({} words)", seal.len()));
+    }
+    if seal[0] != RV32IM_SEAL_VERSION {
+        return Some(format!("seal version {} != {RV32IM_SEAL_VERSION}", seal[0]));
+    }
+    let io: &[Val] = bytemuck::checked::cast_slice(&seal[1..1 + CircuitImpl::OUTPUT_SIZE]);
+    let total = io[LAYOUT_GLOBAL.total_cycles._super.offset];
+    (total != Val::new(1 << po2)).then(|| format!("totalCycles global {total:?} != 2^{po2}"))
+}
+
+fn assert_seal_v3(what: &str, seal: &[u32], po2: u32) {
+    if let Some(e) = seal_v3_error(seal, po2) {
+        panic!("{what}: {e}");
+    }
+}
+
+/// P31-06: release-3.1's rv32im protocol constants (PORT_PLAN 1.1 row 3), which the seals of
+/// these tests and the Metal kernels (`kRegCountGlobal`, P31-02) are built against.
+#[test]
+fn rv32im_3_1_constants() {
+    assert_eq!(RV32IM_SEAL_VERSION, 3);
+    assert_eq!(
+        CircuitImpl::CIRCUIT_INFO,
+        ProtocolInfo(*b"RV32IM:v2rev3___")
+    );
+    assert_eq!(CircuitImpl::OUTPUT_SIZE, 91);
+    assert_eq!(REGCOUNT_GLOBAL, 91);
+    assert!(LAYOUT_GLOBAL.total_cycles._super.offset < CircuitImpl::OUTPUT_SIZE);
+}
+
+/// P31-06 (PORT_PLAN 1.1 row 3): 3.1's `totalCycles` global against the Metal prover. 3.1's
+/// `prove::witgen::tests::total_cycles_mismatch_fails` proves the honest case with the default
+/// segment prover (Metal in this build) and runs the tampered cases on the CPU HAL. Here:
+/// - the honest Metal seal verifies, is seal version 3 and carries totalCycles == 2^po2; with a
+///   3.0 version word (2) `verify` rejects it as a format error, and with the totalCycles word
+///   of its outputs changed `verify` rejects it;
+/// - a tampered global (half and double the trace length; [TamperTotalCycles] writes it into the
+///   device global buffer right before the Metal witgen, which is what an upload of a tampered
+///   `PreflightResults::global` gives) through the Metal prover never yields an accepted proof:
+///   the prover fails, or the seal fails `verify` and also fails `risc0_zkp::verify` without the
+///   totalCycles check (the circuit constraint itself rejects it, not only 3.1's verifier check).
+///   The GPU witgen does not check constraints (`eqz` is a no-op, notes/P31-05.md), so a seal is
+///   the expected outcome; the test reports which one it got.
+#[test]
+fn total_cycles_tamper_rejected_metal() {
+    let segment = segments(testutil::kernel::basic(), DEFAULT_SEGMENT_LIMIT_PO2).remove(0);
+    let metal = super::segment_prover().unwrap();
+    let offset = LAYOUT_GLOBAL.total_cycles._super.offset;
+    let total = 1u32 << segment.po2;
+    let rand_z = ExtVal::ONE;
+
+    let seal = metal
+        .prove_core(PreflightResults::new(&segment, rand_z).unwrap())
+        .unwrap();
+    crate::verify(&seal).unwrap();
+    assert_seal_v3("honest Metal seal", &seal, segment.po2);
+
+    let mut v2 = seal.clone();
+    v2[0] = 2;
+    assert!(
+        matches!(
+            crate::verify(&v2),
+            Err(VerificationError::ReceiptFormatError)
+        ),
+        "a seal with the 3.0 version word must be rejected"
+    );
+    for claimed in [total / 2, total * 2] {
+        let mut bad = seal.clone();
+        bad[1 + offset] = Val::as_u32_slice_unchecked(&[Val::new(claimed)])[0];
+        assert!(
+            crate::verify(&bad).is_err(),
+            "seal with totalCycles {claimed} in its outputs verified"
+        );
+    }
+
+    let suite = Poseidon2HashSuite::new_suite();
+    for claimed in [total / 2, total * 2] {
+        let tampered = SegmentProverImpl::new(|| {
+            let hal = Arc::new(MetalHalPoseidon2::new());
+            let inner = MetalCircuitHalPoseidon2::new(hal.clone()).unwrap();
+            (hal, Arc::new(TamperTotalCycles { inner, claimed }))
+        });
+        let results = PreflightResults::new(&segment, rand_z).unwrap();
+        let outcome = match catch_unwind(AssertUnwindSafe(|| tampered.prove_core(results))) {
+            Err(_) => "the Metal prover panicked".to_string(),
+            Ok(Err(e)) => format!("the Metal prover failed: {e:#}"),
+            Ok(Ok(seal)) => {
+                let full = crate::verify(&seal);
+                assert!(
+                    full.is_err(),
+                    "Metal seal with totalCycles = {claimed} (2^po2 = {total}) verified"
+                );
+                let circuit_only =
+                    risc0_zkp::verify::verify(&CircuitImpl, &suite, &seal[1..], |_, _| Ok(()));
+                assert!(
+                    circuit_only.is_err(),
+                    "Metal seal with totalCycles = {claimed} passes the circuit's constraints \
+                     (only 3.1's totalCycles check would reject it)"
+                );
+                format!(
+                    "Metal seal rejected: verify {:?}, without the totalCycles check {:?}",
+                    full.unwrap_err(),
+                    circuit_only.unwrap_err()
+                )
+            }
+        };
+        eprintln!("[p31-06] totalCycles = {claimed} (2^po2 = {total}): {outcome}");
+    }
+
+    // The wrapper with the honest value gives the honest seal (it changes nothing else), and the
+    // Metal prover still proves honestly after the tampered runs.
+    let honest = SegmentProverImpl::new(|| {
+        let hal = Arc::new(MetalHalPoseidon2::new());
+        let inner = MetalCircuitHalPoseidon2::new(hal.clone()).unwrap();
+        (
+            hal,
+            Arc::new(TamperTotalCycles {
+                inner,
+                claimed: total,
+            }),
+        )
+    });
+    let seal2 = honest
+        .prove_core(PreflightResults::new(&segment, rand_z).unwrap())
+        .unwrap();
+    assert_eq!(seal, seal2, "TamperTotalCycles with the honest value");
+    let seal3 = metal
+        .prove_core(PreflightResults::new(&segment, rand_z).unwrap())
+        .unwrap();
+    assert_eq!(seal, seal3, "honest Metal seal after the tampered runs");
+}
+
+/// The Metal circuit HAL with the `totalCycles` global overwritten (`claimed`) in the device
+/// global buffer right before witgen; every other call is the Metal HAL's.
+struct TamperTotalCycles {
+    inner: MetalCircuitHalPoseidon2,
+    claimed: u32,
+}
+
+impl CircuitWitnessGenerator<MetalHalPoseidon2> for TamperTotalCycles {
+    fn writes_cycle_cols(&self) -> bool {
+        self.inner.writes_cycle_cols()
+    }
+
+    fn takes_zeroed_data(&self) -> bool {
+        self.inner.takes_zeroed_data()
+    }
+
+    fn generate_witness(
+        &self,
+        mode: StepMode,
+        preflight: &PreflightTrace,
+        global: &MetaBuffer<MetalHalPoseidon2>,
+        data: &MetaBuffer<MetalHalPoseidon2>,
+        pre_data: &MetaBuffer<MetalHalPoseidon2>,
+    ) -> anyhow::Result<()> {
+        let offset = LAYOUT_GLOBAL.total_cycles._super.offset;
+        global
+            .buf
+            .view_mut(|g: &mut [Val]| g[offset] = Val::new(self.claimed));
+        self.inner
+            .generate_witness(mode, preflight, global, data, pre_data)
+    }
+}
+
+impl CircuitAccumulator<MetalHalPoseidon2> for TamperTotalCycles {
+    fn step_accum(
+        &self,
+        preflight: &PreflightTrace,
+        data: &MetaBuffer<MetalHalPoseidon2>,
+        accum: &MetaBuffer<MetalHalPoseidon2>,
+        global: &MetaBuffer<MetalHalPoseidon2>,
+        mix: &MetaBuffer<MetalHalPoseidon2>,
+    ) -> anyhow::Result<()> {
+        self.inner.step_accum(preflight, data, accum, global, mix)
+    }
+
+    fn step_accum_zeroizes(&self) -> bool {
+        self.inner.step_accum_zeroizes()
+    }
+}
+
+impl CircuitHal<MetalHalPoseidon2> for TamperTotalCycles {
+    fn accumulate(
+        &self,
+        preflight: &AccumPreflight,
+        ctrl: &BufferImpl<Val>,
+        io: &BufferImpl<Val>,
+        data: &BufferImpl<Val>,
+        mix: &BufferImpl<Val>,
+        accum: &BufferImpl<Val>,
+        steps: usize,
+    ) {
+        self.inner
+            .accumulate(preflight, ctrl, io, data, mix, accum, steps)
+    }
+
+    fn eval_check(
+        &self,
+        check: &BufferImpl<Val>,
+        groups: &[&BufferImpl<Val>],
+        globals: &[&BufferImpl<Val>],
+        poly_mix: ExtVal,
+        po2: usize,
+        steps: usize,
+    ) {
+        self.inner
+            .eval_check(check, groups, globals, poly_mix, po2, steps)
+    }
+
+    fn eval_check_dep(&self) {
+        self.inner.eval_check_dep()
+    }
 }
 
 /// W7-R1: the "huge class" banner of the heavy tests (one process can reach most of a 36 GB Mac).
@@ -364,6 +609,7 @@ fn seal_matches_cpu_large() {
         };
         let t_cpu = t.elapsed().as_secs_f64();
         crate::verify(&seal_cpu).unwrap();
+        assert_seal_v3(&format!("{name} (CPU)"), &seal_cpu, segment.po2);
         eprintln!("[w7-r1] {name}: after the CPU proof: {}", footprint_line());
         let fresh = kept.is_none().then(|| super::segment_prover().unwrap());
         let metal = kept
@@ -377,6 +623,9 @@ fn seal_matches_cpu_large() {
                 Err(e) => format!("Metal prove error: {e:#}"),
                 Ok(seal) => match crate::verify(&seal) {
                     Err(e) => format!("Metal seal does not verify: {e:?}"),
+                    Ok(()) if seal_v3_error(&seal, segment.po2).is_some() => {
+                        seal_v3_error(&seal, segment.po2).unwrap()
+                    }
                     Ok(()) if seal != seal_cpu => format!(
                         "Metal seal differs from the CPU seal (first word {:?})",
                         seal_cpu.iter().zip(&seal).position(|(a, b)| a != b)
@@ -388,7 +637,7 @@ fn seal_matches_cpu_large() {
                 "[r11] {name} po2 {} rep {rep}: {} (cpu {:.0} ms, metal {:.0} ms)",
                 segment.po2,
                 if verdict.is_empty() {
-                    "seals equal, verify"
+                    "seals equal, verify (seal v3, totalCycles == 2^po2)"
                 } else {
                     verdict.as_str()
                 },
@@ -550,6 +799,7 @@ fn prove_po2_sweep() {
             match metal_prove(&hal, metal.as_ref(), segment) {
                 Ok((secs, marks, seal)) => {
                     crate::verify(&seal).unwrap();
+                    assert_seal_v3(&format!("sweep po2 {po2}"), &seal, po2 as u32);
                     let mut line = String::new();
                     let mut max = 0;
                     for w in marks.windows(2) {
@@ -625,6 +875,7 @@ fn prove_po2_sweep() {
             let seal = cpu.prove(segment).unwrap();
             let secs = t.elapsed().as_secs_f64();
             crate::verify(&seal).unwrap();
+            assert_seal_v3(&format!("sweep po2 {po2} (CPU)"), &seal, po2 as u32);
             let before_drop = footprint_line();
             drop(fresh);
             eprintln!(
