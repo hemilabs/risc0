@@ -626,6 +626,610 @@ fn witness_bit_equal_to_reference() {
     }
 }
 
+/// Item W7-G1: the cached graph is released and rebuilt on demand; a rebuilt graph gives the same
+/// witness, a holder keeps a released graph alive, and the idle hook frees nothing that is in use.
+#[test]
+fn graph_release_and_rebuild() {
+    use super::super::metal_witness as mw;
+    let _lock = gpu_test_lock();
+    if component_dir().is_err() || mw::kind() == mw::Kind::Ref {
+        eprintln!("skipped: no risc0-groth16 component, or the ref evaluator");
+        return;
+    }
+    let seal = seal_words();
+    mw::clear_reservations();
+    mw::preload_for_wrap().unwrap();
+    assert!(mw::is_cached());
+    let first = mw::witness(seal).unwrap();
+    let builds = mw::builds();
+
+    // Held by a wrap: the idle hook leaves it (it may still free an idle `fast.rs` program of
+    // another test); a release drops the cache, not the holder's copy.
+    let held = mw::wrap_graph().unwrap();
+    let d0 = mw::drops();
+    mw::release_idle_now();
+    assert!(mw::is_cached());
+    assert_eq!(mw::drops(), d0);
+    assert!(mw::release());
+    assert!(!mw::is_cached());
+    assert!(held.witness(seal, true).unwrap() == first);
+
+    // Rebuilt on the next use, bit-equal.
+    let t = Instant::now();
+    let again = mw::witness(seal).unwrap();
+    eprintln!(
+        "W7-G1 rebuild + witness: {:.1} ms",
+        t.elapsed().as_secs_f64() * 1e3
+    );
+    assert!(mw::builds() > builds);
+    assert!(mw::is_cached());
+    assert!(again == first, "the rebuilt graph's witness differs");
+
+    // Fix round 1: a wrap still holding the old graph does not empty the cache of the new one
+    // (another wrap's prestart built it while this wrap proved).
+    let d0 = mw::drops();
+    assert!(mw::release_slot(Some(&held), 0).is_none());
+    assert!(mw::is_cached());
+    drop(held);
+    assert_eq!(
+        mw::drops(),
+        d0 + 1,
+        "the old graph is dropped by its last holder"
+    );
+
+    // Idle: the hook's mechanism drops it (and says how much it freed).
+    let d0 = mw::drops();
+    let freed = mw::release_idle_now();
+    assert_eq!(mw::drops(), d0 + 1);
+    eprintln!("W7-G1 release_idle freed {:.1} MiB", mib(freed));
+    assert!(!mw::is_cached());
+    let d1 = mw::drops();
+    mw::release_idle_now();
+    assert_eq!(mw::drops(), d1);
+    // The public hook (Metal enabled or not) never fails.
+    let _ = crate::prove::release_graph();
+}
+
+/// Item W7-G1 (fix round 1, PLAN 8.7): the drop counter the release tests assert on counts only
+/// graphs that were the process's cached graph, so tests that compile throw-away evaluators
+/// (`witness_with`, in [witness_evaluators_bit_equal], which runs in parallel without the lock)
+/// cannot move it.
+#[test]
+fn uncached_graphs_do_not_count_as_cached_drops() {
+    use super::super::metal_witness as mw;
+    let _lock = gpu_test_lock();
+    if component_dir().is_err() {
+        eprintln!("skipped: no risc0-groth16 component");
+        return;
+    }
+    let d0 = mw::drops();
+    let w = mw::witness_with(mw::Kind::Fast, 1, seal_words()).unwrap();
+    assert!(!w.is_empty());
+    assert_eq!(mw::drops(), d0, "a throw-away graph's drop was counted");
+}
+
+/// Item W7-G1 (fix round 1): the pressure-drain hook does not drop the graph when the drop cannot
+/// lower the footprint (libmalloc's large cache on and no explicit `RISC0_G16_GRAPH_RELEASE=1`):
+/// there a drop frees nothing and each rebuild leaves ~580 MiB more behind.
+#[test]
+fn release_hook_keeps_the_graph_with_the_large_cache_on() {
+    use super::super::metal_witness as mw;
+    let _lock = gpu_test_lock();
+    if component_dir().is_err() || mw::kind() == mw::Kind::Ref {
+        eprintln!("skipped: no risc0-groth16 component, or the ref evaluator");
+        return;
+    }
+    mw::clear_reservations();
+    mw::preload_for_wrap().unwrap();
+    assert!(mw::is_cached());
+    let d0 = mw::drops();
+    let freed = crate::prove::release_graph();
+    if mw::idle_release_allowed() {
+        eprintln!("large cache off or release forced: the hook drops the idle graph");
+        assert_eq!(mw::drops(), d0 + 1);
+        assert!(!mw::is_cached());
+    } else {
+        assert_eq!(freed, 0);
+        assert_eq!(
+            mw::drops(),
+            d0,
+            "the hook dropped the graph with the large cache on"
+        );
+        assert!(mw::is_cached());
+    }
+}
+
+/// Item W7-G1 fix round 2 (the round-2 review's finding): a pressure drain that fires while a wrap
+/// runs (here from `pre_gpu`, where the zkvm releases the STARK pools and where W7-A1's drain
+/// would fire) must not drop the wrap's graph: before the fix the hook freed ~950 MiB and the wrap
+/// rebuilt the graph synchronously (0.7-0.9 s, under the GPU lock on the in-place path). Uses the
+/// hook's mechanism ([release_idle_now]: the public hook is a no-op with the large cache on),
+/// three cycles, every proof verified.
+#[test]
+fn drain_during_a_wrap_keeps_its_graph() {
+    use super::super::metal_witness as mw;
+    let _lock = gpu_test_lock();
+    if !available() || mw::kind() == mw::Kind::Ref {
+        return;
+    }
+    for i in 0..3 {
+        mw::preload_for_wrap().unwrap();
+        let b0 = mw::builds();
+        let freed = std::cell::Cell::new(None);
+        let dir = tempfile::tempdir().unwrap();
+        let r = gpu_prove(
+            seal_words(),
+            &mut Some(|| freed.set(Some(mw::release_idle_now()))),
+            dir.path(),
+        );
+        let seal = match r {
+            Err(e) if refused_by_budget(&e) => return,
+            r => r.unwrap(),
+        };
+        check_proof(&seal, dir.path());
+        eprintln!(
+            "W7G1DRAIN cycle {i}: the drain in pre_gpu freed {:.1} MiB; builds {} -> {}",
+            mib(freed.get().unwrap_or(0)),
+            b0,
+            mw::builds()
+        );
+        assert_eq!(mw::wraps_in_progress(), 0);
+        assert_eq!(freed.get(), Some(0), "the drain in pre_gpu freed memory");
+        assert_eq!(
+            mw::builds(),
+            b0,
+            "the drain dropped the wrap's graph: the wrap rebuilt it synchronously"
+        );
+    }
+}
+
+/// Item W7-G1 fix round 2: what keeps the graph from a drain or a wrap's after-witness release
+/// besides a handle: a wrap in progress before its witness, another wrap still in progress (the
+/// last one out releases), and a prestart reservation until a wrap takes it.
+#[test]
+fn wraps_in_progress_and_reservations_keep_the_graph() {
+    use super::super::metal_witness as mw;
+    let _lock = gpu_test_lock();
+    if component_dir().is_err() || mw::kind() == mw::Kind::Ref {
+        eprintln!("skipped: no risc0-groth16 component, or the ref evaluator");
+        return;
+    }
+    assert_eq!(mw::wraps_in_progress(), 0);
+    mw::clear_reservations();
+    mw::preload_for_wrap().unwrap();
+    let d0 = mw::drops();
+    {
+        // A wrap in its pre_gpu (no handle yet): the drain leaves the graph.
+        let w1 = mw::WrapGuard::begin();
+        assert_eq!(mw::release_idle_now(), 0);
+        assert!(mw::is_cached());
+        // A second wrap in progress (on another thread: P31-G1, nested guards on one thread are
+        // one wrap): the first one's after-witness release (with or without its handle) leaves
+        // the cache to the last wrap out.
+        let (go, stop) = (
+            std::sync::mpsc::channel::<()>(),
+            std::sync::mpsc::channel::<()>(),
+        );
+        let (started, stop_rx) = (go.0, stop.1);
+        let other = std::thread::spawn(move || {
+            let _w2 = mw::WrapGuard::begin();
+            started.send(()).unwrap();
+            stop_rx.recv().unwrap();
+        });
+        go.1.recv().unwrap();
+        assert_eq!(mw::wraps_in_progress(), 2);
+        // A nested guard on this thread does not count as another wrap.
+        let nested = mw::WrapGuard::begin();
+        assert_eq!(mw::wraps_in_progress(), 2);
+        drop(nested);
+        let held = mw::wrap_graph().unwrap();
+        assert!(mw::release_slot(Some(&held), 1).is_none());
+        assert!(mw::release_slot(None, 1).is_none());
+        assert!(mw::is_cached());
+        stop.0.send(()).unwrap();
+        other.join().unwrap();
+        drop((held, w1));
+    }
+    assert_eq!(mw::wraps_in_progress(), 0);
+    // The next job's prestart reserved the graph: neither a drain nor a failed wrap's release
+    // (no handle) drops it, until a wrap takes the reservation and finishes.
+    mw::reserve_for_wrap();
+    assert_eq!(mw::release_idle_now(), 0);
+    assert!(mw::release_slot(None, 0).is_none());
+    assert!(mw::is_cached());
+    {
+        let _w = mw::WrapGuard::begin();
+        assert_eq!(mw::release_idle_now(), 0);
+        assert!(mw::is_cached());
+    }
+    assert_eq!(
+        mw::drops(),
+        d0,
+        "the graph was dropped while in use or reserved"
+    );
+    // Taken and finished: idle, the drain's mechanism drops it.
+    mw::release_idle_now();
+    assert!(!mw::is_cached());
+    assert_eq!(mw::drops(), d0 + 1);
+}
+
+/// Item P31-G1: [mw::Reservations] in isolation: owned per thread (a thread's next prestart
+/// replaces its untaken one), each lapses on its own (a later reservation does not renew an
+/// earlier one), a wrap takes its own thread's, else the newest.
+#[test]
+fn reservations_are_owned_and_lapse() {
+    use super::super::metal_witness::Reservations;
+    let ttl = Duration::from_secs(30);
+    let other = || {
+        std::thread::spawn(|| std::thread::current().id())
+            .join()
+            .unwrap()
+    };
+    let (me, a, b) = (std::thread::current().id(), other(), other());
+    let t0 = Instant::now();
+    let at = |s: u64| t0 + Duration::from_secs(s);
+
+    // The W7-G1 review-3 shape: a leaked reservation (a), then jobs on another thread (me) every
+    // 10 s, each reserving and wrapping. The leaked one lapses at 30 s although jobs keep coming.
+    let mut r = Reservations::new();
+    assert!(!r.reserve(a, at(0), ttl));
+    for k in 1..=6u64 {
+        assert!(!r.reserve(me, at(10 * k), ttl));
+        assert!(r.take(me, true, at(10 * k + 1), ttl));
+        let live = r.live(at(10 * k + 2), ttl);
+        assert_eq!(live, usize::from(10 * k + 2 < 30), "job {k}: {live} live");
+    }
+
+    // Owned: the same thread's second prestart replaces its first (its wrap never came).
+    let mut r = Reservations::new();
+    assert!(!r.reserve(me, at(0), ttl));
+    assert!(r.reserve(me, at(5), ttl));
+    assert_eq!(r.live(at(6), ttl), 1);
+    assert!(r.take(me, false, at(6), ttl));
+    assert_eq!(r.live(at(6), ttl), 0);
+
+    // A wrap on a thread without a reservation takes the newest only with `any`, so the older
+    // (leaked) one lapses on its own schedule.
+    let mut r = Reservations::new();
+    r.reserve(a, at(0), ttl);
+    r.reserve(b, at(20), ttl);
+    assert!(!r.take(me, false, at(21), ttl));
+    assert_eq!(r.next_lapse(at(21), ttl), Some(Duration::from_secs(9)));
+    assert!(r.take(me, true, at(21), ttl));
+    assert_eq!(r.live(at(21), ttl), 1);
+    assert_eq!(r.live(at(30), ttl), 0, "a's reservation outlived its ttl");
+    assert_eq!(r.next_lapse(at(30), ttl), None);
+    assert!(!r.take(me, true, at(31), ttl));
+}
+
+/// Item P31-G1 (the remaining W7-G1 defect, review 3): a prestart whose wrap never comes must not
+/// keep the after-wrap release off. Before, one leaked reservation plus a prestart every < 30 s kept
+/// the shared counter above 0 forever and the graph stayed cached after every wrap. Now: a thread's
+/// next prestart replaces its leaked reservation; one leaked on another thread lapses on its own,
+/// and then a helper releases the graph the blocked wrap left (short ttl here, 300 ms).
+#[test]
+fn missed_wrap_does_not_disable_release() {
+    use super::super::metal_witness as mw;
+    let _lock = gpu_test_lock();
+    if component_dir().is_err() || mw::kind() == mw::Kind::Ref {
+        eprintln!("skipped: no risc0-groth16 component, or the ref evaluator");
+        return;
+    }
+    struct Ttl;
+    impl Drop for Ttl {
+        fn drop(&mut self) {
+            mw::TEST_TTL_MS.store(0, Ordering::Relaxed);
+            mw::clear_reservations();
+        }
+    }
+    mw::clear_reservations();
+    mw::TEST_TTL_MS.store(300, Ordering::Relaxed);
+    let _ttl = Ttl;
+    mw::preload_for_wrap().unwrap();
+
+    // Same thread: job 1's prestart leaked (no wrap), job 2's prestart replaces it, job 2's wrap
+    // takes it, and its release goes through.
+    let s0 = mw::superseded_reservations();
+    mw::reserve_for_wrap();
+    mw::reserve_for_wrap();
+    assert_eq!(mw::superseded_reservations(), s0 + 1);
+    assert_eq!(mw::live_reservations(), 1);
+    {
+        let _w = mw::WrapGuard::begin();
+        assert_eq!(mw::live_reservations(), 0);
+        let held = mw::wrap_graph().unwrap();
+        assert!(
+            mw::release_slot(Some(&held), 1).is_some(),
+            "a leaked reservation of this thread kept the release off"
+        );
+    }
+    assert!(!mw::is_cached());
+
+    // Another thread's leaked reservation: this thread's jobs keep coming (each reserves and
+    // wraps); the first release is blocked, then the lapse helper releases the graph, and the
+    // later jobs release normally.
+    for job in 0..3 {
+        mw::preload_for_wrap().unwrap();
+        if job == 0 {
+            // Leaked after the build (which takes longer than the 300 ms ttl).
+            std::thread::spawn(mw::reserve_for_wrap).join().unwrap();
+        }
+        mw::reserve_for_wrap();
+        let released = {
+            let _w = mw::WrapGuard::begin();
+            let held = mw::wrap_graph().unwrap();
+            mw::release_slot(Some(&held), 1).is_some()
+        };
+        assert_eq!(released, job != 0, "job {job}: released at the wrap");
+        if !released {
+            assert!(mw::is_cached());
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        eprintln!("P31G1LEAK job {job}: released at the wrap {released}");
+        assert!(
+            !mw::is_cached(),
+            "job {job}: the graph stayed cached after the wrap (leaked reservation)"
+        );
+        assert_eq!(mw::live_reservations(), 0);
+    }
+
+    // A missed wrap's graph goes at this thread's next proof start (not after the 300 ms lapse).
+    mw::TEST_TTL_MS.store(5_000, Ordering::Relaxed);
+    mw::preload_for_wrap().unwrap();
+    mw::reserve_for_wrap();
+    assert!(mw::is_cached());
+    // Another thread's proof start does not touch this thread's reservation.
+    assert!(!std::thread::spawn(mw::proof_start).join().unwrap());
+    assert!(mw::is_cached());
+    assert!(mw::proof_start());
+    assert!(
+        !mw::is_cached(),
+        "the missed wrap's graph outlived the next proof start"
+    );
+    assert_eq!(mw::live_reservations(), 0);
+    assert!(!mw::proof_start());
+}
+
+/// Item P31-G1: the long-running miner: `P31G1_JOBS` (default 24) jobs in one process, each as the
+/// zkvm and the worker run it: `prestart_prover`, an identity_p254 stand-in (900 ms), the wrap
+/// through `shrink_wrap_with` (verified), then the worker's `release_srs` (the key between jobs;
+/// zk-miner `release_groth16_cache_if_tight`). Every 5th job's prestart has no wrap (identity_p254
+/// failed). After each job: the process footprint, the device allocation and whether the graph is
+/// cached. The footprint and the device allocation must not grow after the first jobs settle.
+/// Heavy: `cargo test --release --features metal --lib p31g1_long_run -- --ignored --nocapture
+/// --test-threads 1` under gpu-run, with `MallocLargeCache=0` (release on) or without.
+#[test]
+#[ignore]
+fn p31g1_long_run() {
+    use super::super::metal_witness as mw;
+    use risc0_groth16_sys::metal::{allocated_bytes, filemap::process_memory};
+    let _lock = gpu_test_lock();
+    if !available() {
+        return;
+    }
+    let jobs: usize = std::env::var("P31G1_JOBS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(24);
+    let settle_ms: u64 = std::env::var("P31G1_SETTLE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2000);
+    let (control_root, claim_digest, bn254_id) = fixture_meta();
+    let mut fps = Vec::new();
+    let mut allocs = Vec::new();
+    let mut wraps = 0;
+    let t_all = Instant::now();
+    eprintln!(
+        "P31G1RUN release_enabled={} kind={:?} start footprint {:.1} MiB",
+        mw::release_enabled(),
+        mw::kind(),
+        mib(process_memory().phys_footprint)
+    );
+    let mut starts = Vec::new();
+    for job in 0..jobs {
+        // The zkvm's prover constructor (proof start), then the STARK (not modelled: this
+        // checks the Groth16 side), then the wrap's prestart and identity_p254.
+        crate::prove::preload_graph_background();
+        std::thread::sleep(Duration::from_millis(200));
+        let f_start = process_memory().phys_footprint;
+        let cached_at_start = mw::is_cached();
+        starts.push(f_start);
+        crate::prove::prestart_prover().unwrap();
+        std::thread::sleep(Duration::from_millis(900));
+        let missed = job % 5 == 4;
+        let mut wrap_ms = 0.0;
+        if !missed {
+            let t = Instant::now();
+            let seal = match crate::prove::shrink_wrap_with(seal_words(), || {}) {
+                Err(e) if refused_by_budget(&e) => {
+                    eprintln!("P31G1RUN job {job}: refused by the budget: {e:#}");
+                    return;
+                }
+                r => r.unwrap(),
+            };
+            wrap_ms = t.elapsed().as_secs_f64() * 1e3;
+            Verifier::new(
+                &seal.to_vec(),
+                control_root,
+                claim_digest,
+                bn254_id,
+                &verifying_key(),
+            )
+            .unwrap()
+            .verify()
+            .expect("the long-run wrap does not verify");
+            wraps += 1;
+        }
+        crate::prove::release_srs().unwrap();
+        // Let the after-wrap release thread finish (it drops off the critical path).
+        std::thread::sleep(Duration::from_millis(200));
+        let f200 = process_memory().phys_footprint;
+        std::thread::sleep(Duration::from_millis(settle_ms));
+        let f = process_memory().phys_footprint;
+        let a = allocated_bytes();
+        eprintln!(
+            "P31G1RUN job {job}{}: at the start {:.1} MiB (graph cached {cached_at_start}); wrap \
+             {wrap_ms:.1} ms, footprint {:.1} MiB ({:.1} at 200 ms), device {:.1} MiB, graph \
+             cached {}, reservations {}",
+            if missed { " (missed wrap)" } else { "" },
+            mib(f_start),
+            mib(f),
+            mib(f200),
+            mib(a),
+            mw::is_cached(),
+            mw::live_reservations()
+        );
+        if !missed {
+            fps.push(f);
+        }
+        allocs.push(a);
+        // With the release on, the graph never outlives its job: not after a wrap, and a missed
+        // wrap's graph is gone at the next proof start.
+        if mw::release_enabled() {
+            assert!(
+                !cached_at_start,
+                "job {job}: the graph was cached at the proof start"
+            );
+            assert!(
+                missed || !mw::is_cached(),
+                "job {job}: the graph was cached after the wrap"
+            );
+        }
+    }
+    eprintln!(
+        "P31G1RUN {wraps} wraps in {jobs} jobs, {:.1} s",
+        t_all.elapsed().as_secs_f64()
+    );
+    // Settled after the first 3 jobs: the last third against jobs 3..6, within 128 MiB, after
+    // the wraps and at the proof starts.
+    let n = fps.len();
+    let settle = fps[3..6].iter().copied().max().unwrap();
+    let late = fps[n - n / 3..].iter().copied().max().unwrap();
+    let s_settle = starts[3..6].iter().copied().max().unwrap();
+    let s_late = starts[jobs - jobs / 3..].iter().copied().max().unwrap();
+    assert!(
+        s_late <= s_settle + (128 << 20),
+        "footprint at the proof start grew from {:.1} to {:.1} MiB",
+        mib(s_settle),
+        mib(s_late)
+    );
+    assert!(
+        late <= settle + (128 << 20),
+        "footprint grew from {:.1} to {:.1} MiB",
+        mib(settle),
+        mib(late)
+    );
+    let a_settle = allocs[3..6].iter().copied().max().unwrap();
+    let a_late = allocs[jobs - jobs / 3..].iter().copied().max().unwrap();
+    assert!(
+        a_late <= a_settle + (16 << 20),
+        "device allocation grew from {:.1} to {:.1} MiB",
+        mib(a_settle),
+        mib(a_late)
+    );
+}
+
+/// Item W7-G1 fix round 1 (the review's hook finding, kept as a check): five cycles of a wrap's
+/// prestart build, a verified wrap and the pressure-drain hook. The footprint before each hook
+/// call must not climb cycle over cycle (before the fix, with the large cache on, it rose ~580
+/// MiB per cycle: 4044 -> 6365 MiB). Heavy: `cargo test ... w7g1_hook_cycle -- --ignored
+/// --nocapture --test-threads 1` under gpu-run.
+#[test]
+#[ignore]
+fn w7g1_hook_cycle() {
+    use risc0_groth16_sys::metal::filemap::process_memory;
+    let _lock = gpu_test_lock();
+    if !available() {
+        return;
+    }
+    let mut before = Vec::new();
+    for i in 0..5 {
+        super::super::metal_witness::preload_for_wrap().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let seal = match gpu_prove(seal_words(), &mut Some(|| {}), dir.path()) {
+            Err(e) if refused_by_budget(&e) => return,
+            r => r.unwrap(),
+        };
+        check_proof(&seal, dir.path());
+        let f = process_memory().phys_footprint;
+        let freed = crate::prove::release_graph();
+        eprintln!(
+            "W7G1HOOK cycle {i}: footprint {:.1} MiB before the hook, freed {:.1} MiB",
+            mib(f),
+            mib(freed)
+        );
+        before.push(f);
+    }
+    // Cycles 1..4 against cycle 1 (cycle 0 is before the key's pools settle): within 256 MiB.
+    let growth = before[4].saturating_sub(before[1]);
+    assert!(
+        growth < 256 << 20,
+        "footprint grew {:.1} MiB over 3 hook cycles",
+        mib(growth)
+    );
+}
+
+/// Item W7-G1 measurement helper (not a check): the graph's share of the process footprint and
+/// its build times (first build, rebuild with the digest known), then the footprint after the
+/// release. `cargo test ... w7g1_graph_share -- --ignored --nocapture --test-threads 1`.
+#[test]
+#[ignore]
+fn w7g1_graph_share() {
+    use super::super::metal_witness as mw;
+    use risc0_groth16_sys::metal::filemap::process_memory;
+    let _lock = gpu_test_lock();
+    if component_dir().is_err() {
+        return;
+    }
+    let fp = || process_memory().phys_footprint;
+    let rounds: usize = std::env::var("W7G1_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    let pause: u64 = std::env::var("W7G1_PAUSE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let start = fp();
+    for round in 0..rounds {
+        std::thread::sleep(Duration::from_millis(pause));
+        let f0 = fp();
+        eprintln!(
+            "W7G1SHARE round {round}: footprint {:.1} MiB at the start (+{:.1} over the first)",
+            mib(f0),
+            mib(f0.saturating_sub(start))
+        );
+        let t = Instant::now();
+        mw::preload_for_wrap().unwrap();
+        let build_ms = t.elapsed().as_secs_f64() * 1e3;
+        let f1 = fp();
+        let t = Instant::now();
+        let w = mw::witness(seal_words()).unwrap();
+        let wit_ms = t.elapsed().as_secs_f64() * 1e3;
+        drop(w);
+        let f2 = fp();
+        let t = Instant::now();
+        let d0 = mw::drops();
+        mw::release();
+        let rel_ms = t.elapsed().as_secs_f64() * 1e3;
+        eprintln!(
+            "W7G1SHARE round {round}: graphs dropped by the release: {}",
+            mw::drops() - d0
+        );
+        let f3 = fp();
+        eprintln!(
+            "W7G1SHARE round {round} kind {:?}: build {build_ms:.1} ms, footprint +{:.1} MiB; \
+             witness {wit_ms:.1} ms, after it +{:.1} MiB; release {rel_ms:.1} ms, after it \
+             {:+.1} MiB vs before the build",
+            mw::kind(),
+            mib(f1.saturating_sub(f0)),
+            mib(f2.saturating_sub(f0)),
+            (f3 as f64 - f0 as f64) / (1u64 << 20) as f64
+        );
+    }
+}
+
 /// Item G13: the compiled evaluators (`par` with several thread counts, `fast`) give the same
 /// witness as the reference generator, element by element, for the fixture and a perturbed seal.
 #[test]

@@ -312,6 +312,36 @@ pub fn invalidate_cache_in(d: &Path) -> usize {
         .count()
 }
 
+/// The cache file name for `key`.
+fn cache_file_name(key: u64) -> String {
+    format!("coeffs_compact_metal_{key:016x}.bin")
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: delete the cache file between its write and its readback (another process's GC).
+    static DELETE_BEFORE_READBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Item W7-G1: superseded cache files are removed unless `RISC0_G16_METAL_COEFF_CACHE_GC=0`.
+fn gc_enabled() -> bool {
+    std::env::var("RISC0_G16_METAL_COEFF_CACHE_GC").as_deref() != Ok("0")
+}
+
+/// Item W7-G1: delete the cache files in `d` that older cache versions (`1..current`) made of
+/// the same original (`file`, `meta`), after the `current` version has loaded. Newer versions
+/// are kept (a revert knob, e.g. `RISC0_G16_METAL_COEFF_ORDER=natural` for version 1, must not
+/// delete what the default build uses), and so are other originals' files. A prover build that
+/// still uses an older version rebuilds its file when it runs (1-3 s, once). Returns the number
+/// of files removed.
+fn remove_superseded(d: &Path, file: &File, meta: &std::fs::Metadata, current: u32) -> usize {
+    (VERSION_NATURAL..current)
+        .filter_map(|v| source_key_v(file, meta, v).ok())
+        .map(|k| d.join(cache_file_name(k)))
+        .filter(|p| p.is_file() && std::fs::remove_file(p).is_ok())
+        .count()
+}
+
 /// The disk cache is on unless `RISC0_G16_METAL_COEFF_CACHE=0`.
 fn cache_enabled() -> bool {
     std::env::var("RISC0_G16_METAL_COEFF_CACHE").as_deref() != Ok("0")
@@ -396,8 +426,22 @@ impl CompactCoeffs {
             "\"{p}\": too many coefficients for the compact form"
         );
         let key = source_key(&file, &meta)?;
-        let cache_path = cache_dir.map(|d| d.join(format!("coeffs_compact_metal_{key:016x}.bin")));
+        let cache_path = cache_dir.map(|d| d.join(cache_file_name(key)));
         let verbose = std::env::var_os("RISC0_VERBOSE").is_some();
+        // Item W7-G1: once this version's cache is in place, the older versions' files of the
+        // same original are dead weight (324 MB each).
+        let gc = |cp: &Path| {
+            if let Some(d) = cache_dir.filter(|_| gc_enabled()) {
+                let removed = remove_superseded(d, &file, &meta, version());
+                if removed > 0 && verbose {
+                    eprintln!(
+                        "[groth16-metal] removed {removed} superseded compact coefficient cache \
+                         file(s) beside {}",
+                        cp.display()
+                    );
+                }
+            }
+        };
         let mut stats = CompactStats {
             cache_path: cache_path.clone(),
             ..Default::default()
@@ -419,6 +463,7 @@ impl CompactCoeffs {
                         stats.total = t0.elapsed();
                         stats.bytes = c.payload_bytes();
                         c.stats = stats;
+                        gc(cp);
                         return Ok(c);
                     }
                     Err(e) => {
@@ -446,8 +491,15 @@ impl CompactCoeffs {
             stats.write = t.elapsed();
             match written {
                 Ok(()) => {
+                    #[cfg(test)]
+                    if DELETE_BEFORE_READBACK.with(|d| d.get()) {
+                        let _ = std::fs::remove_file(cp);
+                    }
                     let t = Instant::now();
-                    let mut c = Self::from_cache(
+                    // Item W7-G1 (fix round 1): a readback failure (for example another
+                    // process's superseded-version GC deleting this file in between) falls back
+                    // to the buffers just built instead of failing the load.
+                    match Self::from_cache(
                         device,
                         cp,
                         key,
@@ -456,13 +508,25 @@ impl CompactCoeffs {
                         domain_size,
                         mapped,
                     )
-                    .with_context(|| format!("reading back {}", cp.display()))?;
-                    stats.load = t.elapsed();
-                    stats.source = CompactSource::Built;
-                    stats.total = t0.elapsed();
-                    stats.bytes = c.payload_bytes();
-                    c.stats = stats;
-                    return Ok(c);
+                    .with_context(|| format!("reading back {}", cp.display()))
+                    {
+                        Ok(mut c) => {
+                            stats.load = t.elapsed();
+                            stats.source = CompactSource::Built;
+                            stats.total = t0.elapsed();
+                            stats.bytes = c.payload_bytes();
+                            c.stats = stats;
+                            gc(cp);
+                            return Ok(c);
+                        }
+                        Err(e) => {
+                            if verbose {
+                                eprintln!(
+                                    "[groth16-metal] {e:#}; using the coefficients just built"
+                                );
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     if verbose {
@@ -673,9 +737,14 @@ fn u32s(b: &[u8]) -> Vec<u32> {
 
 /// The cache key of the original coefficients file (see the module docs).
 fn source_key(file: &File, meta: &std::fs::Metadata) -> Result<u64> {
+    source_key_v(file, meta, version())
+}
+
+/// [source_key] for cache format `version`.
+fn source_key_v(file: &File, meta: &std::fs::Metadata, version: u32) -> Result<u64> {
     let size = meta.len();
     let mut h = fnv1a(FNV_BASIS, TAG);
-    h = fnv1a(h, &version().to_le_bytes());
+    h = fnv1a(h, &version.to_le_bytes());
     h = fnv1a(h, &32u32.to_le_bytes());
     h = fnv1a(h, &48u32.to_le_bytes());
     let mut block = vec![0u8; 4096];
@@ -832,6 +901,40 @@ mod tests {
     };
     use metal::MTLResourceOptions;
 
+    /// Item W7-G1: loading version `current` removes the same original's older-version files and
+    /// nothing else (not newer versions, not other originals' files).
+    #[test]
+    fn superseded_cache_versions_are_removed() {
+        let d = temp_path("gc");
+        std::fs::create_dir_all(&d).unwrap();
+        let src = d.join("preprocessed_coeffs.bin");
+        std::fs::write(&src, (0..64 * 1024u32).map(|i| i as u8).collect::<Vec<_>>()).unwrap();
+        let file = File::open(&src).unwrap();
+        let meta = file.metadata().unwrap();
+        let at = |v: u32| d.join(cache_file_name(source_key_v(&file, &meta, v).unwrap()));
+        let (v1, v2) = (at(VERSION_NATURAL), at(VERSION_LEN_ORDER));
+        assert_ne!(v1, v2);
+        let other = d.join(cache_file_name(0x0123_4567_89ab_cdef));
+        for p in [&v1, &v2, &other] {
+            std::fs::write(p, b"cache").unwrap();
+        }
+        // Version 1 current (the revert knob): the newer version-2 file stays.
+        assert_eq!(remove_superseded(&d, &file, &meta, VERSION_NATURAL), 0);
+        assert!(v1.is_file() && v2.is_file() && other.is_file());
+        // Version 2 current: version 1 of this original goes, the rest stays.
+        assert_eq!(remove_superseded(&d, &file, &meta, VERSION_LEN_ORDER), 1);
+        assert!(!v1.exists() && v2.is_file() && other.is_file());
+        assert_eq!(remove_superseded(&d, &file, &meta, VERSION_LEN_ORDER), 0);
+        // The key is the version's: the current key is the version-2 one.
+        if len_order() {
+            assert_eq!(
+                source_key(&file, &meta).unwrap(),
+                source_key_v(&file, &meta, 2).unwrap()
+            );
+        }
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
     /// Runs the full and the compact witness_into_poly for A and B over a random witness;
     /// returns (full out, compact out, fault words).
     fn both_outputs(
@@ -911,6 +1014,32 @@ mod tests {
             read(&out_cmp, zeros.len()),
             [read(&f0, 4)[0] as u32, read(&f1, 4)[0] as u32],
         )
+    }
+
+    /// Item W7-G1 (fix round 1): the cache file vanishing between its write and its readback
+    /// (another process's superseded-version GC) does not fail the load: the coefficients just
+    /// built are used.
+    #[test]
+    fn readback_failure_uses_the_built_coefficients() {
+        let _lock = crate::metal::test_lock::shared();
+        let dev = kernels().unwrap().device.clone();
+        let (wn, n) = (40usize, 16usize);
+        let (bytes, _, _) = synthetic(&[(0, 3), (2, 1), (7, 5)], &[(1, 2), (3, 1)], wn as u32);
+        let src = temp_path("compact_readback_src.bin");
+        std::fs::write(&src, &bytes).unwrap();
+        let dir = temp_path("compact_readback_cache");
+        std::fs::create_dir_all(&dir).unwrap();
+        let full = Coeffs::load(&dev, &src).unwrap();
+        DELETE_BEFORE_READBACK.with(|d| d.set(true));
+        let c = CompactCoeffs::load_in(&dev, &src, wn, n, true, Some(&dir));
+        DELETE_BEFORE_READBACK.with(|d| d.set(false));
+        let c = c.expect("a readback failure must fall back to the built coefficients");
+        assert_eq!(c.stats.source, CompactSource::BuiltUncached);
+        let (a, b, faults) = both_outputs(&full, &c, wn, n);
+        assert_eq!(faults, [0, 0]);
+        assert_eq!(a, b, "compact != full");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&src);
     }
 
     #[test]

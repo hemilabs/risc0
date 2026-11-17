@@ -38,7 +38,7 @@ use std::{
     io::{BufWriter, Write},
     path::PathBuf,
     process::{Child, Command, Stdio},
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -99,7 +99,14 @@ fn to_u(x: &Fr) -> U254 {
     U254::from_limbs(x.into_bigint().0)
 }
 
-static PROGRAM: OnceLock<std::result::Result<Program, String>> = OnceLock::new();
+/// The built program (item W7-G1: releasable, see [release]). A failed first build is remembered
+/// for the life of the process (as the `OnceLock` before it did); a failed rebuild after a
+/// release is not (fix round 2, as `metal_witness`'s graph): that call fails, the next one tries
+/// again.
+static PROGRAM: Mutex<Option<Arc<Program>>> = Mutex::new(None);
+static PROGRAM_BUILD: Mutex<()> = Mutex::new(());
+static PROGRAM_FAILED: OnceLock<String> = OnceLock::new();
+static PROGRAM_BUILT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub(crate) fn graph_path() -> Result<PathBuf> {
     Ok(super::component::component_dir()?.join("stark_verify_graph.bin"))
@@ -123,8 +130,52 @@ pub(crate) fn check_graph_digest(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Read the witness graph, check its digest (in parallel with the parse when `overlap`) and
-/// parse it. Returns the parsed graph and the read / parse times.
+/// Item W7-G1: the identity of the graph file whose digest this process has checked (device,
+/// inode, size, modification and status-change times, from `fstat` of the file that was read).
+/// A releasable graph is rebuilt for every wrap on small Macs; the SHA-256 (~0.5 s in `sha2`,
+/// the longest leg of a build) is then skipped while the file is unchanged.
+/// `RISC0_G16_GRAPH_REVERIFY=1` checks it on every build.
+static VERIFIED: Mutex<Option<[i64; 7]>> = Mutex::new(None);
+
+#[cfg(unix)]
+fn file_id(meta: &std::fs::Metadata) -> [i64; 7] {
+    use std::os::unix::fs::MetadataExt as _;
+    [
+        meta.dev() as i64,
+        meta.ino() as i64,
+        meta.size() as i64,
+        meta.mtime(),
+        meta.mtime_nsec(),
+        meta.ctime(),
+        meta.ctime_nsec(),
+    ]
+}
+
+/// Elsewhere (Intel builds on Windows): size and modification time.
+#[cfg(not(unix))]
+fn file_id(meta: &std::fs::Metadata) -> [i64; 7] {
+    let m = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+    [
+        meta.len() as i64,
+        m.map_or(0, |d| d.as_secs() as i64),
+        m.map_or(0, |d| d.subsec_nanos() as i64),
+        0,
+        0,
+        0,
+        0,
+    ]
+}
+
+fn reverify() -> bool {
+    std::env::var("RISC0_G16_GRAPH_REVERIFY").as_deref() == Ok("1")
+}
+
+/// Read the witness graph, check its digest (in parallel with the parse when `overlap`; skipped
+/// when this process already checked the unchanged file, see [VERIFIED]) and parse it. Returns
+/// the parsed graph and the read / parse times.
 #[allow(clippy::type_complexity)]
 pub(crate) fn read_graph(
     overlap: bool,
@@ -135,13 +186,24 @@ pub(crate) fn read_graph(
     [std::time::Duration; 2],
 )> {
     let t0 = std::time::Instant::now();
-    let bytes = std::fs::read(graph_path()?).context("failed to read the witness graph")?;
+    let (bytes, id) = {
+        use std::io::Read as _;
+        let mut f = File::open(graph_path()?).context("failed to open the witness graph")?;
+        let meta = f.metadata().context("failed to stat the witness graph")?;
+        let mut bytes = Vec::with_capacity(meta.len() as usize);
+        f.read_to_end(&mut bytes)
+            .context("failed to read the witness graph")?;
+        (bytes, file_id(&meta))
+    };
     let t_read = t0.elapsed();
+    let known = !reverify() && *VERIFIED.lock().unwrap_or_else(|e| e.into_inner()) == Some(id);
     let parse = |bytes: &[u8]| {
         deserialize_witnesscalc_graph_from_bytes(bytes)
             .map_err(|e| anyhow!("failed to parse the witness graph: {e:?}"))
     };
-    let parsed = if overlap {
+    let parsed = if known {
+        parse(&bytes)?
+    } else if overlap {
         std::thread::scope(|sc| {
             let digest = sc.spawn(|| check_graph_digest(&bytes));
             let parsed = parse(&bytes);
@@ -154,6 +216,9 @@ pub(crate) fn read_graph(
         check_graph_digest(&bytes)?;
         parse(&bytes)?
     };
+    if !known {
+        *VERIFIED.lock().unwrap_or_else(|e| e.into_inner()) = Some(id);
+    }
     let (nodes, signals, input_mapping) = parsed;
     Ok((
         nodes,
@@ -259,11 +324,54 @@ fn build_program() -> Result<Program> {
     })
 }
 
-fn program() -> Result<&'static Program> {
+fn program() -> Result<Arc<Program>> {
+    if let Some(e) = PROGRAM_FAILED.get() {
+        return Err(anyhow!("{e}"));
+    }
+    if let Some(p) = PROGRAM.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        return Ok(p);
+    }
+    let _build = PROGRAM_BUILD.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(p) = PROGRAM.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        return Ok(p);
+    }
+    if let Some(e) = PROGRAM_FAILED.get() {
+        return Err(anyhow!("{e}"));
+    }
+    match build_program() {
+        Ok(p) => {
+            let p = Arc::new(p);
+            *PROGRAM.lock().unwrap_or_else(|e| e.into_inner()) = Some(p.clone());
+            PROGRAM_BUILT.store(true, std::sync::atomic::Ordering::Relaxed);
+            Ok(p)
+        }
+        Err(e) if PROGRAM_BUILT.load(std::sync::atomic::Ordering::Relaxed) => {
+            Err(e.context("witness program rebuild after a release failed"))
+        }
+        Err(e) => {
+            let e = PROGRAM_FAILED.get_or_init(|| format!("{e:#}"));
+            Err(anyhow!("{e}"))
+        }
+    }
+}
+
+/// Item W7-G1: drop the built program (the next use rebuilds it from the file; its digest is
+/// remembered). A caller still using it keeps it alive until it is done. Returns whether one was
+/// cached.
+#[cfg_attr(not(feature = "metal"), allow(dead_code))]
+pub(crate) fn release() -> bool {
+    let p = PROGRAM.lock().unwrap_or_else(|e| e.into_inner()).take();
+    p.is_some()
+}
+
+/// Whether a program is cached and nobody else holds it (what [release] may free at once).
+#[cfg_attr(not(feature = "metal"), allow(dead_code))]
+pub(crate) fn idle_cached() -> bool {
     PROGRAM
-        .get_or_init(|| build_program().map_err(|e| format!("{e:#}")))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
         .as_ref()
-        .map_err(|e| anyhow!("{e}"))
+        .is_some_and(|p| Arc::strong_count(p) == 1)
 }
 
 /// Read, check and precompile the witness graph (~1 s); call early on a
@@ -305,7 +413,7 @@ pub(crate) fn seal_inputs(seal_bytes: &[u8]) -> Result<Vec<U254>> {
 /// elements (the GPU prover's input).
 pub(crate) fn witness(seal_bytes: &[u8]) -> Result<Vec<wtns_file::FieldElement<32>>> {
     let prog = program()?;
-    witness_elements(prog, &seal_inputs(seal_bytes)?)
+    witness_elements(&prog, &seal_inputs(seal_bytes)?)
 }
 
 /// Evaluate the witness and write it in .wtns format to `out`.
@@ -467,7 +575,7 @@ pub(crate) fn shrink_wrap(seal_bytes: &[u8]) -> Result<Seal> {
     let inputs = seal_inputs(seal_bytes)?;
     {
         let fifo = prover.fifo.take().unwrap();
-        write_witness(prog, &inputs, BufWriter::with_capacity(1 << 20, fifo))?;
+        write_witness(&prog, &inputs, BufWriter::with_capacity(1 << 20, fifo))?;
     }
     let t_wit = t0.elapsed();
     let output = prover
