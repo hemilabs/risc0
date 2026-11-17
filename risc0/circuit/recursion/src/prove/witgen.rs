@@ -197,18 +197,34 @@ fn host_chain_min_len() -> usize {
     *N
 }
 
+/// A 256-bit ZK-noise seed ([with_noise_seed32]). B9-SEC: the seal check
+/// (`RISC0_METAL_REC_SEAL_CHECK`) returns the receipt it proved under such a seed, so the seed is
+/// as wide as a ChaCha key and comes from the OS ([os_noise_seed]); the zero knowledge of that
+/// receipt then rests on 256 bits of OS entropy, as the stock prover's (`rand::rng()`, an
+/// OS-seeded ChaCha) does, not on a 64-bit value.
+pub(crate) type NoiseSeed = [u8; 32];
+
+/// Domain of the per-stream key derivation ([seeded_noise_rng]).
+const NOISE_STREAM_DOMAIN: &[u8] = b"risc0-circuit-recursion/zk-noise/stream/v1";
+/// Domain of the test-only expansion of a `u64` seed ([noise_seed_from_u64]). Different from
+/// [NOISE_STREAM_DOMAIN], so a `u64`-derived seed is never a stream key.
+#[cfg(test)]
+const NOISE_TEST_U64_DOMAIN: &[u8] = b"risc0-circuit-recursion/zk-noise/test-u64-seed/v1";
+
 thread_local! {
-    /// Test / validation hook ([with_noise_seed]): when set, the ZK noise of the witness and
-    /// accum tails comes from a `StdRng` seeded with it instead of `rand::rng()`, so two provers
-    /// (CPU and Metal) given the same input produce bit-identical seals.
-    static NOISE_SEED: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    /// Validation hook ([with_noise_seed32]): when set, the ZK noise of the witness and accum
+    /// tails comes from a `StdRng` keyed from it ([seeded_noise_rng]) instead of `rand::rng()`,
+    /// so two provers (CPU and Metal) given the same input produce bit-identical seals.
+    static NOISE_SEED: std::cell::Cell<Option<NoiseSeed>> = const { std::cell::Cell::new(None) };
 }
 
-/// Run `f` with deterministic ZK noise on this thread (seed `seed`); restores the previous state.
-/// Only for seal-equality validation: deterministic noise removes zero knowledge.
+/// Run `f` with deterministic ZK noise on this thread (256-bit seed `seed`); restores the
+/// previous state. Only for seal-equality validation (the Metal seal check with an
+/// [os_noise_seed], and tests). The noise is a deterministic function of `seed`: a receipt proved
+/// here is zero knowledge only if `seed` is secret and uniformly random.
 #[allow(dead_code)] // used by the Metal seal check and tests
-pub(crate) fn with_noise_seed<R>(seed: u64, f: impl FnOnce() -> R) -> R {
-    struct Restore(Option<u64>);
+pub(crate) fn with_noise_seed32<R>(seed: NoiseSeed, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<NoiseSeed>);
     impl Drop for Restore {
         fn drop(&mut self) {
             NOISE_SEED.with(|s| s.set(self.0));
@@ -218,27 +234,69 @@ pub(crate) fn with_noise_seed<R>(seed: u64, f: impl FnOnce() -> R) -> R {
     f()
 }
 
-/// The seed set by [with_noise_seed] on this thread, if any.
-fn noise_seed() -> Option<u64> {
+/// Tests: [with_noise_seed32] with a short seed, expanded by [noise_seed_from_u64]. Test-only on
+/// purpose (B9-SEC): no proving path can key the noise from 64 bits.
+#[cfg(test)]
+#[allow(dead_code)] // used by the Metal tests
+pub(crate) fn with_noise_seed<R>(seed: u64, f: impl FnOnce() -> R) -> R {
+    with_noise_seed32(noise_seed_from_u64(seed), f)
+}
+
+/// Tests: the 256-bit seed of a `u64` test seed, `SHA-256(NOISE_TEST_U64_DOMAIN || seed_le)`.
+#[cfg(test)]
+pub(crate) fn noise_seed_from_u64(seed: u64) -> NoiseSeed {
+    use sha2::Digest as _;
+    let mut h = sha2::Sha256::new();
+    h.update(NOISE_TEST_U64_DOMAIN);
+    h.update(seed.to_le_bytes());
+    h.finalize().into()
+}
+
+/// A fresh 256-bit noise seed from the OS (`getrandom` via `rand::rngs::OsRng`).
+#[allow(dead_code)] // used by the Metal seal check
+pub(crate) fn os_noise_seed() -> Result<NoiseSeed> {
+    use rand::TryRngCore as _;
+    let mut seed = NoiseSeed::default();
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut seed)
+        .map_err(|e| anyhow::anyhow!("ZK noise seed from the OS: {e}"))?;
+    Ok(seed)
+}
+
+/// The seed set by [with_noise_seed32] on this thread, if any.
+fn noise_seed() -> Option<NoiseSeed> {
     NOISE_SEED.with(|s| s.get())
 }
 
-/// The seeded noise stream `stream` (1 = data, 2 = accum) under [with_noise_seed].
-fn seeded_noise_rng(seed: u64, stream: u64) -> rand::rngs::StdRng {
+/// The ChaCha key of noise stream `stream` (1 = data, 2 = accum) under `seed`:
+/// `SHA-256(NOISE_STREAM_DOMAIN || seed || stream_le)`. Every one of the 256 seed bits and the
+/// stream index go into the key; distinct streams get unrelated keys.
+pub(crate) fn noise_stream_key(seed: &NoiseSeed, stream: u64) -> [u8; 32] {
+    use sha2::Digest as _;
+    let mut h = sha2::Sha256::new();
+    h.update(NOISE_STREAM_DOMAIN);
+    h.update(seed);
+    h.update(stream.to_le_bytes());
+    h.finalize().into()
+}
+
+/// The seeded noise stream `stream` under [with_noise_seed32]: `StdRng` (ChaCha12) keyed with
+/// [noise_stream_key].
+pub(crate) fn seeded_noise_rng(seed: &NoiseSeed, stream: u64) -> rand::rngs::StdRng {
     use rand::SeedableRng as _;
-    rand::rngs::StdRng::seed_from_u64(seed ^ stream.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+    rand::rngs::StdRng::from_seed(noise_stream_key(seed, stream))
 }
 
 /// The ZK noise of one fill: `n` independent `BabyBearElem::random` draws, in order (3.1 security
 /// fix `f68f86020`: one fresh value per noise cell, never a repeated value). The RNG is the
-/// stock prover's `rand::rng()` (the drawing thread's CSPRNG), or under [with_noise_seed]
+/// stock prover's `rand::rng()` (the drawing thread's CSPRNG), or under [with_noise_seed32]
 /// (`seed`) a `StdRng` for `stream`, so CPU and Metal provers given the same seed agree.
-pub(crate) fn draw_noise(seed: Option<u64>, stream: u64, n: usize) -> Vec<BabyBearElem> {
+pub(crate) fn draw_noise(seed: Option<NoiseSeed>, stream: u64, n: usize) -> Vec<BabyBearElem> {
     fn draw(rng: &mut impl rand::RngCore, n: usize) -> Vec<BabyBearElem> {
         (0..n).map(|_| BabyBearElem::random(rng)).collect()
     }
     match seed {
-        Some(seed) => draw(&mut seeded_noise_rng(seed, stream), n),
+        Some(seed) => draw(&mut seeded_noise_rng(&seed, stream), n),
         None => draw(&mut rand::rng(), n),
     }
 }
@@ -665,7 +723,7 @@ where
             use risc0_zkp::ZK_CYCLES;
             // 3.1 security fix (f68f86020): an independent random value per noise cell, in every
             // mode (the generic passes and the HAL row passes alike; nothing fills the tail with
-            // one repeated value). `draw_noise` keeps the seeded test hook ([with_noise_seed]).
+            // one repeated value). `draw_noise` keeps the seal-check hook ([with_noise_seed32]).
             let data_noise = match early_noise.and_then(EarlyNoise::join) {
                 Some((data_noise, a)) => {
                     EARLY_NOISE_USED.fetch_add(1, Ordering::Relaxed);
