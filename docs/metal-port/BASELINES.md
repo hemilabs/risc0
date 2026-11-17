@@ -1481,7 +1481,7 @@ as in wave 7. 16 GB without the figure: po2 19, 10.16 s; 24 GB: po2 20, 8.39 s.
   of headroom. Needs >= 5 MiB more room on the risc0 Groth16 side.
 - `--benchmark` exits 0 when a program's Groth16 wrap fails (`fit4g/*.log`: "Groth16 wrap failed" and rc=0).
   A script that checks only the exit status misses the failure.
-- **Security review finding (recorded, not fixed by this baseline):** the opt-in validation knob
+- **Security review finding (FIXED by B9-SEC, merge abea7c97c; see `notes/B9-SEC.md`):** the opt-in validation knob
   `RISC0_METAL_REC_SEAL_CHECK=1` (`recursion/src/prove/hal/metal/mod.rs`, `prove_seal_checked`, reachable in
   release builds) returns the Metal recursion receipt, and that receipt's ZK noise comes from a single 64-bit
   `rand::random()` seed expanded by `StdRng::seed_from_u64`. Stock 3.1 draws each cell from the OS-seeded
@@ -1489,5 +1489,9 @@ as in wave 7. 16 GB without the figure: po2 19, 10.16 s; 24 GB: po2 20, 8.39 s.
   and row-pass paths are unaffected (`p31_09_noise_rows_independent_*`). Fix: a 256-bit seed with domain-separated
   per-stream derivation, or return an unseeded re-proof, or refuse the knob outside test / debug builds; document
   it as a validation-only knob. Owner: the recursion item (P31-09 follow-up).
+  Resolution (B9-SEC): the seal check now draws a 32-byte OS seed per proof (`os_noise_seed`), each noise
+  stream is ChaCha12 keyed by domain-separated SHA-256(domain || seed || stream), the u64 seed helper is
+  `cfg(test)` only, and the knob is documented as validation-only. Default path unchanged; performance no change
+  (interleaved A/B in the note). Receipts made with the knob on verify with the stock 3.1.0 verifier.
 - Not measured here: the IPC worker path, 8-10 and 16-20-core parts, a real 16 GB Mac, CPU prover baselines,
   W7-T1 / W7-G1 (not merged into 3.0 or 3.1).
