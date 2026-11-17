@@ -24,8 +24,8 @@
 //! split). NTT, Merkle hashing and FRI run through the zkp Metal HAL, for every hash suite:
 //! `poseidon_254` (identity_p254) uses the zkp `MetalHashPoseidon254` since Z10
 //! (`RISC0_METAL_REC_P254=cpu` reverts it to the CPU prover). `RISC0_METAL_REC_SEAL_CHECK=1`
-//! re-proves every proof on the CPU with the same deterministic noise and requires identical
-//! seals (C9 validation knob).
+//! re-proves every proof on the CPU with the same noise (keyed from a 256-bit OS seed, B9-SEC)
+//! and requires identical seals (C9 validation knob, not a production setting).
 //!
 //! PSOs: the base kernels (C1's hand-written ones and C2's four step wrappers) are built once per
 //! process on first use; the eval_check PSOs are built lazily for the variant
@@ -77,9 +77,11 @@ use risc0_zkp::{
     },
 };
 
+#[cfg(test)]
+use crate::prove::witgen::with_noise_seed;
 use crate::prove::{
-    witgen::with_noise_seed, Preflight, Program, RecursionProver, RecursionProverImpl,
-    RecursionReceipt,
+    witgen::{os_noise_seed, with_noise_seed32},
+    Preflight, Program, RecursionProver, RecursionProverImpl, RecursionReceipt,
 };
 
 /// Environment variable selecting the eval_check kernels: `rg` (the Metal-only regrouped split in
@@ -847,13 +849,24 @@ pub(crate) fn warmup() -> Result<()> {
 }
 
 /// Environment variable: `1` makes every Metal recursion proof (poseidon2, sha-256) a validation
-/// run (C9): the proof is made with deterministic ZK noise, then re-proved by the CPU prover with
-/// the same noise, and the two seals must be bit-identical (else the proof fails). Doubles the
-/// cost of a proof and removes zero knowledge: never set it in production.
+/// run (C9): the proof is made with ZK noise keyed from a fresh 256-bit OS seed, then re-proved
+/// by the CPU prover with the same noise, and the two seals must be bit-identical (else the proof
+/// fails). The Metal receipt is returned.
+///
+/// Validation knob only: it doubles the cost of a proof. B9-SEC: its receipts stay zero
+/// knowledge. The seed comes from the OS ([os_noise_seed], 256 bits), each noise stream is a
+/// ChaCha12 keyed with a domain-separated SHA-256 of (seed, stream), and the seed never leaves
+/// [prove_seal_checked]; before B9-SEC it was a 64-bit `rand::random()` value.
 pub(crate) const SEAL_CHECK_ENV: &str = "RISC0_METAL_REC_SEAL_CHECK";
 
 /// Seal checks passed so far (tests).
 pub(crate) static SEAL_CHECKS_OK: AtomicUsize = AtomicUsize::new(0);
+
+/// The noise seed of the last [prove_seal_checked] on any thread (tests only: B9-SEC checks that
+/// the returned receipt is the function of this 256-bit seed and of no 64-bit one).
+#[cfg(test)]
+pub(crate) static LAST_SEAL_CHECK_SEED: std::sync::Mutex<Option<crate::prove::witgen::NoiseSeed>> =
+    std::sync::Mutex::new(None);
 
 /// Serializes the tests that set or assert process-wide prover state (the seal-check and
 /// phase counters, the host chain check switch). Poison-tolerant, so one failing test does
@@ -951,8 +964,9 @@ fn clone_preflight(p: &Preflight) -> Preflight {
     c
 }
 
-/// Prove with `metal` and then with `cpu`, both under the same deterministic noise seed, and
-/// require bit-identical seals and outputs ([SEAL_CHECK_ENV]).
+/// Prove with `metal` and then with `cpu`, both under the same fresh 256-bit OS noise seed
+/// ([os_noise_seed], [with_noise_seed32]), and require bit-identical seals and outputs
+/// ([SEAL_CHECK_ENV]). Returns the Metal receipt.
 pub(crate) fn prove_seal_checked(
     metal: &dyn RecursionProver,
     cpu: &dyn RecursionProver,
@@ -960,15 +974,21 @@ pub(crate) fn prove_seal_checked(
     input: std::collections::VecDeque<u32>,
     preflight: Option<Preflight>,
 ) -> Result<RecursionReceipt> {
-    let seed: u64 = rand::random();
+    let seed = os_noise_seed()?;
+    #[cfg(test)]
+    {
+        *LAST_SEAL_CHECK_SEED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(seed);
+    }
     let cpu_preflight = preflight.as_ref().map(clone_preflight);
     let t0 = std::time::Instant::now();
-    let m = with_noise_seed(seed, || {
+    let m = with_noise_seed32(seed, || {
         metal.prove_shared(program, input.clone(), preflight)
     })?;
     let metal_s = t0.elapsed().as_secs_f64();
     let t0 = std::time::Instant::now();
-    let c = with_noise_seed(seed, || cpu.prove_shared(program, input, cpu_preflight))?;
+    let c = with_noise_seed32(seed, || cpu.prove_shared(program, input, cpu_preflight))?;
     let cpu_s = t0.elapsed().as_secs_f64();
     if let Some(i) = first_diff(&m.output, &c.output) {
         bail!("{SEAL_CHECK_ENV}: output differs from the CPU prover at word {i}");

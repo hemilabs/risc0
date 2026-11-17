@@ -14,8 +14,9 @@
 
 //! C9 integration tests of the recursion Metal HAL (PLAN 4.3 row C9): the translators' `--check`
 //! round trips, a metallib smoke test, bit-identical seals against the CPU prover (deterministic
-//! ZK noise, [with_noise_seed]), identity_p254 through the CPU fallback with the host-chain check
-//! on, and the CPU HAL witgen leaving the caller's trace untouched. The per-phase equivalence and
+//! ZK noise, [with_noise_seed]), the 256-bit seal-check noise seed (B9-SEC), identity_p254
+//! through the CPU fallback with the host-chain check on, and the CPU HAL witgen leaving the
+//! caller's trace untouched. The per-phase equivalence and
 //! fault-path tests live with their phases (`c6_tests`, `c7_tests`, `c8_tests`).
 
 use std::{
@@ -226,6 +227,108 @@ fn seal_check_detects_a_difference() {
     let cpu = Reseeded(crate::prove::hal::cpu::recursion_prover("poseidon2").unwrap());
     let err = prove_seal_checked(metal.as_ref(), &cpu, &program, test_input(), None).unwrap_err();
     assert!(format!("{err:#}").contains("seal differs"), "{err:#}");
+}
+
+/// B9-SEC (host only): each noise stream's ChaCha key depends on every one of the 256 seed bits
+/// and on the stream, so no 64-bit value selects the noise of a seeded proof. Before B9-SEC the
+/// key was `seed_from_u64(seed ^ stream * K)` of a 64-bit seed.
+#[test]
+fn b9_sec_noise_key_uses_every_seed_bit() {
+    use crate::prove::witgen::{noise_seed_from_u64, noise_stream_key, seeded_noise_rng};
+    use rand::RngCore as _;
+    let seed = crate::prove::witgen::os_noise_seed().unwrap();
+    assert_ne!(
+        seed,
+        crate::prove::witgen::os_noise_seed().unwrap(),
+        "fresh OS seeds"
+    );
+    for stream in [1u64, 2] {
+        let key = noise_stream_key(&seed, stream);
+        let first = seeded_noise_rng(&seed, stream).next_u64();
+        for bit in 0..256 {
+            let mut s = seed;
+            s[bit / 8] ^= 1 << (bit % 8);
+            assert_ne!(
+                noise_stream_key(&s, stream),
+                key,
+                "stream {stream}, seed bit {bit}"
+            );
+            assert_ne!(
+                seeded_noise_rng(&s, stream).next_u64(),
+                first,
+                "stream {stream}, bit {bit}"
+            );
+        }
+    }
+    assert_ne!(noise_stream_key(&seed, 1), noise_stream_key(&seed, 2));
+    // The test expansion of a u64 is domain separated from the stream keys.
+    assert_ne!(noise_seed_from_u64(7), noise_seed_from_u64(8));
+    assert_ne!(
+        noise_stream_key(&noise_seed_from_u64(7), 1),
+        noise_seed_from_u64(7)
+    );
+}
+
+/// B9-SEC: the receipt `RISC0_METAL_REC_SEAL_CHECK` returns (Metal, checked against the CPU) has
+/// ZK noise that is a function of a fresh 256-bit OS seed and of no 64-bit value: the CPU re-proof
+/// under that seed reproduces its seal; flipping one seed bit outside the first 64 changes it; the
+/// seed's low 64 bits used as a `u64` test seed do not reproduce it; two seal checks use
+/// different seeds and give different seals. (The noise of a receipt is not reproducible from
+/// any u64 because the 192 high seed bits, each of which changes the key
+/// ([b9_sec_noise_key_uses_every_seed_bit]), are OS entropy no u64 path can set: `with_noise_seed`
+/// is test-only and hashes its u64 under a separate domain.)
+#[test]
+fn b9_sec_seal_checked_receipt_noise_is_256_bit() {
+    let _heavy = crate::prove::hal::metal::heavy_test_lock();
+    let _guard = crate::prove::hal::metal::global_state_test_lock();
+    let program = get_zkr("test_recursion_circuit.zkr", 16).unwrap();
+    let metal = metal_recursion_prover("poseidon2").unwrap();
+    let cpu = crate::prove::hal::cpu::recursion_prover("poseidon2").unwrap();
+    let last_seed = || {
+        LAST_SEAL_CHECK_SEED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("prove_seal_checked records its seed")
+    };
+    let r1 =
+        prove_seal_checked(metal.as_ref(), cpu.as_ref(), &program, test_input(), None).unwrap();
+    let s1 = last_seed();
+    let r2 =
+        prove_seal_checked(metal.as_ref(), cpu.as_ref(), &program, test_input(), None).unwrap();
+    let s2 = last_seed();
+    assert_ne!(s1, s2, "each seal check draws a fresh seed");
+    assert_ne!(r1.seal, r2.seal, "each seal check has fresh noise");
+    assert!(
+        s1[8..].iter().any(|&b| b != 0),
+        "seed bits above 64 are OS entropy"
+    );
+    let reprove = |seed: crate::prove::witgen::NoiseSeed| {
+        with_noise_seed32(seed, || cpu.prove(&program, test_input(), None))
+            .unwrap()
+            .seal
+    };
+    assert_eq!(
+        reprove(s1),
+        r1.seal,
+        "the receipt is the function of its 256-bit seed"
+    );
+    for bit in [64usize, 128, 255] {
+        let mut s = s1;
+        s[bit / 8] ^= 1 << (bit % 8);
+        assert_ne!(reprove(s), r1.seal, "seed bit {bit} changes the noise");
+    }
+    let lo = u64::from_le_bytes(s1[..8].try_into().unwrap());
+    let u = with_noise_seed(lo, || cpu.prove(&program, test_input(), None)).unwrap();
+    assert_ne!(
+        u.seal, r1.seal,
+        "the seed's low 64 bits do not reproduce the receipt"
+    );
+    assert_ne!(crate::prove::witgen::noise_seed_from_u64(lo), s1);
+    eprintln!(
+        "B9-SEC: seal-checked receipt reproduced only by its 256-bit OS seed ({} seal words)",
+        r1.seal.len()
+    );
 }
 
 /// The CPU HAL witgen runs on a copy of the cycles: the caller's trace is unchanged and a second

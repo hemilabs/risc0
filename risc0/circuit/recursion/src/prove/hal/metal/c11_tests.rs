@@ -664,11 +664,24 @@ mod p31_09 {
     }
 
     /// The stream [crate::prove::witgen::with_noise_seed] must give, recomputed here from
-    /// the stock `BabyBearElem::random` (n draws in order from the seeded `StdRng`).
+    /// the stock `BabyBearElem::random` (n draws in order from a `StdRng` keyed with
+    /// `SHA-256(stream domain || 256-bit seed || stream)`, the seed being the test expansion of
+    /// the `u64`; B9-SEC), independently of `witgen::seeded_noise_rng`.
     fn seeded_stream(seed: u64, stream: u64, n: usize) -> Vec<u32> {
         use rand::SeedableRng as _;
-        let mut rng =
-            rand::rngs::StdRng::seed_from_u64(seed ^ stream.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        use sha2::Digest as _;
+        let seed32: [u8; 32] = sha2::Sha256::new()
+            .chain_update(b"risc0-circuit-recursion/zk-noise/test-u64-seed/v1")
+            .chain_update(seed.to_le_bytes())
+            .finalize()
+            .into();
+        let key: [u8; 32] = sha2::Sha256::new()
+            .chain_update(b"risc0-circuit-recursion/zk-noise/stream/v1")
+            .chain_update(seed32)
+            .chain_update(stream.to_le_bytes())
+            .finalize()
+            .into();
+        let mut rng = rand::rngs::StdRng::from_seed(key);
         (0..n)
             .map(|_| BabyBearElem::random(&mut rng).as_u32_montgomery())
             .collect()
