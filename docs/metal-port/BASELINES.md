@@ -1212,3 +1212,282 @@ Without the dispatcher figure (`--benchmark` plans with the HAL limit) the 18 GB
   all in segments, as its note claimed); at the default budget it is a no-op for speed.
 - Not measured here: W7-V2's standalone-release path (`keccak_standalone_repeat`), IPC-only paths (M9 recycle,
   M10 respawn-early), 8-10 and 16-20-core parts, a real 16 GB Mac, CPU prover baselines.
+
+# 3.1
+
+Baseline of the risc0 3.1 port (PORT_PLAN P31-17) after the phase-A/B/C merges. risc0 v3.1.0 changes the
+circuits and the GPU kernels for security (rv32im `RV32IM:v2rev3___`, 484 poly-mix powers, `totalCycles`;
+recursion BIT_AND_ELEM canonical decomposition and independent ZK noise; Poseidon254 S-box x^8 -> x^7; Groth16
+ceremony v0.2.0, selector `e71e6620`). Wave 7 (3.0) is the reference. Every 3.1-vs-3.0 delta below comes from
+an **interleaved A/B in this session** against the frozen wave-7 3.0 builds (the wave-7 worker kept as
+`.w7-bak`, and the 3.0 rv32im test binary in the read-only `deps/risc0` target). It is attributed per phase.
+
+| | |
+|---|---|
+| Date | 2026-11-16, 18:48-19:50 local time |
+| Machine | Apple M5 Max, 40-core GPU, 36 GB unified memory (28.1 GiB recommended working set), macOS 27.2.1 (26B131) |
+| risc0 | `zkminer/metal-3.1` @ `a0ff0fb751ccf3079549e942b45d0914755ae464` (P31-01..16 + T1 merged) |
+| zk-miner | `metal-3.1` @ `0e57ab4d2198b6b15c4e1927c9bd26eea08eee7e` (P31-19 + P31-M9b merged; clean tree, path-patched to the checkout above) |
+| Worker | `make -f Makefile.mac mac-install-worker WARM=0` (`cargo build --locked --release -p zkminer-prove-risc0 --features metal --bin zkminer-prove-risc0-metal`, then the default P31-M9b offline archive set: 11 archives, 165 MiB, built in 112 s). Installed to `~/.zkminer/provers/zkminer-prove-risc0-metal` (sha256 `9161605e…6ed0`, identical to `target/release`). The wave-7 binary is kept as `.w7-bak` (sha256 `731bcd24…`) |
+| Method | as wave 7: `--benchmark` of the **installed** worker under `/usr/bin/time -l`, `RUST_LOG=info RISC0_METAL_ARCHIVE_GC=0`, every GPU command alone under `bin/gpu-run` (heavy, `--no-budget`; budgets via `RISC0_METAL_MAX_WORKING_SET_BYTES` inside the command). `ZKMINER_BENCH_RECEIPT_DIR` dumped the Groth16 receipts for the stock verifier |
+| Machine state | No other cargo / test / prover process ran (checked with `ps`). Load averages 1.4-5.1 over the session, 1.4-2.9 during the full-suite runs (each log records start / end load). No memguard stop or kill. After cold-OS-cache runs, `scripts/quiet.sh` waited until `MTLCompilerService` was idle before the next timed run |
+| Logs | `/Users/user/zkminer/scratch/w8/baseline/` (`full/`, `cold/`, `phx_def/`, `phx_bud/`, `wabx_def/`, `wabx_4g/`, `wabx_8g/`, `kab_def/`, `fit4g/`, `bud/`, `keccak/`, `sim/`, `prof/`, `warm/`, `prod/`, `receipts/`, `logs/`; drivers and parsers in `scripts/`, adapted from the wave-7 ones) |
+
+Warm-up: one `BENCH_ONLY=fibonacci` run and one `RISC0_METAL_RV32IM_EVAL_FC=wait` memory-merkle run at the
+default, 4 GiB and 8 GiB budgets (`warm/`). Every pipeline was warm ("built the Metal pipelines in 0.1 s (warm)").
+
+## 3.1.1 Worker `--benchmark` (full suite, po2 20 segments)
+
+Four 3.1 runs (`full/full1-4.log`) and two frozen 3.0 runs interleaved with the last of them (`full30_1`
+between 3.1 runs 3 and 4, `full30_2` after run 4). Load 1.4-2.9. Every run proved, wrapped and verified every program.
+
+| program | cycles | wave 7 (3.0) runs 1 / 2 / 3 (s) | 3.0 this session (s) | **3.1 runs 1 / 2 / 3 / 4 (s)** | RTX 4090 (s) | Metal / 4090 |
+|---|---|---|---|---|---|---|
+| fibonacci | 32,768 | 0.23 / 0.24 / 0.24 | 0.24 / 0.24 | 0.28 / 0.28 / 0.28 / 0.27 | 0.48 | 0.58x |
+| sha256-chain | 46,137,344 | 50.03 / 49.89 / 49.96 | 49.99 / 49.85 | 50.47 / 50.57 / 50.42 / 50.36 | 35.82 | 1.41x |
+| ecdsa-verify | 65,011,712 | 70.16 / 70.06 / 70.15 | 70.11 / 69.90 | 70.57 / 70.62 / 70.54 / 70.66 | 47.65 | 1.48x |
+| bigint-mul | 27,525,120 | 30.10 / 30.16 / 30.13 | 30.10 / 30.04 | 30.36 / 30.44 / 30.43 / 30.37 | 19.77 | 1.54x |
+| memory-merkle | 7,340,032 | 8.19 / 8.17 / 8.18 | 8.21 / 8.17 | 8.25 / 8.25 / 8.26 / 8.24 | 5.70 | 1.45x |
+| chacha-mix | 8,404,992 | 9.51 / 9.52 / 9.52 | 9.57 / 9.51 | 9.65 / 9.63 / 9.59 / 9.64 | 6.67 | 1.44x |
+| **all (sum of cycles / sum of STARK)** | 154,451,968 | 168.22 / 168.04 / 168.18 s, 918K c/s | 168.22 / 167.71 s, 918K / 921K | **169.58 / 169.79 / 169.52 / 169.54 s; 910.8K / 909.7K / 911.1K / 911.0K c/s (median 169.56 s, 910.9K c/s)** | 116.09 s, 1.33M c/s | **1.46x** |
+
+- **3.1 costs +1.3 to +1.8 s of STARK (+0.8 to +1.1 %)** against the 3.0 worker in the same session. Segments
+  140.44-140.75 s against 138.80-139.35 s (+1.1 to +1.9 s); recursion 29.03-29.11 against 28.86-28.90 s (+0.15 to
+  +0.25 s). The per-phase A/B (3.1.3) explains the segments: +13 ms per po2 20 segment, mostly eval_check (the 26
+  extra poly-mix powers and the new constraints of the 3.1 rv32im circuit). Recursion: 3.1.3 and 3.1.4.
+- **Goal gap**: the goal is >= 1.197M c/s, i.e. a full-suite STARK <= 129.0 s. 3.1 gives 910.9K c/s:
+  **40.5 s (23.9 %) of STARK still to remove** (wave 7: 39.2 s, 23.3 %). The RTX 4090 takes 1.46x less time than
+  this Mac (wave 7: 1.45x). The RTX 5090 (~2.3M c/s, 67.2 s) takes 2.53x less time than this Mac.
+
+**Groth16 wrap** (first and warm separately):
+
+| wrap | identity_p254 | shrink_wrap | total |
+|---|---|---|---|
+| warm, 3.1 (every wrap after the first, 20 samples) | **900.6-907.6 ms** (median 903.8) | 670.5-679.1 ms (median 675.1) | **1.57-1.59 s** |
+| warm, 3.0 this session (10 samples) | 738.2-745.4 ms (median 740.5) | 618.3-625.1 (median 620.5) | 1.36-1.37 s |
+| first wrap of a `--benchmark` process, 3.1 | 911.5 / 913.7 / 912.9 / 925.0 ms | 672.6-675.5 ms | **1.58-1.60 s** |
+| first wrap of a fresh `BENCH_ONLY=fibonacci` worker, 3.1 (10 runs, `cold/`) | 911.7-920.0 ms | | 1.59 s |
+
+- The **wrap is +0.22 s (+16 %)** on 3.1: identity_p254 +163 ms and shrink_wrap +55 ms (A/B and profile in 3.1.4).
+  The first wrap is still a warm one (+9 ms; the M9 / P31-M9b ctrl prewarm: "identity_p254 ctrl kept (98 MiB)
+  in 251-253 ms"). Wrap 1.58 s is still below the RTX 4090's ~2.0 s.
+
+**First job of a fresh worker** (`BENCH_ONLY=fibonacci`, `time -l` wall, warm OS cache): **2.25-2.32 s** (5 runs;
+wave 7 1.93-1.95 s). The +0.35 s is the 3.1 wrap (+0.22 s) and the slower 3.1 recursion of a fresh process (3.1.4).
+
+**Memory.**
+
+| | wave 7 (3.0) | 3.1 |
+|---|---|---|
+| process peak footprint, full suite (`time -l`) | 14.69 / 14.69 / 14.69 GB | **14.69 / 14.70 / 14.69 / 14.69 GB** (unchanged) |
+| `--benchmark` process lifetime peak | 14007-14013 MiB | 14009-14016 MiB |
+| CPU user time of the full suite | 24.8-24.9 s | 26.4 s |
+| wall time of the full suite | 176.6-176.8 s (176.3-176.8 this session) | 179.5-179.7 s (+2.9 s: STARK +1.5, six wraps +1.3) |
+
+Metal peaks per phase at po2 20 (MiB, segments / recursion / wrap): memory-merkle 9437 / 9437 / **5635**,
+bigint-mul 9612 / 8994 / 5635, chacha-mix 9402-9419 / 8281 / 5635, ecdsa-verify 9498 / 9484-9485 / 5635,
+sha256-chain 9408 / 9408 / 5635, fibonacci 356 / 1493 / 5635. Segments are +32 MiB over wave 7. The wrap
+peak is **+259 MiB** (5376 -> 5635): the v0.2.0 Groth16 circuit is larger (6,257,165 witness elements against
+5,635,930). The device allocation of shrink_wrap is 4200.0 MiB (3.0 3957.5 MiB). The process footprint does
+not change because it peaks in the segments.
+
+## 3.1.2 Cold start and first install
+
+`BENCH_ONLY=fibonacci`, `cold/`. The worker is the default install, which now ships the offline (AOT) set (P31-M9b).
+
+| | pipelines | process wall (`time -l`) | first wrap |
+|---|---|---|---|
+| warm (5 runs, interleaved with the next row) | 0.1 s | **2.25-2.32 s** (wave 7 1.93-1.95) | 1.59 s |
+| cold OS shader cache (`MTL_SHADER_CACHE_SIZE=0`), runtime archives present (5 runs) | 0.1 s | **2.29-2.32 s** (wave 7 **7.95-8.42 s**) | 1.59 s |
+| first install with the default offline set: `MTL_SHADER_CACHE_SIZE=0`, empty `RISC0_METAL_ARCHIVE_DIR`, worker's `metal-aot/` (3 runs) | 0.1 s ("AOT_DIR=~/.zkminer/provers/metal-aot (packaged beside the worker)") | **2.31 / 2.31 / 2.31 s** (wave 7 with a hand-installed set 7.40-7.95 s; wave 7 default install 92.0-101.5 s) | 1.59 s |
+| first install without the set (`ZKMINER_METAL_AOT=0`, otherwise as above; 2 runs) | 57.0-58.4 s (rv32im+zkp 57-58, recursion 25-27, keccak 17-32, groth16 22-27 in parallel) | 59.2-60.6 s | 1.59 s |
+
+- **Both wave-7 cold-start open items are closed by P31-M9b.** The cold-OS-cache regression in `--benchmark`
+  is gone: 8.0-8.4 s -> 2.3 s, because fibonacci "starts at once (first segment po2 15, probed in 0.005 s)"
+  instead of waiting for the po2 20 specialization. The default install ships the AOT set, so a first start
+  takes 2.3 s (wave 7: 92-102 s).
+- `make mac-install-worker` took 142.6 s, including the AOT set build of 112 s. The risc0 dump tests had been
+  compiled into `target/aot-dump` beforehand, outside the GPU lock. The 4 dump tests then ran under
+  `gpu-run --light`.
+- A cold run leaves `MTLCompilerService` at ~300 % CPU for several seconds after the worker exits. That is the
+  background po2 20 specialization, which keeps running after exit. A timed run right after a cold one can
+  therefore see extra load.
+
+## 3.1.3 Per-phase breakdown: po2 20 rv32im segment
+
+`risc0-circuit-rv32im` release lib test `prove_po2_sweep`, `R11_PO2S=20 R11_CPU=0 R11_REPS=4`, 7 rounds of
+A (3.1), T (frozen 3.0 binary `risc0_circuit_rv32im-5d2fa880e1a95e2f`), A2 (3.1), rotated (`phx_def/`,
+`scripts/phx.sh`, `phana.py`; per-process median of reps 1-3; load 1.9-3.3). Every seal verifies (3.1: seal v3).
+The delta is T minus the mean of A and A2 in its round, so a negative number means 3.1 is slower.
+
+| phase | wave 7 ms | 3.0 this session (T) ms | **3.1 (A / A2) ms** | 3.0 - 3.1 per round | share (3.1) |
+|---|---|---|---|---|---|
+| preflight + alloc | 12 | 12 | 12 / 12 | 0.0 | 1.3 % |
+| witgen | 6 | 6 | 6 / 6 | 0.0 | 0.6 % |
+| data commit | 210 | 210 | **210 / 210** | 0.0 [-1.0, 0.0] | 22.2 % |
+| accum | 8 | 8 | 10 / 10 | **-2.0 [-2.0, -2.0] 7/7** | 1.1 % |
+| accum commit | 109 | 109 | **109 / 109** | 0.0 | 11.5 % |
+| eval_check | 542 / 539 | 541 [539-544] | **550 [549-551] / 550 [543-553]** | **-9.5 [-13.0, -2.5] 7/7** | 58.0 % |
+| FRI + tail | 50 | 50 | 52 / 52 | **-2.0 [-3.0, -1.0] 7/7** | 5.5 % |
+| **segment** | 936 / 933 | **935 [933-938]** | **948 [946-950] / 948 [941-951]** | **-13.0 [-15.5, -6.5] 7/7** (A2-A 0.0 [-7, +4]) | |
+
+- **3.1 makes a po2 20 segment 13 ms slower (+1.4 %).** eval_check is +9.5 ms (+1.8 %): 484 poly-mix powers
+  instead of 458 and the new constraints of the 3.1 rv32im circuit (P31-03). accum is +2 ms: the 3.1 accum
+  layout (P31-05, `argU16` 4 -> 10). FRI + tail is +2 ms: the one extra global (`totalCycles`) and the regenerated
+  taps. The two commits and witgen do not change. Peak GPU allocation is 9319 MiB in both builds.
+- In the worker (`prof/mm_verbose*.log`, `RISC0_VERBOSE=1`, memory-merkle) the steady segments take 942.6-946.9
+  ms on 3.1 and 933.2-937.5 ms on 3.0. The first segment takes 1156.5 ms (3.0: 1125.5 ms).
+- At the worker's budget tiers (one process each, 3.1 / 3.0, `phx_bud/`): po2 20 at 8 GiB takes 1022 / 1013 ms,
+  with eval_check 545 / 537 and peak 8129 / 8145 MiB. po2 19 at 4 GiB takes 518 / 511 ms, with peak 4080 /
+  4021 MiB. A single process at each tier is a record, not a claim.
+
+### Recursion per proof (`prof/mm_verbose.log` vs `mm_verbose_30.log`)
+
+| | 3.0 | 3.1 |
+|---|---|---|
+| steady lift | 91.8-92.2 ms | **91.7-92.5 ms** (unchanged) |
+| steady join | 96.9-98.0 ms | **97.2-97.9 ms** (unchanged) |
+| first pair lift0+lift1 | 263.8 ms | **306.9 ms (+43)** |
+| step 1 next_lift | 109.1 ms | **177.2 ms (+68)** |
+| memory-merkle lift/join total (13 proofs) | 1.368 s | 1.479 s |
+
+The 3.1 BIT_AND_ELEM constraints and the independent noise cells cost nothing measurable per proof. The +0.11 s
+appears once per process, on the first lift and join. 3.1 ships the zkr programs xz-compressed, and
+`get_zkr` decodes each one on its first use: 52 ms for `lift_rv32im_v2_20`, 79 ms for `join` (P31-10's
+profile). P31-10's cache prevents a second decode. A full suite pays the decode once per program, which is why
+its recursion grows by only +0.15 to +0.25 s.
+
+### identity_p254 + shrink_wrap (`BENCH_ONLY=fibonacci`, `RISC0_VERBOSE=1 RISC0_G16_METAL_PROFILE=1`, `prof/g16*.log`)
+
+| identity_p254 phase (ms) | 3.0 | 3.1 | |
+|---|---|---|---|
+| preflight / witgen / ctrl | 11.1 / 26.6 / 5.4 (Restored) | 11.0 / 26.4 / 6.6 (Restored) | |
+| data commit | 436.1 | **544.3** | **+108 (+25 %)** |
+| accum / accum commit | 5.1 / 95.6 | 5.1 / **120.0** | +24 |
+| check commit | 122.2 | **146.9** | +25 |
+| FRI | 31.7 (161.4 finalize) | 39.0 (193.5 finalize) | +7 |
+| **identity_p254** | 742.7 | **908.3** | **+166** |
+
+Every identity_p254 delta is in the Poseidon254 merkle hashing. The x^7 S-box costs +25 % per hash on Metal, as
+P31-11 measured (+26.5 % on the hash shapes). The prewarmed ctrl commit is 187.8 ms on 3.1 against 151.1 ms on
+3.0. It runs at start-up, off the job.
+
+| shrink_wrap GPU ms | zero+witness_poly | NTT | sort_h | MSM H | sort_w | MSM A / B1 / C | MSM B2 | sum | allocated |
+|---|---|---|---|---|---|---|---|---|---|
+| 3.0 (v0.1.0) | 42.1 | 82.8 | 12.5 | 175.0 | 5.9 | 36.4 / 37.7 / 37.3 | 151.0 | 580.8 | 3957.5 MiB |
+| 3.1 (v0.2.0) | 45.3 | 82.8 | 12.5 | 174.5 | 6.9 | 44.4 / 45.8 / 43.7 | 177.3 | **633.2** | **4200.0 MiB** |
+
+The +52 ms is all in the witness-sized MSMs (A, B1, C, B2) and in witness_poly: v0.2.0 has 11 % more witness
+elements. The domain is unchanged (2^23), so the NTT and the H MSM cost the same.
+
+## 3.1.4 3.1 vs 3.0 worker A/B, and 3.1 knobs
+
+**3.1 vs 3.0** (`scripts/wabx.sh`, `BENCH_ONLY=memory-merkle`, rounds of A1 (3.1), T (3.0 `.w7-bak`), A2 (3.1),
+rotated; delta = T minus the mean of A1 and A2, so a negative number means 3.1 is slower). Every run proved,
+wrapped and verified.
+
+| budget | rounds, load | A2-A1 STARK | 3.1 STARK (seg + rec) | 3.0 STARK | 3.0 - 3.1 STARK | seg | rec | wrap (p254 / shrink) | footprint 3.0 - 3.1 | Metal peaks 3.1 (seg / rec / wrap) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| default (po2 20) | 7, 1.8-2.9 | +0.000 [-0.020, +0.030] | 8.35 (6.85 + 1.49) | 8.19 | **-0.170 [-0.195, -0.140] 7/7** | -0.065 | -0.105 | **-0.220** (-166.0 / -55.4 ms) | **-0.130 GB** (13.20 vs 13.07) | 9437 / 9437 / 5635 (3.0 9421 / 9421 / 5392) |
+| 8 GiB (po2 19) | 5, 1.6-3.1 | +0.010 [-0.010, +0.030] | 10.22 (7.24 + 2.97) | 10.04 | **-0.175 [-0.205, -0.145] 5/5** | -0.080 | -0.110 | **-0.230** (-162.9 / -67.0) | -0.059 GB (7.33 vs 7.27) | 4738 / 4337 / 5635 |
+| 4 GiB (po2 18) | 5, 1.7-3.1 | +0.010 [-0.020, +0.040] | 13.92 (7.79 + 6.13) | 13.74 | **-0.185 [-0.200, -0.160] 5/5** | -0.075 | -0.110 | **-0.230** (-163.5 / -71.6) | **+0.147 GB** (5.02 vs 5.17: 3.1 is smaller) | 2388 / 2183 / 4054 (3.0 2400 / 2199 / 3958) |
+
+- On a 7-segment job, 3.1 costs **+2.1 % of STARK**. About 40 % of that is the segments (~10 ms per segment) and
+  about 60 % is the per-process first-use zkr decode in recursion (3.1.3). The wrap costs +0.22-0.23 s at every
+  budget.
+- At 4 GiB, 3.1 uses 0.15 GB **less** memory: P31-19 defers the keccak pipelines when the Groth16 key would not
+  fit, and P31-12's split H shrinks the wrap. At the default budget it uses 0.13 GB more (the wrap
+  allocation and P31-10's zkr cache).
+
+**Knobs of this wave** (default budget, `kab_def/`, 7 rounds A1 / ZK / BL / A2 rotated, load 1.6-4.1;
+A2-A1 STARK +0.020 [-0.050, +0.030], rec 0.000 [-0.010, +0.010]):
+
+| item | knob (off) | delta (off - on) | verdict |
+|---|---|---|---|
+| P31-10 zkr program cache | `RISC0_METAL_REC_ZKR_CACHE=0` | **rec +0.025 [+0.010, +0.030] 7/7** (~2 ms per proof over 13 proofs); STARK +0.020 7/7; footprint +0.013 GB 7/7 | **holds** (P31-10: lift -1.2, join -2.0 ms per proof) |
+| P31-M9b background prewarm | `ZKMINER_METAL_PREWARM_BLOCKING=1` (M9's blocking prewarm) | STARK -0.010 [-0.060, +0.025] 2/7, wrap -0.005, wall -0.025 | no change on a warm machine, as M9b claims. Its gain is the cold-OS-cache wall in 3.1.2 (8.0 -> 2.3 s) |
+| P31-19 keccak prewarm deferral | `ZKMINER_METAL_PREWARM_KECCAK=on`, 4 GiB fibonacci (`fit4g/KC.log`) | **Groth16 wrap refused**: "allocating 4235118872 bytes for the Groth16 prover ... with ... already allocated would exceed the limit" | **fit claim holds**: the knob is what makes the 4 GiB wrap fit |
+| P31-12 split H | `RISC0_G16_METAL_SPLIT_H=off`, 4 GiB fibonacci (`fit4g/SH.log`) | **Groth16 wrap refused** (plans 4371531224 B) | **fit claim holds** |
+| P31-11 x^7, P31-09 noise | none (security fixes, no way back) | priced in 3.1.3 | - |
+
+## 3.1.5 Budgets and simulated hosts
+
+`BENCH_ONLY=fibonacci` (3 fresh runs per budget, `bud/`), memory-merkle (the A1 / A2 arms of 3.1.4), keccak
+`k5_keccak_metal_e2e` (`K5_E2E_PO2S=14,17,18`, `gpu-run --budget`, 2 runs per budget, `keccak/`). **Everything
+proves and verifies at both budgets. Every worker job wraps at both budgets.**
+
+| budget | program | po2 | STARK | Groth16 wrap (p254 + shrink_wrap) | Metal peak MiB (seg / rec / wrap) | process peak footprint |
+|---|---|---|---|---|---|---|
+| 4 GiB | fibonacci | 18 | 0.27 s | **1.72 s** (0.898-0.899 + 0.816-0.824; wave 7 1.49) | 340 / 1477 / 4054 | 4.46-4.47 GB (wave 7 4.53-4.54) |
+| 4 GiB | memory-merkle | 18 | **13.92 [13.91-13.95] s** (7.79 + 6.13), 8,388,608 cycles, **603K c/s** (wave 7 13.72 s, 611K) | 1.72-1.73 s | 2388 / 2183 / 4054 | **5.02 GB** (wave 7 5.16-5.17) |
+| 4 GiB | keccak e2e 14,17,18 | 14, 17 (18 skipped below 7084 MiB) | po2 14 0.79-0.82 s, po2 17 1.78 s (prove + lift + verify; no wrap in this test) | - | - | 5.81-5.82 GB (= wave 7) |
+| 8 GiB | fibonacci | 19 | 0.27 s | **1.73-1.74 s** (0.911-0.913 + 0.819-0.823; wave 7 1.50-1.51) | 356 / 1493 / 5635 | 4.75 GB (wave 7 4.62-4.63) |
+| 8 GiB | memory-merkle | 19 | **10.22 [10.21-10.23] s** (7.24 + 2.97), 7,864,320 cycles, **770K c/s** (wave 7 10.05 s, 783K) | 1.74 s | 4738 / 4337 / 5635 | **7.33 GB** (wave 7 7.25) |
+| 8 GiB | keccak e2e 14,17,18 | 14, 17, 18 | 0.78, 1.77-1.78, 2.93-2.94 s (= wave 7) | - | - | 10.24 GB (= wave 7) |
+| 28.1 GiB (default) | memory-merkle | 20 | 8.35 s, 879K c/s | 1.59 s | 9437 / 9437 / 5635 | 13.20 GB (wave 7 13.07) |
+
+- On 3.1, memory-merkle STARK is +1.3 to +1.7 % at the budget tiers (3.1.4). keccak is unchanged: its circuit
+  and translators are byte-identical to 3.0 (P31-13).
+- shrink_wrap below 20 GiB takes 0.82 s (wave 7 0.75 s; the `fast` evaluator), so the budget wraps are 1.72-1.74 s.
+- **Not every receipt can be made at 4 GiB** (P31-14 / P31-19 open issue, reproduced here): after a keccak proof
+  in the same process, the Groth16 key load is refused ("allocating 4235118872 bytes ... with 64946176 bytes
+  already allocated would exceed the limit of 4294967296", `prod/b4_keccak.log`). The composite and succinct
+  receipts are made and verify. Worker jobs without keccak wrap at 4 GiB (13 of 13 here; P31-M9b saw 1 refusal
+  in 56). The remaining Groth16 headroom at 4 GiB is ~57 MiB.
+
+**Tier the worker selects on a simulated host** (`sim/`, memory-merkle, `ZKMINER_METAL_HOST_RAM_BYTES` = host
+RAM, `RISC0_METAL_MAX_WORKING_SET_BYTES` = that Mac's HAL limit, `ZKMINER_CUDA_VRAM_BYTES` = RAM - 8 GiB as the
+dispatcher passes it; tier table `w7`; one run each):
+
+| host | HAL limit / planned figure | po2 chosen | STARK | wrap | Metal peaks MiB | footprint |
+|---|---|---|---|---|---|---|
+| 16 GB | 10.67 / 8 GiB | 19 | 10.19 s (wave 7 9.96) | 1.74 s | 4798 / 4798 / 5635 | 7.38 GB (wave 7 7.32) |
+| 18 GB | 12 / 10 GiB | 19 | 10.17 s (wave 7 9.96) | 1.74 s | 4798 / 4798 / 5635 | 7.38 GB |
+| 24 GB | 16 / 16 GiB | 20 | 8.40 s (wave 7 8.25) | 1.74 s | 9405 / 8614 / 5635 | 12.39 GB (wave 7 12.29) |
+
+Without the dispatcher figure the 18 GB case again picks po2 20 at 12 GiB (8.63 s, 12.39 GB, `sim/h18_mm.log`),
+as in wave 7. 16 GB without the figure: po2 19, 10.16 s; 24 GB: po2 20, 8.39 s.
+
+## 3.1.6 Correctness
+
+- **Stock verifier**: `tools/stock_verify31` (crates.io `risc0-zkvm 3.1.0`, build.rs checks the registry
+  sources), built `--locked` into scratch. **34 / 34 receipts made here verify ("STOCK 3.1 VERIFY: OK")**:
+  - 18 Groth16 receipts of full runs 1-3 (6 programs each);
+  - memory-merkle Groth16 at 4 and 8 GiB, plus the simulated 16 / 18 / 24 GB hosts (5);
+  - the P31-14 producer's composite, succinct and Groth16 receipts for keccak (default and 8 GiB) and compose
+    (default) (9);
+  - keccak composite and succinct at 4 GiB (2). Its Groth16 is the known refusal above.
+  
+  Every Groth16 receipt reports verifier parameters `e71e6620a834f4d8...` (selector `e71e6620`), i.e. the v0.2.0
+  setup's VK in the stock verifier. Every worker run also printed `verified` (the worker's own check).
+- **3.0 receipts are rejected** by the same verifier: 6 / 6 of P31-14's 3.0 fibonacci / merkle composite,
+  succinct and Groth16 receipts (`logs/rej30/`). Composite: "invalid receipt format". Succinct: parameters
+  digest `ece5e9b8...`. Groth16: `73c457ba...`.
+- Segment seals verify in every `prove_po2_sweep` rep (seal v3, 3.1 verifier). k5 keccak prove + lift + verify
+  passed in 4 / 4 runs.
+
+## 3.1.7 Open items from this baseline
+
+- **STARK 910.9K c/s, 23.9 % (40.5 s of 169.6 s) short of the 1.197M c/s goal.** 3.1 added +0.8-1.1 % to the
+  full-suite STARK: +13 ms per po2 20 segment (eval_check +9.5, accum +2, FRI + tail +2). A po2 20 segment takes
+  948 ms: eval_check 58 %, data commit 22 %, accum commit 11.5 %. Recursion takes 29.0 s (17 % of the STARK).
+- **The wrap is +0.22 s on 3.1** (1.36 -> 1.58 s warm), almost all from Poseidon254 x^7 in identity_p254
+  (+166 ms, every merkle commit +25 %) and the larger v0.2.0 MSMs (+52 ms). It is still below the 4090's
+  ~2.0 s. The p254 merkle hash is the lever if wrap time matters, for example latency on small jobs.
+- **First-use zkr decode** (~0.1 s per fresh process: `lift_rv32im_v2_20` 52 ms + `join` 79 ms xz decode) lands
+  on the first job's recursion. M9b's background prewarm could call `get_zkr` for the tier's lift and join
+  programs at start-up to take it off the first job. Not measured.
+- **4 GiB Groth16 after keccak** (P31-14 open issue 1 / P31-19 section 6): the wrap is still refused; ~57 MiB
+  of headroom. Needs >= 5 MiB more room on the risc0 Groth16 side.
+- `--benchmark` exits 0 when a program's Groth16 wrap fails (`fit4g/*.log`: "Groth16 wrap failed" and rc=0).
+  A script that checks only the exit status misses the failure.
+- **Security review finding (recorded, not fixed by this baseline):** the opt-in validation knob
+  `RISC0_METAL_REC_SEAL_CHECK=1` (`recursion/src/prove/hal/metal/mod.rs`, `prove_seal_checked`, reachable in
+  release builds) returns the Metal recursion receipt, and that receipt's ZK noise comes from a single 64-bit
+  `rand::random()` seed expanded by `StdRng::seed_from_u64`. Stock 3.1 draws each cell from the OS-seeded
+  ChaCha thread RNG. In that path the zero-knowledge of the returned receipt therefore rests on 64 bits. Default
+  and row-pass paths are unaffected (`p31_09_noise_rows_independent_*`). Fix: a 256-bit seed with domain-separated
+  per-stream derivation, or return an unseeded re-proof, or refuse the knob outside test / debug builds; document
+  it as a validation-only knob. Owner: the recursion item (P31-09 follow-up).
+- Not measured here: the IPC worker path, 8-10 and 16-20-core parts, a real 16 GB Mac, CPU prover baselines,
+  W7-T1 / W7-G1 (not merged into 3.0 or 3.1).
