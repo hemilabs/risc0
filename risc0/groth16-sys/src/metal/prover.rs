@@ -72,7 +72,8 @@
 //! `ntt_mul_powers` pass, < 1 ms), so the split layout takes 3882 MiB (planned 3885.0 MiB) and a
 //! 4 GiB budget keeps ~150 MiB beside it and the process-wide pipeline objects (46-62 MiB); about
 //! +2 ms of GPU time per proof. [SplitH::Auto] / [TwLent::Auto] take the reduced layouts only
-//! where the faster ones do not leave [AUTO_HEADROOM_BYTES] ([choose_layout]). (The 3.0 key, v0.1.0: 5,635,930 elements, 3890-3900 MiB.)
+//! where the faster ones do not leave [AUTO_HEADROOM_BYTES] ([choose_layout]). (The 3.0 key,
+//! v0.1.0: 5,635,930 elements, 3890-3900 MiB.)
 
 use std::{
     fs::File,
@@ -1055,7 +1056,8 @@ impl MetalProver {
         // Item B9-4G fix round 1: touch the lent region once here (its fill and table), so that
         // its pages are made resident during the key load (which overlaps the host witness)
         // rather than in the first proof's command buffer (+6 ms per wrap at 4 GiB, where every
-        // wrap reloads the key; see notes/B9-4G.md). Each proof still refills and rebuilds it.
+        // wrap reloads the key; see notes/B9-4G.md). The first proof after the build uses this
+        // table as is; every later proof refills and rebuilds it.
         if tw_lent && tw_prefault() {
             if let Some((buf, off, len)) = ntt.lent_twiddle_region() {
                 let t = Instant::now();

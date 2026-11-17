@@ -870,9 +870,13 @@ fn b9_4g_tw_lent_bit_exact() {
         report_build(&name, &prover);
         assert_eq!(prover.tw_lent(), tw_lent == TwLent::On);
         assert_eq!(prover.build_stats.tw_lent, prover.tw_lent());
-        // Fix round 1: a lent region is touched at the build (the table is rebuilt per proof
-        // anyway; the proofs below check that the result is unchanged).
-        assert_eq!(prover.build_stats.tw_prefault.is_some(), prover.tw_lent());
+        // Fix round 1: a lent region is touched at the build unless
+        // `RISC0_G16_METAL_TW_PREFAULT=0` (the revert knob; then every proof fills and builds the
+        // table). The proofs below check that both modes give the reference proofs.
+        assert_eq!(
+            prover.build_stats.tw_prefault.is_some(),
+            prover.tw_lent() && tw_prefault()
+        );
         let st = &prover.build_stats;
         let growth = st.allocated_after - st.allocated_before;
         // The check's slack (4 MiB; 32 with `RISC0_G16_METAL_ARCHIVE=0`, see [plan_slack]).
