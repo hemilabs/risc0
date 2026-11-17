@@ -429,7 +429,7 @@ fn report_build(name: &str, p: &MetalProver) {
     let st = &p.build_stats;
     eprintln!(
         "G10BUILD {name}: srs {:?} coeffs {:?} validate {:?} gpu setup {:?} total {:?}; split_h \
-         {}; planned {:.1} MiB, allocated {:.1} -> {:.1} MiB (+{:.1}), footprint {:.1} -> {:.1} MiB (+{:.1}), \
+         {}; tw_lent {}; planned {:.1} MiB, allocated {:.1} -> {:.1} MiB (+{:.1}), footprint {:.1} -> {:.1} MiB (+{:.1}), \
          coefficients {:.1} MiB",
         st.srs_load,
         st.coeffs_load,
@@ -437,6 +437,7 @@ fn report_build(name: &str, p: &MetalProver) {
         st.gpu_setup,
         st.total,
         st.split_h,
+        st.tw_lent,
         mib(st.planned_bytes),
         mib(st.allocated_before),
         mib(st.allocated_after),
@@ -635,9 +636,11 @@ fn p31_12_split_h_bit_exact() {
         return;
     };
     let setup = SetupParams::new(&dir).unwrap();
+    // P31-12's rules, without item B9-4G's lent twiddles (`b9_4g_tw_lent_bit_exact`).
     let lay = |split_h: SplitH, room: u64| {
         let mem = MemOptions {
             split_h,
+            tw_lent: TwLent::Off,
             ..MemOptions::all()
         };
         layout(
@@ -674,6 +677,7 @@ fn p31_12_split_h_bit_exact() {
     for split_h in [SplitH::Off, SplitH::On] {
         let mem = MemOptions {
             split_h,
+            tw_lent: TwLent::Off,
             ..MemOptions::all()
         };
         let mut prover = match MetalProver::new_with(&setup, mem) {
@@ -724,6 +728,209 @@ fn p31_12_split_h_bit_exact() {
             }
         }
     }
+}
+
+/// Item B9-4G: the lent NTT twiddles ([MemOptions::tw_lent]).
+/// - Layout choice: `Auto` keeps P31-12's layouts where they leave [AUTO_HEADROOM_BYTES]
+///   (whole at the 8 GiB and default budgets, the split layout with room to spare) and takes
+///   split + lent twiddles at a 4 GiB budget beside 62 MiB of pipeline objects; forced switches
+///   are taken as given; the lent layouts save the table less the 2.1 MiB `sorted` grows by.
+/// - The planned footprint is the real growth plus at most 4 MiB (page rounding; the check).
+/// - Proofs: split + lent and unsplit + lent give the same pre-blinding values and proof as the
+///   reference layout (fixed r, s), for a witness-like and a random witness, three proofs in a
+///   row (the table is rebuilt before each), and after the fuzz check (whose MSMs overwrite
+///   `sorted`).
+#[test]
+fn b9_4g_tw_lent_bit_exact() {
+    assert_eq!(MemOptions::all().tw_lent, TwLent::Auto);
+    assert_eq!(MemOptions::none().tw_lent, TwLent::Off);
+    assert_eq!(MemOptions::parse("tw_lent=on").unwrap().tw_lent, TwLent::On);
+    assert_eq!(MemOptions::parse("-tw_lent").unwrap().tw_lent, TwLent::Off);
+    assert_eq!(
+        MemOptions::parse("base,+tw_lent").unwrap().tw_lent,
+        TwLent::Auto
+    );
+    assert_eq!(MemOptions::parse("tw_lent=maybe"), None);
+
+    let _lock = prover_test_lock();
+    let Some(dir) = component_dir() else {
+        return;
+    };
+    let setup = SetupParams::new(&dir).unwrap();
+    let lay = |split_h: SplitH, tw_lent: TwLent, room: u64| {
+        let mem = MemOptions {
+            split_h,
+            tw_lent,
+            ..MemOptions::all()
+        };
+        layout(
+            setup.srs_path.as_path(),
+            setup.pcoeffs_path.as_path(),
+            mem,
+            room,
+        )
+        .unwrap()
+    };
+    let gib = 1u64 << 30;
+    let pso = 62 << 20;
+    let whole = lay(SplitH::Off, TwLent::Off, 0);
+    let split = lay(SplitH::On, TwLent::Off, 0);
+    let whole_tw = lay(SplitH::Off, TwLent::On, 0);
+    let split_tw = lay(SplitH::On, TwLent::On, 0);
+    assert!(!whole.tw_lent && whole_tw.tw_lent && split_tw.tw_lent && split_tw.split_h);
+    let tw = super::super::ntt::NttPlan::twiddle_bytes_for(whole.lg);
+    for (a, b) in [(&whole, &whole_tw), (&split, &split_tw)] {
+        let saved = a.planned_bytes - b.planned_bytes;
+        assert!(saved <= tw && saved + (4 << 20) > tw, "saved {saved}");
+    }
+    let auto = |room: u64| {
+        let l = lay(SplitH::Auto, TwLent::Auto, room);
+        (l.split_h, l.tw_lent)
+    };
+    assert_eq!(auto(u64::MAX), (false, false));
+    assert_eq!(auto(8 * gib - pso), (false, false));
+    assert_eq!(auto(whole.planned_bytes), (false, false));
+    assert_eq!(
+        auto(split.planned_bytes + AUTO_HEADROOM_BYTES),
+        (true, false)
+    );
+    assert_eq!(
+        auto(split.planned_bytes + AUTO_HEADROOM_BYTES - 1),
+        (true, true)
+    );
+    assert_eq!(auto(4 * gib - pso), (true, true));
+    assert_eq!(auto(4 * gib - (46 << 20)), (true, true));
+    // Smaller than every layout: the smallest (then refused by the budget check).
+    assert_eq!(auto(0), (true, true));
+    // Forced switches.
+    assert_eq!(
+        {
+            let l = lay(SplitH::Off, TwLent::Auto, 4 * gib - pso);
+            (l.split_h, l.tw_lent)
+        },
+        (false, true)
+    );
+    assert_eq!(
+        {
+            let l = lay(SplitH::Auto, TwLent::Off, 4 * gib - pso);
+            (l.split_h, l.tw_lent)
+        },
+        (true, false)
+    );
+    assert_eq!(
+        {
+            let l = lay(SplitH::Off, TwLent::On, u64::MAX);
+            (l.split_h, l.tw_lent)
+        },
+        (false, true)
+    );
+    eprintln!(
+        "B9-4G layout: planned whole {:.1}, split {:.1}, whole+tw {:.1}, split+tw {:.1} MiB; \
+         sorted min {:.1} MiB (scratch sorted {:.1} MiB)",
+        mib(whole.planned_bytes),
+        mib(split.planned_bytes),
+        mib(whole_tw.planned_bytes),
+        mib(split_tw.planned_bytes),
+        mib(split_tw.sorted_min),
+        mib(MsmScratch::sizes_for(split_tw.cap, split_tw.cfg)[4]),
+    );
+
+    let mut reference: Vec<Proof> = vec![];
+    for (split_h, tw_lent) in [
+        (SplitH::Off, TwLent::Off),
+        (SplitH::On, TwLent::On),
+        (SplitH::Off, TwLent::On),
+    ] {
+        let mem = MemOptions {
+            split_h,
+            tw_lent,
+            ..MemOptions::all()
+        };
+        let mut prover = match MetalProver::new_with(&setup, mem) {
+            Ok(p) => p,
+            Err(e) if super::super::working_set_budget().is_some() => {
+                let msg = format!("{e:#}");
+                assert!(msg.contains("working-set budget exceeded"), "{msg}");
+                eprintln!("B9-4G {split_h:?} {tw_lent:?}: refused under the budget: {msg}");
+                continue;
+            }
+            Err(e) => panic!("{split_h:?} {tw_lent:?}: {e:#}"),
+        };
+        let name = format!("split_h={split_h:?},tw_lent={tw_lent:?}");
+        report_build(&name, &prover);
+        assert_eq!(prover.tw_lent(), tw_lent == TwLent::On);
+        assert_eq!(prover.build_stats.tw_lent, prover.tw_lent());
+        let st = &prover.build_stats;
+        let growth = st.allocated_after - st.allocated_before;
+        assert!(
+            st.planned_bytes >= growth && st.planned_bytes - growth <= 4 << 20,
+            "{name}: planned {} vs growth {growth}",
+            st.planned_bytes
+        );
+        let mut proofs = vec![];
+        let witnesses = [
+            ("witness-like", witness_like(&prover, 0x3112)),
+            ("random", random_witness(&prover, 0x3113)),
+            ("witness-like again", witness_like(&prover, 0x3112)),
+        ];
+        for (what, w) in &witnesses {
+            let p = prover
+                .prove_with_blinding(w, &ProveOptions::default(), Fr::from(3u64), Fr::from(5u64))
+                .unwrap();
+            eprintln!(
+                "B9-4G {name} {what}: gpu {:.1} ms, allocated after {:.1} MiB",
+                p.stats.gpu_total_ms(),
+                mib(p.stats.allocated)
+            );
+            assert_eq!(
+                p.stats.allocated, prover.build_stats.allocated_after,
+                "{what}"
+            );
+            proofs.push(p);
+        }
+        if prover.tw_lent() {
+            let (a, b1, c, b2) = prover.fuzz_check().unwrap();
+            assert!(
+                a.is_zero() && b1.is_zero() && c.is_zero() && b2.is_zero(),
+                "fuzz check ({name})"
+            );
+            let p = prover
+                .prove_with_blinding(
+                    &witnesses[1].1,
+                    &ProveOptions::default(),
+                    Fr::from(3u64),
+                    Fr::from(5u64),
+                )
+                .unwrap();
+            assert_eq!(
+                p.pre_blinding, proofs[1].pre_blinding,
+                "after the fuzz check"
+            );
+            // Profiled (one command buffer per stage): the same proof.
+            let p = prover
+                .prove_with_blinding(
+                    &witnesses[0].1,
+                    &ProveOptions {
+                        profile: true,
+                        ..Default::default()
+                    },
+                    Fr::from(3u64),
+                    Fr::from(5u64),
+                )
+                .unwrap();
+            assert_eq!(p.pre_blinding, proofs[0].pre_blinding, "profiled");
+        }
+        assert_eq!(proofs[0].pre_blinding, proofs[2].pre_blinding);
+        if reference.is_empty() {
+            reference = proofs;
+        } else {
+            for (p, r) in proofs.iter().zip(&reference) {
+                assert_eq!(p.pre_blinding, r.pre_blinding, "{name}");
+                assert_eq!((p.a, p.b, p.c), (r.a, r.b, r.c), "{name}");
+            }
+        }
+    }
+    assert!(!reference.is_empty(), "no layout was built");
 }
 
 /// G10: interleaved A/B of memory layouts on the real key (benchmark, ignored). `G10_VARIANTS`
@@ -823,21 +1030,21 @@ fn g10_bench() {
 
 /// Item G13: a witness written straight into the shared witness buffer proves exactly as the same
 /// witness passed as a slice (same blinding: equal proofs), and [planned_bytes] is the footprint
-/// the build checked against the budget.
+/// the build checked against the budget. (Asked before the build: the `Auto` layouts depend on
+/// the room left, and once the prover is built an 8 GiB budget has room only for a reduced one;
+/// item B9-4G, the assertion failed at 8 GiB before.)
 #[test]
 fn g13_in_place_witness_bit_exact() {
     let _lock = prover_test_lock();
     let Some(dir) = component_dir() else {
         return;
     };
+    let setup = SetupParams::new(&dir).unwrap();
+    let planned = planned_bytes(&setup, MemOptions::from_env()).unwrap();
     let Some(mut prover) = build_or_refused(&dir) else {
         return;
     };
-    let setup = SetupParams::new(&dir).unwrap();
-    assert_eq!(
-        planned_bytes(&setup, MemOptions::from_env()).unwrap(),
-        prover.build_stats.planned_bytes
-    );
+    assert_eq!(planned, prover.build_stats.planned_bytes);
     let opts = ProveOptions::default();
     for seed in [13u64, 14] {
         let witness = random_witness(&prover, seed);

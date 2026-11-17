@@ -57,6 +57,9 @@ pub const FUSED_LOG: u32 = 9;
 pub const MAX_LG: u32 = 27;
 /// log2 of the low window of the coset power tables (shift^k = lo[k mod 2^12] * hi[k >> 12]).
 const LG_LO: u32 = 12;
+/// The byte a lent twiddle region is filled with before [NttPlan::encode_lent_twiddles] (item
+/// B9-4G): every 32-bit limb 0x01010101, a canonical Montgomery form (below r).
+pub const LENT_FILL_BYTE: u8 = 0x01;
 
 /// Buffer indices of the kernels (mirrors the comment blocks of `bit_rev.metal`/`ntt.metal`).
 pub mod buf {
@@ -244,8 +247,18 @@ pub struct NttPlan {
     n: u64,
     schedule: NttSchedule,
     kernels: NttKernels,
-    /// w^j, j < max(n/2, 1).
+    /// w^j, j < max(n/2, 1), at byte offset [Self::tw_off] of this buffer. Owned (built once
+    /// with the plan), or (item B9-4G, [NttPlan::with_lent_twiddles]) a region of a caller's
+    /// buffer that is free while the NTTs run, rewritten by [NttPlan::encode_lent_twiddles]
+    /// before each use.
     tw: Buffer,
+    tw_off: u64,
+    tw_lent: bool,
+    /// For a lent table: w^k for k < 2^tw_lg_lo, and K^-1 w^(k 2^tw_lg_lo) with K the element
+    /// whose bytes are all [LENT_FILL_BYTE] (see [NttPlan::encode_lent_twiddles]).
+    tw_lo: Option<Buffer>,
+    tw_hi: Option<Buffer>,
+    tw_lg_lo: u32,
     /// shift^k for k < 2^lg_lo.
     coset_lo: Buffer,
     /// shift^(k 2^lg_lo) for k < 2^(lg - lg_lo).
@@ -291,6 +304,22 @@ impl NttPlan {
         lg: u32,
         schedule: NttSchedule,
     ) -> Result<Self> {
+        Self::with_lent_twiddles(device, queue, kernels, lg, schedule, None)
+    }
+
+    /// [Self::with_kernels], with the twiddle table (n/2 Fr, [Self::twiddle_bytes]) in
+    /// `lent_tw` = (buffer, byte offset) instead of an own buffer (item B9-4G: the Groth16
+    /// prover's 4 GiB layout lends the MSM scratch's free tail, -128 MiB at 2^23). A lent table
+    /// is not built here: the caller encodes [Self::encode_lent_twiddles] before the transforms
+    /// of each use, since the lender overwrites it in between. The coset tables stay owned.
+    pub fn with_lent_twiddles(
+        device: &DeviceRef,
+        queue: &CommandQueueRef,
+        kernels: NttKernels,
+        lg: u32,
+        schedule: NttSchedule,
+        lent_tw: Option<(&BufferRef, u64)>,
+    ) -> Result<Self> {
         ensure!(
             lg <= MAX_LG,
             "groth16-metal: NTT domain 2^{lg} too large (max 2^{MAX_LG})"
@@ -313,18 +342,58 @@ impl NttPlan {
         let private = |count: u64| {
             super::new_buffer_checked(device, count.max(1) * FR_BYTES, true, "the NTT tables")
         };
-        let tw = private(n / 2)?;
+        let (tw, tw_off) = match lent_tw {
+            Some((buf, off)) => {
+                ensure!(
+                    off.is_multiple_of(FR_BYTES)
+                        && buf.length() >= off + Self::twiddle_bytes_for(lg),
+                    "groth16-metal: lent NTT twiddle region ({} bytes at {off}) too small for \
+                     2^{lg}",
+                    buf.length()
+                );
+                (buf.to_owned(), off)
+            }
+            None => (private(n / 2)?, 0),
+        };
+        // A lent table is rebuilt per use as fill(K) * lo[j mod 2^lo] * hi[j >> lo]
+        // (`ntt_mul_powers`, two multiplications per entry) from these small tables.
+        let tw_lg = lg.saturating_sub(1);
+        let tw_lg_lo = tw_lg.min(LG_LO);
+        let (tw_lo, tw_hi) = if lent_tw.is_some() {
+            (
+                Some(private(1 << tw_lg_lo)?),
+                Some(private(1 << (tw_lg - tw_lg_lo))?),
+            )
+        } else {
+            (None, None)
+        };
         let coset_lo = private(1 << lg_lo)?;
         let coset_hi = private(1 << (lg - lg_lo))?;
         let coset_hi_ninv = private(1 << (lg - lg_lo))?;
 
         submit_and_wait(queue, |enc| {
-            encode_powers(&kernels, enc, &tw, (n / 2).max(1), Fr::one(), w);
-            encode_powers(&kernels, enc, &coset_lo, 1 << lg_lo, Fr::one(), shift);
+            match (&tw_lo, &tw_hi) {
+                (Some(lo), Some(hi)) => {
+                    let kinv = lent_fill_element().inverse().unwrap();
+                    encode_powers(&kernels, enc, lo, 0, 1 << tw_lg_lo, Fr::one(), w);
+                    encode_powers(
+                        &kernels,
+                        enc,
+                        hi,
+                        0,
+                        1 << (tw_lg - tw_lg_lo),
+                        kinv,
+                        w.pow([1u64 << tw_lg_lo]),
+                    );
+                }
+                _ => encode_powers(&kernels, enc, &tw, 0, (n / 2).max(1), Fr::one(), w),
+            }
+            encode_powers(&kernels, enc, &coset_lo, 0, 1 << lg_lo, Fr::one(), shift);
             encode_powers(
                 &kernels,
                 enc,
                 &coset_hi,
+                0,
                 1 << (lg - lg_lo),
                 Fr::one(),
                 shift_hi,
@@ -333,6 +402,7 @@ impl NttPlan {
                 &kernels,
                 enc,
                 &coset_hi_ninv,
+                0,
                 1 << (lg - lg_lo),
                 ninv,
                 shift_hi,
@@ -345,6 +415,11 @@ impl NttPlan {
             schedule,
             kernels,
             tw,
+            tw_off,
+            tw_lent: lent_tw.is_some(),
+            tw_lo,
+            tw_hi,
+            tw_lg_lo,
             coset_lo,
             coset_hi,
             coset_hi_ninv,
@@ -375,17 +450,68 @@ impl NttPlan {
         self.schedule
     }
 
-    /// Bytes of GPU memory the plan's tables hold.
-    pub fn table_bytes(&self) -> u64 {
-        self.tw.length()
-            + self.coset_lo.length()
-            + self.coset_hi.length()
-            + self.coset_hi_ninv.length()
+    /// Bytes of the twiddle table for 2^lg (n/2 Fr, at least one).
+    pub fn twiddle_bytes_for(lg: u32) -> u64 {
+        ((1u64 << lg) / 2).max(1) * FR_BYTES
     }
 
-    /// The twiddle table (w^j, j < n/2), for tests.
-    pub fn twiddles(&self) -> &BufferRef {
-        &self.tw
+    /// Whether the twiddle table is lent ([Self::with_lent_twiddles]).
+    pub fn twiddles_lent(&self) -> bool {
+        self.tw_lent
+    }
+
+    /// The region a lent twiddle table occupies, (buffer, byte offset, bytes); `None` for an
+    /// owned table. Before [Self::encode_lent_twiddles], fill it with [LENT_FILL_BYTE] (a blit
+    /// in the same command buffer, or [Self::encode_lent_fill]).
+    pub fn lent_twiddle_region(&self) -> Option<(&BufferRef, u64, u64)> {
+        self.tw_lent
+            .then(|| (&*self.tw, self.tw_off, Self::twiddle_bytes_for(self.lg)))
+    }
+
+    /// Fill the lent region with [LENT_FILL_BYTE] (a no-op for an owned table).
+    pub fn encode_lent_fill(&self, blit: &metal::BlitCommandEncoderRef) {
+        if let Some((buf, off, len)) = self.lent_twiddle_region() {
+            blit.fill_buffer(buf, metal::NSRange::new(off, len), LENT_FILL_BYTE);
+        }
+    }
+
+    /// Item B9-4G: rebuild a lent twiddle table in its region, which must hold
+    /// [LENT_FILL_BYTE] bytes (filled earlier in the same command buffer or queue): each entry
+    /// K * lo[j mod 2^lo] * hi[j >> lo] = w^j (`ntt_mul_powers`, the same canonical values as
+    /// the owned table, bit for bit). A no-op for an owned table. Encode the fill and this
+    /// before the transforms whenever the lender may have written the region since the last use.
+    pub fn encode_lent_twiddles(&self, enc: &ComputeCommandEncoderRef) {
+        let (Some(lo), Some(hi)) = (&self.tw_lo, &self.tw_hi) else {
+            return;
+        };
+        let p = MulPowersParams {
+            lg: self.lg.saturating_sub(1),
+            lg_lo: self.tw_lg_lo,
+            bitrev: 0,
+            _pad: 0,
+        };
+        enc.set_compute_pipeline_state(self.mul_powers_pso());
+        enc.set_buffer(buf::X, Some(&self.tw), self.tw_off);
+        enc.set_buffer(buf::MUL_LO, Some(lo), 0);
+        enc.set_buffer(buf::MUL_HI, Some(hi), 0);
+        set_params(enc, buf::MUL_PARAMS, &p);
+        dispatch_1d(enc, self.mul_powers_pso(), 1 << p.lg);
+    }
+
+    /// Bytes of GPU memory the plan's own tables hold (a lent twiddle table is not counted; its
+    /// small rebuild tables are).
+    pub fn table_bytes(&self) -> u64 {
+        let tw = if self.tw_lent { 0 } else { self.tw.length() };
+        let rebuild = [&self.tw_lo, &self.tw_hi]
+            .iter()
+            .map(|b| b.as_ref().map_or(0, |b| b.length()))
+            .sum::<u64>();
+        tw + rebuild + self.coset_lo.length() + self.coset_hi.length() + self.coset_hi_ninv.length()
+    }
+
+    /// The twiddle table (w^j, j < n/2) and its byte offset, for tests.
+    pub fn twiddles(&self) -> (&BufferRef, u64) {
+        (&self.tw, self.tw_off)
     }
 
     /// Coefficients -> evaluations over the domain, natural order in and out.
@@ -557,7 +683,7 @@ impl NttPlan {
                     };
                     enc.set_compute_pipeline_state(self.stage_pso());
                     enc.set_buffer(buf::X, Some(x), offset);
-                    enc.set_buffer(buf::TW, Some(&self.tw), 0);
+                    enc.set_buffer(buf::TW, Some(&self.tw), self.tw_off);
                     set_params(enc, buf::STAGE_PARAMS, &p);
                     dispatch_1d(enc, self.stage_pso(), self.n / 2);
                 }
@@ -580,7 +706,7 @@ impl NttPlan {
                     };
                     enc.set_compute_pipeline_state(self.fused_pso());
                     enc.set_buffer(buf::X, Some(x), offset);
-                    enc.set_buffer(buf::TW, Some(&self.tw), 0);
+                    enc.set_buffer(buf::TW, Some(&self.tw), self.tw_off);
                     set_params(enc, buf::STAGE_PARAMS, &p);
                     enc.set_threadgroup_memory_length(0, tg_bytes);
                     enc.dispatch_thread_groups(
@@ -593,11 +719,18 @@ impl NttPlan {
     }
 }
 
+/// K: the element whose Montgomery limbs are all [LENT_FILL_BYTE] bytes.
+fn lent_fill_element() -> Fr {
+    let b = LENT_FILL_BYTE as u32;
+    fr_from_words(&[b * 0x0101_0101; 8])
+}
+
 /// `out[j] = c * base^j` for j < count.
 fn encode_powers(
     k: &NttKernels,
     enc: &ComputeCommandEncoderRef,
     out: &BufferRef,
+    offset: u64,
     count: u64,
     c: Fr,
     base: Fr,
@@ -614,7 +747,7 @@ fn encode_powers(
         s.square_in_place();
     }
     enc.set_compute_pipeline_state(&k.powers);
-    enc.set_buffer(buf::POWERS_OUT, Some(out), 0);
+    enc.set_buffer(buf::POWERS_OUT, Some(out), offset);
     set_params(enc, buf::POWERS_PARAMS, &p);
     dispatch_1d(enc, &k.powers, count);
 }
@@ -794,7 +927,8 @@ mod tests {
             let out = upload(&c, &vec![Fr::zero(); n / 2]);
             let cb = c.queue.new_command_buffer();
             let blit = cb.new_blit_command_encoder();
-            blit.copy_from_buffer(plan.twiddles(), 0, &out, 0, (n as u64 / 2) * FR_BYTES);
+            let (tw, tw_off) = plan.twiddles();
+            blit.copy_from_buffer(tw, tw_off, &out, 0, (n as u64 / 2) * FR_BYTES);
             blit.end_encoding();
             cb.commit();
             cb.wait_until_completed();
@@ -923,6 +1057,119 @@ mod tests {
             "R17AUDIT groth16 ntt lg {lg} x{} schedules: {reps}/{reps} reps equal ark",
             ALL.len()
         );
+    }
+
+    /// Item B9-4G: a plan whose twiddle table is lent (a region of a larger buffer at an
+    /// offset, holding garbage until [NttPlan::encode_lent_twiddles] rewrites it) gives the same
+    /// tables and transforms as an owned one, and owns only the coset tables; the region is
+    /// rewritten in the same command buffer before each use, so a lender that overwrites it in
+    /// between (here: random bytes) does not matter.
+    #[test]
+    fn lent_twiddles_match_owned() {
+        // The fill element is canonical (the kernels' inputs must be below r).
+        let k = lent_fill_element();
+        assert_eq!(fr_from_words(&fr_to_words(&k)), k);
+        assert!(k.0 < Fr::MODULUS);
+        let Some(c) = ctx() else { return };
+        for lg in [0u32, 1, 2, 10, 12, 13, 16, 20] {
+            let n = 1usize << lg;
+            let owned = NttPlan::new(&c.device, &c.queue, &c.lib, lg).unwrap();
+            let off = 3 * FR_BYTES * 1024;
+            let tw_len = (NttPlan::twiddle_bytes_for(lg) / FR_BYTES) as usize;
+            let lender = upload(&c, &random(3 * 1024 + tw_len + 7, 77 + lg as u64));
+            let too_small = upload(&c, &random(3 * 1024 + tw_len - 1, 1));
+            assert!(NttPlan::with_lent_twiddles(
+                &c.device,
+                &c.queue,
+                NttKernels::new(&c.device, &c.lib).unwrap(),
+                lg,
+                NttSchedule::default(),
+                Some((&too_small, off)),
+            )
+            .is_err());
+            let lent = NttPlan::with_lent_twiddles(
+                &c.device,
+                &c.queue,
+                NttKernels::new(&c.device, &c.lib).unwrap(),
+                lg,
+                NttSchedule::default(),
+                Some((&lender, off)),
+            )
+            .unwrap();
+            assert!(lent.twiddles_lent() && !owned.twiddles_lent());
+            assert!(owned.lent_twiddle_region().is_none());
+            assert_eq!(
+                lent.lent_twiddle_region().map(|(_, o, l)| (o, l)),
+                Some((off, NttPlan::twiddle_bytes_for(lg)))
+            );
+            // The rebuild tables: 2^lo + 2^(lg - 1 - lo) Fr.
+            let tl = lg.saturating_sub(1).min(LG_LO);
+            let rebuild = ((1u64 << tl) + (1u64 << (lg.saturating_sub(1) - tl))) * FR_BYTES;
+            assert_eq!(
+                lent.table_bytes() + NttPlan::twiddle_bytes_for(lg),
+                owned.table_bytes() + rebuild
+            );
+            let input = random(n, 500 + lg as u64);
+            for round in 0..2 {
+                // The lender scribbles over the region between uses.
+                let junk = random(tw_len, 900 + round + lg as u64);
+                let w = lender.contents() as *mut u32;
+                for (i, x) in junk.iter().enumerate() {
+                    let words = fr_to_words(x);
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(words.as_ptr(), w.add(8 * (3 * 1024 + i)), 8)
+                    };
+                }
+                let fill = || {
+                    let cb = c.queue.new_command_buffer();
+                    let blit = cb.new_blit_command_encoder();
+                    lent.encode_lent_fill(blit);
+                    owned.encode_lent_fill(blit); // no-op
+                    blit.end_encoding();
+                    cb.commit();
+                    cb.wait_until_completed();
+                };
+                let (want, _) = run(&c, &owned, &input, NttPlan::encode_to_coset);
+                fill();
+                let (got, _) = run(&c, &lent, &input, |p, enc, b, o| {
+                    p.encode_lent_twiddles(enc);
+                    p.encode_to_coset(enc, b, o);
+                });
+                assert_same(&format!("lent to_coset lg {lg} round {round}"), &got, &want);
+                let (want, _) = run(&c, &owned, &input, |p, enc, b, o| {
+                    p.encode_lent_twiddles(enc); // no-op
+                    p.encode_forward(enc, b, o);
+                });
+                fill();
+                let (got, _) = run(&c, &lent, &input, |p, enc, b, o| {
+                    p.encode_lent_twiddles(enc);
+                    p.encode_forward(enc, b, o);
+                });
+                assert_same(&format!("lent forward lg {lg} round {round}"), &got, &want);
+                // The region now holds exactly the owned table, and nothing outside it changed.
+                let (tw, tw_off) = owned.twiddles();
+                let copy = upload(&c, &vec![Fr::zero(); tw_len]);
+                let cb = c.queue.new_command_buffer();
+                let blit = cb.new_blit_command_encoder();
+                blit.copy_from_buffer(tw, tw_off, &copy, 0, tw_len as u64 * FR_BYTES);
+                blit.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+                let all = download(&lender, 3 * 1024 + tw_len + 7);
+                assert_same(
+                    "lent table",
+                    &all[3 * 1024..3 * 1024 + tw_len],
+                    &download(&copy, tw_len),
+                );
+                let orig = random(3 * 1024 + tw_len + 7, 77 + lg as u64);
+                assert_same("before the region", &all[..3 * 1024], &orig[..3 * 1024]);
+                assert_same(
+                    "after the region",
+                    &all[3 * 1024 + tw_len..],
+                    &orig[3 * 1024 + tw_len..],
+                );
+            }
+        }
     }
 
     /// Two transforms at different offsets of one buffer, in one command buffer.

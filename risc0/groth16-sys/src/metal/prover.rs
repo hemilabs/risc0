@@ -64,9 +64,14 @@
 //! regenerated fuzz and the MSM pieces once MSM H's sort has consumed h; without `alias` a, b, c
 //! 768 MiB + fuzz + pieces), witness 191 MiB, NTT tables 128 MiB, MSM scratch ~542 MiB (~412 MiB
 //! split). Everything is allocated at construction (nothing during a proof), after one budget
-//! check of the whole footprint ([super::check_working_set]); planned 4169.0 MiB unsplit and
-//! 4038.9 MiB split, so the smallest working-set budget that builds it is ~3.95 GiB. (The 3.0
-//! key, v0.1.0: 5,635,930 elements, 3890-3900 MiB, ~3.84 GiB.)
+//! check of the whole footprint ([super::check_working_set]), which is the real growth plus
+//! at most ~3 MiB of page rounding (item B9-4G; P31-12 kept 32 MiB of slack): planned 4141.0 MiB
+//! unsplit, 4010.9 MiB split. Item B9-4G: [MemOptions::tw_lent] keeps the NTT twiddle table
+//! (128 MiB) in the MSM scratch's `sorted` buffer behind c, rebuilt in each proof (a fill and
+//! one `ntt_mul_powers` pass, < 1 ms), so the split layout takes 3882 MiB (planned 3885.0 MiB)
+//! and a 4 GiB budget keeps ~150 MiB beside it and the process-wide pipeline objects (46-62
+//! MiB). [SplitH::Auto] / [TwLent::Auto] take the reduced layouts only where the faster ones do
+//! not fit ([choose_layout]). (The 3.0 key, v0.1.0: 5,635,930 elements, 3890-3900 MiB.)
 
 use std::{
     fs::File,
@@ -101,9 +106,6 @@ use super::{
 use crate::SetupParams;
 
 const FR_BYTES: u64 = 32;
-/// Allowance for page rounding of ~20 buffers and the NTT plan's pipelines in the footprint
-/// check (measured: the plan without it was 0.3 MiB below the real growth).
-const PLAN_SLACK: u64 = 32 << 20;
 
 /// The process-wide GPU objects: device, queue, the groth16 library and the pipelines of the
 /// small kernels and the MSM (built once; cold creation of the MSM pipelines takes up to minutes
@@ -127,16 +129,24 @@ pub struct Kernels {
 impl Kernels {
     /// An NTT plan for 2^lg with the default schedule, from the shared pipelines if there are.
     pub fn ntt_plan(&self, lg: u32) -> Result<NttPlan> {
-        match &self.ntt {
-            Some(k) => NttPlan::with_kernels(
-                &self.device,
-                &self.queue,
-                k.clone(),
-                lg,
-                NttSchedule::default(),
-            ),
-            None => NttPlan::new(&self.device, &self.queue, &self.library, lg),
-        }
+        self.ntt_plan_with(lg, None)
+    }
+
+    /// [Self::ntt_plan], with the twiddle table in `lent_tw` (item B9-4G,
+    /// [NttPlan::with_lent_twiddles]).
+    pub fn ntt_plan_with(&self, lg: u32, lent_tw: Option<(&BufferRef, u64)>) -> Result<NttPlan> {
+        let kernels = match &self.ntt {
+            Some(k) => k.clone(),
+            None => NttKernels::new(&self.device, &self.library)?,
+        };
+        NttPlan::with_lent_twiddles(
+            &self.device,
+            &self.queue,
+            kernels,
+            lg,
+            NttSchedule::default(),
+            lent_tw,
+        )
     }
 }
 
@@ -446,7 +456,45 @@ pub struct MemOptions {
     /// device allocation with the v0.2.0 key; +2.5 ms of GPU time per proof, profiled). See
     /// [SplitH]; the results are the same group elements.
     pub split_h: SplitH,
+    /// `tw_lent` (item B9-4G): the NTT twiddle table (n/2 Fr, 128 MiB at 2^23) in the MSM
+    /// scratch's `sorted` buffer behind c, rewritten at the start of every proof's NTT stage
+    /// instead of kept in an own buffer: -126 MiB of device allocation with the v0.2.0 key (the
+    /// `sorted` buffer grows by 2.1 MiB to hold c and the table). See [TwLent]; same results,
+    /// bit for bit.
+    pub tw_lent: TwLent,
 }
+
+/// When [MemOptions::tw_lent] lends the twiddle table. `RISC0_G16_METAL_TW_LENT=on|auto|off`
+/// (default `auto`); `RISC0_G16_METAL_G10_OFF=tw_lent` is `off`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TwLent {
+    /// Never (an own twiddle buffer, built once per key load).
+    Off,
+    /// Only for the smallest layout, when the layouts without it do not fit the working-set
+    /// room with [AUTO_HEADROOM_BYTES] to spare (see [layout]): the 4 GiB tier, where the
+    /// process-wide pipeline objects (46-62 MiB) left 22-57 MiB beside the split layout.
+    Auto,
+    /// Always (tests, A/B).
+    On,
+}
+
+impl TwLent {
+    fn parse(v: &str) -> Option<Self> {
+        match v {
+            "on" | "1" => Some(Self::On),
+            "auto" => Some(Self::Auto),
+            "off" | "0" => Some(Self::Off),
+            _ => None,
+        }
+    }
+}
+
+/// Item B9-4G: the room [SplitH::Auto] / [TwLent::Auto] keep beside a reduced layout before they
+/// take the next smaller one. Things the prover's check cannot see come and go beside it:
+/// process-wide pipeline objects built later (a first keccak proof adds 16 MiB steps), the
+/// zkp HAL's small persistent buffers. 128 MiB is twice the largest such set measured (62 MiB
+/// after the zk-miner worker's start-up warmup).
+pub const AUTO_HEADROOM_BYTES: u64 = 128 << 20;
 
 /// When [MemOptions::split_h] splits MSM H. `RISC0_G16_METAL_SPLIT_H=on|auto|off` (default
 /// `auto`); `RISC0_G16_METAL_G10_OFF=split_h` is `off`.
@@ -456,9 +504,9 @@ pub enum SplitH {
     Off,
     /// Only when the unsplit footprint does not fit the working-set room (the limit,
     /// `RISC0_METAL_MAX_WORKING_SET_BYTES` or the device's recommended working set, minus what is
-    /// allocated) and the split one is smaller: the v0.2.0 key's prover plans 4169.0 MiB unsplit,
-    /// above a 4 GiB budget, and 4038.9 MiB split. Above that, the (slightly) faster unsplit
-    /// layout.
+    /// allocated) and the split one is smaller: the v0.2.0 key's prover plans 4141.0 MiB unsplit,
+    /// above a 4 GiB budget, and 4010.9 MiB split (3885.0 MiB with [TwLent]; [choose_layout]
+    /// has the whole rule). Above that, the (slightly) faster unsplit layout.
     Auto,
     /// Always (tests, A/B).
     On,
@@ -483,7 +531,7 @@ impl Default for MemOptions {
 
 impl MemOptions {
     /// Switch names for `RISC0_G16_METAL_G10_OFF`.
-    pub const NAMES: &'static [&'static str] = &["compact", "mmap", "alias", "split_h"];
+    pub const NAMES: &'static [&'static str] = &["compact", "mmap", "alias", "split_h", "tw_lent"];
 
     pub fn all() -> Self {
         Self {
@@ -491,6 +539,7 @@ impl MemOptions {
             mmap: true,
             alias: true,
             split_h: SplitH::Auto,
+            tw_lent: TwLent::Auto,
         }
     }
 
@@ -501,24 +550,26 @@ impl MemOptions {
             mmap: false,
             alias: false,
             split_h: SplitH::Off,
+            tw_lent: TwLent::Off,
         }
     }
 
-    /// Turn the switch `name` on or off; false for an unknown name. `split_h` on is
-    /// [SplitH::Auto].
+    /// Turn the switch `name` on or off; false for an unknown name. `split_h` / `tw_lent` on
+    /// is [SplitH::Auto] / [TwLent::Auto].
     pub fn set(&mut self, name: &str, on: bool) -> bool {
         match name {
             "compact" => self.compact = on,
             "mmap" => self.mmap = on,
             "alias" => self.alias = on,
             "split_h" => self.split_h = if on { SplitH::Auto } else { SplitH::Off },
+            "tw_lent" => self.tw_lent = if on { TwLent::Auto } else { TwLent::Off },
             _ => return false,
         }
         true
     }
 
     /// Like [Tuning::parse]: "base" (= none), "all", "-name", "+name", comma separated; also
-    /// "split_h=on|auto|off".
+    /// "split_h=on|auto|off", "tw_lent=on|auto|off".
     pub fn parse(spec: &str) -> Option<Self> {
         let mut t = Self::all();
         for item in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -528,6 +579,10 @@ impl MemOptions {
                 _ => {
                     if let Some(v) = item.strip_prefix("split_h=") {
                         t.split_h = SplitH::parse(v)?;
+                        continue;
+                    }
+                    if let Some(v) = item.strip_prefix("tw_lent=") {
+                        t.tw_lent = TwLent::parse(v)?;
                         continue;
                     }
                     let (on, name) = match item.as_bytes()[0] {
@@ -561,6 +616,12 @@ impl MemOptions {
             match SplitH::parse(v.trim()) {
                 Some(s) => t.split_h = s,
                 None => eprintln!("[groth16-metal] RISC0_G16_METAL_SPLIT_H={v}: not on|auto|off"),
+            }
+        }
+        if let Ok(v) = std::env::var("RISC0_G16_METAL_TW_LENT") {
+            match TwLent::parse(v.trim()) {
+                Some(s) => t.tw_lent = s,
+                None => eprintln!("[groth16-metal] RISC0_G16_METAL_TW_LENT={v}: not on|auto|off"),
             }
         }
         t
@@ -623,7 +684,8 @@ pub struct BuildStats {
     pub srs_load: Duration,
     pub coeffs_load: Duration,
     pub coeffs_validate: Duration,
-    /// NTT plan (its pipelines and twiddle tables) + fuzz generation + scratch allocation.
+    /// NTT plan (its tables; with [MemOptions::tw_lent] only the small ones) + fuzz generation
+    /// + scratch allocation.
     pub gpu_setup: Duration,
     pub total: Duration,
     /// Device `currentAllocatedSize` before loading and once built (process-wide).
@@ -636,6 +698,8 @@ pub struct BuildStats {
     /// Whether MSM H is split ([MemOptions::split_h], decided at the build under
     /// [SplitH::Auto]).
     pub split_h: bool,
+    /// Whether the NTT twiddles are lent ([MemOptions::tw_lent]).
+    pub tw_lent: bool,
     /// Process physical footprint (`proc_pid_rusage`) before loading and once built.
     pub footprint_before: u64,
     pub footprint_after: u64,
@@ -797,6 +861,8 @@ pub struct MetalProver {
     c_in_scratch: bool,
     /// MSM H runs as two MSMs over the domain's halves ([MemOptions::split_h]).
     split_h: bool,
+    /// The NTT twiddles live in the scratch's `sorted` buffer ([MemOptions::tw_lent]).
+    tw_lent: bool,
     /// Blocks of the ChaCha fuzz (`fuzz_blocks(wn)`).
     fuzz_blocks: u64,
     mem: MemOptions,
@@ -882,10 +948,13 @@ impl MetalProver {
             polys,
             pieces_lent,
             split_h,
+            tw_lent,
+            sorted_min,
             planned_bytes,
         } = layout(srs_path, coeffs_path, mem, working_set_room(device))?;
         stats.planned_bytes = planned_bytes;
         stats.split_h = split_h;
+        stats.tw_lent = tw_lent;
         check_working_set(
             device,
             "the Groth16 prover (proving key, coefficients and scratch)",
@@ -936,8 +1005,29 @@ impl MetalProver {
         let fault = alloc(16, false, "the fault word")?;
         let wsums = alloc(wsum_bytes, false, "the MSM window sums")?;
         check_working_set(device, "the NTT tables", ntt_bytes)?;
-        let ntt = k.ntt_plan(lg)?;
-        let mut scratch = MsmScratch::new_with(device, cap, cfg, pieces_lent.then_some(&*abc))?;
+        let (ntt, mut scratch) = if tw_lent {
+            // Item B9-4G: the scratch first, its `sorted` buffer holds the twiddles behind c.
+            let scratch = MsmScratch::new_with_sorted(
+                device,
+                cap,
+                cfg,
+                pieces_lent.then_some(&*abc),
+                sorted_min,
+            )?;
+            let tw_off = if c_in_scratch { n as u64 * FR_BYTES } else { 0 };
+            let ntt = k.ntt_plan_with(lg, Some((scratch.sorted_buffer(), tw_off)))?;
+            (ntt, scratch)
+        } else {
+            let ntt = k.ntt_plan(lg)?;
+            let scratch = MsmScratch::new_with_sorted(
+                device,
+                cap,
+                cfg,
+                pieces_lent.then_some(&*abc),
+                sorted_min,
+            )?;
+            (ntt, scratch)
+        };
         ensure!(
             scratch.pieces_lent() == pieces_lent,
             "groth16-metal: MSM piece buffer layout"
@@ -975,6 +1065,7 @@ impl MetalProver {
             abc,
             c_in_scratch,
             split_h,
+            tw_lent,
             fuzz_blocks,
             mem,
             witness,
@@ -997,6 +1088,11 @@ impl MetalProver {
     /// Whether this prover splits MSM H ([MemOptions::split_h]).
     pub fn split_h(&self) -> bool {
         self.split_h
+    }
+
+    /// Whether this prover lends its NTT twiddles to the MSM scratch ([MemOptions::tw_lent]).
+    pub fn tw_lent(&self) -> bool {
+        self.tw_lent
     }
 
     /// The coefficients (full or compact).
@@ -1124,7 +1220,12 @@ impl MetalProver {
             (abc, 2 * nn * FR_BYTES)
         };
 
-        run.fill_new(abc, 2 * nn * FR_BYTES);
+        // Item B9-4G: a lent twiddle region gets its fill here, and its table in the NTT stage.
+        let mut fills = vec![(&**abc, 0, 2 * nn * FR_BYTES, 0u8)];
+        if let Some((buf, off, len)) = self.ntt.lent_twiddle_region() {
+            fills.push((buf, off, len, super::ntt::LENT_FILL_BYTE));
+        }
+        run.fill_new(&fills);
         let coeffs = &self.coeffs;
         run.stage("witness_poly", 0, |enc| {
             encode_witness_poly(
@@ -1152,6 +1253,10 @@ impl MetalProver {
         let fuzzed = !opts.tune.nofuzz;
         let fuzz_now = self.fuzz.as_ref().filter(|_| fuzzed);
         run.stage("ntt", 0, |enc| {
+            // Item B9-4G: a lent twiddle table was overwritten by the last proof's sorts; rebuild
+            // it from the fill above (no-op for an own table). witness_poly wrote only c, before
+            // it in `sorted`.
+            ntt.encode_lent_twiddles(enc);
             ntt.encode_to_coset(enc, abc, 0);
             ntt.encode_to_coset(enc, abc, fr(nn));
             ntt.encode_to_coset(enc, c_buf, c_off);
@@ -1524,6 +1629,10 @@ struct Layout {
     pieces_lent: bool,
     /// MSM H runs as two MSMs over the domain's halves ([MemOptions::split_h]).
     split_h: bool,
+    /// The NTT twiddles live in the scratch's `sorted` buffer ([MemOptions::tw_lent]).
+    tw_lent: bool,
+    /// The scratch's `sorted` buffer is at least this long (c and the lent twiddles).
+    sorted_min: u64,
     /// The whole footprint, checked against the working-set budget before loading.
     planned_bytes: u64,
 }
@@ -1547,11 +1656,12 @@ fn layout(srs_path: &Path, coeffs_path: &Path, mem: MemOptions, room: u64) -> Re
     let fuzz_blocks = small::fuzz_blocks(wn as u64);
     let fuzz_len = 2 * fuzz_blocks;
     let wsum_bytes = wsum_bytes(cfg);
-    let ntt_bytes = ((n as u64 / 2).max(1) + 4096 + 2 * (n as u64 >> 12).max(1)) * FR_BYTES;
-    let fixed = header.points_bytes() + coeffs_bytes + ntt_bytes + wsum_bytes + 16 + PLAN_SLACK;
+    let tw_bytes = NttPlan::twiddle_bytes_for(lg);
+    let coset_bytes = (4096 + 2 * (n as u64 >> 12).max(1)) * FR_BYTES;
+    let fixed = header.points_bytes() + coeffs_bytes + wsum_bytes + 16 + plan_slack();
     // The MSM scratch holds `cap` scalars: every MSM's (H over the domain, the witness MSMs over
     // wn), or with `split_h` (item P31-12) H's halves.
-    let plan = |split_h: bool| {
+    let plan = |split_h: bool, tw_lent: bool| {
         let cap = wn.max(if split_h { n / 2 } else { n }) as u32;
         let scratch_sizes = MsmScratch::sizes_for(cap, cfg);
         // Item G10 aliasing: c in the scratch's `sorted` buffer (index 4 of the sizes) and the
@@ -1565,9 +1675,20 @@ fn layout(srs_path: &Path, coeffs_path: &Path, mem: MemOptions, room: u64) -> Re
         if split_h && pieces_lent && scratch_sizes[5] > n as u64 * FR_BYTES {
             return None;
         }
+        // Item B9-4G: the twiddles behind c in `sorted` (free from the start of the proof to
+        // MSM H's sort), which grows to hold both if it must.
+        let sorted_min = if tw_lent {
+            let c_bytes = if c_in_scratch { n as u64 * FR_BYTES } else { 0 };
+            c_bytes + tw_bytes
+        } else {
+            0
+        };
+        let sorted_extra = sorted_min.saturating_sub(scratch_sizes[4]);
+        let ntt_bytes = coset_bytes + if tw_lent { 0 } else { tw_bytes };
         let own = (polys * n as u64 + wn as u64 + if fuzz_late { 0 } else { fuzz_len }) * FR_BYTES;
-        let planned_bytes = fixed + own + scratch_sizes.iter().sum::<u64>()
-            - if pieces_lent { scratch_sizes[5] } else { 0 };
+        let planned_bytes =
+            fixed + ntt_bytes + own + scratch_sizes.iter().sum::<u64>() + sorted_extra
+                - if pieces_lent { scratch_sizes[5] } else { 0 };
         Some(Layout {
             wn,
             n,
@@ -1583,19 +1704,89 @@ fn layout(srs_path: &Path, coeffs_path: &Path, mem: MemOptions, room: u64) -> Re
             polys,
             pieces_lent,
             split_h,
+            tw_lent,
+            sorted_min,
             planned_bytes,
         })
     };
-    let whole = plan(false).expect("unsplit layout");
-    Ok(match mem.split_h {
-        SplitH::Off => whole,
-        SplitH::On => plan(true).unwrap_or(whole),
-        SplitH::Auto if whole.planned_bytes <= room => whole,
-        SplitH::Auto => match plan(true) {
-            Some(split) if split.planned_bytes < whole.planned_bytes => split,
-            _ => whole,
-        },
-    })
+    Ok(choose_layout(mem, room, plan))
+}
+
+/// The layout [MemOptions] select for `room` bytes of working-set room; `plan(split_h,
+/// tw_lent)` makes a layout (`None`: that split is not possible with this key).
+///
+/// Forced switches (`On` / `Off`) are taken as given (a forced split this key cannot do falls
+/// back to the unsplit form, as in P31-12). Under `Auto` (the default) the candidates go from
+/// the fastest to the smallest: the first (unsplit, own twiddles) if it fits the room
+/// (P31-12's rule, so the default and 8 GiB budgets keep their layout); else, of the smaller
+/// ones, the first that leaves [AUTO_HEADROOM_BYTES] of the room, else the smallest (item
+/// B9-4G). With `tw_lent` off that is P31-12's rule: split whenever the unsplit layout does not
+/// fit and the split one is smaller.
+fn choose_layout(
+    mem: MemOptions,
+    room: u64,
+    plan: impl Fn(bool, bool) -> Option<Layout>,
+) -> Layout {
+    let splits: &[bool] = match mem.split_h {
+        SplitH::Off => &[false],
+        SplitH::On => &[true],
+        SplitH::Auto => &[false, true],
+    };
+    let tws: &[bool] = match mem.tw_lent {
+        TwLent::Off => &[false],
+        TwLent::On => &[true],
+        TwLent::Auto => &[false, true],
+    };
+    // Fastest first: the lent twiddles (a table rebuilt per proof) after the split.
+    let mut cands: Vec<Layout> = Vec::new();
+    for &tw in tws {
+        for &split in splits {
+            let forced_fallback = || {
+                if split && mem.split_h == SplitH::On {
+                    plan(false, tw)
+                } else {
+                    None
+                }
+            };
+            if let Some(l) = plan(split, tw).or_else(forced_fallback) {
+                cands.push(l);
+            }
+        }
+    }
+    let first = cands.remove(0);
+    if cands.is_empty() || first.planned_bytes <= room {
+        return first;
+    }
+    cands.retain(|l| l.planned_bytes < first.planned_bytes);
+    if let Some(i) = cands
+        .iter()
+        .position(|l| l.planned_bytes.saturating_add(AUTO_HEADROOM_BYTES) <= room)
+    {
+        return cands.swap_remove(i);
+    }
+    let Some(i) = (0..cands.len()).min_by_key(|&i| cands[i].planned_bytes) else {
+        return first;
+    };
+    cands.swap_remove(i)
+}
+
+/// Allowance in the planned footprint for page rounding of the ~20 buffers (measured below
+/// 1.2 MiB; item B9-4G) and, with `RISC0_G16_METAL_ARCHIVE=0`, the NTT plan's own pipelines,
+/// which that mode builds per key load after the check (P31-12's 32 MiB). With the archive
+/// (the default) the plan builds nothing, so the check is the real growth plus ~3 MiB.
+/// `RISC0_G16_METAL_PLAN_SLACK_MIB=<n>` overrides it (32 is P31-12's check).
+fn plan_slack() -> u64 {
+    if let Some(mib) = std::env::var("RISC0_G16_METAL_PLAN_SLACK_MIB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        return mib << 20;
+    }
+    if pipelines::use_archive() {
+        4 << 20
+    } else {
+        32 << 20
+    }
 }
 
 /// The working-set room [SplitH::Auto] plans for: the limit (the explicit budget, else the
@@ -1908,12 +2099,15 @@ impl<'q> Run<'q> {
         }
     }
 
-    fn open(&mut self, label: &str, group: u32, fill: Option<(&BufferRef, u64)>) {
+    /// `fills`: (buffer, offset, bytes, byte value) regions the new command buffer fills first.
+    fn open(&mut self, label: &str, group: u32, fills: &[(&BufferRef, u64, u64, u8)]) {
         self.close();
         let cb = self.queue.new_command_buffer().to_owned();
-        if let Some((buf, len)) = fill {
+        if !fills.is_empty() {
             let blit = cb.new_blit_command_encoder();
-            blit.fill_buffer(buf, NSRange::new(0, len), 0);
+            for &(buf, off, len, value) in fills {
+                blit.fill_buffer(buf, NSRange::new(off, len), value);
+            }
             blit.end_encoding();
         }
         let enc = cb.new_compute_command_encoder().to_owned();
@@ -1921,9 +2115,10 @@ impl<'q> Run<'q> {
         self.cur = Some((cb, enc, group));
     }
 
-    /// Start a new command buffer (group 0) whose first command zero-fills `len` bytes of `buf`.
-    fn fill_new(&mut self, buf: &BufferRef, len: u64) {
-        self.open("zero", 0, Some((buf, len)));
+    /// Start a new command buffer (group 0) whose first commands fill `fills` (see [Self::open];
+    /// the prover zero-fills a, b and, item B9-4G, fills a lent twiddle region).
+    fn fill_new(&mut self, fills: &[(&BufferRef, u64, u64, u8)]) {
+        self.open("zero", 0, fills);
     }
 
     /// Start a new command buffer (group `group`) whose first command copies `len` bytes from
@@ -1962,7 +2157,7 @@ impl<'q> Run<'q> {
             {
                 *self.labels.last_mut().unwrap() = format!("zero+{label}");
             }
-            _ => self.open(label, group, None),
+            _ => self.open(label, group, &[]),
         }
         f(&self.cur.as_ref().unwrap().1);
     }

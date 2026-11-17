@@ -31,10 +31,11 @@
 //! preload only allocates, reads the key files, builds pipelines and runs two small command
 //! buffers (fuzz and NTT tables) on its own queue; it never uses a `MetalHal`.
 //!
-//! Memory: the cached prover holds 3.9 GB of device memory for the rzup component (item G10:
-//! points mapped from the zkey without a copy, compact coefficients from a disk cache, a/b/c,
-//! fuzz and MSM pieces aliased; 5.6 GB with `RISC0_G16_METAL_G10=0`), see
-//! [prover::MemOptions]. `RISC0_METAL_MAX_WORKING_SET_BYTES` (the zkp HAL's budget, PLAN 9.1) is
+//! Memory: the cached prover holds 4142 MiB of device memory for the rzup v0.2.0 component (item
+//! G10: points mapped from the zkey without a copy, compact coefficients from a disk cache,
+//! a/b/c, fuzz and MSM pieces aliased; 6004 MiB with `RISC0_G16_METAL_G10=0`); where that does
+//! not fit, the smaller layouts of items P31-12 (split MSM H, 4012 MiB) and B9-4G (the NTT
+//! twiddles lent to the MSM scratch, 3882 MiB: the 4 GiB tier), see [prover::MemOptions]. `RISC0_METAL_MAX_WORKING_SET_BYTES` (the zkp HAL's budget, PLAN 9.1) is
 //! honoured: [check_working_set] fails before any allocation that would take the device's
 //! `currentAllocatedSize` above it, and the prover checks its whole footprint before loading.
 

@@ -1145,8 +1145,22 @@ impl MsmScratch {
         cfg: MsmConfig,
         pieces: Option<&BufferRef>,
     ) -> Result<Self> {
+        Self::new_with_sorted(device, cap_n, cfg, pieces, 0)
+    }
+
+    /// [Self::new_with], with the `sorted` buffer at least `min_sorted` bytes (item B9-4G: the
+    /// prover keeps c and the NTT twiddles there while no sort runs; see
+    /// [Self::sorted_buffer]). The MSMs use only its first [Self::sizes_for]`[4]` bytes.
+    pub fn new_with_sorted(
+        device: &DeviceRef,
+        cap_n: u32,
+        cfg: MsmConfig,
+        pieces: Option<&BufferRef>,
+        min_sorted: u64,
+    ) -> Result<Self> {
         cfg.validate();
-        let sizes = Self::sizes(cap_n, cfg);
+        let mut sizes = Self::sizes(cap_n, cfg);
+        sizes[4] = sizes[4].max(min_sorted);
         let lent = pieces.filter(|b| b.length() >= sizes[5]);
         let own: u64 = sizes.iter().sum::<u64>() - if lent.is_some() { sizes[5] } else { 0 };
         super::check_working_set(device, "the MSM scratch", own)?;
