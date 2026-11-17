@@ -16,12 +16,13 @@
 # recursion, keccak and Groth16 PSOs built first, as `warm_up_pipelines` does; receipts in
 # r<ver>_b<budget>_wpso).
 # Expected: every 3.1 receipt "STOCK 3.1 VERIFY: OK", every 3.0 receipt "REJECTED" (also with
-# --relabel-as-31). KNOWN_FAIL lists <receipt dir>/<case> runs whose Groth16 wrap is known to be
-# refused by the working-set budget (open issue in docs/metal-port/notes/P31-14.md): for those the
-# producer must fail with "Metal working-set budget exceeded" after writing composite and succinct
-# receipts (which must still verify), and the matrix shows KNOWN-FAIL; a known failure that now
-# passes is reported as an unexpected pass so the list gets updated. Exit 1 if any expectation
-# fails.
+# --relabel-as-31). KNOWN_FAIL (default empty) lists <receipt dir>/<case> runs whose Groth16 wrap
+# is known to be refused by the working-set budget: for those the producer must fail with "Metal
+# working-set budget exceeded" after writing composite and succinct receipts (which must still
+# verify), and the matrix shows KNOWN-FAIL; a known failure that now passes is reported as an
+# unexpected pass so the list gets updated. Exit 1 if any expectation fails. (P31-14 listed the
+# 3.1 keccak and warm-PSO fibonacci runs at 4 GiB; item B9-4G's smaller 4 GiB Groth16 layout
+# wraps them, docs/metal-port/notes/B9-4G.md.)
 # Long runs can be split (the matrix at the end judges every receipt already in OUT): CASES (default
 # "fibonacci merkle compose keccak") picks the unbudgeted cases, VERSIONS (default "31 30") the
 # producers to run, BUDGETS the budget runs ("" for none).
@@ -31,10 +32,9 @@ TREE=${HERE:h:h}
 : ${OUT:?set OUT} ${GUESTS:?set GUESTS}
 GPU_RUN=${GPU_RUN:-$HOME/zkminer/bin/gpu-run}
 BUDGETS=${BUDGETS-"8589934592 4294967296"}
-# The 3.1 Groth16 key (v0.2.0) reserves 4039 MiB, leaving 57 MiB at a 4 GiB budget for everything
-# else; the process-wide pipeline objects after a keccak proof, or after the worker's warmup, are
-# 62 MiB, so the key load is refused (3.0's smaller key fits). See the P31-14 note.
-KNOWN_FAIL=${KNOWN_FAIL-"r31_b4294967296/keccak r31_b4294967296_wpso/fibonacci"}
+# Nothing is known to fail: since B9-4G the 3.1 Groth16 prover takes 3882 MiB at a 4 GiB budget
+# (P31-14: 4039 MiB checked, refused once the keccak or worker-warmup pipeline objects existed).
+KNOWN_FAIL=${KNOWN_FAIL-""}
 mkdir -p $OUT/logs
 export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-6}
 
