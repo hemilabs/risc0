@@ -803,14 +803,32 @@ fn wraps_in_progress_and_reservations_keep_the_graph() {
         let w1 = mw::WrapGuard::begin();
         assert_eq!(mw::release_idle_now(), 0);
         assert!(mw::is_cached());
-        // A second wrap in progress: the first one's after-witness release (with or without its
-        // handle) leaves the cache to the last wrap out.
-        let w2 = mw::WrapGuard::begin();
+        // A second wrap in progress (on another thread: P31-G1, nested guards on one thread are
+        // one wrap): the first one's after-witness release (with or without its handle) leaves
+        // the cache to the last wrap out.
+        let (go, stop) = (
+            std::sync::mpsc::channel::<()>(),
+            std::sync::mpsc::channel::<()>(),
+        );
+        let (started, stop_rx) = (go.0, stop.1);
+        let other = std::thread::spawn(move || {
+            let _w2 = mw::WrapGuard::begin();
+            started.send(()).unwrap();
+            stop_rx.recv().unwrap();
+        });
+        go.1.recv().unwrap();
+        assert_eq!(mw::wraps_in_progress(), 2);
+        // A nested guard on this thread does not count as another wrap.
+        let nested = mw::WrapGuard::begin();
+        assert_eq!(mw::wraps_in_progress(), 2);
+        drop(nested);
         let held = mw::wrap_graph().unwrap();
         assert!(mw::release_slot(Some(&held), 1).is_none());
         assert!(mw::release_slot(None, 1).is_none());
         assert!(mw::is_cached());
-        drop((held, w2, w1));
+        stop.0.send(()).unwrap();
+        other.join().unwrap();
+        drop((held, w1));
     }
     assert_eq!(mw::wraps_in_progress(), 0);
     // The next job's prestart reserved the graph: neither a drain nor a failed wrap's release
@@ -833,6 +851,283 @@ fn wraps_in_progress_and_reservations_keep_the_graph() {
     mw::release_idle_now();
     assert!(!mw::is_cached());
     assert_eq!(mw::drops(), d0 + 1);
+}
+
+/// Item P31-G1: [mw::Reservations] in isolation: owned per thread (a thread's next prestart
+/// replaces its untaken one), each lapses on its own (a later reservation does not renew an
+/// earlier one), a wrap takes its own thread's, else the newest.
+#[test]
+fn reservations_are_owned_and_lapse() {
+    use super::super::metal_witness::Reservations;
+    let ttl = Duration::from_secs(30);
+    let other = || {
+        std::thread::spawn(|| std::thread::current().id())
+            .join()
+            .unwrap()
+    };
+    let (me, a, b) = (std::thread::current().id(), other(), other());
+    let t0 = Instant::now();
+    let at = |s: u64| t0 + Duration::from_secs(s);
+
+    // The W7-G1 review-3 shape: a leaked reservation (a), then jobs on another thread (me) every
+    // 10 s, each reserving and wrapping. The leaked one lapses at 30 s although jobs keep coming.
+    let mut r = Reservations::new();
+    assert!(!r.reserve(a, at(0), ttl));
+    for k in 1..=6u64 {
+        assert!(!r.reserve(me, at(10 * k), ttl));
+        assert!(r.take(me, true, at(10 * k + 1), ttl));
+        let live = r.live(at(10 * k + 2), ttl);
+        assert_eq!(live, usize::from(10 * k + 2 < 30), "job {k}: {live} live");
+    }
+
+    // Owned: the same thread's second prestart replaces its first (its wrap never came).
+    let mut r = Reservations::new();
+    assert!(!r.reserve(me, at(0), ttl));
+    assert!(r.reserve(me, at(5), ttl));
+    assert_eq!(r.live(at(6), ttl), 1);
+    assert!(r.take(me, false, at(6), ttl));
+    assert_eq!(r.live(at(6), ttl), 0);
+
+    // A wrap on a thread without a reservation takes the newest only with `any`, so the older
+    // (leaked) one lapses on its own schedule.
+    let mut r = Reservations::new();
+    r.reserve(a, at(0), ttl);
+    r.reserve(b, at(20), ttl);
+    assert!(!r.take(me, false, at(21), ttl));
+    assert_eq!(r.next_lapse(at(21), ttl), Some(Duration::from_secs(9)));
+    assert!(r.take(me, true, at(21), ttl));
+    assert_eq!(r.live(at(21), ttl), 1);
+    assert_eq!(r.live(at(30), ttl), 0, "a's reservation outlived its ttl");
+    assert_eq!(r.next_lapse(at(30), ttl), None);
+    assert!(!r.take(me, true, at(31), ttl));
+}
+
+/// Item P31-G1 (the remaining W7-G1 defect, review 3): a prestart whose wrap never comes must not
+/// keep the after-wrap release off. Before, one leaked reservation plus a prestart every < 30 s kept
+/// the shared counter above 0 forever and the graph stayed cached after every wrap. Now: a thread's
+/// next prestart replaces its leaked reservation; one leaked on another thread lapses on its own,
+/// and then a helper releases the graph the blocked wrap left (short ttl here, 300 ms).
+#[test]
+fn missed_wrap_does_not_disable_release() {
+    use super::super::metal_witness as mw;
+    let _lock = gpu_test_lock();
+    if component_dir().is_err() || mw::kind() == mw::Kind::Ref {
+        eprintln!("skipped: no risc0-groth16 component, or the ref evaluator");
+        return;
+    }
+    struct Ttl;
+    impl Drop for Ttl {
+        fn drop(&mut self) {
+            mw::TEST_TTL_MS.store(0, Ordering::Relaxed);
+            mw::clear_reservations();
+        }
+    }
+    mw::clear_reservations();
+    mw::TEST_TTL_MS.store(300, Ordering::Relaxed);
+    let _ttl = Ttl;
+    mw::preload_for_wrap().unwrap();
+
+    // Same thread: job 1's prestart leaked (no wrap), job 2's prestart replaces it, job 2's wrap
+    // takes it, and its release goes through.
+    let s0 = mw::superseded_reservations();
+    mw::reserve_for_wrap();
+    mw::reserve_for_wrap();
+    assert_eq!(mw::superseded_reservations(), s0 + 1);
+    assert_eq!(mw::live_reservations(), 1);
+    {
+        let _w = mw::WrapGuard::begin();
+        assert_eq!(mw::live_reservations(), 0);
+        let held = mw::wrap_graph().unwrap();
+        assert!(
+            mw::release_slot(Some(&held), 1).is_some(),
+            "a leaked reservation of this thread kept the release off"
+        );
+    }
+    assert!(!mw::is_cached());
+
+    // Another thread's leaked reservation: this thread's jobs keep coming (each reserves and
+    // wraps); the first release is blocked, then the lapse helper releases the graph, and the
+    // later jobs release normally.
+    for job in 0..3 {
+        mw::preload_for_wrap().unwrap();
+        if job == 0 {
+            // Leaked after the build (which takes longer than the 300 ms ttl).
+            std::thread::spawn(mw::reserve_for_wrap).join().unwrap();
+        }
+        mw::reserve_for_wrap();
+        let released = {
+            let _w = mw::WrapGuard::begin();
+            let held = mw::wrap_graph().unwrap();
+            mw::release_slot(Some(&held), 1).is_some()
+        };
+        assert_eq!(released, job != 0, "job {job}: released at the wrap");
+        if !released {
+            assert!(mw::is_cached());
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        eprintln!("P31G1LEAK job {job}: released at the wrap {released}");
+        assert!(
+            !mw::is_cached(),
+            "job {job}: the graph stayed cached after the wrap (leaked reservation)"
+        );
+        assert_eq!(mw::live_reservations(), 0);
+    }
+
+    // A missed wrap's graph goes at this thread's next proof start (not after the 300 ms lapse).
+    mw::TEST_TTL_MS.store(5_000, Ordering::Relaxed);
+    mw::preload_for_wrap().unwrap();
+    mw::reserve_for_wrap();
+    assert!(mw::is_cached());
+    // Another thread's proof start does not touch this thread's reservation.
+    assert!(!std::thread::spawn(mw::proof_start).join().unwrap());
+    assert!(mw::is_cached());
+    assert!(mw::proof_start());
+    assert!(
+        !mw::is_cached(),
+        "the missed wrap's graph outlived the next proof start"
+    );
+    assert_eq!(mw::live_reservations(), 0);
+    assert!(!mw::proof_start());
+}
+
+/// Item P31-G1: the long-running miner: `P31G1_JOBS` (default 24) jobs in one process, each as the
+/// zkvm and the worker run it: `prestart_prover`, an identity_p254 stand-in (900 ms), the wrap
+/// through `shrink_wrap_with` (verified), then the worker's `release_srs` (the key between jobs;
+/// zk-miner `release_groth16_cache_if_tight`). Every 5th job's prestart has no wrap (identity_p254
+/// failed). After each job: the process footprint, the device allocation and whether the graph is
+/// cached. The footprint and the device allocation must not grow after the first jobs settle.
+/// Heavy: `cargo test --release --features metal --lib p31g1_long_run -- --ignored --nocapture
+/// --test-threads 1` under gpu-run, with `MallocLargeCache=0` (release on) or without.
+#[test]
+#[ignore]
+fn p31g1_long_run() {
+    use super::super::metal_witness as mw;
+    use risc0_groth16_sys::metal::{allocated_bytes, filemap::process_memory};
+    let _lock = gpu_test_lock();
+    if !available() {
+        return;
+    }
+    let jobs: usize = std::env::var("P31G1_JOBS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(24);
+    let settle_ms: u64 = std::env::var("P31G1_SETTLE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2000);
+    let (control_root, claim_digest, bn254_id) = fixture_meta();
+    let mut fps = Vec::new();
+    let mut allocs = Vec::new();
+    let mut wraps = 0;
+    let t_all = Instant::now();
+    eprintln!(
+        "P31G1RUN release_enabled={} kind={:?} start footprint {:.1} MiB",
+        mw::release_enabled(),
+        mw::kind(),
+        mib(process_memory().phys_footprint)
+    );
+    let mut starts = Vec::new();
+    for job in 0..jobs {
+        // The zkvm's prover constructor (proof start), then the STARK (not modelled: this
+        // checks the Groth16 side), then the wrap's prestart and identity_p254.
+        crate::prove::preload_graph_background();
+        std::thread::sleep(Duration::from_millis(200));
+        let f_start = process_memory().phys_footprint;
+        let cached_at_start = mw::is_cached();
+        starts.push(f_start);
+        crate::prove::prestart_prover().unwrap();
+        std::thread::sleep(Duration::from_millis(900));
+        let missed = job % 5 == 4;
+        let mut wrap_ms = 0.0;
+        if !missed {
+            let t = Instant::now();
+            let seal = match crate::prove::shrink_wrap_with(seal_words(), || {}) {
+                Err(e) if refused_by_budget(&e) => {
+                    eprintln!("P31G1RUN job {job}: refused by the budget: {e:#}");
+                    return;
+                }
+                r => r.unwrap(),
+            };
+            wrap_ms = t.elapsed().as_secs_f64() * 1e3;
+            Verifier::new(
+                &seal.to_vec(),
+                control_root,
+                claim_digest,
+                bn254_id,
+                &verifying_key(),
+            )
+            .unwrap()
+            .verify()
+            .expect("the long-run wrap does not verify");
+            wraps += 1;
+        }
+        crate::prove::release_srs().unwrap();
+        // Let the after-wrap release thread finish (it drops off the critical path).
+        std::thread::sleep(Duration::from_millis(200));
+        let f200 = process_memory().phys_footprint;
+        std::thread::sleep(Duration::from_millis(settle_ms));
+        let f = process_memory().phys_footprint;
+        let a = allocated_bytes();
+        eprintln!(
+            "P31G1RUN job {job}{}: at the start {:.1} MiB (graph cached {cached_at_start}); wrap \
+             {wrap_ms:.1} ms, footprint {:.1} MiB ({:.1} at 200 ms), device {:.1} MiB, graph \
+             cached {}, reservations {}",
+            if missed { " (missed wrap)" } else { "" },
+            mib(f_start),
+            mib(f),
+            mib(f200),
+            mib(a),
+            mw::is_cached(),
+            mw::live_reservations()
+        );
+        if !missed {
+            fps.push(f);
+        }
+        allocs.push(a);
+        // With the release on, the graph never outlives its job: not after a wrap, and a missed
+        // wrap's graph is gone at the next proof start.
+        if mw::release_enabled() {
+            assert!(
+                !cached_at_start,
+                "job {job}: the graph was cached at the proof start"
+            );
+            assert!(
+                missed || !mw::is_cached(),
+                "job {job}: the graph was cached after the wrap"
+            );
+        }
+    }
+    eprintln!(
+        "P31G1RUN {wraps} wraps in {jobs} jobs, {:.1} s",
+        t_all.elapsed().as_secs_f64()
+    );
+    // Settled after the first 3 jobs: the last third against jobs 3..6, within 128 MiB, after
+    // the wraps and at the proof starts.
+    let n = fps.len();
+    let settle = fps[3..6].iter().copied().max().unwrap();
+    let late = fps[n - n / 3..].iter().copied().max().unwrap();
+    let s_settle = starts[3..6].iter().copied().max().unwrap();
+    let s_late = starts[jobs - jobs / 3..].iter().copied().max().unwrap();
+    assert!(
+        s_late <= s_settle + (128 << 20),
+        "footprint at the proof start grew from {:.1} to {:.1} MiB",
+        mib(s_settle),
+        mib(s_late)
+    );
+    assert!(
+        late <= settle + (128 << 20),
+        "footprint grew from {:.1} to {:.1} MiB",
+        mib(settle),
+        mib(late)
+    );
+    let a_settle = allocs[3..6].iter().copied().max().unwrap();
+    let a_late = allocs[jobs - jobs / 3..].iter().copied().max().unwrap();
+    assert!(
+        a_late <= a_settle + (16 << 20),
+        "device allocation grew from {:.1} to {:.1} MiB",
+        mib(a_settle),
+        mib(a_late)
+    );
 }
 
 /// Item W7-G1 fix round 1 (the review's hook finding, kept as a check): five cycles of a wrap's

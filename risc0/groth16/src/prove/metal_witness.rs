@@ -40,7 +40,7 @@
 //! same witness (`metal_tests::witness_evaluators_bit_equal`).
 
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex, OnceLock,
 };
 
@@ -365,15 +365,123 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// wrap's start are ordered: either the drain sees the wrap, or the wrap starts after the drop.
 static WRAPS: AtomicUsize = AtomicUsize::new(0);
 
-/// Item W7-G1 (fix round 2): [reserve_for_wrap] calls not yet taken by a wrap ([WrapGuard]), and
-/// when the latest was made. Under the [SLOT] lock.
-static RESERVED: Mutex<(usize, Option<std::time::Instant>)> = Mutex::new((0, None));
+/// Item W7-G1 (fix round 2), owned and expiring per entry since item P31-G1: one prestart's claim
+/// on the graph for the wrap that follows it ([reserve_for_wrap]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Reservation {
+    /// The thread that called the prestart. The zkvm calls `prestart_prover` and the wrap on the
+    /// same thread, one job after the other, so a thread has at most one wrap to come.
+    owner: std::thread::ThreadId,
+    at: std::time::Instant,
+}
+
+/// Item P31-G1: the live reservations. Before, this was one counter with the time of the latest
+/// reservation: a reservation that no wrap took (identity_p254 failed, a wrap that failed before
+/// `gpu_prove`, a caller that proved no wrap) stayed counted, and every later prestart renewed the
+/// shared timestamp, so in a miner that starts a job at least every 30 s the count never reached
+/// 0 again and the after-wrap release was off for the life of the process (W7-G1 review 3: the
+/// graph stayed cached after every wrap, footprint 2326 -> 3615 MiB). Now:
+/// - each reservation lapses on its own, [reserve_ttl] after it was made;
+/// - it is owned by its thread: a thread's next prestart replaces its earlier reservation, whose
+///   wrap therefore never came (a thread runs its jobs one after the other);
+/// - a wrap takes its own thread's reservation, else (a caller that prestarts on one thread and
+///   wraps on another) the newest one, so an older leaked one is left to lapse instead of being
+///   carried forward by every later job;
+/// - when a lapse is all that kept a finished wrap from releasing the graph, a helper releases it
+///   then ([schedule_lapse_release]).
+#[derive(Debug, Default)]
+pub(crate) struct Reservations(Vec<Reservation>);
+
+impl Reservations {
+    pub(crate) const fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    fn prune(&mut self, now: std::time::Instant, ttl: std::time::Duration) {
+        self.0.retain(|r| now.saturating_duration_since(r.at) < ttl);
+    }
+
+    /// Reserve for `owner`; true if it replaced `owner`'s earlier, untaken reservation.
+    pub(crate) fn reserve(
+        &mut self,
+        owner: std::thread::ThreadId,
+        now: std::time::Instant,
+        ttl: std::time::Duration,
+    ) -> bool {
+        self.prune(now, ttl);
+        if let Some(r) = self.0.iter_mut().find(|r| r.owner == owner) {
+            r.at = now;
+            return true;
+        }
+        self.0.push(Reservation { owner, at: now });
+        false
+    }
+
+    /// Take `owner`'s reservation, else (with `any`) the newest live one. True if one was taken.
+    pub(crate) fn take(
+        &mut self,
+        owner: std::thread::ThreadId,
+        any: bool,
+        now: std::time::Instant,
+        ttl: std::time::Duration,
+    ) -> bool {
+        self.prune(now, ttl);
+        let mut i = self.0.iter().position(|r| r.owner == owner);
+        if i.is_none() && any {
+            i = (0..self.0.len()).max_by_key(|&i| self.0[i].at);
+        }
+        match i {
+            Some(i) => {
+                self.0.swap_remove(i);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Live reservations at `now`.
+    pub(crate) fn live(&mut self, now: std::time::Instant, ttl: std::time::Duration) -> usize {
+        self.prune(now, ttl);
+        self.0.len()
+    }
+
+    /// How long until the first live reservation lapses (None: none is live).
+    pub(crate) fn next_lapse(
+        &mut self,
+        now: std::time::Instant,
+        ttl: std::time::Duration,
+    ) -> Option<std::time::Duration> {
+        self.prune(now, ttl);
+        self.0
+            .iter()
+            .map(|r| ttl.saturating_sub(now.saturating_duration_since(r.at)))
+            .min()
+    }
+}
+
+/// The process's [Reservations]. Under the [SLOT] lock.
+static RESERVED: Mutex<Reservations> = Mutex::new(Reservations::new());
+
+/// Item P31-G1: a helper is waiting for a reservation to lapse ([schedule_lapse_release]).
+/// Changed only under the [SLOT] lock.
+static LAPSE_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Reservations that a later prestart on the same thread replaced (diagnostics and tests).
+static SUPERSEDED: AtomicUsize = AtomicUsize::new(0);
 
 /// How long a [reserve_for_wrap] reservation holds without a wrap taking it
 /// (`RISC0_G16_GRAPH_RESERVE_MS`, default 30000; `0` turns reservations off). It only bounds a
-/// reservation whose wrap never came (identity_p254 failed, or the caller proved no wrap): a
-/// wrap normally takes it within identity_p254's 0.4-2 s.
+/// reservation whose wrap never came and whose thread made no later prestart (identity_p254
+/// failed and that thread proved nothing more): a wrap normally takes it within identity_p254's
+/// 0.4-2 s.
 fn reserve_ttl() -> std::time::Duration {
+    #[cfg(test)]
+    {
+        let ms = TEST_TTL_MS.load(Ordering::Relaxed);
+        if ms > 0 {
+            return std::time::Duration::from_millis(ms);
+        }
+    }
     static TTL: OnceLock<std::time::Duration> = OnceLock::new();
     *TTL.get_or_init(|| {
         std::time::Duration::from_millis(
@@ -385,52 +493,204 @@ fn reserve_ttl() -> std::time::Duration {
     })
 }
 
+/// Tests: a [reserve_ttl] override in ms (0: none) that also enables [schedule_lapse_release]
+/// without the release being on. Set only under `gpu_test_lock()`.
+#[cfg(test)]
+pub(crate) static TEST_TTL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether [schedule_lapse_release] runs (and releases when it wakes): with the release on. In
+/// tests only while a test holds [TEST_TTL_MS], so that a helper left sleeping by one test cannot
+/// drop the graph under a later one (PLAN 8.7).
+fn lapse_release_enabled() -> bool {
+    #[cfg(test)]
+    return TEST_TTL_MS.load(Ordering::Relaxed) > 0;
+    #[cfg(not(test))]
+    release_enabled()
+}
+
 /// Whether a reservation is live (caller holds the [SLOT] lock).
 fn reserved_locked() -> bool {
-    let r = lock(&RESERVED);
-    r.0 > 0 && r.1.is_some_and(|t| t.elapsed() < reserve_ttl())
+    lock(&RESERVED).live(std::time::Instant::now(), reserve_ttl()) > 0
 }
 
 /// Item W7-G1 (fix round 2): the wrap's prestart ([super::metal::prestart], called before
 /// identity_p254) reserves the graph it builds for the wrap that follows: a pressure drain during
 /// identity_p254 would only move the graph's allocation to the wrap's critical path (a
 /// synchronous 0.7-0.9 s rebuild), not off the wrap's peak, which holds the graph anyway. The
-/// next [WrapGuard] takes the reservation; one that no wrap takes lapses after [reserve_ttl].
+/// wrap takes the reservation ([WrapGuard::begin]); see [Reservations] for one that no wrap takes.
 pub(crate) fn reserve_for_wrap() {
     if reserve_ttl().is_zero() {
         return;
     }
     let _slot = lock(&SLOT);
-    let mut r = lock(&RESERVED);
-    r.0 += 1;
-    r.1 = Some(std::time::Instant::now());
+    let replaced = lock(&RESERVED).reserve(
+        std::thread::current().id(),
+        std::time::Instant::now(),
+        reserve_ttl(),
+    );
+    // P31-G1: if this reservation's wrap never comes, release the graph when it lapses.
+    if lapse_release_enabled() {
+        schedule_lapse_release();
+    }
+    if replaced {
+        SUPERSEDED.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(
+            "groth16 witness graph: this thread's previous prestart reservation was never taken \
+             by a wrap; replaced"
+        );
+    }
+}
+
+/// Item P31-G1: a proof starts on this thread (the zkvm's prover constructor,
+/// `preload_graph_background`). A reservation this thread still holds is from a prestart whose
+/// wrap never came (identity_p254 failed): drop it, and with the release on drop the graph now if
+/// nothing else holds or reserves it, instead of carrying ~0.9 GB through this proof's STARK
+/// until the reservation lapses. Returns whether a reservation was dropped.
+pub(crate) fn proof_start() -> bool {
+    let g = {
+        let mut slot = lock(&SLOT);
+        let now = std::time::Instant::now();
+        let mut r = lock(&RESERVED);
+        if !r.take(std::thread::current().id(), false, now, reserve_ttl()) {
+            return false;
+        }
+        let idle = WRAPS.load(Ordering::Relaxed) == 0 && r.live(now, reserve_ttl()) == 0;
+        #[cfg(test)]
+        let on = release_enabled() || TEST_TTL_MS.load(Ordering::Relaxed) > 0;
+        #[cfg(not(test))]
+        let on = release_enabled();
+        if idle && on {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    SUPERSEDED.fetch_add(1, Ordering::Relaxed);
+    if g.is_some() {
+        tracing::info!(
+            "groth16 witness graph released at a proof start: the previous prestart's wrap never came"
+        );
+        let spawned = std::thread::Builder::new()
+            .name("g16-graph-release".into())
+            .spawn(move || drop(g));
+        drop(spawned);
+    }
+    true
 }
 
 /// Tests: drop every reservation (a test that called prestart without a wrap).
 #[cfg(test)]
 pub(crate) fn clear_reservations() {
     let _slot = lock(&SLOT);
-    *lock(&RESERVED) = (0, None);
+    *lock(&RESERVED) = Reservations::new();
 }
 
-/// Item W7-G1 (fix round 2): one wrap in progress, from the top of [super::metal]'s `gpu_prove`
-/// until it returns. Takes one [reserve_for_wrap] reservation.
+/// Tests: live reservations now.
+#[cfg(test)]
+pub(crate) fn live_reservations() -> usize {
+    let _slot = lock(&SLOT);
+    lock(&RESERVED).live(std::time::Instant::now(), reserve_ttl())
+}
+
+/// Reservations replaced by a later prestart on the same thread (tests and diagnostics).
+#[cfg(test)]
+pub(crate) fn superseded_reservations() -> usize {
+    SUPERSEDED.load(Ordering::Relaxed)
+}
+
+/// Item W7-G1 (fix round 2): one wrap in progress, from the top of [super::metal]'s
+/// `shrink_wrap_or_docker` (item P31-G1: before, `gpu_prove`, so a wrap that failed before it
+/// left its reservation behind) until it returns. Takes the wrap's [reserve_for_wrap]
+/// reservation: this thread's, else the newest ([Reservations::take]). Nested guards on one
+/// thread (`gpu_prove` inside `shrink_wrap_or_docker`) count as one wrap.
 pub(crate) struct WrapGuard(());
+
+thread_local! {
+    /// [WrapGuard]s alive on this thread.
+    static WRAP_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 impl WrapGuard {
     pub(crate) fn begin() -> Self {
-        let _slot = lock(&SLOT);
-        WRAPS.fetch_add(1, Ordering::Relaxed);
-        let mut r = lock(&RESERVED);
-        r.0 = r.0.saturating_sub(1);
+        let depth = WRAP_DEPTH.with(|d| {
+            let v = d.get();
+            d.set(v + 1);
+            v
+        });
+        if depth == 0 {
+            let _slot = lock(&SLOT);
+            WRAPS.fetch_add(1, Ordering::Relaxed);
+            lock(&RESERVED).take(
+                std::thread::current().id(),
+                true,
+                std::time::Instant::now(),
+                reserve_ttl(),
+            );
+        }
         Self(())
     }
 }
 
 impl Drop for WrapGuard {
     fn drop(&mut self) {
-        let _slot = lock(&SLOT);
-        WRAPS.fetch_sub(1, Ordering::Relaxed);
+        let depth = WRAP_DEPTH.with(|d| {
+            let v = d.get() - 1;
+            d.set(v);
+            v
+        });
+        if depth == 0 {
+            let _slot = lock(&SLOT);
+            WRAPS.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Item P31-G1: a finished wrap could not release the graph only because a reservation was live
+/// (caller holds the [SLOT] lock). If that reservation's wrap never comes, nothing else would
+/// release the graph until the next wrap's witness: ~0.9 GB through the next job's STARK. So a
+/// helper sleeps until the reservation lapses and then releases the graph if no wrap is in
+/// progress and none is reserved; a wrap that starts meanwhile takes over (its own release).
+/// At most one helper at a time.
+fn schedule_lapse_release() {
+    if LAPSE_PENDING.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("g16-graph-lapse".into())
+        .spawn(|| loop {
+            let wait = {
+                let mut slot = lock(&SLOT);
+                let next = lock(&RESERVED).next_lapse(std::time::Instant::now(), reserve_ttl());
+                match next {
+                    Some(d) if WRAPS.load(Ordering::Relaxed) == 0 && lapse_release_enabled() => d,
+                    _ => {
+                        // A wrap is in progress (its own release follows), or nothing is reserved
+                        // any more: release now unless a wrap is in progress.
+                        let g = if next.is_none()
+                            && WRAPS.load(Ordering::Relaxed) == 0
+                            && lapse_release_enabled()
+                        {
+                            slot.take()
+                        } else {
+                            None
+                        };
+                        LAPSE_PENDING.store(false, Ordering::Relaxed);
+                        drop(slot);
+                        if g.is_some() {
+                            tracing::info!(
+                                "groth16 witness graph released after an untaken prestart \
+                                 reservation lapsed"
+                            );
+                        }
+                        drop(g);
+                        return;
+                    }
+                }
+            };
+            std::thread::sleep(wait + std::time::Duration::from_millis(5));
+        });
+    if spawned.is_err() {
+        LAPSE_PENDING.store(false, Ordering::Relaxed);
     }
 }
 
@@ -681,7 +941,14 @@ pub(crate) fn release_after_wrap(held: Option<Arc<Graph>>) {
 /// more than `own` wraps (the caller's) are in progress or a prestart reservation is live.
 pub(crate) fn release_slot(held: Option<&Arc<Graph>>, own: usize) -> Option<Arc<Graph>> {
     let mut slot = lock(&SLOT);
-    if WRAPS.load(Ordering::Relaxed) > own || reserved_locked() {
+    if WRAPS.load(Ordering::Relaxed) > own {
+        return None;
+    }
+    if reserved_locked() {
+        // P31-G1: only a reservation keeps it; if no wrap takes that, release when it lapses.
+        if slot.is_some() && lapse_release_enabled() {
+            schedule_lapse_release();
+        }
         return None;
     }
     match (held, slot.as_ref()) {

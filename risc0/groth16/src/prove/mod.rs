@@ -98,6 +98,9 @@ pub fn preload_graph_background() {
         not(any(feature = "cuda", feature = "rocm", feature = "intel"))
     ))]
     if self::metal::enabled() {
+        // Item P31-G1: on the caller's thread (the one that will prestart and wrap): drops a
+        // reservation its previous proof's prestart left without a wrap.
+        self::metal::proof_start();
         std::thread::spawn(|| {
             let _ = self::metal::preload_graph();
         });
@@ -111,7 +114,8 @@ pub fn preload_graph_background() {
 ///
 /// "In use" covers a whole wrap, from its start (so also its `pre_gpu`, key load and GPU-lock
 /// wait, before it touches the graph), and the graph [prestart_prover] built for the wrap that
-/// follows it (until that wrap starts, or 30 s, `RISC0_G16_GRAPH_RESERVE_MS`): a drain there would
+/// follows it (until that wrap starts, the same thread's next proof start or prestart, or 30 s,
+/// `RISC0_G16_GRAPH_RESERVE_MS`, whichever comes first; item P31-G1): a drain there would
 /// only move the rebuild onto the wrap's critical path, not lower the wrap's peak.
 ///
 /// It drops the graph only where that lowers the footprint: when the process was **spawned** with

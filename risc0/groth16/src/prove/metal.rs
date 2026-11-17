@@ -114,6 +114,11 @@ pub(crate) fn preload_graph() -> Result<()> {
     super::metal_witness::preload()
 }
 
+/// Item P31-G1: a proof starts on the calling thread; see [super::metal_witness::proof_start].
+pub(crate) fn proof_start() {
+    super::metal_witness::proof_start();
+}
+
 /// Prepare a wrap in the background: build the witness graph (CPU), and (item G13) start loading
 /// the proving key if it fits beside what is still to come ([early_key_load]).
 ///
@@ -335,6 +340,10 @@ fn shrink_wrap_or_docker(
     pre_gpu: impl FnOnce(),
     supported: impl Fn() -> Result<()>,
 ) -> Result<Seal> {
+    // Item P31-G1: the wrap is in progress (and takes its prestart's reservation) from here, so
+    // one that fails before `gpu_prove` (or falls back to Docker) does not leave the reservation
+    // behind; `gpu_prove`'s own guard nests in this one (notes/B9-G1.md).
+    let _wrap = super::metal_witness::WrapGuard::begin();
     // `fast::witness` and `to_json` read the seal as `&[u32]` (bytemuck::cast_slice, which panics
     // on unaligned data): give them an aligned copy when the caller's slice is not.
     let copy = aligned_copy(identity_p254_seal_bytes);
