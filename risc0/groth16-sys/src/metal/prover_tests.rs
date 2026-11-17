@@ -789,7 +789,17 @@ fn b9_4g_tw_lent_bit_exact() {
     };
     assert_eq!(auto(u64::MAX), (false, false));
     assert_eq!(auto(8 * gib - pso), (false, false));
-    assert_eq!(auto(whole.planned_bytes), (false, false));
+    // Fix round 1: the unsplit layout, too, only with the headroom (P31-12 kept it whenever it
+    // fitted: `p31_12_split_h_bit_exact` tests that rule with `TwLent::Off`).
+    assert_eq!(
+        auto(whole.planned_bytes + AUTO_HEADROOM_BYTES),
+        (false, false)
+    );
+    assert_eq!(
+        auto(whole.planned_bytes + AUTO_HEADROOM_BYTES - 1),
+        (true, false)
+    );
+    assert_eq!(auto(whole.planned_bytes), (true, false));
     assert_eq!(
         auto(split.planned_bytes + AUTO_HEADROOM_BYTES),
         (true, false)
@@ -860,10 +870,14 @@ fn b9_4g_tw_lent_bit_exact() {
         report_build(&name, &prover);
         assert_eq!(prover.tw_lent(), tw_lent == TwLent::On);
         assert_eq!(prover.build_stats.tw_lent, prover.tw_lent());
+        // Fix round 1: a lent region is touched at the build (the table is rebuilt per proof
+        // anyway; the proofs below check that the result is unchanged).
+        assert_eq!(prover.build_stats.tw_prefault.is_some(), prover.tw_lent());
         let st = &prover.build_stats;
         let growth = st.allocated_after - st.allocated_before;
+        // The check's slack (4 MiB; 32 with `RISC0_G16_METAL_ARCHIVE=0`, see [plan_slack]).
         assert!(
-            st.planned_bytes >= growth && st.planned_bytes - growth <= 4 << 20,
+            st.planned_bytes >= growth && st.planned_bytes - growth <= plan_slack(),
             "{name}: planned {} vs growth {growth}",
             st.planned_bytes
         );

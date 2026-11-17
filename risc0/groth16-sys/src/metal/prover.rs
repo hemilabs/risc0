@@ -67,11 +67,12 @@
 //! check of the whole footprint ([super::check_working_set]), which is the real growth plus
 //! at most ~3 MiB of page rounding (item B9-4G; P31-12 kept 32 MiB of slack): planned 4141.0 MiB
 //! unsplit, 4010.9 MiB split. Item B9-4G: [MemOptions::tw_lent] keeps the NTT twiddle table
-//! (128 MiB) in the MSM scratch's `sorted` buffer behind c, rebuilt in each proof (a fill and
-//! one `ntt_mul_powers` pass, < 1 ms), so the split layout takes 3882 MiB (planned 3885.0 MiB)
-//! and a 4 GiB budget keeps ~150 MiB beside it and the process-wide pipeline objects (46-62
-//! MiB). [SplitH::Auto] / [TwLent::Auto] take the reduced layouts only where the faster ones do
-//! not fit ([choose_layout]). (The 3.0 key, v0.1.0: 5,635,930 elements, 3890-3900 MiB.)
+//! (128 MiB) in the MSM scratch's `sorted` buffer behind c, built at the build (so its pages are
+//! resident before the first proof) and rebuilt in each later proof (a fill and one
+//! `ntt_mul_powers` pass, < 1 ms), so the split layout takes 3882 MiB (planned 3885.0 MiB) and a
+//! 4 GiB budget keeps ~150 MiB beside it and the process-wide pipeline objects (46-62 MiB); about
+//! +2 ms of GPU time per proof. [SplitH::Auto] / [TwLent::Auto] take the reduced layouts only
+//! where the faster ones do not leave [AUTO_HEADROOM_BYTES] ([choose_layout]). (The 3.0 key, v0.1.0: 5,635,930 elements, 3890-3900 MiB.)
 
 use std::{
     fs::File,
@@ -457,9 +458,10 @@ pub struct MemOptions {
     /// [SplitH]; the results are the same group elements.
     pub split_h: SplitH,
     /// `tw_lent` (item B9-4G): the NTT twiddle table (n/2 Fr, 128 MiB at 2^23) in the MSM
-    /// scratch's `sorted` buffer behind c, rewritten at the start of every proof's NTT stage
-    /// instead of kept in an own buffer: -126 MiB of device allocation with the v0.2.0 key (the
-    /// `sorted` buffer grows by 2.1 MiB to hold c and the table). See [TwLent]; same results,
+    /// scratch's `sorted` buffer behind c, built at the build and rewritten at the start of
+    /// every later proof's NTT stage instead of kept in an own buffer: -126 MiB of device
+    /// allocation with the v0.2.0 key (the `sorted` buffer grows by 2.1 MiB to hold c and the
+    /// table). About +2 ms of GPU time per proof (notes/B9-4G.md). See [TwLent]; same results,
     /// bit for bit.
     pub tw_lent: TwLent,
 }
@@ -700,6 +702,9 @@ pub struct BuildStats {
     pub split_h: bool,
     /// Whether the NTT twiddles are lent ([MemOptions::tw_lent]).
     pub tw_lent: bool,
+    /// Item B9-4G fix round 1: time to fill and build the lent twiddle region once at the build
+    /// (`None`: owned twiddles, or `RISC0_G16_METAL_TW_PREFAULT=0`).
+    pub tw_prefault: Option<Duration>,
     /// Process physical footprint (`proc_pid_rusage`) before loading and once built.
     pub footprint_before: u64,
     pub footprint_after: u64,
@@ -863,6 +868,10 @@ pub struct MetalProver {
     split_h: bool,
     /// The NTT twiddles live in the scratch's `sorted` buffer ([MemOptions::tw_lent]).
     tw_lent: bool,
+    /// Item B9-4G fix round 1: the lent twiddle region holds the table (built at the build, see
+    /// [BuildStats::tw_prefault]) and nothing has written `sorted` since, so the next proof can
+    /// skip its fill and rebuild. Cleared by every proof and [Self::fuzz_check].
+    tw_ready: bool,
     /// Blocks of the ChaCha fuzz (`fuzz_blocks(wn)`).
     fuzz_blocks: u64,
     mem: MemOptions,
@@ -1043,6 +1052,20 @@ impl MetalProver {
             })
             .context("generating the fuzz")?;
         }
+        // Item B9-4G fix round 1: touch the lent region once here (its fill and table), so that
+        // its pages are made resident during the key load (which overlaps the host witness)
+        // rather than in the first proof's command buffer (+6 ms per wrap at 4 GiB, where every
+        // wrap reloads the key; see notes/B9-4G.md). Each proof still refills and rebuilds it.
+        if tw_lent && tw_prefault() {
+            if let Some((buf, off, len)) = ntt.lent_twiddle_region() {
+                let t = Instant::now();
+                let mut run = Run::new(&k.queue, false);
+                run.fill_new(&[(buf, off, len, super::ntt::LENT_FILL_BYTE)]);
+                run.stage("tw_prefault", 0, |enc| ntt.encode_lent_twiddles(enc));
+                run.finish().context("prefaulting the lent twiddles")?;
+                stats.tw_prefault = Some(t.elapsed());
+            }
+        }
         stats.gpu_setup = t.elapsed();
         stats.allocated_after = device.current_allocated_size();
         stats.footprint_after = super::filemap::process_memory().phys_footprint;
@@ -1066,6 +1089,7 @@ impl MetalProver {
             c_in_scratch,
             split_h,
             tw_lent,
+            tw_ready: stats.tw_prefault.is_some(),
             fuzz_blocks,
             mem,
             witness,
@@ -1220,9 +1244,13 @@ impl MetalProver {
             (abc, 2 * nn * FR_BYTES)
         };
 
-        // Item B9-4G: a lent twiddle region gets its fill here, and its table in the NTT stage.
+        // Item B9-4G: a lent twiddle region gets its fill here, and its table in the NTT stage,
+        // unless it still holds the table built with the prover (fix round 1: the first proof
+        // after a key load, i.e. every wrap at the 4 GiB tier, where the key is released between
+        // wraps). This proof's sorts overwrite it either way.
+        let tw_rebuild = !std::mem::replace(&mut self.tw_ready, false);
         let mut fills = vec![(&**abc, 0, 2 * nn * FR_BYTES, 0u8)];
-        if let Some((buf, off, len)) = self.ntt.lent_twiddle_region() {
+        if let Some((buf, off, len)) = self.ntt.lent_twiddle_region().filter(|_| tw_rebuild) {
             fills.push((buf, off, len, super::ntt::LENT_FILL_BYTE));
         }
         run.fill_new(&fills);
@@ -1256,7 +1284,9 @@ impl MetalProver {
             // Item B9-4G: a lent twiddle table was overwritten by the last proof's sorts; rebuild
             // it from the fill above (no-op for an own table). witness_poly wrote only c, before
             // it in `sorted`.
-            ntt.encode_lent_twiddles(enc);
+            if tw_rebuild {
+                ntt.encode_lent_twiddles(enc);
+            }
             ntt.encode_to_coset(enc, abc, 0);
             ntt.encode_to_coset(enc, abc, fr(nn));
             ntt.encode_to_coset(enc, c_buf, c_off);
@@ -1570,6 +1600,8 @@ impl MetalProver {
     ) -> Result<(G1Projective, G1Projective, G1Projective, G2Projective)> {
         let k = kernels()?;
         let msm = &k.msm;
+        // Its sorts overwrite a lent twiddle table (the next proof rebuilds it).
+        self.tw_ready = false;
         let cfg = self.scratch.config();
         let (srs, wsums, scratch) = (&self.srs, &self.wsums, &mut self.scratch);
         let out = |slot: Slot| MsmBuf::at(wsums, slot_offset(cfg, slot));
@@ -1717,11 +1749,10 @@ fn layout(srs_path: &Path, coeffs_path: &Path, mem: MemOptions, room: u64) -> Re
 ///
 /// Forced switches (`On` / `Off`) are taken as given (a forced split this key cannot do falls
 /// back to the unsplit form, as in P31-12). Under `Auto` (the default) the candidates go from
-/// the fastest to the smallest: the first (unsplit, own twiddles) if it fits the room
-/// (P31-12's rule, so the default and 8 GiB budgets keep their layout); else, of the smaller
-/// ones, the first that leaves [AUTO_HEADROOM_BYTES] of the room, else the smallest (item
-/// B9-4G). With `tw_lent` off that is P31-12's rule: split whenever the unsplit layout does not
-/// fit and the split one is smaller.
+/// the fastest to the smallest: the first that leaves [AUTO_HEADROOM_BYTES] of the room, else
+/// the smallest (item B9-4G; the default and 8 GiB budgets keep the unsplit layout). With
+/// `tw_lent` not `Auto` it is P31-12's rule: the first (unsplit) if it fits the room, else the
+/// first smaller one that leaves the headroom, else the smallest.
 fn choose_layout(
     mem: MemOptions,
     room: u64,
@@ -1754,7 +1785,15 @@ fn choose_layout(
         }
     }
     let first = cands.remove(0);
-    if cands.is_empty() || first.planned_bytes <= room {
+    // Fix round 1: under `TwLent::Auto` the first layout, too, must leave the headroom (the
+    // check is now within 4 MiB of the real growth, so "fits" alone could leave ~3 MiB at
+    // budgets between 4 and 4.25 GiB); the default and 8 GiB budgets have GiBs to spare.
+    let need = if mem.tw_lent == TwLent::Auto {
+        AUTO_HEADROOM_BYTES
+    } else {
+        0
+    };
+    if cands.is_empty() || first.planned_bytes.saturating_add(need) <= room {
         return first;
     }
     cands.retain(|l| l.planned_bytes < first.planned_bytes);
@@ -1787,6 +1826,13 @@ fn plan_slack() -> u64 {
     } else {
         32 << 20
     }
+}
+
+/// Item B9-4G fix round 1: whether a prover with lent twiddles touches their region at the
+/// build (default). `RISC0_G16_METAL_TW_PREFAULT=0` leaves it to the first proof (the round-0
+/// behaviour, ~6 ms slower per proof after a key load).
+fn tw_prefault() -> bool {
+    std::env::var("RISC0_G16_METAL_TW_PREFAULT").as_deref() != Ok("0")
 }
 
 /// The working-set room [SplitH::Auto] plans for: the limit (the explicit budget, else the
