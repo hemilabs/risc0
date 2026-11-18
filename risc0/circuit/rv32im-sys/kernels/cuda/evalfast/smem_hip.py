@@ -26,7 +26,8 @@
 # with buffer trace loads (160.5 -> 156.3 ms with the chain functions called; 16 words 158.1).
 # With lu_alias=True (regen.py's gfx12 variant) ef_sm keeps `nmain` rows and the LogUp words past them
 # live in wmma_hip.py's staging array ef_wlds, which LogUp blocks never use (15 words per thread at 12
-# slots): 31 LogUp words for the LDS of 16 (RX 9070 XT, ef harness: -1.0 ms).
+# slots): 31 LogUp words for the LDS of 16 (RX 9070 XT, ef harness: -1.0 ms). wmma_hip.py leaves the
+# LogUp functions' chains scalar for this, and convert() refuses a LogUp function that stages links.
 #
 # usage: smem_hip.py <in.cu> <out.cu> [--nmain N] [--nlu N]
 import collections
@@ -50,6 +51,8 @@ def convert(s, nmain=32, nlu=32, gfx12=False, lu_alias=False, stats=None):
             continue
         end = lines.index('}', i + 1)
         g = 'l' if m.group(1) in LU else 'm'
+        if lu_alias and g == 'l' and any('ef_wst(' in l or 'EF_WSETUP' in l for l in lines[i + 1:end]):
+            sys.exit('smem_hip: %s stages WMMA links in ef_wlds, where lu_alias keeps LogUp words' % m.group(1))
         nfn += 1
         for k in range(i + 1, end):
             l = lines[k]
