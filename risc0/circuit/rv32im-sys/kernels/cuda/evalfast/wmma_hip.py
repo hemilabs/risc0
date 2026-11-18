@@ -49,8 +49,14 @@
 import re
 import sys
 
-LINK = re.compile(r'^  RkAcc (x\d+) = (rk_link(?:_nf)?_k)\((\w+), (\w+), (\d+)u\);$')
+from smem_hip import LU  # the LogUp-phase functions
+
+LINK =re.compile(r'^  RkAcc (x\d+) = (rk_link(?:_nf)?_k)\((\w+), (\w+), (\d+)u\);$')
 FIN = re.compile(r'^  FpExt (x\d+) = rk_fin\((rk_link(?:_nf)?_k)\((\w+), (\w+), (\d+)u\)\);$')
+# A chain whose last link is an RkAcc statement, finished on a later line: accfirst_cuda.py's split
+# of the 3.1 circuit ends poly_fp's chain with `return rk_fin(x997);` (the LogUp block restarts
+# from FpExt(0)).
+FIN_SEP = re.compile(r'^  (?:return|(?:FpExt|auto) (x\d+) =) rk_fin\((x\d+)\);$')
 
 HELPERS = r'''// ---- wmma_hip.py: poly_mix chains on the gfx12 matrix units (V_WMMA_I32_16X16X16_IU8) ----
 #if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx1200__) || defined(__gfx1201__)) && !defined(EF_NO_WMMA)
@@ -147,9 +153,16 @@ def convert(s, wmin=6, slots=24, group=None, regions=1, inc=1, lag=1, qpre=1, st
     func = None
     for i, l in enumerate(lines):
         if l.startswith(('__device__', '__global__', 'template')) and l.rstrip().endswith('{'):
-            # the generated phase functions (straight-line bodies); helpers and kernels are skipped
-            func = i if re.match(r'__device__ (EF_NOINLINE )?\w+ (rv32im_v2_\d+|poly_fp|rk_accblk|rk_hoist)\(', l) else None
+            # the generated phase functions (straight-line bodies); helpers and kernels are skipped, and
+            # so are the LogUp phase's: smem_hip.py's gfx12 variant keeps LogUp words in ef_wlds, the
+            # staging array (3.1's LogUp block has one 9-link chain, which stays scalar)
+            fm = re.match(r'__device__ (EF_NOINLINE )?\w+ (rv32im_v2_\d+|poly_fp|rk_accblk|rk_hoist)\(', l)
+            func = i if fm and fm.group(2) not in LU else None
             ftypes = {}
+            # chains are function-local: a name reused in the next function (rk_accblk's
+            # `const FpExt x997 = FpExt(0)` after rv32im_v2_3's `RkAcc x997`) starts a new chain
+            if open_ch:
+                sys.exit('wmma_hip: %d chains without rk_fin before line %d' % (len(open_ch), i + 1))
             for m in re.finditer(r'(FpExt\*?|Fp\*?) (arg\w+)', l):
                 ftypes[m.group(2)] = m.group(1)
         if func is None:
@@ -168,6 +181,10 @@ def convert(s, wmin=6, slots=24, group=None, regions=1, inc=1, lag=1, qpre=1, st
                     ids = re.findall(r'\b(x\d+|arg\w+)\b', rhs)
                     t = 'FpExt' if any(ftypes.get(x) == 'FpExt' for x in ids) else 'Fp'
             ftypes[v] = t
+        m = FIN_SEP.match(l)
+        if m and m.group(2) in open_ch:
+            open_ch.pop(m.group(2))['fin'] = (i, m.group(1))  # no name: `return`
+            continue
         m = LINK.match(l) or FIN.match(l)
         if not m:
             if re.search(r'rk_link(_nf)?_k\(', l):
@@ -188,12 +205,14 @@ def convert(s, wmin=6, slots=24, group=None, regions=1, inc=1, lag=1, qpre=1, st
             ch['fin'] = (i, out)
     if open_ch:
         sys.exit('wmma_hip: %d chains without rk_fin' % len(open_ch))
-    # every intermediate RkAcc is only the next link's base
+    # every RkAcc a link defines is only the next link's base (or the separate rk_fin's argument)
     for ch in chains:
         f0 = ch['func']
         f1 = next(j for j in range(f0, len(lines)) if lines[j] == '}')
         body = '\n'.join(lines[f0:f1])
-        for (i, _, _, _, _) in ch['links'][:-1]:
+        for (i, _, _, _, _) in ch['links']:
+            if not LINK.match(lines[i]):
+                continue  # the chain's inline rk_fin(rk_link_k(...)) end
             v = LINK.match(lines[i]).group(1)
             if len(re.findall(r'\b%s\b' % v, body)) != 2:
                 sys.exit('wmma_hip: %s (line %d) has other uses' % (v, i + 1))
@@ -286,7 +305,8 @@ def convert(s, wmin=6, slots=24, group=None, regions=1, inc=1, lag=1, qpre=1, st
             base = ('rk_fin(efs_%d) + efb_%d' % (n, n)) if has_ext else 'efb_%d' % n
         else:
             base = ('rk_fin(efs_%d)' % n) if has_ext else ch['base']
-        gfx.setdefault(fi, []).append('FpExt %s = ef_wfin(efw, %s, %du, %s);' % (out, d, R0, base))
+        res = ('FpExt %s =' % out) if out else 'return'
+        gfx.setdefault(fi, []).append('%s ef_wfin(efw, %s, %du, %s);' % (res, d, R0, base))
     for i, st in gfx.items():
         lines[i] = '  EF_W((%s), %s)' % (' '.join(st), lines[i].strip())
     for f in sorted(funcs, reverse=True):
