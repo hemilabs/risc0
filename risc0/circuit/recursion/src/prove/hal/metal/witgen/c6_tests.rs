@@ -42,7 +42,7 @@ use crate::{
         preflight::Preflight,
         program::Program,
         witgen::{host_chains, host_ctrl_for},
-        zkr::get_zkr,
+        zkr::get_zkr_shared,
     },
     CircuitImpl, CIRCUIT,
 };
@@ -53,7 +53,7 @@ fn test_input() -> VecDeque<u32> {
 }
 
 pub(super) fn preflight_for(po2: usize) -> (Arc<Program>, Preflight) {
-    let program = get_zkr("test_recursion_circuit.zkr", po2).unwrap();
+    let program = get_zkr_shared("test_recursion_circuit.zkr", po2).unwrap();
     let mut pf = Preflight::new(test_input());
     for (cycle, row) in program.code_by_row().enumerate() {
         pf.step(cycle, row).unwrap();
@@ -382,7 +382,7 @@ fn prewitgen_and_shadow_check_hooks() {
     let cpu_receipt = crate::prove::hal::cpu::recursion_prover("poseidon2")
         .unwrap()
         .prove(
-            &get_zkr("test_recursion_circuit.zkr", po2).unwrap(),
+            &get_zkr_shared("test_recursion_circuit.zkr", po2).unwrap(),
             test_input(),
             None,
         )
@@ -462,7 +462,7 @@ fn prove_with_host_chains_check() {
     let _heavy = crate::prove::hal::metal::heavy_test_lock();
     let _guard = crate::prove::hal::metal::global_state_test_lock();
     for po2 in [16, 18] {
-        let program = get_zkr("test_recursion_circuit.zkr", po2).unwrap();
+        let program = get_zkr_shared("test_recursion_circuit.zkr", po2).unwrap();
         let (_, pf) = preflight_for(po2);
         let expect_chains = host_chains(&program, &pf).is_some();
         let before = crate::prove::set_host_chains_check(true);

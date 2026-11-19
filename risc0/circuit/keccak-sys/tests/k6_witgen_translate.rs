@@ -22,6 +22,8 @@
 //!   `-DR0_KECCAK_WITGEN_INLINE`).
 //! - `metallib_has_every_arm` (`--features metal`): every `step_arm_<K>` is in `METAL_LIB`.
 
+// W10-GATE: Metal-only (upstream release-3.1 has no such test; other builds do not run it).
+#![cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 #![allow(dead_code)]
 
 #[path = "../build_metal_witgen.rs"]

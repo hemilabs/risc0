@@ -32,7 +32,8 @@
 //! Both are ignored (seconds to minutes, several GiB of GPU memory): run them under the machine's
 //! GPU lock.
 
-#![cfg(feature = "prove")]
+// W10-GATE: Metal-only (upstream release-3.1 has no such test; other builds do not run it).
+#![cfg(all(feature = "prove", feature = "metal"))]
 
 use risc0_circuit_keccak::{compute_keccak_digest, KeccakState, KECCAK_CONTROL_IDS};
 use risc0_circuit_keccak_methods::{KECCAK_ELF, KECCAK_ID};
