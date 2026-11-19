@@ -25,9 +25,20 @@ use risc0_zkvm_platform::syscall::{
 use super::{Syscall, SyscallContext, SyscallKind};
 
 /// `RISC0_KECCAK_RIGHTSIZE_PO2=0` proves every keccak request at the session's keccak max po2
-/// (the pre-K10 behaviour); unset (or anything else), at the smallest po2 that holds its inputs
-/// ([request_po2]).
+/// (upstream 3.1, and the pre-K10 behaviour); set to anything else, at the smallest po2 that
+/// holds its inputs ([request_po2]). Unset: [KECCAK_RIGHTSIZE_DEFAULT].
 pub(crate) const KECCAK_RIGHTSIZE_ENV: &str = "RISC0_KECCAK_RIGHTSIZE_PO2";
+
+/// W10-GATE: K10 right-sizing is on by default only in Metal builds. Every other build (CPU,
+/// CUDA, ROCm, Intel) asks for the session's keccak max po2 by default, exactly as upstream
+/// release-3.1, and right-sizes only when [KECCAK_RIGHTSIZE_ENV] opts in.
+pub(crate) const KECCAK_RIGHTSIZE_DEFAULT: bool = METAL_BUILD;
+
+/// A Metal build (the `metal` feature, which only builds on macOS/iOS).
+const METAL_BUILD: bool = cfg!(all(
+    feature = "metal",
+    any(target_os = "macos", target_os = "ios")
+));
 
 /// The po2 a keccak request of `inputs` permutations is proved at (K10, LEADS #51): the smallest
 /// po2 of [KECCAK_PO2_RANGE] whose circuit holds them (`max_keccak_inputs`, the same capacity the
@@ -44,8 +55,17 @@ pub(crate) fn request_po2(inputs: usize, max_po2: usize, rightsize: bool) -> usi
         .unwrap_or(max_po2)
 }
 
-fn rightsize_enabled() -> bool {
-    !std::env::var(KECCAK_RIGHTSIZE_ENV).is_ok_and(|v| v.trim() == "0")
+/// Whether keccak requests are right-sized: [KECCAK_RIGHTSIZE_DEFAULT] when
+/// [KECCAK_RIGHTSIZE_ENV] is unset, off when it is `0`, on for any other value.
+pub(crate) fn rightsize_enabled() -> bool {
+    rightsize_from(std::env::var(KECCAK_RIGHTSIZE_ENV).ok().as_deref())
+}
+
+fn rightsize_from(knob: Option<&str>) -> bool {
+    match knob {
+        None => KECCAK_RIGHTSIZE_DEFAULT,
+        Some(v) => v.trim() != "0",
+    }
 }
 
 #[derive(Clone, Default)]
@@ -129,11 +149,18 @@ impl SysKeccak {
         let claim = ctx.load_digest_from_register(REG_A4)?;
         let control_root = ctx.load_digest_from_register(REG_A5)?;
 
-        let po2 = request_po2(self.inputs.len(), self.max_po2, rightsize_enabled());
+        let rightsize = rightsize_enabled();
+        let po2 = request_po2(self.inputs.len(), self.max_po2, rightsize);
         let proof_request = ProveKeccakRequest {
             claim_digest: claim,
             control_root,
-            input: std::mem::take(&mut self.inputs),
+            // Metal (K10) moves the inputs out; other builds clone them and clear after the
+            // request is handed on, as upstream does (W10-GATE).
+            input: if METAL_BUILD {
+                std::mem::take(&mut self.inputs)
+            } else {
+                self.inputs.clone()
+            },
             po2,
         };
 
@@ -150,6 +177,9 @@ impl SysKeccak {
         metric.count += 1;
         metric.size += 1 << po2 as u64;
 
+        // reset
+        self.inputs.clear();
+
         Ok((0, 0))
     }
 }
@@ -158,7 +188,36 @@ impl SysKeccak {
 mod tests {
     use risc0_circuit_keccak::{max_keccak_inputs, KECCAK_PO2_RANGE};
 
-    use super::request_po2;
+    use super::{request_po2, rightsize_from, KECCAK_RIGHTSIZE_DEFAULT};
+
+    /// W10-GATE: right-sizing is on by default only in Metal builds; the knob opts in or out on
+    /// every build.
+    #[test]
+    fn rightsize_default_is_metal_only() {
+        let metal = cfg!(all(
+            feature = "metal",
+            any(target_os = "macos", target_os = "ios")
+        ));
+        assert_eq!(KECCAK_RIGHTSIZE_DEFAULT, metal);
+        assert_eq!(rightsize_from(None), metal);
+        assert!(!rightsize_from(Some("0")));
+        assert!(!rightsize_from(Some(" 0 ")));
+        assert!(rightsize_from(Some("1")));
+    }
+
+    /// W10-GATE: off Metal (knob unset) a request carries the session's max po2, as upstream
+    /// release-3.1: `request_po2(.., rightsize = false)` is the max for every input count.
+    #[test]
+    fn default_request_po2_is_upstream_off_metal() {
+        if KECCAK_RIGHTSIZE_DEFAULT {
+            return;
+        }
+        for max_po2 in KECCAK_PO2_RANGE {
+            for n in [0, 1, max_keccak_inputs(max_po2)] {
+                assert_eq!(request_po2(n, max_po2, rightsize_from(None)), max_po2);
+            }
+        }
+    }
 
     #[test]
     fn request_po2_is_smallest_that_fits() {

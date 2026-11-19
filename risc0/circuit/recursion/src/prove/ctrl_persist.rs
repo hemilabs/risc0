@@ -497,7 +497,7 @@ pub(crate) fn prewarm_p254_ctrl_with(
     if !risc0_zkp::hal::metal::enabled("recursion") {
         return Ok(P254Prewarm::Skipped("Metal recursion disabled".into()));
     }
-    let program = super::zkr::get_zkr("identity.zkr", po2)?;
+    let program = super::zkr::get_zkr_shared("identity.zkr", po2)?;
     let key = super::ctrl_cache_key(&program);
     // The bytes the kept copy will hold (coefficients, every Merkle node, the code), checked
     // against the cap before any GPU work.

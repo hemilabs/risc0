@@ -19,6 +19,9 @@
 //! `RawMemoryTransaction`) against the same numbers, read from that header, so the two sides
 //! cannot drift apart silently. Runs on every target (no GPU or toolchain needed).
 
+// W10-GATE: Metal-only (upstream release-3.1 has no such test; other builds do not run it).
+#![cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+
 use std::{collections::BTreeMap, mem::offset_of};
 
 use risc0_circuit_rv32im_sys::{RawMemoryTransaction, RawPreflightCycle};

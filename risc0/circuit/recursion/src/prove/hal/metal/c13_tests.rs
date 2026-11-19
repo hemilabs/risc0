@@ -211,7 +211,7 @@ where
     H: Hal<Field = BabyBear, Elem = BabyBearElem, ExtElem = BabyBearExtElem>,
 {
     for po2 in [14, 18] {
-        let program = crate::prove::zkr::get_zkr("test_recursion_circuit.zkr", po2).unwrap();
+        let program = crate::prove::zkr::get_zkr_shared("test_recursion_circuit.zkr", po2).unwrap();
         let a = new_hal();
         let group = commit_ctrl_group(&a, &program);
         let host = group.to_host();
@@ -264,7 +264,7 @@ fn c13_persisted_group_needs_same_code() {
         return;
     }
     ctrl_persist::clear();
-    let program = crate::prove::zkr::get_zkr("test_recursion_circuit.zkr", 14).unwrap();
+    let program = crate::prove::zkr::get_zkr_shared("test_recursion_circuit.zkr", 14).unwrap();
     let key = ctrl_cache_key(&program);
     let hal = MetalHalPoseidon2::new();
     let group = commit_ctrl_group(&hal, &program);
@@ -311,7 +311,7 @@ fn c13_persist_cap_and_eviction() {
         return;
     }
     ctrl_persist::clear();
-    let program = crate::prove::zkr::get_zkr("test_recursion_circuit.zkr", 14).unwrap();
+    let program = crate::prove::zkr::get_zkr_shared("test_recursion_circuit.zkr", 14).unwrap();
     let key = ctrl_cache_key(&program);
     let code = Arc::new(program.code.clone());
     let hal = MetalHalPoseidon2::new();
@@ -333,7 +333,7 @@ fn c13_persist_cap_and_eviction() {
     let cap = bytes + bytes / 4;
     ctrl_persist::store(&p2, key, code.clone(), None, &group, 50.0, cap);
     assert!(ctrl_persist::would_keep(&p254, key, bytes - 1, cap));
-    let small = crate::prove::zkr::get_zkr("test_recursion_circuit.zkr", 13).unwrap();
+    let small = crate::prove::zkr::get_zkr_shared("test_recursion_circuit.zkr", 13).unwrap();
     let small_key = ctrl_cache_key(&small);
     let small_code = Arc::new(small.code.clone());
     let small_group = commit_ctrl_group(&MetalHalPoseidon254::new(), &small);
@@ -397,7 +397,7 @@ fn fresh_prover_seal_matches_cpu(hashfn: &str, po2: usize) {
     // `all` (unless the process runs with the knob at 0), so the poseidon2 path is covered too.
     let off = !ctrl_persist::enabled();
     ctrl_persist::set_test_mode(Some(if off { Mode::Off } else { Mode::All }));
-    let program = crate::prove::zkr::get_zkr("test_recursion_circuit.zkr", po2).unwrap();
+    let program = crate::prove::zkr::get_zkr_shared("test_recursion_circuit.zkr", po2).unwrap();
     let input =
         || -> std::collections::VecDeque<u32> { (0..16u32).map(|i| i * 0x101 + 7).collect() };
     let first = metal_recursion_prover(hashfn).unwrap();

@@ -18,7 +18,7 @@ mod args;
 mod cycle_count;
 // mod fork;
 mod getenv;
-mod keccak;
+pub(crate) mod keccak;
 mod log;
 mod panic;
 mod pipe;

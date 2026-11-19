@@ -66,6 +66,13 @@ impl CircuitWitnessGenerator<CpuHal> for CpuCircuitHal {
             data: data.as_ptr(),
             global: global.as_ptr(),
         };
+        // W10-GATE: upstream release-3.1 runs the witgen on the caller's trace; Metal builds,
+        // whose CPU fallback and seal checks re-run it, use a copy.
+        if !crate::prove::witgen::METAL_BUILD {
+            return ffi_wrap(|| unsafe {
+                risc0_circuit_recursion_cpu_witgen(mode, &buffers, preflight, total_cycles)
+            });
+        }
         // The witgen advances `cycles[c].iopIdx` in place (kernels/cxx/extern.cpp), so run it on
         // a copy: the caller's trace stays pristine and a second witgen over it (the host-chain
         // and prewitgen checks) sees the same input. 8 bytes per cycle.

@@ -1262,8 +1262,8 @@ mod c5_tests {
     /// output and globals as the CPU prover, every phase served by the Metal circuit HAL. Prints
     /// the peak device allocation per phase and overall (PLAN 9.1).
     fn prove_test_zkr(po2: usize) {
-        use crate::prove::zkr::get_zkr;
-        let program = get_zkr("test_recursion_circuit.zkr", po2).unwrap();
+        use crate::prove::zkr::get_zkr_shared;
+        let program = get_zkr_shared("test_recursion_circuit.zkr", po2).unwrap();
         // Two Poseidon2 digests (8 words each), as zkvm's `test_zkr` adds them.
         let input: VecDeque<u32> = (0..16u32).map(|i| i * 0x101 + 7).collect();
         let before = phase_calls();

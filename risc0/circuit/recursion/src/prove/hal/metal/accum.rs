@@ -376,7 +376,8 @@ mod c7_tests {
         static LAST_ACCUM_S: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
     }
     use crate::prove::{
-        hal::cpu::CpuCircuitHal, preflight::Preflight, witgen::WitnessGenerator, zkr::get_zkr,
+        hal::cpu::CpuCircuitHal, preflight::Preflight, witgen::WitnessGenerator,
+        zkr::get_zkr_shared,
     };
 
     /// The real witness of test_recursion_circuit.zkr at `po2` (CPU witgen): ctrl, data, global
@@ -395,7 +396,7 @@ mod c7_tests {
         cache
             .entry(po2)
             .or_insert_with(|| {
-                let program = get_zkr("test_recursion_circuit.zkr", po2).unwrap();
+                let program = get_zkr_shared("test_recursion_circuit.zkr", po2).unwrap();
                 let input: VecDeque<u32> = (0..16u32).map(|i| i * 0x101 + 7).collect();
                 let mut preflight = Preflight::new(input);
                 for (cycle, row) in program.code_by_row().enumerate() {
@@ -703,7 +704,7 @@ mod c7_tests {
         let _heavy = crate::prove::hal::metal::heavy_test_lock();
         let _guard = crate::prove::hal::metal::global_state_test_lock();
         for po2 in [16, 18] {
-            let program = get_zkr("test_recursion_circuit.zkr", po2).unwrap();
+            let program = get_zkr_shared("test_recursion_circuit.zkr", po2).unwrap();
             let input: VecDeque<u32> = (0..16u32).map(|i| i * 0x101 + 7).collect();
             let prover = super::super::recursion_prover("poseidon2").unwrap();
             let probe = MetalHalPoseidon2::new();

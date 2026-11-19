@@ -1429,9 +1429,10 @@ fn keccak_update2() {
         session.pending_keccaks[0].claim_digest,
         digest!("4be4abacf05e312a566673392786c5ae69b8c7ed2b77bb2d63119e035420866c")
     );
-    // One permutation: proved at the smallest keccak po2 (K10 rightsizing), not at the max of 15
-    // (unless RISC0_KECCAK_RIGHTSIZE_PO2=0).
-    let rightsize = !std::env::var("RISC0_KECCAK_RIGHTSIZE_PO2").is_ok_and(|v| v.trim() == "0");
+    // One permutation: on Metal builds proved at the smallest keccak po2 (K10 rightsizing), not
+    // at the max of 15 (unless RISC0_KECCAK_RIGHTSIZE_PO2=0); elsewhere at the max, as upstream
+    // (unless RISC0_KECCAK_RIGHTSIZE_PO2 opts in; W10-GATE).
+    let rightsize = crate::host::server::exec::syscall::keccak::rightsize_enabled();
     assert_eq!(session.pending_keccaks[0].input.len(), 1);
     assert_eq!(
         session.pending_keccaks[0].po2,

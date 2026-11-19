@@ -41,7 +41,7 @@ use crate::{
         hal::{cpu::CpuCircuitHal, CircuitWitnessGenerator as _},
         preflight::Preflight,
         witgen::host_ctrl_for,
-        zkr::get_zkr,
+        zkr::get_zkr_shared,
     },
     CircuitImpl, CIRCUIT,
 };
@@ -138,7 +138,7 @@ fn metallib_smoke() {
 fn noise_seed_controls_the_seal() {
     let _heavy = crate::prove::hal::metal::heavy_test_lock();
     let _guard = crate::prove::hal::metal::global_state_test_lock();
-    let program = get_zkr("test_recursion_circuit.zkr", 16).unwrap();
+    let program = get_zkr_shared("test_recursion_circuit.zkr", 16).unwrap();
     let cpu = crate::prove::hal::cpu::recursion_prover("poseidon2").unwrap();
     let a = cpu.prove(&program, test_input(), None).unwrap();
     let b = cpu.prove(&program, test_input(), None).unwrap();
@@ -157,7 +157,7 @@ fn noise_seed_controls_the_seal() {
 /// prover's seal bit for bit. Prints wall time and peak device memory per phase (PLAN 9.1).
 fn seal_matches_cpu(hashfn: &str, po2: usize) {
     let _guard = crate::prove::hal::metal::global_state_test_lock();
-    let program = get_zkr("test_recursion_circuit.zkr", po2).unwrap();
+    let program = get_zkr_shared("test_recursion_circuit.zkr", po2).unwrap();
     let metal = metal_recursion_prover(hashfn).unwrap();
     let cpu = crate::prove::hal::cpu::recursion_prover(hashfn).unwrap();
     // Warm (PSOs, ctrl caches, pool) so the timing below is a steady-state proof.
@@ -222,7 +222,7 @@ fn seal_check_detects_a_difference() {
             with_noise_seed(1, || self.0.prove(program, input, preflight))
         }
     }
-    let program = get_zkr("test_recursion_circuit.zkr", 16).unwrap();
+    let program = get_zkr_shared("test_recursion_circuit.zkr", 16).unwrap();
     let metal = metal_recursion_prover("poseidon2").unwrap();
     let cpu = Reseeded(crate::prove::hal::cpu::recursion_prover("poseidon2").unwrap());
     let err = prove_seal_checked(metal.as_ref(), &cpu, &program, test_input(), None).unwrap_err();
@@ -281,7 +281,7 @@ fn b9_sec_noise_key_uses_every_seed_bit() {
 fn b9_sec_seal_checked_receipt_noise_is_256_bit() {
     let _heavy = crate::prove::hal::metal::heavy_test_lock();
     let _guard = crate::prove::hal::metal::global_state_test_lock();
-    let program = get_zkr("test_recursion_circuit.zkr", 16).unwrap();
+    let program = get_zkr_shared("test_recursion_circuit.zkr", 16).unwrap();
     let metal = metal_recursion_prover("poseidon2").unwrap();
     let cpu = crate::prove::hal::cpu::recursion_prover("poseidon2").unwrap();
     let last_seed = || {
@@ -336,7 +336,7 @@ fn b9_sec_seal_checked_receipt_noise_is_256_bit() {
 #[test]
 fn cpu_witgen_keeps_trace() {
     let po2 = 16;
-    let program = get_zkr("test_recursion_circuit.zkr", po2).unwrap();
+    let program = get_zkr_shared("test_recursion_circuit.zkr", po2).unwrap();
     let mut pf = Preflight::new(test_input());
     for (cycle, row) in program.code_by_row().enumerate() {
         pf.step(cycle, row).unwrap();
@@ -391,7 +391,7 @@ fn p254_cpu_fallback_with_host_chains_check() {
     let _heavy = crate::prove::hal::metal::heavy_test_lock();
     let _guard = crate::prove::hal::metal::global_state_test_lock();
     for hashfn in ["poseidon_254", "poseidon2"] {
-        let program = get_zkr("test_recursion_circuit.zkr", 16).unwrap();
+        let program = get_zkr_shared("test_recursion_circuit.zkr", 16).unwrap();
         let before = crate::prove::set_host_chains_check(true);
         let mut prover = crate::prove::Prover::new(program.clone(), hashfn);
         prover.add_input(test_input().make_contiguous());
@@ -422,7 +422,7 @@ fn r17_seal_repeat() {
     let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
     let reps: usize = env("R17_AUDIT_REPS", "10").parse().unwrap();
     let po2: usize = env("R17_AUDIT_PO2", "18").parse().unwrap();
-    let program = get_zkr("test_recursion_circuit.zkr", po2).unwrap();
+    let program = get_zkr_shared("test_recursion_circuit.zkr", po2).unwrap();
     let mut bad = vec![];
     for hashfn in env("R17_AUDIT_HASHFNS", "poseidon2,sha-256").split(',') {
         let metal = metal_recursion_prover(hashfn).unwrap();
@@ -459,9 +459,9 @@ fn r17_seal_repeat() {
 
 /// P31-10 A/B bench (ignored; heavy, run by hand): real lift/join/resolve proofs replayed from
 /// `C11_CAPTURES` (optional `C11_ONLY` filter), each round in the order zkvm makes them, with the
-/// program handed over as [get_zkr] hands it: `RISC0_METAL_REC_ZKR_CACHE` on (default) passes
+/// program handed over as [get_zkr_shared] hands it: `RISC0_METAL_REC_ZKR_CACHE` on (default) passes
 /// the same `Arc<Program>` to every proof of a program (the P31-10 cache); `0` builds a new one
-/// per proof from its words, as stock 3.1's `get_zkr` does ([Program::from_encoded] inside the
+/// per proof from its words, as stock 3.1's `get_zkr_shared` does ([Program::from_encoded] inside the
 /// timed region; the prover then re-checks the code against its ctrl caches). `P3110_REPS`
 /// rounds (default 7) after one warm round. Prints `P3110CAP <file> ...` and a `P3110BENCH`
 /// line with the per-round sum and the per-kind (lift/join) medians.

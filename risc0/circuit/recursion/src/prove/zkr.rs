@@ -22,26 +22,41 @@ use anyhow::{anyhow, bail, Result};
 
 use super::Program;
 
-/// The program `name` for `po2` cycles.
+pub fn get_zkr(name: &str, po2: usize) -> Result<Program> {
+    let encoded = cached_zkr(name)?;
+    Ok(Program::from_encoded(&encoded, po2))
+}
+
+/// The program `name` for `po2` cycles, shared: [get_zkr] as an `Arc`.
 ///
-/// Shared: every lift and join asks for its program, and building one from its words
+/// Every lift and join asks for its program, and building one from its words
 /// ([Program::from_encoded]: 12-24 MB, 1.1-2.2 ms on an M5 Max) plus the prover's re-check of a
 /// new `Arc`'s code against its ctrl caches (a 16-24 MB compare; pointer equality skips it)
-/// cost 1.1-2.0 ms per Metal lift and 2.0-2.6 ms per join (1-2 %, notes/P31-10.md). So the built programs
-/// are kept per process, keyed by (name, po2) (P31-10, as fork 3.0's F30 cache), and every call
-/// for the same program returns the same `Arc`. Like stock's word memo, a zkr is decoded at most
-/// once per process: no name is ever evicted. Revert knob: `RISC0_METAL_REC_ZKR_CACHE=0`
-/// (stock 3.1: the decoded words are kept per name, a new [Program] is built on every call).
-pub fn get_zkr(name: &str, po2: usize) -> Result<Arc<Program>> {
+/// cost 1.1-2.0 ms per Metal lift and 2.0-2.6 ms per join (1-2 %, notes/P31-10.md). So with the
+/// program cache on, the built programs are kept per process, keyed by (name, po2) (P31-10, as
+/// fork 3.0's F30 cache), and every call for the same program returns the same `Arc`. Like
+/// stock's word memo, a zkr is decoded at most once per process: no name is ever evicted.
+///
+/// The cache is on by default only in Metal builds (W10-GATE); elsewhere this is
+/// `Arc::new(get_zkr(name, po2)?)`, upstream release-3.1's behaviour (the decoded words are kept
+/// per name, a new [Program] is built on every call). `RISC0_METAL_REC_ZKR_CACHE`: `0` (or
+/// `off`/`false`) turns it off, any other value turns it on, on every build.
+pub fn get_zkr_shared(name: &str, po2: usize) -> Result<Arc<Program>> {
     if !program_cache_enabled() {
-        let encoded = cached_zkr(name)?;
-        return Ok(Arc::new(Program::from_encoded(&encoded, po2)));
+        return Ok(Arc::new(get_zkr(name, po2)?));
     }
     program_cache::get(name, po2)
 }
 
-/// `RISC0_METAL_REC_ZKR_CACHE`: `0` (or `off`/`false`) turns the [get_zkr] program cache off.
+/// `RISC0_METAL_REC_ZKR_CACHE`: `0` (or `off`/`false`) turns the [get_zkr_shared] program cache
+/// off, any other value on; unset: [ZKR_CACHE_DEFAULT].
 const ZKR_CACHE_ENV: &str = "RISC0_METAL_REC_ZKR_CACHE";
+
+/// W10-GATE: the program cache is on by default only in Metal builds.
+const ZKR_CACHE_DEFAULT: bool = cfg!(all(
+    feature = "metal",
+    any(target_os = "macos", target_os = "ios")
+));
 
 fn program_cache_enabled() -> bool {
     #[cfg(test)]
@@ -49,15 +64,17 @@ fn program_cache_enabled() -> bool {
         return on;
     }
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        !matches!(
-            std::env::var(ZKR_CACHE_ENV).as_deref().map(str::trim),
-            Ok("0" | "off" | "false")
-        )
-    })
+    *ON.get_or_init(|| program_cache_from(std::env::var(ZKR_CACHE_ENV).ok().as_deref()))
 }
 
-/// The [get_zkr] program cache: per zkr name, the programs built for its po2s (at most
+fn program_cache_from(knob: Option<&str>) -> bool {
+    match knob.map(str::trim) {
+        None => ZKR_CACHE_DEFAULT,
+        Some(v) => !matches!(v, "0" | "off" | "false"),
+    }
+}
+
+/// The [get_zkr_shared] program cache: per zkr name, the programs built for its po2s (at most
 /// [program_cache::PO2_CAP], LRU among them). It replaces the per-name word memo ([cached_zkr],
 /// not filled while the cache is on), with the same bound: one copy of each zkr the process has
 /// used, never decoded twice. Names are never evicted (fix round 1): an LRU over names made every
@@ -308,6 +325,46 @@ mod tests {
         }
     }
 
+    /// W10-GATE: `get_zkr` keeps upstream release-3.1's signature on every build, and the
+    /// program cache behind [get_zkr_shared] is on by default only in Metal builds.
+    #[test]
+    fn get_zkr_signature_and_cache_default() {
+        let _upstream: fn(&str, usize) -> Result<Program> = get_zkr;
+        let _shared: fn(&str, usize) -> Result<Arc<Program>> = get_zkr_shared;
+        let metal = cfg!(all(
+            feature = "metal",
+            any(target_os = "macos", target_os = "ios")
+        ));
+        assert_eq!(ZKR_CACHE_DEFAULT, metal);
+        assert_eq!(program_cache_from(None), metal);
+        for off in ["0", "off", "false", " 0 "] {
+            assert!(!program_cache_from(Some(off)), "{off:?}");
+        }
+        assert!(program_cache_from(Some("1")));
+    }
+
+    /// W10-GATE: off Metal, with the knob unset, [get_zkr_shared] builds a new program per call
+    /// (upstream: `get_zkr(..).into()`) and equals [get_zkr].
+    #[test]
+    fn get_zkr_shared_default_off_metal_is_upstream() {
+        if ZKR_CACHE_DEFAULT || std::env::var_os(ZKR_CACHE_ENV).is_some() {
+            return;
+        }
+        let _lock = override_lock();
+        // A zkr no other (non-ignored) test of this module puts in the cache.
+        let name = "union.zkr";
+        let a = get_zkr_shared(name, 18).unwrap();
+        let b = get_zkr_shared(name, 18).unwrap();
+        assert!(!Arc::ptr_eq(&a, &b));
+        let plain = get_zkr(name, 18).unwrap();
+        assert!(same_program(&a, &plain) && same_program(&b, &plain));
+        assert_eq!(
+            program_cache::len(name),
+            0,
+            "the cache was filled off Metal"
+        );
+    }
+
     #[test]
     fn get_zkr_from_each_section() {
         get_zkr("lift_rv32im_v2_14.zkr", 18).unwrap();
@@ -339,14 +396,14 @@ mod tests {
         let stock =
             Program::from_encoded(&extract_zkr(ZkrSection::for_name(name), name).unwrap(), 18);
         program_cache::set_test_override(Some(true));
-        let a = get_zkr(name, 18).unwrap();
-        let b = get_zkr(name, 18).unwrap();
+        let a = get_zkr_shared(name, 18).unwrap();
+        let b = get_zkr_shared(name, 18).unwrap();
         // Another po2 of a cached program: built from its words, same code.
-        let c = get_zkr(name, 19).unwrap();
-        let d = get_zkr(name, 19).unwrap();
+        let c = get_zkr_shared(name, 19).unwrap();
+        let d = get_zkr_shared(name, 19).unwrap();
         program_cache::set_test_override(Some(false));
-        let off1 = get_zkr(name, 18).unwrap();
-        let off2 = get_zkr(name, 18).unwrap();
+        let off1 = get_zkr_shared(name, 18).unwrap();
+        let off2 = get_zkr_shared(name, 18).unwrap();
         program_cache::set_test_override(None);
         assert!(
             Arc::ptr_eq(&a, &b),
@@ -373,14 +430,14 @@ mod tests {
         let _lock = override_lock();
         program_cache::set_test_override(Some(true));
         let name = "lift_rv32im_v2_15.zkr";
-        let first = get_zkr(name, 22).unwrap();
+        let first = get_zkr_shared(name, 22).unwrap();
         let decodes = program_cache::decodes(name);
         let mut got = Vec::new();
         for po2 in [20, 21, 22, 20, 21, 22, 19] {
-            got.push(get_zkr(name, po2).unwrap());
+            got.push(get_zkr_shared(name, po2).unwrap());
             assert!(program_cache::len(name) <= program_cache::PO2_CAP);
         }
-        let again = get_zkr(name, 19).unwrap();
+        let again = get_zkr_shared(name, 19).unwrap();
         let bytes = program_cache::bytes();
         program_cache::set_test_override(None);
         assert_eq!(
@@ -411,9 +468,15 @@ mod tests {
         let names: Vec<String> = (14..24)
             .map(|po2| format!("lift_rv32im_v2_{po2}.zkr"))
             .collect();
-        let first: Vec<_> = names.iter().map(|n| get_zkr(n, 22).unwrap()).collect();
+        let first: Vec<_> = names
+            .iter()
+            .map(|n| get_zkr_shared(n, 22).unwrap())
+            .collect();
         let before: Vec<usize> = names.iter().map(|n| program_cache::decodes(n)).collect();
-        let second: Vec<_> = names.iter().map(|n| get_zkr(n, 22).unwrap()).collect();
+        let second: Vec<_> = names
+            .iter()
+            .map(|n| get_zkr_shared(n, 22).unwrap())
+            .collect();
         let after: Vec<usize> = names.iter().map(|n| program_cache::decodes(n)).collect();
         program_cache::set_test_override(None);
         assert_eq!(before, after, "steady-state get_zkr re-ran the xz decode");
@@ -443,7 +506,7 @@ mod tests {
             "identity.zkr",
         ] {
             let t = Instant::now();
-            let p = get_zkr(name, 18).unwrap();
+            let p = get_zkr_shared(name, 18).unwrap();
             let first = t.elapsed().as_secs_f64() * 1e3;
             drop(p);
             let mut times = Vec::new();
@@ -452,7 +515,7 @@ mod tests {
             let encoded = extract_zkr(ZkrSection::for_name(name), name).unwrap();
             for _ in 0..reps {
                 let t = Instant::now();
-                let p = get_zkr(name, 18).unwrap();
+                let p = get_zkr_shared(name, 18).unwrap();
                 times.push(t.elapsed().as_secs_f64() * 1e3);
                 let t = Instant::now();
                 drop(p);
