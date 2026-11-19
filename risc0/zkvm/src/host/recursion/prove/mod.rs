@@ -566,10 +566,10 @@ pub fn test_zkr(
     digest2: &Digest,
     po2: usize,
 ) -> Result<SuccinctReceipt<crate::claim::Unknown>> {
-    use risc0_circuit_recursion::prove::zkr::get_zkr;
+    use risc0_circuit_recursion::prove::zkr::get_zkr_shared;
     use risc0_zkp::core::hash::poseidon2::Poseidon2HashSuite;
 
-    let program = get_zkr("test_recursion_circuit.zkr", po2)?;
+    let program = get_zkr_shared("test_recursion_circuit.zkr", po2)?;
     let suite = Poseidon2HashSuite::new_suite();
     let control_id = program.compute_control_id(suite.clone()).unwrap();
     let opts = ProverOpts::succinct().with_control_ids(vec![control_id]);

@@ -27,7 +27,7 @@ use test_log::test;
 
 use super::*;
 use crate::{
-    prove::{hal::CircuitWitnessGenerator as _, zkr::get_zkr, RecursionProverImpl},
+    prove::{hal::CircuitWitnessGenerator as _, zkr::get_zkr_shared, RecursionProverImpl},
     CircuitImpl, CIRCUIT,
 };
 
@@ -73,7 +73,7 @@ fn scratch_poison_recovers_after_budget_panic() {
     );
 
     // The same circuit HAL proves again (as the zkvm's thread-local cached prover would).
-    let program = get_zkr("test_recursion_circuit.zkr", 16).unwrap();
+    let program = get_zkr_shared("test_recursion_circuit.zkr", 16).unwrap();
     let metal = RecursionProverImpl::new(hal.clone(), circuit_hal.clone());
     let m = metal
         .prove(&program, test_input(), None)
@@ -170,7 +170,7 @@ fn witgen_rejects_short_buffers() {
 /// `CTRL_CACHE` used to fail every later proof of the process with `PoisonError`).
 #[test]
 fn host_ctrl_cache_survives_poison() {
-    let program = get_zkr("test_recursion_circuit.zkr", 16).unwrap();
+    let program = get_zkr_shared("test_recursion_circuit.zkr", 16).unwrap();
     let a = crate::prove::witgen::host_ctrl_for(&program);
     let _ = std::thread::spawn(|| {
         let _guard = crate::prove::witgen::ctrl_cache();

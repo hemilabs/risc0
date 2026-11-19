@@ -386,12 +386,14 @@ mod keccak_po2 {
     };
 
     pub const KECCAK_TEST_PO2: u32 = 15;
-    /// The po2 the request is proved at: one permutation fits the smallest keccak po2 (K10), or
-    /// the max with RISC0_KECCAK_RIGHTSIZE_PO2=0.
+    /// The po2 the request is proved at: with K10 right-sizing (Metal builds by default) one
+    /// permutation fits the smallest keccak po2; without it (other builds by default, as
+    /// upstream, or RISC0_KECCAK_RIGHTSIZE_PO2=0) the max (W10-GATE).
     fn keccak_proved_po2() -> usize {
-        match std::env::var("RISC0_KECCAK_RIGHTSIZE_PO2") {
-            Ok(v) if v.trim() == "0" => KECCAK_TEST_PO2 as usize,
-            _ => 14,
+        if crate::host::server::exec::syscall::keccak::rightsize_enabled() {
+            14
+        } else {
+            KECCAK_TEST_PO2 as usize
         }
     }
     struct Coprocessor {

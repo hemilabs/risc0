@@ -29,6 +29,9 @@
 //!
 //! Pure Python, no GPU and no Metal toolchain; runs without any feature.
 
+// W10-GATE: Metal-only (upstream release-3.1 has no such test; other builds do not run it).
+#![cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+
 use std::{path::PathBuf, process::Command};
 
 fn run(script: &str, args: &[&str]) {

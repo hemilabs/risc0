@@ -61,7 +61,7 @@ fn c16_prewarm_p254_kept_then_restored() {
     assert_eq!(prewarm_p254_ctrl(PO2).unwrap(), P254Prewarm::AlreadyKept);
 
     // The kept copy equals a commit of the same program on a fresh HAL.
-    let program = crate::prove::zkr::get_zkr("identity.zkr", PO2).unwrap();
+    let program = crate::prove::zkr::get_zkr_shared("identity.zkr", PO2).unwrap();
     let key = ctrl_cache_key(&program);
     let hal = MetalHalPoseidon254::new();
     let hashfn = hal.get_hash_suite().name.clone();
@@ -232,7 +232,7 @@ fn w7c1_prewarm_race_at_budget() {
         limit >> 20
     );
     // Load identity.zkr first, so that B reaches the lock quickly.
-    crate::prove::zkr::get_zkr("identity.zkr", PO2).unwrap();
+    crate::prove::zkr::get_zkr_shared("identity.zkr", PO2).unwrap();
     // A's margin under the limit (default 400 MiB; M9's 4 GiB run had 154 MiB).
     let margin: u64 = std::env::var("W7C1_RACE_MARGIN_MIB")
         .ok()

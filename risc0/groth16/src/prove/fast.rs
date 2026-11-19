@@ -112,13 +112,31 @@ pub(crate) fn graph_path() -> Result<PathBuf> {
     Ok(super::component::component_dir()?.join("stark_verify_graph.bin"))
 }
 
-/// Whether the graph build uses the item G13 shortcuts (default on; `RISC0_G16_GRAPH_MEMO=0`
-/// reverts to the pre-G13 build): one inverse per distinct constant instead of one per Div node
-/// (the rzup graph has 3.55M Div-by-constant nodes over 2,134 constants: ~4.1 s of inversions),
-/// the SHA-256 check overlapped with the parse, and the per-node translation in parallel. The
-/// program is identical either way.
+/// Whether the graph build uses the item G13 shortcuts (`RISC0_G16_GRAPH_MEMO=0` is the pre-G13
+/// build, upstream release-3.1's; any other value turns them on): one inverse per distinct
+/// constant instead of one per Div node (the rzup graph has 3.55M Div-by-constant nodes over
+/// 2,134 constants: ~4.1 s of inversions), the SHA-256 check overlapped with the parse, and the
+/// per-node translation in parallel. The program is identical either way. Unset:
+/// [MEMO_DEFAULT].
 pub(crate) fn memo_enabled() -> bool {
-    std::env::var("RISC0_G16_GRAPH_MEMO").as_deref() != Ok("0")
+    memo_from(std::env::var("RISC0_G16_GRAPH_MEMO").ok().as_deref())
+}
+
+/// A Metal build (the `metal` feature, which only builds on macOS/iOS).
+const METAL_BUILD: bool = cfg!(all(
+    feature = "metal",
+    any(target_os = "macos", target_os = "ios")
+));
+
+/// W10-GATE: the G13 build is the default only in Metal builds; Intel builds (which compile this
+/// file too) keep upstream release-3.1's build unless `RISC0_G16_GRAPH_MEMO` opts in.
+const MEMO_DEFAULT: bool = METAL_BUILD;
+
+fn memo_from(knob: Option<&str>) -> bool {
+    match knob {
+        None => MEMO_DEFAULT,
+        Some(v) => v != "0",
+    }
 }
 
 /// SHA-256 of `bytes`, checked against [GRAPH_SHA256].
@@ -309,7 +327,7 @@ fn build_program() -> Result<Program> {
         consts.len(),
     );
     tracing::debug!("{msg}");
-    if std::env::var_os("RISC0_VERBOSE").is_some() {
+    if METAL_BUILD && std::env::var_os("RISC0_VERBOSE").is_some() {
         eprintln!("[groth16] {msg}");
     }
     Ok(Program {
@@ -601,4 +619,22 @@ pub(crate) fn shrink_wrap(seal_bytes: &[u8]) -> Result<Seal> {
     );
     let proof_json: ProofJson = serde_json::from_str(&contents)?;
     proof_json.try_into()
+}
+
+/// W10-GATE: the G13 graph build is the default only in Metal builds.
+#[cfg(test)]
+mod w10_gate_tests {
+    use super::*;
+
+    #[test]
+    fn memo_default_is_metal_only() {
+        let metal = cfg!(all(
+            feature = "metal",
+            any(target_os = "macos", target_os = "ios")
+        ));
+        assert_eq!(MEMO_DEFAULT, metal);
+        assert_eq!(memo_from(None), metal);
+        assert!(!memo_from(Some("0")));
+        assert!(memo_from(Some("1")));
+    }
 }

@@ -127,10 +127,11 @@ pub trait ProverServer: private::Sealed {
     /// Prove the specified keccak request
     ///
     /// The request is proved at `request.po2`, which may be smaller than the session's keccak
-    /// max po2 (`ExecutorEnvBuilder::keccak_max_po2`): since K10 the executor asks for the
-    /// smallest po2 in [risc0_circuit_keccak::KECCAK_PO2_RANGE] whose circuit holds the batch
-    /// (`RISC0_KECCAK_RIGHTSIZE_PO2=0` restores the max), so a [crate::CoprocessorCallback]
-    /// sees requests of several sizes. The lifted receipt's control ID is that po2's
+    /// max po2 (`ExecutorEnvBuilder::keccak_max_po2`): in Metal builds (K10) the executor asks
+    /// for the smallest po2 in [risc0_circuit_keccak::KECCAK_PO2_RANGE] whose circuit holds the
+    /// batch (`RISC0_KECCAK_RIGHTSIZE_PO2=0` restores the max; other builds ask for the max, as
+    /// upstream, unless `RISC0_KECCAK_RIGHTSIZE_PO2=1` opts in), so a
+    /// [crate::CoprocessorCallback] can see requests of several sizes. The lifted receipt's control ID is that po2's
     /// `KECCAK_CONTROL_IDS` entry, under `KECCAK_CONTROL_ROOT` for every po2. On Metal, at a
     /// small working-set budget, the provers this thread cached (segment, recursion) are
     /// released first when they leave no room for the proof (`RISC0_KECCAK_SMALL_BUDGET_RELEASE=0`

@@ -23,7 +23,8 @@
 //!
 //! `K5_E2E_PO2S=14,15,16,17,18 cargo test -p risc0-zkvm --release --features metal --test k5_keccak_metal_e2e -- --ignored --nocapture`
 
-#![cfg(feature = "prove")]
+// W10-GATE: Metal-only (upstream release-3.1 has no such test; other builds do not run it).
+#![cfg(all(feature = "prove", feature = "metal"))]
 
 use risc0_circuit_keccak::{
     compute_keccak_digest, KeccakState, KECCAK_CONTROL_IDS, KECCAK_PO2_RANGE,

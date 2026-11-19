@@ -30,12 +30,32 @@ use anyhow::{Context, Result};
 static VERBOSE: LazyLock<bool> = LazyLock::new(|| std::env::var("RISC0_VERBOSE").is_ok());
 
 /// W7-R2: drop the data witness after `step_accum` at every po2 on unified-memory HALs, which
-/// are Metal and the CPU HAL (`CpuHal::has_unified_memory` is true), so the knob also changes
-/// CPU proofs; seals are unaffected because nothing reads the data witness after accum
-/// (`RISC0_METAL_DROP_DATA_EARLY=0`: only at po2>=22, as before, on every HAL).
+/// are Metal and the CPU HAL (`CpuHal::has_unified_memory` is true); seals are unaffected because
+/// nothing reads the data witness after accum. `RISC0_METAL_DROP_DATA_EARLY=0`: only at po2>=22
+/// (upstream release-3.1), any other value: at every po2. Unset: [DROP_DATA_EARLY_DEFAULT].
 static DROP_DATA_EARLY: LazyLock<bool> = LazyLock::new(|| {
-    std::env::var("RISC0_METAL_DROP_DATA_EARLY").map_or(true, |v| v.trim() != "0")
+    drop_data_early_from(std::env::var("RISC0_METAL_DROP_DATA_EARLY").ok().as_deref())
 });
+
+/// W10-GATE: the early drop is on by default only in Metal builds (the `metal` feature, which
+/// only builds on macOS/iOS), whose CPU fallback keeps it too. CPU-only builds drop at po2>=22,
+/// as upstream release-3.1, unless the knob opts in.
+const DROP_DATA_EARLY_DEFAULT: bool = cfg!(all(
+    feature = "metal",
+    any(target_os = "macos", target_os = "ios")
+));
+
+fn drop_data_early_from(knob: Option<&str>) -> bool {
+    match knob {
+        None => DROP_DATA_EARLY_DEFAULT,
+        Some(v) => v.trim() != "0",
+    }
+}
+
+/// Whether `step_accum` drops the data witness of a `cycles`-row segment right after reading it.
+fn drops_data_after_accum(cycles: usize, unified_memory: bool, early: bool) -> bool {
+    cycles >= (1 << 22) || (unified_memory && early)
+}
 
 /// On CUDA and ROCm the witgen kernel writes the five per-cycle columns (CYCLE_COLS) from the
 /// uploaded cycles, so the host injector leaves them out (5 of its ~5.1 entries per row at
@@ -529,7 +549,7 @@ where
         // 4 GiB (po2 19) and 8 GiB (po2 20) budgets refuse in commit_group(ACCUM). On Metal the
         // buffer returns to the pool (the next segment's prefill can still take it; a budget
         // drain can release it). `RISC0_METAL_DROP_DATA_EARLY=0`: only at po2>=22.
-        if self.cycles >= (1 << 22) || (hal.has_unified_memory() && *DROP_DATA_EARLY) {
+        if drops_data_after_accum(self.cycles, hal.has_unified_memory(), *DROP_DATA_EARLY) {
             self.data = None;
         }
 
@@ -1041,4 +1061,39 @@ pub(crate) fn advise_huge<T>(v: &Vec<T>) {
     }
     #[cfg(not(target_os = "linux"))]
     let _ = v;
+}
+
+/// W10-GATE: the early data-witness drop is on by default only in Metal builds; elsewhere the
+/// threshold is upstream release-3.1's po2 22.
+#[cfg(test)]
+mod w10_gate_tests {
+    use super::*;
+
+    #[test]
+    fn drop_data_early_default_is_metal_only() {
+        let metal = cfg!(all(
+            feature = "metal",
+            any(target_os = "macos", target_os = "ios")
+        ));
+        assert_eq!(DROP_DATA_EARLY_DEFAULT, metal);
+        assert_eq!(drop_data_early_from(None), metal);
+        assert!(!drop_data_early_from(Some("0")));
+        assert!(drop_data_early_from(Some("1")));
+        // The knob off: po2 >= 22 only, on every HAL (upstream).
+        for po2 in 14..=24 {
+            for unified in [false, true] {
+                assert_eq!(drops_data_after_accum(1 << po2, unified, false), po2 >= 22);
+            }
+        }
+        // On: every po2 of a unified-memory HAL.
+        assert!(drops_data_after_accum(1 << 14, true, true));
+        assert!(!drops_data_after_accum(1 << 21, false, true));
+        if std::env::var_os("RISC0_METAL_DROP_DATA_EARLY").is_none() {
+            // CpuHal (unified memory) in a CPU-only build: upstream's threshold.
+            assert_eq!(
+                drops_data_after_accum(1 << 20, true, *DROP_DATA_EARLY),
+                metal
+            );
+        }
+    }
 }
