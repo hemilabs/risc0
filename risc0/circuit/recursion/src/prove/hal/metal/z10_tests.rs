@@ -29,7 +29,7 @@ use test_log::test;
 
 use super::*;
 use crate::{
-    prove::{witgen::with_noise_seed, zkr::get_zkr},
+    prove::{witgen::with_noise_seed, zkr::get_zkr_shared},
     CircuitImpl, CIRCUIT, REGISTER_GROUP_ACCUM, REGISTER_GROUP_CODE, REGISTER_GROUP_DATA,
 };
 
@@ -105,7 +105,7 @@ fn z10_profile_cpu_p254() {
         );
     }
     println!("Z10PROF cpu p254 merkle total {hash_total:.3} s");
-    let program = get_zkr("test_recursion_circuit.zkr", po2).unwrap();
+    let program = get_zkr_shared("test_recursion_circuit.zkr", po2).unwrap();
     for hashfn in ["poseidon_254", "poseidon2"] {
         let p = crate::prove::hal::cpu::recursion_prover(hashfn).unwrap();
         for _ in 0..reps {
@@ -145,7 +145,7 @@ fn rec_p254_knob_parses() {
 /// the proof's peak device allocation.
 fn p254_seal_matches_cpu(po2: usize) {
     let _guard = global_state_test_lock();
-    let program = get_zkr("test_recursion_circuit.zkr", po2).unwrap();
+    let program = get_zkr_shared("test_recursion_circuit.zkr", po2).unwrap();
     let metal = metal_p254_prover().unwrap();
     let cpu = crate::prove::hal::cpu::recursion_prover("poseidon_254").unwrap();
     // Warm (PSOs, ctrl caches, pool).
@@ -192,7 +192,7 @@ fn p254_seal_matches_cpu_po2_18() {
 fn factory_p254_uses_metal() {
     let _heavy = crate::prove::hal::metal::heavy_test_lock();
     let _guard = global_state_test_lock();
-    let program = get_zkr("test_recursion_circuit.zkr", 14).unwrap();
+    let program = get_zkr_shared("test_recursion_circuit.zkr", 14).unwrap();
     let p = recursion_prover("poseidon_254").unwrap();
     let calls = phase_calls();
     let r = p.prove(&program, test_input(), None).unwrap();
@@ -225,7 +225,7 @@ fn z10_ab_p254_prover() {
     let _guard = global_state_test_lock();
     let po2 = env_usize("Z10_PROFILE_PO2", 18);
     let pairs = env_usize("Z10_AB_PAIRS", 7);
-    let program = get_zkr("test_recursion_circuit.zkr", po2).unwrap();
+    let program = get_zkr_shared("test_recursion_circuit.zkr", po2).unwrap();
     let cpu = crate::prove::hal::cpu::recursion_prover("poseidon_254").unwrap();
     let metal = metal_p254_prover().unwrap();
     metal.prove(&program, test_input(), None).unwrap();
@@ -260,7 +260,7 @@ fn z10_time_metal_p254() {
     let _guard = global_state_test_lock();
     let po2 = env_usize("Z10_PROFILE_PO2", 18);
     let reps = env_usize("Z10_REPS", 5);
-    let program = get_zkr("test_recursion_circuit.zkr", po2).unwrap();
+    let program = get_zkr_shared("test_recursion_circuit.zkr", po2).unwrap();
     let metal = metal_p254_prover().unwrap();
     metal.prove(&program, test_input(), None).unwrap();
     let probe = MetalHalPoseidon254::new();

@@ -182,19 +182,36 @@ fn pinned_ptr<T>(_p: Option<&()>, _i: usize) -> Option<*const T> {
     None
 }
 
-/// Chains at least this long run on the host (default; `RISC0_REC_HOST_CHAIN_MIN_LEN` overrides
-/// it, read once, for the C12 retune).
+/// Chains at least this long run on the host (default; on Metal builds
+/// `RISC0_REC_HOST_CHAIN_MIN_LEN` overrides it, read once, for the C12 retune).
 const HOST_CHAIN_MIN_LEN: usize = 16;
 
+/// A Metal build (the `metal` feature, which only builds on macOS/iOS). W10-GATE: the fork's
+/// changes that are not Metal code are on by default only when this is true.
+pub(crate) const METAL_BUILD: bool = cfg!(all(
+    feature = "metal",
+    any(target_os = "macos", target_os = "ios")
+));
+
+/// [HOST_CHAIN_MIN_LEN], or on Metal builds `RISC0_REC_HOST_CHAIN_MIN_LEN` (W10-GATE: CUDA and
+/// ROCm keep upstream release-3.1's constant; the variable is not read there).
 fn host_chain_min_len() -> usize {
     static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        std::env::var("RISC0_REC_HOST_CHAIN_MIN_LEN")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&n: &usize| n >= 2)
-            .unwrap_or(HOST_CHAIN_MIN_LEN)
+        host_chain_min_len_from(
+            METAL_BUILD,
+            std::env::var("RISC0_REC_HOST_CHAIN_MIN_LEN")
+                .ok()
+                .as_deref(),
+        )
     });
     *N
+}
+
+fn host_chain_min_len_from(metal: bool, knob: Option<&str>) -> usize {
+    knob.filter(|_| metal)
+        .and_then(|v| v.parse().ok())
+        .filter(|&n: &usize| n >= 2)
+        .unwrap_or(HOST_CHAIN_MIN_LEN)
 }
 
 /// A 256-bit ZK-noise seed ([with_noise_seed32]). B9-SEC: the seal check
@@ -301,12 +318,25 @@ pub(crate) fn draw_noise(seed: Option<NoiseSeed>, stream: u64, n: usize) -> Vec<
     }
 }
 
-/// `RISC0_RECURSION_NOISE_OVERLAP=0` (read once): draw the ZK noise on the proving thread where
-/// it is used (as the stock prover does), instead of on a helper thread while the witness is
-/// generated (P31-09). Either way every cell gets its own independent value; only where the
-/// ~3.4 ms of draws run changes.
-static NOISE_OVERLAP: LazyLock<bool> =
-    LazyLock::new(|| std::env::var("RISC0_RECURSION_NOISE_OVERLAP").as_deref() != Ok("0"));
+/// `RISC0_RECURSION_NOISE_OVERLAP` (read once): `0` draws the ZK noise on the proving thread
+/// where it is used (as the stock prover does), any other value on a helper thread while the
+/// witness is generated (P31-09). Either way every cell gets its own independent value; only
+/// where the ~3.4 ms of draws run changes. Unset: on in Metal builds, off elsewhere (W10-GATE:
+/// upstream release-3.1's order on CPU, CUDA, ROCm and Intel).
+static NOISE_OVERLAP: LazyLock<bool> = LazyLock::new(|| {
+    noise_overlap_from(
+        std::env::var("RISC0_RECURSION_NOISE_OVERLAP")
+            .ok()
+            .as_deref(),
+    )
+});
+
+fn noise_overlap_from(knob: Option<&str>) -> bool {
+    match knob {
+        None => METAL_BUILD,
+        Some(v) => v != "0",
+    }
+}
 
 thread_local! {
     /// Test override of [NOISE_OVERLAP] on this thread.
@@ -875,4 +905,40 @@ pub(crate) fn host_witgen(
         )
     })?;
     Ok((data, global))
+}
+
+/// W10-GATE: the fork's non-Metal-code changes in this file are on by default only in Metal
+/// builds; elsewhere the defaults are upstream release-3.1's.
+#[cfg(test)]
+mod w10_gate_tests {
+    use super::*;
+
+    #[test]
+    fn noise_overlap_default_is_metal_only() {
+        let metal = cfg!(all(
+            feature = "metal",
+            any(target_os = "macos", target_os = "ios")
+        ));
+        assert_eq!(METAL_BUILD, metal);
+        assert_eq!(noise_overlap_from(None), metal);
+        assert!(!noise_overlap_from(Some("0")));
+        assert!(noise_overlap_from(Some("1")));
+        if std::env::var_os("RISC0_RECURSION_NOISE_OVERLAP").is_none() {
+            assert_eq!(*NOISE_OVERLAP, metal);
+        }
+    }
+
+    #[test]
+    fn host_chain_min_len_env_is_metal_only() {
+        assert_eq!(HOST_CHAIN_MIN_LEN, 16);
+        assert_eq!(host_chain_min_len_from(false, None), 16);
+        assert_eq!(host_chain_min_len_from(false, Some("24")), 16);
+        assert_eq!(host_chain_min_len_from(true, None), 16);
+        assert_eq!(host_chain_min_len_from(true, Some("24")), 24);
+        assert_eq!(host_chain_min_len_from(true, Some("1")), 16);
+        assert_eq!(host_chain_min_len_from(true, Some("x")), 16);
+        if !METAL_BUILD {
+            assert_eq!(host_chain_min_len(), 16);
+        }
+    }
 }

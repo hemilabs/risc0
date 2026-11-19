@@ -20,7 +20,7 @@ use std::{collections::VecDeque, sync::Arc, time::Instant};
 use test_log::test;
 
 use super::*;
-use crate::prove::{witgen::with_noise_seed, zkr::get_zkr};
+use crate::prove::{witgen::with_noise_seed, zkr::get_zkr_shared};
 
 fn test_input() -> VecDeque<u32> {
     (0..16u32).map(|i| i * 0x101 + 7).collect()
@@ -55,7 +55,7 @@ fn c11_bench_proofs() {
     let zkr = std::env::var("C11_ZKR").unwrap_or_else(|_| "test_recursion_circuit.zkr".into());
     let po2 = env_usize("C11_PO2", 18);
     let reps = env_usize("C11_REPS", 7);
-    let program = get_zkr(&zkr, po2).unwrap();
+    let program = get_zkr_shared(&zkr, po2).unwrap();
     let prover = metal_recursion_prover(&hashfn).unwrap();
     let t = Instant::now();
     prover.prove(&program, test_input(), None).unwrap();
@@ -237,7 +237,7 @@ pub(crate) fn seal_matches_cpu(hashfn: &str, po2: usize) {
     // Serialized with the other whole-proof tests: the working-set budget is device-wide, so
     // concurrent proofs add up under RISC0_METAL_MAX_WORKING_SET_BYTES (C10 finding 6).
     let _guard = global_state_test_lock();
-    let program = get_zkr("test_recursion_circuit.zkr", po2).unwrap();
+    let program = get_zkr_shared("test_recursion_circuit.zkr", po2).unwrap();
     let metal = metal_recursion_prover(hashfn).unwrap();
     let cpu = crate::prove::hal::cpu::recursion_prover(hashfn).unwrap();
     prove_seal_checked(metal.as_ref(), cpu.as_ref(), &program, test_input(), None).unwrap();
@@ -615,7 +615,7 @@ mod p31_09 {
     fn noise_rows_independent(row_passes: bool) {
         let _heavy = crate::prove::hal::metal::heavy_test_lock();
         let _guard = global_state_test_lock();
-        let program = get_zkr("test_recursion_circuit.zkr", PO2).unwrap();
+        let program = get_zkr_shared("test_recursion_circuit.zkr", PO2).unwrap();
         let mode = if row_passes { "row passes" } else { "generic" };
         let (d, a) = metal_witness(row_passes, &program);
         let (dt, at) = (
@@ -695,7 +695,7 @@ mod p31_09 {
     fn p31_09_seeded_noise_row_passes_eq_generic_eq_cpu() {
         let _heavy = crate::prove::hal::metal::heavy_test_lock();
         let _guard = global_state_test_lock();
-        let program = get_zkr("test_recursion_circuit.zkr", PO2).unwrap();
+        let program = get_zkr_shared("test_recursion_circuit.zkr", PO2).unwrap();
         let seed = 0x5eed_0931;
         let run = |f: &dyn Fn() -> (Vec<u32>, Vec<u32>), overlap: bool| {
             wg::with_noise_overlap(overlap, || with_noise_seed(seed, f))

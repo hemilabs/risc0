@@ -15,6 +15,9 @@
 //! The Metal cache key (`KernelBuild::metal_cache_key`), flag defaults and `.air` placement.
 //! Pure Rust: no Metal toolchain needed.
 
+// W10-GATE: Metal-only (upstream release-3.1 has no such test; other builds do not run it).
+#![cfg(any(target_os = "macos", target_os = "ios"))]
+
 use std::{
     fs,
     path::{Path, PathBuf},
