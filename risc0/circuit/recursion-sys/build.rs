@@ -516,9 +516,14 @@ fn build_rocm_kernels() {
             supra_amalg.push_str(&line);
         } else {
             if fast_assert && name.starts_with("step_") {
+                // Joined, not `{dir}/name`: `kernel_dir` is canonical, which on Windows is a
+                // verbatim `\\?\` path, where `/` is no separator and clang cannot open the file.
+                // That left Windows builds needing RISC0_HIP_REC_ASSERT=1, whose witgen kernels
+                // (asserts compiled out under NDEBUG) fail at launch on an RX 9070 XT under HIP SDK
+                // 7.2 with the 3.1 circuit, while these, as Linux builds them, prove.
                 risc0_amalg.push_str(&format!(
-                    "#include \"{}/rec_fast_assert.cuh\"\n",
-                    kernel_dir.display()
+                    "#include \"{}\"\n",
+                    kernel_dir.join("rec_fast_assert.cuh").display()
                 ));
             }
             risc0_amalg.push_str(&line);
