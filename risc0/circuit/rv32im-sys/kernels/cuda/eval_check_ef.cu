@@ -37,6 +37,12 @@
 #define EF_SPLIT_SHIFT 1
 #endif
 // evalfast (Intel pipeline output) converted to CUDA by to_cuda.py
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+__device__ __forceinline__ uint32_t ef_csub70(uint32_t h) { uint32_t o; asm("{\n\t.reg .pred p;\n\tsetp.ge.u32 p, %1, 0x78000001;\n\tmov.b32 %0, %1;\n\t@p sub.u32 %0, %1, 0x78000001;\n\t}" : "=r"(o) : "r"(h)); return o; }
+__device__ __forceinline__ uint32_t ef_cadd70(uint32_t t) { uint32_t o; asm("{\n\t.reg .pred p;\n\tsetp.ge.u32 p, %1, 0x87ffffff;\n\tmov.b32 %0, %1;\n\t@p add.u32 %0, %1, 0x78000001;\n\t}" : "=r"(o) : "r"(t)); return o; }
+#define EF_MINSUBP(h) ef_csub70(h)
+#define EF_MINADDP(t) ef_cadd70(t)
+#endif
 #include "ef_fp.h"
 #include "ef_fpext.h"
 #include <cstdint>
@@ -64,7 +70,11 @@ constexpr size_t kInvRate = 4;
 // ---- lincomb.py: lazily reduced FpExt linear combinations ----
 struct RkW { uint32_t lo[4]; uint32_t hi[4]; };   // S_j = hi*2^32 + lo, hi < P between steps
 __device__ __forceinline__ static uint32_t rkw_mulhi(uint32_t a, uint32_t b) { return uint32_t((uint64_t(a) * uint64_t(b)) >> 32); }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+__device__ __forceinline__ static uint32_t rkw_fold(uint32_t h) { return EF_MINSUBP(h); }
+#else
 __device__ __forceinline__ static uint32_t rkw_fold(uint32_t h) { uint32_t f = h - Fp::P; return h < f ? h : f; }
+#endif
 __device__ __forceinline__ static void rkw_mac(RkW& w, int j, uint32_t x, uint32_t y) {
 #ifdef EF_WIDE
   uint64_t t = ((uint64_t(w.hi[j]) << 32) | w.lo[j]) + uint64_t(x) * uint64_t(y);
@@ -123,14 +133,22 @@ __device__ __forceinline__ static void rkw_v(RkW& w, FpExt v, bool neg) {
 }
 __device__ __forceinline__ static FpExt rkw_fin(const RkW& w) {
   uint32_t r[4];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+  for (int j = 0; j < 4; j++) { uint32_t t = w.hi[j] - rkw_mulhi(w.lo[j] * Fp::M, Fp::P); r[j] = EF_MINADDP(t); }
+#else
   for (int j = 0; j < 4; j++) { uint32_t t = w.hi[j] - rkw_mulhi(w.lo[j] * Fp::M, Fp::P); uint32_t u = t + Fp::P; r[j] = t < u ? t : u; }
+#endif
   return FpExt(Fp::fromRaw(r[0]), Fp::fromRaw(r[1]), Fp::fromRaw(r[2]), Fp::fromRaw(r[3]));
 }
 
 // ---- lincombF: lazily reduced Fp linear combinations ----
 struct RkW1 { uint32_t lo; uint32_t hi; };
 __device__ __forceinline__ static uint32_t rkw1_mulhi(uint32_t a, uint32_t b) { return uint32_t((uint64_t(a) * uint64_t(b)) >> 32); }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+__device__ __forceinline__ static uint32_t rkw1_fold(uint32_t h) { return EF_MINSUBP(h); }
+#else
 __device__ __forceinline__ static uint32_t rkw1_fold(uint32_t h) { uint32_t f = h - Fp::P; return h < f ? h : f; }
+#endif
 __device__ __forceinline__ static RkW1 rkw1_ff0(Fp a, Fp b, bool neg) {
   const uint32_t x = neg ? Fp::P - a.asRaw() : a.asRaw(), y = b.asRaw();
   RkW1 w; w.lo = x * y; w.hi = rkw1_mulhi(x, y); return w;
@@ -152,7 +170,11 @@ __device__ __forceinline__ static void rkw1_v(RkW1& w, Fp v, bool neg) {
 }
 __device__ __forceinline__ static Fp rkw1_fin(const RkW1& w) {
   const uint32_t h = w.hi;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+  uint32_t t = h - rkw1_mulhi(w.lo * Fp::M, Fp::P); return Fp::fromRaw(EF_MINADDP(t));
+#else
   uint32_t t = h - rkw1_mulhi(w.lo * Fp::M, Fp::P); uint32_t u = t + Fp::P; return Fp::fromRaw(t < u ? t : u);
+#endif
 }
 // ---- lazy poly_mix accumulator (RK_LAZYCHAIN) ----
 struct RkAcc { uint32_t lo[4]; uint32_t hi[4]; };   // S_j = hi*2^32+lo, invariant hi < P
@@ -166,7 +188,11 @@ template <typename A> __device__ __forceinline__ static RkAcc rk_link(const A& b
   for (int j = 0; j < 4; j++) {
     uint64_t t = ((uint64_t(s.hi[j]) << 32) | s.lo[j]) + uint64_t(cr) * uint64_t(pm.elems[j].asRaw());
     uint32_t h = uint32_t(t >> 32);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+    s.lo[j] = uint32_t(t); s.hi[j] = EF_MINSUBP(h);
+#else
     s.lo[j] = uint32_t(t); s.hi[j] = rk_umin(h, h - Fp::P);
+#endif
   }
   return s;
 #else
@@ -176,14 +202,22 @@ template <typename A> __device__ __forceinline__ static RkAcc rk_link(const A& b
     uint32_t pl = cr * p, ph = rk_mulhi(cr, p);
     uint32_t n = s.lo[j] + pl;
     uint32_t h = s.hi[j] + ph + (n < pl ? 1u : 0u);   // < P + 0.47P + 1 < 2P
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+    s.lo[j] = n; s.hi[j] = EF_MINSUBP(h);
+#else
     s.lo[j] = n; s.hi[j] = rk_umin(h, h - Fp::P);
+#endif
   }
   return s;
 #endif
 }
 template <typename A> __device__ __forceinline__ static RkAcc rk_link(const A& base, FpExt c, const FpExt& pm) {
   RkAcc s = rk_acc(base); FpExt p = c * pm;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+  for (int j = 0; j < 4; j++) { uint32_t h0 = EF_MINSUBP(s.hi[j]); uint32_t h = h0 + p.elems[j].asRaw(); s.hi[j] = EF_MINSUBP(h); }
+#else
   for (int j = 0; j < 4; j++) { uint32_t h0 = rk_umin(s.hi[j], s.hi[j] - Fp::P); uint32_t h = h0 + p.elems[j].asRaw(); s.hi[j] = rk_umin(h, h - Fp::P); }
+#endif
   return s;
 }
 // no-fold variant: input hi < P, output hi < P + 0.47P + 1 < 2P (fits u32); the next link must fold.
@@ -215,7 +249,11 @@ __device__ __forceinline__ static FpExt rk_fin(const RkAcc& s) {
   for (int j = 0; j < 4; j++) {
     uint32_t m = s.lo[j] * Fp::M;
     uint32_t t = s.hi[j] - rk_mulhi(m, Fp::P);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+    r[j] = EF_MINADDP(t);
+#else
     r[j] = rk_umin(t, t + Fp::P);
+#endif
   }
   return FpExt(Fp::fromRaw(r[0]), Fp::fromRaw(r[1]), Fp::fromRaw(r[2]), Fp::fromRaw(r[3]));
 }
@@ -238,7 +276,11 @@ __device__ __forceinline__ static uint64_t ef_madw(uint32_t a, uint32_t b, uint6
 #endif
 }
 __device__ __forceinline__ static uint64_t ef_fold64(uint64_t t) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+  uint32_t h = EF_MINSUBP(uint32_t(t >> 32));
+#else
   uint32_t h = uint32_t(t >> 32), f = h - Fp::P; h = h < f ? h : f;
+#endif
   return (uint64_t(h) << 32) | uint32_t(t);
 }
 // pm row j of the NBETA-folded 4x4 matrix of constant k

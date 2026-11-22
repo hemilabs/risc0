@@ -64,8 +64,13 @@ private:
   static constexpr inline uint32_t add(uint32_t a, uint32_t b) {
     uint32_t r = a + b;
 #if defined(__CUDA_ARCH__) && defined(EF_FP_FAST)
+#if __CUDA_ARCH__ >= 750
     uint32_t s = r - P;
     return (r < s ? r : s);
+#else
+    if (!__builtin_is_constant_evaluated()) return ef_csub70(r);
+    return (r >= P ? r - P : r);
+#endif
 #else
     return (r >= P ? r - P : r);
 #endif
@@ -75,8 +80,13 @@ private:
   static constexpr inline uint32_t sub(uint32_t a, uint32_t b) {
     uint32_t r = a - b;
 #if defined(__CUDA_ARCH__) && defined(EF_FP_FAST)
+#if __CUDA_ARCH__ >= 750
     uint32_t s = r + P;
     return (r < s ? r : s);
+#else
+    if (!__builtin_is_constant_evaluated()) return ef_cadd70(r);
+    return (r >= 0x87ffffffu ? r + P : r);
+#endif
 #else
     return (r > P ? r + P : r);
 #endif
@@ -124,8 +134,13 @@ private:
     uint32_t hi = uint32_t((uint64_t(a) * uint64_t(b)) >> 32);
     uint32_t m = lo * M;
     uint32_t r = hi - uint32_t((uint64_t(m) * uint64_t(P)) >> 32);
+#if __CUDA_ARCH__ >= 750
     uint32_t s = r + P;
     return (r < s ? r : s);
+#else
+    if (!__builtin_is_constant_evaluated()) return ef_cadd70(r);
+    return (r >= 0x87ffffffu ? r + P : r);
+#endif
 #endif
     uint64_t o64 = uint64_t(a) * uint64_t(b);
     uint32_t low = -uint32_t(o64);
