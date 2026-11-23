@@ -270,8 +270,8 @@ pub trait ProverServer: private::Sealed {
         #[cfg(any(feature = "rocm", feature = "intel"))]
         prover_impl::release_cached_provers();
         let t2 = std::time::Instant::now();
-        let seal = shrink_wrap_with(&seal_bytes, release_hal_buffers)?.to_vec();
-        release_hal_buffers();
+        let seal = shrink_wrap_with(&seal_bytes, release_hal_buffers_for_wrap)?.to_vec();
+        release_hal_buffers_after_wrap();
         let wrap_ms = t2.elapsed().as_secs_f64() * 1000.0;
 
         eprintln!(
@@ -582,4 +582,31 @@ pub fn release_hal_buffers() {
     // segment pipeline drained (`shrink_wrap_with` runs it on the calling thread).
     #[cfg(feature = "metal")]
     prover_impl::release_cached_provers();
+}
+
+/// [release_hal_buffers] before the Groth16 wrap. On CUDA cards with at most 16 GiB (see
+/// `risc0_zkp::hal::cuda::wrap_release_mode`) it also shrinks the CUDA local-memory reservation
+/// for the wrap (and, if asked, drops this thread's cached segment and recursion provers, whose
+/// buffers go back to the pool first): at the wrap's peak on a 12 GB TITAN V (Windows) the
+/// driver moved part of that reservation into shared system memory, and the next proof's first
+/// stack-using kernels ran at up to 1.8x their time. Undone by [release_hal_buffers_after_wrap].
+pub(crate) fn release_hal_buffers_for_wrap() {
+    #[cfg(feature = "cuda")]
+    {
+        if risc0_zkp::hal::cuda::wrap_release_mode().provers {
+            prover_impl::release_cached_provers();
+        }
+        risc0_zkp::hal::cuda::release_for_wrap();
+    }
+    #[cfg(not(feature = "cuda"))]
+    release_hal_buffers();
+}
+
+/// [release_hal_buffers] after the Groth16 wrap, restoring what [release_hal_buffers_for_wrap]
+/// shrank.
+pub(crate) fn release_hal_buffers_after_wrap() {
+    #[cfg(feature = "cuda")]
+    risc0_zkp::hal::cuda::restore_after_wrap();
+    #[cfg(not(feature = "cuda"))]
+    release_hal_buffers();
 }

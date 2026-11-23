@@ -435,13 +435,23 @@ fn shrink_wrap_inner(seal_bytes: &[u8], pre_gpu: impl FnOnce()) -> Result<Seal> 
 
     // Start SRS preload on background thread while witness calc runs on CPU.
     // SRS loading (disk I/O + GPU upload) overlaps with witness computation.
-    let srs_preload = {
-        let setup_clone = SetupParams::new(root_dir)
-            .context("failed to create groth16 setup params for preload")?;
+    let setup_clone =
+        SetupParams::new(root_dir).context("failed to create groth16 setup params for preload")?;
+    let spawn_preload = move || {
         std::thread::spawn(move || {
             let _ = risc0_groth16_sys::preload(&setup_clone);
         })
     };
+    // On cards where `pre_gpu` frees the STARK's memory for the wrap (see
+    // `risc0_zkp::hal::cuda::wrap_release_mode`), the upload starts after it: started before, it
+    // ran beside the STARK's cached buffers, filled a 12 GB TITAN V and made the driver move
+    // resident memory into shared system memory. `RISC0_CUDA_WRAP_EARLY_PRELOAD=1` starts it first.
+    let preload_first = {
+        let m = risc0_zkp::hal::cuda::wrap_release_mode();
+        !(m.provers || m.stack) || std::env::var("RISC0_CUDA_WRAP_EARLY_PRELOAD").as_deref() == Ok("1")
+    };
+    let mut spawn_preload = Some(spawn_preload);
+    let mut srs_preload = if preload_first { spawn_preload.take().map(|f| f()) } else { None };
 
     let witness_params = WitnessParams::new(root_dir);
     // The graph (parsed in the background since the session started) is waited for on the
@@ -449,13 +459,18 @@ fn shrink_wrap_inner(seal_bytes: &[u8], pre_gpu: impl FnOnce()) -> Result<Seal> 
     let witness = std::thread::scope(|sc| {
         let h = sc.spawn(|| calc_witness(get_cached_graph(&witness_params.graph_path), &inputs));
         pre_gpu();
+        if let Some(f) = spawn_preload.take() {
+            srs_preload = Some(f());
+        }
         h.join()
             .unwrap_or_else(|_| Err(anyhow::anyhow!("groth16 witness thread panicked")))
     })
     .context("failed to calculate groth16 witness")?;
 
     // Wait for SRS preload to complete before taking the GPU lock.
-    let _ = srs_preload.join();
+    if let Some(h) = srs_preload {
+        let _ = h.join();
+    }
 
     {
         let _lock = risc0_zkp::hal::cuda::singleton().lock();

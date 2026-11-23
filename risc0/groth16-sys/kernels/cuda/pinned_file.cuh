@@ -1,14 +1,20 @@
 #pragma once
 
-// A pinned host copy of a file, read once per process (ROCm on Windows).
+// A pinned host copy of a file, read once per process (ROCm and CUDA on Windows).
 //
 // The Groth16 prover's proving key (the zkey's points and the preprocessed coefficients, ~4.7
 // GB) is released after every proof on a card that can't keep it beside the next STARK, so
 // every wrap reloads it. From the file (read or mapped, so pageable) that reload ran ~1.5 s
 // on an RX 9070 XT; from this copy the uploads are DMA. Returns nullptr when the copy can't be
 // made (or RISC0_GROTH16_PINNED_KEY=0), and the callers fall back to the file.
+//
+// On CUDA the copy is made only when a file is loaded a second time, i.e. when the key was
+// released between proofs (the zk-miner worker does on cards below 20 GiB): a process that
+// keeps its key never holds the ~5 GB of page-locked host memory. RISC0_GROTH16_PINNED_KEY=1
+// pins on the first load too.
 
-#if defined(_WIN32) && defined(__HIPCC__) && !defined(__HIP_DEVICE_COMPILE__)
+#if defined(_WIN32) && !defined(__HIP_DEVICE_COMPILE__) && \
+    (defined(__HIPCC__) || !defined(__CUDA_ARCH__))
 #define GROTH16_PINNED_FILES 1
 
 #include <cstdio>
@@ -20,10 +26,8 @@
 #include <sys/stat.h>
 
 static const unsigned char* groth16_pinned_file(const char* path, size_t* size) {
-  static const bool enabled = [] {
-    const char* v = std::getenv("RISC0_GROTH16_PINNED_KEY");
-    return !(v && std::strcmp(v, "0") == 0);
-  }();
+  static const char* const env = std::getenv("RISC0_GROTH16_PINNED_KEY");
+  static const bool enabled = !(env && std::strcmp(env, "0") == 0);
   if (!enabled)
     return nullptr;
   static std::mutex m;
@@ -34,6 +38,11 @@ static const unsigned char* groth16_pinned_file(const char* path, size_t* size) 
     *size = it->second.second;
     return it->second.first;
   }
+#ifndef __HIPCC__
+  static std::map<std::string, int> loads;
+  if (++loads[path] < 2 && !(env && std::strcmp(env, "1") == 0))
+    return nullptr;
+#endif
   std::FILE* file = std::fopen(path, "rb");
   if (!file)
     return nullptr;
@@ -47,6 +56,7 @@ static const unsigned char* groth16_pinned_file(const char* path, size_t* size) 
   if (cudaMallocHost(&buf, len) != cudaSuccess || !buf) {
     (void)cudaGetLastError();
     std::fclose(file);
+    std::fprintf(stderr, "groth16: could not pin %zu bytes for %s, reading it pageable\n", len, path);
     return nullptr;
   }
   size_t got = std::fread(buf, 1, len, file);
@@ -55,6 +65,8 @@ static const unsigned char* groth16_pinned_file(const char* path, size_t* size) 
     cudaFreeHost(buf);
     return nullptr;
   }
+  if (std::getenv("RISC0_VERBOSE"))
+    std::fprintf(stderr, "groth16: pinned %zu bytes for %s\n", len, path);
   cache[path] = {(unsigned char*)buf, len};
   *size = len;
   return (const unsigned char*)buf;

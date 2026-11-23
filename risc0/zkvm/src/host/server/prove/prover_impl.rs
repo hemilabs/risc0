@@ -69,7 +69,7 @@ impl Drop for DrainSegmentProverOnExit {
 
 /// Drop this thread's cached segment prover and the device buffers it keeps between segments
 /// (see `release_cached_provers`). Only between sessions: the prover must be idle.
-#[cfg(any(feature = "rocm", feature = "intel", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "intel", feature = "metal"))]
 fn release_cached_segment_prover() {
     CACHED_SEGMENT_PROVER.with(|cell| {
         if let Ok(mut borrow) = cell.try_borrow_mut() {
@@ -84,11 +84,13 @@ fn release_cached_segment_prover() {
 /// ~2 GB of them into shared system memory, where they stayed: every later session ran ~2.5x
 /// slower. On an Arc B580 (12 GB, Windows) at po2=20 the next session's segments took 106 s
 /// instead of 28 (54-65 s with this alone; the rest was the HAL's pool, see `pool_max_bytes` in
-/// risc0-zkp's Intel HAL). Rebuilt by the next session, in device memory.
+/// risc0-zkp's Intel HAL). Rebuilt by the next session, in device memory. On CUDA only when
+/// `RISC0_CUDA_WRAP_RELEASE` asks for it (see `risc0_zkp::hal::cuda::wrap_release_mode`),
+/// through `release_hal_buffers_for_wrap`.
 ///
 /// On Metal this is also how `release_hal_buffers` returns pooled memory: the pools belong to the
 /// HALs these provers hold (see there).
-#[cfg(any(feature = "rocm", feature = "intel", feature = "metal"))]
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "intel", feature = "metal"))]
 pub(crate) fn release_cached_provers() {
     release_cached_segment_prover();
     risc0_circuit_recursion::prove::release_cached_provers();
@@ -1662,8 +1664,8 @@ impl ProverImpl {
             // Released while the wrap computes its witness on another thread.
             #[cfg(any(feature = "rocm", feature = "intel"))]
             release_cached_provers();
-            let seal = shrink_wrap_with(&seal_bytes, super::release_hal_buffers)?.to_vec();
-            super::release_hal_buffers();
+            let seal = shrink_wrap_with(&seal_bytes, super::release_hal_buffers_for_wrap)?.to_vec();
+            super::release_hal_buffers_after_wrap();
             let wrap_ms = t0.elapsed().as_secs_f64() * 1000.0;
             eprintln!(
                 "[succinct_to_groth16] identity_p254=pre-computed shrink_wrap={wrap_ms:.1}ms \

@@ -231,6 +231,118 @@ pub fn clear_buffer_pool() {
     );
 }
 
+extern "C" {
+    fn cuCtxGetLimit(value: *mut usize, limit: i32) -> i32;
+    fn cuCtxSetLimit(limit: i32, value: usize) -> i32;
+}
+const CU_LIMIT_STACK_SIZE: i32 = 0;
+
+/// Cards with at most this much memory release more before the Groth16 wrap (see
+/// [wrap_release_mode]).
+const WRAP_RELEASE_MAX_TOTAL: usize = 16 << 30;
+/// Per-thread stack the wrap runs with (CUDA's default limit). The driver grows it again for any
+/// kernel that needs more.
+const WRAP_STACK_BYTES: usize = 1024;
+
+/// What [release_for_wrap] frees besides the HAL's pool, for the CALLER (the zkvm prover also
+/// drops its cached provers when `provers` is set). By default `stack` on cards with at most
+/// 16 GiB, and `provers` off: on a TITAN V the stack alone removed the post-wrap slowdown, and
+/// dropping the provers cost the next identity_p254 ~90 ms to rebuild its prover.
+/// `RISC0_CUDA_WRAP_RELEASE=0` turns both off, `=1` both on, `=stack` / `=provers` selects one.
+#[derive(Clone, Copy, Debug)]
+pub struct WrapRelease {
+    /// Drop the cached segment and recursion provers before the pool is drained.
+    pub provers: bool,
+    /// Shrink the CUDA local-memory (stack) reservation for the wrap.
+    pub stack: bool,
+}
+
+/// See [WrapRelease].
+pub fn wrap_release_mode() -> WrapRelease {
+    static MODE: std::sync::LazyLock<WrapRelease> = std::sync::LazyLock::new(|| {
+        let env = std::env::var("RISC0_CUDA_WRAP_RELEASE").ok();
+        let small = || {
+            cust::memory::mem_get_info()
+                .map(|(_, total)| total <= WRAP_RELEASE_MAX_TOTAL)
+                .unwrap_or(false)
+        };
+        let (provers, stack) = match env.as_deref() {
+            Some("0") => (false, false),
+            Some("1") => (true, true),
+            Some("stack") => (false, true),
+            Some("provers") => (true, false),
+            _ => (false, small()),
+        };
+        WrapRelease { provers, stack }
+    });
+    *MODE
+}
+
+fn free_gib() -> f64 {
+    cust::memory::mem_get_info()
+        .map(|(free, _)| free as f64 / (1u64 << 30) as f64)
+        .unwrap_or(-1.0)
+}
+
+/// Stack limit saved by [release_for_wrap], restored by [restore_after_wrap].
+static WRAP_SAVED_STACK: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
+
+/// Before the Groth16 wrap, on the thread that proved the STARK (its pool is thread-local): the
+/// HAL's pool ([clear_buffer_pool]) and, per [wrap_release_mode], the CUDA local-memory
+/// reservation. The reservation is sized for the stack-heaviest kernel the STARK launched
+/// (8.6 KB per thread x every resident thread: ~1.4 GB on an 80-SM card) and stays allocated
+/// while idle; at the wrap's peak on a 12 GB card under WDDM the driver moved part of it into
+/// shared system memory, where the next proof's stack-using kernels ran at up to 1.8x their time.
+/// Shrunk here, it is reallocated in device memory by [restore_after_wrap].
+pub fn release_for_wrap() {
+    let before = free_gib();
+    clear_buffer_pool();
+    let after_pool = free_gib();
+    let mut msg = String::new();
+    if wrap_release_mode().stack {
+        let mut old = 0usize;
+        unsafe {
+            if cuCtxGetLimit(&mut old, CU_LIMIT_STACK_SIZE) == 0 && old > WRAP_STACK_BYTES {
+                let _ = cuCtxSynchronize();
+                let rc = cuCtxSetLimit(CU_LIMIT_STACK_SIZE, WRAP_STACK_BYTES);
+                if rc == 0 {
+                    *WRAP_SAVED_STACK.lock().unwrap_or_else(|e| e.into_inner()) = Some(old);
+                }
+                msg = format!(", stack limit {old} -> {WRAP_STACK_BYTES} B (rc {rc})");
+            }
+        }
+    }
+    tracing::info!(
+        "release_for_wrap: free {before:.2} GiB, {after_pool:.2} after the pool, {:.2} after all{msg}",
+        free_gib()
+    );
+}
+
+/// After the Groth16 wrap: [clear_buffer_pool] again, and the stack limit [release_for_wrap]
+/// lowered back to its value (the reservation is reallocated now, in device memory).
+pub fn restore_after_wrap() {
+    clear_buffer_pool();
+    let saved = WRAP_SAVED_STACK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    if let Some(old) = saved {
+        let before = free_gib();
+        let rc = unsafe {
+            let mut cur = 0usize;
+            if cuCtxGetLimit(&mut cur, CU_LIMIT_STACK_SIZE) == 0 && cur >= old {
+                0
+            } else {
+                cuCtxSetLimit(CU_LIMIT_STACK_SIZE, old)
+            }
+        };
+        tracing::info!(
+            "restore_after_wrap: stack limit back to {old} B (rc {rc}), free {before:.2} -> {:.2} GiB",
+            free_gib()
+        );
+    }
+}
+
 // The GPU becomes unstable as the number of concurrent provers grow.
 //
 // Held for a whole proving call by the code that proves (`exclusive`; the rv32im session, each
