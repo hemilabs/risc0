@@ -60,7 +60,7 @@ impl Default for BaseUrls {
             risc0_github_base_url: "https://github.com/risc0".into(),
             github_api_base_url: "https://api.github.com".into(),
             risc0_base_url: "https://risczero.com".into(),
-            s3_base_url: "https://risc0-artifacts.s3.us-west-2.amazonaws.com".into(),
+            s3_base_url: "https://artifacts.risczero.net".into(),
         }
     }
 }
