@@ -23,9 +23,11 @@
 ///
 /// Access ordering: CUDA's HIP build puts compiler barriers around each access because witgen
 /// threads read back rows that neighbouring threads write (SHA2 back 68). MSL has no compiler
-/// barrier. The default plan (4.2) avoids the race with a separate `pre_data` buffer; defining
-/// RV32IM_ORDERED_ROWS makes every access a volatile 32-bit access instead, which the compiler
-/// may neither reorder against other volatile accesses nor merge.
+/// barrier. The host's default avoids the race with a separate `pre_data` snapshot (witgen.rs;
+/// `RISC0_METAL_WITGEN_SINGLE_BUFFER=1` binds `data` itself, and back loads then race with the
+/// stores of neighbouring threads). Defining RV32IM_ORDERED_ROWS makes every access a volatile
+/// 32-bit access, which the compiler may neither reorder against other volatile accesses nor
+/// merge; it does not order accesses across threads, so it is no substitute for the snapshot.
 
 #include "cuda_compat.h"
 #include "rv32im_fp.h"

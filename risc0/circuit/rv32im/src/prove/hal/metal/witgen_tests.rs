@@ -706,7 +706,7 @@ fn witgen_snapshot_over_budget_is_an_error() {
     );
 }
 
-/// Single-buffer mode (CUDA's default `pre_data == data`, the default since R15w) against the
+/// Single-buffer mode (CUDA's default `pre_data == data`, R15w's default, opt-in since) against the
 /// CPU, whatever the tuning env says (notes/R15w.md has the gate).
 #[test]
 fn witgen_single_buffer_matches_cpu() {

@@ -1465,6 +1465,10 @@ pub(crate) struct Runtime {
     open_seq: AtomicU64,
     /// Every batch with a sequence number up to this one has completed (shared with the pool).
     completed_seq: Arc<AtomicU64>,
+    /// A command-buffer error that `poll` recorded and `try_sync` has not reported yet. A poll
+    /// outside a sync (an allocation, a flush) can retire the failed batch, after which
+    /// `unsynced()` is false; host reads check this too, so they still sync and report it.
+    error_pending: AtomicBool,
     debug: AtomicBool,
     batch_limit: AtomicUsize,
     pub(crate) max_tg_mem: u64,
@@ -1584,6 +1588,7 @@ impl Runtime {
             pool,
             open_seq: AtomicU64::new(0),
             completed_seq,
+            error_pending: AtomicBool::new(false),
             debug: AtomicBool::new(debug),
             batch_limit: AtomicUsize::new(batch_limit),
             max_tg_mem,
@@ -1855,6 +1860,7 @@ impl Runtime {
                     tracing::error!("Metal command buffer {} failed: {msg}", front.seq);
                     st.error
                         .get_or_insert_with(|| format!("Metal command buffer failed: {msg}"));
+                    self.error_pending.store(true, Ordering::Release);
                 }
                 _ => break,
             }
@@ -2126,6 +2132,7 @@ impl Runtime {
         }
         self.poll(&mut st);
         debug_assert!(st.in_flight.is_empty());
+        self.error_pending.store(false, Ordering::Release);
         match st.error.take() {
             Some(err) => Err(anyhow!(err)),
             None => Ok(()),
@@ -2138,10 +2145,11 @@ impl Runtime {
         }
     }
 
-    /// Called by every host access to a HAL buffer: waits for outstanding GPU work, then (in
-    /// debug mode) checks that no unsynced batch uses the buffer.
+    /// Called by every host access to a HAL buffer: waits for outstanding GPU work (and reports
+    /// a command-buffer error an earlier poll retired), then (in debug mode) checks that no
+    /// unsynced batch uses the buffer.
     pub(crate) fn sync_for_host(&self, buf: &BufferRef, name: &str, what: &str) {
-        if self.unsynced() {
+        if self.unsynced() || self.error_pending.load(Ordering::Acquire) {
             self.sync();
         }
         self.check_host_access(buf, name, what);
