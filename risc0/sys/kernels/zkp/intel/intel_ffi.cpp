@@ -286,58 +286,94 @@ size_t esimd_device_total_memory() {
     return g_shared_device ? g_shared_device->get_info<sycl::info::device::global_mem_size>() : 0;
 }
 
-void esimd_destroy_queue(void* queue) {
-    if (queue) {
-        auto* q = static_cast<sycl::queue*>(queue);
-        q->wait();
-        delete q;
+// No C++ exception may leave these: Rust calls them as `extern "C"`, and one
+// that crossed (a failed allocation at a segment size too large for the card
+// made the runtime throw) unwound through Rust frames whose destructors call
+// back in here, threw again, and aborted the process ("panic in a destructor
+// during cleanup"), where the CUDA and HIP HALs answer an allocation failure
+// the worker can catch. The ones that can fail mid-proof return an error
+// string for `esimd_check` (a Rust panic, which unwinds cleanly); the ones
+// destructors call (free, the quiet sync, destroy) never fail: a failure there
+// is reported once, on stderr.
+
+static void report_once(const char* what, const char* msg) {
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true)) {
+        fprintf(stderr, "esimd: %s failed: %s (reported once)\n", what, msg);
     }
 }
 
-void esimd_sync(void* queue) {
-    auto* q = static_cast<sycl::queue*>(queue);
-    q->wait();
+#define FFI_QUIET(label, body) \
+    try { body; } \
+    catch (const std::exception& e) { report_once(label, e.what()); } \
+    catch (...) { report_once(label, "unknown C++ exception"); }
+
+void esimd_destroy_queue(void* queue) {
+    if (queue) {
+        auto* q = static_cast<sycl::queue*>(queue);
+        FFI_QUIET("queue wait before destroy", q->wait());
+        FFI_QUIET("queue destroy", delete q);
+    }
 }
 
+const char* esimd_sync(void* queue) {
+    auto* q = static_cast<sycl::queue*>(queue);
+    FFI_WRAP(q->wait());
+}
+
+void esimd_sync_quiet(void* queue) {
+    auto* q = static_cast<sycl::queue*>(queue);
+    FFI_QUIET("queue wait", q->wait());
+}
+
+// Null on failure, as `sycl::malloc_device` itself returns on most.
 void* esimd_malloc_device(void* queue, size_t bytes) {
     auto* q = static_cast<sycl::queue*>(queue);
-    return sycl::malloc_device<uint8_t>(bytes, *q);
+    try {
+        return sycl::malloc_device<uint8_t>(bytes, *q);
+    } catch (...) {
+        return nullptr;
+    }
 }
 
 void esimd_free_device(void* queue, void* ptr) {
     auto* q = static_cast<sycl::queue*>(queue);
-    sycl::free(ptr, *q);
+    FFI_QUIET("free", sycl::free(ptr, *q));
 }
 
-void esimd_memcpy_htod(void* queue, void* dst, const void* src, size_t bytes) {
+const char* esimd_memcpy_htod(void* queue, void* dst, const void* src, size_t bytes) {
     auto* q = static_cast<sycl::queue*>(queue);
-    if (htod_staging::enabled()) {
-        // The source is copied before this returns, so the caller may free
-        // or reuse it immediately. See htod_staging above.
-        htod_staging::copy(*q, static_cast<char*>(dst), static_cast<const char*>(src), bytes);
-        return;
-    }
-    q->memcpy(dst, src, bytes);
-    // No wait: in-order queue guarantees subsequent kernels see the data.
-    // Unsafe if the caller reuses `src` before the copy runs (see htod_staging).
+    FFI_WRAP(
+        if (htod_staging::enabled()) {
+            // The source is copied before this returns, so the caller may free
+            // or reuse it immediately. See htod_staging above.
+            htod_staging::copy(*q, static_cast<char*>(dst), static_cast<const char*>(src), bytes);
+        } else {
+            q->memcpy(dst, src, bytes);
+            // No wait: in-order queue guarantees subsequent kernels see the data.
+            // Unsafe if the caller reuses `src` before the copy runs (see htod_staging).
+        }
+    );
 }
 
-void esimd_memcpy_dtoh(void* queue, void* dst, const void* src, size_t bytes) {
+const char* esimd_memcpy_dtoh(void* queue, void* dst, const void* src, size_t bytes) {
     auto* q = static_cast<sycl::queue*>(queue);
-    q->memcpy(dst, src, bytes);
-    q->wait();  // Must wait: host reads dst immediately after return.
+    FFI_WRAP(
+        q->memcpy(dst, src, bytes);
+        q->wait();  // Must wait: host reads dst immediately after return.
+    );
 }
 
-void esimd_memset(void* queue, void* ptr, int value, size_t bytes) {
+const char* esimd_memset(void* queue, void* ptr, int value, size_t bytes) {
     auto* q = static_cast<sycl::queue*>(queue);
-    q->memset(ptr, value, bytes);
     // No wait: in-order queue serializes subsequent operations.
+    FFI_WRAP(q->memset(ptr, value, bytes));
 }
 
-void esimd_memcpy_dtod(void* queue, void* dst, const void* src, size_t bytes) {
+const char* esimd_memcpy_dtod(void* queue, void* dst, const void* src, size_t bytes) {
     auto* q = static_cast<sycl::queue*>(queue);
-    q->memcpy(dst, src, bytes);
     // No wait: in-order queue serializes subsequent operations.
+    FFI_WRAP(q->memcpy(dst, src, bytes));
 }
 
 // GPU query: extract one column of data + Merkle auth path, entirely on device.
@@ -1167,7 +1203,7 @@ const char* esimd_combos_finalize_ffi(void* queue, void* d_out, const void* d_co
 }
 
 // Pre-warm GPU caches and SYCL runtime to eliminate first-segment overhead.
-void esimd_warmup(void* queue, uint32_t max_lg_n) {
+static void esimd_warmup_impl(void* queue, uint32_t max_lg_n) {
     auto* q = static_cast<sycl::queue*>(queue);
     // Allocate a small buffer for warmup operations
     uint32_t n = 1u << 14;  // 16K elements — triggers twiddle computation for lg=14
@@ -1259,6 +1295,11 @@ void esimd_warmup(void* queue, uint32_t max_lg_n) {
     q->wait();  // sycl::free does not wait for kernels using the buffer
 
     sycl::free(d, *q);
+}
+
+// See the note above esimd_destroy_queue: no exception may reach Rust.
+const char* esimd_warmup(void* queue, uint32_t max_lg_n) {
+    FFI_WRAP(esimd_warmup_impl(queue, max_lg_n));
 }
 
 } // extern "C"

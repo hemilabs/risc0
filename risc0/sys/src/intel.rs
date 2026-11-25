@@ -28,7 +28,10 @@ extern "C" {
     pub fn esimd_create_queue() -> *mut c_void;
     pub fn esimd_device_total_memory() -> usize;
     pub fn esimd_destroy_queue(queue: *mut c_void);
-    pub fn esimd_sync(queue: *mut c_void);
+    // These return null or an error string for `esimd_check` / `esimd_result`; no C++ exception
+    // leaves any of them (intel_ffi.cpp). `esimd_sync_quiet` is for destructors: it never fails.
+    pub fn esimd_sync(queue: *mut c_void) -> *const std::os::raw::c_char;
+    pub fn esimd_sync_quiet(queue: *mut c_void);
 
     // Device memory management
     pub fn esimd_malloc_device(queue: *mut c_void, bytes: usize) -> *mut c_void;
@@ -38,23 +41,28 @@ extern "C" {
         dst: *mut c_void,
         src: *const c_void,
         bytes: usize,
-    );
+    ) -> *const std::os::raw::c_char;
     pub fn esimd_memcpy_dtoh(
         queue: *mut c_void,
         dst: *mut c_void,
         src: *const c_void,
         bytes: usize,
-    );
-    pub fn esimd_memset(queue: *mut c_void, ptr: *mut c_void, value: c_int, bytes: usize);
+    ) -> *const std::os::raw::c_char;
+    pub fn esimd_memset(
+        queue: *mut c_void,
+        ptr: *mut c_void,
+        value: c_int,
+        bytes: usize,
+    ) -> *const std::os::raw::c_char;
     pub fn esimd_memcpy_dtod(
         queue: *mut c_void,
         dst: *mut c_void,
         src: *const c_void,
         bytes: usize,
-    );
+    ) -> *const std::os::raw::c_char;
 
     // Warmup
-    pub fn esimd_warmup(queue: *mut c_void, max_lg_n: u32);
+    pub fn esimd_warmup(queue: *mut c_void, max_lg_n: u32) -> *const std::os::raw::c_char;
     pub fn esimd_prepare_zk_shift(queue: *mut c_void, lg_n: u32) -> *const std::os::raw::c_char;
 
     // NTT
@@ -384,7 +392,7 @@ pub fn get_queue() -> *mut c_void {
 
 /// Run the one-time kernel warmup (twiddles, JIT of the hot kernels) on `queue`.
 pub fn warmup_once(queue: *mut c_void) {
-    WARMUP.call_once(|| unsafe { esimd_warmup(queue, 22) });
+    WARMUP.call_once(|| esimd_check(unsafe { esimd_warmup(queue, 22) }));
 }
 
 /// Create the queue, run the warmup and build the zk_shift tables for
@@ -409,7 +417,13 @@ pub fn start_background_init(lgs: Vec<u32>) {
 /// Synchronize the SYCL queue (wait for all submitted work to complete).
 /// WARNING: This blocks the CPU.
 pub fn sync() {
-    unsafe { esimd_sync(get_queue()) };
+    esimd_check(unsafe { esimd_sync(get_queue()) });
+}
+
+/// As [`sync`], for a destructor or cleanup: a failure is reported (once, on stderr) and not raised,
+/// since a panic there, during another's unwinding, aborts the process.
+pub fn sync_quiet() {
+    unsafe { esimd_sync_quiet(get_queue()) };
 }
 
 // ============================================================================
@@ -420,20 +434,28 @@ pub fn sync() {
 /// The error string is allocated with strdup() on the C++ side; we free it here.
 #[inline]
 pub fn esimd_check(err: *const std::os::raw::c_char) {
-    if !err.is_null() {
-        let msg = unsafe {
-            let s = CStr::from_ptr(err)
-                .to_str()
-                .unwrap_or("invalid error string")
-                .to_string();
-            extern "C" {
-                fn free(ptr: *const std::os::raw::c_char);
-            }
-            free(err);
-            s
-        };
-        panic!("Intel GPU error: {msg}");
+    if let Err(e) = esimd_result(err) {
+        panic!("{e}");
     }
+}
+
+/// [`esimd_check`] as a `Result`, for a caller that returns one.
+pub fn esimd_result(err: *const std::os::raw::c_char) -> anyhow::Result<()> {
+    if err.is_null() {
+        return Ok(());
+    }
+    let msg = unsafe {
+        let s = CStr::from_ptr(err)
+            .to_str()
+            .unwrap_or("invalid error string")
+            .to_string();
+        extern "C" {
+            fn free(ptr: *const std::os::raw::c_char);
+        }
+        free(err);
+        s
+    };
+    anyhow::bail!("Intel GPU error: {msg}")
 }
 
 // ============================================================================
@@ -493,29 +515,28 @@ impl IntelDeviceBuffer {
             self.len
         );
         let queue = get_queue();
-        unsafe {
+        esimd_result(unsafe {
             esimd_memcpy_htod(
                 queue,
                 self.ptr as *mut c_void,
                 data.as_ptr() as *const c_void,
                 data.len(),
-            );
-        }
-        Ok(())
+            )
+        })
     }
 
     /// Copy device data to a new host Vec.
     pub fn as_host_vec(&self) -> anyhow::Result<Vec<u8>> {
         let mut vec = vec![0u8; self.len];
         let queue = get_queue();
-        unsafe {
+        esimd_result(unsafe {
             esimd_memcpy_dtoh(
                 queue,
                 vec.as_mut_ptr() as *mut c_void,
                 self.ptr as *const c_void,
                 self.len,
-            );
-        }
+            )
+        })?;
         Ok(vec)
     }
 
@@ -530,42 +551,42 @@ impl IntelDeviceBuffer {
         );
         let mut vec = vec![0u8; len];
         let queue = get_queue();
-        unsafe {
+        esimd_result(unsafe {
             esimd_memcpy_dtoh(
                 queue,
                 vec.as_mut_ptr() as *mut c_void,
                 self.ptr.add(offset) as *const c_void,
                 len,
-            );
-        }
+            )
+        })?;
         Ok(vec)
     }
 
     /// Set all bytes to `value`.
     pub fn memset(&mut self, value: i32, size: usize) {
         let queue = get_queue();
-        unsafe { esimd_memset(queue, self.ptr as *mut c_void, value, size) };
+        esimd_check(unsafe { esimd_memset(queue, self.ptr as *mut c_void, value, size) });
     }
 
     /// Set all 32-bit words to `value`. Equivalent to HipDeviceBuffer's set_32().
     pub fn set_32(&mut self, value: u32) {
         if value == 0 {
             let queue = get_queue();
-            unsafe { esimd_memset(queue, self.ptr as *mut c_void, 0, self.len) };
+            esimd_check(unsafe { esimd_memset(queue, self.ptr as *mut c_void, 0, self.len) });
         } else {
             // For non-zero: upload a host buffer filled with the value.
             // SYCL doesn't have a memsetD32 equivalent, so we do it manually.
             let count = self.len / 4;
             let host_buf: Vec<u32> = vec![value; count];
             let queue = get_queue();
-            unsafe {
+            esimd_check(unsafe {
                 esimd_memcpy_htod(
                     queue,
                     self.ptr as *mut c_void,
                     host_buf.as_ptr() as *const c_void,
                     self.len,
-                );
-            }
+                )
+            });
         }
     }
 

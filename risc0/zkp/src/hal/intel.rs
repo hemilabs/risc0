@@ -325,8 +325,9 @@ impl IntelBufferPool {
 /// workload (e.g. a different po2) stay allocated, up to the pool cap, for the
 /// life of the process and can crowd out a later, larger session.
 pub fn release_idle_buffers() {
-    // esimd_free_device does not wait for queued work; drain the queue first.
-    unsafe { intel::esimd_sync(get_queue()) };
+    // esimd_free_device does not wait for queued work; drain the queue first. Quietly: this is
+    // cleanup, also after a proof that failed (a panic here would end the worker).
+    intel::sync_quiet();
     let idle = BUFFER_POOL.lock().take_all();
     drop(idle);
 }
@@ -389,7 +390,7 @@ impl RawBuffer {
                 // still use them; drain the queue first.
                 let all = BUFFER_POOL.lock().take_all();
                 if !all.is_empty() {
-                    unsafe { intel::esimd_sync(get_queue()) };
+                    intel::sync();
                 }
                 drop(all);
                 IntelDeviceBuffer::uninitialized(size).unwrap_or_else(|e| {
@@ -414,8 +415,9 @@ impl Drop for RawBuffer {
         let overflow = BUFFER_POOL.lock().push(size, buf, max_bytes);
         if overflow.is_some() {
             // Over the pool cap (reachable in long sessions): the buffer is freed, and
-            // esimd_free_device does not wait for queued kernels still using it.
-            unsafe { intel::esimd_sync(get_queue()) };
+            // esimd_free_device does not wait for queued kernels still using it. Quietly: a
+            // destructor, which may run while another failure unwinds.
+            intel::sync_quiet();
         }
         drop(overflow);
     }
@@ -500,14 +502,14 @@ impl<T> BufferImpl<T> {
         let buf = self.buffer.lock();
         let queue = get_queue();
         let ptr = buf.buf.as_device_ptr();
-        unsafe {
+        intel::esimd_check(unsafe {
             intel::esimd_memcpy_htod(
                 queue,
                 (ptr.0 as *mut u8).add(byte_offset) as *mut std::ffi::c_void,
                 bytes.as_ptr() as *const std::ffi::c_void,
                 byte_len,
-            );
-        }
+            )
+        });
     }
 }
 
@@ -573,14 +575,14 @@ impl<T: Clone> Buffer<T> for BufferImpl<T> {
             // Upload just the modified region back to the correct offset in device memory.
             let queue = get_queue();
             let ptr = buf.buf.as_device_ptr();
-            unsafe {
+            intel::esimd_check(unsafe {
                 intel::esimd_memcpy_htod(
                     queue,
                     (ptr.0 as *mut u8).add(byte_offset) as *mut std::ffi::c_void,
                     host_buf.as_ptr() as *const std::ffi::c_void,
                     byte_len,
-                );
-            }
+                )
+            });
         }
     }
 

@@ -100,14 +100,14 @@ fn buf_key<T: Clone>(buf: &IntelBuffer<T>) -> (usize, usize) {
 fn dtoh_into(buf: &IntelBuffer<BabyBearElem>, offset: usize, dst: &mut [BabyBearElem]) {
     assert!(offset + dst.len() <= buf.size());
     let src = buf.as_device_ptr_with_offset(offset);
-    unsafe {
+    risc0_sys::intel::esimd_check(unsafe {
         risc0_sys::intel::esimd_memcpy_dtoh(
             risc0_sys::intel::get_queue(),
             dst.as_mut_ptr() as *mut std::ffi::c_void,
             src.0 as *const std::ffi::c_void,
             std::mem::size_of_val(dst),
-        );
-    }
+        )
+    });
 }
 
 /// Single-copy D2H (BufferImpl::to_vec stages through a second host vector).
