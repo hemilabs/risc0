@@ -490,6 +490,28 @@ fn command_buffer_error_sync_panics() {
     let _ = out.to_vec();
 }
 
+/// A failed batch that a poll outside a sync retired (here an allocation's, after the batch
+/// finished) still fails the next host read instead of handing back its partial output.
+#[test]
+#[should_panic(expected = "Metal command buffer failed: injected test error")]
+fn command_buffer_error_retired_by_poll_fails_host_read() {
+    let hal = MetalHalSha256::new();
+    let ones = hal.copy_from_elem("ones", &elems(std::iter::repeat_n(1, 64)));
+    let out = hal.alloc_elem("out", 64);
+    hal.try_sync().unwrap();
+    hal.rt.inject_batch_error();
+    hal.eltwise_add_elem(&out, &ones, &ones);
+    hal.flush();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    // Allocations poll; once the batch has finished, one of them retires it.
+    while hal.rt.unsynced() {
+        assert!(std::time::Instant::now() < deadline, "the batch never completed");
+        let _ = hal.alloc_elem("poll", 64);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let _ = out.to_vec();
+}
+
 // ---- Z6: generic testutil coverage of every Metal Hal method ----
 
 #[test]

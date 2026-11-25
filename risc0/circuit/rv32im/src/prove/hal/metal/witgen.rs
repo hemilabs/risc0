@@ -30,19 +30,20 @@
 //!    so no single dispatch runs long enough for the GPU watchdog.
 //! 3. `sync()` (phase end, PLAN 2.6), then the fault word: any `RV32IM_FAULT_*` bit → `Err`.
 //!
-//! `pre_data`: the prover passes `data` itself unless `RISC0_USE_PRE_DATA` is set. Since R15w the
-//! default binds `data` itself (single-buffer mode, CUDA's default `pre_data == data`), saving
-//! `rows * 211 * 4` bytes (885 MB at po2 20; a memory win, the call time does not change
-//! measurably). A back load of a row a neighbouring thread is writing can then read that row's
-//! injected value or its final one, and some cells of a row one and some the other. The evidence
-//! that the witness is still the CPU's is empirical, for this noinline step graph, not a proof:
-//! CUDA's single-buffer default with the same noinline graph (its ffi.cu notes that the fully
-//! inlined build reorders those back loads and is *not* bit-exact), and the R17-method gate in
-//! notes/R15w.md (600 calls on 5 segments, sorted and production launch orders, 0 bad, against a
-//! same-session defect-shape baseline that fails 5/5). `RISC0_METAL_WITGEN_SINGLE_BUFFER=0` restores
-//! R8's snapshot: a copy of `data` taken after `injectCycleCols`, bound at index 1, so back loads
-//! never read a row a neighbouring thread is writing. A separate `pre_data` from the prover
-//! (`RISC0_USE_PRE_DATA`) already holds the scattered rows and cycle columns and is bound as is.
+//! `pre_data`: the prover passes `data` itself unless `RISC0_USE_PRE_DATA` is set. The default
+//! (R8's, again since the race review that followed R15w) takes a snapshot: a copy of `data`
+//! made after `injectCycleCols`, bound at index 1, so back loads never read a row a neighbouring
+//! thread is writing. It costs `rows * 211 * 4` bytes while witgen runs (885 MB at po2 20).
+//! `RISC0_METAL_WITGEN_SINGLE_BUFFER=1` binds `data` itself instead (single-buffer mode, CUDA's
+//! default `pre_data == data`, R15w's default): a back load of a row a neighbouring thread is
+//! writing can then read that row's injected value or its final one, and some cells of a row one
+//! and some the other, with nothing ordering the two (no barrier, fence or atomic). The evidence
+//! that its witness is still the CPU's is empirical, for this noinline step graph and the M5's
+//! GPU, not a proof: CUDA's single-buffer default with the same noinline graph (its ffi.cu notes
+//! that the fully inlined build reorders those back loads and is *not* bit-exact), and the
+//! R17-method gate in notes/R15w.md (600 calls on 5 segments, on one M5). A separate `pre_data`
+//! from the prover (`RISC0_USE_PRE_DATA`) already holds the scattered rows and cycle columns and
+//! is bound as is.
 //!
 //! Launch order and threadgroup size (R15w, [WitgenTune]): the first parallel launch (cycles
 //! before the table split) runs its cycles grouped by major within 2^14-row windows
@@ -238,14 +239,14 @@ pub(crate) struct WitgenTune {
 /// overlapped with the GPU setup (fix round 1: with it these defaults together make the call
 /// ~11-17 ms faster than R13's path in interleaved pairs, against A'-A medians of 0-14 ms;
 /// inline, the sort's host cost depends on CPU load and can cancel the kernel gain), no minor key (no gain measured), and
-/// single-buffer mode (no `rows * 211 * 4`-byte snapshot: −885 MB at po2 20, call time "no
-/// change"; bit-exact empirically, 600 gate calls on 5 segments).
+/// the `pre_data` snapshot (+885 MB at po2 20 while witgen runs; single-buffer mode has an
+/// unordered read-after-write between neighbouring threads, see the module doc).
 /// `RISC0_METAL_WITGEN_SORT=0 RISC0_METAL_WITGEN_SINGLE_BUFFER=0` restores the R8-R17 behaviour.
 pub(crate) const DEFAULT_TUNE: WitgenTune = WitgenTune {
     tg: 0,
     sort_win: 14,
     minor: false,
-    single: true,
+    single: false,
     sort_overlap: true,
 };
 
