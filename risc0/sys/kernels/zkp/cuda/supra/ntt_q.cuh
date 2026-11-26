@@ -636,6 +636,29 @@ static void launch(cudaStream_t st, unsigned cols, const fr_t* in, fr_t* out, si
     CUDA_OK(cudaGetLastError());
 }
 
+#ifndef __HIPCC__
+// pass_k's dynamic shared memory for a line of 2^LOGL and TB columns a block, as `launch` sizes it.
+static size_t smem_bytes(unsigned LOGL, unsigned TB) {
+    const size_t L = (size_t)1 << LOGL;
+    const size_t LS = L + L / 32 + (32 / TB > 0 ? 32 / TB : 1);
+    const size_t TW = 256 + 256 * ((size_t)1 << (LOGL - 8));
+    return (TB * LS + TW) * sizeof(fr_t);
+}
+// The current device's opt-in limit of dynamic shared memory a block (99 KB on an RTX 5090, 64 KB on
+// an RTX 2080 Ti), read once per device.
+static size_t smem_optin() {
+    static int limit[16];
+    int dev;
+    CUDA_OK(cudaGetDevice(&dev));
+    if (limit[dev] == 0) {
+        int v = 0;
+        CUDA_OK(cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
+        limit[dev] = v > 0 ? v : 48 * 1024;
+    }
+    return (size_t)limit[dev];
+}
+#endif
+
 template<int MODE>
 static void pass(cudaStream_t st, unsigned LOGL, unsigned TB, unsigned cols, const fr_t* in, fr_t* out,
                  size_t ics, size_t ocs, unsigned lgX, unsigned rows_in, const LineTabs& LT, Tw tw,
@@ -643,8 +666,12 @@ static void pass(cudaStream_t st, unsigned LOGL, unsigned TB, unsigned cols, con
 {
 #define NTTQ_INST(LL, TT, MB) if (LOGL == LL && TB == TT) { launch<LL, TT, MODE, MB>(st, cols, in, out, ics, ocs, lgX, rows_in, LT, tw, lo, hi, scale, flags); return; }
 #ifndef __HIPCC__
+    // A device that allows a block less shared memory than the schedule's instance needs (64 KB on
+    // Turing: (9, 32) takes ~69 KB and (11, 8) ~75 KB) runs the same line with half the columns a
+    // block, as often as it takes; a block's columns are independent, so the output is the same.
+    while (TB > 4 && smem_bytes(LOGL, TB) > smem_optin()) TB /= 2;
     NTTQ_INST(8, 16, 4) NTTQ_INST(8, 32, 2) NTTQ_INST(9, 16, 2) NTTQ_INST(9, 32, 1)
-    NTTQ_INST(9, 8, 3) NTTQ_INST(10, 8, 2) NTTQ_INST(11, 8, 1)
+    NTTQ_INST(9, 8, 3) NTTQ_INST(10, 8, 2) NTTQ_INST(11, 8, 1) NTTQ_INST(11, 4, 1)
 #else
     // Shared memory is capped at 64 KB per block: no (9, 32) or (11, 8); (11, 4) instead.
     NTTQ_INST(8, 16, 4) NTTQ_INST(8, 32, 2) NTTQ_INST(9, 16, 2)
