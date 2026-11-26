@@ -112,13 +112,22 @@ inline void coalesced_load(thread Fp* r, const device Fp* inout, uint idx, uint 
 }
 
 // Threadgroup scratch viewed as xchg[blockDim][Z] (raw words).
+//
+// M2 fix: every barrier around the 8-lane transposes is a threadgroup barrier. CUDA orders them
+// with __syncwarp and the first port used simdgroup_barrier(mem_threadgroup), its MSL analogue.
+// On an M2 (applegpu_g14) that does not order the exchange: every multi-pass NTT came out wrong
+// at random elements, 992 of 1026 pass layouts wrong in 20 of 20 runs (only the single-pass
+// sizes, lg <= 10, were exact). Threadgroup barriers on the load side alone or the store side
+// alone did not fix it; on both, 20568 of 20568 runs were exact (scratch/m2diag round 2). The M5
+// never showed the fault. Callers reach these in uniform control flow (COALESCED is a template
+// constant), as a threadgroup barrier requires.
 template <int Z> inline void transpose(thread Fp* r, threadgroup uint* xchg, uint tx) {
   const uint x = tx & (Z - 1);
   const uint y = tx & ~(Z - 1);
   for (int z = 0; z < Z; z++) {
     xchg[(y + z) * Z + x] = r[z].asRaw();
   }
-  simdgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
   for (int z = 0; z < Z; z++) {
     r[z] = Fp::fromRaw(xchg[(y + x) * Z + z]);
   }
@@ -216,7 +225,7 @@ ct_x(const device Fp* in0 [[buffer(0)]],
     coalesced_load<Z>(r0, d_in, idx0, stage + 1, tx);
     coalesced_load<Z>(r1, d_in, idx1, stage + 1, tx);
     transpose<Z>(r0, sh, tx);
-    simdgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     transpose<Z>(r1, sh, tx);
   } else {
     uint z_shift = inp_mask == 0 ? iterations : 0;
@@ -326,18 +335,16 @@ ct_x(const device Fp* in0 [[buffer(0)]],
   rotw = (rotw >> 1) | (rotw << (iterations - 1));
   idx1 = (idx1 & ~mask) | (rotw & mask);
 
-  // V3 barrier fix: WAR on the exchange buffer before the transpose. With iterations <= 6 the
-  // only earlier use of the exchange buffer is the load transpose of the same 8-lane group, whose
-  // row reads by one lane overlap the column writes of the others: a simdgroup barrier orders
-  // them (Z8a; CUDA relies on warp lockstep here, the shuffles in between are not barriers).
-  if (COALESCED && iterations > 6) {
+  // V3 barrier fix: WAR on the exchange buffer before the transpose (with iterations <= 6 the
+  // earlier use is the load transpose of the same 8-lane group; CUDA relies on warp lockstep
+  // here). A threadgroup barrier in both cases: a simdgroup barrier is not enough on an M2 (see
+  // transpose).
+  if (COALESCED) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
-  } else if (COALESCED) {
-    simdgroup_barrier(mem_flags::mem_threadgroup);
   }
   if (COALESCED) {
     transpose<Z>(r0, sh, tx);
-    simdgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     transpose<Z>(r1, sh, tx);
     coalesced_store<Z>(d_out, idx0, r0, stage, tx);
     coalesced_store<Z>(d_out, idx1, r1, stage, tx);
@@ -397,7 +404,7 @@ gs_x(const device Fp* in0 [[buffer(0)]],
     coalesced_load<Z>(r0, d_in, idx0, stage - iterations, tx);
     coalesced_load<Z>(r1, d_in, idx1, stage - iterations, tx);
     transpose<Z>(r0, sh, tx);
-    simdgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     transpose<Z>(r1, sh, tx);
   } else {
     uint z_shift = out_mask == 0 ? iterations : 0;
@@ -478,18 +485,16 @@ gs_x(const device Fp* in0 [[buffer(0)]],
   rotw = (rotw << 1) | (rotw >> (iterations - 1));
   idx1 = (idx1 & ~mask) | (rotw & mask);
 
-  // V3 barrier fix: WAR on the exchange buffer before the transpose. With iterations <= 6 the
-  // only earlier use of the exchange buffer is the load transpose of the same 8-lane group, whose
-  // row reads by one lane overlap the column writes of the others: a simdgroup barrier orders
-  // them (Z8a; CUDA relies on warp lockstep here, the shuffles in between are not barriers).
-  if (COALESCED && iterations > 6) {
+  // V3 barrier fix: WAR on the exchange buffer before the transpose (with iterations <= 6 the
+  // earlier use is the load transpose of the same 8-lane group; CUDA relies on warp lockstep
+  // here). A threadgroup barrier in both cases: a simdgroup barrier is not enough on an M2 (see
+  // transpose).
+  if (COALESCED) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
-  } else if (COALESCED) {
-    simdgroup_barrier(mem_flags::mem_threadgroup);
   }
   if (COALESCED) {
     transpose<Z>(r0, sh, tx);
-    simdgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     transpose<Z>(r1, sh, tx);
     coalesced_store<Z>(d_out, idx0, r0, stage - iterations + 1, tx);
     coalesced_store<Z>(d_out, idx1, r1, stage - iterations + 1, tx);
