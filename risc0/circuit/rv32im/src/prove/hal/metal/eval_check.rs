@@ -151,6 +151,17 @@ impl EvalKernel {
         }
     }
 
+    /// The lazily built split (or, for the baseline, only) kernel of a non-default form; None
+    /// for evalfast, whose PSOs are built when the library loads.
+    pub(crate) fn lazy_kernel(self) -> Option<&'static str> {
+        match self {
+            Self::Evalfast => None,
+            Self::EvalfastR12 => Some("ef_eval_split_r12"),
+            Self::EvalfastR15e => Some("ef_eval_split_r15e"),
+            Self::Baseline => Some("eval_check"),
+        }
+    }
+
     /// The kernel [EVAL_KERNEL_ENV] selects now.
     pub(crate) fn current() -> anyhow::Result<Self> {
         match std::env::var(EVAL_KERNEL_ENV) {
@@ -626,7 +637,9 @@ const EF_THREADS: u64 = 128;
 /// library loads): built from `lib` on first use and kept for the process (R15e: the baseline
 /// `eval_check` PSO takes ~60 s cold and is not needed unless [EVAL_KERNEL_ENV] selects it).
 /// One library per process (`Rv32imKernels` is process-wide), so the cache is keyed by name.
-/// Errors are returned, not cached.
+/// A PSO the device refuses is not retried: the error is kept and returned again (an M2 refuses
+/// the baseline `eval_check`, `ef_eval_split_r12` and `ef_eval_split_r15e` with "Compute function
+/// exceeds available stack space", after ~30 s of compiling the first of them).
 pub(crate) fn lazy_pipeline(
     lib: &metal::LibraryRef,
     name: &'static str,
@@ -635,27 +648,34 @@ pub(crate) fn lazy_pipeline(
         collections::HashMap,
         sync::{Mutex, OnceLock},
     };
-    static PSOS: OnceLock<Mutex<HashMap<&'static str, &'static metal::ComputePipelineState>>> =
-        OnceLock::new();
+    type Built = Result<&'static metal::ComputePipelineState, String>;
+    static PSOS: OnceLock<Mutex<HashMap<&'static str, Built>>> = OnceLock::new();
     // Held while a PSO builds, so two threads never build the same one.
     let mut psos = PSOS.get_or_init(Default::default).lock().unwrap();
-    if let Some(pso) = psos.get(name) {
-        return Ok(pso);
+    if let Some(built) = psos.get(name) {
+        return built.clone().map_err(|e| anyhow::anyhow!("{e}"));
     }
     let t = std::time::Instant::now();
     let function = lib
         .get_function(name, None)
         .map_err(|e| anyhow::anyhow!("rv32im metallib function {name}: {e}"))?;
-    let pso = lib
+    let pso = match lib
         .device()
         .new_compute_pipeline_state_with_function(&function)
-        .map_err(|e| anyhow::anyhow!("compute pipeline for {name}: {e}"))?;
+    {
+        Ok(pso) => pso,
+        Err(e) => {
+            let e = format!("compute pipeline for {name}: {e}");
+            psos.insert(name, Err(e.clone()));
+            return Err(anyhow::anyhow!("{e}"));
+        }
+    };
     tracing::info!(
         "rv32im Metal: built the {name} PSO on first use in {:?}",
         t.elapsed()
     );
     let pso: &'static metal::ComputePipelineState = Box::leak(Box::new(pso));
-    psos.insert(name, pso);
+    psos.insert(name, Ok(pso));
     Ok(pso)
 }
 /// The pipelines of one evalfast build and the threadgroup size its `ef_eval_split` was compiled
@@ -734,7 +754,7 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
         po2: usize,
         steps: usize,
     ) -> anyhow::Result<()> {
-        match EvalKernel::current()? {
+        match self.usable_eval_kernel(EvalKernel::current()?) {
             EvalKernel::Evalfast => {
                 self.eval_check_evalfast(check, groups, globals, poly_mix, po2, steps)
             }
@@ -746,6 +766,31 @@ impl<MH: MetalHash> MetalCircuitHal<MH> {
             }
             EvalKernel::Baseline => {
                 self.eval_check_baseline(check, groups, globals, poly_mix, po2, steps)
+            }
+        }
+    }
+
+    /// `k`, or evalfast when `k`'s PSO does not build on this device (an M2 refuses the baseline,
+    /// R12 and R15e forms: "Compute function exceeds available stack space"). Every form computes
+    /// the same check bit for bit, so this changes only the speed; it warns once per form.
+    fn usable_eval_kernel(&self, k: EvalKernel) -> EvalKernel {
+        let Some(name) = k.lazy_kernel() else {
+            return k;
+        };
+        match lazy_pipeline(self.ctx.library(), name) {
+            Ok(_) => k,
+            Err(e) => {
+                static WARNED: std::sync::Mutex<Vec<&'static str>> =
+                    std::sync::Mutex::new(Vec::new());
+                let mut warned = WARNED.lock().unwrap();
+                if !warned.contains(&name) {
+                    warned.push(name);
+                    tracing::warn!(
+                        "rv32im Metal: {EVAL_KERNEL_ENV} selects {k:?}, which this GPU cannot run \
+                         ({e:#}); using evalfast (the same results)"
+                    );
+                }
+                EvalKernel::Evalfast
             }
         }
     }
@@ -1381,6 +1426,38 @@ mod ef_tests {
 
     /// Runs one GPU eval_check `reps` times over the same Metal buffers; returns every `check`,
     /// the GPU wall time of each run and the peak `currentAllocatedSize` during the runs.
+    /// [gpu_checks]' results: each run's check, each run's time, the peak allocation.
+    type Checks = (Vec<Vec<Val>>, Vec<std::time::Duration>, u64);
+
+    /// Whether `which` builds on this device (an M2 refuses the baseline, R12 and R15e forms:
+    /// "Compute function exceeds available stack space"); prints a skip line when it does not.
+    fn builds(c: &MetalCircuitHal<risc0_zkp::hal::metal::MetalHashSha256>, which: Which) -> bool {
+        let k = match which {
+            Which::Baseline => EvalKernel::Baseline,
+            Which::EvalfastR12 => EvalKernel::EvalfastR12,
+            Which::EvalfastR15e => EvalKernel::EvalfastR15e,
+            _ => return true,
+        };
+        match lazy_pipeline(c.ctx.library(), k.lazy_kernel().unwrap()) {
+            Ok(_) => true,
+            Err(e) => {
+                println!("skipping {which:?}: it does not build on this GPU ({e:#})");
+                false
+            }
+        }
+    }
+
+    /// [gpu_checks] when `which` builds on this device ([builds]), else None.
+    fn gpu_checks_if_builds(
+        c: &MetalCircuitHal<risc0_zkp::hal::metal::MetalHashSha256>,
+        inp: &Inputs,
+        po2: usize,
+        which: Which,
+        reps: usize,
+    ) -> Option<Checks> {
+        builds(c, which).then(|| gpu_checks(c, inp, po2, which, reps))
+    }
+
     fn gpu_checks(
         c: &MetalCircuitHal<risc0_zkp::hal::metal::MetalHashSha256>,
         inp: &Inputs,
@@ -1476,9 +1553,10 @@ mod ef_tests {
         let hal = Arc::new(MetalHalSha256::new());
         let c = MetalCircuitHal::new(hal.clone()).unwrap();
         let (fast, fast_t, fast_peak) = gpu_checks(&c, inp, po2, Which::Evalfast, reps);
-        let (base, base_t, base_peak) = gpu_checks(&c, inp, po2, Which::Baseline, 1);
-        let (r12, r12_t, _) = gpu_checks(&c, inp, po2, Which::EvalfastR12, 1);
-        let (r15e, r15e_t, _) = gpu_checks(&c, inp, po2, Which::EvalfastR15e, 1);
+        // The baseline, R12 and R15e forms do not build on an M2 ([builds]): checked where they do.
+        let base = gpu_checks_if_builds(&c, inp, po2, Which::Baseline, 1);
+        let r12 = gpu_checks_if_builds(&c, inp, po2, Which::EvalfastR12, 1);
+        let r15e = gpu_checks_if_builds(&c, inp, po2, Which::EvalfastR15e, 1);
         let (fc, fc_t, _) = gpu_checks(&c, inp, po2, Which::EvalfastFc, 2);
         // R22: the nested-chain kernels (the revert switch) too.
         let (nest, nest_t, _) = gpu_checks(&c, inp, po2, Which::EvalfastNest, 1);
@@ -1509,20 +1587,17 @@ mod ef_tests {
                 cpu.len()
             );
         }
-        let n = mismatches(&cpu, &r15e[0]);
-        assert_eq!(
-            n,
-            0,
-            "po2 {po2}: evalfast_r15e vs CPU: {n} of {} differ",
-            cpu.len()
-        );
-        let n = mismatches(&cpu, &r12[0]);
-        assert_eq!(
-            n,
-            0,
-            "po2 {po2}: evalfast_r12 vs CPU: {n} of {} differ",
-            cpu.len()
-        );
+        for (what, r) in [("evalfast_r15e", &r15e), ("evalfast_r12", &r12)] {
+            if let Some((r, _, _)) = r {
+                let n = mismatches(&cpu, &r[0]);
+                assert_eq!(
+                    n,
+                    0,
+                    "po2 {po2}: {what} vs CPU: {n} of {} differ",
+                    cpu.len()
+                );
+            }
+        }
         for (i, f) in fast.iter().enumerate() {
             let n = mismatches(&cpu, f);
             assert_eq!(
@@ -1532,22 +1607,27 @@ mod ef_tests {
                 cpu.len()
             );
         }
-        let n = mismatches(&cpu, &base[0]);
-        assert_eq!(
-            n,
-            0,
-            "po2 {po2}: baseline vs CPU: {n} of {} differ",
-            cpu.len()
-        );
+        if let Some((base, _, _)) = &base {
+            let n = mismatches(&cpu, &base[0]);
+            assert_eq!(
+                n,
+                0,
+                "po2 {po2}: baseline vs CPU: {n} of {} differ",
+                cpu.len()
+            );
+        }
+        let t = |r: &Option<Checks>| r.as_ref().map(|r| r.1.clone());
+        let (r15e_t, r12_t, base_t) = (t(&r15e), t(&r12), t(&base));
+        let base_peak = base.as_ref().map(|b| b.2);
         println!(
             "R12 eval_check po2 {po2} ({kind} inputs): {} elements bit-exact (evalfast x{reps} == \
              evalfast specialized x2 == nested == nested specialized == evalfast_r15e == \
              evalfast_r12 == baseline == CPU); evalfast {fast_t:?}, specialized {fc_t:?}, \
              nested {nest_t:?}, nested specialized {fcn_t:?}, \
              evalfast_r15e {r15e_t:?}, \
-             evalfast_r12 {r12_t:?}, baseline {base_t:?}, \
+             evalfast_r12 {r12_t:?}, baseline {base_t:?} (None: does not build on this GPU), \
              CPU HAL {cpu_time:?}; inputs {} B, peak \
-             currentAllocatedSize evalfast {fast_peak} B / baseline {base_peak} B",
+             currentAllocatedSize evalfast {fast_peak} B / baseline {base_peak:?} B",
             cpu.len(),
             inp.bytes(),
         );
@@ -1602,10 +1682,16 @@ mod ef_tests {
         let hal = Arc::new(MetalHalSha256::new());
         let c = MetalCircuitHal::new(hal.clone()).unwrap();
         let mut bad = Vec::new();
+        // Without a baseline PSO (an M2: [builds]) the CPU is the reference.
+        let have_base = builds(&c, Which::Baseline);
         for seed in 1..=seeds {
             let inp = Inputs::seeded(po2, seed, Dist::Uniform);
-            let (base, _, _) = gpu_checks(&c, &inp, po2, Which::Baseline, 1);
-            if with_cpu {
+            let base = if have_base {
+                gpu_checks(&c, &inp, po2, Which::Baseline, 1).0
+            } else {
+                vec![cpu_check(&inp, po2)]
+            };
+            if with_cpu && have_base {
                 let cpu = cpu_check(&inp, po2);
                 let n = mismatches(&cpu, &base[0]);
                 println!("P31-03 baseline vs CPU seed {seed} po2 {po2}: {n} elements differ");
@@ -1638,7 +1724,9 @@ mod ef_tests {
                 Which::EvalfastR15e,
                 Which::EvalfastR12,
             ] {
-                let (r, t, _) = gpu_checks(&c, &inp, po2, which, 1);
+                let Some((r, t, _)) = gpu_checks_if_builds(&c, &inp, po2, which, 1) else {
+                    continue;
+                };
                 let n = mismatches(&base[0], &r[0]);
                 println!(
                     "R22 evalfast {which:?} seed {seed} po2 {po2}: {n} elements differ; {t:?}"
@@ -1667,7 +1755,13 @@ mod ef_tests {
         let c = MetalCircuitHal::new(hal.clone()).unwrap();
         // R17 audit: `R12_BASE_REPS` (default 2) baseline runs, each compared with the first.
         let base_reps: usize = std::env::var("R12_BASE_REPS").map_or(2, |v| v.parse().unwrap());
-        let (base, base_t, _) = gpu_checks(&c, &inp, po2, Which::Baseline, base_reps.max(2));
+        // Without a baseline PSO (an M2: [builds]) the CPU is the reference.
+        let (base, base_t) = if builds(&c, Which::Baseline) {
+            let (b, t, _) = gpu_checks(&c, &inp, po2, Which::Baseline, base_reps.max(2));
+            (b, t)
+        } else {
+            (vec![cpu_check(&inp, po2)], vec![])
+        };
         let base_bad: Vec<(usize, usize)> = base
             .iter()
             .enumerate()
@@ -2359,7 +2453,7 @@ mod ef_tests {
         let built: Vec<_> = std::thread::scope(|s| {
             let hs: Vec<_> = cases
                 .iter()
-                .map(|&(name, fc, _)| {
+                .map(|&(name, fc, fast)| {
                     let (dir, hal, c) = (dir.clone(), &hal, &c);
                     s.spawn(move || {
                         let t = std::time::Instant::now();
@@ -2378,7 +2472,7 @@ mod ef_tests {
                                 return (None, own);
                             }
                         }
-                        let (pso, r) = metal::objc::rc::autoreleasepool(|| {
+                        let built = metal::objc::rc::autoreleasepool(|| {
                             archive::specialized_pipeline(
                                 Some(dir),
                                 &hal.device,
@@ -2388,8 +2482,17 @@ mod ef_tests {
                                 name,
                                 fc,
                             )
-                        })
-                        .unwrap();
+                        });
+                        // The slow-regime reference (R15e's form) exceeds an M2's stack limit
+                        // ("Compute function exceeds available stack space"): nothing to
+                        // compare there. A default kernel must build everywhere.
+                        let (pso, r) = match built {
+                            Err(e) if !fast => {
+                                println!("R22 {name}: does not build on this GPU ({e:#}); skipped");
+                                return (None, None);
+                            }
+                            b => b.unwrap(),
+                        };
                         let path = r.path.clone().expect("archive written");
                         let info = archive_info(&path, name);
                         println!("R22 {name} {fc:?}: {info:?} ({:?})", t.elapsed());
@@ -2399,7 +2502,7 @@ mod ef_tests {
                 .collect();
             hs.into_iter().map(|h| h.join().unwrap()).collect()
         });
-        for ((name, _, fast), (_, info)) in cases.iter().zip(&built) {
+        for ((name, _, fast), (pso, info)) in cases.iter().zip(&built) {
             let regime = Regime::of(*info, STACK_MAX);
             if *fast {
                 assert!(
@@ -2408,6 +2511,8 @@ mod ef_tests {
                      compiler regime (native stack <= {STACK_MAX} B); eval_check will be ~2.4x \
                      slower. See docs/metal-port/notes/R22.md"
                 );
+            } else if pso.is_none() && info.is_none() {
+                continue; // did not build on this GPU (printed above)
             } else {
                 assert!(
                     matches!(regime, Regime::Slow(_)),
@@ -2424,6 +2529,9 @@ mod ef_tests {
         let [code, data, accum, mix, out] = [&inp.code, &inp.data, &inp.accum, &inp.mix, &inp.out]
             .map(|b| hal.copy_from_elem("in", b));
         for i in [2, 4] {
+            if built[i].0.is_none() {
+                continue; // did not build on this GPU (printed above)
+            }
             let check = hal.alloc_elem("check", ExtVal::EXT_SIZE * steps * INV_RATE);
             check.view_mut(|v| v.fill(Val::new_raw(0x7fff_ffff)));
             let k = EfKernels {
