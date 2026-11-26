@@ -106,23 +106,32 @@ struct FrParams {
                                       0x0e0a77c1u};
 };
 
+// Every limb loop below is unrolled by hand (`#pragma unroll`). IGC unrolled them on its own in the
+// G1 MSM kernels but not in the G2 ones, which are about twice their size: there the limb arrays
+// lived in private memory (the G2 bucket kernel had 1,443 load and 959 store instructions, 759 of
+// them single-dword private stores, against 202 and 106 in G1's), and MSM B2 took 4.6 s of a 6.2 s
+// proof on an Arc Pro B70, each G1 MSM ~0.28 s. Unrolled, B2 takes 1.08 s and the proof 2.6 s; the
+// G1 MSMs move by -10% to +8%. The library takes ~3 minutes to build instead of one.
 template <class Params> struct Mont {
   uint32_t l[8];
 
   static inline Mont zero() {
     Mont r;
+    #pragma unroll
     for (int i = 0; i < 8; i++)
       r.l[i] = 0;
     return r;
   }
   static inline Mont one() {
     Mont r;
+    #pragma unroll
     for (int i = 0; i < 8; i++)
       r.l[i] = Params::ONE[i];
     return r;
   }
   static inline Mont from_limbs(const uint32_t* v) {
     Mont r;
+    #pragma unroll
     for (int i = 0; i < 8; i++)
       r.l[i] = v[i];
     return r;
@@ -130,12 +139,14 @@ template <class Params> struct Mont {
 
   inline bool is_zero() const {
     uint32_t acc = 0;
+    #pragma unroll
     for (int i = 0; i < 8; i++)
       acc |= l[i];
     return acc == 0;
   }
   inline bool operator==(const Mont& o) const {
     uint32_t acc = 0;
+    #pragma unroll
     for (int i = 0; i < 8; i++)
       acc |= l[i] ^ o.l[i];
     return acc == 0;
@@ -146,11 +157,13 @@ template <class Params> struct Mont {
   static inline Mont reduce_once(const uint32_t t[8], uint32_t hi) {
     uint32_t u[8];
     uint32_t borrow = 0;
+    #pragma unroll
     for (int i = 0; i < 8; i++)
       u[i] = subb(t[i], Params::P[i], borrow, borrow);
     // Keep t - P unless it went negative (and t had no carry-out).
     bool keep_t = borrow && !hi;
     Mont r;
+    #pragma unroll
     for (int i = 0; i < 8; i++)
       r.l[i] = keep_t ? t[i] : u[i];
     return r;
@@ -159,6 +172,7 @@ template <class Params> struct Mont {
   friend inline Mont operator+(const Mont& a, const Mont& b) {
     uint32_t t[8];
     uint32_t c = 0;
+    #pragma unroll
     for (int i = 0; i < 8; i++)
       t[i] = addc(a.l[i], b.l[i], c, c);
     return reduce_once(t, c);
@@ -167,11 +181,13 @@ template <class Params> struct Mont {
   friend inline Mont operator-(const Mont& a, const Mont& b) {
     uint32_t t[8];
     uint32_t borrow = 0;
+    #pragma unroll
     for (int i = 0; i < 8; i++)
       t[i] = subb(a.l[i], b.l[i], borrow, borrow);
     // Add P back if it went negative (masked, no branch).
     uint32_t mask = 0u - borrow;
     uint32_t c = 0;
+    #pragma unroll
     for (int i = 0; i < 8; i++)
       t[i] = addc(t[i], Params::P[i] & mask, c, c);
     return from_limbs(t);
@@ -183,11 +199,14 @@ template <class Params> struct Mont {
   // Montgomery multiplication (CIOS, 32-bit operations only): a * b * R^-1 mod P.
   friend inline Mont operator*(const Mont& a, const Mont& b) {
     uint32_t t[10];
+    #pragma unroll
     for (int i = 0; i < 10; i++)
       t[i] = 0;
+    #pragma unroll
     for (int i = 0; i < 8; i++) {
       uint32_t c = 0;
       uint32_t bi = b.l[i];
+      #pragma unroll
       for (int j = 0; j < 8; j++) {
         // t[j] + a[j] * bi + c fits in 64 bits: (hi, lo).
         uint32_t lo = a.l[j] * bi, hi = mulhi32(a.l[j], bi);
@@ -208,6 +227,7 @@ template <class Params> struct Mont {
       uint32_t lo = m * Params::P[0], hi = mulhi32(m, Params::P[0]);
       (void)addc(lo, t[0], 0, k);
       c = hi + k;
+      #pragma unroll
       for (int j = 1; j < 8; j++) {
         lo = m * Params::P[j];
         hi = mulhi32(m, Params::P[j]);
@@ -252,6 +272,7 @@ template <class Params> struct Mont {
   inline Mont inv() const {
     uint32_t e[8];
     uint64_t borrow = 2;
+    #pragma unroll
     for (int i = 0; i < 8; i++) {
       uint64_t d = (uint64_t)Params::P[i] - borrow;
       e[i] = (uint32_t)d;
