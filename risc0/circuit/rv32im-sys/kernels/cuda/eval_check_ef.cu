@@ -30,6 +30,12 @@
 #ifndef EF_THREADS
 #define EF_THREADS 128
 #endif
+// Turing (sm_75): at 3 blocks per SM the kernel is held to 128 registers and spills ~2.8 KB a
+// thread into local memory; at 2 it takes 255 and spills ~0.2 KB. RTX 2080 Ti, po2 19: 166 -> 149
+// ms a segment, zk-miner's benchmark suite 3.7% faster. Other architectures keep 3.
+#if !defined(EF_MINB) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
+#define EF_MINB 2
+#endif
 #ifndef EF_MINB
 #define EF_MINB 3
 #endif
